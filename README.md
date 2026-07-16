@@ -37,8 +37,8 @@ paths are documented rather than hidden — see [`LTX_GEMM_PARITY.md`](LTX_GEMM_
 
 ## Building
 
-Requires the CUDA toolkit. `cudarc` (vendored under `third_party/`) JIT-compiles the
-kernels at runtime via NVRTC.
+Requires the CUDA toolkit. Kernels are JIT-compiled at runtime via NVRTC (through the
+`cudarc` crate).
 
 ```bash
 cargo build --release -p synaptix-cli
