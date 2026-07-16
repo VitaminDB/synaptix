@@ -1,0 +1,273 @@
+use std::path::{Path, PathBuf};
+
+use synaptix_core::device::Device;
+use synaptix_core::dtype::DType;
+use synaptix_core::precision::PrecisionConfig;
+
+use crate::commands::device::resolve as resolve_device;
+
+pub struct RunArgs {
+    pub model: PathBuf,
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub seed: u64,
+    pub device: String,
+    /// Размер preallocated KV-буфера + RoPE capacity (long-context). None →
+    /// prompt+max_tokens для KV, max_position_embeddings для RoPE.
+    pub max_seq: Option<usize>,
+    /// Attention-backend: auto|flash-decode|fa2|fa4. None → SYN_ATTN env → auto.
+    pub attn: Option<String>,
+    /// KV-кеш dtype: None/bf16 → compute dtype; fp8/mxfp8 → MXFP8 block-scale
+    /// (256K-контекст); fp8e4m3 → legacy per-tensor E4M3.
+    pub kv_dtype: Option<String>,
+    /// Пресет точности: none (default) | nvfp4 | fp8/mxfp8. Задаёт compute + квант групп.
+    pub quant: Option<String>,
+    /// Override compute (активаций): f16|bf16|f32. None → SYN_DTYPE/пресет.
+    pub compute_dtype: Option<String>,
+    /// Override веса attn+mlp групп: bf16|f16|fp8|nvfp4.
+    pub storage_dtype: Option<String>,
+    /// Override проекции в словарь (lm_head): bf16|f16|fp8|nvfp4.
+    pub lm_head_dtype: Option<String>,
+    /// Override таблицы эмбеддингов: bf16|f16|fp8.
+    pub embed_dtype: Option<String>,
+    /// CUDA-graph decode: захватывает single-token forward в граф и реплеит
+    /// (устраняет launch-overhead). Требует CUDA. Greedy ≈ обычному decode.
+    pub graph: bool,
+    /// Прогон prefill+1-токен до замера (прогрев NVRTC JIT для честного бенча).
+    pub warmup: bool,
+}
+
+/// `--kv-dtype` → DType KV-кеша. Делегирует в единый фасад.
+pub fn parse_kv_dtype(s: Option<&str>, compute: DType) -> DType {
+    synaptix::facade::llm::parse_kv_dtype(s, compute)
+}
+
+/// Строит [`PrecisionConfig`] из CLI: пресет (`--quant`) → override compute →
+/// override весов (storage/lm-head/embed) → kv. Единый билдер из `synaptix::facade::llm`.
+pub fn build_precision(
+    quant: Option<&str>,
+    compute_dtype: Option<&str>,
+    storage_dtype: Option<&str>,
+    lm_head_dtype: Option<&str>,
+    embed_dtype: Option<&str>,
+    kv_dtype: Option<&str>,
+) -> Result<PrecisionConfig, String> {
+    synaptix::facade::llm::build_precision(
+        quant,
+        compute_dtype,
+        storage_dtype,
+        lm_head_dtype,
+        embed_dtype,
+        kv_dtype,
+    )
+}
+
+/// Архитектура модели — определяет, какой pipeline грузит CLI (run/chat
+/// поддерживают qwen3/hybrid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Qwen3,
+    Hybrid,
+}
+
+/// Детекция архитектуры через единый `synaptix::facade::arch`. Llama/Gemma3 в
+/// CLI run/chat не поддержаны (используйте synthos) — возвращают ошибку.
+pub fn detect_arch(path: &Path) -> Result<Arch, String> {
+    use synaptix::facade::arch::{detect_llm_arch, LlmArch};
+    match detect_llm_arch(path)? {
+        LlmArch::Qwen3 => Ok(Arch::Qwen3),
+        LlmArch::Hybrid => Ok(Arch::Hybrid),
+        other => Err(format!(
+            "CLI run/chat поддерживает qwen3/hybrid; детектирован {other:?} — используйте synthos"
+        )),
+    }
+}
+
+pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let device = resolve_device(&args.device);
+    crate::commands::device::resolve_attn(args.attn.as_deref());
+
+    if !args.model.exists() {
+        return Err(format!("model path not found: {}", args.model.display()).into());
+    }
+    let precision = build_precision(
+        args.quant.as_deref(),
+        args.compute_dtype.as_deref(),
+        args.storage_dtype.as_deref(),
+        args.lm_head_dtype.as_deref(),
+        args.embed_dtype.as_deref(),
+        args.kv_dtype.as_deref(),
+    )?;
+    let arch = detect_arch(&args.model)?;
+    eprintln!(
+        "synaptix run: loading model from {} (arch={arch:?}, compute={:?}, attn_w={:?}, mlp_w={:?}, lm_head={:?}, embed={:?}, kv={:?}, {:?})",
+        args.model.display(),
+        precision.compute, precision.attn_w, precision.mlp_w,
+        precision.lm_head, precision.embed, precision.kv, device
+    );
+    match arch {
+        Arch::Qwen3 => run_qwen3(&args, device, precision),
+        Arch::Hybrid => run_hybrid(&args, device, precision),
+    }
+}
+
+fn run_qwen3(
+    args: &RunArgs,
+    device: Device,
+    precision: PrecisionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_llm_qwen3::pipeline::{GenerationConfig, Qwen3Pipeline};
+
+    let t0 = std::time::Instant::now();
+    let pipeline = Qwen3Pipeline::load_with_precision(&args.model, device, precision, args.max_seq)
+        .map_err(|e| format!("load: {e}"))?;
+    eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+
+    let prompt_ids = pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?;
+    eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
+
+    // MXFP8-KV поддержан dev/graph-путём (B3.6: device-pos append + device-Tkv
+    // flash-decode) — квант-KV больше не отключает граф.
+    let graph_ok = args.graph && !device.is_cpu();
+
+    // --warmup — прогон одного prefill+1-токен до замера, чтобы NVRTC JIT
+    // (~100ms, one-time) не загрязнял prefill_ms. Для честного warm-бенчмарка.
+    if args.warmup {
+        let warm = GenerationConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            max_seq: args.max_seq,
+            ..Default::default()
+        };
+        #[cfg(feature = "cuda")]
+        if graph_ok {
+            let _ = pipeline.generate_with_graph(&prompt_ids, warm.clone());
+        }
+        let _ = pipeline.generate(&prompt_ids, warm);
+        eprintln!("synaptix run: warmup done (JIT прогрет)");
+    }
+
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_tokens,
+        temperature: args.temperature,
+        seed: args.seed,
+        eos_token_id: pipeline.config.eos_token_id,
+        max_seq: args.max_seq,
+        ..Default::default()
+    };
+
+    let use_graph = graph_ok;
+    let (new_ids, stats) = if use_graph {
+        #[cfg(feature = "cuda")]
+        {
+            pipeline
+                .generate_with_graph(&prompt_ids, gen_cfg)
+                .map_err(|e| format!("generate(graph): {e}"))?
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            pipeline
+                .generate(&prompt_ids, gen_cfg)
+                .map_err(|e| format!("generate: {e}"))?
+        }
+    } else {
+        pipeline
+            .generate(&prompt_ids, gen_cfg)
+            .map_err(|e| format!("generate: {e}"))?
+    };
+    let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
+    print_run_result(
+        &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
+    );
+    Ok(())
+}
+
+fn run_hybrid(
+    args: &RunArgs,
+    device: Device,
+    precision: PrecisionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_llm_qwen3_next_hybrid::pipeline::{GenerationConfig, HybridPipeline};
+
+    let compute = precision.compute;
+    let t0 = std::time::Instant::now();
+    let pipeline = HybridPipeline::load_with_precision(&args.model, device, precision, args.max_seq)
+        .map_err(|e| format!("load: {e}"))?;
+    eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+
+    let prompt_ids = pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?;
+    eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
+
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_tokens,
+        temperature: args.temperature,
+        seed: args.seed,
+        max_seq: args.max_seq,
+        ..Default::default()
+    };
+
+    // CUDA-graph для гибрида требует compute=F16 (ядра linear-decode F16-нативные).
+    // MXFP8-KV поддержан (B3.6) — квант-KV граф не отключает.
+    let want_graph = args.graph && !device.is_cpu();
+    let use_graph = want_graph && compute == DType::F16;
+    if want_graph && !use_graph {
+        eprintln!(
+            "synaptix run: CUDA-graph для hybrid требует compute=F16 (например --quant nvfp4); compute={compute:?} → обычный decode"
+        );
+    }
+
+    let (new_ids, stats) = if use_graph {
+        #[cfg(feature = "cuda")]
+        {
+            pipeline
+                .generate_with_graph(&prompt_ids, gen_cfg)
+                .map_err(|e| format!("generate(graph): {e}"))?
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            pipeline
+                .generate(&prompt_ids, gen_cfg)
+                .map_err(|e| format!("generate: {e}"))?
+        }
+    } else {
+        pipeline
+            .generate(&prompt_ids, gen_cfg)
+            .map_err(|e| format!("generate: {e}"))?
+    };
+    let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
+    print_run_result(
+        &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
+    );
+    Ok(())
+}
+
+/// Печать сгенерированного текста + статистики prefill/decode (общая для всех arch).
+fn print_run_result(
+    prompt: &str,
+    text: &str,
+    prompt_tokens: usize,
+    new_tokens: usize,
+    prefill_ms: u128,
+    decode_ms: u128,
+) {
+    print!("{prompt}{text}");
+    println!();
+    let tot = prefill_ms + decode_ms;
+    let prefill_tps = if prefill_ms > 0 {
+        (prompt_tokens as f32) / (prefill_ms as f32 / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_tps = if decode_ms > 0 && new_tokens > 1 {
+        ((new_tokens.saturating_sub(1)) as f32) / (decode_ms as f32 / 1000.0)
+    } else {
+        0.0
+    };
+    eprintln!("synaptix run: {prompt_tokens} prompt + {new_tokens} new tokens in {tot} ms");
+    eprintln!(
+        "synaptix run: prefill {} tok in {} ms ({:.1} tok/s) | decode {} tok in {} ms ({:.2} tok/s)",
+        prompt_tokens, prefill_ms, prefill_tps,
+        new_tokens.saturating_sub(1), decode_ms, decode_tps,
+    );
+}

@@ -1,0 +1,26 @@
+[package]
+name = "synaptix-kernels-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: CUDA ядра (NVRTC, рантайм-компиляция .cu)."
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "synaptix-core/cuda"]
+
+[dependencies]
+synaptix-core = { workspace = true, features = [] }
+half          = { workspace = true }
+bytemuck      = { workspace = true }
+parking_lot   = { workspace = true }
+once_cell     = { workspace = true }
+thiserror     = { workspace = true }
+cudarc        = { workspace = true, optional = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-ops = { workspace = true }
+half = { workspace = true }
+rayon = { workspace = true }

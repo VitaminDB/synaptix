@@ -1,0 +1,21 @@
+[package]
+name = "synaptix-llm-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Общее config-driven ядро декодер-LLM (DecoderModel): нормы pre/post, GQA, RoPE single/scaled/dual, partial RoPE, output-gate, sliding-window, GatedDeltaNet linear-attn. Покрывает qwen3/llama/gemma3/qwen3-next-hybrid."
+
+[features]
+default = []
+cuda = ["synaptix-core/cuda", "synaptix-infer/cuda"]
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-infer     = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

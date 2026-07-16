@@ -1,0 +1,31 @@
+[package]
+name = "synaptix-asr-whisper"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Whisper v1 / v2 / v3."
+
+[features]
+default = []
+cuda = ["synaptix-core/cuda", "dep:synaptix-infer", "synaptix-infer/cuda"]
+
+[dependencies]
+synaptix-infer     = { workspace = true, optional = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-audio     = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+safetensors        = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true, features = ["cuda"] }
+synaptix-test-utils   = { workspace = true }

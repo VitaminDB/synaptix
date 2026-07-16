@@ -1,0 +1,29 @@
+[package]
+name = "synaptix-debug"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: bit-exact debug (dump/compare/NaN-detector/shape-assert)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+thiserror     = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+half          = { workspace = true }
+bytemuck      = { workspace = true }
+clap          = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-autograd    = { workspace = true }
+tempfile             = { workspace = true }
+
+[[bin]]
+name = "synaptix-diff"
+path = "src/bin/synaptix_diff.rs"
+
+[[bin]]
+name = "synaptix-dump-inspect"
+path = "src/bin/synaptix_dump_inspect.rs"

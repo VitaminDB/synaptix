@@ -1,0 +1,19 @@
+[package]
+name = "synaptix-kernels-cpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: CPU ядра (AVX-512/AVX2/NEON, SIMD)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+half          = { workspace = true }
+bytemuck      = { workspace = true }
+num-traits    = { workspace = true }
+rayon         = { workspace = true }
+wide          = { workspace = true }
+once_cell     = { workspace = true }
+
+[dev-dependencies]
+synaptix-test-utils = { workspace = true }

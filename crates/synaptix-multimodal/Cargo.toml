@@ -1,0 +1,16 @@
+[package]
+name = "synaptix-multimodal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: multimodal fusion (text+image+audio+video)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-nn   = { workspace = true }
+synaptix-ops  = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-music-acestep"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ACE-Step v1.5."
+
+# Фичи cuda нет: GPU — дефолт synaptix (core/infer/kernels уже cuda-default),
+# CUDA-граф/ядра компилятся всегда, устройство выбирается в рантайме.
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-audio = { workspace = true }
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-infer     = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+safetensors        = { workspace = true }
+thiserror          = { workspace = true }

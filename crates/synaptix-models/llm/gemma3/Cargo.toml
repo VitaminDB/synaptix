@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-llm-gemma3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Gemma3 (sandwich norms, Q/K norm, dual RoPE, sliding window)."
+
+[features]
+default = []
+cuda = ["synaptix-core/cuda", "synaptix-llm-common/cuda"]
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+# CUDA NVFP4-тест (cuda_nvfp4_generates): тянет cuda-бэкенд по умолчанию.
+synaptix-kernels-cuda = { workspace = true }

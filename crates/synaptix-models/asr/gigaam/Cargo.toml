@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-asr-gigaam"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "GigaAM Conformer."
+
+[features]
+default = []
+cuda = ["synaptix-core/cuda"]
+
+[dependencies]
+synaptix-core   = { workspace = true }
+synaptix-ops    = { workspace = true }
+synaptix-bundle = { workspace = true }
+synaptix-io     = { workspace = true }
+synaptix-audio  = { workspace = true }
+thiserror       = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+safetensors     = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true, features = ["cuda"] }
+synaptix-test-utils  = { workspace = true }
+hound = { workspace = true }

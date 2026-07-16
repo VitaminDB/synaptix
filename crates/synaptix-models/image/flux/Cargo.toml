@@ -1,0 +1,31 @@
+[package]
+name = "synaptix-image-flux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "FLUX.1 (dev / schnell) — text→image, нативная реализация на synaptix."
+
+[features]
+default = []
+cuda = ["dep:synaptix-kernels-cuda"]
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-diffusion = { workspace = true }
+synaptix-kernels-cuda = { workspace = true, optional = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+regex              = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }
+half                 = { workspace = true }

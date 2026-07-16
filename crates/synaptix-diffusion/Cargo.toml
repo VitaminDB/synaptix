@@ -1,0 +1,18 @@
+[package]
+name = "synaptix-diffusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: diffusion (schedulers, guidance, conditioning, pipelines)."
+
+[dependencies]
+synaptix-core   = { workspace = true }
+synaptix-ops    = { workspace = true }
+synaptix-nn     = { workspace = true }
+synaptix-infer  = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }

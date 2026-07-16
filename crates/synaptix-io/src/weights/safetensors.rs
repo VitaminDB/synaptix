@@ -1,0 +1,231 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use memmap2::Mmap;
+use safetensors::SafeTensors;
+use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
+
+use crate::error::{IoError, Result};
+use super::WeightLoader;
+
+fn st_dtype_to_synaptix(dtype: safetensors::Dtype) -> Option<DType> {
+    match dtype {
+        safetensors::Dtype::F32  => Some(DType::F32),
+        safetensors::Dtype::F16  => Some(DType::F16),
+        safetensors::Dtype::BF16 => Some(DType::BF16),
+        safetensors::Dtype::I32  => Some(DType::I32),
+        safetensors::Dtype::I64  => Some(DType::I64),
+        safetensors::Dtype::U8   => Some(DType::U8),
+        safetensors::Dtype::U32  => Some(DType::U32),
+        _                        => None,
+    }
+}
+
+struct MmapShard {
+    _mmap: Mmap,
+    data: &'static [u8],
+}
+
+impl MmapShard {
+    fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path).map_err(IoError::Io)?;
+        let mmap = unsafe { Mmap::map(&file).map_err(IoError::Io)? };
+        let data: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
+        Ok(Self { _mmap: mmap, data })
+    }
+}
+
+/// Метаданные тензора без загрузки данных (форма + dtype в кодировке synaptix).
+#[derive(Debug, Clone)]
+pub struct TensorInfo {
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+}
+
+/// Разобранная запись индекса: dtype, форма и zero-copy слайс в mmap-шарде.
+#[derive(Clone)]
+struct Entry {
+    dtype: DType,
+    shape: Vec<usize>,
+    data: &'static [u8],
+}
+
+pub struct SafetensorsLoader {
+    // SAFETY: `entries`/`metadata` держат `&'static`-слайсы в эти mmap'ы, поэтому
+    // шарды обязаны жить не меньше loader'а.
+    _shards: Vec<Arc<MmapShard>>,
+    entries: HashMap<String, Entry>,
+    metadata: HashMap<String, String>,
+    default_device: Device,
+    prefix: Option<String>,
+}
+
+impl SafetensorsLoader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let shard = Arc::new(MmapShard::open(path.as_ref())?);
+        let mut entries = HashMap::new();
+        let mut metadata = HashMap::new();
+        index_shard(&shard, &mut entries, &mut metadata)?;
+        Ok(Self {
+            _shards: vec![shard],
+            entries,
+            metadata,
+            default_device: Device::Cpu,
+            prefix: None,
+        })
+    }
+
+    pub fn open_sharded(paths: &[impl AsRef<Path>]) -> Result<Self> {
+        let mut shards = Vec::new();
+        let mut entries = HashMap::new();
+        let mut metadata = HashMap::new();
+        for path in paths.iter() {
+            let shard = Arc::new(MmapShard::open(path.as_ref())?);
+            index_shard(&shard, &mut entries, &mut metadata)?;
+            shards.push(shard);
+        }
+        Ok(Self { _shards: shards, entries, metadata, default_device: Device::Cpu, prefix: None })
+    }
+
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.default_device = device;
+        self
+    }
+
+    /// Лёгкий клон с переопределённым `default_device`: разделяет mmap-шарды
+    /// (`Arc`), дублирует только индекс (без повторного mmap/разбора заголовка).
+    /// Нужно для streaming-offload — грузить веса напрямую mmap→GPU без
+    /// резидентной host-копии.
+    pub fn clone_with_device(&self, device: Device) -> Self {
+        Self {
+            _shards: self._shards.clone(),
+            entries: self.entries.clone(),
+            metadata: self.metadata.clone(),
+            default_device: device,
+            prefix: self.prefix.clone(),
+        }
+    }
+
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// `__metadata__`-секция safetensors (например `config`/`model_version` у LTX).
+    /// При шардировании ключи поздних шардов перекрывают ранние.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
+    /// Сырые байты mmap-шардов (целиком, с заголовками). Для host-register
+    /// (pinned) при offload-стриминге: шарды живут пока жив loader (Arc).
+    pub fn shard_bytes(&self) -> Vec<&[u8]> {
+        self._shards.iter().map(|s| s.data).collect()
+    }
+
+    /// Форма + dtype тензора без загрузки данных (учитывает `with_prefix`).
+    pub fn tensor_info(&self, name: &str) -> Option<TensorInfo> {
+        self.entries.get(&self.resolve_name(name)).map(|e| TensorInfo {
+            dtype: e.dtype,
+            shape: e.shape.clone(),
+        })
+    }
+
+    /// Итератор `(имя, dtype, форма)` по всем тензорам (имена — как в файле, без
+    /// снятия префикса).
+    pub fn infos(&self) -> impl Iterator<Item = (&str, DType, &[usize])> {
+        self.entries.iter().map(|(k, e)| (k.as_str(), e.dtype, e.shape.as_slice()))
+    }
+
+    /// Сырой mmap-слайс тензора + dtype файла + форма (учитывает `with_prefix`),
+    /// без создания Tensor/H2D. Слайс жив пока жив loader (Arc-шарды).
+    pub fn raw_bytes(&self, name: &str) -> Option<(&[u8], DType, &[usize])> {
+        self.entries
+            .get(&self.resolve_name(name))
+            .map(|e| (e.data, e.dtype, e.shape.as_slice()))
+    }
+
+    fn resolve_name(&self, name: &str) -> String {
+        match &self.prefix {
+            Some(p) if !name.starts_with(p.as_str()) => format!("{p}.{name}"),
+            _ => name.to_string(),
+        }
+    }
+
+    fn load_internal(&self, name: &str, device: Device, dtype: Option<DType>) -> Result<Tensor> {
+        let key = self.resolve_name(name);
+        let entry = self.entries.get(&key)
+            .ok_or_else(|| IoError::Safetensors(format!("tensor not found: {key}")))?;
+        // zero-copy: H2D напрямую из mmap-слайса. Индекс с dtype/shape/slice разобран
+        // один раз в open(), без повторного SafeTensors::deserialize на каждый тензор
+        // (для 5947-тензорного LTX это убирает ~5947 разборов 872KB-заголовка).
+        let tensor = Tensor::from_raw_slice(entry.data, entry.shape.clone(), entry.dtype, device)
+            .map_err(IoError::Core)?;
+        match dtype {
+            Some(d) if d != entry.dtype => tensor.to_dtype(d).map_err(IoError::Core),
+            _ => Ok(tensor),
+        }
+    }
+}
+
+fn index_shard(
+    shard: &Arc<MmapShard>,
+    entries: &mut HashMap<String, Entry>,
+    metadata: &mut HashMap<String, String>,
+) -> Result<()> {
+    let st = SafeTensors::deserialize(shard.data)
+        .map_err(|e| IoError::Safetensors(e.to_string()))?;
+    for (name, view) in st.tensors() {
+        let dtype = st_dtype_to_synaptix(view.dtype())
+            .ok_or_else(|| IoError::Safetensors(format!("unsupported dtype {:?}", view.dtype())))?;
+        // SAFETY: view.data() заимствует shard.data (он `&'static`), поэтому слайс
+        // переживает локальный `st`; шард держится в loader'е, пока жив слайс.
+        entries.insert(name, Entry { dtype, shape: view.shape().to_vec(), data: view.data() });
+    }
+    if let Ok((_, meta)) = SafeTensors::read_metadata(shard.data) {
+        if let Some(m) = meta.metadata() {
+            for (k, v) in m.iter() {
+                metadata.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+impl WeightLoader for SafetensorsLoader {
+    fn load(&self, name: &str) -> Result<Tensor> {
+        self.load_internal(name, self.default_device, None)
+    }
+
+    fn load_to(&self, name: &str, device: Device, dtype: DType) -> Result<Tensor> {
+        self.load_internal(name, device, Some(dtype))
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.entries.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+pub fn load_file(path: impl AsRef<Path>, device: Device) -> Result<HashMap<String, Tensor>> {
+    let loader = SafetensorsLoader::open(path)?.with_device(device);
+    let mut out = HashMap::new();
+    for name in loader.names() {
+        let name = name.to_string();
+        let t = loader.load(&name)?;
+        out.insert(name, t);
+    }
+    Ok(out)
+}
+
+pub fn scan_shards(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let dir = dir.as_ref();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(IoError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}

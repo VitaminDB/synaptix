@@ -1,0 +1,13 @@
+[package]
+name = "synaptix-dispatch"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: dispatch операторов на backends."
+
+[dependencies]
+synaptix-core = { workspace = true }
+parking_lot   = { workspace = true }
+once_cell     = { workspace = true }
+thiserror     = { workspace = true }

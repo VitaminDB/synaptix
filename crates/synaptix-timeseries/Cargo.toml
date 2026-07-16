@@ -1,0 +1,12 @@
+[package]
+name = "synaptix-timeseries"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: time-series forecasting (TFT, N-BEATS, PatchTST, ...)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-nn   = { workspace = true }
+thiserror     = { workspace = true }

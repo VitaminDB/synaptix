@@ -1,0 +1,16 @@
+[package]
+name = "synaptix-recsys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: recommender systems (DLRM, Two-Tower, SASRec, ...)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-nn   = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }

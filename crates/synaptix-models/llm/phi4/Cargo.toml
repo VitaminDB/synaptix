@@ -1,0 +1,20 @@
+[package]
+name = "synaptix-llm-phi4"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Phi-4."
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+thiserror          = { workspace = true }

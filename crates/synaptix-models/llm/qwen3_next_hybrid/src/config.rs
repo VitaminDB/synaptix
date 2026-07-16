@@ -1,0 +1,354 @@
+use serde::Deserialize;
+use synaptix_llm_common as common;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    Linear,
+    Full,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RopeParameters {
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f32,
+}
+
+fn default_rope_theta() -> f32 {
+    10_000_000.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct TextConfigRaw {
+    vocab_size: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    max_position_embeddings: usize,
+    rms_norm_eps: f32,
+    partial_rotary_factor: f32,
+    attn_output_gate: bool,
+    hidden_act: String,
+    full_attention_interval: usize,
+    linear_num_key_heads: usize,
+    linear_num_value_heads: usize,
+    linear_key_head_dim: usize,
+    linear_value_head_dim: usize,
+    linear_conv_kernel_dim: usize,
+    layer_types: Vec<String>,
+    tie_word_embeddings: bool,
+    bos_token_id: Option<u32>,
+    eos_token_id: Option<u32>,
+    rope_parameters: RopeParameters,
+}
+
+impl Default for TextConfigRaw {
+    fn default() -> Self {
+        Self {
+            vocab_size: 248320,
+            hidden_size: 5120,
+            intermediate_size: 17408,
+            num_hidden_layers: 64,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            max_position_embeddings: 262144,
+            rms_norm_eps: 1.0e-6,
+            partial_rotary_factor: 0.25,
+            attn_output_gate: true,
+            hidden_act: "silu".into(),
+            full_attention_interval: 4,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            layer_types: Vec::new(),
+            tie_word_embeddings: false,
+            bos_token_id: Some(248044),
+            eos_token_id: Some(248044),
+            rope_parameters: RopeParameters { rope_theta: default_rope_theta() },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HybridConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
+    pub attn_output_gate: bool,
+    pub hidden_act: String,
+    pub full_attention_interval: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_conv_kernel_dim: usize,
+    pub layer_kinds: Vec<LayerKind>,
+    pub tie_word_embeddings: bool,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+}
+
+impl HybridConfig {
+    pub fn from_hf_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let root: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| ConfigError::Parse(format!("config json: {e}")))?;
+        let tc = root
+            .get("text_config")
+            .cloned()
+            .unwrap_or_else(|| root.clone());
+        let raw: TextConfigRaw = serde_json::from_value(tc)
+            .map_err(|e| ConfigError::Parse(format!("text_config: {e}")))?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: TextConfigRaw) -> Result<Self, ConfigError> {
+        let layer_kinds = if raw.layer_types.is_empty() {
+            (0..raw.num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % raw.full_attention_interval == 0 {
+                        LayerKind::Full
+                    } else {
+                        LayerKind::Linear
+                    }
+                })
+                .collect()
+        } else {
+            raw.layer_types
+                .iter()
+                .map(|s| match s.as_str() {
+                    "full_attention" => Ok(LayerKind::Full),
+                    "linear_attention" => Ok(LayerKind::Linear),
+                    other => Err(ConfigError::Invalid(format!("layer_type: {other}"))),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if layer_kinds.len() != raw.num_hidden_layers {
+            return Err(ConfigError::Invalid(format!(
+                "layer_types len {} != num_hidden_layers {}",
+                layer_kinds.len(),
+                raw.num_hidden_layers
+            )));
+        }
+        let cfg = Self {
+            vocab_size: raw.vocab_size,
+            hidden_size: raw.hidden_size,
+            intermediate_size: raw.intermediate_size,
+            num_hidden_layers: raw.num_hidden_layers,
+            num_attention_heads: raw.num_attention_heads,
+            num_key_value_heads: raw.num_key_value_heads,
+            head_dim: raw.head_dim,
+            max_position_embeddings: raw.max_position_embeddings,
+            rms_norm_eps: raw.rms_norm_eps,
+            rope_theta: raw.rope_parameters.rope_theta,
+            partial_rotary_factor: raw.partial_rotary_factor,
+            attn_output_gate: raw.attn_output_gate,
+            hidden_act: raw.hidden_act,
+            full_attention_interval: raw.full_attention_interval,
+            linear_num_key_heads: raw.linear_num_key_heads,
+            linear_num_value_heads: raw.linear_num_value_heads,
+            linear_key_head_dim: raw.linear_key_head_dim,
+            linear_value_head_dim: raw.linear_value_head_dim,
+            linear_conv_kernel_dim: raw.linear_conv_kernel_dim,
+            layer_kinds,
+            tie_word_embeddings: raw.tie_word_embeddings,
+            bos_token_id: raw.bos_token_id,
+            eos_token_id: raw.eos_token_id,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.hidden_size == 0 || self.num_attention_heads == 0 {
+            return Err(ConfigError::Invalid("hidden_size/heads == 0".into()));
+        }
+        if self.num_key_value_heads == 0
+            || self.num_attention_heads % self.num_key_value_heads != 0
+        {
+            return Err(ConfigError::Invalid(format!(
+                "GQA: heads={} % kv_heads={} != 0",
+                self.num_attention_heads, self.num_key_value_heads
+            )));
+        }
+        if self.linear_num_key_heads == 0
+            || self.linear_num_value_heads % self.linear_num_key_heads != 0
+        {
+            return Err(ConfigError::Invalid(format!(
+                "linear GQA: v_heads={} % k_heads={} != 0",
+                self.linear_num_value_heads, self.linear_num_key_heads
+            )));
+        }
+        let rd = self.rotary_dim();
+        if rd == 0 || rd % 2 != 0 {
+            return Err(ConfigError::Invalid(format!("rotary_dim must be even > 0, got {rd}")));
+        }
+        if self.hidden_act != "silu" && self.hidden_act != "swish" {
+            return Err(ConfigError::Invalid(format!("hidden_act: {}", self.hidden_act)));
+        }
+        Ok(())
+    }
+
+    pub fn to_decoder_config(&self) -> common::DecoderConfig {
+        let layer_kinds = self
+            .layer_kinds
+            .iter()
+            .map(|k| match k {
+                LayerKind::Linear => common::LayerKind::Linear,
+                LayerKind::Full => common::LayerKind::Full,
+            })
+            .collect();
+        common::DecoderConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            head_dim: self.head_dim,
+            max_position_embeddings: self.max_position_embeddings,
+            rms_norm_eps: self.rms_norm_eps,
+            norm_gain: common::NormGain::OnePlus,
+            activation: common::Activation::Silu,
+            sandwich_norms: false,
+            qk_norm: true,
+            attn_output_gate: self.attn_output_gate,
+            attn_scale: 1.0 / (self.head_dim as f32).sqrt(),
+            embed_scale: None,
+            rope_global: common::RopeSpec {
+                theta: self.rope_theta,
+                rotary_dim: self.rotary_dim(),
+                scaled_freqs: None,
+            },
+            rope_local: None,
+            sliding_window: None,
+            sliding_window_pattern: 0,
+            layer_kinds,
+            linear: Some(common::LinearAttnConfig {
+                num_key_heads: self.linear_num_key_heads,
+                num_value_heads: self.linear_num_value_heads,
+                key_head_dim: self.linear_key_head_dim,
+                value_head_dim: self.linear_value_head_dim,
+                conv_kernel: self.linear_conv_kernel_dim,
+            }),
+            tie_word_embeddings: self.tie_word_embeddings,
+            bos_token_id: self.bos_token_id,
+            eos_token_ids: self.eos_ids(),
+        }
+    }
+
+    pub fn rotary_dim(&self) -> usize {
+        let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as usize;
+        rd - (rd % 2)
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.num_attention_heads / self.num_key_value_heads
+    }
+
+    pub fn linear_group_size(&self) -> usize {
+        self.linear_num_value_heads / self.linear_num_key_heads
+    }
+
+    pub fn q_total_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim
+    }
+
+    pub fn kv_total_dim(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+
+    pub fn linear_key_dim(&self) -> usize {
+        self.linear_num_key_heads * self.linear_key_head_dim
+    }
+
+    pub fn linear_value_dim(&self) -> usize {
+        self.linear_num_value_heads * self.linear_value_head_dim
+    }
+
+    pub fn conv_dim(&self) -> usize {
+        self.linear_key_dim() * 2 + self.linear_value_dim()
+    }
+
+    pub fn layer_kind(&self, idx: usize) -> LayerKind {
+        self.layer_kinds[idx]
+    }
+
+    pub fn eos_ids(&self) -> Vec<u32> {
+        self.eos_token_id.into_iter().collect()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("config parse: {0}")]
+    Parse(String),
+    #[error("config invalid: {0}")]
+    Invalid(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "attn_output_gate": true,
+            "bos_token_id": 248044,
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 24,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 4,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {"rope_theta": 10000000},
+            "tie_word_embeddings": false,
+            "vocab_size": 248320
+        }
+    }"#;
+
+    #[test]
+    fn parses_text_config() {
+        let cfg = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(cfg.hidden_size, 5120);
+        assert_eq!(cfg.num_hidden_layers, 4);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.rotary_dim(), 64);
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+        assert_eq!(cfg.group_size(), 6);
+        assert_eq!(cfg.linear_group_size(), 3);
+        assert_eq!(cfg.linear_key_dim(), 2048);
+        assert_eq!(cfg.linear_value_dim(), 6144);
+        assert_eq!(cfg.conv_dim(), 10240);
+        assert_eq!(cfg.layer_kind(0), LayerKind::Linear);
+        assert_eq!(cfg.layer_kind(3), LayerKind::Full);
+        assert!(!cfg.tie_word_embeddings);
+        assert!(cfg.attn_output_gate);
+    }
+}

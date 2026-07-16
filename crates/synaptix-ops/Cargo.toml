@@ -1,0 +1,22 @@
+[package]
+name = "synaptix-ops"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: операторы (attention/ssm/ffn/norm/pos/conv/embed)."
+
+[features]
+default = []
+cuda = ["synaptix-core/cuda", "synaptix-kernels-cuda/cuda"]
+
+[dependencies]
+synaptix-core         = { workspace = true }
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+half          = { workspace = true }
+thiserror     = { workspace = true }
+rand          = { workspace = true }
+
+[dev-dependencies]
+synaptix-test-utils = { workspace = true }

@@ -1,0 +1,23 @@
+pub mod diarization_utils;
+pub mod error;
+pub mod io;
+pub mod mel;
+pub mod mfcc;
+pub mod resample;
+pub mod stft;
+pub mod streaming;
+pub mod vad;
+pub mod wake_word;
+pub mod window;
+
+pub use error::{AudioError, Result};
+pub use io::{read_wav_mono_f32, write_wav_mono_f32};
+pub use mel::{log_mel_spectrogram, mel_filterbank, MelConfig, MelNorm, MelScale};
+pub use mfcc::{mfcc, MfccConfig};
+pub use resample::resample_linear;
+pub use stft::{istft, stft, PadMode, StftConfig};
+pub use streaming::chunker::AudioChunker;
+pub use streaming::lcp_delta::LcpDelta;
+pub use streaming::sliding_window::SlidingWindow;
+pub use vad::{EnergyVad, Vad, VadDecision};
+pub use window::{hamming, hann, WindowKind};

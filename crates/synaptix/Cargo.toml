@@ -1,0 +1,62 @@
+[package]
+name = "synaptix"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: универсальный нейро-фреймворк (фасад)."
+
+[features]
+default = []
+
+# Гранулярные cuda-фичи по подсистемам (synthos прокидывает только нужные).
+llm-cuda = [
+    "synaptix-llm-qwen3/cuda",
+    "synaptix-llm-qwen3-next-hybrid/cuda",
+    "synaptix-llm-llama/cuda",
+    "synaptix-llm-gemma3/cuda",
+    "synaptix-llm-common/cuda",
+    "synaptix-core/cuda",
+]
+asr-cuda = ["synaptix-asr-whisper/cuda", "synaptix-asr-gigaam/cuda", "synaptix-core/cuda"]
+kb-cuda = ["synaptix-embedding-bge-m3/cuda", "synaptix-core/cuda"]
+diar-cuda = ["synaptix-diarization-sortformer/cuda", "synaptix-core/cuda"]
+tts-cuda = ["synaptix-tts-omnivoice/cuda", "synaptix-core/cuda"]
+
+cuda = [
+    "llm-cuda",
+    "asr-cuda",
+    "kb-cuda",
+    "diar-cuda",
+    "tts-cuda",
+    "synaptix-kernels-cuda/cuda",
+]
+
+[dependencies]
+synaptix-core         = { workspace = true }
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-nn           = { workspace = true }
+synaptix-ops          = { workspace = true }
+synaptix-infer        = { workspace = true }
+synaptix-bundle       = { workspace = true }
+synaptix-tokenizer    = { workspace = true }
+synaptix-runtime      = { workspace = true }
+synaptix-audio        = { workspace = true }
+
+# LLM-архитектуры (фасад facade::llm диспетчит по детекции арх).
+synaptix-llm-common   = { workspace = true }
+synaptix-llm-qwen3    = { workspace = true }
+synaptix-llm-qwen3-next-hybrid = { workspace = true }
+synaptix-llm-llama    = { workspace = true }
+synaptix-llm-gemma3   = { workspace = true }
+
+# ASR / embeddings / rerank / диаризация / TTS.
+synaptix-asr-whisper  = { workspace = true }
+synaptix-asr-gigaam   = { workspace = true }
+synaptix-embedding-bge-m3 = { workspace = true }
+synaptix-diarization-sortformer = { workspace = true }
+synaptix-tts-omnivoice = { workspace = true }
+
+hound      = { workspace = true }
+serde_json = { workspace = true }

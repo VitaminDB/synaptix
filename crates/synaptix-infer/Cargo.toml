@@ -1,0 +1,30 @@
+[package]
+name = "synaptix-infer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: inference engine (KV cache, sampling, scheduler, speculative)."
+
+[features]
+# GPU — дефолт. CUDA graph capture/replay (cudarc, driver API) компилится всегда.
+default = ["cuda"]
+cuda = ["dep:cudarc", "synaptix-core/cuda"]
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+safetensors        = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+parking_lot        = { workspace = true }
+once_cell          = { workspace = true }
+cudarc             = { workspace = true, optional = true }
+
+[dev-dependencies]
+synaptix-test-utils  = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }

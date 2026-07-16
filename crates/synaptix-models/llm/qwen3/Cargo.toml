@@ -1,0 +1,32 @@
+[package]
+name = "synaptix-llm-qwen3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen3 / Qwen3-MoE native Rust."
+
+[features]
+default = []
+# Device-резидентный decode + CUDA-graph (generate_with_graph, forward_decode_dev):
+# тянет cuda-пути synaptix-core (default_stream/htod) и synaptix-infer
+# (GraphCapturer/replay через cudarc driver API).
+cuda = ["synaptix-core/cuda", "synaptix-infer/cuda", "synaptix-llm-common/cuda"]
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-infer     = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

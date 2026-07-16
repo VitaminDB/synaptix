@@ -1,0 +1,23 @@
+[package]
+name = "synaptix-tokenizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: токенизация (BPE/WP/SP/tiktoken) + jinja chat templates."
+
+[dependencies]
+synaptix-core = { workspace = true }
+thiserror     = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+minijinja     = { workspace = true }
+tokenizers    = { workspace = true }
+aho-corasick  = { workspace = true }
+regex         = { workspace = true }
+once_cell     = { workspace = true }
+ahash         = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+synaptix-test-utils = { workspace = true }

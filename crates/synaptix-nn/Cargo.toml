@@ -1,0 +1,18 @@
+[package]
+name = "synaptix-nn"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: Module trait + готовые блоки (Transformer/SSM/VAE/DiT)."
+
+[dependencies]
+synaptix-core     = { workspace = true }
+synaptix-autograd = { workspace = true }
+synaptix-ops      = { workspace = true }
+thiserror         = { workspace = true }
+once_cell         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "synaptix-autograd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: автодифференцирование (Variable, tape, backward)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+thiserror     = { workspace = true }
+parking_lot   = { workspace = true }
+once_cell     = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }
+synaptix-ops         = { workspace = true }

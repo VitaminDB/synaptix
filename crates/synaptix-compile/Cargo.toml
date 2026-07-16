@@ -1,0 +1,15 @@
+[package]
+name = "synaptix-compile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: graph IR + fusion passes + codegen (torch.compile-like)."
+
+[dependencies]
+synaptix-core         = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+thiserror             = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }

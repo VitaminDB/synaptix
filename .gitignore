@@ -1,0 +1,29 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local agent state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference tensors & model weights — large and derived from upstream models;
+# never committed. Regenerate with scripts/reference/.
+tests/reference_data/
+**/*.safetensors
+**/*.syn
+
+# Python reference environment
+**/.venv/
+**/__pycache__/

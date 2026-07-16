@@ -1,0 +1,19 @@
+[package]
+name = "synaptix-train"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: training (trainer, optimizers, RLHF, distillation)."
+
+[dependencies]
+synaptix-core     = { workspace = true }
+synaptix-autograd = { workspace = true }
+synaptix-nn       = { workspace = true }
+synaptix-ops      = { workspace = true }
+synaptix-infer    = { workspace = true }
+thiserror         = { workspace = true }
+
+[dev-dependencies]
+synaptix-test-utils  = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }

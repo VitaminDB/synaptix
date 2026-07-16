@@ -1,0 +1,27 @@
+[package]
+name = "synaptix-tts-voxcpm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "VoxCPM."
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-audio     = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

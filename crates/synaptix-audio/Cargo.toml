@@ -1,0 +1,20 @@
+[package]
+name = "synaptix-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: audio utilities (mel/VAD/codecs/resample/streaming)."
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-ops  = { workspace = true }
+synaptix-nn   = { workspace = true }
+thiserror     = { workspace = true }
+rustfft       = { workspace = true }
+hound         = { workspace = true }
+rubato        = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+tempfile             = { workspace = true }

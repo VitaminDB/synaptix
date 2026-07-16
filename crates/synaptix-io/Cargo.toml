@@ -1,0 +1,37 @@
+[package]
+name = "synaptix-io"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: weight loaders, dataloaders, HF hub, audio/image/video/document IO."
+
+[features]
+default = []
+audio = ["dep:hound", "dep:symphonia", "dep:rubato"]
+image = ["dep:image"]
+video = ["dep:ffmpeg-next"]
+documents = ["dep:pulldown-cmark", "dep:htmd", "dep:pdf-extract", "dep:ignore"]
+
+[dependencies]
+synaptix-core   = { workspace = true }
+synaptix-bundle = { workspace = true }
+thiserror       = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+memmap2         = { workspace = true }
+safetensors     = { workspace = true }
+hound           = { workspace = true, optional = true }
+symphonia       = { workspace = true, optional = true }
+rubato          = { workspace = true, optional = true }
+image           = { workspace = true, optional = true }
+pulldown-cmark  = { workspace = true, optional = true }
+htmd            = { workspace = true, optional = true }
+pdf-extract     = { workspace = true, optional = true }
+ignore          = { workspace = true, optional = true }
+ffmpeg-next     = { workspace = true, optional = true }
+
+[dev-dependencies]
+synaptix-test-utils  = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }
+tempfile             = { workspace = true }

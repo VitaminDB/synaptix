@@ -1,0 +1,17 @@
+[package]
+name = "synaptix-vision"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: vision preprocessing + augmentation + video utils."
+
+[dependencies]
+synaptix-core = { workspace = true }
+thiserror     = { workspace = true }
+image         = { workspace = true }
+rand          = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+tempfile             = { workspace = true }

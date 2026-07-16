@@ -1,0 +1,17 @@
+[package]
+name = "synaptix-distributed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: distributed (NCCL/MPI/P2P/RDMA + TP/PP/SP/EP/ZeRO)."
+
+[dependencies]
+synaptix-core         = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+thiserror             = { workspace = true }
+parking_lot           = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-test-utils  = { workspace = true }

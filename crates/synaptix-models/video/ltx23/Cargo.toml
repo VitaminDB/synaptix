@@ -1,0 +1,31 @@
+[package]
+name = "synaptix-video-ltx23"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "LTX-2.3 22B."
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-audio     = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-config    = { workspace = true }
+synaptix-io        = { workspace = true }
+cudarc             = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-core = { workspace = true }
+synaptix-io = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

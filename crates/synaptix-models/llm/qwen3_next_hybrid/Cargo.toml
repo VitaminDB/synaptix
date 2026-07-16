@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-llm-qwen3-next-hybrid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen3-Next hybrid (gated DeltaNet linear-attention + gated full-attention, partial RoPE, mRoPE) native Rust port."
+
+[features]
+default = []
+# Device-резидентный decode + CUDA-graph (generate_with_graph через
+# GraphCapturer): тянет cuda-пути core + infer (capture/replay) + common.
+cuda = ["synaptix-core/cuda", "synaptix-infer/cuda", "synaptix-llm-common/cuda"]
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-infer     = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-bundle    = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

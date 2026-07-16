@@ -1,0 +1,16 @@
+[package]
+name = "synaptix-depth-anything"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-ops  = { workspace = true }
+synaptix-io   = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+
+[features]
+cuda = []

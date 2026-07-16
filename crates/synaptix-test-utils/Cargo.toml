@@ -1,0 +1,12 @@
+[package]
+name = "synaptix-test-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+synaptix-core = { workspace = true }
+safetensors    = { workspace = true }
+half           = { workspace = true }

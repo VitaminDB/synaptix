@@ -1,0 +1,34 @@
+[package]
+name = "synaptix-rag"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: RAG (embeddings, reranker, retrieval, chunking, index)."
+
+[features]
+default = []
+sqlite-vec = ["dep:rusqlite", "dep:sqlite-vec"]
+# Маркеры охвата doc-парсинга (деп компилируются безусловно; маркеры нужны
+# synthos для проводки своих kb-фич на synaptix-rag).
+doc-processing-folder = []
+doc-processing-html = []
+doc-processing-pdf = []
+
+[dependencies]
+synaptix-core = { workspace = true }
+synaptix-nn   = { workspace = true }
+thiserror     = { workspace = true }
+rusqlite      = { workspace = true, optional = true }
+sqlite-vec    = { workspace = true, optional = true }
+
+# Парсинг документов + chunking + folder-walk (модуль `doc`, нативный текст,
+#).
+pulldown-cmark = { workspace = true }
+htmd           = { workspace = true }
+pdf-extract    = { workspace = true }
+ignore         = { workspace = true }
+tokenizers     = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

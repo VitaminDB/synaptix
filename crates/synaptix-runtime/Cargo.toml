@@ -1,0 +1,23 @@
+[package]
+name = "synaptix-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: global AtomicBool flags, mempool, telemetry."
+
+[features]
+default = []
+# Включает NVTX-range/mark через cudarc::nvtx (libnvToolsExt.so загружается dynamically).
+# Без фичи — NvtxRange/mark остаются no-op.
+nvtx = ["dep:cudarc"]
+
+[dependencies]
+synaptix-core      = { workspace = true }
+parking_lot        = { workspace = true }
+once_cell          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics            = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+cudarc             = { workspace = true, optional = true, features = ["nvtx"] }

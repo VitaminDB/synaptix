@@ -1,0 +1,13 @@
+[package]
+name = "synaptix-rl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: RL environments + agents."
+
+[dependencies]
+synaptix-core     = { workspace = true }
+synaptix-nn       = { workspace = true }
+synaptix-autograd = { workspace = true }
+thiserror         = { workspace = true }
