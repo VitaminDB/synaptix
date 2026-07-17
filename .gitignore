@@ -27,3 +27,6 @@ tests/reference_data/
 # Python reference environment
 **/.venv/
 **/__pycache__/
+
+# Local symlink to a model directory, used by the CUDA integration tests
+/crates/synaptix/models

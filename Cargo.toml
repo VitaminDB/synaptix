@@ -186,8 +186,11 @@ bytemuck = { version = "1.16", features = ["derive"] }
 num-traits = "0.2"
 rayon = "1.10"
 wide = "0.7"
-# CUDA bindings (crates.io upstream). NVRTC compiles kernels at runtime.
-cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "nvrtc", "f16", "fallback-dynamic-loading", "cuda-version-from-build-system"] }
+# CUDA bindings. NVRTC compiles kernels at runtime.
+# Vendored upstream 0.19.8 + capture-aware patch: upstream records/waits CUDA events
+# and calls stream.synchronize() from launch/device_ptr, which is illegal while a
+# stream is capturing a graph (CUDA_ERROR_INVALID_VALUE). See third_party/cudarc/PATCH.md.
+cudarc = { path = "third_party/cudarc", default-features = false, features = ["std", "driver", "nvrtc", "f16", "fallback-dynamic-loading", "cuda-version-from-build-system"] }
 libc = "0.2"
 minijinja = { version = "2.5", features = ["loader", "json", "preserve_order"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
