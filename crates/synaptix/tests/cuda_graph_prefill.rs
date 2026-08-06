@@ -80,7 +80,8 @@ fn forward_prefill_dev_matches_forward_single_chunk() {
     let mut pstate = model.make_prefill_state(chunk).expect("prefill state");
     pstate.update(&ids, 0).expect("prefill update");
     no_grad(|| model.forward_prefill_dev(&mut pstate, &mut kv_dev)).expect("forward_prefill_dev");
-    let dev_v = to_f32(&pstate.logits);
+    let last_row = pstate.logits.narrow(0, pstate.chunk_size - 1, 1).expect("last logits row");
+    let dev_v = to_f32(&last_row);
 
     let cs = cos_sim(&ref_v, &dev_v);
     let am_ref = argmax(&ref_v);
@@ -131,7 +132,8 @@ fn forward_prefill_dev_matches_forward_offset_chunk() {
     let mut pstate = model.make_prefill_state(chunk).expect("prefill state");
     pstate.update(&ids[half..], half as u32).expect("prefill update");
     no_grad(|| model.forward_prefill_dev(&mut pstate, &mut kv_dev)).expect("forward_prefill_dev offset");
-    let dev_v = to_f32(&pstate.logits);
+    let last_row = pstate.logits.narrow(0, pstate.chunk_size - 1, 1).expect("last logits row");
+    let dev_v = to_f32(&last_row);
 
     let cs = cos_sim(&ref_v, &dev_v);
     let am_ref = argmax(&ref_v);

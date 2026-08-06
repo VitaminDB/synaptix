@@ -91,6 +91,8 @@ impl FlashSplitQKernels {
             .map_err(|e| SynaptixError::Cuda(format!("set_attribute flash_splitq2 shared: {e:?}")))?;
         }
         // HD=256: smem = (64+2·32)·256·2 = 64 KB → выше дефолтных 48 KB.
+        // `_dev`-варианты считают smem как 4·BN·(D+8)·2 = 66 KB при HD=256 —
+        // им лимит нужен так же, иначе launch падает с CUDA_ERROR_INVALID_VALUE.
         for func in [
             &f16_hd64,
             &f16_hd128,
@@ -101,6 +103,12 @@ impl FlashSplitQKernels {
             &f16_hd64_bshd,
             &bf16_hd64_bshd,
             &bf16_hd128_win,
+            &f16_hd64_dev,
+            &f16_hd128_dev,
+            &f16_hd256_dev,
+            &bf16_hd64_dev,
+            &bf16_hd128_dev,
+            &bf16_hd256_dev,
         ] {
             func.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,

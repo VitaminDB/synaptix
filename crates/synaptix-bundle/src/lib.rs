@@ -16,6 +16,7 @@ pub mod error;
 pub mod header;
 pub mod path;
 pub mod quantized;
+pub mod stream;
 
 mod bundle;
 mod builder;
@@ -35,6 +36,7 @@ pub use cdir::{BundleMeta, CdirFormat, ChunkEntry, ChunkStatus, ChunkType, FileT
 pub use editor::{compact, BundleEditor};
 pub use error::{Error, Result};
 pub use quantized::{QuantizedChunkHeader, QUANT_FORMAT_FP8E4M3, QUANTIZED_CHUNK_NAME};
+pub use stream::{safetensors_header, StDtype, StreamTensor, TensorStream};
 pub use resolver::{FsResolver, RefResolver};
 
 pub const SUPPORTED_MAJOR: u16 = 1;

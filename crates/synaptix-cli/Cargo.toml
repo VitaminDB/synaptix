@@ -13,11 +13,13 @@ synaptix-train        = { workspace = true }
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true, optional = true }
 synaptix-bundle       = { workspace = true }
+synaptix-gguf         = { workspace = true, optional = true }
 synaptix-tokenizer    = { workspace = true }
 synaptix-debug        = { workspace = true }
 synaptix-llm-common   = { workspace = true }
 synaptix-llm-qwen3    = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
+synaptix-vlm-qwen3    = { workspace = true }
 synaptix-asr-whisper  = { workspace = true }
 synaptix-image-sdxl   = { workspace = true }
 synaptix-image-flux   = { workspace = true }
@@ -40,9 +42,10 @@ safetensors        = "0.7"
 
 [features]
 default = ["cuda"]
+gguf = ["dep:synaptix-gguf"]
 # CUDA-инференс по умолчанию (synaptix-kernels-cuda, default = cuda-бэкенд).
 # Без этой фичи CLI собирается CPU-only.
-cuda = ["dep:synaptix-kernels-cuda", "synaptix/llm-cuda", "synaptix-llm-qwen3/cuda", "synaptix-llm-qwen3-next-hybrid/cuda", "synaptix-asr-whisper/cuda", "synaptix-image-flux/cuda", "synaptix-tts-voxcpm/cuda"]
+cuda = ["dep:synaptix-kernels-cuda", "synaptix/llm-cuda", "synaptix-llm-qwen3/cuda", "synaptix-llm-qwen3-next-hybrid/cuda", "synaptix-vlm-qwen3/cuda", "synaptix-asr-whisper/cuda", "synaptix-image-flux/cuda", "synaptix-tts-voxcpm/cuda"]
 
 [dev-dependencies]
 tempfile           = { workspace = true }

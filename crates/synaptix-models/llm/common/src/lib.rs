@@ -1,6 +1,7 @@
 pub mod config;
 pub mod generate;
 pub mod model;
+pub mod mtp;
 pub mod weights;
 
 pub use config::{

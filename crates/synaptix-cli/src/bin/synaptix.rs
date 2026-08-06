@@ -33,6 +33,18 @@ enum Commands {
         arch: Option<String>,
         #[arg(long)]
         component: Option<String>,
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
+        #[arg(long, default_value = "auto")]
+        dtype: String,
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        sha256: bool,
+        #[arg(long, default_value_t = false)]
+        blake3: bool,
     },
     Bench {
         model: PathBuf,
@@ -98,6 +110,19 @@ enum Commands {
         /// Прогрев NVRTC JIT (prefill+1 токен) до замера — для честного бенча.
         #[arg(long, default_value_t = false)]
         warmup: bool,
+        /// Требовать MTP-декод на встроенной nextn-голове (greedy). Без флага
+        /// MTP включается сам, когда доступен.
+        #[arg(long, default_value_t = false)]
+        mtp: bool,
+        /// Запретить MTP-декод.
+        #[arg(long, default_value_t = false)]
+        no_mtp: bool,
+        /// Отключить CUDA-graph в MTP-декоде.
+        #[arg(long, default_value_t = false)]
+        no_graph_mtp: bool,
+        /// Изображение для мультимодального промпта.
+        #[arg(long)]
+        image: Option<PathBuf>,
     },
     Chat {
         model: PathBuf,
@@ -550,16 +575,18 @@ fn main() -> ExitCode {
         Commands::Inspect { file, verbose, filter } => {
             inspect::run(inspect::InspectArgs { file, verbose, filter })
         }
-        Commands::Convert { input, output, format, arch, component } => {
-            convert::run(convert::ConvertArgs { input, output, format, arch, component })
-        }
+        Commands::Convert {
+            input, output, format, arch, component, mmproj, dtype, tokenizer, id, sha256, blake3,
+        } => convert::run(convert::ConvertArgs {
+            input, output, format, arch, component, mmproj, dtype, tokenizer, id, sha256, blake3,
+        }),
         Commands::Bench { model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype } => {
             bench::run(bench::BenchArgs { model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype })
         }
         Commands::Run {
             model, prompt, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup,
+            warmup, mtp, no_mtp, no_graph_mtp, image,
         } => {
             run_cmd::run(run_cmd::RunArgs {
                 model,
@@ -577,6 +604,10 @@ fn main() -> ExitCode {
                 lm_head_dtype,
                 embed_dtype,
                 graph: !no_graph,
+                mtp,
+                no_mtp,
+                no_graph_mtp,
+                image,
                 warmup,
             })
         }

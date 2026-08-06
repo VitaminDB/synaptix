@@ -12,6 +12,7 @@ members = [
     "crates/synaptix-nn",
     "crates/synaptix-tokenizer",
     "crates/synaptix-bundle",
+    "crates/synaptix-gguf",
     "crates/synaptix-io",
     "crates/synaptix-infer",
     "crates/synaptix-train",
@@ -45,6 +46,7 @@ members = [
     "crates/synaptix-models/llm/command_r",
     "crates/synaptix-models/vlm/llava",
     "crates/synaptix-models/vlm/qwen2_vl",
+    "crates/synaptix-models/vlm/qwen3_vl",
     "crates/synaptix-models/vlm/internvl",
     "crates/synaptix-models/vlm/florence_2",
     "crates/synaptix-models/vlm/idefics",
@@ -215,6 +217,7 @@ synaptix-ops          = { path = "crates/synaptix-ops" }
 synaptix-nn           = { path = "crates/synaptix-nn" }
 synaptix-tokenizer    = { path = "crates/synaptix-tokenizer" }
 synaptix-bundle       = { path = "crates/synaptix-bundle" }
+synaptix-gguf         = { path = "crates/synaptix-gguf" }
 synaptix-io           = { path = "crates/synaptix-io" }
 synaptix-infer        = { path = "crates/synaptix-infer" }
 synaptix-train        = { path = "crates/synaptix-train" }
@@ -234,6 +237,7 @@ synaptix-distributed  = { path = "crates/synaptix-distributed" }
 synaptix-cli          = { path = "crates/synaptix-cli" }
 synaptix-llm-qwen3    = { path = "crates/synaptix-models/llm/qwen3" }
 synaptix-llm-qwen3-next-hybrid = { path = "crates/synaptix-models/llm/qwen3_next_hybrid" }
+synaptix-vlm-qwen3    = { path = "crates/synaptix-models/vlm/qwen3_vl" }
 synaptix-llm-common   = { path = "crates/synaptix-models/llm/common" }
 synaptix-asr-whisper  = { path = "crates/synaptix-models/asr/whisper" }
 synaptix-image-sdxl   = { path = "crates/synaptix-models/image/sdxl" }

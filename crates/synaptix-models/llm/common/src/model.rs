@@ -359,7 +359,103 @@ pub struct KvCache {
     pub max_seq: usize,
 }
 
+fn deep_copy(src: &Tensor) -> Result<Tensor, ModelError> {
+    let mut dst = Tensor::zeros(src.dims().to_vec(), src.dtype(), src.device())
+        .map_err(|e| ModelError::Forward(e.to_string()))?;
+    dst.copy_from(src).map_err(|e| ModelError::Forward(e.to_string()))?;
+    Ok(dst)
+}
+
+pub struct LinearSnapshot {
+    conv_dev: Option<Tensor>,
+    ssm_dev: Option<Tensor>,
+    conv_host: Option<Vec<f32>>,
+    ssm_host: Option<Vec<f32>>,
+}
+
 impl KvCache {
+    pub fn alloc_linear_snapshot(&self) -> Result<Vec<LinearSnapshot>, ModelError> {
+        self.snapshot_linear()
+    }
+
+    pub fn save_linear_into(&self, snap: &mut [LinearSnapshot]) -> Result<(), ModelError> {
+        let mut i = 0;
+        for l in &self.layers {
+            let LayerCache::Linear(st) = l else { continue };
+            let s = snap.get_mut(i).ok_or_else(|| {
+                ModelError::Shape("save_linear_into: снапшот короче числа linear-слоёв".into())
+            })?;
+            i += 1;
+            if let (Some(src), Some(dst)) = (&st.conv_state_dev, s.conv_dev.as_mut()) {
+                dst.copy_from(src).map_err(|e| ModelError::Forward(e.to_string()))?;
+            }
+            if let (Some(src), Some(dst)) = (&st.ssm_state_dev, s.ssm_dev.as_mut()) {
+                dst.copy_from(src).map_err(|e| ModelError::Forward(e.to_string()))?;
+            }
+            if let Some(v) = s.conv_host.as_mut() {
+                v.copy_from_slice(&st.conv_state);
+            }
+            if let Some(v) = s.ssm_host.as_mut() {
+                v.copy_from_slice(&st.ssm_state);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn snapshot_linear(&self) -> Result<Vec<LinearSnapshot>, ModelError> {
+        let mut out = Vec::new();
+        for l in &self.layers {
+            let LayerCache::Linear(st) = l else { continue };
+            let snap = if st.conv_state_dev.is_some() || st.ssm_state_dev.is_some() {
+                LinearSnapshot {
+                    conv_dev: match &st.conv_state_dev {
+                        Some(t) => Some(deep_copy(t)?),
+                        None => None,
+                    },
+                    ssm_dev: match &st.ssm_state_dev {
+                        Some(t) => Some(deep_copy(t)?),
+                        None => None,
+                    },
+                    conv_host: None,
+                    ssm_host: None,
+                }
+            } else {
+                LinearSnapshot {
+                    conv_dev: None,
+                    ssm_dev: None,
+                    conv_host: Some(st.conv_state.clone()),
+                    ssm_host: Some(st.ssm_state.clone()),
+                }
+            };
+            out.push(snap);
+        }
+        Ok(out)
+    }
+
+    pub fn restore_linear(&mut self, snap: &[LinearSnapshot]) -> Result<(), ModelError> {
+        let mut i = 0;
+        for l in self.layers.iter_mut() {
+            let LayerCache::Linear(st) = l else { continue };
+            let s = snap.get(i).ok_or_else(|| {
+                ModelError::Shape("restore_linear: снапшот короче числа linear-слоёв".into())
+            })?;
+            i += 1;
+            if let (Some(src), Some(dst)) = (&s.conv_dev, st.conv_state_dev.as_mut()) {
+                dst.copy_from(src).map_err(|e| ModelError::Forward(e.to_string()))?;
+            }
+            if let (Some(src), Some(dst)) = (&s.ssm_dev, st.ssm_state_dev.as_mut()) {
+                dst.copy_from(src).map_err(|e| ModelError::Forward(e.to_string()))?;
+            }
+            if let Some(v) = &s.conv_host {
+                st.conv_state.copy_from_slice(v);
+            }
+            if let Some(v) = &s.ssm_host {
+                st.ssm_state.copy_from_slice(v);
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in &mut self.layers {
@@ -426,6 +522,7 @@ pub struct PrefillState {
     pub rope_cos: Tensor,
     pub rope_sin: Tensor,
     pub logits: Tensor,
+    pub hidden: Tensor,
 }
 
 impl PrefillState {
@@ -777,24 +874,69 @@ impl DecoderModel {
     }
 
     pub fn forward(&self, input_ids: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {
+        let hidden = self.forward_trunk(input_ids, kv_cache)?;
+        self.head_at(&hidden, hidden.dims()[1] - 1)
+    }
+
+    pub fn embed_ids(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
+        let mut hidden = token_embedding(input_ids, &self.embed).coerr()?;
+        if let Some(scale) = self.embed_scale {
+            hidden = hidden.mul_scalar(scale).coerr()?;
+        }
+        Ok(hidden)
+    }
+
+    pub fn normed_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
+        let dev = self.device;
+        let normed = prof(dev, "norm", || {
+            rms_norm(hidden, &self.final_norm, self.config.rms_norm_eps).coerr()
+        })?;
+        normed.narrow(1, idx, 1).coerr()?.squeeze(1).coerr()
+    }
+
+    pub fn lm_head_forward(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+        prof(self.device, "lm_head", || self.lm_head.forward(x))
+    }
+
+    pub fn head_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
+        let row = self.normed_at(hidden, idx)?;
+        self.lm_head_forward(&row)
+    }
+
+    pub fn forward_trunk(&self, input_ids: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {
         if input_ids.rank() != 2 {
             return Err(ModelError::Shape(format!("input_ids must be [B, S], got {:?}", input_ids.dims())));
         }
         let batch = input_ids.dims()[0];
         let s = input_ids.dims()[1];
         let past = kv_cache.seq_len;
+        let hidden = self.embed_ids(input_ids)?;
+        if dump_layers_on() { record_layer_norm(999, "embed", &hidden, s, past); }
+        self.run_blocks(hidden, kv_cache, batch, s)
+    }
+
+    pub fn forward_from_hidden(&self, hidden: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {
+        if hidden.rank() != 3 {
+            return Err(ModelError::Shape(format!("hidden must be [B, S, H], got {:?}", hidden.dims())));
+        }
+        let batch = hidden.dims()[0];
+        let s = hidden.dims()[1];
+        self.run_blocks(hidden.clone(), kv_cache, batch, s)
+    }
+
+    fn run_blocks(
+        &self,
+        mut hidden: Tensor,
+        kv_cache: &mut KvCache,
+        batch: usize,
+        s: usize,
+    ) -> Result<Tensor, ModelError> {
+        let past = kv_cache.seq_len;
         if past + s > kv_cache.max_seq {
             return Err(ModelError::Shape(format!("KV overflow: past {past} + s {s} > max_seq {}", kv_cache.max_seq)));
         }
-
-        let mut hidden = token_embedding(input_ids, &self.embed).coerr()?;
-        if let Some(scale) = self.embed_scale {
-            hidden = hidden.mul_scalar(scale).coerr()?;
-        }
-
         let dev = self.device;
         let dump_layers = dump_layers_on();
-        if dump_layers { record_layer_norm(999, "embed", &hidden, s, past); }
 
         // Один блок (attn/linear-mixer + MLP) → новый hidden. Вынесено в замыкание,
         // чтобы общий код работал и в резидентном цикле, и в host-stream (блок
@@ -868,11 +1010,7 @@ impl DecoderModel {
             }
         }
         kv_cache.seq_len = past + s;
-
-        let normed = prof(dev, "norm", || rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps).coerr())?;
-        let last = normed.narrow(1, s - 1, 1).coerr()?.squeeze(1).coerr()?;
-        let logits = prof(dev, "lm_head", || self.lm_head.forward(&last))?;
-        Ok(logits)
+        Ok(hidden)
     }
 
     /// Энкодер-проход: вернуть ВСЕ hidden states как HF `output_hidden_states=True`:
@@ -1146,8 +1284,20 @@ impl DecoderModel {
         let sin = self.rope_global.sin();
         let rope_cos = Tensor::cat(&[cos, cos], 1).coerr()?.to_dtype(self.dtype).coerr()?;
         let rope_sin = Tensor::cat(&[sin, sin], 1).coerr()?.to_dtype(self.dtype).coerr()?;
-        let logits = Tensor::zeros(vec![1usize, self.config.vocab_size], self.dtype, dev).coerr()?;
-        Ok(PrefillState { chunk_size, input, pos_start, tcache_dev, rope_cos, rope_sin, logits })
+        let logits =
+            Tensor::zeros(vec![chunk_size, self.config.vocab_size], self.dtype, dev).coerr()?;
+        let hidden =
+            Tensor::zeros(vec![chunk_size, self.config.hidden_size], self.dtype, dev).coerr()?;
+        Ok(PrefillState {
+            chunk_size,
+            input,
+            pos_start,
+            tcache_dev,
+            rope_cos,
+            rope_sin,
+            logits,
+            hidden,
+        })
     }
 
     /// Device-резидентный prefill одного chunk'а (T = `state.chunk_size`). Аналог
@@ -1186,10 +1336,12 @@ impl DecoderModel {
             };
             let (h, pq) = rms_norm_quant(&hidden, &blk.pre_attn_norm, blk.rms_eps, want_attn)?;
             let mixed = match &blk.mixer {
-                Mixer::Full(fa) => {
-                    fa.forward_prefill_dev(&h, &mut kv.layers[idx], state, pq.as_ref())?
-                }
-                Mixer::Linear(la) => la.forward_prefill_dev(&h, &mut kv.layers[idx])?,
+                Mixer::Full(fa) => fa
+                    .forward_prefill_dev(&h, &mut kv.layers[idx], state, pq.as_ref())
+                    .map_err(|e| ModelError::Forward(format!("prefill_dev full[{idx}]: {e}")))?,
+                Mixer::Linear(la) => la
+                    .forward_prefill_dev(&h, &mut kv.layers[idx])
+                    .map_err(|e| ModelError::Forward(format!("prefill_dev linear[{idx}]: {e}")))?,
             };
             hidden = residual.add(&mixed).coerr()?;
 
@@ -1200,9 +1352,18 @@ impl DecoderModel {
             hidden = residual2.add(&mlp_out).coerr()?;
         }
 
+        let trunk = hidden
+            .contiguous()
+            .coerr()?
+            .reshape(vec![chunk, self.config.hidden_size])
+            .coerr()?;
+        state
+            .hidden
+            .copy_from(&trunk)
+            .map_err(|e| ModelError::Forward(format!("prefill_dev hidden copy: {e}")))?;
         let normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps).coerr()?;
-        let last = normed.narrow(1, chunk - 1, 1).coerr()?.squeeze(1).coerr()?;
-        let logits = self.lm_head.forward(&last)?;
+        let rows = normed.reshape(vec![chunk, self.config.hidden_size]).coerr()?;
+        let logits = self.lm_head.forward(&rows)?;
         state.logits.copy_from(&logits).coerr()?;
         Ok(())
     }
@@ -1480,10 +1641,6 @@ impl FullAttn {
 
 impl LinearAttn {
     fn forward(&self, h: &Tensor, cache: &mut LayerCache, s: usize, device: Device, compute: DType) -> Result<Tensor, ModelError> {
-        let state = match cache {
-            LayerCache::Linear(s) => s,
-            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
-        };
         let (dk, dv, h_v, h_k, conv_dim, k) = (self.dk, self.dv, self.num_v_heads, self.num_k_heads, self.conv_dim, self.conv_k);
 
         // CUDA fast-path: device-резидентная цепочка (chunk_conv1d + silu +
@@ -1496,8 +1653,27 @@ impl LinearAttn {
             && self.dt_bias_dev.is_some()
             && matches!(compute, DType::F16 | DType::BF16 | DType::F32)
         {
+            if s <= SMALL_CHUNK_DEV && compute == DType::F16 && self.norm_w_f16.is_some() {
+                let mut parts = Vec::with_capacity(s);
+                for t in 0..s {
+                    let ht = h.narrow(1, t, 1).coerr()?.contiguous().coerr()?;
+                    parts.push(self.forward_decode_dev(&ht, cache)?);
+                }
+                let refs: Vec<&Tensor> = parts.iter().collect();
+                return Tensor::cat(&refs, 1).coerr();
+            }
+            let state = match cache {
+                LayerCache::Linear(s) => s,
+                LayerCache::Full(_) => {
+                    return Err(ModelError::Shape("linear layer got full cache".into()))
+                }
+            };
             return self.forward_cuda_chunk_prefill(h, state, s, dk, dv, h_v, h_k, conv_dim, k, device, compute);
         }
+        let state = match cache {
+            LayerCache::Linear(s) => s,
+            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+        };
 
         // CPU path (host-mix): полная host цепочка, как раньше.
         let dbg = dump_layers_on();
@@ -1678,12 +1854,54 @@ impl LinearAttn {
     /// `DecoderConfig::graph_prefill_ok` режет hybrid (`linear.is_none()`)
     /// заранее, так что в норме сюда не приходим; метод оставлен для полноты
     /// `Mixer`-енама и чтобы вызывающий `forward_prefill_dev` компилировался.
-    fn forward_prefill_dev(&self, _h: &Tensor, _cache: &mut LayerCache) -> Result<Tensor, ModelError> {
-        Err(ModelError::Forward(
-            "forward_prefill_dev: linear mixer (GatedDeltaNet) — ждёт hybrid-prefill-сессии".into(),
-        ))
+    fn forward_prefill_dev(&self, h: &Tensor, cache: &mut LayerCache) -> Result<Tensor, ModelError> {
+        let device = h.device();
+        let compute = h.dtype();
+        if !matches!(device, Device::Cuda(_))
+            || self.conv_w_dev.is_none()
+            || self.a_log_dev.is_none()
+            || self.dt_bias_dev.is_none()
+            || !matches!(compute, DType::F16 | DType::BF16 | DType::F32)
+        {
+            return Err(ModelError::Forward(
+                "forward_prefill_dev: linear mixer требует CUDA и device-зеркал весов".into(),
+            ));
+        }
+        let s = h.dims()[1];
+        if let Some(out) = self.try_small_chunk_dev(h, cache, s, compute)? {
+            return Ok(out);
+        }
+        let state = match cache {
+            LayerCache::Linear(s) => s,
+            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+        };
+        self.forward_cuda_chunk_prefill(
+            h, state, s, self.dk, self.dv, self.num_v_heads, self.num_k_heads, self.conv_dim,
+            self.conv_k, device, compute,
+        )
+    }
+
+    fn try_small_chunk_dev(
+        &self,
+        h: &Tensor,
+        cache: &mut LayerCache,
+        s: usize,
+        compute: DType,
+    ) -> Result<Option<Tensor>, ModelError> {
+        if s == 0 || s > SMALL_CHUNK_DEV || compute != DType::F16 || self.norm_w_f16.is_none() {
+            return Ok(None);
+        }
+        let mut parts = Vec::with_capacity(s);
+        for t in 0..s {
+            let ht = h.narrow(1, t, 1).coerr()?.contiguous().coerr()?;
+            parts.push(self.forward_decode_dev(&ht, cache)?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        Ok(Some(Tensor::cat(&refs, 1).coerr()?))
     }
 }
+
+const SMALL_CHUNK_DEV: usize = 8;
 
 fn missing(what: &str) -> ModelError {
     ModelError::Forward(format!("forward_decode_dev: {what} не инициализирован"))

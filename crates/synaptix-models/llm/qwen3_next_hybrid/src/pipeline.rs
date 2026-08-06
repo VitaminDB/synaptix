@@ -16,9 +16,28 @@ pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, Strea
 
 pub struct HybridPipeline {
     pub model: DecoderModel,
+    pub mtp: Option<synaptix_llm_common::mtp::MtpModule>,
+    pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
     pub tokenizer: HfTokenizer,
     pub config: HybridConfig,
     pub add_bos: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MtpStats {
+    pub steps: usize,
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
+impl MtpStats {
+    pub fn acceptance(&self) -> f32 {
+        if self.drafted == 0 {
+            0.0
+        } else {
+            self.accepted as f32 / self.drafted as f32
+        }
+    }
 }
 
 impl HybridPipeline {
@@ -32,7 +51,7 @@ impl HybridPipeline {
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, cap)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
-        Ok(Self { model, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, tokenizer, config, add_bos: false })
     }
 
     pub fn load_with_precision(
@@ -56,7 +75,489 @@ impl HybridPipeline {
         // model.kv_dtype оставался compute(F16) → MXFP8-KV игнорировался, KV
         // аллоцировался F16 и decode шёл по f16-flash (qwen3-pipeline это делал).
         .with_kv_cache_dtype(precision.kv);
-        Ok(Self { model, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, tokenizer, config, add_bos: false })
+    }
+
+    pub fn load_with_precision_mtp(
+        path: impl AsRef<Path>,
+        device: Device,
+        precision: PrecisionConfig,
+        max_seq: Option<usize>,
+        enable_mtp: bool,
+    ) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        let mut me = Self::load_with_precision(path, device, precision, max_seq)?;
+        if !enable_mtp || me.config.mtp_num_hidden_layers == 0 {
+            return Ok(me);
+        }
+        let weights = HybridWeights::load(path, device, precision.compute)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        if !synaptix_llm_common::mtp::present(&weights) {
+            return Ok(me);
+        }
+        let cap = max_seq.unwrap_or_else(|| me.config.max_position_embeddings.min(4096));
+        let dcfg = me.config.to_decoder_config();
+        let module = synaptix_llm_common::mtp::MtpModule::build(
+            &dcfg,
+            me.config.mtp_num_hidden_layers,
+            &weights,
+            device,
+            precision.compute,
+            precision.attn_w,
+            precision.mlp_w,
+            precision.lm_head,
+            cap,
+        )
+        .map_err(|e| PipelineError::Model(format!("mtp: {e}")))?;
+        me.mtp = Some(module);
+        Ok(me)
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+
+    #[cfg(feature = "cuda")]
+    fn build_mtp_graph(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+    ) -> Result<MtpGraph, PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_infer::graph_capture::GraphCapturer;
+        use synaptix_infer::InferError;
+
+        let ord = match self.model.device {
+            Device::Cuda(o) => o,
+            _ => return Err(PipelineError::Forward("MTP-граф требует CUDA".into())),
+        };
+        let mut state = self
+            .model
+            .make_prefill_state(2)
+            .map_err(|e| PipelineError::Forward(format!("prefill state: {e}")))?;
+        self.model
+            .sync_decode_host_state(kv)
+            .map_err(|e| PipelineError::Forward(format!("mtp graph sync host: {e}")))?;
+        self.model
+            .sync_decode_dev_state(kv)
+            .map_err(|e| PipelineError::Forward(format!("mtp graph sync dev: {e}")))?;
+        let seq0 = kv.seq_len;
+        let snap = kv
+            .snapshot_linear()
+            .map_err(|e| PipelineError::Forward(format!("mtp graph snapshot: {e}")))?;
+
+        state
+            .update(&[0u32, 0u32], seq0 as u32)
+            .map_err(|e| PipelineError::Forward(format!("mtp graph warmup update: {e}")))?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)
+            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
+        let mut capturer = GraphCapturer::new(3);
+        let graph = {
+            let model = &self.model;
+            let state_ref = &mut state;
+            let kv_ref = &mut *kv;
+            no_grad(|| {
+                capturer.capture_with(&stream, |_s| {
+                    model
+                        .forward_prefill_dev(state_ref, kv_ref)
+                        .map_err(|e| InferError::Other(e.to_string()))
+                })
+            })
+        }
+        .map_err(|e| PipelineError::Forward(format!("mtp graph capture: {e}")))?;
+        let _ = graph.upload();
+
+        kv.restore_linear(&snap)
+            .map_err(|e| PipelineError::Forward(format!("mtp graph restore: {e}")))?;
+        kv.seq_len = seq0;
+        Ok(MtpGraph {
+            state,
+            graph,
+            stream,
+            hidden_size: self.config.hidden_size,
+        })
+    }
+
+
+    pub fn load_vision(
+        &mut self,
+        path: impl AsRef<Path>,
+        dtype: DType,
+    ) -> Result<bool, PipelineError> {
+        let path = path.as_ref();
+        if !synaptix_vlm_qwen3::bundle_has_vision(path) {
+            return Ok(false);
+        }
+        let tower = synaptix_vlm_qwen3::load_from_bundle(path, self.model.device, dtype)
+            .map_err(|e| PipelineError::Load(format!("vision: {e}")))?;
+        self.vision = Some(tower);
+        Ok(true)
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    pub fn encode_image(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::PreprocessLimits,
+    ) -> Result<synaptix_core::tensor::Tensor, PipelineError> {
+        use synaptix_core::grad::no_grad;
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let prepared = synaptix_vlm_qwen3::prepare_image(
+            path,
+            &tower.config,
+            limits,
+            self.model.device,
+        )
+        .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+        no_grad(|| tower.forward(&prepared.patches, prepared.grid))
+            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))
+    }
+
+    pub fn image_token_count(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::PreprocessLimits,
+    ) -> Result<usize, PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let img = synaptix_io::image::png::load_image(path, Device::Cpu)
+            .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+        let dims = img.dims();
+        let (nh, nw) = synaptix_vlm_qwen3::preprocess::smart_resize(
+            dims[1],
+            dims[2],
+            tower.config.size_factor(),
+            limits,
+        );
+        let p = tower.config.patch_size;
+        Ok((nh / p) * (nw / p) / tower.config.merge_unit())
+    }
+
+    fn embed_with_images(
+        &self,
+        ids: &[u32],
+        image_embeds: &[synaptix_core::tensor::Tensor],
+    ) -> Result<synaptix_core::tensor::Tensor, PipelineError> {
+        use synaptix_core::tensor::Tensor;
+        let device = self.model.device;
+        let pad = self
+            .config
+            .image_token_id
+            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+        let hidden = self.config.hidden_size;
+        let mut segments: Vec<Tensor> = Vec::new();
+        let mut img_idx = 0usize;
+        let mut i = 0usize;
+        while i < ids.len() {
+            if ids[i] == pad {
+                let start = i;
+                while i < ids.len() && ids[i] == pad {
+                    i += 1;
+                }
+                let run = i - start;
+                let emb = image_embeds.get(img_idx).ok_or_else(|| {
+                    PipelineError::Forward(format!(
+                        "изображений меньше, чем блоков image_pad (нужен #{img_idx})"
+                    ))
+                })?;
+                img_idx += 1;
+                if emb.dims()[0] != run {
+                    return Err(PipelineError::Forward(format!(
+                        "image_pad-блок {run} токенов, а vision дал {}",
+                        emb.dims()[0]
+                    )));
+                }
+                let e = emb
+                    .to_dtype(self.model.dtype)
+                    .and_then(|t| t.reshape(vec![1usize, run, hidden]))
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                segments.push(e);
+            } else {
+                let start = i;
+                while i < ids.len() && ids[i] != pad {
+                    i += 1;
+                }
+                let chunk = Tensor::from_vec(ids[start..i].to_vec(), vec![1usize, i - start], device)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                let e = self
+                    .model
+                    .embed_ids(&chunk)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                segments.push(e);
+            }
+        }
+        let refs: Vec<&Tensor> = segments.iter().collect();
+        Tensor::cat(&refs, 1).map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+
+    pub fn generate_with_images(
+        &self,
+        prompt_ids: &[u32],
+        image_embeds: &[synaptix_core::tensor::Tensor],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_core::tensor::Tensor;
+
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg);
+        let device = self.model.device;
+        let l = prompt_ids.len();
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let eos = synaptix_llm_common::generate::eos_set(&cfg);
+        let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
+
+        let t0 = std::time::Instant::now();
+        let emb = self.embed_with_images(prompt_ids, image_embeds)?;
+        let hidden = no_grad(|| self.model.forward_from_hidden(&emb, &mut kv))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut logits = self
+            .model
+            .head_at(&hidden, l - 1)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        let dec_t0 = std::time::Instant::now();
+        loop {
+            let tok = sampler.sample(&logits).map_err(PipelineError::from)?;
+            out.push(tok);
+            if !sink.on_token(tok) || out.len() >= cfg.max_new_tokens || eos.contains(&tok) {
+                break;
+            }
+            if kv.seq_len >= kv.max_seq {
+                break;
+            }
+            let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            logits = no_grad(|| self.model.forward(&step, &mut kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+        let new_tokens = out.len();
+        Ok((
+            out,
+            GenerationStats {
+                prompt_tokens: l,
+                new_tokens,
+                prefill_ms,
+                decode_ms,
+            },
+        ))
+    }
+
+    pub fn generate_mtp(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
+        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, false)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn generate_mtp_with_graph(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
+        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, true)
+    }
+
+    fn generate_mtp_inner(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+        use_graph: bool,
+    ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_core::tensor::Tensor;
+
+        let Some(mtp) = self.mtp.as_ref() else {
+            return Err(PipelineError::Model("MTP-голова не загружена".into()));
+        };
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg);
+        if cfg.temperature > 0.0 {
+            return Err(PipelineError::Forward(
+                "MTP-декод реализован для greedy (temperature = 0): спекулятивный сэмплинг с сохранением распределения не подключён".into(),
+            ));
+        }
+        let device = self.model.device;
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let l = prompt.len();
+        let eos = synaptix_llm_common::generate::eos_set(&cfg);
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 2);
+
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut mtp_kv = mtp
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+
+        let argmax = |t: &Tensor| -> Result<u32, PipelineError> {
+            let v = t
+                .to_dtype(synaptix_core::dtype::DType::F32)
+                .and_then(|x| x.flatten_all())
+                .and_then(|x| x.to_vec1::<f32>())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let mut best = 0usize;
+            for (i, x) in v.iter().enumerate() {
+                if *x > v[best] {
+                    best = i;
+                }
+            }
+            Ok(best as u32)
+        };
+
+        let t0 = std::time::Instant::now();
+        let ids = Tensor::from_vec(prompt.clone(), vec![1usize, l], device)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let hidden = no_grad(|| self.model.forward_trunk(&ids, &mut kv))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut h_prev = hidden
+            .narrow(1, l - 1, 1)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > 1 {
+            let hs = hidden
+                .narrow(1, 0, l - 1)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let shifted = Tensor::from_vec(prompt[1..].to_vec(), vec![1usize, l - 1], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            no_grad(|| mtp.advance(&self.model, &hs, &shifted, &mut mtp_kv))
+                .map_err(|e| PipelineError::Forward(format!("mtp prefill: {e}")))?;
+        }
+        let first = argmax(
+            &self
+                .model
+                .head_at(&hidden, l - 1)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?,
+        )?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut out: Vec<u32> = vec![first];
+        let mut cancelled = !sink.on_token(first);
+        let mut cur = first;
+        let mut forced: Option<u32> = None;
+        let mut stats = MtpStats::default();
+
+        #[cfg(feature = "cuda")]
+        let mut graph_ctx = if use_graph {
+            Some(self.build_mtp_graph(&mut kv)?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_graph;
+
+        let mut snap_buf = kv
+            .alloc_linear_snapshot()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+
+        let dec_t0 = std::time::Instant::now();
+        while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
+            let pos = kv.seq_len;
+            if pos + 2 > kv.max_seq {
+                break;
+            }
+            let (second, was_draft) = match forced.take() {
+                Some(t) => (t, false),
+                None => {
+                    let next = Tensor::from_vec(vec![cur], vec![1usize, 1], device)
+                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    let dl = no_grad(|| mtp.draft_logits(&self.model, &h_prev, &next, &mut mtp_kv))
+                        .map_err(|e| PipelineError::Forward(format!("mtp draft: {e}")))?;
+                    stats.drafted += 1;
+                    (argmax(&dl)?, true)
+                }
+            };
+            stats.steps += 1;
+
+            if was_draft {
+                kv.save_linear_into(&mut snap_buf)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            }
+            let seq_before = kv.seq_len;
+
+            let step = {
+                #[cfg(feature = "cuda")]
+                {
+                    match graph_ctx.as_mut() {
+                        Some(g) => g.run(&mut kv, cur, second, pos as u32)?,
+                        None => self.verify_plain(&mut kv, cur, second, device)?,
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    self.verify_plain(&mut kv, cur, second, device)?
+                }
+            };
+            let a = argmax(&step.logits0)?;
+
+            let fill = Tensor::from_vec(vec![a], vec![1usize, 1], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            no_grad(|| mtp.advance(&self.model, &step.hidden0, &fill, &mut mtp_kv))
+                .map_err(|e| PipelineError::Forward(format!("mtp advance: {e}")))?;
+
+            if !was_draft {
+                let b = argmax(&step.logits1)?;
+                out.push(b);
+                cancelled = !sink.on_token(b);
+                h_prev = step.hidden1;
+                cur = b;
+                continue;
+            }
+
+            out.push(a);
+            cancelled = !sink.on_token(a);
+            if a == second {
+                stats.accepted += 1;
+                if eos.contains(&a) || out.len() >= cfg.max_new_tokens {
+                    cur = a;
+                    continue;
+                }
+                let b = argmax(&step.logits1)?;
+                out.push(b);
+                cancelled = !sink.on_token(b);
+                h_prev = step.hidden1;
+                cur = b;
+            } else {
+                kv.restore_linear(&snap_buf)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                kv.seq_len = seq_before;
+                forced = Some(a);
+            }
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+
+        let stats_gen = GenerationStats {
+            prompt_tokens: l,
+            new_tokens: out.len(),
+            prefill_ms,
+            decode_ms,
+        };
+        Ok((out, stats_gen, stats))
     }
 
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>, PipelineError> {
@@ -338,6 +839,89 @@ impl HybridPipeline {
             decode_ms,
         };
         Ok((out, stats))
+    }
+}
+
+
+struct VerifyStep {
+    logits0: synaptix_core::tensor::Tensor,
+    logits1: synaptix_core::tensor::Tensor,
+    hidden0: synaptix_core::tensor::Tensor,
+    hidden1: synaptix_core::tensor::Tensor,
+}
+
+#[cfg(feature = "cuda")]
+pub struct MtpGraph {
+    state: synaptix_llm_common::model::PrefillState,
+    graph: std::sync::Arc<synaptix_core::device::cuda::CudaGraph>,
+    stream: std::sync::Arc<synaptix_core::device::cuda::Stream>,
+    hidden_size: usize,
+}
+
+impl HybridPipeline {
+    fn verify_plain(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        cur: u32,
+        second: u32,
+        device: Device,
+    ) -> Result<VerifyStep, PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_core::tensor::Tensor;
+        let chunk = Tensor::from_vec(vec![cur, second], vec![1usize, 2], device)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let hh = no_grad(|| self.model.forward_trunk(&chunk, kv))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let logits0 = self
+            .model
+            .head_at(&hh, 0)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let logits1 = self
+            .model
+            .head_at(&hh, 1)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let hidden0 = hh.narrow(1, 0, 1).map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let hidden1 = hh.narrow(1, 1, 1).map_err(|e| PipelineError::Forward(e.to_string()))?;
+        Ok(VerifyStep { logits0, logits1, hidden0, hidden1 })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl MtpGraph {
+    fn run(
+        &mut self,
+        kv: &mut synaptix_llm_common::KvCache,
+        cur: u32,
+        second: u32,
+        pos: u32,
+    ) -> Result<VerifyStep, PipelineError> {
+        self.state
+            .update(&[cur, second], pos)
+            .map_err(|e| PipelineError::Forward(format!("mtp graph update: {e}")))?;
+        self.graph
+            .launch()
+            .map_err(|e| PipelineError::Forward(format!("mtp graph launch: {e:?}")))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
+        kv.seq_len = pos as usize + 2;
+        let row = |t: &synaptix_core::tensor::Tensor, i: usize| {
+            t.narrow(0, i, 1)
+                .and_then(|x| x.contiguous())
+                .map_err(|e| PipelineError::Forward(format!("mtp graph row {i}: {e}")))
+        };
+        let h0 = row(&self.state.hidden, 0)?
+            .reshape(vec![1usize, 1, self.hidden_size])
+            .map_err(|e| PipelineError::Forward(format!("mtp graph hidden0: {e}")))?;
+        let h1 = row(&self.state.hidden, 1)?
+            .reshape(vec![1usize, 1, self.hidden_size])
+            .map_err(|e| PipelineError::Forward(format!("mtp graph hidden1: {e}")))?;
+        Ok(VerifyStep {
+            logits0: row(&self.state.logits, 0)?,
+            logits1: row(&self.state.logits, 1)?,
+            hidden0: h0,
+            hidden1: h1,
+        })
     }
 }
 

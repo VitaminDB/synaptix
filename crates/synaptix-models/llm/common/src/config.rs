@@ -138,6 +138,6 @@ impl DecoderConfig {
     /// `gated_delta_rule_prefill` остаётся валиден для hybrid). Hybrid-prefill
     /// граф — отдельная сессия.
     pub fn graph_prefill_ok(&self) -> bool {
-        self.graph_decode_ok() && self.linear.is_none()
+        self.graph_decode_ok()
     }
 }

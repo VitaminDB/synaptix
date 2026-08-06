@@ -15,9 +15,11 @@ use crate::cdir::{
 use crate::chunk::{chunk_total_size, header_len, ChunkHeader};
 use crate::error::{Error, Result};
 use crate::header::{
-    align_up, CdirOnDiskFormat, FileHeader, Footer, FILE_HEADER_SIZE, FLAG_HAS_SHA256_MANIFEST,
+    align_up, CdirOnDiskFormat, FileHeader, Footer, ALIGNMENT, FILE_HEADER_SIZE,
+    FLAG_HAS_SHA256_MANIFEST,
 };
 use crate::path as syn_path;
+use crate::stream::{payload_len as stream_payload_len, safetensors_header, CountingWriter, TensorStream};
 use crate::CURRENT_MINOR;
 
 /// Размер блока для стриминговой копии payload'а: достаточно большой, чтобы
@@ -82,10 +84,16 @@ enum FilePayload {
     Path(PathBuf),
 }
 
+struct StreamSource {
+    name: String,
+    stream: Box<dyn TensorStream>,
+}
+
 /// Builder for a fresh bundle.
 pub struct BundleBuilder {
     meta: BundleMeta,
     tensor_sources: Vec<TensorSource>,
+    streams: Vec<StreamSource>,
     files: Vec<FilePending>,
     cdir_format: CdirFormat,
     sha256: bool,
@@ -107,6 +115,7 @@ impl BundleBuilder {
                 ..Default::default()
             },
             tensor_sources: Vec::new(),
+            streams: Vec::new(),
             files: Vec::new(),
             cdir_format: CdirFormat::Cbor,
             sha256: false,
@@ -146,6 +155,9 @@ impl BundleBuilder {
                 total = total.saturating_add(std::fs::metadata(p)?.len());
             }
         }
+        for s in &self.streams {
+            total = total.saturating_add(stream_payload_len(s.stream.plan(), ALIGNMENT as usize)?);
+        }
         for fp in &self.files {
             match &fp.payload {
                 FilePayload::Owned(b) => total = total.saturating_add(b.len() as u64),
@@ -178,7 +190,15 @@ impl BundleBuilder {
     /// Количество логических этапов: один на каждый `TensorSource` + один на
     /// каждый `FilePending`. UI использует это число для подписи прогресс-бара.
     pub fn item_count(&self) -> usize {
-        self.tensor_sources.len() + self.files.len()
+        self.tensor_sources.len() + self.streams.len() + self.files.len()
+    }
+
+    pub fn add_tensor_stream(mut self, name: &str, stream: Box<dyn TensorStream>) -> Self {
+        self.streams.push(StreamSource {
+            name: name.to_string(),
+            stream,
+        });
+        self
     }
 
     pub fn arch(mut self, arch: impl Into<String>) -> Self {
@@ -415,7 +435,12 @@ impl BundleBuilder {
         // Emit Plan: для tensor sources прогресс тикает дважды (copy-to-stage
         // и pack-to-bundle), поэтому total = 2 * tensor_bytes + file_bytes.
         // Это даёт линейный прогресс через всю операцию.
-        let total_items = self.tensor_sources.len() + self.files.len();
+        let total_items = self.tensor_sources.len() + self.streams.len() + self.files.len();
+        let total_stream_bytes: u64 = self
+            .streams
+            .iter()
+            .map(|s| stream_payload_len(s.stream.plan(), ALIGNMENT as usize).unwrap_or(0))
+            .sum();
         let total_tensor_bytes: u64 = self
             .tensor_sources
             .iter()
@@ -430,8 +455,13 @@ impl BundleBuilder {
                 FilePayload::Path(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
             })
             .sum();
-        let total_bytes = total_tensor_bytes.saturating_mul(2).saturating_add(total_file_bytes);
-        let payload_bytes = total_tensor_bytes.saturating_add(total_file_bytes);
+        let total_bytes = total_tensor_bytes
+            .saturating_mul(2)
+            .saturating_add(total_stream_bytes)
+            .saturating_add(total_file_bytes);
+        let payload_bytes = total_tensor_bytes
+            .saturating_add(total_stream_bytes)
+            .saturating_add(total_file_bytes);
         emit(
             &self.progress,
             ProgressEvent::Plan { total_bytes, total_items, payload_bytes },
@@ -509,6 +539,41 @@ impl BundleBuilder {
                 },
             );
             tensors_tmps.push(tmp_t);
+            next_id += 1;
+            item_index += 1;
+        }
+
+        let streams = std::mem::take(&mut self.streams);
+        for src in streams {
+            let chunk_name = format!("tensors:{}", src.name);
+            let plan_bytes = stream_payload_len(src.stream.plan(), ALIGNMENT as usize)?;
+            emit(
+                &self.progress,
+                ProgressEvent::ItemStart {
+                    index: item_index,
+                    name: chunk_name.clone(),
+                    bytes: plan_bytes,
+                },
+            );
+            cursor = write_chunk_from_stream(
+                &mut w,
+                cursor,
+                next_id,
+                &chunk_name,
+                src.stream,
+                self.sha256,
+                self.blake3,
+                &mut entries,
+                self.progress.as_ref(),
+            )?;
+            emit(
+                &self.progress,
+                ProgressEvent::ItemDone {
+                    index: item_index,
+                    name: chunk_name,
+                    deleted_sources: false,
+                },
+            );
             next_id += 1;
             item_index += 1;
         }
@@ -756,6 +821,121 @@ fn write_chunk_streaming(
 
 fn written_so_far<W: std::io::Seek>(w: &mut W) -> Result<u64> {
     Ok(w.stream_position()?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_chunk_from_stream(
+    w: &mut BufWriter<File>,
+    cursor: u64,
+    id: u64,
+    name: &str,
+    mut stream: Box<dyn TensorStream>,
+    with_sha256: bool,
+    with_blake3: bool,
+    entries: &mut Vec<ChunkEntry>,
+    progress: Option<&ProgressCallback>,
+) -> Result<u64> {
+    use std::io::Seek;
+
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > syn_path::MAX_PATH_LEN {
+        return Err(Error::InvalidPath { path: name.into(), reason: "name exceeds MAX_PATH_LEN" });
+    }
+    let plan: Vec<crate::stream::StreamTensor> = stream.plan().to_vec();
+    let header = safetensors_header(&plan, ALIGNMENT as usize)?;
+    let payload_len = header.len() as u64 + plan.iter().map(|t| t.nbytes()).sum::<u64>();
+    let hlen = header_len(name_bytes.len());
+
+    let mut chunk_hdr = ChunkHeader {
+        id,
+        kind: ChunkType::Tensors.to_u8() as u16,
+        flags: 0,
+        payload_len,
+        raw_len: payload_len,
+        payload_crc32c: 0,
+        name_len: name_bytes.len() as u16,
+    };
+    chunk_hdr.write(&mut *w, name_bytes)?;
+
+    let mut on_bytes = |n: u64| {
+        if let Some(cb) = progress {
+            cb(ProgressEvent::Bytes { delta: n });
+        }
+    };
+    let mut cw = CountingWriter {
+        inner: w,
+        written: 0,
+        crc: 0,
+        on_bytes: Some(&mut on_bytes),
+    };
+    {
+        use std::io::Write as _;
+        cw.write_all(&header)?;
+    }
+    for (i, t) in plan.iter().enumerate() {
+        let before = cw.written;
+        stream.write_tensor(i, &mut cw)?;
+        let got = cw.written - before;
+        if got != t.nbytes() {
+            return Err(Error::Safetensors(format!(
+                "поток отдал {got} байт для `{}`, план обещал {} — safetensors-заголовок стал бы битым",
+                t.name,
+                t.nbytes()
+            )));
+        }
+    }
+    let crc = cw.crc;
+    let written_payload = cw.written;
+    if written_payload != payload_len {
+        return Err(Error::Safetensors(format!(
+            "поток `{name}`: записано {written_payload} байт, ожидалось {payload_len}"
+        )));
+    }
+
+    let pad = align_up(hlen + payload_len) - (hlen + payload_len);
+    if pad > 0 {
+        w.write_all(&vec![0u8; pad as usize])?;
+    }
+
+    w.flush()?;
+    let end = w.get_mut().stream_position()?;
+    w.get_mut().seek(std::io::SeekFrom::Start(cursor))?;
+    chunk_hdr.payload_crc32c = crc;
+    chunk_hdr.write(&mut *w.get_mut(), name_bytes)?;
+    w.get_mut().seek(std::io::SeekFrom::Start(end))?;
+
+    let (sha256, blake3) = if with_sha256 || with_blake3 {
+        w.flush()?;
+        let f = w.get_ref().try_clone()?;
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        let start = (cursor + hlen) as usize;
+        let slice = &mmap[start..start + payload_len as usize];
+        (
+            with_sha256.then(|| sha256_of(slice)),
+            with_blake3.then(|| blake3_of(slice)),
+        )
+    } else {
+        (None, None)
+    };
+
+    entries.push(ChunkEntry {
+        id,
+        kind: ChunkType::Tensors.to_u8(),
+        name: name.into(),
+        offset: cursor,
+        header_len: hlen as u32,
+        payload_off: cursor + hlen,
+        payload_len,
+        raw_len: payload_len,
+        flags: 0,
+        crc32c: crc,
+        status: CHUNK_STATUS_ALIVE,
+        sha256,
+        blake3,
+        tag: None,
+        metadata: Default::default(),
+    });
+    Ok(cursor + chunk_total_size(name_bytes.len(), payload_len))
 }
 
 /// Запись чанка с in-memory payload'ом. Используется для `FilePayload::Owned`.

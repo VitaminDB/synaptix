@@ -36,6 +36,17 @@ pub struct RunArgs {
     pub graph: bool,
     /// Прогон prefill+1-токен до замера (прогрев NVRTC JIT для честного бенча).
     pub warmup: bool,
+    /// MTP (multi-token prediction): спекулятивный декод на встроенной
+    /// nextn-голове модели. Требует greedy (--temperature 0) и mtp.* в бандле.
+    /// Включается автоматически при выполнении условий; флаг делает требование
+    /// жёстким (ошибка, если MTP недоступен).
+    pub mtp: bool,
+    /// Запретить MTP даже когда он доступен.
+    pub no_mtp: bool,
+    /// Отключить CUDA-graph для MTP verify-шага (для сравнения/отладки).
+    pub no_graph_mtp: bool,
+    /// Изображение для мультимодального промпта (Qwen3.6-VL).
+    pub image: Option<PathBuf>,
 }
 
 /// `--kv-dtype` → DType KV-кеша. Делегирует в единый фасад.
@@ -192,12 +203,83 @@ fn run_hybrid(
 
     let compute = precision.compute;
     let t0 = std::time::Instant::now();
-    let pipeline = HybridPipeline::load_with_precision(&args.model, device, precision, args.max_seq)
-        .map_err(|e| format!("load: {e}"))?;
+    let greedy = args.temperature == 0.0;
+    let want_mtp = !args.no_mtp && (args.mtp || greedy) && args.image.is_none();
+    let pipeline = HybridPipeline::load_with_precision_mtp(
+        &args.model, device, precision, args.max_seq, want_mtp,
+    )
+    .map_err(|e| format!("load: {e}"))?;
+    if args.mtp && !pipeline.has_mtp() {
+        return Err("MTP запрошен, но mtp.* нет в бандле (нужен MTP-вариант GGUF)".into());
+    }
+    if args.mtp && !greedy {
+        return Err("MTP-декод реализован для greedy: укажите --temperature 0".into());
+    }
+    let use_mtp = pipeline.has_mtp() && greedy && !args.no_mtp;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
-    let prompt_ids = pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?;
+    let mut pipeline = pipeline;
+    let image_embeds = match &args.image {
+        Some(path) => {
+            if !pipeline
+                .load_vision(&args.model, compute)
+                .map_err(|e| format!("vision load: {e}"))?
+            {
+                return Err("в бандле нет компонента `vision` (сконвертируйте GGUF с --mmproj)".into());
+            }
+            let limits = synaptix_vlm_qwen3::PreprocessLimits::default();
+            let n = pipeline
+                .image_token_count(path, limits)
+                .map_err(|e| format!("image: {e}"))?;
+            let emb = pipeline
+                .encode_image(path, limits)
+                .map_err(|e| format!("image: {e}"))?;
+            eprintln!("synaptix run: image {} → {} vision-токенов", path.display(), n);
+            Some((n, emb))
+        }
+        None => None,
+    };
+    let pipeline = pipeline;
+
+    let prompt_text = match &image_embeds {
+        Some((n, _)) => {
+            let pad = "<|image_pad|>".repeat(*n);
+            format!(
+                "<|im_start|>user\n<|vision_start|>{pad}<|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n",
+                args.prompt
+            )
+        }
+        None => args.prompt.clone(),
+    };
+    let prompt_ids = pipeline.encode(&prompt_text).map_err(|e| format!("tokenize: {e}"))?;
     eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
+
+    if let Some((_, emb)) = &image_embeds {
+        let gen_cfg = GenerationConfig {
+            max_new_tokens: args.max_tokens,
+            temperature: args.temperature,
+            seed: args.seed,
+            max_seq: args.max_seq,
+            ..Default::default()
+        };
+        let mut noop = |_: u32| true;
+        let t = std::time::Instant::now();
+        let (ids, stats) = pipeline
+            .generate_with_images(&prompt_ids, std::slice::from_ref(emb), gen_cfg, &mut noop)
+            .map_err(|e| format!("vlm generate: {e}"))?;
+        let text = pipeline.decode(&ids).map_err(|e| format!("decode: {e}"))?;
+        println!("{text}");
+        eprintln!(
+            "synaptix run: {} prompt + {} new tokens in {} ms | prefill {} ms | decode {} ms ({:.2} tok/s)",
+            stats.prompt_tokens,
+            stats.new_tokens,
+            t.elapsed().as_millis(),
+            stats.prefill_ms,
+            stats.decode_ms,
+            stats.new_tokens as f64 / (stats.decode_ms.max(1) as f64 / 1000.0)
+        );
+        return Ok(());
+    }
 
     let gen_cfg = GenerationConfig {
         max_new_tokens: args.max_tokens,
@@ -206,6 +288,48 @@ fn run_hybrid(
         max_seq: args.max_seq,
         ..Default::default()
     };
+
+    if use_mtp {
+        let mut noop = |_: u32| true;
+        let t = std::time::Instant::now();
+        let graph_mtp = !args.no_graph_mtp && !device.is_cpu() && compute == DType::F16;
+        if !args.no_graph_mtp && !graph_mtp {
+            eprintln!("synaptix run: MTP-граф требует CUDA + compute=F16 → обычный MTP-путь");
+        }
+        #[cfg(feature = "cuda")]
+        let res = if graph_mtp {
+            pipeline.generate_mtp_with_graph(&prompt_ids, gen_cfg, &mut noop)
+        } else {
+            pipeline.generate_mtp(&prompt_ids, gen_cfg, &mut noop)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let res = pipeline.generate_mtp(&prompt_ids, gen_cfg, &mut noop);
+        let (ids, stats, mtp) = res.map_err(|e| format!("mtp generate: {e}"))?;
+        let text = pipeline.decode(&ids).map_err(|e| format!("decode: {e}"))?;
+        println!("{}{}", args.prompt, text);
+        eprintln!(
+            "synaptix run: {} prompt + {} new tokens in {} ms",
+            stats.prompt_tokens,
+            stats.new_tokens,
+            t.elapsed().as_millis()
+        );
+        eprintln!(
+            "synaptix run: prefill {} tok in {} ms | decode {} tok in {} ms ({:.2} tok/s)",
+            stats.prompt_tokens,
+            stats.prefill_ms,
+            stats.new_tokens,
+            stats.decode_ms,
+            stats.new_tokens as f64 / (stats.decode_ms.max(1) as f64 / 1000.0)
+        );
+        eprintln!(
+            "synaptix run: MTP шагов {} | черновиков {} | принято {} ({:.1}%)",
+            mtp.steps,
+            mtp.drafted,
+            mtp.accepted,
+            mtp.acceptance() * 100.0
+        );
+        return Ok(());
+    }
 
     // CUDA-graph для гибрида требует compute=F16 (ядра linear-decode F16-нативные).
     // MXFP8-KV поддержан (B3.6) — квант-KV граф не отключает.

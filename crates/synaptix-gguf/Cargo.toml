@@ -1,0 +1,20 @@
+[package]
+name = "synaptix-gguf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "GGUF v3 reader, ggml block dequantisation and GGUF → .syn repacking."
+
+[dependencies]
+synaptix-bundle = { workspace = true }
+memmap2.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

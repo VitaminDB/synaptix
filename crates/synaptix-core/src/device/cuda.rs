@@ -2,6 +2,7 @@
 mod inner {
     use crate::error::{Result, SynaptixError};
     use cudarc::driver::{CudaContext, CudaStream};
+    pub use cudarc::driver::{CudaGraph, CudaStream as Stream};
     use once_cell::sync::Lazy;
     use parking_lot::RwLock;
     use std::collections::HashMap;

@@ -41,8 +41,31 @@ struct TextConfigRaw {
     layer_types: Vec<String>,
     tie_word_embeddings: bool,
     bos_token_id: Option<u32>,
-    eos_token_id: Option<u32>,
+    eos_token_id: EosField,
+    mtp_num_hidden_layers: usize,
     rope_parameters: RopeParameters,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum EosField {
+    #[default]
+    Absent,
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl EosField {
+    fn ids(&self) -> Vec<u32> {
+        match self {
+            EosField::Absent => Vec::new(),
+            EosField::One(v) => vec![*v],
+            EosField::Many(v) => v.clone(),
+        }
+    }
+    fn first(&self) -> Option<u32> {
+        self.ids().first().copied()
+    }
 }
 
 impl Default for TextConfigRaw {
@@ -69,7 +92,8 @@ impl Default for TextConfigRaw {
             layer_types: Vec::new(),
             tie_word_embeddings: false,
             bos_token_id: Some(248044),
-            eos_token_id: Some(248044),
+            eos_token_id: EosField::One(248044),
+            mtp_num_hidden_layers: 0,
             rope_parameters: RopeParameters { rope_theta: default_rope_theta() },
         }
     }
@@ -100,6 +124,12 @@ pub struct HybridConfig {
     pub tie_word_embeddings: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+    pub eos_token_ids: Vec<u32>,
+    pub mtp_num_hidden_layers: usize,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+    pub vision_start_token_id: Option<u32>,
+    pub vision_end_token_id: Option<u32>,
 }
 
 impl HybridConfig {
@@ -112,7 +142,13 @@ impl HybridConfig {
             .unwrap_or_else(|| root.clone());
         let raw: TextConfigRaw = serde_json::from_value(tc)
             .map_err(|e| ConfigError::Parse(format!("text_config: {e}")))?;
-        Self::from_raw(raw)
+        let mut cfg = Self::from_raw(raw)?;
+        let id = |k: &str| root.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
+        cfg.image_token_id = id("image_token_id");
+        cfg.video_token_id = id("video_token_id");
+        cfg.vision_start_token_id = id("vision_start_token_id");
+        cfg.vision_end_token_id = id("vision_end_token_id");
+        Ok(cfg)
     }
 
     fn from_raw(raw: TextConfigRaw) -> Result<Self, ConfigError> {
@@ -166,7 +202,13 @@ impl HybridConfig {
             layer_kinds,
             tie_word_embeddings: raw.tie_word_embeddings,
             bos_token_id: raw.bos_token_id,
-            eos_token_id: raw.eos_token_id,
+            eos_token_id: raw.eos_token_id.first(),
+            eos_token_ids: raw.eos_token_id.ids(),
+            mtp_num_hidden_layers: raw.mtp_num_hidden_layers,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -288,7 +330,11 @@ impl HybridConfig {
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
-        self.eos_token_id.into_iter().collect()
+        if self.eos_token_ids.is_empty() {
+            self.eos_token_id.into_iter().collect()
+        } else {
+            self.eos_token_ids.clone()
+        }
     }
 }
 
@@ -350,5 +396,39 @@ mod tests {
         assert_eq!(cfg.layer_kind(3), LayerKind::Full);
         assert!(!cfg.tie_word_embeddings);
         assert!(cfg.attn_output_gate);
+    }
+
+    #[test]
+    fn reads_vision_token_ids() {
+        let with = SAMPLE.replace(
+            "\"model_type\": \"qwen3_5\",",
+            "\"model_type\": \"qwen3_5\", \"image_token_id\": 248056, \"vision_start_token_id\": 248053,",
+        );
+        let cfg = HybridConfig::from_hf_bytes(with.as_bytes()).unwrap();
+        assert_eq!(cfg.image_token_id, Some(248056));
+        assert_eq!(cfg.vision_start_token_id, Some(248053));
+        let cfg = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(cfg.image_token_id, None);
+    }
+
+    #[test]
+    fn reads_mtp_layer_count() {
+        let cfg = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(cfg.mtp_num_hidden_layers, 0);
+        let with = SAMPLE.replace(r#""vocab_size": 248320"#, r#""vocab_size": 248320, "mtp_num_hidden_layers": 1"#);
+        let cfg = HybridConfig::from_hf_bytes(with.as_bytes()).unwrap();
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+    }
+
+    #[test]
+    fn eos_token_id_accepts_scalar_and_list() {
+        let one = SAMPLE.replace(r#""eos_token_id": 248044"#, r#""eos_token_id": 248046"#);
+        let cfg = HybridConfig::from_hf_bytes(one.as_bytes()).unwrap();
+        assert_eq!(cfg.eos_ids(), vec![248046]);
+
+        let many = SAMPLE.replace(r#""eos_token_id": 248044"#, r#""eos_token_id": [248046, 248044]"#);
+        let cfg = HybridConfig::from_hf_bytes(many.as_bytes()).unwrap();
+        assert_eq!(cfg.eos_ids(), vec![248046, 248044]);
+        assert_eq!(cfg.eos_token_id, Some(248046));
     }
 }

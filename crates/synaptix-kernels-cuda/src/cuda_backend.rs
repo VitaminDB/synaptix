@@ -20,6 +20,14 @@ pub fn ensure_registered() {
     synaptix_core::backend::registry::register_backend(DeviceKind::Cuda, cuda_backend());
 }
 
+
+fn stream_is_capturing(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> bool {
+    matches!(
+        stream.capture_status(),
+        Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+    )
+}
+
 impl Backend for CudaBackend {
     fn device_kind(&self) -> Device {
         Device::Cuda(0)
@@ -3314,9 +3322,11 @@ impl Backend for CudaBackend {
             q_scale,
             silu,
         )?;
-        stream
-            .synchronize()
-            .map_err(|e| SynaptixError::Cuda(format!("linear_prefill sync: {e:?}")))?;
+        if !stream_is_capturing(&stream) {
+            stream
+                .synchronize()
+                .map_err(|e| SynaptixError::Cuda(format!("linear_prefill sync: {e:?}")))?;
+        }
         Ok(())
     }
 
