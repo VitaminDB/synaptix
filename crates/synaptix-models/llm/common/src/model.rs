@@ -1782,6 +1782,13 @@ impl LinearAttn {
 
         // Backend op: chunk_conv1d + silu + prep_scatter + chunk_gated_delta_rule.
         // out = [h_v, s, dv] F32. Мутирует cs_t/ss_t (dev-зеркала) in-place.
+        let conv_w_c;
+        let conv_w = if conv_w.dtype() == compute {
+            conv_w
+        } else {
+            conv_w_c = conv_w.to_dtype(compute).coerr()?;
+            &conv_w_c
+        };
         let out = {
             let cs_t = state.conv_state_dev.as_mut().ok_or_else(|| missing("conv_state_dev"))?;
             let ss_t = state.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev"))?;

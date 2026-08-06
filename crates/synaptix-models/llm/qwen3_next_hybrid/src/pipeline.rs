@@ -90,6 +90,21 @@ impl HybridPipeline {
         if !enable_mtp || me.config.mtp_num_hidden_layers == 0 {
             return Ok(me);
         }
+        if precision.compute != DType::F16 {
+            eprintln!(
+                "[hybrid] MTP пропущен: спекулятивный путь требует compute=F16, получено {:?}",
+                precision.compute
+            );
+            return Ok(me);
+        }
+        if precision.lm_head == DType::MXFP8 || precision.embed == DType::MXFP8 {
+            eprintln!(
+                "[hybrid] MTP пропущен: MXFP8 lm_head/embed ({:?}/{:?}) роняет verify-граф; \
+                 используйте f16 или nvfp4",
+                precision.lm_head, precision.embed
+            );
+            return Ok(me);
+        }
         let weights = HybridWeights::load(path, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         if !synaptix_llm_common::mtp::present(&weights) {
