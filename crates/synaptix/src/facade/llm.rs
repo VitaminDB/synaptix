@@ -356,10 +356,27 @@ impl LlmPipeline {
                 .generate_streaming(prompt_ids, cfg, sink)
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
-            LlmPipeline::Hybrid(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Hybrid(p) => {
+                if mtp_enabled() && p.has_mtp() && cfg.temperature == 0.0 {
+                    #[cfg(feature = "llm-cuda")]
+                    {
+                        return p
+                            .generate_mtp_with_graph(prompt_ids, cfg, sink)
+                            .map(|_| ())
+                            .map_err(|e| LlmError(e.to_string()));
+                    }
+                    #[cfg(not(feature = "llm-cuda"))]
+                    {
+                        return p
+                            .generate_mtp(prompt_ids, cfg, sink)
+                            .map(|_| ())
+                            .map_err(|e| LlmError(e.to_string()));
+                    }
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             // Llama/Gemma3 ещё не имеют нативного token-by-token стрима: гоняем
             // eager generate и прокручиваем полученные id через sink (псевдо-стрим;
             // сэмплинг top_k/top_p/min_p/repeat_penalty этими пайплайнами пока не
@@ -689,9 +706,15 @@ pub fn load_llm(
         LlmArch::Qwen3 => Qwen3Pipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Qwen3)
             .map_err(|e| LlmError(format!("load qwen3: {e}")))?,
-        LlmArch::Hybrid => HybridPipeline::load_with_precision(path, device, precision, max_seq)
-            .map(LlmPipeline::Hybrid)
-            .map_err(|e| LlmError(format!("load hybrid: {e}")))?,
+        LlmArch::Hybrid => HybridPipeline::load_with_precision_mtp(
+            path,
+            device,
+            precision,
+            max_seq,
+            mtp_enabled(),
+        )
+        .map(LlmPipeline::Hybrid)
+        .map_err(|e| LlmError(format!("load hybrid: {e}")))?,
         LlmArch::Llama => LlamaPipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Llama)
             .map_err(|e| LlmError(format!("load llama: {e}")))?,
@@ -716,6 +739,16 @@ pub fn load_llm_with_policy(
 }
 
 // ── Рантайм-сеттеры (no-op: нативный synaptix управляет иначе) ───────────────
+
+static MTP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_mtp_enabled(on: bool) {
+    MTP_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn mtp_enabled() -> bool {
+    MTP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn set_flash_attn_mode(_mode: FlashAttnMode) {}
 pub fn set_graph_decode_enabled(_on: bool) {}
