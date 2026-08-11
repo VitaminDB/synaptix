@@ -124,7 +124,23 @@ impl Resampler {
 
     fn upsample(&self, x: &Tensor) -> R<Tensor> {
         let x = pad_replicate(x, self.up_pad, self.up_pad)?;
-        let y = x.dwconv1d(&self.up_filter, None, RESAMPLE_RATIO, 0, true)?;
+        let c = x.dims()[1];
+        let y = match x.dwconv1d(&self.up_filter, None, RESAMPLE_RATIO, 0, true) {
+            Ok(v) => v,
+            Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
+                synaptix_ops::conv::conv_transpose1d::conv_transpose1d(
+                    &x,
+                    &self.up_filter,
+                    None,
+                    RESAMPLE_RATIO,
+                    0,
+                    0,
+                    c,
+                    1,
+                )?
+            }
+            Err(e) => return Err(e),
+        };
         let y = y.mul_scalar(RESAMPLE_RATIO as f32)?;
         let n = y.dims()[2];
         let keep = n - self.up_pad_left - self.up_pad_right;
@@ -133,7 +149,15 @@ impl Resampler {
 
     fn downsample(&self, x: &Tensor) -> R<Tensor> {
         let x = pad_replicate(x, self.down_pad_left, self.down_pad_right)?;
-        x.dwconv1d(&self.down_filter, None, RESAMPLE_RATIO, 0, false)
+        let c = x.dims()[1];
+        synaptix_ops::conv::depthwise::depthwise_conv(
+            &x,
+            &self.down_filter,
+            None,
+            RESAMPLE_RATIO,
+            0,
+            c,
+        )
     }
 }
 
@@ -800,8 +824,9 @@ impl AudioVae {
         device: Device,
         dtype: DType,
     ) -> Result<Self, H3Error> {
-        let latents_mean = w.get_as("latents_mean", DType::F32)?;
-        let latents_std = w.get_as("latents_std", DType::F32)?;
+        let c = cfg.vae_latent_channels;
+        let latents_mean = Tensor::from_vec(cfg.latents_mean.clone(), vec![c], device)?;
+        let latents_std = Tensor::from_vec(cfg.latents_std.clone(), vec![c], device)?;
         Ok(Self {
             dec_in_proj: Conv1dW::load_any(w, "dec_in_proj", true, 1, 0, 1, dtype)?,
             decoder: BigVgan::load(w, &cfg, device, dtype)?,
