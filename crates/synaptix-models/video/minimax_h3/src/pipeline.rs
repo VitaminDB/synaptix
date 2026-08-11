@@ -1,0 +1,477 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use synaptix_core::{device::Device, dtype::DType, error::SynaptixError, tensor::Tensor};
+
+use crate::adaln::{mod_segments, AdalnCache, AdalnPlan, ModSegment};
+use crate::config::{
+    audio_latent_frames, frames_for_duration, latent_frames, latent_grid, snap_frame_count,
+    AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP,
+};
+use crate::dit::H3Dit;
+use crate::guider::{apply_cfg, GuiderParams};
+use crate::layout::{Keyframe, LayoutRequest, PackedLayout, RefBlock, SegmentKind};
+use crate::loader::H3Checkpoint;
+use crate::rope::RopeTables;
+use crate::scheduler::H3Scheduler;
+use crate::H3Error;
+
+type R<T> = Result<T, SynaptixError>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DenoiseProgress {
+    pub step: usize,
+    pub total: usize,
+    pub sigma: f64,
+}
+
+#[derive(Default)]
+pub struct DenoiseHooks<'a> {
+    pub progress: Option<&'a (dyn Fn(DenoiseProgress) + Sync)>,
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl DenoiseHooks<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+
+    fn report(&self, step: usize, total: usize, sigma: f64) {
+        if let Some(p) = self.progress {
+            p(DenoiseProgress { step, total, sigma });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    pub width: usize,
+    pub height: usize,
+    pub frame_count: usize,
+    pub latent_t: usize,
+    pub latent_h: usize,
+    pub latent_w: usize,
+    pub audio_t: usize,
+}
+
+impl Geometry {
+    pub fn new(width: usize, height: usize, frame_count: usize) -> Self {
+        let frames = snap_frame_count(frame_count);
+        let (lh, lw) = latent_grid(width, height);
+        Self {
+            width,
+            height,
+            frame_count: frames,
+            latent_t: latent_frames(frames),
+            latent_h: lh,
+            latent_w: lw,
+            audio_t: audio_latent_frames(frames),
+        }
+    }
+
+    pub fn from_duration(width: usize, height: usize, seconds: f64) -> Self {
+        Self::new(width, height, frames_for_duration(seconds))
+    }
+
+    pub fn video_tokens(&self, patch: [usize; 3]) -> usize {
+        (self.latent_t / patch[0]) * (self.latent_h / patch[1]) * (self.latent_w / patch[2])
+    }
+}
+
+pub fn patchify_video(latent: &Tensor, patch: [usize; 3]) -> R<Tensor> {
+    let d = latent.dims().to_vec();
+    let (b, c, tf, hf, wf) = (d[0], d[1], d[2], d[3], d[4]);
+    let (pt, ph, pw) = (patch[0], patch[1], patch[2]);
+    let (t, h, w) = (tf / pt, hf / ph, wf / pw);
+    latent
+        .reshape(vec![b, c, t, pt, h, ph, w, pw])?
+        .permute([0, 2, 4, 6, 1, 3, 5, 7])?
+        .contiguous()?
+        .reshape(vec![b * t * h * w, c * pt * ph * pw])
+}
+
+pub fn unpatchify_video(
+    rows: &Tensor,
+    t: usize,
+    h: usize,
+    w: usize,
+    c: usize,
+    patch: [usize; 3],
+) -> R<Tensor> {
+    let (pt, ph, pw) = (patch[0], patch[1], patch[2]);
+    rows.reshape(vec![1, t, h, w, c, pt, ph, pw])?
+        .permute([0, 4, 1, 5, 2, 6, 3, 7])?
+        .contiguous()?
+        .reshape(vec![1, c, t * pt, h * ph, w * pw])
+}
+
+pub fn pack_audio(latent: &Tensor) -> R<Tensor> {
+    let d = latent.dims().to_vec();
+    let (c, ch, t) = (d[1], d[2], d[3]);
+    latent
+        .reshape(vec![c, ch, t])?
+        .permute([1, 2, 0])?
+        .contiguous()?
+        .reshape(vec![ch * t, c])
+}
+
+pub fn unpack_audio(rows: &Tensor, ch: usize) -> R<Tensor> {
+    let d = rows.dims().to_vec();
+    let t = d[0] / ch;
+    let c = d[1];
+    rows.reshape(vec![ch, t, c])?
+        .permute([2, 0, 1])?
+        .contiguous()?
+        .reshape(vec![1, c, ch, t])
+}
+
+pub struct Conditioning {
+    pub context: Tensor,
+    pub text_tags: Vec<u8>,
+}
+
+pub struct CondRows {
+    pub video: Option<Tensor>,
+    pub audio: Option<Tensor>,
+}
+
+impl Default for CondRows {
+    fn default() -> Self {
+        Self { video: None, audio: None }
+    }
+}
+
+pub struct DenoiseRequest<'a> {
+    pub geometry: Geometry,
+    pub cond: &'a Conditioning,
+    pub negative: Option<&'a Conditioning>,
+    pub keyframes: Vec<Keyframe>,
+    pub refs: Vec<RefBlock>,
+    pub cond_rows: CondRows,
+    pub guider: GuiderParams,
+    pub seed: Option<u64>,
+    pub init_video: Option<Tensor>,
+    pub init_audio: Option<Tensor>,
+    pub visual_cond_aug: Option<f32>,
+    pub audio_cond_aug: Option<f32>,
+}
+
+impl<'a> DenoiseRequest<'a> {
+    pub fn new(geometry: Geometry, cond: &'a Conditioning) -> Self {
+        Self {
+            geometry,
+            cond,
+            negative: None,
+            keyframes: Vec::new(),
+            refs: Vec::new(),
+            cond_rows: CondRows::default(),
+            guider: GuiderParams::positive_only(),
+            seed: None,
+            init_video: None,
+            init_audio: None,
+            visual_cond_aug: None,
+            audio_cond_aug: None,
+        }
+    }
+}
+
+pub struct DenoiseOutput {
+    pub video_latent: Tensor,
+    pub audio_latent: Tensor,
+}
+
+pub struct PreparedRun {
+    pub layout: PackedLayout,
+    pub plan: AdalnPlan,
+    pub segments: Vec<ModSegment>,
+    pub rope: RopeTables,
+    pub video_seg: (usize, usize, usize),
+    pub audio_seg: (usize, usize, usize),
+    pub refined_cond: Tensor,
+    pub refined_negative: Option<Tensor>,
+}
+
+pub fn prepare(
+    dit: &H3Dit,
+    req: &DenoiseRequest<'_>,
+    sched: &H3Scheduler,
+) -> Result<PreparedRun, H3Error> {
+    let g = req.geometry;
+    let text_len = req.cond.context.dims()[1];
+    let layout = PackedLayout::build(
+        &LayoutRequest::new(text_len, g.latent_t, g.latent_h, g.latent_w, g.audio_t)
+            .with_frame_count(g.frame_count)
+            .with_keyframes(req.keyframes.clone())
+            .with_refs(req.refs.clone()),
+    )?;
+    let plan = AdalnPlan::build(&layout, sched, req.visual_cond_aug, req.audio_cond_aug);
+    let segments = mod_segments(&layout, &plan.roles, Some(&req.cond.text_tags));
+    let rope = dit.rope_tables(&layout.positions)?;
+
+    let vseg = layout
+        .segment(SegmentKind::Video)
+        .ok_or_else(|| H3Error::Layout("нет video-сегмента".into()))?;
+    let aseg = layout
+        .segment(SegmentKind::Audio)
+        .ok_or_else(|| H3Error::Layout("нет audio-сегмента".into()))?;
+    let vrow = plan.roles.index(plan.roles.role_for(SegmentKind::Video)) * crate::config::ADALN_MODALITIES;
+    let arow = plan.roles.index(plan.roles.role_for(SegmentKind::Audio)) * crate::config::ADALN_MODALITIES;
+
+    let refined_cond = dit.refine_text(&req.cond.context)?;
+    let refined_negative = match &req.negative {
+        Some(n) => Some(dit.refine_text(&n.context)?),
+        None => None,
+    };
+
+    Ok(PreparedRun {
+        layout,
+        plan,
+        segments,
+        rope,
+        video_seg: (vseg.start, vseg.stop, vrow / crate::config::ADALN_MODALITIES),
+        audio_seg: (aseg.start, aseg.stop, arow / crate::config::ADALN_MODALITIES),
+        refined_cond,
+        refined_negative,
+    })
+}
+
+fn assemble_hidden(
+    prep: &PreparedRun,
+    refined: &Tensor,
+    video_rows: &Tensor,
+    audio_rows: &Tensor,
+) -> R<Tensor> {
+    let mut parts: Vec<Tensor> = Vec::with_capacity(prep.layout.segments.len());
+    let mut voff = 0usize;
+    let mut aoff = 0usize;
+    for seg in &prep.layout.segments {
+        let n = seg.len();
+        if n == 0 {
+            continue;
+        }
+        match seg.kind {
+            SegmentKind::Text => parts.push(refined.narrow(0, 0, n)?.contiguous()?),
+            SegmentKind::Cond | SegmentKind::RefImg | SegmentKind::Video => {
+                parts.push(video_rows.narrow(0, voff, n)?.contiguous()?);
+                voff += n;
+            }
+            SegmentKind::RefAudio | SegmentKind::Audio => {
+                parts.push(audio_rows.narrow(0, aoff, n)?.contiguous()?);
+                aoff += n;
+            }
+        }
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
+}
+
+fn merge_stream_rows(
+    target: &Tensor,
+    cond: Option<&Tensor>,
+    update: &[bool],
+) -> R<Tensor> {
+    let Some(cond) = cond else {
+        return Ok(target.clone());
+    };
+    let mut parts: Vec<Tensor> = Vec::new();
+    let mut t_off = 0usize;
+    let mut c_off = 0usize;
+    let mut i = 0usize;
+    while i < update.len() {
+        let flag = update[i];
+        let mut j = i;
+        while j < update.len() && update[j] == flag {
+            j += 1;
+        }
+        let n = j - i;
+        if flag {
+            parts.push(target.narrow(0, t_off, n)?.contiguous()?);
+            t_off += n;
+        } else {
+            parts.push(cond.narrow(0, c_off, n)?.contiguous()?);
+            c_off += n;
+        }
+        i = j;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
+}
+
+pub fn build_adaln_cache(
+    dit: &H3Dit,
+    ckpt: &H3Checkpoint,
+    prep: &PreparedRun,
+    cache_dtype: DType,
+) -> Result<AdalnCache, H3Error> {
+    dit.build_adaln_cache(&prep.plan, ckpt, cache_dtype)
+}
+
+pub fn init_latents(
+    geometry: Geometry,
+    latents_dim: usize,
+    audio_dim: usize,
+    device: Device,
+    dtype: DType,
+    seed: Option<u64>,
+) -> Result<(Tensor, Tensor), H3Error> {
+    let mut rng = synaptix_ops::rng::Philox4x32::new(seed.unwrap_or(0));
+    let v_shape = vec![1, latents_dim, geometry.latent_t, geometry.latent_h, geometry.latent_w];
+    let a_shape = vec![1, audio_dim, 2, geometry.audio_t];
+    let v = randn(&v_shape, device, dtype, &mut rng)?;
+    let a = randn(&a_shape, device, dtype, &mut rng)?;
+    Ok((v, a))
+}
+
+fn randn(
+    shape: &[usize],
+    device: Device,
+    dtype: DType,
+    rng: &mut synaptix_ops::rng::Philox4x32,
+) -> Result<Tensor, H3Error> {
+    let n: usize = shape.iter().product();
+    let mut v = vec![0f32; n];
+    synaptix_ops::rng::fill_normal_f32(rng, &mut v);
+    Ok(Tensor::from_vec(v, shape.to_vec(), device)?.to_dtype(dtype)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av(
+    dit: &H3Dit,
+    cache: &AdalnCache,
+    prep: &PreparedRun,
+    req: &DenoiseRequest<'_>,
+    sched: &H3Scheduler,
+    hooks: &DenoiseHooks<'_>,
+) -> Result<DenoiseOutput, H3Error> {
+    let cfg = &dit.cfg;
+    let g = req.geometry;
+    let device = dit.device();
+    let compute = dit.compute_dtype();
+
+    let (mut v_lat, mut a_lat) = match (&req.init_video, &req.init_audio) {
+        (Some(v), Some(a)) => (v.clone(), a.clone()),
+        _ => {
+            let (v, a) = init_latents(
+                g,
+                cfg.latents_dim,
+                cfg.audio_latents_dim,
+                device,
+                compute,
+                req.seed,
+            )?;
+            (req.init_video.clone().unwrap_or(v), req.init_audio.clone().unwrap_or(a))
+        }
+    };
+
+    let steps = sched.steps();
+    let patch = cfg.patch_size;
+
+    for step in 0..steps {
+        if hooks.cancelled() {
+            return Err(H3Error::Cancelled);
+        }
+        hooks.report(step, steps, sched.video_sigma(step));
+
+        let v_rows_t = patchify_video(&v_lat, patch)?;
+        let a_rows_t = pack_audio(&a_lat)?;
+        let v_rows = merge_stream_rows(&v_rows_t, req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
+        let a_rows = merge_stream_rows(&a_rows_t, req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
+
+        let v_emb = dit.embed_video(&v_rows)?;
+        let a_emb = dit.embed_audio(&a_rows)?;
+
+        let hidden = assemble_hidden(prep, &prep.refined_cond, &v_emb, &a_emb)?;
+        let (v_out, a_out) = dit.forward(
+            &hidden,
+            cache,
+            step,
+            &prep.segments,
+            &prep.rope,
+            prep.video_seg,
+            prep.audio_seg,
+        )?;
+
+        let (v_out, a_out) = match (&prep.refined_negative, req.guider.needs_uncond(step)) {
+            (Some(neg), true) => {
+                let n_hidden = assemble_hidden(prep, neg, &v_emb, &a_emb)?;
+                let (nv, na) = dit.forward(
+                    &n_hidden,
+                    cache,
+                    step,
+                    &prep.segments,
+                    &prep.rope,
+                    prep.video_seg,
+                    prep.audio_seg,
+                )?;
+                (
+                    apply_cfg(&v_out, &nv, req.guider.cfg_scale)?,
+                    apply_cfg(&a_out, &na, req.guider.cfg_scale)?,
+                )
+            }
+            _ => (v_out, a_out),
+        };
+
+        let v_vel = unpatchify_video(
+            &v_out.mul_scalar(-1.0)?,
+            g.latent_t / patch[0],
+            g.latent_h / patch[1],
+            g.latent_w / patch[2],
+            cfg.latents_dim,
+            patch,
+        )?;
+        let a_vel = unpack_audio(&a_out.mul_scalar(-1.0)?, 2)?;
+
+        let dv = sched.video_dt(step) as f32;
+        let da = sched.audio_dt(step) as f32;
+        v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(dv)?)?;
+        a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(da)?)?;
+    }
+    hooks.report(steps, steps, sched.video_sigma(steps));
+
+    Ok(DenoiseOutput { video_latent: v_lat, audio_latent: a_lat })
+}
+
+pub fn cond_rows_from_keyframe_latents(
+    latents: &[Tensor],
+    patch: [usize; 3],
+    noise_aug: Option<f32>,
+    seed: u64,
+) -> Result<Option<Tensor>, H3Error> {
+    if latents.is_empty() {
+        return Ok(None);
+    }
+    let aug = noise_aug.unwrap_or(VISUAL_COND_TIMESTEP);
+    let mut rows = Vec::with_capacity(latents.len());
+    for z in latents {
+        let r = patchify_video(&z.to_dtype(DType::F32)?, patch)?;
+        rows.push(apply_noise_aug(&r, aug, seed)?);
+    }
+    let refs: Vec<&Tensor> = rows.iter().collect();
+    Ok(Some(Tensor::cat(&refs, 0)?))
+}
+
+pub fn cond_rows_from_audio_latents(
+    latents: &[Tensor],
+    noise_aug: Option<f32>,
+    seed: u64,
+) -> Result<Option<Tensor>, H3Error> {
+    if latents.is_empty() {
+        return Ok(None);
+    }
+    let aug = noise_aug.unwrap_or(AUDIO_COND_TIMESTEP);
+    let mut rows = Vec::with_capacity(latents.len());
+    for z in latents {
+        let r = pack_audio(&z.to_dtype(DType::F32)?)?;
+        rows.push(apply_noise_aug(&r, aug, seed + 1)?);
+    }
+    let refs: Vec<&Tensor> = rows.iter().collect();
+    Ok(Some(Tensor::cat(&refs, 0)?))
+}
+
+fn apply_noise_aug(rows: &Tensor, aug: f32, seed: u64) -> Result<Tensor, H3Error> {
+    if aug >= 1.0 {
+        return Ok(rows.clone());
+    }
+    let mut rng = synaptix_ops::rng::Philox4x32::new(seed);
+    let noise = randn(rows.dims(), rows.device(), rows.dtype(), &mut rng)?;
+    Ok(rows.mul_scalar(aug)?.add(&noise.mul_scalar(1.0 - aug)?)?)
+}

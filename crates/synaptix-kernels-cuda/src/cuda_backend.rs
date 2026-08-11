@@ -1529,6 +1529,80 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn rope_split_partial(
+        &self,
+        x: (&Storage, &Layout),
+        cos: (&Storage, &Layout),
+        sin: (&Storage, &Layout),
+        rot_dim: usize,
+        out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (x_st, x_lo) = x;
+        let (cos_st, cos_lo) = cos;
+        let (sin_st, sin_lo) = sin;
+        let (out_st, _out_lo) = out;
+        let dtype = x_lo.dtype();
+        if cos_lo.dtype() != DType::F32 || sin_lo.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported(
+                "cuda rope_split_partial: cos/sin must be F32",
+            ));
+        }
+        let xr = x_lo.dims().len();
+        if xr < 2 {
+            return Err(SynaptixError::Unsupported("cuda rope_split_partial: x rank < 2"));
+        }
+        let d = x_lo.dims()[xr - 1];
+        let s_len = x_lo.dims()[xr - 2];
+        if rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > d {
+            return Err(SynaptixError::Unsupported("cuda rope_split_partial: rot_dim"));
+        }
+        if cos_lo.dims().len() != 2 || cos_lo.dims()[0] != s_len || cos_lo.dims()[1] * 2 != rot_dim
+        {
+            return Err(SynaptixError::Unsupported("cuda rope_split_partial: cos shape"));
+        }
+        if sin_lo.dims() != cos_lo.dims() {
+            return Err(SynaptixError::Unsupported("cuda rope_split_partial: sin shape"));
+        }
+        if !x_lo.is_contiguous() || !cos_lo.is_contiguous() || !sin_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let rows = x_lo.numel() / d.max(1);
+        let x_buf = x_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("cuda rope_split_partial: x non-cuda"))?;
+        let cos_buf = cos_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("cuda rope_split_partial: cos non-cuda"))?;
+        let sin_buf = sin_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("cuda rope_split_partial: sin non-cuda"))?;
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("cuda rope_split_partial: out non-cuda"))?;
+        let ctx = x_buf.device().clone();
+        let ord = x_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::elementwise::rope::RopeKernels::for_context(&ctx)?;
+        crate::elementwise::rope::run_rope_split_partial_u8(
+            &kernels,
+            &stream,
+            x_buf.slice(),
+            x_lo.byte_offset(),
+            out_buf.slice_mut(),
+            0,
+            cos_buf.slice(),
+            cos_lo.byte_offset(),
+            sin_buf.slice(),
+            sin_lo.byte_offset(),
+            rows as u32,
+            s_len as u32,
+            d as u32,
+            rot_dim as u32,
+            dtype,
+        )
+    }
+
     fn rope_interleaved(
         &self,
         x: (&Storage, &Layout),
@@ -2785,6 +2859,72 @@ impl Backend for CudaBackend {
             dim as u32,
             vocab as u32,
             dtype,
+        )
+    }
+
+    fn embed_gather_mxfp8(
+        &self,
+        table: &Storage,
+        scales: &Storage,
+        ids: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        vocab: usize,
+        dim: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (ids_st, ids_lo) = ids;
+        let (out_st, out_lo) = out;
+        if ids_lo.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported(
+                "cuda embed_gather_mxfp8: ids must be U32",
+            ));
+        }
+        if out_lo.dtype() != DType::F16 {
+            return Err(SynaptixError::Unsupported(
+                "cuda embed_gather_mxfp8: out must be F16",
+            ));
+        }
+        if !ids_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let n_ids = ids_lo.numel();
+        let table_buf = table.as_cuda().ok_or(SynaptixError::Unsupported(
+            "cuda embed_gather_mxfp8: table non-cuda",
+        ))?;
+        let scales_buf = scales.as_cuda().ok_or(SynaptixError::Unsupported(
+            "cuda embed_gather_mxfp8: scales non-cuda",
+        ))?;
+        let ctx = table_buf.device().clone();
+        let ord = table_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::embed::EmbedKernels::for_context(&ctx)?;
+        let ids_buf = ids_st.as_cuda().ok_or(SynaptixError::Unsupported(
+            "cuda embed_gather_mxfp8: ids non-cuda",
+        ))?;
+        let ids_off = ids_lo.byte_offset();
+        let ids_view = unsafe {
+            ids_buf
+                .slice()
+                .slice(ids_off..ids_off + n_ids * 4)
+                .transmute::<u32>(n_ids)
+                .ok_or_else(|| SynaptixError::Cuda("embed_gather_mxfp8: transmute ids".into()))?
+        };
+        let out_buf = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported(
+            "cuda embed_gather_mxfp8: out non-cuda",
+        ))?;
+        crate::embed::embed_gather_mxfp8(
+            &kernels,
+            &stream,
+            table_buf.slice(),
+            0,
+            scales_buf.slice(),
+            0,
+            &ids_view,
+            out_buf.slice_mut(),
+            0,
+            n_ids as u32,
+            dim as u32,
+            vocab as u32,
         )
     }
 

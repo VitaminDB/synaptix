@@ -370,6 +370,22 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("rope_split не поддержан этим backend"))
     }
 
+    /// Partial Split RoPE: вращает первые `rot_dim` из `D`, остальные измерения
+    /// проходят без изменений. `x[.., S, D]`, `cos`/`sin` — F32 `[S, rot_dim/2]`.
+    /// Позиция строки = `row % S`, что даёт broadcast по головам при layout
+    /// `[H, S, D]`. Default `Unsupported`.
+    fn rope_split_partial(
+        &self,
+        _x: (&Storage, &Layout),
+        _cos: (&Storage, &Layout),
+        _sin: (&Storage, &Layout),
+        _rot_dim: usize,
+        _out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("rope_split_partial не поддержан этим backend"))
+    }
+
     /// Interleaved (adjacent-pair / FLUX use_real_unbind_dim=-1) RoPE одним ядром.
     /// `x`/`out` [B,S,H,D]; `cos`/`sin` — F32 ПОЛНАЯ таблица [S,D]. `h` = число
     /// голов (позиция = (row/h)%S). Заменяет ~10 decomposed-ops. Default Unsupported.
@@ -575,6 +591,19 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("embed_gather не поддержан этим backend"))
+    }
+
+    fn embed_gather_mxfp8(
+        &self,
+        _table: &Storage,
+        _scales: &Storage,
+        _ids: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _vocab: usize,
+        _dim: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("embed_gather_mxfp8 не поддержан этим backend"))
     }
 
     /// MXFP8-KV квантизующий append: `dst` — MXFP8 `[B,nkv,max_seq,hd]` (E4M3

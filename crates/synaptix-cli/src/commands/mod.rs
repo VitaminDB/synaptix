@@ -5,6 +5,7 @@ pub mod chat;
 pub mod convert;
 pub mod device;
 pub mod diff;
+pub mod h3;
 pub mod imagine;
 pub mod inspect;
 pub mod music;

@@ -25,6 +25,9 @@ pub struct RopeKernels {
     split_f16: CudaFunction,
     split_bf16: CudaFunction,
     split_f32: CudaFunction,
+    split_partial_f16: CudaFunction,
+    split_partial_bf16: CudaFunction,
+    split_partial_f32: CudaFunction,
     interleaved_f16: CudaFunction,
     interleaved_bf16: CudaFunction,
     interleaved_f32: CudaFunction,
@@ -53,6 +56,9 @@ impl RopeKernels {
             split_f16: load_fn(&module, "rope_split_f16")?,
             split_bf16: load_fn(&module, "rope_split_bf16")?,
             split_f32: load_fn(&module, "rope_split_f32")?,
+            split_partial_f16: load_fn(&module, "rope_split_partial_f16")?,
+            split_partial_bf16: load_fn(&module, "rope_split_partial_bf16")?,
+            split_partial_f32: load_fn(&module, "rope_split_partial_f32")?,
             interleaved_f16: load_fn(&module, "rope_interleaved_f16")?,
             interleaved_bf16: load_fn(&module, "rope_interleaved_bf16")?,
             interleaved_f32: load_fn(&module, "rope_interleaved_f32")?,
@@ -298,6 +304,97 @@ pub fn run_rope_split_u8(
         DType::BF16 => go!(bf16, &kernels.split_bf16),
         DType::F32 => go!(f32, &kernels.split_f32),
         _ => return Err(SynaptixError::Unsupported("rope_split: dtype")),
+    }
+    Ok(())
+}
+
+/// Partial split RoPE из untyped `u8`: вращает первые `rot_dim` из `d`, остальные
+/// пропускает. `x`/`out` — `dtype` [.., S, D] (rows = numel/D, позиция = row % S);
+/// `cos`/`sin` — F32 [S, rot_dim/2]. Один launch на (rows) строк, ротация в F32.
+#[allow(clippy::too_many_arguments)]
+pub fn run_rope_split_partial_u8(
+    kernels: &RopeKernels,
+    stream: &Arc<CudaStream>,
+    x: &CudaSlice<u8>,
+    x_off: usize,
+    out: &mut CudaSlice<u8>,
+    out_off: usize,
+    cos: &CudaSlice<u8>,
+    cos_off: usize,
+    sin: &CudaSlice<u8>,
+    sin_off: usize,
+    rows: u32,
+    s_len: u32,
+    d: u32,
+    rot_dim: u32,
+    dtype: DType,
+) -> Result<()> {
+    if rows == 0 || d == 0 {
+        return Ok(());
+    }
+    if rot_dim % 2 != 0 || rot_dim > d {
+        return Err(SynaptixError::Cuda(format!(
+            "rope_split_partial: rot_dim={rot_dim} vs head_dim={d}"
+        )));
+    }
+    if d > 1024 {
+        return Err(SynaptixError::Cuda(format!(
+            "rope_split_partial: head_dim={d} > 1024"
+        )));
+    }
+    let esz = (dtype.size_in_bits() / 8) as usize;
+    let xn = (rows as usize) * (d as usize);
+    let cn = (s_len as usize) * (rot_dim as usize / 2);
+    let cfg = LaunchConfig {
+        grid_dim: (rows, 1, 1),
+        block_dim: (d, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let cos_v = unsafe {
+        cos.slice(cos_off..cos_off + cn * 4)
+            .transmute::<f32>(cn)
+            .ok_or_else(|| SynaptixError::Cuda("rope_split_partial: transmute cos".into()))?
+    };
+    let sin_v = unsafe {
+        sin.slice(sin_off..sin_off + cn * 4)
+            .transmute::<f32>(cn)
+            .ok_or_else(|| SynaptixError::Cuda("rope_split_partial: transmute sin".into()))?
+    };
+
+    macro_rules! go {
+        ($t:ty, $func:expr) => {{
+            let x_v = unsafe {
+                x.slice(x_off..x_off + xn * esz)
+                    .transmute::<$t>(xn)
+                    .ok_or_else(|| SynaptixError::Cuda("rope_split_partial: transmute x".into()))?
+            };
+            let mut o_s = out.slice_mut(out_off..out_off + xn * esz);
+            let mut o_v = unsafe {
+                o_s.transmute_mut::<$t>(xn).ok_or_else(|| {
+                    SynaptixError::Cuda("rope_split_partial: transmute out".into())
+                })?
+            };
+            let mut b = stream.launch_builder($func);
+            b.arg(&x_v)
+                .arg(&mut o_v)
+                .arg(&cos_v)
+                .arg(&sin_v)
+                .arg(&s_len)
+                .arg(&d)
+                .arg(&rot_dim);
+            unsafe {
+                b.launch(cfg).map_err(|e| {
+                    SynaptixError::Cuda(format!("launch rope_split_partial: {e:?}"))
+                })?;
+            }
+        }};
+    }
+
+    match dtype {
+        DType::F16 => go!(f16, &kernels.split_partial_f16),
+        DType::BF16 => go!(bf16, &kernels.split_partial_bf16),
+        DType::F32 => go!(f32, &kernels.split_partial_f32),
+        _ => return Err(SynaptixError::Unsupported("rope_split_partial: dtype")),
     }
     Ok(())
 }
