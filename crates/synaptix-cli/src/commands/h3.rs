@@ -77,7 +77,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cuda(args.device);
     let compute = parse_dtype(args.compute_dtype.as_deref(), DType::BF16)?;
     let quant_dit = parse_dtype(args.quant_transformer.as_deref(), DType::NVFP4)?;
-    let quant_enc = parse_dtype(args.quant_encoder.as_deref(), DType::MXFP8)?;
+    let quant_enc = parse_dtype(args.quant_encoder.as_deref(), DType::NVFP4)?;
 
     let variant = args
         .variant

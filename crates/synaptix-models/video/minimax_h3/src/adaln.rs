@@ -254,6 +254,7 @@ impl AdalnCache {
         self.blocks[block]
             .narrow(0, step, 1)?
             .narrow(1, chunk, 1)?
+            .contiguous()?
             .reshape(vec![self.rows, self.hidden])
     }
 
@@ -262,14 +263,15 @@ impl AdalnCache {
             .narrow(0, step, 1)?
             .narrow(1, chunk, 1)?
             .narrow(2, row, 1)?
-            .reshape(vec![1, self.hidden])?
-            .contiguous()
+            .contiguous()?
+            .reshape(vec![1, self.hidden])
     }
 
     pub fn final_chunk(&self, step: usize, chunk: usize) -> R<Tensor> {
         self.final_layer
             .narrow(0, step, 1)?
             .narrow(1, chunk, 1)?
+            .contiguous()?
             .reshape(vec![self.final_rows, self.hidden])
     }
 
@@ -278,8 +280,8 @@ impl AdalnCache {
             .narrow(0, step, 1)?
             .narrow(2, row, 1)?
             .narrow(1, chunk, 1)?
-            .reshape(vec![1, self.hidden])?
-            .contiguous()
+            .contiguous()?
+            .reshape(vec![1, self.hidden])
     }
 
     pub fn num_blocks(&self) -> usize {

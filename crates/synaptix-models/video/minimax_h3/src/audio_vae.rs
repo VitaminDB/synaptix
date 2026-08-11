@@ -554,6 +554,7 @@ impl CausalAttention {
         let qkv = qkv.reshape(vec![n, 3, self.heads, self.head_dim])?;
         let take = |i: usize| -> R<Tensor> {
             qkv.narrow(1, i, 1)?
+                .contiguous()?
                 .reshape(vec![n, self.heads, self.head_dim])?
                 .transpose(0, 1)?
                 .contiguous()?
@@ -925,6 +926,7 @@ impl AudioVae {
         for i in 0..b * s {
             let row = seq
                 .narrow(0, i, 1)?
+                .contiguous()?
                 .reshape(vec![self.cfg.latent_dim, t])?
                 .transpose(0, 1)?
                 .contiguous()?;
