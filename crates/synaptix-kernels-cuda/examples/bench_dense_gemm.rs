@@ -1,6 +1,5 @@
 //! Бенч dense BF16 GEMM (Tensor::matmul → cutlass dense_gemm) на SDXL FF-формах.
 //! Сравнение с torch.matmul (scripts/reference). TFLOP/s = 2*M*N*K / time.
-#![cfg(feature = "cuda")]
 
 use std::time::Instant;
 use synaptix_core::device::Device;

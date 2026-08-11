@@ -8,7 +8,6 @@ description = "Synaptix: операторы (attention/ssm/ffn/norm/pos/conv/emb
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda", "synaptix-kernels-cuda/cuda"]
 
 [dependencies]
 synaptix-core         = { workspace = true }

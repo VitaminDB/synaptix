@@ -8,7 +8,6 @@ description = "HiDream."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

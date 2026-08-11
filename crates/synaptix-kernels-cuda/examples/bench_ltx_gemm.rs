@@ -2,7 +2,6 @@
 //! nvfp4, mxfp8 (on-the-fly квант активации — как делает QuantLinear в проде).
 //! TFLOP/s = 2*M*N*K / time. NVRTC-компиляция вырезана прогревом (warmup).
 //! Запускать ПО ОДНОМУ процессу (см. память: параллель = OOM-фриз).
-#![cfg(feature = "cuda")]
 
 use std::time::Instant;
 use synaptix_core::device::{self, Device};

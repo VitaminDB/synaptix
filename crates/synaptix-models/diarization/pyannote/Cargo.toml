@@ -8,7 +8,6 @@ description = "Pyannote diarization."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

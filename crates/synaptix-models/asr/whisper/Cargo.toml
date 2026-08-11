@@ -8,10 +8,9 @@ description = "Whisper v1 / v2 / v3."
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda", "dep:synaptix-infer", "synaptix-infer/cuda"]
 
 [dependencies]
-synaptix-infer     = { workspace = true, optional = true }
+synaptix-infer     = { workspace = true }
 synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
@@ -27,5 +26,5 @@ safetensors        = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu  = { workspace = true }
-synaptix-kernels-cuda = { workspace = true, features = ["cuda"] }
+synaptix-kernels-cuda = { workspace = true }
 synaptix-test-utils   = { workspace = true }

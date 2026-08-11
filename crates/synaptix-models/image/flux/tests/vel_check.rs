@@ -1,7 +1,6 @@
 //! Сверка velocity forward_cap (CUDA) с Python vel0 — тем же путём, что
 //! cpu_vs_cuda. Резолвит противоречие CLI(0.954)-vs-test(CPU≡CUDA). feature cuda.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};

@@ -1,6 +1,5 @@
 //! Диагностика LTX v_attn1: flash_attention на формах stage1 (T=3520) и
 //! stage2 (T=14080), [1,32,T,128] BF16. Эффективные TF = 4·T²·h·dh / t.
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

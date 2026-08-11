@@ -8,7 +8,6 @@ description = "CosyVoice 2."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

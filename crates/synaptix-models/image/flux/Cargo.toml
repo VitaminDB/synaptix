@@ -8,7 +8,6 @@ description = "FLUX.1 (dev / schnell) — text→image, нативная реа�
 
 [features]
 default = []
-cuda = ["dep:synaptix-kernels-cuda"]
 
 [dependencies]
 synaptix-core      = { workspace = true }
@@ -19,7 +18,7 @@ synaptix-bundle    = { workspace = true }
 synaptix-config    = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-diffusion = { workspace = true }
-synaptix-kernels-cuda = { workspace = true, optional = true }
+synaptix-kernels-cuda = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

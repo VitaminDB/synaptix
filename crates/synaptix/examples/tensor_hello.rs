@@ -17,7 +17,6 @@ fn main() -> Result<()> {
     println!("CPU matmul result:");
     println!("{c_cpu}");
 
-    #[cfg(feature = "cuda")]
     {
         if synaptix::device::cuda::get(0).is_ok() {
             let a_g = a.to_device(Device::Cuda(0))?;

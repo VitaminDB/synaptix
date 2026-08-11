@@ -2,7 +2,6 @@
 //! Замеряет время/вызов и эффективную DRAM-bandwidth (вес читается раз/вызов).
 //! NVRTC: правка gemv_nvfp4.cu подхватывается без пересборки Rust.
 //! Запуск: cargo run --release --example bench_nvfp4_gemv --features cuda
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::CudaSlice;
 use half::f16;

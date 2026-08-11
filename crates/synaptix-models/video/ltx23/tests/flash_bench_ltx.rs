@@ -2,7 +2,6 @@
 //! (v_attn1 = 64% шага по SYN_LTX_PROF). Замер ms/вызов + TFLOPS без QKV-GEMM
 //! и транспозов. ncu: echo 1|sudo -S ncu -k regex:flash_splitq -c 3 -s 5 <bin>.
 
-#![cfg(feature = "cuda")]
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 

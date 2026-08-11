@@ -22,7 +22,6 @@ impl PinnedBuf {
     /// `alloc_zeroed`. Это безопасно: API ниже всё равно отдаёт обычный slice u8.
     pub fn new(len: usize) -> Self {
         let allocated = len.max(1);
-        #[cfg(feature = "cuda")]
         {
             if let Ok(ptr) = try_cuda_alloc(allocated) {
                 // cuMemHostAlloc не гарантирует zero-init, обнулим явно — это
@@ -40,7 +39,6 @@ impl PinnedBuf {
     /// целиком — pinned-кэш offload-весов: обнулять десятки GB накладно и незачем).
     pub fn new_uninit(len: usize) -> Self {
         let allocated = len.max(1);
-        #[cfg(feature = "cuda")]
         {
             if let Ok(ptr) = try_cuda_alloc(allocated) {
                 return Self { ptr, len, is_cuda_pinned: true };
@@ -75,7 +73,6 @@ impl PinnedBuf {
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
         if self.ptr.is_null() { return; }
-        #[cfg(feature = "cuda")]
         if self.is_cuda_pinned {
             unsafe {
                 let _ = cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void);
@@ -87,7 +84,6 @@ impl Drop for PinnedBuf {
     }
 }
 
-#[cfg(feature = "cuda")]
 fn try_cuda_alloc(num_bytes: usize) -> Result<*mut u8, ()> {
     // cuMemHostAlloc требует initialized CUDA context. Возвращаем Err если что-то не так
     // — тогда вызов upgradeитcя на std::alloc fallback. Никогда не паникуем.

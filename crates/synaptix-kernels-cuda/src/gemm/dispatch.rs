@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::f16;
@@ -477,6 +478,51 @@ pub fn nvfp4_quantize_act(
 /// тогда вызывающий делает фолбэк (dequant→BF16). Bit-точность: квант построчный, хвост
 /// паддинга нулевой и отбрасывается копией первых m строк.
 #[allow(clippy::too_many_arguments)]
+struct Mxfp8Scratch {
+    xq: CudaSlice<u8>,
+    sa: CudaSlice<u8>,
+}
+
+static MXFP8_SCRATCH: OnceLock<Mutex<HashMap<usize, Mxfp8Scratch>>> = OnceLock::new();
+
+fn with_mxfp8_scratch<R>(
+    stream: &Arc<CudaStream>,
+    ordinal: usize,
+    xq_need: usize,
+    sa_need: usize,
+    f: impl FnOnce(&mut CudaSlice<u8>, &mut CudaSlice<u8>) -> Result<R>,
+) -> Result<R> {
+    let cache = MXFP8_SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| SynaptixError::Cuda("mxfp8 scratch: poisoned".into()))?;
+    let slot = guard.entry(ordinal);
+    let entry = match slot {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let xq = stream
+                .alloc_zeros::<u8>(xq_need.max(1))
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc xq scratch: {e:?}")))?;
+            let sa = stream
+                .alloc_zeros::<u8>(sa_need.max(1))
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc sa scratch: {e:?}")))?;
+            e.insert(Mxfp8Scratch { xq, sa })
+        }
+    };
+    if entry.xq.len() < xq_need {
+        entry.xq = stream
+            .alloc_zeros::<u8>(xq_need)
+            .map_err(|e| SynaptixError::Cuda(format!("mxfp8: grow xq scratch: {e:?}")))?;
+    }
+    if entry.sa.len() < sa_need {
+        entry.sa = stream
+            .alloc_zeros::<u8>(sa_need)
+            .map_err(|e| SynaptixError::Cuda(format!("mxfp8: grow sa scratch: {e:?}")))?;
+    }
+    let Mxfp8Scratch { xq, sa } = entry;
+    f(xq, sa)
+}
+
 pub fn mxfp8_linear_tiled(
     qk: &Mxfp8QuantKernels,
     ctx: &Arc<CudaContext>,
@@ -520,27 +566,27 @@ pub fn mxfp8_linear_tiled(
     // → скретчи ровно на m строк и GEMM ПРЯМО в out при любом m (старый путь
     // m_pad-скретчей+копий стоил ~1GB DRAM/вызов на 26520).
     let scratch_rows = if use_rot { m_us } else { mp_us };
-    let mut xq = unsafe { stream.alloc::<u8>(scratch_rows * k_us) }
-        .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc xq: {e:?}")))?;
-    let mut sa = unsafe { stream.alloc::<u8>(scratch_rows * k_us / 32) }
-        .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc sa: {e:?}")))?;
-    {
-        let x_view = unsafe { x_u8.transmute::<f16>(m_us * k_us) }
-            .ok_or_else(|| SynaptixError::Cuda("mxfp8: transmute x→f16".into()))?;
-        crate::elementwise::quant::mxfp8_quant_natural(qk, stream, &x_view, &mut xq, &mut sa, m, k)?;
-    }
-    if !use_rot && !aligned {
-        let mut xq_tail = xq.slice_mut(m_us * k_us..);
-        stream
-            .memset_zeros(&mut xq_tail)
-            .map_err(|e| SynaptixError::Cuda(format!("mxfp8: zero xq tail: {e:?}")))?;
-        let mut sa_tail = sa.slice_mut(m_us * k_us / 32..);
-        stream
-            .memset_zeros(&mut sa_tail)
-            .map_err(|e| SynaptixError::Cuda(format!("mxfp8: zero sa tail: {e:?}")))?;
-    }
+    let xq_need = scratch_rows * k_us;
+    let sa_need = scratch_rows * k_us / 32;
+    with_mxfp8_scratch(stream, ctx.ordinal(), xq_need, sa_need, |xq, sa| {
+        {
+            let x_view = unsafe { x_u8.transmute::<f16>(m_us * k_us) }
+                .ok_or_else(|| SynaptixError::Cuda("mxfp8: transmute x→f16".into()))?;
+            crate::elementwise::quant::mxfp8_quant_natural(qk, stream, &x_view, xq, sa, m, k)?;
+        }
+        if !use_rot && !aligned {
+            let mut xq_tail = xq.slice_mut(m_us * k_us..xq_need);
+            stream
+                .memset_zeros(&mut xq_tail)
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8: zero xq tail: {e:?}")))?;
+            let mut sa_tail = sa.slice_mut(m_us * k_us / 32..sa_need);
+            stream
+                .memset_zeros(&mut sa_tail)
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8: zero sa tail: {e:?}")))?;
+        }
 
-    run_mxfp8_gemm(&gk, stream, &xq, w_packed, &sa, w_scales, out_u8, m, m_pad, n, k, use_rot, aligned)
+        run_mxfp8_gemm(&gk, stream, xq, w_packed, sa, w_scales, out_u8, m, m_pad, n, k, use_rot, aligned)
+    })
 }
 
 /// MXFP8 linear из УЖЕ квантованной активации (`xq` packed [m,k] e4m3 + `sa`

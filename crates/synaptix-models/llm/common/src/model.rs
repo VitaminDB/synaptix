@@ -2,6 +2,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::Result as CoreResult;
 use synaptix_core::error::SynaptixError;
+use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 use synaptix_ops::attention::linear::{
     gated_delta_decay_beta, gated_delta_net_recurrent, GatedDeltaNetState,
@@ -328,7 +329,8 @@ pub struct DecoderModel {
     pub device: Device,
     pub dtype: DType,
     pub kv_dtype: DType,
-    embed: Tensor,
+    embed: Option<Tensor>,
+    embed_q: Option<QuantWeight>,
     final_norm: Tensor,
     lm_head: QLinear,
     blocks: Vec<Block>,
@@ -556,9 +558,10 @@ impl DecoderModel {
         attn_w: DType,
         mlp_w: DType,
         lm_head_dtype: DType,
+        embed_dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self, ModelError> {
-        Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, rope_capacity)
+        Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity)
     }
 
     /// Авто-выбор резидент/offload для генерации. Пробует резидентную загрузку
@@ -578,11 +581,12 @@ impl DecoderModel {
         attn_w: DType,
         mlp_w: DType,
         lm_head_dtype: DType,
+        embed_dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self, ModelError> {
         let mode = offload_mode();
-        let resident = |()| Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, rope_capacity);
-        let offload = |()| Self::build_ext(cfg, weights, device, Some(Device::Cpu), compute, attn_w, mlp_w, lm_head_dtype, rope_capacity);
+        let resident = |()| Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity);
+        let offload = |()| Self::build_ext(cfg, weights, device, Some(Device::Cpu), compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity);
 
         if device.is_cpu() || mode == OffloadMode::Resident {
             return resident(());
@@ -617,6 +621,7 @@ impl DecoderModel {
         attn_w: DType,
         mlp_w: DType,
         lm_head_dtype: DType,
+        embed_dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self, ModelError> {
         let eps = cfg.rms_norm_eps;
@@ -659,7 +664,25 @@ impl DecoderModel {
                 .map_err(|e| ModelError::Load(e.to_string()))
         };
 
-        let embed = weights.tensor("model.embed_tokens.weight", device, compute)?;
+        let mut embed_dense = Some(weights.tensor("model.embed_tokens.weight", device, compute)?);
+        let embed_quant = if embed_dtype == DType::MXFP8
+            && !cfg.tie_word_embeddings
+            && matches!(device, Device::Cuda(_))
+            && cfg.hidden_size % 32 == 0
+        {
+            let q = embed_dense
+                .as_ref()
+                .unwrap()
+                .quantize_to_mxfp8()
+                .map_err(|e| ModelError::Build(format!("quantize embed to mxfp8: {e}")))?;
+            embed_dense = None;
+            if let Device::Cuda(o) = device {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+            }
+            Some(q)
+        } else {
+            None
+        };
         let final_norm = norm("model.norm.weight")?
             .to_device(device)
             .map_err(|e| ModelError::Load(e.to_string()))?;
@@ -667,7 +690,13 @@ impl DecoderModel {
         // для gather). Иначе грузим lm_head.weight и квантуем по `lm_head_dtype`
         // (NVFP4 [vocab,hidden] %64==0 → GEMV; экономит 2.5GB→0.7GB чтения/токен).
         let lm_head = if cfg.tie_word_embeddings {
-            QLinear::build(embed.clone(), compute, compute)?
+            QLinear::build(
+                embed_dense
+                    .clone()
+                    .ok_or_else(|| ModelError::Build("tied lm_head без embed".into()))?,
+                compute,
+                compute,
+            )?
         } else {
             // lm_head всегда резидентен на `device` (даже при offload); квант
             // считается на GPU. На CPU-устройстве квант недоступен → плотный.
@@ -799,7 +828,8 @@ impl DecoderModel {
             device,
             dtype: compute,
             kv_dtype: compute,
-            embed,
+            embed: embed_dense,
+            embed_q: embed_quant,
             final_norm,
             lm_head,
             blocks,
@@ -821,6 +851,58 @@ impl DecoderModel {
             &self.rope_global
         } else {
             self.rope_local.as_ref().unwrap_or(&self.rope_global)
+        }
+    }
+
+    pub fn rope_capacity(&self) -> usize {
+        self.rope_capacity
+    }
+
+    pub fn kv_bytes_per_token(&self) -> usize {
+        let c = &self.config;
+        let mxfp8 = self.kv_dtype == DType::MXFP8;
+        let elem = if mxfp8 {
+            1 + 1usize.div_ceil(32)
+        } else {
+            (self.dtype.size_in_bits() / 8).max(1)
+        };
+        let per_full = c.num_key_value_heads * c.head_dim * 2 * elem;
+        let full_layers = (0..self.blocks.len())
+            .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
+            .count();
+        per_full * full_layers
+    }
+
+    pub fn has_mxfp8_head_or_embed(&self) -> bool {
+        self.embed_q
+            .as_ref()
+            .map(|q| q.dtype() == DType::MXFP8)
+            .unwrap_or(false)
+            || self.lm_head.quant_dtype() == Some(DType::MXFP8)
+    }
+
+    fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
+        match (&self.embed_q, &self.embed) {
+            (Some(q), _) => {
+                let mut dims = input_ids.dims().to_vec();
+                let flat = input_ids
+                    .contiguous()
+                    .and_then(|t| t.reshape(vec![input_ids.numel()]))
+                    .coerr()?;
+                let emb = q.embed_gather(&flat).coerr()?;
+                dims.push(self.config.hidden_size);
+                emb.reshape(dims).coerr()
+            }
+            (None, Some(t)) => token_embedding(input_ids, t).coerr(),
+            (None, None) => Err(ModelError::Build("embed отсутствует".into())),
+        }
+    }
+
+    fn embed_rows(&self, ids_flat: &Tensor) -> Result<Tensor, ModelError> {
+        match (&self.embed_q, &self.embed) {
+            (Some(q), _) => q.embed_gather(ids_flat).coerr(),
+            (None, Some(t)) => t.embed_gather(ids_flat).coerr(),
+            (None, None) => Err(ModelError::Build("embed отсутствует".into())),
         }
     }
 
@@ -879,7 +961,7 @@ impl DecoderModel {
     }
 
     pub fn embed_ids(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
-        let mut hidden = token_embedding(input_ids, &self.embed).coerr()?;
+        let mut hidden = self.embed_tokens(input_ids)?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
         }
@@ -1005,8 +1087,15 @@ impl DecoderModel {
             }
             synaptix_core::device::cuda::set_offload_pinned(false);
         } else {
+            let sync_ord = match self.device {
+                Device::Cuda(o) => Some(o),
+                _ => None,
+            };
             for (idx, blk) in self.blocks.iter().enumerate() {
                 hidden = step(idx, blk, &hidden, kv_cache)?;
+                if let Some(o) = sync_ord {
+                    synaptix_core::device::cuda::layer_sync(o, s > 1);
+                }
             }
         }
         kv_cache.seq_len = past + s;
@@ -1050,7 +1139,7 @@ impl DecoderModel {
         };
         let pad_ref = pad_bias.as_ref();
 
-        let mut hidden = token_embedding(input_ids, &self.embed).coerr()?;
+        let mut hidden = self.embed_tokens(input_ids)?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
         }
@@ -1209,7 +1298,7 @@ impl DecoderModel {
         // cond+uncond in one forward) with per-row positions in state.pos_dev.
         let b = state.input.dims()[0];
         let ids_flat = state.input.reshape(vec![b]).coerr()?;
-        let emb = prof(dev, "embed_gather", || self.embed.embed_gather(&ids_flat)).coerr()?;
+        let emb = prof(dev, "embed_gather", || self.embed_rows(&ids_flat))?;
         let mut hidden = emb.reshape(vec![b, 1, self.config.hidden_size]).coerr()?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
@@ -1322,7 +1411,7 @@ impl DecoderModel {
         }
         let chunk = state.chunk_size;
         let ids_flat = state.input.reshape(vec![chunk]).coerr()?;
-        let emb = self.embed.embed_gather(&ids_flat).coerr()?;
+        let emb = self.embed_rows(&ids_flat)?;
         let mut hidden = emb.reshape(vec![1usize, chunk, self.config.hidden_size]).coerr()?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;

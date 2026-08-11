@@ -8,7 +8,6 @@ description = "Cohere Command-R / R+."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

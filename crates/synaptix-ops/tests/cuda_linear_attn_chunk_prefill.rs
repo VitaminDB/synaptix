@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! End-to-end: `Tensor::linear_attn_chunk_prefill` (CUDA-резидентная chain
 //! chunk_conv1d → silu → prep_scatter → chunk_gated_delta_rule) vs ПОЛНАЯ

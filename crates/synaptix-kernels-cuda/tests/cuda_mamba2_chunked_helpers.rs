@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Smoke + bit-exact тесты для всех 11 Mamba2 chunked-SSD helpers.
 //! Каждый kernel сверяется с CPU-эталоном на маленьких размерах.

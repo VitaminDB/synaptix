@@ -13,4 +13,3 @@ synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
 
 [features]
-cuda = []

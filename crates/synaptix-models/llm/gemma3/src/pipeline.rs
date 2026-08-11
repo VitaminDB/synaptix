@@ -60,7 +60,7 @@ impl GemmaPipeline {
             .map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
-        let model = DecoderModel::build(&dcfg, &weights, device, dtype, dtype, dtype, dtype, rope_capacity)
+        let model = DecoderModel::build(&dcfg, &weights, device, dtype, dtype, dtype, dtype, dtype, rope_capacity)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
         Ok(Self { model, tokenizer, config })
     }
@@ -118,7 +118,7 @@ impl GemmaPipeline {
             None
         };
         let model = DecoderModel::build_ext(
-            &dcfg, &weights, device, block_device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, rope_capacity,
+            &dcfg, &weights, device, block_device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, rope_capacity,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         // Как в qwen3/llama/hybrid: пробросить --kv-dtype в модель (иначе KV молча

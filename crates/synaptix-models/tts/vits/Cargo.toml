@@ -8,7 +8,6 @@ description = "VITS."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

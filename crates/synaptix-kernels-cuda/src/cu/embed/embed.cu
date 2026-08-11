@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 // Token-embedding gather: out[t, :] = table[ids[t], :].
 //   table [V, D] row-major, ids [N] (u32), out [N, D] row-major.
@@ -42,4 +43,22 @@ extern "C" __global__ void embed_gather_f16(
 extern "C" __global__ void embed_gather_bf16(
     const __nv_bfloat16* table, const unsigned int* ids, __nv_bfloat16* out, int n_ids, int dim, int vocab) {
   embed_gather_impl<__nv_bfloat16>(table, ids, out, n_ids, dim, vocab);
+}
+
+extern "C" __global__ void embed_gather_mxfp8_f16(
+    const __nv_fp8_e4m3* __restrict__ table, const unsigned char* __restrict__ scales,
+    const unsigned int* __restrict__ ids, __half* __restrict__ out,
+    int n_ids, int dim, int vocab) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long total = (long)n_ids * dim;
+  if (idx >= total) return;
+  int t = (int)(idx / dim);
+  int d = (int)(idx % dim);
+  unsigned int row = ids[t];
+  if (row >= (unsigned int)vocab) {
+    out[idx] = __float2half(0.0f);
+    return;
+  }
+  float sv = __uint_as_float(((unsigned)scales[(long)row * (dim / 32) + (d / 32)]) << 23);
+  out[idx] = __float2half(float(table[(long)row * dim + d]) * sv);
 }

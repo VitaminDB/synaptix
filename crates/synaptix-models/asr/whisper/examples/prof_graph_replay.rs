@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 use std::time::Instant;
 

@@ -8,7 +8,6 @@ description = "LTX-2.3 22B."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

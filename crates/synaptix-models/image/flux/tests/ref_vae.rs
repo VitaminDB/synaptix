@@ -7,7 +7,6 @@
 //! и сверяем. Гейт — cos И per-element max-abs (не только cos). Тест
 //! пропускается, если веса/reference отсутствуют. Требует feature `cuda`.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 

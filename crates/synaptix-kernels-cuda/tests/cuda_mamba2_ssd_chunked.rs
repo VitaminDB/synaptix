@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bit-exact (с допуском, см. ниже) тесты Mamba2 chunked-SSD против
 //! recurrent baseline ([`Mamba2SsdKernels::ssd`]) на тех же inputs.

@@ -90,7 +90,7 @@ impl AceStepLm {
         let config = LmConfig::lm_1_7b();
         let dcfg = to_decoder_config(&config);
         let model = DecoderModel::build(
-            &dcfg, &src, device, compute, quant_w, quant_w, compute, rope_capacity,
+            &dcfg, &src, device, compute, quant_w, quant_w, compute, compute, rope_capacity,
         )
         .map_err(|e| AceError::Load(e.to_string()))?;
         Ok(Self { model, config, device, compute })

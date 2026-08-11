@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Корректность best_cu MXFP8 GEMM (block-scale, TMA + warp-spec) end-to-end:
 //! gemm_mxfp8_linear (GPU MXFP8-квант x+w + TMA + gemm) vs CPU-f32 по исходным

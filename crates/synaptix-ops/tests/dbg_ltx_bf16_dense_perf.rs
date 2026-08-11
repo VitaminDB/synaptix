@@ -1,6 +1,5 @@
 //! Диагностика дыры bf16-стрима LTX: прод-путь dense linear (linear_bias_residual →
 //! best_cu TN) на формах DiT-блока stage1/stage2 vs ожидание bf16-карты (~cuBLAS).
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

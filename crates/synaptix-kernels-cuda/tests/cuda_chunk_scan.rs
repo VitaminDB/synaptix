@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Parity: chunked gated delta rule (chunk_scan) vs рекуррентный per-step
 //! (gated_delta_rule). Проверяется многочанковый путь (nc>1) — то, что эталонный

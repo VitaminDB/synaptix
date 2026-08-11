@@ -1,6 +1,5 @@
 //! Диагностика qk_norm ×15 (FLUX квант-путь): тайминг rms_norm на форме
 //! [4608,24,128] F16 vs BF16 + прямой rms_norm_fused (ошибка = причина фолбэка).
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

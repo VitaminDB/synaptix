@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 use half::f16;
 use std::sync::Arc;

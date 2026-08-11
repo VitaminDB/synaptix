@@ -3,7 +3,6 @@ use std::path::Path;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
-#[cfg(feature = "cuda")]
 use synaptix_core::tensor::Tensor;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
@@ -49,7 +48,7 @@ impl HybridPipeline {
             .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?;
         let cap = config.max_position_embeddings.min(4096);
         let dcfg = config.to_decoder_config();
-        let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, cap)
+        let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, dtype, cap)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
         Ok(Self { model, mtp: None, vision: None, tokenizer, config, add_bos: false })
     }
@@ -68,7 +67,7 @@ impl HybridPipeline {
         let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(
-            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, cap,
+            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, cap,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         // БАГ-ФИКС: пробросить kv-dtype (--kv-dtype mxfp8) в модель. Без этого
@@ -97,14 +96,6 @@ impl HybridPipeline {
             );
             return Ok(me);
         }
-        if precision.lm_head == DType::MXFP8 || precision.embed == DType::MXFP8 {
-            eprintln!(
-                "[hybrid] MTP пропущен: MXFP8 lm_head/embed ({:?}/{:?}) роняет verify-граф; \
-                 используйте f16 или nvfp4",
-                precision.lm_head, precision.embed
-            );
-            return Ok(me);
-        }
         let weights = HybridWeights::load(path, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         if !synaptix_llm_common::mtp::present(&weights) {
@@ -121,6 +112,7 @@ impl HybridPipeline {
             precision.attn_w,
             precision.mlp_w,
             precision.lm_head,
+            precision.embed,
             cap,
         )
         .map_err(|e| PipelineError::Model(format!("mtp: {e}")))?;
@@ -132,8 +124,14 @@ impl HybridPipeline {
         self.mtp.is_some()
     }
 
+    pub fn graph_decode_supported(&self) -> bool {
+        matches!(self.model.device, Device::Cuda(_))
+            && self.model.dtype == DType::F16
+            && self.model.kv_dtype != DType::MXFP8
+            && !self.model.has_mxfp8_head_or_embed()
+    }
 
-    #[cfg(feature = "cuda")]
+
     fn build_mtp_graph(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -385,14 +383,14 @@ impl HybridPipeline {
         self.generate_mtp_inner(prompt_ids, gen_cfg, sink, false)
     }
 
-    #[cfg(feature = "cuda")]
     pub fn generate_mtp_with_graph(
         &self,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, true)
+        let use_graph = !self.model.has_mxfp8_head_or_embed();
+        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, use_graph)
     }
 
     fn generate_mtp_inner(
@@ -412,11 +410,7 @@ impl HybridPipeline {
             return Err(PipelineError::Tokenize("empty prompt".into()));
         }
         let cfg = self.prepare_cfg(gen_cfg);
-        if cfg.temperature > 0.0 {
-            return Err(PipelineError::Forward(
-                "MTP-декод реализован для greedy (temperature = 0): спекулятивный сэмплинг с сохранением распределения не подключён".into(),
-            ));
-        }
+        let stochastic = cfg.temperature > 0.0;
         let device = self.model.device;
         let prompt = self.maybe_prepend_bos(prompt_ids);
         let l = prompt.len();
@@ -447,44 +441,69 @@ impl HybridPipeline {
         };
 
         let t0 = std::time::Instant::now();
-        let ids = Tensor::from_vec(prompt.clone(), vec![1usize, l], device)
+        let chunk = match cfg.prefill_batch {
+            0 => l,
+            n => n.max(1),
+        };
+        let mut hidden = None;
+        let mut off = 0usize;
+        while off < l {
+            let end = (off + chunk).min(l);
+            let part = Tensor::from_vec(
+                prompt[off..end].to_vec(),
+                vec![1usize, end - off],
+                device,
+            )
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let hidden = no_grad(|| self.model.forward_trunk(&ids, &mut kv))
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let mut h_prev = hidden
-            .narrow(1, l - 1, 1)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        if l > 1 {
-            let hs = hidden
-                .narrow(1, 0, l - 1)
+            let h = no_grad(|| self.model.forward_trunk(&part, &mut kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let shifted = Tensor::from_vec(prompt[1..].to_vec(), vec![1usize, l - 1], device)
+            let n = end - off;
+            let adv = if end < l { n } else { n - 1 };
+            if adv > 0 {
+                let hs = h
+                    .narrow(1, 0, adv)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                let shifted = Tensor::from_vec(
+                    prompt[off + 1..off + 1 + adv].to_vec(),
+                    vec![1usize, adv],
+                    device,
+                )
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            no_grad(|| mtp.advance(&self.model, &hs, &shifted, &mut mtp_kv))
-                .map_err(|e| PipelineError::Forward(format!("mtp prefill: {e}")))?;
+                no_grad(|| mtp.advance(&self.model, &hs, &shifted, &mut mtp_kv))
+                    .map_err(|e| PipelineError::Forward(format!("mtp prefill: {e}")))?;
+            }
+            hidden = Some(h);
+            off = end;
         }
-        let first = argmax(
-            &self
-                .model
-                .head_at(&hidden, l - 1)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?,
-        )?;
+        let hidden = hidden.ok_or_else(|| PipelineError::Forward("prefill: пустой промпт".into()))?;
+        let last = hidden.dims()[1] - 1;
+        let mut h_prev = hidden
+            .narrow(1, last, 1)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, &prompt);
+        let head0 = self
+            .model
+            .head_at(&hidden, last)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let first = if stochastic {
+            sampler.sample(&head0).map_err(PipelineError::from)?
+        } else {
+            argmax(&head0)?
+        };
         let prefill_ms = t0.elapsed().as_millis();
 
         let mut out: Vec<u32> = vec![first];
         let mut cancelled = !sink.on_token(first);
         let mut cur = first;
         let mut forced: Option<u32> = None;
+        let mut draft_q: Option<Vec<f32>> = None;
         let mut stats = MtpStats::default();
 
-        #[cfg(feature = "cuda")]
         let mut graph_ctx = if use_graph {
             Some(self.build_mtp_graph(&mut kv)?)
         } else {
             None
         };
-        #[cfg(not(feature = "cuda"))]
-        let _ = use_graph;
 
         let mut snap_buf = kv
             .alloc_linear_snapshot()
@@ -504,7 +523,15 @@ impl HybridPipeline {
                     let dl = no_grad(|| mtp.draft_logits(&self.model, &h_prev, &next, &mut mtp_kv))
                         .map_err(|e| PipelineError::Forward(format!("mtp draft: {e}")))?;
                     stats.drafted += 1;
-                    (argmax(&dl)?, true)
+                    let tok = if stochastic {
+                        let q = sampler.probs(&dl).map_err(PipelineError::from)?;
+                        let t = sampler.sample_from_probs(&q);
+                        draft_q = Some(q);
+                        t
+                    } else {
+                        argmax(&dl)?
+                    };
+                    (tok, true)
                 }
             };
             stats.steps += 1;
@@ -516,19 +543,49 @@ impl HybridPipeline {
             let seq_before = kv.seq_len;
 
             let step = {
-                #[cfg(feature = "cuda")]
                 {
                     match graph_ctx.as_mut() {
                         Some(g) => g.run(&mut kv, cur, second, pos as u32)?,
                         None => self.verify_plain(&mut kv, cur, second, device)?,
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    self.verify_plain(&mut kv, cur, second, device)?
-                }
             };
-            let a = argmax(&step.logits0)?;
+            let (a, draft_accepted) = if !was_draft {
+                (second, false)
+            } else if stochastic {
+                let p = sampler.probs(&step.logits0).map_err(PipelineError::from)?;
+                match draft_q.take() {
+                    Some(q) => {
+                        let idx = second as usize;
+                        let qi = q.get(idx).copied().unwrap_or(0.0);
+                        let pi = p.get(idx).copied().unwrap_or(0.0);
+                        let ratio = if qi > 0.0 { (pi / qi).min(1.0) } else { 0.0 };
+                        if sampler.uniform() < ratio {
+                            (second, true)
+                        } else {
+                            let mut resid: Vec<f32> = p
+                                .iter()
+                                .zip(q.iter())
+                                .map(|(pv, qv)| (pv - qv).max(0.0))
+                                .collect();
+                            let sum: f32 = resid.iter().sum();
+                            if sum > 0.0 {
+                                for x in resid.iter_mut() {
+                                    *x /= sum;
+                                }
+                                (sampler.sample_from_probs(&resid), false)
+                            } else {
+                                (sampler.sample_from_probs(&p), false)
+                            }
+                        }
+                    }
+                    None => (sampler.sample_from_probs(&p), false),
+                }
+            } else {
+                let a = argmax(&step.logits0)?;
+                let acc = a == second;
+                (a, acc)
+            };
 
             let fill = Tensor::from_vec(vec![a], vec![1usize, 1], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
@@ -536,7 +593,11 @@ impl HybridPipeline {
                 .map_err(|e| PipelineError::Forward(format!("mtp advance: {e}")))?;
 
             if !was_draft {
-                let b = argmax(&step.logits1)?;
+                let b = if stochastic {
+                    sampler.sample(&step.logits1).map_err(PipelineError::from)?
+                } else {
+                    argmax(&step.logits1)?
+                };
                 out.push(b);
                 cancelled = !sink.on_token(b);
                 h_prev = step.hidden1;
@@ -546,13 +607,18 @@ impl HybridPipeline {
 
             out.push(a);
             cancelled = !sink.on_token(a);
-            if a == second {
+            sampler.commit(a);
+            if draft_accepted {
                 stats.accepted += 1;
                 if eos.contains(&a) || out.len() >= cfg.max_new_tokens {
                     cur = a;
                     continue;
                 }
-                let b = argmax(&step.logits1)?;
+                let b = if stochastic {
+                    sampler.sample(&step.logits1).map_err(PipelineError::from)?
+                } else {
+                    argmax(&step.logits1)?
+                };
                 out.push(b);
                 cancelled = !sink.on_token(b);
                 h_prev = step.hidden1;
@@ -672,7 +738,6 @@ impl HybridPipeline {
     /// одному advance state за launch). Greedy совпадает с [`Self::generate`] с
     /// точностью до F16-compute. Требует CUDA-устройство, **compute=F16** (ядра
     /// linear-decode F16-нативные) и не-FP8 KV.
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph(
         &self,
         prompt_ids: &[u32],
@@ -682,7 +747,6 @@ impl HybridPipeline {
         self.generate_with_graph_streaming(prompt_ids, gen_cfg, &mut noop)
     }
 
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph_streaming(
         &self,
         prompt_ids: &[u32],
@@ -702,7 +766,6 @@ impl HybridPipeline {
     /// (prefix-KV-кэш). После decode синкает device→host linear-состояние, чтобы
     /// следующий ход продолжил host-scan корректно. `prompt_ids` — уже с BOS (если
     /// нужен): caller отвечает за совпадение с кэшированным префиксом.
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -865,7 +928,6 @@ struct VerifyStep {
     hidden1: synaptix_core::tensor::Tensor,
 }
 
-#[cfg(feature = "cuda")]
 pub struct MtpGraph {
     state: synaptix_llm_common::model::PrefillState,
     graph: std::sync::Arc<synaptix_core::device::cuda::CudaGraph>,
@@ -901,7 +963,6 @@ impl HybridPipeline {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl MtpGraph {
     fn run(
         &mut self,
@@ -1014,7 +1075,6 @@ mod tests {
         assert!(!new_ids.is_empty());
     }
 
-    #[cfg(feature = "cuda")]
     fn nvfp4_f16_precision() -> PrecisionConfig {
         PrecisionConfig {
             compute: DType::F16,
@@ -1029,7 +1089,6 @@ mod tests {
     /// Сверка CUDA-graph decode против host-reference (та же модель, greedy):
     /// токены должны совпасть (с точностью до F16-compute). Также печатает
     /// tok/s обоих путей. Gated на `SYN_QWEN_NEXT_GRAPH` + наличие бандла.
-    #[cfg(feature = "cuda")]
     #[test]
     fn cuda_graph_matches_host() {
         if std::env::var("SYN_QWEN_NEXT_GRAPH").is_err() {

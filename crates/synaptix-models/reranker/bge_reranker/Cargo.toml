@@ -8,7 +8,6 @@ description = "BGE-reranker."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

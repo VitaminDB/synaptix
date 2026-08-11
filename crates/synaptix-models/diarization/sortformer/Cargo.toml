@@ -8,7 +8,6 @@ description = "NVIDIA NeMo Streaming Sortformer speaker diarization (4spk v2.1).
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda"]
 
 [dependencies]
 synaptix-core      = { workspace = true }
@@ -25,5 +24,5 @@ safetensors        = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu  = { workspace = true }
-synaptix-kernels-cuda = { workspace = true, features = ["cuda"] }
+synaptix-kernels-cuda = { workspace = true }
 synaptix-test-utils   = { workspace = true }

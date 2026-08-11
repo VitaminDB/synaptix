@@ -89,7 +89,7 @@ impl TextEncoder {
         let src = BundleWeightSource::new(CompLoader::open(path, None, device)?);
         let dcfg = qwen3_embedding_config();
         let model = DecoderModel::build(
-            &dcfg, &src, device, compute, quant_w, quant_w, compute, rope_capacity,
+            &dcfg, &src, device, compute, quant_w, quant_w, compute, compute, rope_capacity,
         )
         .map_err(|e| AceError::Load(e.to_string()))?;
         Ok(Self { model, embed, hidden, device })

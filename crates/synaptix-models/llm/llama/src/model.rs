@@ -24,7 +24,7 @@ mod tests {
         synaptix_kernels_cpu::ensure_registered();
         let w = LlamaWeights::load(&dir, Device::Cpu, DType::F32).expect("load");
         let cfg = w.config.to_decoder_config();
-        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::F32, DType::F32, DType::F32, DType::F32, 64)
+        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::F32, DType::F32, DType::F32, DType::F32, DType::F32, 64)
             .expect("build model");
         let mut kv = model.make_kv_cache(1, 64).expect("make kv cache");
         let ids = Tensor::from_vec(vec![128000u32, 9906, 1917], vec![1usize, 3], Device::Cpu).unwrap();

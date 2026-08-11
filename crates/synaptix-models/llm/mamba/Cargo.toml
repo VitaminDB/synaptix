@@ -8,7 +8,6 @@ description = "Mamba1 / Mamba2 standalone."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

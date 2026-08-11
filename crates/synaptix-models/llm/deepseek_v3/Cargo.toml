@@ -8,7 +8,6 @@ description = "DeepSeek-V3 (MLA + fine-grained MoE)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

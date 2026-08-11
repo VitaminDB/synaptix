@@ -91,7 +91,6 @@ fn debug_display() {
     assert!(s.contains("Tensor"));
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cat_cuda_matches_cpu_reference() {
     if synaptix_core::device::cuda::get(0).is_err() {

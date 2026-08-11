@@ -8,7 +8,6 @@ description = "Hymba (NVIDIA hybrid SSM-attn)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

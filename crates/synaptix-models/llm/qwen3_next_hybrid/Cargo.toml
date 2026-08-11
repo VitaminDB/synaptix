@@ -8,9 +8,6 @@ description = "Qwen3-Next hybrid (gated DeltaNet linear-attention + gated full-a
 
 [features]
 default = []
-# Device-резидентный decode + CUDA-graph (generate_with_graph через
-# GraphCapturer): тянет cuda-пути core + infer (capture/replay) + common.
-cuda = ["synaptix-core/cuda", "synaptix-infer/cuda", "synaptix-llm-common/cuda", "synaptix-vlm-qwen3/cuda"]
 
 [dependencies]
 synaptix-llm-common = { workspace = true }

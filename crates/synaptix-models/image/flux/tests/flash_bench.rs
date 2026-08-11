@@ -2,7 +2,6 @@
 //! footprint (без 23GB-трансформера) → ncu профилируется быстро. Замер ms/вызов +
 //! TFLOPS. ncu: echo 1|sudo -S ncu -k regex:flash_splitq_bf16_hd128 -c 3 -s 5 <bin>.
 
-#![cfg(feature = "cuda")]
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 

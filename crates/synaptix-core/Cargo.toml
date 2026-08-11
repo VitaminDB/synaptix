@@ -7,10 +7,7 @@ license.workspace = true
 description = "Synaptix: фундамент тензоров, dtype, device."
 
 [features]
-# GPU — дефолтный режим synaptix. cudarc/CUDA-код компилятся всегда; выбор
-# Cuda/Cpu — в рантайме. Потребителям не нужно прописывать `cuda`.
-default = ["cuda"]
-cuda = ["dep:cudarc"]
+default = []
 
 [dependencies]
 thiserror   = { workspace = true }
@@ -23,7 +20,7 @@ once_cell   = { workspace = true }
 rand        = { workspace = true }
 serde       = { workspace = true }
 bincode     = { workspace = true }
-cudarc      = { workspace = true, optional = true }
+cudarc      = { workspace = true }
 libc        = { workspace = true }
 
 [dev-dependencies]

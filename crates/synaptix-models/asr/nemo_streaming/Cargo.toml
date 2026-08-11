@@ -8,7 +8,6 @@ description = "NeMo Streaming Conformer."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

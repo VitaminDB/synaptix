@@ -14,10 +14,8 @@
 
 use crate::error::{InferError, Result};
 
-#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-#[cfg(feature = "cuda")]
 use cudarc::driver::{
     sys::{CUgraphInstantiate_flags_enum, CUstreamCaptureMode_enum},
     CudaGraph, CudaStream,
@@ -26,7 +24,6 @@ use cudarc::driver::{
 pub struct GraphCapturer {
     pub warmup_steps: usize,
     captured: bool,
-    #[cfg(feature = "cuda")]
     graph: parking_lot::Mutex<Option<Arc<CudaGraph>>>,
 }
 
@@ -35,7 +32,6 @@ impl GraphCapturer {
         Self {
             warmup_steps,
             captured: false,
-            #[cfg(feature = "cuda")]
             graph: parking_lot::Mutex::new(None),
         }
     }
@@ -56,7 +52,6 @@ impl GraphCapturer {
     ///
     /// Возвращает `Arc<CudaGraph>` — replay-объект (cudarc-обёртка с RAII destroy).
     /// Этот же `Arc` сохраняется внутри capturer и доступен через [`Self::graph`].
-    #[cfg(feature = "cuda")]
     pub fn capture_with<F>(&mut self, stream: &Arc<CudaStream>, mut step: F) -> Result<Arc<CudaGraph>>
     where
         F: FnMut(&Arc<CudaStream>) -> Result<()>,
@@ -115,18 +110,7 @@ impl GraphCapturer {
     }
 
     /// Возвращает захваченный граф, если он есть.
-    #[cfg(feature = "cuda")]
     pub fn graph(&self) -> Option<Arc<CudaGraph>> {
         self.graph.lock().clone()
-    }
-
-    /// Без CUDA-фичи реальный capture не доступен — возвращает понятную ошибку. Сохранена
-    /// исходная сигнатура `capture(&mut self)` для совместимости с прошлым стабом.
-    #[cfg(not(feature = "cuda"))]
-    pub fn capture(&mut self) -> Result<()> {
-        Err(InferError::Other(
-            "CUDA graph capture requires `cuda` feature; rebuild synaptix-infer with --features cuda"
-                .into(),
-        ))
     }
 }

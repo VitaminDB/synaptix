@@ -4,7 +4,6 @@
 //! собираем `T5Encoder::xxl()`, подаём дампнутые ids, сверяем (cos И max-abs).
 //! Требует feature `cuda`.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 

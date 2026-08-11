@@ -8,7 +8,6 @@ description = "GigaAM Conformer."
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda"]
 
 [dependencies]
 synaptix-core   = { workspace = true }
@@ -23,6 +22,6 @@ safetensors     = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu = { workspace = true }
-synaptix-kernels-cuda = { workspace = true, features = ["cuda"] }
+synaptix-kernels-cuda = { workspace = true }
 synaptix-test-utils  = { workspace = true }
 hound = { workspace = true }

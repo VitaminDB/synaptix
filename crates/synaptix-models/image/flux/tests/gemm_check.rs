@@ -2,7 +2,6 @@
 //! ПОЭЛЕМЕНТНО (max-abs, не cos — cos прячет per-row баги). Reference:
 //! `scripts/reference/gen_gemm_ref.py`. Требует feature `cuda`.
 
-#![cfg(feature = "cuda")]
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_nn::linear::Linear;

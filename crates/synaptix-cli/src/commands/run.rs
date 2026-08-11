@@ -151,7 +151,6 @@ fn run_qwen3(
             max_seq: args.max_seq,
             ..Default::default()
         };
-        #[cfg(feature = "cuda")]
         if graph_ok {
             let _ = pipeline.generate_with_graph(&prompt_ids, warm.clone());
         }
@@ -170,17 +169,10 @@ fn run_qwen3(
 
     let use_graph = graph_ok;
     let (new_ids, stats) = if use_graph {
-        #[cfg(feature = "cuda")]
         {
             pipeline
                 .generate_with_graph(&prompt_ids, gen_cfg)
                 .map_err(|e| format!("generate(graph): {e}"))?
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            pipeline
-                .generate(&prompt_ids, gen_cfg)
-                .map_err(|e| format!("generate: {e}"))?
         }
     } else {
         pipeline
@@ -296,14 +288,11 @@ fn run_hybrid(
         if !args.no_graph_mtp && !graph_mtp {
             eprintln!("synaptix run: MTP-граф требует CUDA + compute=F16 → обычный MTP-путь");
         }
-        #[cfg(feature = "cuda")]
         let res = if graph_mtp {
             pipeline.generate_mtp_with_graph(&prompt_ids, gen_cfg, &mut noop)
         } else {
             pipeline.generate_mtp(&prompt_ids, gen_cfg, &mut noop)
         };
-        #[cfg(not(feature = "cuda"))]
-        let res = pipeline.generate_mtp(&prompt_ids, gen_cfg, &mut noop);
         let (ids, stats, mtp) = res.map_err(|e| format!("mtp generate: {e}"))?;
         let text = pipeline.decode(&ids).map_err(|e| format!("decode: {e}"))?;
         println!("{}{}", args.prompt, text);
@@ -342,17 +331,10 @@ fn run_hybrid(
     }
 
     let (new_ids, stats) = if use_graph {
-        #[cfg(feature = "cuda")]
         {
             pipeline
                 .generate_with_graph(&prompt_ids, gen_cfg)
                 .map_err(|e| format!("generate(graph): {e}"))?
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            pipeline
-                .generate(&prompt_ids, gen_cfg)
-                .map_err(|e| format!("generate: {e}"))?
         }
     } else {
         pipeline

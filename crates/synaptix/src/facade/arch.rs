@@ -47,13 +47,15 @@ pub fn arch_key(path: &Path) -> Option<String> {
         .or_else(|| bundle_arch(path))
 }
 
-/// `max_position_embeddings` из config.json (потолок контекста). None если нет.
 pub fn config_max_seq(path: &Path) -> Option<usize> {
     let bytes = read_model_file(path, "config.json")?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("max_position_embeddings")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
+    let field = |v: &serde_json::Value| {
+        v.get("max_position_embeddings")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+    };
+    v.get("text_config").and_then(field).or_else(|| field(&v))
 }
 
 /// LLM-архитектура — определяет, какой pipeline грузить.

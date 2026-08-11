@@ -68,6 +68,7 @@ impl MtpModule {
         attn_w: DType,
         mlp_w: DType,
         lm_head_dtype: DType,
+        embed_dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self, ModelError> {
         if num_layers == 0 {
@@ -91,6 +92,7 @@ impl MtpModule {
             attn_w,
             mlp_w,
             lm_head_dtype,
+            embed_dtype,
             rope_capacity,
         )?;
 

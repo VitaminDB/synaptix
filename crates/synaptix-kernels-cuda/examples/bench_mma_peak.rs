@@ -1,6 +1,5 @@
 //! ISA-пик mma.sync.m16n8k16 bf16→f32 на sm_120: чистый регистровый цикл без
 //! памяти. Истинный потолок для bf16-attention/GEMM через mma.sync (не wgmma).
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use std::time::Instant;

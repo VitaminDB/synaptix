@@ -7,8 +7,7 @@ license.workspace = true
 description = "Synaptix: CUDA ядра (NVRTC, рантайм-компиляция .cu)."
 
 [features]
-default = ["cuda"]
-cuda = ["dep:cudarc", "synaptix-core/cuda"]
+default = []
 
 [dependencies]
 synaptix-core = { workspace = true, features = [] }
@@ -17,7 +16,7 @@ bytemuck      = { workspace = true }
 parking_lot   = { workspace = true }
 once_cell     = { workspace = true }
 thiserror     = { workspace = true }
-cudarc        = { workspace = true, optional = true }
+cudarc        = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu = { workspace = true }

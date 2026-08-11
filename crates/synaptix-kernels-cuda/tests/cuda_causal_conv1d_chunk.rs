@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bit-exact: `causal_conv1d_chunk_{f32,f16,bf16}` (prefill T≥1, stateful)
 //! vs host `synaptix_ops::conv::causal_conv1d_stateful` + optional SiLU.

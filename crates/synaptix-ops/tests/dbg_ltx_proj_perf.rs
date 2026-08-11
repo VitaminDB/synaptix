@@ -1,6 +1,5 @@
 //! Диагностика LTX qkv_proj 35ms: linear_quant nvfp4 m=3520 n=4096 k=4096,
 //! вход BF16 (как LTX compute) vs F16, + выровненный m=3584.
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

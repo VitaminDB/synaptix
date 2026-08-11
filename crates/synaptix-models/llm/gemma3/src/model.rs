@@ -27,7 +27,7 @@ mod tests {
         synaptix_kernels_cpu::ensure_registered();
         let w = GemmaWeights::load(&dir, Device::Cpu, DType::BF16).expect("load");
         let cfg = w.config.to_decoder_config();
-        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::BF16, DType::BF16, DType::BF16, DType::BF16, 64)
+        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::BF16, DType::BF16, DType::BF16, DType::BF16, DType::BF16, 64)
             .expect("build");
         let mut kv = model.make_kv_cache(1, 64).expect("kv");
         let ids = Tensor::from_vec(vec![2u32, 1841, 563], vec![1usize, 3], Device::Cpu).unwrap();

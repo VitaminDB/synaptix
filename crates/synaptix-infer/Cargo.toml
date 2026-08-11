@@ -8,8 +8,7 @@ description = "Synaptix: inference engine (KV cache, sampling, scheduler, specul
 
 [features]
 # GPU — дефолт. CUDA graph capture/replay (cudarc, driver API) компилится всегда.
-default = ["cuda"]
-cuda = ["dep:cudarc", "synaptix-core/cuda"]
+default = []
 
 [dependencies]
 synaptix-core      = { workspace = true }
@@ -23,7 +22,7 @@ thiserror          = { workspace = true }
 tokio              = { workspace = true }
 parking_lot        = { workspace = true }
 once_cell          = { workspace = true }
-cudarc             = { workspace = true, optional = true }
+cudarc             = { workspace = true }
 
 [dev-dependencies]
 synaptix-test-utils  = { workspace = true }

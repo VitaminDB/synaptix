@@ -2,7 +2,6 @@
 //! мои стадии трансформера с Python-промежуточными (inter_real). Reference:
 //! gen_flux_io.py (io + inter_real). 512² → packed 32×32, txt=512. feature cuda.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};

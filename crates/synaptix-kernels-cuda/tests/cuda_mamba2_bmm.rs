@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bit-exact (BF16 F32-acc) тесты для Mamba2 chunked-SSD helper `mamba2_bmm`.
 //!

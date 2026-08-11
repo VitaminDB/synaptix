@@ -164,15 +164,8 @@ impl Tensor {
             return Err(SynaptixError::DimOutOfRange { dim, rank });
         }
         if !self.device().is_cpu() {
-            #[cfg(feature = "cuda")]
             {
                 return self.index_select_cuda(dim, indices);
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(SynaptixError::Unsupported(
-                    "index_select on non-CPU device requires cuda feature",
-                ));
             }
         }
         let src = self.contiguous()?;
@@ -230,7 +223,6 @@ impl Tensor {
     /// (`positions`/`input_ids`) и читаются на host (`clone_dtoh`); затем для
     /// каждого выбранного индекса копируется contiguous-блок `inner` элементов.
     /// Используется в `token_embedding` (dim=0) и `RopeCache::select_positions`.
-    #[cfg(feature = "cuda")]
     fn index_select_cuda(&self, dim: usize, indices: &Tensor) -> Result<Self> {
         let src = self.contiguous()?;
         let idx = indices.contiguous()?;

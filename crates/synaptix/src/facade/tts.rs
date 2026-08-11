@@ -102,13 +102,8 @@ pub struct TtsPipeline {
 
 impl TtsPipeline {
     pub fn best_device() -> Device {
-        #[cfg(feature = "cuda")]
         {
             Device::Cuda(0)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            Device::Cpu
         }
     }
 

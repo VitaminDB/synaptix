@@ -8,7 +8,6 @@
 //!   C. vs f32-референс (gemm_f32, независимый загрузчик): rel ≤ 0.02;
 //!   D. bias+residual (linear_bias_residual) vs f32-композиция.
 //! Запускать ОДНИМ процессом (env-кэши других ручек не трогаем).
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

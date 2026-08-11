@@ -8,7 +8,6 @@ description = "Voxtral audio LM."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

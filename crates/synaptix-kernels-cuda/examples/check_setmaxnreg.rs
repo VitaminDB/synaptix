@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 const SRC: &str = r#"
 extern "C" __global__ void smaxnreg_probe(int *out) {
     if (threadIdx.x < 128)

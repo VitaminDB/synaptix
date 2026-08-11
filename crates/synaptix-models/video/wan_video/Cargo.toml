@@ -8,7 +8,6 @@ description = "Wan-Video."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

@@ -1,7 +1,6 @@
 //! Гейт fused «adaLN-модуляция + NVFP4-квант»: БИТ-эквивалентность decomposed-
 //! цепочке rms_norm_fused(ones) → add_scalar(1) → broadcast_mul → broadcast_add
 //! → to(F16) → nvfp4_quantize_act. Полное побайтовое сравнение y/packed/scales.
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;

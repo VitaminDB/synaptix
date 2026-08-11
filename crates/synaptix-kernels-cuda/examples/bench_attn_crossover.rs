@@ -6,7 +6,6 @@
 //!
 //! Запуск: `cargo run -p synaptix-kernels-cuda --example bench_attn_crossover \
 //!          --features cuda --profile fast-release`
-#![cfg(feature = "cuda")]
 
 use std::time::Instant;
 

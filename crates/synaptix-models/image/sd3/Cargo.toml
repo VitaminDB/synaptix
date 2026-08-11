@@ -8,7 +8,6 @@ description = "SD3 / SD3.5 (MMDiT)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

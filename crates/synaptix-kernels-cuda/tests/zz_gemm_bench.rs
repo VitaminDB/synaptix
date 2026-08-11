@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 use half::bf16;
 use cudarc::driver::CudaSlice;
 use synaptix_kernels_cuda::best_cu::gemm::gemm_bf16::{best_gemm_bf16_cfg, Bf16Config, BestGemmBf16Kernels};

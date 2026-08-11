@@ -8,7 +8,6 @@ description = "Stable Audio Open."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

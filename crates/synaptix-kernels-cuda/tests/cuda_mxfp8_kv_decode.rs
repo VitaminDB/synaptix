@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! MXFP8-KV flash (CUDA): append-квант + per-32-block inline-dequant flash-attention.
 //! Сверяет полный путь (Tensor::kv_append_quant_mxfp8_inplace +

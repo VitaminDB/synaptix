@@ -8,7 +8,6 @@ description = "Gemma3 (sandwich norms, Q/K norm, dual RoPE, sliding window)."
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda", "synaptix-llm-common/cuda"]
 
 [dependencies]
 synaptix-llm-common = { workspace = true }
