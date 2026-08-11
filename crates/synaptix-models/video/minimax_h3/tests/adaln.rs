@@ -106,3 +106,58 @@ fn cache_size_scales_with_steps_and_roles() {
     assert_eq!(bytes, per_block * 50 + final_layer);
     assert!(bytes < 200 * 1024 * 1024, "кэш {bytes} байт слишком велик");
 }
+
+#[test]
+fn cache_slices_are_reshapable_at_every_step_and_chunk() {
+    synaptix_kernels_cpu::ensure_registered();
+    use synaptix_core::device::Device;
+    use synaptix_core::tensor::Tensor;
+    use synaptix_video_minimax_h3::adaln::AdalnCache;
+    use synaptix_video_minimax_h3::config::{ADALN_CHUNKS, FINAL_ADALN_CHUNKS};
+
+    let (steps, rows, final_rows, hidden, num_blocks) = (3usize, 6usize, 2usize, 8usize, 2usize);
+    let fill = |chunks: usize, r: usize| -> Tensor {
+        let n = steps * chunks * r * hidden;
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        Tensor::from_vec(data, vec![steps, chunks, r, hidden], Device::Cpu).unwrap()
+    };
+    let blocks: Vec<Tensor> = (0..num_blocks).map(|_| fill(ADALN_CHUNKS, rows)).collect();
+    let cache = AdalnCache::new(
+        blocks,
+        fill(FINAL_ADALN_CHUNKS, final_rows),
+        rows,
+        final_rows,
+        hidden,
+        steps,
+    );
+
+    for b in 0..num_blocks {
+        for step in 0..steps {
+            for c in 0..ADALN_CHUNKS {
+                let t = cache.chunk(b, step, c).expect("chunk");
+                assert_eq!(t.dims(), &[rows, hidden]);
+                let got = t.reshape(vec![rows * hidden]).unwrap().to_vec1::<f32>().unwrap();
+                let base = ((step * ADALN_CHUNKS + c) * rows * hidden) as f32;
+                assert_eq!(got[0], base, "блок {b} шаг {step} чанк {c}");
+                assert_eq!(got[rows * hidden - 1], base + (rows * hidden - 1) as f32);
+                for r in 0..rows {
+                    let one = cache.row(b, step, c, r).expect("row");
+                    assert_eq!(one.dims(), &[1, hidden]);
+                    assert_eq!(
+                        one.reshape(vec![hidden]).unwrap().to_vec1::<f32>().unwrap()[0],
+                        base + (r * hidden) as f32
+                    );
+                }
+            }
+        }
+    }
+
+    for step in 0..steps {
+        for c in 0..FINAL_ADALN_CHUNKS {
+            assert_eq!(cache.final_chunk(step, c).expect("final").dims(), &[final_rows, hidden]);
+            for r in 0..final_rows {
+                assert_eq!(cache.final_row(step, c, r).expect("final row").dims(), &[1, hidden]);
+            }
+        }
+    }
+}
