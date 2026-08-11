@@ -30,3 +30,6 @@ tests/reference_data/
 
 # Local symlink to a model directory, used by the CUDA integration tests
 /crates/synaptix/models
+
+# Клон референсного репозитория MiniMax-H3 (вложенный git, только для паритета)
+/third_party/minimax-h3

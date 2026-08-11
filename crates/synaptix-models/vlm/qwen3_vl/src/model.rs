@@ -94,7 +94,36 @@ pub struct VisionTower {
     merger_norm: Norm,
     merger_fc1: Lin,
     merger_fc2: Lin,
+    deepstack: Vec<Merger>,
     use_rope: bool,
+}
+
+pub struct Merger {
+    norm: Norm,
+    fc1: Lin,
+    fc2: Lin,
+}
+
+impl Merger {
+    fn load(
+        weights: &dyn VisionWeights,
+        prefix: &str,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, VisionError> {
+        Ok(Self {
+            norm: Norm::load(weights, &format!("{prefix}.norm"), device, dtype)?,
+            fc1: Lin::load(weights, &format!("{prefix}.linear_fc1"), device, dtype, true)?,
+            fc2: Lin::load(weights, &format!("{prefix}.linear_fc2"), device, dtype, true)?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor, eps: f32) -> Result<Tensor, VisionError> {
+        let h = self.norm.forward(x, eps)?;
+        let h = self.fc1.forward(&h)?;
+        let h = h.gelu_tanh().map_err(|e| VisionError::Forward(e.to_string()))?;
+        self.fc2.forward(&h)
+    }
 }
 
 impl VisionTower {
@@ -145,6 +174,16 @@ impl VisionTower {
             .map(|v| v != "0")
             .unwrap_or(true);
 
+        let mut deepstack = Vec::with_capacity(config.deepstack_visual_indexes.len());
+        for i in 0..config.deepstack_visual_indexes.len() {
+            deepstack.push(Merger::load(
+                weights,
+                &format!("{VIS}.deepstack_merger_list.{i}"),
+                device,
+                dtype,
+            )?);
+        }
+
         Ok(Self {
             merger_norm: Norm::load(weights, &format!("{VIS}.merger.norm"), device, dtype)?,
             merger_fc1: Lin::load(weights, &format!("{VIS}.merger.linear_fc1"), device, dtype, true)?,
@@ -155,6 +194,7 @@ impl VisionTower {
             patch_embed,
             pos_embed,
             blocks,
+            deepstack,
             use_rope,
         })
     }
@@ -253,6 +293,18 @@ impl VisionTower {
     }
 
     pub fn forward(&self, patches: &Tensor, grid: ImageGrid) -> Result<Tensor, VisionError> {
+        Ok(self.forward_deepstack(patches, grid)?.0)
+    }
+
+    pub fn deepstack_len(&self) -> usize {
+        self.deepstack.len()
+    }
+
+    pub fn forward_deepstack(
+        &self,
+        patches: &Tensor,
+        grid: ImageGrid,
+    ) -> Result<(Tensor, Vec<Tensor>), VisionError> {
         let cfg = &self.config;
         let n = grid.patches();
         let hd = cfg.head_dim();
@@ -282,7 +334,8 @@ impl VisionTower {
         };
 
         let scale = 1.0 / (hd as f32).sqrt();
-        for blk in &self.blocks {
+        let mut taps: Vec<Tensor> = Vec::with_capacity(self.deepstack.len());
+        for (bi, blk) in self.blocks.iter().enumerate() {
             let residual = x.clone();
             let h = blk.norm1.forward(&x, eps)?;
             let qkv = blk.qkv.forward(&h)?;
@@ -313,6 +366,15 @@ impl VisionTower {
             let h = e(h.gelu_tanh())?;
             let h = blk.fc2.forward(&h)?;
             x = e(residual.add(&h))?;
+
+            if let Some(slot) = cfg.deepstack_visual_indexes.iter().position(|d| *d == bi) {
+                let t = e(e(x.contiguous())?.reshape(vec![n / cfg.merge_unit(), cfg.merged_dim()]))?;
+                let feat = self.deepstack[slot].forward(&t, eps)?;
+                while taps.len() <= slot {
+                    taps.push(feat.clone());
+                }
+                taps[slot] = feat;
+            }
         }
 
         let x = self.merger_norm.forward(&x, eps)?;
@@ -320,7 +382,7 @@ impl VisionTower {
         let merged = e(x.reshape(vec![n / cfg.merge_unit(), cfg.merged_dim()]))?;
         let h = self.merger_fc1.forward(&merged)?;
         let h = e(h.gelu_tanh())?;
-        self.merger_fc2.forward(&h)
+        Ok((self.merger_fc2.forward(&h)?, taps))
     }
 }
 
@@ -352,6 +414,7 @@ mod tests {
             },
             merger_fc1: Lin { wt: Tensor::zeros(vec![1, 1], DType::F32, Device::Cpu).unwrap(), bias: None },
             merger_fc2: Lin { wt: Tensor::zeros(vec![1, 1], DType::F32, Device::Cpu).unwrap(), bias: None },
+            deepstack: Vec::new(),
             use_rope: false,
         };
         let grid = ImageGrid { t: 1, h: 4, w: 4 };
@@ -381,6 +444,7 @@ mod tests {
             },
             merger_fc1: Lin { wt: Tensor::zeros(vec![1, 1], DType::F32, Device::Cpu).unwrap(), bias: None },
             merger_fc2: Lin { wt: Tensor::zeros(vec![1, 1], DType::F32, Device::Cpu).unwrap(), bias: None },
+            deepstack: Vec::new(),
             use_rope: true,
         };
         let grid = ImageGrid { t: 1, h: 2, w: 2 };

@@ -2300,6 +2300,44 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    /// Partial Split RoPE одним fused-ядром: вращает первые `rot_dim` из `D`,
+    /// остальные измерения проходят без изменений (MiniMax-H3 MM-RoPE: 96 из 128).
+    /// `self` [.., S, D]; `cos`/`sin` — F32 `[S, rot_dim/2]`. Позиция строки =
+    /// `row % S`, поэтому при layout `[H, S, D]` таблица broadcast'ится по головам
+    /// без материализации `[H*S, ..]`. `Unsupported` если backend не умеет.
+    pub fn rope_split_partial_fused(
+        &self,
+        cos: &Tensor,
+        sin: &Tensor,
+        rot_dim: usize,
+    ) -> Result<Self> {
+        let xr = self.rank();
+        if xr < 2 {
+            return Err(SynaptixError::Unsupported("rope_split_partial_fused: x rank < 2"));
+        }
+        let d = self.dims()[xr - 1];
+        if rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > d {
+            return Err(SynaptixError::Unsupported("rope_split_partial_fused: rot_dim"));
+        }
+        let x = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let cos_c = if cos.is_contiguous() { cos.clone() } else { cos.contiguous()? };
+        let sin_c = if sin.is_contiguous() { sin.clone() } else { sin.contiguous()? };
+        let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
+        let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
+        let backend = registry::backend_for(self.device())?;
+        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.rope_split_partial(
+            (&x.storage, &x.layout),
+            (&cos_c.storage, &cos_c.layout),
+            (&sin_c.storage, &sin_c.layout),
+            rot_dim,
+            (&mut storage, &out_layout),
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     /// Interleaved (adjacent-pair / FLUX) RoPE одним fused-ядром. `self` [B,S,H,D];
     /// `cos`/`sin` — F32 ПОЛНАЯ таблица с numel=S*D (любой shape). Заменяет ~10
     /// decomposed-ops apply_rope. `Unsupported` если backend не умеет → fallback.
@@ -2791,7 +2829,6 @@ impl Tensor {
         let esz = self.dtype().bytes_for_numel(1);
         let dst_off = off * row * esz;
         let n_bytes = src_c.layout.numel() * esz;
-        #[cfg(feature = "cuda")]
         if self.device().is_cuda() {
             let src_buf = src_c.storage.as_cuda().ok_or(SynaptixError::Unsupported("copy_rows_from: src"))?;
             let src_byte_off = src_c.layout.byte_offset();
@@ -2816,7 +2853,6 @@ impl Tensor {
     /// вьюхами (Arc::get_mut невозможен), порядок доступа упорядочивает
     /// вызывающий (события слота).
     pub fn cuda_region(&self) -> Result<(u64, usize)> {
-        #[cfg(feature = "cuda")]
         {
             if !self.layout.strides().is_contiguous(self.layout.shape()) {
                 return Err(SynaptixError::NonContiguous);
@@ -2834,8 +2870,6 @@ impl Tensor {
             let bytes = self.dtype().bytes_for_numel(self.layout.numel());
             return Ok((base + self.layout.byte_offset() as u64, bytes));
         }
-        #[cfg(not(feature = "cuda"))]
-        Err(SynaptixError::Unsupported("cuda_region: cuda feature disabled"))
     }
 
     /// In-place копия содержимого `src` в `self` (тот же shape/dtype/device).
@@ -2889,7 +2923,6 @@ impl Tensor {
                 }
                 Ok(())
             }
-            #[cfg(feature = "cuda")]
             Storage::Cuda(b) => {
                 let stream = b.stream().clone();
                 let dst = b.slice_mut();
@@ -2901,8 +2934,6 @@ impl Tensor {
                     .memcpy_htod(&host_bytes, dst)
                     .map_err(|e| SynaptixError::Cuda(format!("write_host_u32 memcpy_htod: {e:?}")))
             }
-            #[cfg(not(feature = "cuda"))]
-            Storage::Cuda(_) => Err(SynaptixError::Unsupported("write_host_u32: cuda disabled")),
         }
     }
 

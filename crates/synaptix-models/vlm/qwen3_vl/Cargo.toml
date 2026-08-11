@@ -8,13 +8,13 @@ description = "Qwen3-VL / Qwen3.6 vision tower (SigLIP-style ViT + 2x2 patch mer
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda"]
 
 [dependencies]
 synaptix-core   = { workspace = true }
 synaptix-ops    = { workspace = true }
 synaptix-io     = { workspace = true, features = ["image"] }
 synaptix-bundle = { workspace = true }
+synaptix-tokenizer = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 thiserror       = { workspace = true }

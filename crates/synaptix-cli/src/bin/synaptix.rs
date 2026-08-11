@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
-    bench, chat, convert, diff, imagine, inspect, music, quantize, run as run_cmd, speak, train,
-    transcribe, video,
+    bench, chat, convert, diff, h3, imagine, inspect, music, quantize, run as run_cmd, speak,
+    train, transcribe, video,
 };
 
 #[derive(Parser)]
@@ -567,6 +567,80 @@ enum Commands {
         #[arg(long)]
         block_mode: Option<usize>,
     },
+    /// MiniMax-H3 33B: текст/кадры → видео + синхронное стерео 32 кГц.
+    H3 {
+        /// Каталог модели (корень MiniMax-H3 или сразу FL2VA/Ref2VA).
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// Текстовый промпт.
+        #[arg(default_value = "")]
+        prompt: String,
+        /// Негативный промпт (нужен при cfg > 1).
+        #[arg(long)]
+        negative_prompt: Option<String>,
+        #[arg(short, long, default_value = "h3.mp4")]
+        output: PathBuf,
+        /// Каталог энкодера Qwen3-VL (по умолчанию <model_dir>/text_encoder).
+        #[arg(long)]
+        encoder: Option<PathBuf>,
+        /// Первый кадр (fl2va).
+        #[arg(long)]
+        first_frame: Option<PathBuf>,
+        /// Последний кадр (fl2va).
+        #[arg(long)]
+        last_frame: Option<PathBuf>,
+        #[arg(long, default_value_t = 1344)]
+        width: usize,
+        #[arg(long, default_value_t = 768)]
+        height: usize,
+        /// Длительность в секундах (снапится на сетку 17k+5 кадров при 24 fps).
+        #[arg(long, default_value_t = 5.0)]
+        duration: f64,
+        /// Явное число кадров (перебивает --duration).
+        #[arg(long)]
+        frames: Option<usize>,
+        /// Число шагов денойзинга (0 = из пресета пайплайна).
+        #[arg(long, default_value_t = 0)]
+        steps: usize,
+        /// CFG scale (0 = из пресета; 1.0 = без негатива, режим Turbo).
+        #[arg(long, default_value_t = 0.0)]
+        cfg_scale: f32,
+        #[arg(long)]
+        seed: Option<u64>,
+        /// LoRA-адаптер (Turbo LoRA для 4-8 шагов).
+        #[arg(long)]
+        lora: Option<PathBuf>,
+        #[arg(long, default_value_t = 1.0)]
+        lora_strength: f32,
+        /// Квантование DiT: none|mxfp8|nvfp4 (дефолт nvfp4).
+        #[arg(long)]
+        quant_transformer: Option<String>,
+        /// Квантование энкодера: none|mxfp8|nvfp4 (дефолт mxfp8).
+        #[arg(long)]
+        quant_encoder: Option<String>,
+        /// Compute-dtype: bf16|f16 (дефолт bf16).
+        #[arg(long)]
+        compute_dtype: Option<String>,
+        /// Стратегия памяти: auto|precomputed-adaln|block-offload.
+        #[arg(long, default_value = "auto")]
+        memory_mode: String,
+        /// Пресет пайплайна (см. --list-pipelines).
+        #[arg(long)]
+        pipeline: Option<String>,
+        /// Показать доступные пресеты и выйти.
+        #[arg(long, default_value_t = false)]
+        list_pipelines: bool,
+        /// Вариант весов: fl2va|ref2va.
+        #[arg(long)]
+        variant: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+        #[arg(long, default_value_t = false)]
+        prof: bool,
+        /// Сохранить рядом с mp4 отдельный wav.
+        #[arg(long, default_value_t = false)]
+        keep_wav: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -730,6 +804,17 @@ fn main() -> ExitCode {
             ref_preprocess, canny_low, canny_high, depth_model,
             quant_transformer, quant_encoder, compute_dtype, device,
             nag_prompt, nag_scale, nag_alpha, nag_tau, force_offload, prof, block_mode,
+        }),
+        Commands::H3 {
+            model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
+            width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
+            quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
+            list_pipelines, variant, device, prof, keep_wav,
+        } => h3::run(h3::H3Args {
+            model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
+            width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
+            quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
+            list_pipelines, variant, device, prof, keep_wav,
         }),
     };
     match res {

@@ -73,6 +73,7 @@ members = [
     "crates/synaptix-models/music/stable_audio",
     "crates/synaptix-models/music/audioldm",
     "crates/synaptix-models/video/ltx23",
+    "crates/synaptix-models/video/minimax_h3",
     "crates/synaptix-models/video/hunyuan_video",
     "crates/synaptix-models/video/cog_video_x",
     "crates/synaptix-models/video/wan_video",
@@ -244,6 +245,7 @@ synaptix-image-sdxl   = { path = "crates/synaptix-models/image/sdxl" }
 synaptix-depth-anything = { path = "crates/synaptix-models/image/depth_anything" }
 synaptix-image-flux   = { path = "crates/synaptix-models/image/flux" }
 synaptix-video-ltx23  = { path = "crates/synaptix-models/video/ltx23" }
+synaptix-video-minimax-h3 = { path = "crates/synaptix-models/video/minimax_h3" }
 synaptix-tts-voxcpm   = { path = "crates/synaptix-models/tts/voxcpm" }
 synaptix-music-acestep = { path = "crates/synaptix-models/music/acestep" }
 synaptix-llm-gemma3   = { path = "crates/synaptix-models/llm/gemma3" }
