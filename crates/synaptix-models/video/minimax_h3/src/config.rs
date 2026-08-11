@@ -370,6 +370,10 @@ pub struct AudioVaeConfig {
     pub resblock_kernel_sizes: Vec<usize>,
     pub resblock_dilation_sizes: Vec<Vec<usize>>,
     pub sampling_rate: usize,
+    #[serde(skip)]
+    pub latents_mean: Vec<f32>,
+    #[serde(skip)]
+    pub latents_std: Vec<f32>,
 }
 
 impl Default for AudioVaeConfig {
@@ -386,21 +390,79 @@ impl Default for AudioVaeConfig {
             resblock_kernel_sizes: vec![3, 7, 11],
             resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
             sampling_rate: AUDIO_SAMPLE_RATE,
+            latents_mean: Vec::new(),
+            latents_std: Vec::new(),
         }
     }
 }
 
 impl AudioVaeConfig {
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, H3Error> {
-        let path = dir.as_ref().join("audio_vae").join("config.json");
-        let bytes = std::fs::read(&path)
-            .map_err(|e| H3Error::Config(format!("{}: {e}", path.display())))?;
-        let mut cfg: Self = serde_json::from_slice(&bytes)
+        let dir = dir.as_ref().join("audio_vae");
+        let mut cfg = Self::default();
+
+        let meta_path = dir.join("metadata.json");
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            let root: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| H3Error::Config(format!("audio_vae/metadata.json: {e}")))?;
+            if let Some(kw) = root.get("metadata").and_then(|m| m.get("kwargs")) {
+                let num = |k: &str| kw.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+                let arr = |k: &str| {
+                    kw.get(k).and_then(|v| v.as_array()).map(|a| {
+                        a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect::<Vec<_>>()
+                    })
+                };
+                if let Some(v) = num("encoder_dim") {
+                    cfg.encoder_dim = v;
+                }
+                if let Some(v) = arr("encoder_rates") {
+                    cfg.encoder_rates = v;
+                }
+                if let Some(v) = num("latent_dim") {
+                    cfg.latent_dim = v;
+                }
+                if let Some(v) = num("decoder_dim") {
+                    cfg.decoder_dim = v;
+                }
+                if let Some(v) = arr("decoder_rates") {
+                    cfg.decoder_rates = v;
+                }
+                if let Some(v) = arr("decoder_kernel_sizes") {
+                    cfg.decoder_kernel_sizes = v;
+                }
+                if let Some(v) = num("vae_latent_channels") {
+                    cfg.vae_latent_channels = v;
+                }
+                if let Some(v) = num("sample_rate") {
+                    cfg.sampling_rate = v;
+                }
+            }
+        }
+
+        let cfg_path = dir.join("config.json");
+        let bytes = std::fs::read(&cfg_path)
+            .map_err(|e| H3Error::Config(format!("{}: {e}", cfg_path.display())))?;
+        let root: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| H3Error::Config(format!("audio_vae/config.json: {e}")))?;
-        if let Some(v) = read_opt_usize(&bytes, "vae_latent_channels")? {
-            cfg.vae_latent_channels = v;
-        } else if let Some(v) = read_opt_usize(&bytes, "latent_channels")? {
-            cfg.vae_latent_channels = v;
+        if let Some(v) = root.get("latent_channels").and_then(|v| v.as_u64()) {
+            cfg.vae_latent_channels = v as usize;
+        }
+        if let Some(v) = root.get("sample_rate").and_then(|v| v.as_u64()) {
+            cfg.sampling_rate = v as usize;
+        }
+        cfg.latents_mean = read_f32_array(&root, "latents_mean")?;
+        cfg.latents_std = read_f32_array(&root, "latents_std")?;
+        if cfg.latents_mean.len() != cfg.vae_latent_channels
+            || cfg.latents_std.len() != cfg.vae_latent_channels
+        {
+            return Err(H3Error::Config(format!(
+                "audio_vae latents_mean/std: {} значений при {} каналах",
+                cfg.latents_mean.len(),
+                cfg.vae_latent_channels
+            )));
+        }
+        if cfg.decoder_kernel_sizes.len() != cfg.decoder_rates.len() {
+            return Err(H3Error::Config("audio_vae: decoder_kernel_sizes != decoder_rates".into()));
         }
         Ok(cfg)
     }
@@ -412,12 +474,6 @@ impl AudioVaeConfig {
     pub fn latents_per_second(&self) -> usize {
         self.sampling_rate / self.hop_length()
     }
-}
-
-fn read_opt_usize(bytes: &[u8], key: &str) -> Result<Option<usize>, H3Error> {
-    let root: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| H3Error::Config(e.to_string()))?;
-    Ok(root.get(key).and_then(|v| v.as_u64()).map(|v| v as usize))
 }
 
 fn read_f32_array(root: &serde_json::Value, key: &str) -> Result<Vec<f32>, H3Error> {
