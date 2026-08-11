@@ -122,7 +122,8 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let encoder_dir = args.encoder.unwrap_or_else(|| paths.text_encoder_dir());
     eprintln!("[h3] загрузка энкодера Qwen3-VL из {}", encoder_dir.display());
-    let encoder = h3::text_encoder::EncoderHandle::load(&encoder_dir, device, quant_enc)?;
+    let encoder =
+        h3::text_encoder::EncoderHandle::load(&encoder_dir, device, compute, quant_enc)?;
 
     let mut images: Vec<(Tensor, h3::text_encoder::ImageGrid)> = Vec::new();
     let mut keyframe_paths: Vec<(usize, PathBuf)> = Vec::new();

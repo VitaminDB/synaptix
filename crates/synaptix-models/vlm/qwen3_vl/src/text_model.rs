@@ -5,6 +5,8 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::SynaptixError;
 use synaptix_core::tensor::Tensor;
+use synaptix_nn::module::Module as _;
+use synaptix_nn::quant_linear::QuantLinear;
 use synaptix_ops::attention::softmax::scaled_dot_attention;
 
 use crate::model::{VisionError, VisionWeights};
@@ -81,23 +83,24 @@ impl TextConfig {
     }
 }
 
-struct Lin {
-    wt: Tensor,
-}
+struct Lin(QuantLinear);
 
 impl Lin {
-    fn load(w: &dyn VisionWeights, key: &str, device: Device, dtype: DType) -> R<Self> {
-        let raw = w.tensor(&format!("{key}.weight"), device, dtype)?;
-        Ok(Self {
-            wt: raw
-                .transpose(0, 1)
-                .and_then(|t| t.contiguous())
-                .map_err(|e| VisionError::Load(e.to_string()))?,
-        })
+    fn load(
+        w: &dyn VisionWeights,
+        key: &str,
+        device: Device,
+        compute: DType,
+        quant: DType,
+    ) -> R<Self> {
+        let raw = w.tensor(&format!("{key}.weight"), device, compute)?;
+        QuantLinear::build(raw, None, quant, compute)
+            .map(Self)
+            .map_err(|e| VisionError::Load(format!("{key}: {e}")))
     }
 
     fn forward(&self, x: &Tensor) -> R<Tensor> {
-        x.matmul(&self.wt).map_err(|e| VisionError::Forward(e.to_string()))
+        self.0.forward(x).map_err(|e| VisionError::Forward(e.to_string()))
     }
 }
 
@@ -128,21 +131,22 @@ impl Layer {
         w: &dyn VisionWeights,
         idx: usize,
         device: Device,
-        dtype: DType,
+        compute: DType,
+        quant: DType,
     ) -> R<Self> {
         let p = format!("{LM}.layers.{idx}");
         Ok(Self {
-            input_norm: w.tensor(&format!("{p}.input_layernorm.weight"), device, dtype)?,
-            post_norm: w.tensor(&format!("{p}.post_attention_layernorm.weight"), device, dtype)?,
-            q: Lin::load(w, &format!("{p}.self_attn.q_proj"), device, dtype)?,
-            k: Lin::load(w, &format!("{p}.self_attn.k_proj"), device, dtype)?,
-            v: Lin::load(w, &format!("{p}.self_attn.v_proj"), device, dtype)?,
-            o: Lin::load(w, &format!("{p}.self_attn.o_proj"), device, dtype)?,
-            q_norm: w.tensor(&format!("{p}.self_attn.q_norm.weight"), device, dtype)?,
-            k_norm: w.tensor(&format!("{p}.self_attn.k_norm.weight"), device, dtype)?,
-            gate: Lin::load(w, &format!("{p}.mlp.gate_proj"), device, dtype)?,
-            up: Lin::load(w, &format!("{p}.mlp.up_proj"), device, dtype)?,
-            down: Lin::load(w, &format!("{p}.mlp.down_proj"), device, dtype)?,
+            input_norm: w.tensor(&format!("{p}.input_layernorm.weight"), device, compute)?,
+            post_norm: w.tensor(&format!("{p}.post_attention_layernorm.weight"), device, compute)?,
+            q: Lin::load(w, &format!("{p}.self_attn.q_proj"), device, compute, quant)?,
+            k: Lin::load(w, &format!("{p}.self_attn.k_proj"), device, compute, quant)?,
+            v: Lin::load(w, &format!("{p}.self_attn.v_proj"), device, compute, quant)?,
+            o: Lin::load(w, &format!("{p}.self_attn.o_proj"), device, compute, quant)?,
+            q_norm: w.tensor(&format!("{p}.self_attn.q_norm.weight"), device, compute)?,
+            k_norm: w.tensor(&format!("{p}.self_attn.k_norm.weight"), device, compute)?,
+            gate: Lin::load(w, &format!("{p}.mlp.gate_proj"), device, compute, quant)?,
+            up: Lin::load(w, &format!("{p}.mlp.up_proj"), device, compute, quant)?,
+            down: Lin::load(w, &format!("{p}.mlp.down_proj"), device, compute, quant)?,
         })
     }
 }
@@ -258,16 +262,17 @@ impl TextEncoder {
         config: TextConfig,
         weights: &dyn VisionWeights,
         device: Device,
-        dtype: DType,
+        compute: DType,
+        quant: DType,
         num_layers: usize,
     ) -> Result<Self, VisionError> {
         let n = num_layers.min(config.num_hidden_layers);
-        let embed = weights.tensor(&format!("{LM}.embed_tokens.weight"), device, dtype)?;
+        let embed = weights.tensor(&format!("{LM}.embed_tokens.weight"), device, compute)?;
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
-            layers.push(Layer::load(weights, i, device, dtype)?);
+            layers.push(Layer::load(weights, i, device, compute, quant)?);
         }
-        Ok(Self { config, embed, layers, device, dtype })
+        Ok(Self { config, embed, layers, device, dtype: compute })
     }
 
     pub fn num_layers(&self) -> usize {

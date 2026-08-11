@@ -16,10 +16,12 @@ impl EncoderHandle {
     pub fn load(
         encoder_dir: impl AsRef<Path>,
         device: Device,
-        dtype: DType,
+        compute: DType,
+        quant: DType,
     ) -> Result<Self, H3Error> {
-        let inner = H3Encoder::load(encoder_dir, None, device, dtype, H3_ENCODER_LAYERS)
-            .map_err(|e| H3Error::Load(e.to_string()))?;
+        let inner =
+            H3Encoder::load(encoder_dir, None, device, compute, quant, H3_ENCODER_LAYERS)
+                .map_err(|e| H3Error::Load(e.to_string()))?;
         Ok(Self { inner })
     }
 
