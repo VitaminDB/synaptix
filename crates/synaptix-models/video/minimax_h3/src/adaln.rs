@@ -214,7 +214,9 @@ impl AdalnProj {
         let y = x
             .matmul(&self.w.transpose(0, 1)?.contiguous()?)?
             .broadcast_add(&self.b)?;
-        y.reshape(vec![m * self.modalities, self.expand, self.hidden])
+        y.reshape(vec![m * self.modalities, self.expand, self.hidden])?
+            .permute([1, 0, 2])?
+            .contiguous()
     }
 }
 
