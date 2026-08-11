@@ -3,7 +3,6 @@
 //! на CUDA с теми же bf16-входами, сравниваем КАЖДУЮ под-операцию CPU-vs-CUDA.
 //! Под-операция с макс. расхождением = багованное CUDA-ядро. feature cuda.
 
-#![cfg(feature = "cuda")]
 
 use std::collections::HashMap;
 use std::path::Path;

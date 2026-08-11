@@ -8,7 +8,6 @@ description = "Общее config-driven ядро декодер-LLM (DecoderMode
 
 [features]
 default = []
-cuda = ["synaptix-core/cuda", "synaptix-infer/cuda"]
 
 [dependencies]
 synaptix-core      = { workspace = true }

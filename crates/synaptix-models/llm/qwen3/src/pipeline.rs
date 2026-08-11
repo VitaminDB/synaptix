@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
-#[cfg(feature = "cuda")]
 use synaptix_core::tensor::Tensor;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
@@ -69,7 +68,7 @@ impl Qwen3Pipeline {
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(
-            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, rope_capacity,
+            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, rope_capacity,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         .with_kv_cache_dtype(precision.kv);
@@ -157,7 +156,6 @@ impl Qwen3Pipeline {
     /// `forward_decode_dev`, и replay-loop (обновить device-буферы → launch → dtoh
     /// logits → host-sample). Greedy совпадает с [`Self::generate`] (с точностью до
     /// F16-rope-таблиц). Требует CUDA-устройство и не-FP8 KV.
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph(
         &self,
         prompt_ids: &[u32],
@@ -167,7 +165,6 @@ impl Qwen3Pipeline {
         self.generate_with_graph_streaming(prompt_ids, gen_cfg, &mut noop)
     }
 
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph_streaming(
         &self,
         prompt_ids: &[u32],
@@ -184,7 +181,6 @@ impl Qwen3Pipeline {
 
     /// Как [`Self::generate_with_graph_streaming`], но prefill стартует с `kv.seq_len`
     /// (prefix-KV-кэш) — `kv` переиспользуется между ходами чата.
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,

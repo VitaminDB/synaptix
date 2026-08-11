@@ -24,7 +24,7 @@ mod tests {
         synaptix_kernels_cpu::ensure_registered();
         let w = Qwen3Weights::load(&dir, Device::Cpu, DType::BF16).expect("load");
         let cfg = w.config.to_decoder_config();
-        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::BF16, DType::BF16, DType::BF16, DType::BF16, 64)
+        let model = DecoderModel::build(&cfg, &w, Device::Cpu, DType::BF16, DType::BF16, DType::BF16, DType::BF16, DType::BF16, 64)
             .expect("build model");
         let mut kv = model.make_kv_cache(1, 64).expect("make kv cache");
         let ids = Tensor::from_vec(vec![151643u32, 9707, 1834], vec![1usize, 3], Device::Cpu).unwrap();

@@ -6,7 +6,6 @@
 //! `ClipTextEncoder::clip_l()` (совпадает с FLUX CLIP-L) и сверяем на тех же ids.
 //! Требует feature `cuda`.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 

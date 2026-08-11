@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bench: Mamba2 SSD chunked-form vs recurrent baseline.
 //!

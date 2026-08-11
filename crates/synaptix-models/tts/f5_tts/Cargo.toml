@@ -8,7 +8,6 @@ description = "F5-TTS."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

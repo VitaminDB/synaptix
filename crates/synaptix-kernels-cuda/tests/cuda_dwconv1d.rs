@@ -1,7 +1,6 @@
 //! dwconv1d/dwconvt1d (CUDA-ядро) vs канальный decompose (CPU-путь ops).
 //! Ядро аккумулирует FMA (без раунда произведения), decompose раундит каждый
 //! tap отдельным tensor-add → расходятся на ULP (~1e-7); порог 2e-6.
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::tensor::Tensor;

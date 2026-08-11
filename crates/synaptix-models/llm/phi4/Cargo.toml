@@ -8,7 +8,6 @@ description = "Phi-4."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

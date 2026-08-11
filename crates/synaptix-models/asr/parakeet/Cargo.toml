@@ -8,7 +8,6 @@ description = "Parakeet RNN-T."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

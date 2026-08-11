@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! best_cu NN matmul (Backend::matmul → gemm_nn_u8): C[M,N]=A[M,K]@B[K,N],
 //! F16/BF16 float-acc vs CPU-f32. Non-batched, K%16==0, N%8==0, M/N любые.

@@ -25,6 +25,7 @@ pub struct EmbedKernels {
     f32: CudaFunction,
     f16: CudaFunction,
     bf16: CudaFunction,
+    mxfp8_f16: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<EmbedKernels>)>>> = OnceLock::new();
@@ -47,6 +48,7 @@ impl EmbedKernels {
             f32: load_fn(&module, "embed_gather_f32")?,
             f16: load_fn(&module, "embed_gather_f16")?,
             bf16: load_fn(&module, "embed_gather_bf16")?,
+            mxfp8_f16: load_fn(&module, "embed_gather_mxfp8_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -99,6 +101,63 @@ pub fn embed_gather<T: DeviceRepr>(
     unsafe {
         bld.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch embed_gather: {e:?}")))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn embed_gather_mxfp8(
+    kernels: &EmbedKernels,
+    stream: &Arc<CudaStream>,
+    table: &CudaSlice<u8>,
+    table_off: usize,
+    scales: &CudaSlice<u8>,
+    scales_off: usize,
+    ids_dev: &CudaView<u32>,
+    out: &mut CudaSlice<u8>,
+    out_off: usize,
+    n_ids: u32,
+    dim: u32,
+    vocab: u32,
+) -> Result<()> {
+    if n_ids == 0 || dim == 0 {
+        return Ok(());
+    }
+    if dim % 32 != 0 {
+        return Err(SynaptixError::Unsupported(
+            "embed_gather_mxfp8: dim должен быть кратен 32",
+        ));
+    }
+    let table_n = (vocab as usize) * (dim as usize);
+    let scales_n = table_n / 32;
+    let out_n = (n_ids as usize) * (dim as usize);
+    let total = (n_ids as u64) * (dim as u64);
+    let grid = total.div_ceil(BLOCK as u64) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (n_ids_i, dim_i, vocab_i) = (n_ids as i32, dim as i32, vocab as i32);
+    let table_v = table.slice(table_off..table_off + table_n);
+    let scales_v = scales.slice(scales_off..scales_off + scales_n);
+    let mut out_s = out.slice_mut(out_off..out_off + out_n * 2);
+    let mut out_v = unsafe {
+        out_s
+            .transmute_mut::<f16>(out_n)
+            .ok_or_else(|| SynaptixError::Cuda("embed mxfp8: transmute out".into()))?
+    };
+    let mut bld = stream.launch_builder(&kernels.mxfp8_f16);
+    bld.arg(&table_v)
+        .arg(&scales_v)
+        .arg(ids_dev)
+        .arg(&mut out_v)
+        .arg(&n_ids_i)
+        .arg(&dim_i)
+        .arg(&vocab_i);
+    unsafe {
+        bld.launch(cfg)
+            .map_err(|e| SynaptixError::Cuda(format!("launch embed_gather_mxfp8: {e:?}")))?;
     }
     Ok(())
 }

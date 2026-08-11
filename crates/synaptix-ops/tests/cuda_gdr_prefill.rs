@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! End-to-end: `Tensor::gated_delta_rule_prefill` (CUDA: copy-bridge → chunk
 //! orchestrator → writeback) vs host `gated_delta_net_recurrent`. Покрывает

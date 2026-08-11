@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bit-exact (F32-эталон) тесты для Mamba2 SSD рекуррентного forward.
 

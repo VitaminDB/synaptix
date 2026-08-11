@@ -8,7 +8,6 @@ description = "Moshi audio LM (streaming)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

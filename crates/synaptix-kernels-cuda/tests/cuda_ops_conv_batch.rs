@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! synaptix-ops conv1d/conv_transpose1d на CUDA при batch>1 (DiT proj_in/out:
 //! K=2, stride=2, b=2). Гейтит 2D×3D matmul-broadcast (баг convT ронял cfg=7 в NaN).

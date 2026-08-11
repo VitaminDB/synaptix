@@ -8,7 +8,6 @@
 //! режимах: `cuMemsetD8Async`/`cuMemcpyDtoDAsync` требуют либо mempool-памяти, либо
 //! kernel-launch, а компилировать ядро ради smoke-теста — overkill.
 
-#![cfg(feature = "cuda")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

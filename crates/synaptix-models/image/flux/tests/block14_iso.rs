@@ -3,7 +3,6 @@
 //! сравниваем КАЖДУЮ под-операцию с Python. Расхождение = чистая ошибка CUDA-
 //! ядра блока 14 (унаследованная отсутствует — вход bit-exact Python). feature cuda.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};

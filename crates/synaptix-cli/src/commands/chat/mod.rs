@@ -100,7 +100,6 @@ impl ChatPipeline {
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), String> {
-        #[cfg(feature = "cuda")]
         {
             use synaptix_core::device::Device;
             use synaptix_core::dtype::DType;

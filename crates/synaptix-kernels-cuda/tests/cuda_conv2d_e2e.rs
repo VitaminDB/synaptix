@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Полная цепочка Tensor::conv2d на CUDA vs ручной CPU-эталон. Без cutlass это
 //! проверяет decutlass-fallback: Cout%8==0 → im2col + best_cu NN (K-tail для

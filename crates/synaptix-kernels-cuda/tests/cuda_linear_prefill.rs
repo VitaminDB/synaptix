@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Durable correctness-гейт для Backend::linear (callsite #2, prefill M>1):
 //! out[m,n] = sum_k x[m,k] * w[n,k], weight = [N,K] row-major.

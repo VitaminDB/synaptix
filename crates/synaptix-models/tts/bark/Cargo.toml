@@ -8,7 +8,6 @@ description = "Bark."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

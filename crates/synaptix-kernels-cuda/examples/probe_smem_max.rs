@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};

@@ -3,7 +3,6 @@
 //! хаотичном FLUX-стэке → сетка. Сравниваем на РЕАЛИСТИЧНЫХ (post-LayerNorm-like)
 //! данных по всем FLUX-формам, ищем где TN отходит от NN. feature cuda.
 
-#![cfg(feature = "cuda")]
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_nn::linear::Linear;

@@ -2,7 +2,6 @@
 //! bf16, non-causal) через прод-путь Tensor::flash_attention.
 //! TFLOP/s = 4·B·H·Tq·Tkv·HD / t. Корректность: малая форма vs naive f32.
 //! SYN_BENCH_SHAPE="Tq Tkv H HD" — другая форма.
-#![cfg(feature = "cuda")]
 
 use std::time::Instant;
 use synaptix_core::device::Device;

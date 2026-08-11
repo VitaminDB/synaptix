@@ -2,7 +2,6 @@
 //! удаления flash_v4): корректность против CPU-SDPA-эталона (F32 softmax)
 //! на GQA/MHA, causal/non, hd 64/128/256, малые Tq (бывший v4-фоллбэк),
 //! bshd-layout (SDXL) и dev-вариант (device-Tkv, CUDA-graph prefill).
-#![cfg(feature = "cuda")]
 
 use std::sync::Arc;
 

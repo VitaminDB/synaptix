@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Bit-exact: `LinearAttnRawKernels::linear_attn_prep_scatter_{f16,bf16,f32}`
 //! (chunk T≥1) vs host scatter loop + `gated_delta_decay_beta`.

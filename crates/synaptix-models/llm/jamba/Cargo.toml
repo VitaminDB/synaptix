@@ -8,7 +8,6 @@ description = "Jamba (AI21)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

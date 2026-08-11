@@ -13,7 +13,6 @@ use crate::config::{GenerationConfig, WhisperConfig};
 use crate::loader::WhisperWeights;
 use crate::mel::whisper_log_mel;
 use crate::model::WhisperModel;
-#[cfg(feature = "cuda")]
 use crate::model::WhisperDecodeState;
 use crate::{Result, WhisperError};
 
@@ -134,7 +133,6 @@ impl WhisperPipeline {
     /// На CUDA идёт через CUDA-graph replay (decode_segment_graph), иначе —
     /// host-loop с KV-cache.
     fn decode_segment(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
-        #[cfg(feature = "cuda")]
         if matches!(self.device, Device::Cuda(_)) {
             return self.decode_segment_graph(mel, lang_token, task);
         }
@@ -174,7 +172,6 @@ impl WhisperPipeline {
     /// device-шагами (populate self-KV), затем шаг захватывается в граф и
     /// реплеится. Логиты копятся в стабильный `state.logits`, argmax+suppress
     /// на host (1 DtoH/шаг).
-    #[cfg(feature = "cuda")]
     fn decode_segment_graph(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
         use synaptix_core::grad::no_grad;
         use synaptix_infer::graph_capture::GraphCapturer;

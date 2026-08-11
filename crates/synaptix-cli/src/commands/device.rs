@@ -1,7 +1,3 @@
-//! Резолв вычислительного устройства для команд инференса + регистрация
-//! backend'ов. CUDA — путь по умолчанию (сборка с feature `cuda`/`cutlass`);
-//! при отсутствии GPU или сборке без CUDA — graceful fallback на CPU.
-
 use synaptix_core::device::Device;
 
 /// Разбирает `--device` (`cuda` | `cuda:N` | `gpu` | `auto` | `cpu`) и
@@ -16,7 +12,6 @@ pub fn resolve(pref: &str) -> Device {
     }
     let want_cuda = p.is_empty() || p == "auto" || p == "cuda" || p == "gpu" || p.starts_with("cuda:");
 
-    #[cfg(feature = "cuda")]
     {
         if want_cuda {
             let ord = p
@@ -32,12 +27,6 @@ pub fn resolve(pref: &str) -> Device {
                     eprintln!("synaptix: CUDA device {ord} недоступен ({e}); fallback на CPU");
                 }
             }
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        if want_cuda {
-            eprintln!("synaptix: бинарь собран без feature `cuda`; используется CPU");
         }
     }
 

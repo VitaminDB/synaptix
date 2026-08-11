@@ -8,7 +8,6 @@ description = "HunyuanVideo."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

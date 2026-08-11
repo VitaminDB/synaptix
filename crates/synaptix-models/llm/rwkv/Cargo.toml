@@ -8,7 +8,6 @@ description = "RWKV v4 / v5 / v6 / v7 standalone."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

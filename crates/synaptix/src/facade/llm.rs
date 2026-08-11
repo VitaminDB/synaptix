@@ -213,9 +213,6 @@ impl QuantPolicy {
         }
     }
 
-    /// Маппинг квант-политики в нативный [`PrecisionConfig`]. NVFP4/MXFP8
-    /// weights_storage → соответствующий пресет (compute=F16, квант-ядра требуют
-    /// F16-актив). Иначе dense(compute). KV-dtype проброшен из `kv_dtype`.
     pub fn to_precision(&self) -> Result<PrecisionConfig, LlmError> {
         let mut p = match self.weights_storage {
             DType::NVFP4 => PrecisionConfig::nvfp4(),
@@ -223,6 +220,8 @@ impl QuantPolicy {
             _ => PrecisionConfig::dense(self.compute),
         };
         p.kv = self.kv_dtype.to_dtype();
+        p.lm_head = self.lm_head_storage;
+        p.embed = self.embed_storage;
         p.validate().map_err(LlmError::from)?;
         Ok(p)
     }
@@ -345,6 +344,24 @@ enum LlmPipeline {
 }
 
 impl LlmPipeline {
+    fn rope_capacity(&self) -> usize {
+        match self {
+            Self::Qwen3(p) => p.model.rope_capacity(),
+            Self::Hybrid(p) => p.model.rope_capacity(),
+            Self::Llama(p) => p.model.rope_capacity(),
+            Self::Gemma3(p) => p.model.rope_capacity(),
+        }
+    }
+
+    fn kv_bytes_per_token(&self) -> usize {
+        match self {
+            Self::Qwen3(p) => p.model.kv_bytes_per_token(),
+            Self::Hybrid(p) => p.model.kv_bytes_per_token(),
+            Self::Llama(p) => p.model.kv_bytes_per_token(),
+            Self::Gemma3(p) => p.model.kv_bytes_per_token(),
+        }
+    }
+
     fn generate_streaming(
         &self,
         prompt_ids: &[u32],
@@ -357,21 +374,19 @@ impl LlmPipeline {
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
             LlmPipeline::Hybrid(p) => {
-                if mtp_enabled() && p.has_mtp() && cfg.temperature == 0.0 {
-                    #[cfg(feature = "llm-cuda")]
+                if mtp_enabled() && p.has_mtp() {
                     {
                         return p
                             .generate_mtp_with_graph(prompt_ids, cfg, sink)
                             .map(|_| ())
                             .map_err(|e| LlmError(e.to_string()));
                     }
-                    #[cfg(not(feature = "llm-cuda"))]
-                    {
-                        return p
-                            .generate_mtp(prompt_ids, cfg, sink)
-                            .map(|_| ())
-                            .map_err(|e| LlmError(e.to_string()));
-                    }
+                }
+                if graph_decode_enabled() && p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
                 }
                 p.generate_streaming(prompt_ids, cfg, sink)
                     .map(|_| ())
@@ -439,6 +454,13 @@ impl Llm {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn kv_bytes_per_token(&self) -> usize {
+        self.pipeline
+            .lock()
+            .map(|p| p.kv_bytes_per_token())
+            .unwrap_or(0)
     }
 
     /// Сырой стриминг: нативный pipeline шлёт id токенов в `sink`; декод/UI —
@@ -561,7 +583,7 @@ impl<'a> LlmGeneration<'a> {
             eos_token_id: None,
             eos_token_ids: self.stop_tokens.clone(),
             max_seq: Some(self.opts.max_seq_len.max(1)),
-            prefill_batch: 0,
+            prefill_batch: prefill_chunk_size(),
         };
 
         let mut sink = DeltaSink {
@@ -662,7 +684,10 @@ fn build_eos_ids(tok: &HfTokenizer, specials: &SpecialTokens) -> Vec<u32> {
 fn ensure_kernels_registered() {
     use std::sync::OnceLock;
     static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(synaptix_kernels_cpu::ensure_registered);
+    ONCE.get_or_init(|| {
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+    });
 }
 
 fn build_facade(
@@ -678,7 +703,10 @@ fn build_facade(
     let template = load_template_source(path)
         .map(|src| ChatTemplate::from_source_with_specials(src, specials.clone()));
 
-    let max_seq_len = max_seq.or_else(|| config_max_seq(path)).unwrap_or(32768);
+    let capacity = pipeline.rope_capacity();
+    let max_seq_len = max_seq
+        .or_else(|| config_max_seq(path))
+        .map_or(capacity, |requested| requested.min(capacity));
 
     let model = Llm {
         pipeline: Mutex::new(pipeline),
@@ -690,9 +718,6 @@ fn build_facade(
     Ok((model, tok))
 }
 
-/// Каноническая загрузка: детект арх → нативный pipeline в заданном
-/// [`PrecisionConfig`]. Сигнатура стабильна — новые арх добавляются веткой
-/// `match`, потребитель не меняется.
 pub fn load_llm(
     path: &Path,
     device: Device,
@@ -751,11 +776,34 @@ pub fn mtp_enabled() -> bool {
 }
 
 pub fn set_flash_attn_mode(_mode: FlashAttnMode) {}
-pub fn set_graph_decode_enabled(_on: bool) {}
+static GRAPH_DECODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_graph_decode_enabled(on: bool) {
+    GRAPH_DECODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn graph_decode_enabled() -> bool {
+    GRAPH_DECODE.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub fn set_la_prep_fused_disabled(_off: bool) {}
 pub fn set_gdr_fused_disabled(_off: bool) {}
-pub fn set_prefill_chunk_size(_size: usize) {}
-pub fn set_layer_sync_mode(_mode: LayerSyncMode) {}
+static PREFILL_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_prefill_chunk_size(size: usize) {
+    PREFILL_CHUNK.store(size, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn prefill_chunk_size() -> usize {
+    PREFILL_CHUNK.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_layer_sync_mode(mode: LayerSyncMode) {
+    let code = match mode {
+        LayerSyncMode::Auto => 0,
+        LayerSyncMode::Off => 1,
+        LayerSyncMode::On => 2,
+    };
+    synaptix_core::device::cuda::set_layer_sync_mode(code);
+}
 
 /// Trim CUDA-mempool после Drop KV-кэша. На non-CUDA сборках `hard_trim_all_pools_device`
 /// резолвится в no-op fallback, поэтому функция доступна безусловно.
@@ -763,6 +811,16 @@ pub fn cuda_trim_pool(ordinal: i32) -> u64 {
     if ordinal < 0 {
         return 0;
     }
-    let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ordinal as usize);
-    0
+    let ord = ordinal as usize;
+    let free_of = || {
+        synaptix_core::device::cuda::mem_info(ord)
+            .map(|(free, _total)| free)
+            .unwrap_or(0)
+    };
+    let before = free_of();
+    if let Err(e) = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord) {
+        eprintln!("[synaptix] cuda_trim_pool({ord}): {e}");
+        return 0;
+    }
+    (free_of().saturating_sub(before) / (1024 * 1024)) as u64
 }

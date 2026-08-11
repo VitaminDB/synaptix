@@ -8,7 +8,6 @@ description = "Tacotron2."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

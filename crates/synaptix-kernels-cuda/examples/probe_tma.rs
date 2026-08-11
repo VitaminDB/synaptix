@@ -7,7 +7,6 @@
 //! try_wait.parity). Это фундамент для TMA-GEMM (2dt). Аналог probe_ldmatrix.
 //!
 //! cargo run -p synaptix-kernels-cuda --features cuda --release --example probe_tma
-#![cfg(feature = "cuda")]
 
 use std::ffi::c_void;
 

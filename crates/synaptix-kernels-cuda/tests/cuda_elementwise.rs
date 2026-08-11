@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 use half::{bf16, f16};
 use synaptix_core::device::Device;

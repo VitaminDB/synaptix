@@ -2,7 +2,6 @@
 //! Runs 10 warmup + 1 profiled launch of c256_s4_swz only.
 //! Shape via env SHAPE=attn|gate (default attn). M via env M (default 1024).
 //! ncu: `-k regex:c256_s4_swz -s 10 -c 1`.
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::CudaSlice;
 use half::f16;

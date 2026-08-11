@@ -8,9 +8,6 @@ description = "LLaMA 2 / 3 / 3.1 / 3.2 / 3.3 native Rust."
 
 [features]
 default = []
-# Device-резидентный decode + CUDA-graph (generate_with_graph, forward_decode_dev),
-# зеркально qwen3.
-cuda = ["synaptix-core/cuda", "synaptix-infer/cuda", "synaptix-llm-common/cuda"]
 
 [dependencies]
 synaptix-llm-common = { workspace = true }

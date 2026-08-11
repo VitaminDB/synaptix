@@ -3,7 +3,6 @@
 //! SHAPE=attn|ff_up|ff_down (default attn), M (default 26624, кратно 256),
 //! CFG=<fname> — прогнать только один конфиг (режим ncu: 10 warmup + 3 замера),
 //! ITERS (default 30).
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::CudaSlice;
 use half::f16;

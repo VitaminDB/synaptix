@@ -53,7 +53,6 @@ pub struct MusicArgs {
 
 pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     synaptix_kernels_cpu::ensure_registered();
-    #[cfg(feature = "cuda")]
     synaptix_kernels_cuda::ensure_registered();
 
     let pick = |o: Option<PathBuf>, name: &str| o.unwrap_or_else(|| args.models.join(name));

@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 use std::hint::black_box;
 use std::time::Instant;

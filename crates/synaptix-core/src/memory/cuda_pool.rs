@@ -1,8 +1,3 @@
-//! Учёт CUDA-аллокаций + интеграция с `cuMemPoolTrimTo`.
-//!
-//! Счётчики (`record_cuda_alloc`/`record_cuda_free`) — чисто атомарные, работают и без CUDA
-//! фичи (как наблюдатель). Реальное освобождение памяти обратно в драйвер делает
-//! [`trim_cuda_mempool`] через `cuMemPoolTrimTo(default_pool, threshold)`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,16 +47,12 @@ pub fn trim_threshold() -> usize {
 /// На CPU-сборке (`not(feature = "cuda")`) — no-op (счётчики не трогаем — они отражают наш
 /// учёт, а не реальный heap). На CUDA-сборке вызывает `cuMemPoolTrimTo(pool, threshold)`,
 /// где threshold = [`trim_threshold()`].
-#[cfg(not(feature = "cuda"))]
-pub fn trim_cuda_mempool() {}
 
-#[cfg(feature = "cuda")]
 pub fn trim_cuda_mempool() {
     let _ = trim_cuda_mempool_device(0);
 }
 
 /// То же, что [`trim_cuda_mempool`], но для конкретного device-ordinal и с пробросом ошибки.
-#[cfg(feature = "cuda")]
 pub fn trim_cuda_mempool_device(ordinal: usize) -> crate::error::Result<()> {
     use crate::error::SynaptixError;
     let ctx = crate::device::cuda::get(ordinal)?;
@@ -77,7 +68,6 @@ pub fn trim_cuda_mempool_device(ordinal: usize) -> crate::error::Result<()> {
 /// Полный трим независимо от текущего trim-threshold (временно сбрасывает в 0):
 /// для граничных компактов, когда в горячей фазе пул работает с высоким
 /// threshold (держит free-list стабильным), а на границе нужно вернуть всё.
-#[cfg(feature = "cuda")]
 pub fn hard_trim_cuda_mempool_device(ordinal: usize) -> crate::error::Result<()> {
     let saved = trim_threshold();
     set_trim_threshold(0);
@@ -91,7 +81,6 @@ pub fn hard_trim_cuda_mempool_device(ordinal: usize) -> crate::error::Result<()>
 /// живут в отдельном пуле драйвера; после Drop графов physical-страницы висят
 /// зарезервированными — обычный cuMemPoolTrimTo их не видит, VAE-бюджет
 /// занижается → другой тайлинг). Память живых графов не трогается.
-#[cfg(feature = "cuda")]
 pub fn trim_graph_mem_device(ordinal: usize) -> crate::error::Result<()> {
     use crate::error::SynaptixError;
     let ctx = crate::device::cuda::get(ordinal)?;
@@ -106,32 +95,19 @@ pub fn trim_graph_mem_device(ordinal: usize) -> crate::error::Result<()> {
 
 /// Полный трим default-пула И weights-пула (перед фазами, меряющими свободную
 /// VRAM, — иначе удержанные пулами блоки занижают бюджет недетерминированно).
-#[cfg(feature = "cuda")]
 pub fn hard_trim_all_pools_device(ordinal: usize) -> crate::error::Result<()> {
+    let _ = crate::device::cuda::synchronize_all(ordinal);
     let r = hard_trim_cuda_mempool_device(ordinal);
     let _ = crate::device::cuda::trim_weights_pool(ordinal);
     r
 }
 
-#[cfg(not(feature = "cuda"))]
-pub fn hard_trim_all_pools_device(_ordinal: usize) -> crate::error::Result<()> {
-    Ok(())
-}
 
-#[cfg(not(feature = "cuda"))]
-pub fn trim_cuda_mempool_device(_ordinal: usize) -> crate::error::Result<()> {
-    Ok(())
-}
 
-#[cfg(not(feature = "cuda"))]
-pub fn hard_trim_cuda_mempool_device(_ordinal: usize) -> crate::error::Result<()> {
-    Ok(())
-}
 
 /// (reserved, used) байт default-пула: RESERVED = удержано у драйвера (вкл.
 /// свободные сегменты), USED = живые с точки зрения пула. reserved≫used =
 /// фрагментация сегментов; used≫наш live-учёт = неучтённые аллокации.
-#[cfg(feature = "cuda")]
 pub fn cuda_mempool_stats(ordinal: usize) -> crate::error::Result<(u64, u64)> {
     use crate::error::SynaptixError;
     use cudarc::driver::sys;

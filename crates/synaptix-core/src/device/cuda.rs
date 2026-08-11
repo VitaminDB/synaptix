@@ -1,4 +1,3 @@
-#[cfg(feature = "cuda")]
 mod inner {
     use crate::error::{Result, SynaptixError};
     use cudarc::driver::{CudaContext, CudaStream};
@@ -237,6 +236,51 @@ mod inner {
         }
         wr.insert(ord, pool as usize);
         Ok(pool)
+    }
+
+    static LAYER_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    pub fn set_layer_sync_mode(mode: u8) {
+        LAYER_SYNC.store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn layer_sync_mode() -> u8 {
+        LAYER_SYNC.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn layer_sync(ordinal: usize, is_prefill: bool) {
+        let enabled = match layer_sync_mode() {
+            1 => false,
+            2 => true,
+            _ => is_prefill,
+        };
+        if !enabled {
+            return;
+        }
+        if let Ok(s) = default_stream(ordinal) {
+            let _ = s.synchronize();
+        }
+    }
+
+    pub fn weights_pool_stats(ordinal: usize) -> Result<(u64, u64)> {
+        use cudarc::driver::sys;
+        let pool = weights_pool(ordinal)?;
+        let get = |attr: sys::CUmemPool_attribute| -> Result<u64> {
+            let mut v: u64 = 0;
+            unsafe {
+                cudarc::driver::result::mem_pool::get_attribute(
+                    pool,
+                    attr,
+                    &mut v as *mut u64 as *mut std::ffi::c_void,
+                )
+            }
+            .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolGetAttribute(weights): {e:?}")))?;
+            Ok(v)
+        };
+        Ok((
+            get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+            get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        ))
     }
 
     pub fn trim_weights_pool(ordinal: usize) -> Result<()> {
@@ -743,56 +787,4 @@ mod inner {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub use inner::*;
-
-#[cfg(not(feature = "cuda"))]
-pub fn get(_ordinal: usize) -> crate::error::Result<()> {
-    Err(crate::error::SynaptixError::Unsupported("cuda feature disabled"))
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn synchronize(_ordinal: usize) -> crate::error::Result<()> {
-    Err(crate::error::SynaptixError::Unsupported("cuda feature disabled"))
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn synchronize_all(_ordinal: usize) -> crate::error::Result<()> {
-    Err(crate::error::SynaptixError::Unsupported("cuda feature disabled"))
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn mem_info(_ordinal: usize) -> crate::error::Result<(usize, usize)> {
-    Err(crate::error::SynaptixError::Unsupported("cuda feature disabled"))
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn set_offload_pinned(_on: bool) {}
-
-#[cfg(not(feature = "cuda"))]
-pub fn offload_pinned_enabled() -> bool {
-    false
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn offload_pin_cache_active() -> bool {
-    false
-}
-
-/// No-op заглушка pinned-кэша offload-весов (без CUDA зеркалить нечего).
-#[cfg(not(feature = "cuda"))]
-pub struct OffloadPinCacheGuard;
-
-#[cfg(not(feature = "cuda"))]
-impl OffloadPinCacheGuard {
-    pub fn new(_ranges: &[&[u8]]) -> Self {
-        Self
-    }
-    pub fn new_paused(_ranges: &[&[u8]]) -> Self {
-        Self
-    }
-    pub fn new_paused_lazy(_ranges: &[&[u8]]) -> Self {
-        Self
-    }
-    pub fn resume(&self) {}
-}

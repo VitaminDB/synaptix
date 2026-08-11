@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Unit-тесты для chunk-FLA helper-ядер против CPU-f32 эталонов.
 

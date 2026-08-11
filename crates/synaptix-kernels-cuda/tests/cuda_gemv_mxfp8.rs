@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! Корректность best_cu gemv_mxfp8 (MXFP8 decode GEMV, SIMT-dequant):
 //! y[N] = W[N,K] @ x[K], W/x = E4M3 + E8M0 per-32-block scales (natural) vs CPU-f32.

@@ -112,6 +112,60 @@ impl TokenSampler {
         self.step += 1;
         Ok(tok)
     }
+
+    pub fn probs(&mut self, logits: &Tensor) -> Result<Vec<f32>, ModelError> {
+        let mut v = logits
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let ctx = ProcessorContext {
+            input_ids: self.context.clone(),
+            step: self.step,
+            batch_idx: 0,
+        };
+        self.pipeline
+            .process(&mut v, &ctx)
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for x in v.iter_mut() {
+            *x = if x.is_finite() { (*x - max).exp() } else { 0.0 };
+            sum += *x;
+        }
+        if sum > 0.0 {
+            for x in v.iter_mut() {
+                *x /= sum;
+            }
+        }
+        Ok(v)
+    }
+
+    pub fn sample_from_probs(&mut self, probs: &[f32]) -> u32 {
+        let u = self.rng.next_f32_uniform();
+        let mut acc = 0.0f32;
+        for (i, p) in probs.iter().enumerate() {
+            acc += *p;
+            if u <= acc {
+                return i as u32;
+            }
+        }
+        probs
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    }
+
+    pub fn uniform(&mut self) -> f32 {
+        self.rng.next_f32_uniform()
+    }
+
+    pub fn commit(&mut self, tok: u32) {
+        self.context.push(tok);
+        self.step += 1;
+    }
 }
 
 pub fn eos_set(cfg: &GenerationConfig) -> HashSet<u32> {

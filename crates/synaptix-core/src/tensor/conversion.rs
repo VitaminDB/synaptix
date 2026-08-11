@@ -1,14 +1,11 @@
-#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 use crate::device::Device;
 use crate::dtype::SynaptixScalar;
 use crate::error::{Result, SynaptixError};
 use crate::tensor::Tensor;
-#[cfg(feature = "cuda")]
 use crate::tensor::layout::Layout;
 use crate::tensor::storage::Storage;
-#[cfg(feature = "cuda")]
 use crate::tensor::storage::CpuBuf;
 
 impl Tensor {
@@ -24,7 +21,6 @@ impl Tensor {
         let byte_offset = self.layout.offset() * elem_bytes;
         match (&*self.storage, device) {
             (Storage::Cpu(b), Device::Cuda(_ord)) => {
-                #[cfg(feature = "cuda")]
                 {
                     // Вес-стрим (pin-mirror/offload-pinned активны) идёт через
                     // изолированный weights-пул + pinned-конвейер — тот же стек,
@@ -36,14 +32,8 @@ impl Tensor {
                     let layout = Layout::contiguous(self.shape().clone(), self.dtype());
                     Ok(Tensor::from_parts(Arc::new(storage), layout))
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = (b, byte_offset, n_bytes);
-                    Err(SynaptixError::Unsupported("cpu→cuda without cuda feature"))
-                }
             }
             (Storage::Cuda(b), Device::Cpu) => {
-                #[cfg(feature = "cuda")]
                 {
                     let stream = b.stream().clone();
                     // offload-выгрузка → pinned-конвейер (pageable dtoh 3-6GB/s
@@ -61,11 +51,6 @@ impl Tensor {
                     let layout = Layout::contiguous(self.shape().clone(), self.dtype());
                     Ok(Tensor::from_parts(Arc::new(storage), layout))
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = b;
-                    Err(SynaptixError::Unsupported("cuda→cpu without cuda feature"))
-                }
             }
             _ => Err(SynaptixError::Unsupported("to_device: device combo")),
         }
@@ -79,18 +64,11 @@ impl Tensor {
 pub(crate) fn storage_to_device(s: &Storage, device: Device) -> Result<Storage> {
     match (s, device) {
         (Storage::Cpu(b), Device::Cuda(_ord)) => {
-            #[cfg(feature = "cuda")]
             {
                 crate::tensor::creation::cuda_alloc_from_bytes(device, b.as_bytes())
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = b;
-                Err(SynaptixError::Unsupported("cpu→cuda without cuda feature"))
-            }
         }
         (Storage::Cuda(b), Device::Cpu) => {
-            #[cfg(feature = "cuda")]
             {
                 let bytes: Vec<u8> = if crate::device::cuda::offload_pinned_enabled()
                     && b.slice().len() >= (4 << 20)
@@ -102,11 +80,6 @@ pub(crate) fn storage_to_device(s: &Storage, device: Device) -> Result<Storage> 
                         .map_err(|e| SynaptixError::Cuda(format!("storage clone_dtoh: {e:?}")))?
                 };
                 Ok(Storage::Cpu(CpuBuf::from_vec(bytes)))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = b;
-                Err(SynaptixError::Unsupported("cuda→cpu without cuda feature"))
             }
         }
         _ => Err(SynaptixError::Unsupported("storage_to_device: device combo")),
@@ -195,7 +168,6 @@ impl Tensor {
                 Ok(bytemuck::cast_slice(bytes).to_vec())
             }
             Storage::Cuda(b) => {
-                #[cfg(feature = "cuda")]
                 {
                     let stream = b.stream.clone();
                     let bytes: Vec<u8> = stream
@@ -203,11 +175,6 @@ impl Tensor {
                         .map_err(|e| SynaptixError::Cuda(format!("clone_dtoh: {e:?}")))?;
                     let slice = &bytes[offset_bytes..offset_bytes + numel * elem_bytes];
                     Ok(bytemuck::cast_slice(slice).to_vec())
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = b;
-                    Err(SynaptixError::Unsupported("cuda dtoh without cuda feature"))
                 }
             }
         }

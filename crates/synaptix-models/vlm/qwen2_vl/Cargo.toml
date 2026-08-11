@@ -8,7 +8,6 @@ description = "Qwen2-VL / Qwen2.5-VL."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

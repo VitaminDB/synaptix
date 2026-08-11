@@ -8,7 +8,6 @@ description = "Florence-2 (vision)."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

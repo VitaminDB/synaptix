@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 
 //! CUDA MXFP8-KV append-квант: BF16 → MXFP8 E4M3 + per-32-block E8M0 (U8).
 //! Сверяет CUDA-ядро с CPU-референсом (тот же E8M0/E4M3 кодек) — bit-exact

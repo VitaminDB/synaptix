@@ -3,7 +3,6 @@
 //! Гейтится фичей `cuda` + наличием весов в `models/Qwen/Qwen3-1.7B`.
 //! Запуск: `cargo test -p synaptix --features cuda --profile fast-release cuda_graph`.
 
-#![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
 use std::sync::Mutex;

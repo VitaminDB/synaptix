@@ -71,6 +71,39 @@ impl QuantWeight {
         &self.scales
     }
 
+    pub fn embed_gather(&self, ids: &Tensor) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        if self.dtype != DType::MXFP8 {
+            return Err(SynaptixError::Unsupported(
+                "QuantWeight::embed_gather: поддержан только MXFP8",
+            ));
+        }
+        let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
+            "QuantWeight::embed_gather: packed освобождён",
+        ))?;
+        let ids_c = if ids.is_contiguous() { ids.clone() } else { ids.contiguous()? };
+        let n = ids_c.numel();
+        let out_layout = Layout::contiguous(Shape::new(vec![n, self.k]), DType::F16);
+        let backend = registry::backend_for(self.device)?;
+        let mut storage =
+            backend.alloc_zeros(DType::F16.bytes_for_numel(n * self.k), self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        backend.embed_gather_mxfp8(
+            &packed,
+            &self.scales,
+            (&ids_c.storage, &ids_c.layout),
+            (&mut storage, &out_layout),
+            self.n,
+            self.k,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     pub fn dtype(&self) -> DType {
         self.dtype
     }

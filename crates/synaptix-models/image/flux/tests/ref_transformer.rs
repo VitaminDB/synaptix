@@ -4,7 +4,6 @@
 //! txt=32. Гейт с поправкой на bf16-дрейф 57 блоков (cos + per-token max-abs).
 //! Требует feature `cuda`.
 
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 

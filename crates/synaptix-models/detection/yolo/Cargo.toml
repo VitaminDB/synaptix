@@ -8,7 +8,6 @@ description = "YOLO v8 / v10 / v11."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

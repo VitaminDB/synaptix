@@ -2,7 +2,6 @@
 //! СТАРАЯ (decode всей последовательности каждый токен, O(N²)) vs НОВАЯ
 //! (vLLM-окно [prefix..], O(N)). Запуск:
 //!   cargo run --profile fast-release --example bench_chat_detok --features cuda -- "/path/model.syn"
-#![cfg(feature = "cuda")]
 
 use synaptix_core::device::Device;
 use synaptix_core::precision::PrecisionConfig;

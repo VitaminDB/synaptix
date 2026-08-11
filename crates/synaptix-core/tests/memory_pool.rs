@@ -81,7 +81,6 @@ fn pinned_buf_drop_does_not_panic() {
     }
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn pinned_buf_uses_cuda_when_available() {
     // На системе с CUDA — буфер должен быть page-locked.
@@ -96,7 +95,6 @@ fn pinned_buf_uses_cuda_when_available() {
     );
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn trim_cuda_mempool_device_returns_ok() {
     use synaptix_core::memory::cuda_pool::trim_cuda_mempool_device;
@@ -109,7 +107,6 @@ fn trim_cuda_mempool_device_returns_ok() {
     trim_cuda_mempool_device(0).expect("trim_cuda_mempool_device должен вернуть Ok на исправном GPU");
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn pinned_buf_can_be_used_with_cuda_htod() {
     // Не идеальный тест (нужен CudaStream), но хотя бы проверяем что pointer not null.

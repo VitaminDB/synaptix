@@ -16,13 +16,8 @@ impl Tensor {
         let storage = match device {
             Device::Cpu => Storage::Cpu(arena::alloc_zeros_cpu(n_bytes)),
             Device::Cuda(_) => {
-                #[cfg(feature = "cuda")]
                 {
                     cuda_alloc_zeros(device, n_bytes)?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(SynaptixError::Unsupported("Tensor::zeros on Cuda without cuda feature"));
                 }
             }
             _ => return Err(SynaptixError::Unsupported("device for Tensor::zeros")),
@@ -46,13 +41,8 @@ impl Tensor {
         let storage = match device {
             Device::Cpu => Storage::Cpu(CpuBuf::from_vec(bytes)),
             Device::Cuda(_) => {
-                #[cfg(feature = "cuda")]
                 {
                     cuda_alloc_from_bytes(device, &bytes)?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(SynaptixError::Unsupported("Tensor::from_vec on Cuda without cuda feature"));
                 }
             }
             _ => return Err(SynaptixError::Unsupported("device for Tensor::from_vec")),
@@ -89,15 +79,8 @@ impl Tensor {
         let storage = match device {
             Device::Cpu => Storage::Cpu(CpuBuf::from_vec(bytes)),
             Device::Cuda(_) => {
-                #[cfg(feature = "cuda")]
                 {
                     cuda_alloc_from_bytes(device, &bytes)?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(SynaptixError::Unsupported(
-                        "Tensor::from_raw_bytes on Cuda without cuda feature",
-                    ));
                 }
             }
             _ => return Err(SynaptixError::Unsupported("device for Tensor::from_raw_bytes")),
@@ -129,15 +112,8 @@ impl Tensor {
         let storage = match device {
             Device::Cpu => Storage::Cpu(CpuBuf::from_vec(bytes.to_vec())),
             Device::Cuda(_) => {
-                #[cfg(feature = "cuda")]
                 {
                     cuda_alloc_from_bytes(device, bytes)?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(SynaptixError::Unsupported(
-                        "Tensor::from_raw_slice on Cuda without cuda feature",
-                    ));
                 }
             }
             _ => return Err(SynaptixError::Unsupported("device for Tensor::from_raw_slice")),
@@ -163,13 +139,8 @@ impl Tensor {
         let storage = match device {
             Device::Cpu => Storage::Cpu(CpuBuf::from_vec(bytes)),
             Device::Cuda(_) => {
-                #[cfg(feature = "cuda")]
                 {
                     cuda_alloc_from_bytes(device, &bytes)?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(SynaptixError::Unsupported("Tensor::ones on Cuda without cuda feature"));
                 }
             }
             _ => return Err(SynaptixError::Unsupported("device for Tensor::ones")),
@@ -219,15 +190,8 @@ impl Tensor {
             }
         }
         if !device.is_cpu() {
-            #[cfg(feature = "cuda")]
             {
                 return cat_cuda(tensors, dim);
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(SynaptixError::Unsupported(
-                    "Tensor::cat on non-CPU device requires cuda feature",
-                ));
             }
         }
         let mut out_dims = first.dims().to_vec();
@@ -324,7 +288,6 @@ fn fill_bytes_one(dtype: DType, numel: usize) -> Result<Vec<u8>> {
 /// Зеркалит CPU-логику: для каждого outer-слайса последовательно копирует
 /// contiguous-чанки каждого входа в выход. Используется в KV-cache append (dim=2)
 /// и apply_rope (dim=3).
-#[cfg(feature = "cuda")]
 fn cat_cuda(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
     let first = tensors[0];
     let dtype = first.dtype();
@@ -406,7 +369,6 @@ fn cat_cuda(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
     Ok(out)
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage> {
     let ord = device.ordinal();
     let stream = crate::device::cuda::alloc_stream(ord)?;
@@ -456,7 +418,6 @@ pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage
     Ok(Storage::Cuda(crate::tensor::storage::CudaBuf::new(ctx, stream, buf, ord)))
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Storage> {
     let ord = device.ordinal();
     let stream = crate::device::cuda::alloc_stream(ord)?;

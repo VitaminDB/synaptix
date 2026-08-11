@@ -10,7 +10,6 @@
 //! точный offset, который вернул ldmatrix.
 //!
 //! cargo run -p synaptix-kernels-cuda --features cuda --release --example probe_ldmatrix
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use synaptix_kernels_cuda::kernels::compile::{compile_module_with_opts, load_fn};

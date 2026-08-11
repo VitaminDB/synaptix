@@ -2,7 +2,6 @@
 //! Pure-GEMM: квант 1×, ядра в цикле. Гейт: per-row max|Δ| rot-vs-base == 0 (бит-в-бит).
 //! SHAPE=attn|ff_up|ff_down, M (default 26624), ITERS (default 30),
 //! DOBENCH=1 (L2-flush + медиана), CHECK=0 (только перф), CFG=base|rot (режим ncu).
-#![cfg(feature = "cuda")]
 
 use cudarc::driver::CudaSlice;
 use half::f16;

@@ -8,7 +8,6 @@ description = "Qwen3-ASR."
 
 [features]
 default = []
-cuda = []
 
 [dependencies]
 synaptix-core      = { workspace = true }

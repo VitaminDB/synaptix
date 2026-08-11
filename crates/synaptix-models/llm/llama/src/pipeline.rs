@@ -88,7 +88,7 @@ impl LlamaPipeline {
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build(
-            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, rope_capacity,
+            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, rope_capacity,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         .with_kv_cache_dtype(precision.kv);
@@ -184,7 +184,6 @@ impl LlamaPipeline {
     /// CUDA-graph decode (зеркально qwen3): тело single-token forward'а
     /// захватывается в `CudaGraph` и реплеится — устраняет launch-overhead. Prefill —
     /// обычный батч-forward. Требует CUDA-устройство и не-FP8 KV.
-    #[cfg(feature = "cuda")]
     pub fn generate_with_graph(
         &self,
         prompt_ids: &[u32],

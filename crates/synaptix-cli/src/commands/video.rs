@@ -132,7 +132,6 @@ pub fn run(args: VideoArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     synaptix_kernels_cpu::ensure_registered();
-    #[cfg(feature = "cuda")]
     synaptix_kernels_cuda::ensure_registered();
 
     let dev = match args.device.as_str() {
