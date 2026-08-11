@@ -11,6 +11,7 @@ default = []
 
 [dependencies]
 synaptix-core   = { workspace = true }
+synaptix-nn     = { workspace = true }
 synaptix-ops    = { workspace = true }
 synaptix-io     = { workspace = true, features = ["image"] }
 synaptix-bundle = { workspace = true }

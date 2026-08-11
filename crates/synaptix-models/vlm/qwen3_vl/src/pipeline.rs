@@ -66,7 +66,8 @@ impl H3Encoder {
         encoder_dir: impl AsRef<Path>,
         tokenizer_json: Option<PathBuf>,
         device: Device,
-        dtype: DType,
+        compute: DType,
+        quant: DType,
         layers: usize,
     ) -> Result<Self, VisionError> {
         let dir = encoder_dir.as_ref();
@@ -77,8 +78,8 @@ impl H3Encoder {
         let tcfg = TextConfig::from_hf_bytes(&cfg_bytes)?;
 
         let weights = DirWeights::open(dir, device)?;
-        let vision = VisionTower::build(vcfg, &weights, device, dtype)?;
-        let text = TextEncoder::build(tcfg, &weights, device, dtype, layers)?;
+        let vision = VisionTower::build(vcfg, &weights, device, compute)?;
+        let text = TextEncoder::build(tcfg, &weights, device, compute, quant, layers)?;
 
         let tok_path = tokenizer_json.unwrap_or_else(|| dir.join("tokenizer.json"));
         let tokenizer = HfTokenizer::from_file(&tok_path)
@@ -90,7 +91,7 @@ impl H3Encoder {
             tokenizer,
             limits: PreprocessLimits::default(),
             device,
-            dtype,
+            dtype: compute,
         })
     }
 
