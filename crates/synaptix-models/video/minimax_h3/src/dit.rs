@@ -145,6 +145,10 @@ impl Attention {
         let q = q.reshape(vec![1, self.heads, s, self.head_dim])?;
         let k = k.reshape(vec![1, self.heads, s, self.head_dim])?;
         let v = v.reshape(vec![1, self.heads, s, self.head_dim])?;
+        if runtime::h3_attn_prof() {
+            let st = crate::pipeline::tensor_stats;
+            eprintln!("[h3-attn] {} · {} · {}", st("q", &q), st("k", &k), st("v", &v));
+        }
 
         let attn = match q.dtype() {
             DType::BF16 | DType::F16 => q
@@ -212,6 +216,16 @@ impl Mlp {
         let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
         drop(h);
         let act = gate.silu_and_mul(&up)?;
+        if runtime::h3_mlp_prof() {
+            let st = crate::pipeline::tensor_stats;
+            eprintln!("[h3-mlp] {} · {} · {} · {}", st("вход", x), st("gate", &gate), st("up", &up), st("act", &act));
+            if x.dims()[0] > 1000 {
+                crate::pipeline::dump_tensor("mlp_in", x);
+                crate::pipeline::dump_tensor("mlp_gate", &gate);
+                crate::pipeline::dump_tensor("mlp_up", &up);
+                crate::pipeline::dump_tensor("mlp_act", &act);
+            }
+        }
         self.fc2.forward(&act)
     }
 }
@@ -315,15 +329,38 @@ impl DiTBlock {
         mods: &BlockMods,
         segments: &[ModSegment],
         rope: &RopeTables,
+        idx: usize,
     ) -> R<Tensor> {
+        let prof = runtime::h3_adaln_prof() && idx == 0;
+        let st = crate::pipeline::tensor_stats;
+        if prof {
+            eprintln!("[h3-mod] {} · {}", st("shift_msa", &mods.shift_msa), st("scale_msa", &mods.scale_msa));
+            eprintln!("[h3-mod] {} · {}", st("gate_msa", &mods.gate_msa), st("gate_mlp", &mods.gate_mlp));
+            eprintln!("[h3-mod] {} · {}", st("shift_mlp", &mods.shift_mlp), st("scale_mlp", &mods.scale_mlp));
+        }
         let h = rms_norm(x, &self.norm1, self.eps)?;
+        if prof {
+            eprintln!("[h3-mod] {}", st("norm1", &h));
+        }
         let h = mod_scale_shift(&h, &mods.shift_msa, &mods.scale_msa, segments)?;
+        if prof {
+            eprintln!("[h3-mod] {}", st("после mod1", &h));
+        }
         let a = self.attn.forward(&h, Some(rope))?;
+        if prof {
+            eprintln!("[h3-mod] {}", st("attn", &a));
+        }
         let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
+        if prof {
+            eprintln!("[h3-mod] {}", st("x после attn", &x));
+        }
 
         let h = rms_norm(&x, &self.norm2, self.eps)?;
         let h = mod_scale_shift(&h, &mods.shift_mlp, &mods.scale_mlp, segments)?;
         let m = self.mlp.forward(&h)?;
+        if prof {
+            eprintln!("[h3-mod] {}", st("mlp", &m));
+        }
         mod_gate(&x, &m, &mods.gate_mlp, segments)
     }
 }
@@ -361,7 +398,7 @@ fn mod_scale_shift(
     segments: &[ModSegment],
 ) -> R<Tensor> {
     let dims = h.dims().to_vec();
-    let mut out = Tensor::empty_uninit(dims.clone(), h.dtype(), h.device())?;
+    let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], h.dtype(), h.device())?;
     for seg in segments {
         let n = seg.stop - seg.start;
         if n == 0 {
@@ -374,14 +411,14 @@ fn mod_scale_shift(
             Ok(y) => y,
             Err(_) => part.broadcast_mul(&s.add_scalar(1.0)?)?.broadcast_add(&sh)?,
         };
-        out.copy_rows_from(seg.start, &y)?;
+        out.copy_rows_from(seg.start, &y.reshape(vec![1, n, dims[1]])?)?;
     }
-    Ok(out)
+    out.reshape(dims)
 }
 
 fn mod_gate(x: &Tensor, other: &Tensor, gate: &Tensor, segments: &[ModSegment]) -> R<Tensor> {
     let dims = x.dims().to_vec();
-    let mut out = Tensor::empty_uninit(dims.clone(), x.dtype(), x.device())?;
+    let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], x.dtype(), x.device())?;
     for seg in segments {
         let n = seg.stop - seg.start;
         if n == 0 {
@@ -394,9 +431,9 @@ fn mod_gate(x: &Tensor, other: &Tensor, gate: &Tensor, segments: &[ModSegment]) 
             Ok(y) => y,
             Err(_) => xp.add(&op.broadcast_mul(&g)?)?,
         };
-        out.copy_rows_from(seg.start, &y)?;
+        out.copy_rows_from(seg.start, &y.reshape(vec![1, n, dims[1]])?)?;
     }
-    Ok(out)
+    out.reshape(dims)
 }
 
 pub struct FinalLayer {
@@ -647,14 +684,29 @@ impl H3Dit {
         video_seg: (usize, usize, usize),
         audio_seg: (usize, usize, usize),
     ) -> R<(Tensor, Tensor)> {
+        let prof = runtime::h3_blk_prof();
+        if prof {
+            eprintln!("[h3-blk] вход · {}", crate::pipeline::tensor_stats("hidden", hidden));
+        }
         let mut h = hidden.clone();
         for (i, block) in self.blocks.iter().enumerate() {
             let mods = BlockMods::from_cache(cache, i, step)?;
-            h = block.forward(&h, &mods, segments, rope)?;
+            h = block.forward(&h, &mods, segments, rope, i)?;
+            if prof {
+                eprintln!("[h3-blk] блок {i} · {}", crate::pipeline::tensor_stats("h", &h));
+            }
         }
         let shift = cache.final_chunk(step, 0)?;
         let scale = cache.final_chunk(step, 1)?;
-        self.final_layer.forward(&h, &shift, &scale, video_seg, audio_seg)
+        let (v, a) = self.final_layer.forward(&h, &shift, &scale, video_seg, audio_seg)?;
+        if prof {
+            eprintln!(
+                "[h3-blk] голова video_seg {video_seg:?} audio_seg {audio_seg:?} · {} · {}",
+                crate::pipeline::tensor_stats("v_out", &v),
+                crate::pipeline::tensor_stats("a_out", &a)
+            );
+        }
+        Ok((v, a))
     }
 }
 

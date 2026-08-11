@@ -685,12 +685,24 @@ impl VaeDecoder {
             .broadcast_mul(&s)?
             .broadcast_add(&m)?
             .to_dtype(self.dtype)?;
-        if z.dims()[2] == 1 {
+        if crate::runtime::h3_vae_prof() {
+            eprintln!(
+                "[h3-vae] {} · {}",
+                crate::pipeline::tensor_stats("латент", latent),
+                crate::pipeline::tensor_stats("денорм", &z)
+            );
+        }
+        let out = if z.dims()[2] == 1 {
             let dec = self.decode_pixels(&z)?;
             let n = dec.dims()[2];
-            return Ok(self.finalize_pixels(&dec.narrow(2, n - 1, 1)?.contiguous()?)?);
+            self.finalize_pixels(&dec.narrow(2, n - 1, 1)?.contiguous()?)?
+        } else {
+            self.decode_temporal(&z)?
+        };
+        if crate::runtime::h3_vae_prof() {
+            eprintln!("[h3-vae] {}", crate::pipeline::tensor_stats("rgb", &out));
         }
-        self.decode_temporal(&z)
+        Ok(out)
     }
 
     fn decode_temporal(&self, z: &Tensor) -> Result<Tensor, H3Error> {

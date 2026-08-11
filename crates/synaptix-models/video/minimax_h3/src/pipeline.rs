@@ -12,8 +12,49 @@ use crate::guider::{apply_cfg, GuiderParams};
 use crate::layout::{Keyframe, LayoutRequest, PackedLayout, RefBlock, SegmentKind};
 use crate::loader::H3Checkpoint;
 use crate::rope::RopeTables;
+use crate::runtime;
 use crate::scheduler::H3Scheduler;
 use crate::H3Error;
+
+pub fn dump_tensor(name: &str, t: &Tensor) {
+    let Ok(dir) = std::env::var("H3_DUMP_DIR") else { return };
+    let Ok(v) = t
+        .to_dtype(DType::F32)
+        .and_then(|x| x.flatten_all())
+        .and_then(|x| x.to_vec1::<f32>())
+    else {
+        return;
+    };
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for x in &v {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    let p = std::path::Path::new(&dir);
+    let _ = std::fs::create_dir_all(p);
+    let _ = std::fs::write(p.join(format!("{name}.f32")), &bytes);
+    let _ = std::fs::write(p.join(format!("{name}.shape")), format!("{:?}", t.dims()));
+}
+
+pub fn tensor_stats(name: &str, t: &Tensor) -> String {
+    let v = match t.to_dtype(DType::F32).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()) {
+        Ok(v) => v,
+        Err(e) => return format!("{name}: <{e}>"),
+    };
+    if v.is_empty() {
+        return format!("{name}: пусто");
+    }
+    let n = v.len() as f64;
+    let mean = v.iter().map(|x| *x as f64).sum::<f64>() / n;
+    let var = v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / n;
+    let nan = v.iter().filter(|x| !x.is_finite()).count();
+    let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(l, h), x| (l.min(*x), h.max(*x)));
+    format!(
+        "{name}[{:?}] μ {mean:+.4} σ {:.4} [{lo:+.3}, {hi:+.3}]{}",
+        t.dims(),
+        var.sqrt(),
+        if nan > 0 { format!(" NaN/Inf {nan}") } else { String::new() }
+    )
+}
 
 type R<T> = Result<T, SynaptixError>;
 
@@ -260,6 +301,14 @@ fn assemble_hidden(
             }
         }
     }
+    if runtime::h3_prof() {
+        eprintln!(
+            "[h3-cat] {} · {} · {}",
+            tensor_stats("refined", refined),
+            tensor_stats("video_rows", video_rows),
+            tensor_stats("audio_rows", audio_rows)
+        );
+    }
     let refs: Vec<&Tensor> = parts.iter().collect();
     Tensor::cat(&refs, 0)
 }
@@ -424,6 +473,21 @@ pub fn denoise_av(
         let da = sched.audio_dt(step) as f32;
         v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(dv)?)?;
         a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(da)?)?;
+
+        if runtime::h3_prof() {
+            eprintln!(
+                "[h3-prof] шаг {step}: σv {:.4} dv {dv:.4} · {} · {}",
+                sched.video_sigma(step),
+                tensor_stats("v_vel", &v_vel),
+                tensor_stats("v_lat", &v_lat)
+            );
+            eprintln!(
+                "[h3-prof] шаг {step}: σa {:.4} da {da:.4} · {} · {}",
+                sched.audio_sigma(step),
+                tensor_stats("a_vel", &a_vel),
+                tensor_stats("a_lat", &a_lat)
+            );
+        }
     }
     hooks.report(steps, steps, sched.video_sigma(steps));
 
