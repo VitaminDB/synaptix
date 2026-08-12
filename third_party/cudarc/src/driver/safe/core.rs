@@ -81,6 +81,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
+                && !matches!(std::env::var("CUDARC_NO_ASYNC_ALLOC").as_deref(), Ok("1"))
         };
         let ctx = Arc::new(CudaContext {
             cu_device,
@@ -153,6 +154,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
+                && !matches!(std::env::var("CUDARC_NO_ASYNC_ALLOC").as_deref(), Ok("1"))
         };
         let ctx = Arc::new(CudaContext {
             cu_device,
@@ -204,6 +206,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
+                && !matches!(std::env::var("CUDARC_NO_ASYNC_ALLOC").as_deref(), Ok("1"))
         };
         let ctx = Arc::new(CudaContext {
             cu_device,
@@ -241,6 +244,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
+                && !matches!(std::env::var("CUDARC_NO_ASYNC_ALLOC").as_deref(), Ok("1"))
         };
         let ctx = Arc::new(CudaContext {
             cu_device,
