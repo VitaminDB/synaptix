@@ -1,12 +1,21 @@
 #include <cuda_fp16.h>
 
+#ifdef SYN_OUT_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 syn_out_t;
+#define SYN_TO_OUT(v) __float2bfloat16(v)
+#else
+typedef __half syn_out_t;
+#define SYN_TO_OUT(v) SYN_TO_OUT(v)
+#endif
+
 template <unsigned int WARPS>
 __device__ __forceinline__ void mma_gemm_shuf_impl(
     const unsigned char* __restrict__ packed_w,
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w,
@@ -103,9 +112,9 @@ __device__ __forceinline__ void mma_gemm_shuf_impl(
         unsigned int row_top = lane >> 2;
         unsigned int m_top_g = m_warp_base + row_top;
         unsigned int m_bot_g = m_top_g + 8u;
-        __half* out_row = out + batch_row * N;
-        if (m_top_g < N) out_row[m_top_g] = __float2half(d0);
-        if (m_bot_g < N) out_row[m_bot_g] = __float2half(d2);
+        syn_out_t* out_row = out + batch_row * N;
+        if (m_top_g < N) out_row[m_top_g] = SYN_TO_OUT(d0);
+        if (m_bot_g < N) out_row[m_bot_g] = SYN_TO_OUT(d2);
     }
 }
 
@@ -114,7 +123,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_f16_w4(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -127,7 +136,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_f16_w8(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -141,7 +150,7 @@ __device__ __forceinline__ void mma_gemm_shuf_n8_impl(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w,
@@ -237,12 +246,12 @@ __device__ __forceinline__ void mma_gemm_shuf_n8_impl(
     unsigned int batch_col0 = batch_tile_base + ((lane & 3u) << 1);
     unsigned int batch_col1 = batch_col0 + 1u;
     if (m_row_top < N) {
-        __stcs(out + batch_col0 * N + m_row_top, __float2half(d0));
-        __stcs(out + batch_col1 * N + m_row_top, __float2half(d1));
+        __stcs(out + batch_col0 * N + m_row_top, SYN_TO_OUT(d0));
+        __stcs(out + batch_col1 * N + m_row_top, SYN_TO_OUT(d1));
     }
     if (m_row_bot < N) {
-        __stcs(out + batch_col0 * N + m_row_bot, __float2half(d2));
-        __stcs(out + batch_col1 * N + m_row_bot, __float2half(d3));
+        __stcs(out + batch_col0 * N + m_row_bot, SYN_TO_OUT(d2));
+        __stcs(out + batch_col1 * N + m_row_bot, SYN_TO_OUT(d3));
     }
 }
 
@@ -251,7 +260,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_n8_f16_w4(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -264,7 +273,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_n8_f16_w8(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -278,7 +287,7 @@ __device__ __forceinline__ void mma_gemm_shuf_2d_impl(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w,
@@ -376,12 +385,12 @@ __device__ __forceinline__ void mma_gemm_shuf_2d_impl(
     unsigned int batch_col0 = batch_warp_base + ((lane & 3u) << 1);
     unsigned int batch_col1 = batch_col0 + 1u;
     if (m_row_top < N) {
-        __stcs(out + batch_col0 * N + m_row_top, __float2half(d0));
-        __stcs(out + batch_col1 * N + m_row_top, __float2half(d1));
+        __stcs(out + batch_col0 * N + m_row_top, SYN_TO_OUT(d0));
+        __stcs(out + batch_col1 * N + m_row_top, SYN_TO_OUT(d1));
     }
     if (m_row_bot < N) {
-        __stcs(out + batch_col0 * N + m_row_bot, __float2half(d2));
-        __stcs(out + batch_col1 * N + m_row_bot, __float2half(d3));
+        __stcs(out + batch_col0 * N + m_row_bot, SYN_TO_OUT(d2));
+        __stcs(out + batch_col1 * N + m_row_bot, SYN_TO_OUT(d3));
     }
 }
 
@@ -390,7 +399,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2d_f16_2x2(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -403,7 +412,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2d_f16_4x2(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -416,7 +425,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2d_f16_4x4(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -429,7 +438,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2d_f16_8x4(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -442,7 +451,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2d_f16_4x8(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
@@ -461,7 +470,7 @@ __device__ __forceinline__ void mma_gemm_shuf_2dr_impl(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w,
@@ -585,12 +594,12 @@ __device__ __forceinline__ void mma_gemm_shuf_2dr_impl(
             unsigned int batch_col0 = base_n + nu * 8u + ((lane & 3u) << 1);
             unsigned int batch_col1 = batch_col0 + 1u;
             if (m_row_top < N) {
-                __stcs(out + batch_col0 * N + m_row_top, __float2half(d[mu][nu][0]));
-                __stcs(out + batch_col1 * N + m_row_top, __float2half(d[mu][nu][1]));
+                __stcs(out + batch_col0 * N + m_row_top, SYN_TO_OUT(d[mu][nu][0]));
+                __stcs(out + batch_col1 * N + m_row_top, SYN_TO_OUT(d[mu][nu][1]));
             }
             if (m_row_bot < N) {
-                __stcs(out + batch_col0 * N + m_row_bot, __float2half(d[mu][nu][2]));
-                __stcs(out + batch_col1 * N + m_row_bot, __float2half(d[mu][nu][3]));
+                __stcs(out + batch_col0 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][2]));
+                __stcs(out + batch_col1 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][3]));
             }
         }
     }
@@ -599,7 +608,7 @@ __device__ __forceinline__ void mma_gemm_shuf_2dr_impl(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x4_m2n2(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<4, 4, 2, 2>(packed_w, scales_w, packed_x, scales_x, out,
@@ -609,7 +618,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x4_m2n2(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x2_m2n4(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<4, 2, 2, 4>(packed_w, scales_w, packed_x, scales_x, out,
@@ -619,7 +628,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x2_m2n4(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m2n2(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<2, 2, 2, 2>(packed_w, scales_w, packed_x, scales_x, out,
@@ -629,7 +638,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m2n2(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n4(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<2, 2, 4, 4>(packed_w, scales_w, packed_x, scales_x, out,
@@ -639,7 +648,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n4(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x2_m2n8(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<4, 2, 2, 8>(packed_w, scales_w, packed_x, scales_x, out,
@@ -649,7 +658,7 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x2_m2n8(
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n8(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
-    __half* __restrict__ out, unsigned int N, unsigned int K,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
     unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x)
 {
     mma_gemm_shuf_2dr_impl<2, 2, 4, 8>(packed_w, scales_w, packed_x, scales_x, out,
@@ -668,7 +677,11 @@ extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n8(
 #undef EMPTY_A
 
 __device__ __forceinline__ unsigned int pack_f2h2(float lo, float hi) {
+#ifdef SYN_OUT_BF16
+    __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
+#else
     __half2 h = __floats2half2_rn(lo, hi);
+#endif
     return *reinterpret_cast<unsigned int*>(&h);
 }
 
@@ -698,7 +711,7 @@ __device__ __forceinline__ void matmul_nvfp4_full_device(
     const void* __restrict__ x_desc,
     const void* __restrict__ sfa_desc,
     const void* __restrict__ sfb_desc,
-    __half*     __restrict__ out,
+    syn_out_t* __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w,
@@ -1241,12 +1254,12 @@ __device__ __forceinline__ void matmul_nvfp4_full_device(
             unsigned int batch_col1 = batch_col0 + 1u;
             bool b0 = batch_col0 < BATCH, b1 = batch_col1 < BATCH;
             if (m_row_top < N) {
-                if (b0) __stcs(out + batch_col0 * N + m_row_top, __float2half(d[mu][nu][0]));
-                if (b1) __stcs(out + batch_col1 * N + m_row_top, __float2half(d[mu][nu][1]));
+                if (b0) __stcs(out + batch_col0 * N + m_row_top, SYN_TO_OUT(d[mu][nu][0]));
+                if (b1) __stcs(out + batch_col1 * N + m_row_top, SYN_TO_OUT(d[mu][nu][1]));
             }
             if (m_row_bot < N) {
-                if (b0) __stcs(out + batch_col0 * N + m_row_bot, __float2half(d[mu][nu][2]));
-                if (b1) __stcs(out + batch_col1 * N + m_row_bot, __float2half(d[mu][nu][3]));
+                if (b0) __stcs(out + batch_col0 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][2]));
+                if (b1) __stcs(out + batch_col1 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][3]));
             }
         }
     }
@@ -1261,7 +1274,7 @@ __device__ __forceinline__ void matmul_nvfp4_full_persistent_device(
     const void* __restrict__ x_desc,
     const void* __restrict__ sfa_desc,
     const void* __restrict__ sfb_desc,
-    __half*     __restrict__ out,
+    syn_out_t* __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int batch,
@@ -1502,12 +1515,12 @@ __device__ __forceinline__ void matmul_nvfp4_full_persistent_device(
                 unsigned int batch_col0 = base_n + nu * 8u + ((lane & 3u) << 1);
                 unsigned int batch_col1 = batch_col0 + 1u;
                 if (m_row_top < N) {
-                    __stcs(out + batch_col0 * N + m_row_top, __float2half(d[mu][nu][0]));
-                    __stcs(out + batch_col1 * N + m_row_top, __float2half(d[mu][nu][1]));
+                    __stcs(out + batch_col0 * N + m_row_top, SYN_TO_OUT(d[mu][nu][0]));
+                    __stcs(out + batch_col1 * N + m_row_top, SYN_TO_OUT(d[mu][nu][1]));
                 }
                 if (m_row_bot < N) {
-                    __stcs(out + batch_col0 * N + m_row_bot, __float2half(d[mu][nu][2]));
-                    __stcs(out + batch_col1 * N + m_row_bot, __float2half(d[mu][nu][3]));
+                    __stcs(out + batch_col0 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][2]));
+                    __stcs(out + batch_col1 * N + m_row_bot, SYN_TO_OUT(d[mu][nu][3]));
                 }
             }
         }
@@ -1519,7 +1532,7 @@ __device__ __forceinline__ void matmul_nvfp4_full_persistent_device(
 #define GN_NVFP4_FULL(NAME, WM, WN, MU, NU, ST, KCH, RDEC, RINC)                            \
     extern "C" __global__ __launch_bounds__((WM * WN + 4) * 32u, 1) void NAME(              \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K,                                        \
+        syn_out_t* out, unsigned int N, unsigned int K,                                        \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int BATCH,  \
         const void* out_desc) {                                                             \
         matmul_nvfp4_full_device<WM, WN, MU, NU, ST, KCH, RDEC, RINC, 0u>(                  \
@@ -1530,7 +1543,7 @@ __device__ __forceinline__ void matmul_nvfp4_full_persistent_device(
 #define GN_NVFP4_FULL_SWZ(NAME, WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ)                   \
     extern "C" __global__ __launch_bounds__((WM * WN + 4) * 32u, 1) void NAME(              \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K,                                        \
+        syn_out_t* out, unsigned int N, unsigned int K,                                        \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int BATCH,  \
         const void* out_desc) {                                                             \
         matmul_nvfp4_full_device<WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ>(                 \
@@ -1556,7 +1569,7 @@ GN_NVFP4_FULL_SWZ(gn_nvfp4_full_128x128_c256_s3_swz, 4, 2, 2, 8, 3, 2, 40, 232, 
 #define GN_NVFP4_FULL_SWZ_FUSED(NAME, WM, WN, MU, NU, ST, KCH, SWZ)                         \
     extern "C" __global__ __launch_bounds__(WM * WN * 32u, 1) void NAME(                    \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K,                                        \
+        syn_out_t* out, unsigned int N, unsigned int K,                                        \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int BATCH,  \
         const void* out_desc) {                                                             \
         matmul_nvfp4_full_device<WM, WN, MU, NU, ST, KCH, 0, 0, SWZ, 0u>(                   \
@@ -1572,7 +1585,7 @@ GN_NVFP4_FULL_SWZ(gn_nvfp4_full_256x128_s3_swz, 4, 2, 4, 8, 3, 2, 40, 232, 64)
 #define GN_NVFP4_FULL_SWZ_FUSED_ROT(NAME, WM, WN, MU, NU, ST, KCH, SWZ)                     \
     extern "C" __global__ __launch_bounds__(WM * WN * 32u, 1) void NAME(                    \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K,                                        \
+        syn_out_t* out, unsigned int N, unsigned int K,                                        \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int BATCH,  \
         const void* out_desc) {                                                             \
         matmul_nvfp4_full_device<WM, WN, MU, NU, ST, KCH, 0, 0, SWZ, 0u, 1u>(               \
@@ -1583,7 +1596,7 @@ GN_NVFP4_FULL_SWZ(gn_nvfp4_full_256x128_s3_swz, 4, 2, 4, 8, 3, 2, 40, 232, 64)
 #define GN_NVFP4_FULL_SWZ_DROT(NAME, WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ)              \
     extern "C" __global__ __launch_bounds__((WM * WN + 4) * 32u, 1) void NAME(              \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K,                                        \
+        syn_out_t* out, unsigned int N, unsigned int K,                                        \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int BATCH,  \
         const void* out_desc) {                                                             \
         matmul_nvfp4_full_device<WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ, 4u, 1u>(         \
@@ -1607,7 +1620,7 @@ GN_NVFP4_FULL_SWZ_DROT(gn_nvfp4_full_128x256_s3_swz_drot, 2, 4, 4, 8, 3, 2, 40, 
 #define GN_NVFP4_FULL_PERSIST_SWZ(NAME, WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ)            \
     extern "C" __global__ __launch_bounds__((WM * WN + 4) * 32u, 1) void NAME(              \
         const void* w_desc, const void* x_desc, const void* sfa_desc, const void* sfb_desc, \
-        __half* out, unsigned int N, unsigned int K, unsigned int batch,                    \
+        syn_out_t* out, unsigned int N, unsigned int K, unsigned int batch,                    \
         unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x) {                         \
         matmul_nvfp4_full_persistent_device<WM, WN, MU, NU, ST, KCH, RDEC, RINC, SWZ>(      \
             w_desc, x_desc, sfa_desc, sfb_desc, out, N, K, batch,                           \

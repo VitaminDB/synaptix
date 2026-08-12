@@ -39,10 +39,28 @@ pub struct Nvfp4QuantKernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4QuantKernels>)>>> = OnceLock::new();
+static CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4QuantKernels>)>>> = OnceLock::new();
 
 impl Nvfp4QuantKernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "nvfp4_quant.cu")
+    }
+
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_IN_BF16"],
+            "nvfp4_quant_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<Nvfp4QuantKernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -53,7 +71,7 @@ impl Nvfp4QuantKernels {
             }
         }
         let src = include_str!("../cu/elementwise/nvfp4_quant.cu");
-        let module = compile_module_with_opts(ctx, src, "nvfp4_quant.cu", &[], Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_80"))?;
         let new = Arc::new(Self {
             quantize_f16_to_nvfp4: load_fn(&module, "quantize_f16_to_nvfp4")?,
             quantize_f16_to_nvfp4_fast: load_fn(&module, "quantize_f16_to_nvfp4_fast")?,

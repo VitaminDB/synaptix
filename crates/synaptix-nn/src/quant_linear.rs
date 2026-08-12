@@ -24,7 +24,11 @@ fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     if in_dt == DType::F16 {
         return x.linear_quant(w);
     }
+    let native = in_dt == DType::BF16 && w.dtype() == DType::NVFP4;
     if !prescale_enabled() {
+        if native {
+            return x.linear_quant(w);
+        }
         return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
     }
     let scale = match x
@@ -40,11 +44,13 @@ fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     };
     let inv = scale.recip()?.to_dtype(in_dt)?;
     let scale = scale.to_dtype(in_dt)?;
-    x.broadcast_mul(&inv)?
-        .to_dtype(DType::F16)?
-        .linear_quant(w)?
-        .to_dtype(in_dt)?
-        .broadcast_mul(&scale)
+    let xs = x.broadcast_mul(&inv)?;
+    let y = if native {
+        xs.linear_quant(w)?
+    } else {
+        xs.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt)?
+    };
+    y.broadcast_mul(&scale)
 }
 
 impl QuantLinear {

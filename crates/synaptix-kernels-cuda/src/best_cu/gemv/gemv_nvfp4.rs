@@ -21,6 +21,7 @@ pub struct Nvfp4MmaGemvShufKernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4MmaGemvShufKernels>)>>> = OnceLock::new();
+static CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4MmaGemvShufKernels>)>>> = OnceLock::new();
 
 const SMEM_OPT_IN_BYTES: i32 = 99 * 1024;
 const W4_M_TILE: u32 = 64;
@@ -45,7 +46,24 @@ fn query_sm_count(ctx: &Arc<CudaContext>) -> Result<u32> {
 
 impl Nvfp4MmaGemvShufKernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "gemv_nvfp4.cu")
+    }
+
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_OUT_BF16"],
+            "gemv_nvfp4_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<Nvfp4MmaGemvShufKernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -56,7 +74,7 @@ impl Nvfp4MmaGemvShufKernels {
             }
         }
         let src = include_str!("gemv_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, "gemv_nvfp4.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
         let repack = load_fn(&module, "nvfp4_w_repack")?;
         let w4 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8")?;

@@ -1,5 +1,18 @@
 #include <cuda_fp16.h>
 
+#ifdef SYN_IN_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 syn_in_t;
+typedef __nv_bfloat162 syn_in2_t;
+#define SYN_IN_TO_F(v) __bfloat162float(v)
+#define SYN_IN2_TO_F2(v) __bfloat1622float2(v)
+#else
+typedef __half syn_in_t;
+typedef __half2 syn_in2_t;
+#define SYN_IN_TO_F(v) __half2float(v)
+#define SYN_IN2_TO_F2(v) __half22float2(v)
+#endif
+
 // NVFP4 quantize / dequant kernels (foundation).
 //
 // Формат — NVIDIA Blackwell NVFP4: 4-битные элементы (E2M1) с per-block
@@ -119,7 +132,7 @@ __device__ __forceinline__ unsigned int tile_scale_offset(
 }
 
 __global__ void quantize_f16_to_nvfp4(
-    const __half* __restrict__ x,
+    const syn_in_t* __restrict__ x,
     unsigned char* __restrict__ packed,
     unsigned char* __restrict__ scales_e4m3,
     unsigned int outer_dim,
@@ -140,7 +153,7 @@ __global__ void quantize_f16_to_nvfp4(
 
     float val = 0.0f;
     if (outer < outer_dim && inner < inner_dim) {
-        val = __half2float(x[data_idx]);
+        val = SYN_IN_TO_F(x[data_idx]);
     }
     amax_sm[tid] = fabsf(val);
     __syncthreads();
@@ -199,7 +212,7 @@ __global__ void quantize_f16_to_nvfp4(
 // 128-тайла scale-раскладки) — буфер скейлов полностью определён БЕЗ CE-memset
 // со стороны вызывающего (тот аллоцирует uninit).
 __global__ void quantize_f16_to_nvfp4_fast(
-    const __half* __restrict__ x,
+    const syn_in_t* __restrict__ x,
     unsigned char* __restrict__ packed,
     unsigned char* __restrict__ scales_e4m3,
     unsigned int outer_dim,
@@ -222,7 +235,7 @@ __global__ void quantize_f16_to_nvfp4_fast(
         x + (size_t)outer * inner_dim + (size_t)block_col * 16u);
     uint4 p0 = src[0];
     uint4 p1 = src[1];
-    __half2 h[8];
+    syn_in2_t h[8];
     *reinterpret_cast<uint4*>(&h[0]) = p0;
     *reinterpret_cast<uint4*>(&h[4]) = p1;
 
@@ -230,7 +243,7 @@ __global__ void quantize_f16_to_nvfp4_fast(
     float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        float2 f = __half22float2(h[i]);
+        float2 f = SYN_IN2_TO_F2(h[i]);
         v[2 * i] = f.x;
         v[2 * i + 1] = f.y;
         amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
