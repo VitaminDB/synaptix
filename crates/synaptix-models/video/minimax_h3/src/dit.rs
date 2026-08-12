@@ -37,6 +37,30 @@ impl Lin {
         Ok(Self(QuantLinear::build(w, b, qdt, compute).map_err(H3Error::from)?))
     }
 
+    pub fn load_qkv(
+        ckpt: &H3Checkpoint,
+        key: &str,
+        heads: usize,
+        head_dim: usize,
+        qdt: DType,
+        compute: DType,
+    ) -> Result<Self, H3Error> {
+        let mut w = ckpt.get_raw(&format!("{key}.weight"))?;
+        if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
+            w = w.add(&d)?;
+        }
+        if let Some(d) = ckpt.lora_diff(key, w.dtype())? {
+            w = w.add(&d)?;
+        }
+        let k = w.dims()[1];
+        let w = w
+            .reshape(vec![heads, 3, head_dim, k])?
+            .permute([1, 0, 2, 3])?
+            .contiguous()?
+            .reshape(vec![heads * 3 * head_dim, k])?;
+        Ok(Self(QuantLinear::build(w, None, qdt, compute).map_err(H3Error::from)?))
+    }
+
     pub fn load_exact(
         ckpt: &H3Checkpoint,
         key: &str,
@@ -105,7 +129,7 @@ impl Attention {
         let heads = cfg.num_attention_heads;
         let head_dim = cfg.attention_head_dim;
         Ok(Self {
-            qkv: Lin::load(ckpt, &format!("{prefix}.qkv_proj"), false, qdt, compute)?,
+            qkv: Lin::load_qkv(ckpt, &format!("{prefix}.qkv_proj"), heads, head_dim, qdt, compute)?,
             out: Lin::load(ckpt, &format!("{prefix}.out_proj"), false, qdt, compute)?,
             q_norm: ckpt.get_as(&format!("{prefix}.q_norm.weight"), compute)?,
             k_norm: ckpt.get_as(&format!("{prefix}.k_norm.weight"), compute)?,
@@ -709,7 +733,7 @@ impl H3Dit {
         if prof {
             eprintln!("[h3-blk] вход · {}", crate::pipeline::tensor_stats("hidden", hidden));
         }
-        if step == 0 {
+        if step == crate::pipeline::dump_step() {
             crate::pipeline::dump_tensor("hidden", hidden);
             crate::pipeline::dump_tensor("rope_cos", &rope.cos);
             crate::pipeline::dump_tensor("rope_sin", &rope.sin);
@@ -743,7 +767,7 @@ impl H3Dit {
         let shift = cache.final_chunk(step, 0)?;
         let scale = cache.final_chunk(step, 1)?;
         let (v, a) = self.final_layer.forward(&h, &shift, &scale, video_seg, audio_seg)?;
-        if step == 0 {
+        if step == crate::pipeline::dump_step() {
             crate::pipeline::dump_tensor("h_last", &h);
             crate::pipeline::dump_tensor("v_out", &v);
             crate::pipeline::dump_tensor("a_out", &a);
