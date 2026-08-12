@@ -154,6 +154,7 @@ pub fn free_vram(device: Device) -> usize {
 
 pub fn trim_pool(device: Device) {
     if let Device::Cuda(ord) = device {
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
         let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
     }
 }
