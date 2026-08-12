@@ -16,9 +16,15 @@ use crate::runtime;
 use crate::scheduler::H3Scheduler;
 use crate::H3Error;
 
-fn audio_step_video_dt() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("H3_AUDIO_DT_VIDEO").as_deref(), Ok("1")))
+fn default_sampler() -> SamplerKind {
+    static KIND: std::sync::OnceLock<SamplerKind> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
+        if matches!(std::env::var("H3_SAMPLER").as_deref(), Ok("euler")) {
+            SamplerKind::Euler
+        } else {
+            SamplerKind::ResMultistep
+        }
+    })
 }
 
 pub fn dump_step() -> usize {
@@ -200,6 +206,12 @@ impl Default for CondRows {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerKind {
+    ResMultistep,
+    Euler,
+}
+
 pub struct DenoiseRequest<'a> {
     pub geometry: Geometry,
     pub cond: &'a Conditioning,
@@ -208,6 +220,7 @@ pub struct DenoiseRequest<'a> {
     pub refs: Vec<RefBlock>,
     pub cond_rows: CondRows,
     pub guider: GuiderParams,
+    pub sampler: SamplerKind,
     pub seed: Option<u64>,
     pub init_video: Option<Tensor>,
     pub init_audio: Option<Tensor>,
@@ -225,6 +238,7 @@ impl<'a> DenoiseRequest<'a> {
             refs: Vec::new(),
             cond_rows: CondRows::default(),
             guider: GuiderParams::positive_only(),
+            sampler: default_sampler(),
             seed: None,
             init_video: None,
             init_audio: None,
@@ -503,6 +517,8 @@ pub fn denoise_av(
 
     let steps = sched.steps();
     let patch = cfg.patch_size;
+    let mut old_denoised_v: Option<Tensor> = None;
+    let mut old_denoised_a: Option<Tensor> = None;
 
     for step in 0..steps {
         if hooks.cancelled() {
@@ -559,31 +575,49 @@ pub fn denoise_av(
         )?;
         let a_vel = unpack_audio(&a_out.mul_scalar(-1.0)?, 2)?;
 
-        let dv = sched.video_dt(step) as f32;
-        let da = sched.audio_dt(step) as f32;
-        let v_before = if runtime::h3_prof() { Some(v_lat.clone()) } else { None };
-        v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(dv)?)?;
-        let da_eff = if audio_step_video_dt() { dv } else { da };
-        a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(da_eff)?)?;
+        let sv = sched.video_sigma(step);
+        let sa = sched.audio_sigma(step);
+        let denoised_v = v_lat.sub(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(sv as f32)?)?;
+        let denoised_a = a_lat.sub(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(sa as f32)?)?;
+
+        match req.sampler {
+            SamplerKind::Euler => {
+                v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(sched.video_dt(step) as f32)?)?;
+                a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(sched.audio_dt(step) as f32)?)?;
+            }
+            SamplerKind::ResMultistep => {
+                v_lat = res_multistep_update(
+                    &v_lat,
+                    &v_vel,
+                    &denoised_v,
+                    old_denoised_v.as_ref(),
+                    if step > 0 { Some(sched.video_sigma(step - 1)) } else { None },
+                    sv,
+                    sched.video_sigma(step + 1),
+                )?;
+                a_lat = res_multistep_update(
+                    &a_lat,
+                    &a_vel,
+                    &denoised_a,
+                    old_denoised_a.as_ref(),
+                    if step > 0 { Some(sched.audio_sigma(step - 1)) } else { None },
+                    sa,
+                    sched.audio_sigma(step + 1),
+                )?;
+            }
+        }
+        old_denoised_v = Some(denoised_v.clone());
+        old_denoised_a = Some(denoised_a);
 
         if runtime::h3_prof() {
-            let sv = sched.video_sigma(step) as f32;
-            let x0_v = v_before
-                .as_ref()
-                .and_then(|x: &Tensor| {
-                    v_vel.to_dtype(x.dtype()).ok().and_then(|v| v.mul_scalar(sv).ok()).and_then(|s| x.sub(&s).ok())
-                })
-                .map(|t| tensor_stats("x0_video", &t))
-                .unwrap_or_default();
             eprintln!(
-                "[h3-prof] шаг {step}: σv {:.4} dv {dv:.4} · {} · {} · {x0_v}",
-                sched.video_sigma(step),
+                "[h3-prof] шаг {step}: σv {sv:.4} · {} · {} · {}",
                 tensor_stats("v_vel", &v_vel),
-                tensor_stats("v_lat", &v_lat)
+                tensor_stats("v_lat", &v_lat),
+                tensor_stats("x0_video", &denoised_v)
             );
             eprintln!(
-                "[h3-prof] шаг {step}: σa {:.4} da {da:.4} · {} · {}",
-                sched.audio_sigma(step),
+                "[h3-prof] шаг {step}: σa {sa:.4} · {} · {}",
                 tensor_stats("a_vel", &a_vel),
                 tensor_stats("a_lat", &a_lat)
             );
@@ -592,6 +626,34 @@ pub fn denoise_av(
     hooks.report(steps, steps, sched.video_sigma(steps));
 
     Ok(DenoiseOutput { video_latent: v_lat, audio_latent: a_lat })
+}
+
+fn res_multistep_update(
+    x: &Tensor,
+    vel: &Tensor,
+    denoised: &Tensor,
+    old_denoised: Option<&Tensor>,
+    sigma_prev: Option<f64>,
+    sigma: f64,
+    sigma_next: f64,
+) -> R<Tensor> {
+    match (old_denoised, sigma_prev) {
+        (Some(old), Some(sp)) if sigma_next > 0.0 => {
+            let t = -sigma.ln();
+            let t_next = -sigma_next.ln();
+            let t_prev = -sp.ln();
+            let h = t_next - t;
+            let c2 = (t_prev - t) / h;
+            let phi1 = (-h).exp_m1() / (-h);
+            let phi2 = (phi1 - 1.0) / (-h);
+            let b1 = phi1 - phi2 / c2;
+            let b2 = phi2 / c2;
+            x.mul_scalar((-h).exp() as f32)?
+                .add(&denoised.mul_scalar((h * b1) as f32)?)?
+                .add(&old.mul_scalar((h * b2) as f32)?)
+        }
+        _ => x.add(&vel.to_dtype(x.dtype())?.mul_scalar((sigma_next - sigma) as f32)?),
+    }
 }
 
 pub fn cond_rows_from_keyframe_latents(
