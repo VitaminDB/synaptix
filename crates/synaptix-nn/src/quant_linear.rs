@@ -32,10 +32,18 @@ const F16_TARGET: f32 = 64.0;
 ///
 /// Масштаб остаётся тензором на устройстве: читать его на хост означало бы
 /// синхронизацию на каждый Linear, а их сотни за шаг.
+fn prescale_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("SYNAPTIX_NO_ACT_PRESCALE").as_deref(), Ok("1")))
+}
+
 fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     let in_dt = x.dtype();
     if in_dt == DType::F16 {
         return x.linear_quant(w);
+    }
+    if !prescale_enabled() {
+        return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
     }
     let scale = match x
         .abs()
