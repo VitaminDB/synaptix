@@ -1,16 +1,43 @@
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static POOL_ALLOC: AtomicUsize = AtomicUsize::new(0);
 static POOL_PEAK: AtomicUsize = AtomicUsize::new(0);
 static POOL_TRIM_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+static LIVE_HIST: OnceLock<Mutex<HashMap<usize, isize>>> = OnceLock::new();
 
-/// Топ живых аллокаций (bytes, count), убыв. по суммарному объёму.
-pub fn live_alloc_top(_n: usize) -> Vec<(usize, isize)> {
-    Vec::new()
+fn live_hist() -> &'static Mutex<HashMap<usize, isize>> {
+    LIVE_HIST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn live_alloc_top(n: usize) -> Vec<(usize, isize)> {
+    let Ok(g) = live_hist().lock() else { return Vec::new() };
+    let mut v: Vec<(usize, isize)> =
+        g.iter().filter(|(_, c)| **c > 0).map(|(b, c)| (*b, *c)).collect();
+    v.sort_by_key(|(b, c)| std::cmp::Reverse(*b as i128 * *c as i128));
+    v.truncate(n);
+    v
+}
+
+fn trace_sizes() -> &'static [usize] {
+    static SIZES: OnceLock<Vec<usize>> = OnceLock::new();
+    SIZES.get_or_init(|| {
+        std::env::var("SYNAPTIX_TRACE_ALLOC")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
 }
 
 pub fn record_cuda_alloc(bytes: usize) {
+    if trace_sizes().contains(&bytes) {
+        eprintln!(
+            "[TRACE_ALLOC {bytes}]\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     let prev = POOL_ALLOC.fetch_add(bytes, Ordering::Relaxed);
     let new_total = prev + bytes;
     let mut peak = POOL_PEAK.load(Ordering::Relaxed);
@@ -20,10 +47,16 @@ pub fn record_cuda_alloc(bytes: usize) {
             Err(cur) => peak = cur,
         }
     }
+    if let Ok(mut g) = live_hist().lock() {
+        *g.entry(bytes).or_insert(0) += 1;
+    }
 }
 
 pub fn record_cuda_free(bytes: usize) {
     POOL_ALLOC.fetch_sub(bytes.min(POOL_ALLOC.load(Ordering::Relaxed)), Ordering::Relaxed);
+    if let Ok(mut g) = live_hist().lock() {
+        *g.entry(bytes).or_insert(0) -= 1;
+    }
 }
 
 pub fn cuda_allocated_bytes() -> usize { POOL_ALLOC.load(Ordering::Relaxed) }
