@@ -14,5 +14,6 @@ thiserror         = { workspace = true }
 once_cell         = { workspace = true }
 
 [dev-dependencies]
-synaptix-kernels-cpu = { workspace = true }
-synaptix-test-utils  = { workspace = true }
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-test-utils   = { workspace = true }
