@@ -506,8 +506,51 @@ pub(crate) fn run_quantize_mxfp8(w: &Tensor) -> Result<QuantWeight> {
 }
 
 #[allow(dead_code)]
+/// Ядро редукции выделяет по потоку на выходной элемент, поэтому свёртка всех
+/// осей шла бы одним потоком через весь тензор. Ниже этого размера разница
+/// незаметна, выше — полная редукция разбивается на две стадии.
+const REDUCE_STAGE_MIN: usize = 1 << 16;
+
+/// Свернуть сперва самую короткую ось: выходных элементов остаётся максимум,
+/// то есть параллелизм максимальный. Остаток сворачивается рекурсивно.
+fn staged_full_reduce(t: &Tensor, op: ReduceOp) -> Result<Option<Tensor>> {
+    let dims = t.dims().to_vec();
+    let base = if dims.len() >= 2 {
+        let short = dims
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, d)| **d)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        run_reduce(t, op, &[short], false)?
+    } else {
+        let n = dims[0];
+        let Some(g) = (1..=12)
+            .map(|p| 1usize << p)
+            .rev()
+            .find(|g| n % g == 0 && n / g > 1)
+        else {
+            return Ok(None);
+        };
+        run_reduce(&t.contiguous()?.reshape(vec![g, n / g])?, op, &[0], false)?
+    };
+    let rest: Vec<usize> = (0..base.rank()).collect();
+    Ok(Some(run_reduce(&base, op, &rest, false)?))
+}
+
 pub(crate) fn run_reduce(t: &Tensor, op: ReduceOp, dims: &[usize], keepdim: bool) -> Result<Tensor> {
     let rank = t.rank();
+    if !keepdim
+        && rank > 0
+        && dims.len() == rank
+        && t.numel() > REDUCE_STAGE_MIN
+        && t.device().is_cuda()
+        && !matches!(op, ReduceOp::ArgMax)
+    {
+        if let Some(y) = staged_full_reduce(t, op)? {
+            return Ok(y);
+        }
+    }
     let mut sorted = dims.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
