@@ -102,6 +102,7 @@ pub struct Nvfp4MmaGemmShufKernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4MmaGemmShufKernels>)>>> = OnceLock::new();
+static CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4MmaGemmShufKernels>)>>> = OnceLock::new();
 
 const SMEM_OPT_IN_BYTES: i32 = 99 * 1024;
 const W4_M_TILE: u32 = 64;
@@ -111,7 +112,24 @@ const W8_THREADS: u32 = 256;
 
 impl Nvfp4MmaGemmShufKernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "gemm_nvfp4.cu")
+    }
+
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_OUT_BF16"],
+            "gemm_nvfp4_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<Nvfp4MmaGemmShufKernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -122,7 +140,7 @@ impl Nvfp4MmaGemmShufKernels {
             }
         }
         let src = include_str!("gemm_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, "gemm_nvfp4.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
         let w4 = load_fn(&module, "nvfp4_mma_gemm_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_mma_gemm_shuf_f16_w8")?;
         let n8_w4 = load_fn(&module, "nvfp4_mma_gemm_shuf_n8_f16_w4")?;
@@ -1044,10 +1062,28 @@ fn query_sm_count(ctx: &Arc<CudaContext>) -> Result<u32> {
 }
 
 static FULL_CACHE: OnceLock<Mutex<Vec<(usize, Arc<GemmNvfp4FullKernels>)>>> = OnceLock::new();
+static FULL_CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<GemmNvfp4FullKernels>)>>> = OnceLock::new();
 
 impl GemmNvfp4FullKernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = FULL_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, FULL_CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "gemm_nvfp4.cu")
+    }
+
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            FULL_CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_OUT_BF16"],
+            "gemm_nvfp4_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<GemmNvfp4FullKernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -1058,7 +1094,7 @@ impl GemmNvfp4FullKernels {
             }
         }
         let src = include_str!("gemm_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, "gemm_nvfp4.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
         let mut fns = Vec::new();
         for cfg in Nvfp4FullCfg::ALL {
             let f = load_fn(&module, cfg.fname)?;

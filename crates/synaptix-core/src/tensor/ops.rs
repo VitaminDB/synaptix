@@ -419,9 +419,9 @@ pub(crate) fn run_linear_quant(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     if x.device() != w.device() {
         return Err(SynaptixError::device_mismatch(x.device(), w.device()));
     }
-    if x.dtype() != DType::F16 {
+    if !matches!(x.dtype(), DType::F16 | DType::BF16) {
         return Err(SynaptixError::Unsupported(
-            "linear_quant: активация x должна быть F16",
+            "linear_quant: активация x должна быть F16 или BF16",
         ));
     }
     let x_dims = x.dims();
@@ -444,8 +444,8 @@ pub(crate) fn run_linear_quant(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
 
     let x_contig = x.contiguous_view()?;
     let backend = registry::backend_for(x.device())?;
-    let out_layout = Layout::contiguous(Shape::new(out_dims), DType::F16);
-    let out_bytes = DType::F16.bytes_for_numel(out_layout.numel());
+    let out_layout = Layout::contiguous(Shape::new(out_dims), x.dtype());
+    let out_bytes = x.dtype().bytes_for_numel(out_layout.numel());
     // uninit (как run_linear после 3ec0c052): alloc_zeros делал CE-memset
     // выхода (217MB на 26520) на КАЖДЫЙ вызов; все quant-пути пишут out целиком.
     let mut storage = backend.alloc_uninit(out_bytes, x.device())?;

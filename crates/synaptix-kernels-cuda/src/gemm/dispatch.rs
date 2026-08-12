@@ -230,6 +230,7 @@ pub fn nvfp4_linear_f16(
     out_u8: &mut CudaSlice<u8>,
     w: &QuantWeight,
     m: u32,
+    out_bf16: bool,
     // Prequant: УЖЕ квантованная активация (packed, scales) — пропускает quantize.
     // Позволяет квантовать общий `h` один раз и переиспользовать во всех проекциях.
     prequant: Option<(&CudaSlice<u8>, &CudaSlice<u8>)>,
@@ -425,7 +426,11 @@ pub fn nvfp4_linear_f16(
                 gemm_k, stream, shuf_w, scales_w, packed_x, scales_x, &mut out_view, n, k, m_run,
             )?,
             Nvfp4Plan::Full(cfg) => {
-                let full_k = GemmNvfp4FullKernels::for_context(ctx)?;
+                let full_k = if out_bf16 {
+                    GemmNvfp4FullKernels::for_context_bf16(ctx)?
+                } else {
+                    GemmNvfp4FullKernels::for_context(ctx)?
+                };
                 gemm_nvfp4_full_cfg_view(
                     &full_k, stream, shuf_w, scales_w, packed_x, scales_x, &mut out_view, n, k,
                     m_run, cfg,

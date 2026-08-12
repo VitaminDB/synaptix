@@ -1,5 +1,14 @@
 #include <cuda_fp16.h>
 
+#ifdef SYN_OUT_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 syn_out_t;
+#define SYN_TO_OUT(v) __float2bfloat16(v)
+#else
+typedef __half syn_out_t;
+#define SYN_TO_OUT(v) SYN_TO_OUT(v)
+#endif
+
 extern "C" __global__ void nvfp4_w_repack(
     const unsigned char* __restrict__ packed_w_in,
     unsigned char* __restrict__ packed_w_out,
@@ -81,7 +90,7 @@ __device__ __forceinline__ void mma_gemv_shuf_impl(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w)
@@ -139,8 +148,8 @@ __device__ __forceinline__ void mma_gemv_shuf_impl(
         unsigned int row_top = lane >> 2;
         unsigned int m_top_g = m_warp_base + row_top;
         unsigned int m_bot_g = m_top_g + 8u;
-        if (m_top_g < N) out[m_top_g] = __float2half(d0);
-        if (m_bot_g < N) out[m_bot_g] = __float2half(d2);
+        if (m_top_g < N) out[m_top_g] = SYN_TO_OUT(d0);
+        if (m_bot_g < N) out[m_bot_g] = SYN_TO_OUT(d2);
     }
 }
 
@@ -149,7 +158,7 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w4(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K, unsigned int sf_inner_dim_w)
 {
     mma_gemv_shuf_impl<4>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w);
@@ -160,7 +169,7 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K, unsigned int sf_inner_dim_w)
 {
     mma_gemv_shuf_impl<8>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w);
@@ -171,7 +180,7 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8_persistent(
     const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    __half*              __restrict__ out,
+    syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
     unsigned int sf_inner_dim_w)
@@ -260,8 +269,8 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8_persistent(
             unsigned int row_top = lane >> 2;
             unsigned int m_top_g = m_warp_base + row_top;
             unsigned int m_bot_g = m_top_g + 8u;
-            if (m_top_g < N) out[m_top_g] = __float2half(d0);
-            if (m_bot_g < N) out[m_bot_g] = __float2half(d2);
+            if (m_top_g < N) out[m_top_g] = SYN_TO_OUT(d0);
+            if (m_bot_g < N) out[m_bot_g] = SYN_TO_OUT(d2);
         }
     }
 }

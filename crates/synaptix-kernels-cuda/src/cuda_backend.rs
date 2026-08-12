@@ -386,13 +386,22 @@ impl Backend for CudaBackend {
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("linear_quant: out non-cuda"))?;
 
+        let bf16 = x_lo.dtype() == DType::BF16;
         match w.dtype() {
             DType::NVFP4 => {
-                let gemm_k =
-                    crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context(&ctx)?;
-                let gemv_k =
-                    crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?;
-                let quant_k = crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?;
+                let (gemm_k, gemv_k, quant_k) = if bf16 {
+                    (
+                        crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context_bf16(&ctx)?,
+                        crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context_bf16(&ctx)?,
+                        crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+                    )
+                } else {
+                    (
+                        crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context(&ctx)?,
+                        crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?,
+                        crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+                    )
+                };
                 crate::gemm::dispatch::nvfp4_linear_f16(
                     &gemm_k,
                     &gemv_k,
@@ -404,6 +413,7 @@ impl Backend for CudaBackend {
                     out_buf.slice_mut(),
                     w,
                     m,
+                    bf16,
                     None,
                 )?;
                 Ok(())
@@ -416,6 +426,11 @@ impl Backend for CudaBackend {
             // требует permuted (bm/bk) scales хранить рядом с natural.
             DType::MXFP8 => {
                 use half::f16;
+                if bf16 {
+                    return Err(SynaptixError::Unsupported(
+                        "linear_quant MXFP8: активация BF16 не поддержана",
+                    ));
+                }
                 let nn = w.n();
                 if k % 32 != 0 {
                     return Err(SynaptixError::Cuda(format!(
@@ -1221,6 +1236,7 @@ impl Backend for CudaBackend {
                     out_buf.slice_mut(),
                     w,
                     m as u32,
+                    false,
                     Some((p_buf.slice(), s_buf.slice())),
                 )?;
                 Ok(())
