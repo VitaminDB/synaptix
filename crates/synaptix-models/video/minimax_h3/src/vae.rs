@@ -642,6 +642,7 @@ impl VaeDecoder {
         let mut x = tokens
             .matmul(&self.x_embed_w.transpose(0, 1)?.contiguous()?)?
             .broadcast_add(&self.x_embed_b)?;
+        crate::pipeline::dump_tensor("vit_embed", &x);
 
         let nreg = self.vit.num_register_tokens;
         let dim = self.vit.dim();
@@ -655,9 +656,13 @@ impl VaeDecoder {
         let rope = RopeTables::from_angles(angles, s + nreg + 1, half, x.device())
             .map_err(err_tensor)?;
 
-        for b in &self.blocks {
+        for (bi, b) in self.blocks.iter().enumerate() {
             x = b.forward(&x, &rope)?;
+            if bi == 0 {
+                crate::pipeline::dump_tensor("vit_blk0", &x);
+            }
         }
+        crate::pipeline::dump_tensor("vit_last", &x);
 
         let x = x.narrow(0, 0, s)?.contiguous()?;
         let x = x.layer_norm_fused(&self.norm_out_w, Some(&self.norm_out_b), self.vit.eps)?;
@@ -685,6 +690,7 @@ impl VaeDecoder {
             .broadcast_mul(&s)?
             .broadcast_add(&m)?
             .to_dtype(self.dtype)?;
+        crate::pipeline::dump_tensor("final_latent", latent);
         if crate::runtime::h3_vae_prof() {
             eprintln!(
                 "[h3-vae] {} · {}",
@@ -749,6 +755,10 @@ impl VaeDecoder {
             }
             let clip = zc.narrow(2, t_start, t_end - t_start)?.contiguous()?;
             let dec = self.decode_pixels(&clip)?;
+            if i == 0 {
+                crate::pipeline::dump_tensor("chunk_z", &clip);
+                crate::pipeline::dump_tensor("chunk_raw", &dec);
+            }
             let dec_frames = dec.dims()[2];
 
             for j in 0..split_count {
@@ -785,7 +795,68 @@ impl VaeDecoder {
             return Err(H3Error::Layout("VAE decode: пустой результат".into()));
         }
         let refs: Vec<&Tensor> = out_parts.iter().collect();
-        Ok(Tensor::cat(&refs, 2)?)
+        let full = Tensor::cat(&refs, 2)?;
+        let want = self.decode_frame_count(z_len, padded_len, num_chunks, pad_tokens);
+        let have = full.dims()[2];
+        if want > 0 && have > want {
+            return Ok(full.narrow(2, 0, want)?.contiguous()?);
+        }
+        Ok(full)
+    }
+
+    fn decode_frame_count(
+        &self,
+        z_len: usize,
+        padded_len: usize,
+        num_chunks: usize,
+        pad_tokens: usize,
+    ) -> usize {
+        let tcs = self.cfg.tokens_chunk_size();
+        let ratio_t = self.cfg.vae_ratio_t;
+        let pre_pad = (ratio_t - self.cfg.clip_length % ratio_t) % ratio_t;
+        let token_overlap = if self.cfg.token_drop == 0 {
+            0
+        } else {
+            (tcs - self.cfg.token_drop % tcs) % tcs
+        };
+        let chunk_dec = tcs * ratio_t;
+        let split_count = usize::from(self.cfg.token_drop > 0) + 1;
+
+        let mut total = 0usize;
+        let mut final_overlap = 0usize;
+        for i in 0..num_chunks {
+            let t_start = i * tcs;
+            let t_end = t_start + tcs + token_overlap;
+            let clip_tokens = t_end.min(padded_len).saturating_sub(t_start.min(padded_len));
+            let clip_frames = clip_tokens * ratio_t;
+            for j in 0..split_count {
+                let f_start = j * chunk_dec;
+                let f_end = (f_start + chunk_dec).min(clip_frames);
+                let frames = f_end.saturating_sub(f_start).saturating_sub(pre_pad);
+                if j == 0 {
+                    total += frames;
+                } else {
+                    final_overlap = frames;
+                }
+            }
+        }
+        total += final_overlap;
+        total.saturating_sub(self.decode_pad_frames(padded_len, pad_tokens, z_len))
+    }
+
+    fn decode_pad_frames(&self, _padded_len: usize, pad_tokens: usize, z_len: usize) -> usize {
+        if pad_tokens == 0 {
+            return 0;
+        }
+        let ratio_t = self.cfg.vae_ratio_t;
+        let tcs = self.cfg.tokens_chunk_size();
+        let intra_tail = self.cfg.clip_length % ratio_t;
+        if intra_tail == 0 {
+            return pad_tokens * ratio_t;
+        }
+        (0..pad_tokens)
+            .map(|k| if (z_len + k) % tcs == 0 { intra_tail } else { ratio_t })
+            .sum()
     }
 }
 
