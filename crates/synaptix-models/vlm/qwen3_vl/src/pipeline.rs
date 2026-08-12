@@ -130,6 +130,12 @@ impl H3Encoder {
             )));
         }
 
+        if let Ok(dir) = std::env::var("H3_DUMP_DIR") {
+            let p = std::path::Path::new(&dir);
+            let _ = std::fs::create_dir_all(p);
+            let _ = std::fs::write(p.join("tokens.json"), format!("{:?}", encoded.ids));
+        }
+
         let mut hidden = self.text.embed_tokens(&encoded.ids)?;
         let e = |r: Result<Tensor, SynaptixError>| {
             r.map_err(|x| VisionError::Forward(x.to_string()))

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 static PROF: AtomicBool = AtomicBool::new(false);
 static VAE_PROF: AtomicBool = AtomicBool::new(false);
@@ -7,6 +7,8 @@ static BLK_PROF: AtomicBool = AtomicBool::new(false);
 static ADALN_PROF: AtomicBool = AtomicBool::new(false);
 static MLP_PROF: AtomicBool = AtomicBool::new(false);
 static PROF_BLOCK: AtomicUsize = AtomicUsize::new(0);
+static SHIFT_V: AtomicU64 = AtomicU64::new(0);
+static SHIFT_A: AtomicU64 = AtomicU64::new(0);
 
 static MEMORY_MODE: AtomicUsize = AtomicUsize::new(0);
 static NBLOCKS_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -46,6 +48,15 @@ pub fn set_h3_adaln_prof(on: bool) {
 }
 pub fn h3_adaln_prof() -> bool {
     ADALN_PROF.load(Ordering::Relaxed)
+}
+
+pub fn set_sigma_shift(video: Option<f64>, audio: Option<f64>) {
+    SHIFT_V.store(video.map(|v| v.to_bits()).unwrap_or(0), Ordering::Relaxed);
+    SHIFT_A.store(audio.map(|v| v.to_bits()).unwrap_or(0), Ordering::Relaxed);
+}
+pub fn sigma_shift() -> (Option<f64>, Option<f64>) {
+    let f = |b: u64| (b != 0).then(|| f64::from_bits(b));
+    (f(SHIFT_V.load(Ordering::Relaxed)), f(SHIFT_A.load(Ordering::Relaxed)))
 }
 
 pub fn set_prof_block(idx: usize) {

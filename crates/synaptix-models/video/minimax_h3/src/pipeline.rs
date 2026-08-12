@@ -16,6 +16,18 @@ use crate::runtime;
 use crate::scheduler::H3Scheduler;
 use crate::H3Error;
 
+fn audio_step_video_dt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("H3_AUDIO_DT_VIDEO").as_deref(), Ok("1")))
+}
+
+pub fn dump_step() -> usize {
+    static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("H3_DUMP_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
 pub fn dump_text(name: &str, body: &str) {
     let Ok(dir) = std::env::var("H3_DUMP_DIR") else { return };
     let p = std::path::Path::new(&dir);
@@ -244,6 +256,8 @@ pub fn prepare(
     sched: &H3Scheduler,
 ) -> Result<PreparedRun, H3Error> {
     let g = req.geometry;
+    dump_tensor("cond_hidden", &req.cond.context);
+    dump_text("cond_tags", &format!("{:?}", req.cond.text_tags));
     let text_len = req.cond.context.dims()[1];
     let layout = PackedLayout::build(
         &LayoutRequest::new(text_len, g.latent_t, g.latent_h, g.latent_w, g.audio_t)
@@ -251,6 +265,18 @@ pub fn prepare(
             .with_keyframes(req.keyframes.clone())
             .with_refs(req.refs.clone()),
     )?;
+    dump_text(
+        "positions",
+        &format!(
+            "[{}]",
+            layout
+                .positions
+                .iter()
+                .map(|p| format!("[{},{},{}]", p[0], p[1], p[2]))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
     let plan = AdalnPlan::build(&layout, sched, req.visual_cond_aug, req.audio_cond_aug);
     let segments = mod_segments(&layout, &plan.roles, Some(&req.cond.text_tags));
     let rope = dit.rope_tables(&layout.positions)?;
@@ -265,8 +291,9 @@ pub fn prepare(
     let arow = plan.roles.index(plan.roles.role_for(SegmentKind::Audio)) * crate::config::ADALN_MODALITIES;
 
     let refined_cond = dit.refine_text(&req.cond.context)?;
+    dump_tensor("refined_cond", &refined_cond);
     let refined_negative = match &req.negative {
-        Some(n) => Some(dit.refine_text(&n.context)?),
+        Some(n) => Some(fit_text_rows(&dit.refine_text(&n.context)?, text_len)?),
         None => None,
     };
 
@@ -280,6 +307,18 @@ pub fn prepare(
         refined_cond,
         refined_negative,
     })
+}
+
+fn fit_text_rows(t: &Tensor, rows: usize) -> R<Tensor> {
+    let have = t.dims()[0];
+    if have == rows {
+        return Ok(t.clone());
+    }
+    if have > rows {
+        return t.narrow(0, 0, rows)?.contiguous();
+    }
+    let pad = Tensor::zeros(vec![rows - have, t.dims()[1]], t.dtype(), t.device())?;
+    Tensor::cat(&[t, &pad], 0)
 }
 
 fn assemble_hidden(
@@ -389,6 +428,50 @@ fn randn(
     Ok(Tensor::from_vec(v, shape.to_vec(), device)?.to_dtype(dtype)?)
 }
 
+pub fn denoise_one(
+    dit: &H3Dit,
+    cache: &AdalnCache,
+    prep: &PreparedRun,
+    req: &DenoiseRequest<'_>,
+    _sched: &H3Scheduler,
+    step: usize,
+) -> Result<(Tensor, Tensor), H3Error> {
+    let cfg = &dit.cfg;
+    let g = req.geometry;
+    let patch = cfg.patch_size;
+    let v_lat = req.init_video.clone().ok_or_else(|| H3Error::Layout("нет init_video".into()))?;
+    let a_lat = req.init_audio.clone().ok_or_else(|| H3Error::Layout("нет init_audio".into()))?;
+
+    let v_rows_t = patchify_video(&v_lat, patch)?;
+    let a_rows_t = pack_audio(&a_lat)?;
+    let v_rows =
+        merge_stream_rows(&v_rows_t, req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
+    let a_rows =
+        merge_stream_rows(&a_rows_t, req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
+    let v_emb = dit.embed_video(&v_rows)?;
+    let a_emb = dit.embed_audio(&a_rows)?;
+    let hidden = assemble_hidden(prep, &prep.refined_cond, &v_emb, &a_emb)?;
+    let (v_out, a_out) = dit.forward(
+        &hidden,
+        cache,
+        step,
+        &prep.segments,
+        &prep.rope,
+        prep.video_seg,
+        prep.audio_seg,
+    )?;
+    let v_vel = unpatchify_video(
+        &v_out.mul_scalar(-1.0)?,
+        g.latent_t / patch[0],
+        g.latent_h / patch[1],
+        g.latent_w / patch[2],
+        cfg.latents_dim,
+        patch,
+    )?;
+    let a_vel = unpack_audio(&a_out.mul_scalar(-1.0)?, 2)?;
+    Ok((v_vel, a_vel))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_av(
     dit: &H3Dit,
@@ -478,12 +561,22 @@ pub fn denoise_av(
 
         let dv = sched.video_dt(step) as f32;
         let da = sched.audio_dt(step) as f32;
+        let v_before = if runtime::h3_prof() { Some(v_lat.clone()) } else { None };
         v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(dv)?)?;
-        a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(da)?)?;
+        let da_eff = if audio_step_video_dt() { dv } else { da };
+        a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(da_eff)?)?;
 
         if runtime::h3_prof() {
+            let sv = sched.video_sigma(step) as f32;
+            let x0_v = v_before
+                .as_ref()
+                .and_then(|x: &Tensor| {
+                    v_vel.to_dtype(x.dtype()).ok().and_then(|v| v.mul_scalar(sv).ok()).and_then(|s| x.sub(&s).ok())
+                })
+                .map(|t| tensor_stats("x0_video", &t))
+                .unwrap_or_default();
             eprintln!(
-                "[h3-prof] шаг {step}: σv {:.4} dv {dv:.4} · {} · {}",
+                "[h3-prof] шаг {step}: σv {:.4} dv {dv:.4} · {} · {} · {x0_v}",
                 sched.video_sigma(step),
                 tensor_stats("v_vel", &v_vel),
                 tensor_stats("v_lat", &v_lat)

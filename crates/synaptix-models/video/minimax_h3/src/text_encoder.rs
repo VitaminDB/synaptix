@@ -19,8 +19,12 @@ impl EncoderHandle {
         compute: DType,
         quant: DType,
     ) -> Result<Self, H3Error> {
+        let layers = std::env::var("H3_ENCODER_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(H3_ENCODER_LAYERS);
         let inner =
-            H3Encoder::load(encoder_dir, None, device, compute, quant, H3_ENCODER_LAYERS)
+            H3Encoder::load(encoder_dir, None, device, compute, quant, layers)
                 .map_err(|e| H3Error::Load(e.to_string()))?;
         Ok(Self { inner })
     }

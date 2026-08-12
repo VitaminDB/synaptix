@@ -27,6 +27,9 @@ impl Default for H3Scheduler {
 
 impl H3Scheduler {
     pub fn new(steps: usize, shift_video: f64, shift_audio: f64) -> Self {
+        let (ov, oa) = crate::runtime::sigma_shift();
+        let shift_video = ov.unwrap_or(shift_video);
+        let shift_audio = oa.unwrap_or(shift_audio);
         let steps = steps.max(1);
         let sigmas = (0..=steps)
             .map(|i| {
