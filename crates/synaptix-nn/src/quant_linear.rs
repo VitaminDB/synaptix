@@ -1,10 +1,3 @@
-//! Linear с опциональным квантованием веса (NVFP4/MXFP8) + bias — общий для всех
-//! моделей (LLM/image: FLUX, SDXL, …). `Dense` = плотный [`Linear`] (вес в
-//! compute-dtype, поддерживает streaming/offload через [`to_device`]). `Quant` =
-//! вес NVFP4 (N%64==0,K%64==0) либо MXFP8 (K%32==0); активация считается в F16,
-//! bias добавляется после (broadcast). Квантованные веса РЕЗИДЕНТНЫ (малы → нет
-//! смысла стримить), поэтому `to_device` на `Quant` не поддержан.
-
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
@@ -19,19 +12,8 @@ pub enum QuantLinear {
     Quant { w: QuantWeight, bias: Option<Tensor> },
 }
 
-/// Целевой максимум активации перед F16-кастом. И вход, и выход `linear_quant`
-/// живут в F16 (потолок 65504), поэтому запас нужен не только под саму
-/// активацию, но и под усиление слоя: |y| <= amax * ||w_row||, а у трансформера
-/// норма строки порядка 5–10. При 64 на входе выход остаётся в районе сотен.
 const F16_TARGET: f32 = 64.0;
 
-/// Квант-ядра принимают и отдают активацию в F16, но у диффузионных
-/// трансформеров massive activations уходят далеко за 65504 — в середине стека
-/// это превращалось в Inf. GEMM линеен по активации, поэтому вход приводится к
-/// целевому масштабу до каста и результат возвращается обратно после.
-///
-/// Масштаб остаётся тензором на устройстве: читать его на хост означало бы
-/// синхронизацию на каждый Linear, а их сотни за шаг.
 fn prescale_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("SYNAPTIX_NO_ACT_PRESCALE").as_deref(), Ok("1")))
@@ -66,9 +48,6 @@ fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
 }
 
 impl QuantLinear {
-    /// Из плотного `[out,in]` веса (+ опц. bias `[out]`). `quant_dtype` выбирает
-    /// схему; несовместимая форма → тихий fallback в Dense (вес кастуется в
-    /// `compute`). bias всегда в `compute`-dtype.
     pub fn build(
         weight: Tensor,
         bias: Option<Tensor>,
@@ -84,8 +63,6 @@ impl QuantLinear {
             Some(b) => Some(b.to_dtype(compute)?),
             None => None,
         };
-        // Квант-ядра требуют F16-вес. bf16→f16 без потерь (f16: 10 бит мантиссы > bf16: 7),
-        // веса трансформера в диапазоне f16 → точный каст.
         let to_f16 = |w: Tensor| -> Result<Tensor> {
             if w.dtype() == DType::F16 { Ok(w) } else { w.to_dtype(DType::F16) }
         };
@@ -107,7 +84,6 @@ impl QuantLinear {
         }
     }
 
-    /// Плотный Linear без квантования (вес как есть). Для слоёв, которые не квантуем.
     pub fn dense(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         Ok(QuantLinear::Dense(Linear::new(weight, bias)?))
     }
@@ -116,8 +92,6 @@ impl QuantLinear {
         matches!(self, QuantLinear::Quant { .. })
     }
 
-    /// `forward(x) + residual` за один проход. Dense → fused-эпилог [`Linear::forward_add`]
-    /// (bit-identical). Quant → linear_quant + bias + residual (broadcast).
     pub fn forward_add(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
         match self {
             QuantLinear::Dense(l) => l.forward_add(x, residual),
@@ -132,8 +106,6 @@ impl QuantLinear {
         }
     }
 
-    /// Перенос на `dev` (layer-streaming). `Quant` переносит packed+scales
-    /// побайтово (квантуем 1× → host-RAM → стрим обратно, bit-identical).
     pub fn to_device(&self, dev: Device) -> Result<Self> {
         match self {
             QuantLinear::Dense(l) => {
@@ -150,25 +122,18 @@ impl QuantLinear {
 }
 
 impl QuantLinear {
-    /// Вес NVFP4 → активацию можно подать prequant-парой (packed, scales).
     pub fn is_nvfp4(&self) -> bool {
         matches!(self, QuantLinear::Quant { w, .. } if w.dtype() == DType::NVFP4)
     }
-    /// Вес MXFP8 → активацию можно подать prequant-парой (packed, natural scales).
     pub fn is_mxfp8(&self) -> bool {
         matches!(self, QuantLinear::Quant { w, .. } if w.dtype() == DType::MXFP8)
     }
-    /// Формат квант-веса (NVFP4|MXFP8), `None` для Dense — выбор формата
-    /// prequant-пары на call-site (fused norm-quant).
     pub fn quant_dtype(&self) -> Option<DType> {
         match self {
             QuantLinear::Quant { w, .. } => Some(w.dtype()),
             QuantLinear::Dense(_) => None,
         }
     }
-    /// Проекция из УЖЕ квантованной активации (packed, scales) — пропускает
-    /// f16-каст и квант. Возвращает `[m, n]` в `out_dt`. Формат пары должен
-    /// совпадать с форматом веса (NVFP4|MXFP8).
     pub fn forward_prequant(
         &self,
         packed: &Tensor,
