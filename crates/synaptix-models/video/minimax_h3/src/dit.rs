@@ -743,6 +743,13 @@ impl H3Dit {
         let shift = cache.final_chunk(step, 0)?;
         let scale = cache.final_chunk(step, 1)?;
         let (v, a) = self.final_layer.forward(&h, &shift, &scale, video_seg, audio_seg)?;
+        if step == 0 {
+            crate::pipeline::dump_tensor("h_last", &h);
+            crate::pipeline::dump_tensor("v_out", &v);
+            crate::pipeline::dump_tensor("a_out", &a);
+            crate::pipeline::dump_tensor("final_shift", &shift);
+            crate::pipeline::dump_tensor("final_scale", &scale);
+        }
         if prof {
             eprintln!(
                 "[h3-blk] голова video_seg {video_seg:?} audio_seg {audio_seg:?} · {} · {}",
