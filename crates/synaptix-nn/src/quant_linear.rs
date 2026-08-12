@@ -27,29 +27,34 @@ const F16_TARGET: f32 = 64.0;
 
 /// Квант-ядра принимают и отдают активацию в F16, но у диффузионных
 /// трансформеров massive activations уходят далеко за 65504 — в середине стека
-/// это превращалось в Inf. GEMM линеен по активации, поэтому большой вход
-/// делится на масштаб до каста и умножается обратно после. Масштаб — степень
-/// двойки, так что оба умножения точны и не вносят собственной ошибки.
+/// это превращалось в Inf. GEMM линеен по активации, поэтому вход приводится к
+/// целевому масштабу до каста и результат возвращается обратно после.
+///
+/// Масштаб остаётся тензором на устройстве: читать его на хост означало бы
+/// синхронизацию на каждый Linear, а их сотни за шаг.
 fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     let in_dt = x.dtype();
     if in_dt == DType::F16 {
         return x.linear_quant(w);
     }
-    let amax = x
+    let scale = match x
         .abs()
         .and_then(|t| t.max_all())
         .and_then(|t| t.to_dtype(DType::F32))
-        .and_then(|t| t.to_scalar::<f32>())
-        .unwrap_or(0.0);
-    if !amax.is_finite() || amax <= F16_TARGET {
-        return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
-    }
-    let s = (amax / F16_TARGET).log2().ceil().exp2();
-    x.mul_scalar(1.0 / s)?
+        .and_then(|t| t.mul_scalar(1.0 / F16_TARGET))
+        .and_then(|t| t.add_scalar(f32::MIN_POSITIVE))
+        .and_then(|t| t.reshape(vec![1]))
+    {
+        Ok(s) => s,
+        Err(_) => return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt),
+    };
+    let inv = scale.recip()?.to_dtype(in_dt)?;
+    let scale = scale.to_dtype(in_dt)?;
+    x.broadcast_mul(&inv)?
         .to_dtype(DType::F16)?
         .linear_quant(w)?
         .to_dtype(in_dt)?
-        .mul_scalar(s)
+        .broadcast_mul(&scale)
 }
 
 impl QuantLinear {
