@@ -6,6 +6,7 @@ static ATTN_PROF: AtomicBool = AtomicBool::new(false);
 static BLK_PROF: AtomicBool = AtomicBool::new(false);
 static ADALN_PROF: AtomicBool = AtomicBool::new(false);
 static MLP_PROF: AtomicBool = AtomicBool::new(false);
+static PROF_BLOCK: AtomicUsize = AtomicUsize::new(0);
 
 static MEMORY_MODE: AtomicUsize = AtomicUsize::new(0);
 static NBLOCKS_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -45,6 +46,13 @@ pub fn set_h3_adaln_prof(on: bool) {
 }
 pub fn h3_adaln_prof() -> bool {
     ADALN_PROF.load(Ordering::Relaxed)
+}
+
+pub fn set_prof_block(idx: usize) {
+    PROF_BLOCK.store(idx, Ordering::Relaxed);
+}
+pub fn prof_block() -> usize {
+    PROF_BLOCK.load(Ordering::Relaxed)
 }
 
 pub fn set_h3_mlp_prof(on: bool) {

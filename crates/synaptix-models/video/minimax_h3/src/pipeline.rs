@@ -16,6 +16,13 @@ use crate::runtime;
 use crate::scheduler::H3Scheduler;
 use crate::H3Error;
 
+pub fn dump_text(name: &str, body: &str) {
+    let Ok(dir) = std::env::var("H3_DUMP_DIR") else { return };
+    let p = std::path::Path::new(&dir);
+    let _ = std::fs::create_dir_all(p);
+    let _ = std::fs::write(p.join(format!("{name}.json")), body);
+}
+
 pub fn dump_tensor(name: &str, t: &Tensor) {
     let Ok(dir) = std::env::var("H3_DUMP_DIR") else { return };
     let Ok(v) = t

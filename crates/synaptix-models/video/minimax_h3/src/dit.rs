@@ -331,7 +331,7 @@ impl DiTBlock {
         rope: &RopeTables,
         idx: usize,
     ) -> R<Tensor> {
-        let prof = runtime::h3_adaln_prof() && idx == 0;
+        let prof = runtime::h3_adaln_prof() && idx == runtime::prof_block();
         let st = crate::pipeline::tensor_stats;
         if prof {
             eprintln!("[h3-mod] {} · {}", st("shift_msa", &mods.shift_msa), st("scale_msa", &mods.scale_msa));
@@ -391,6 +391,25 @@ fn row_of(t: &Tensor, row: usize) -> R<Tensor> {
     t.narrow(0, row, 1)?.contiguous()
 }
 
+fn check_coverage(rows: usize, segments: &[ModSegment]) -> R<()> {
+    let mut cursor = 0usize;
+    for seg in segments {
+        if seg.start != cursor {
+            return Err(SynaptixError::Other(format!(
+                "модуляция: разрыв сегментов, ожидалось {cursor}, получено {}",
+                seg.start
+            )));
+        }
+        cursor = seg.stop;
+    }
+    if cursor != rows {
+        return Err(SynaptixError::Other(format!(
+            "модуляция: сегменты покрывают {cursor} строк из {rows}"
+        )));
+    }
+    Ok(())
+}
+
 fn mod_scale_shift(
     h: &Tensor,
     shift: &Tensor,
@@ -398,6 +417,7 @@ fn mod_scale_shift(
     segments: &[ModSegment],
 ) -> R<Tensor> {
     let dims = h.dims().to_vec();
+    check_coverage(dims[0], segments)?;
     let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], h.dtype(), h.device())?;
     for seg in segments {
         let n = seg.stop - seg.start;
@@ -418,6 +438,7 @@ fn mod_scale_shift(
 
 fn mod_gate(x: &Tensor, other: &Tensor, gate: &Tensor, segments: &[ModSegment]) -> R<Tensor> {
     let dims = x.dims().to_vec();
+    check_coverage(dims[0], segments)?;
     let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], x.dtype(), x.device())?;
     for seg in segments {
         let n = seg.stop - seg.start;
@@ -687,6 +708,29 @@ impl H3Dit {
         let prof = runtime::h3_blk_prof();
         if prof {
             eprintln!("[h3-blk] вход · {}", crate::pipeline::tensor_stats("hidden", hidden));
+        }
+        if step == 0 {
+            crate::pipeline::dump_tensor("hidden", hidden);
+            crate::pipeline::dump_tensor("rope_cos", &rope.cos);
+            crate::pipeline::dump_tensor("rope_sin", &rope.sin);
+            crate::pipeline::dump_text(
+                "layout",
+                &format!(
+                    "{{\"segments\": {:?}, \"video_seg\": {:?}, \"audio_seg\": {:?}, \"rot_dim\": {}}}",
+                    segments.iter().map(|s| [s.start, s.stop, s.row]).collect::<Vec<_>>(),
+                    [video_seg.0, video_seg.1, video_seg.2],
+                    [audio_seg.0, audio_seg.1, audio_seg.2],
+                    rope.rot_dim
+                ),
+            );
+            for i in 0..self.blocks.len() {
+                for c in 0..ADALN_CHUNKS {
+                    crate::pipeline::dump_tensor(
+                        &format!("mod_b{i}_c{c}"),
+                        &cache.chunk(i, step, c)?,
+                    );
+                }
+            }
         }
         let mut h = hidden.clone();
         for (i, block) in self.blocks.iter().enumerate() {

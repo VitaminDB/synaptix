@@ -19,6 +19,39 @@ pub enum QuantLinear {
     Quant { w: QuantWeight, bias: Option<Tensor> },
 }
 
+/// Целевой максимум активации перед F16-кастом. И вход, и выход `linear_quant`
+/// живут в F16 (потолок 65504), поэтому запас нужен не только под саму
+/// активацию, но и под усиление слоя: |y| <= amax * ||w_row||, а у трансформера
+/// норма строки порядка 5–10. При 64 на входе выход остаётся в районе сотен.
+const F16_TARGET: f32 = 64.0;
+
+/// Квант-ядра принимают и отдают активацию в F16, но у диффузионных
+/// трансформеров massive activations уходят далеко за 65504 — в середине стека
+/// это превращалось в Inf. GEMM линеен по активации, поэтому большой вход
+/// делится на масштаб до каста и умножается обратно после. Масштаб — степень
+/// двойки, так что оба умножения точны и не вносят собственной ошибки.
+fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
+    let in_dt = x.dtype();
+    if in_dt == DType::F16 {
+        return x.linear_quant(w);
+    }
+    let amax = x
+        .abs()
+        .and_then(|t| t.max_all())
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_scalar::<f32>())
+        .unwrap_or(0.0);
+    if !amax.is_finite() || amax <= F16_TARGET {
+        return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
+    }
+    let s = (amax / F16_TARGET).log2().ceil().exp2();
+    x.mul_scalar(1.0 / s)?
+        .to_dtype(DType::F16)?
+        .linear_quant(w)?
+        .to_dtype(in_dt)?
+        .mul_scalar(s)
+}
+
 impl QuantLinear {
     /// Из плотного `[out,in]` веса (+ опц. bias `[out]`). `quant_dtype` выбирает
     /// схему; несовместимая форма → тихий fallback в Dense (вес кастуется в
@@ -76,12 +109,7 @@ impl QuantLinear {
         match self {
             QuantLinear::Dense(l) => l.forward_add(x, residual),
             QuantLinear::Quant { w, bias } => {
-                let in_dt = x.dtype();
-                let y = if in_dt == DType::F16 {
-                    x.linear_quant(w)?
-                } else {
-                    x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt)?
-                };
+                let y = quant_matmul(x, w)?;
                 let y = match bias {
                     Some(b) => y.broadcast_add(b)?,
                     None => y,
@@ -154,12 +182,7 @@ impl Module for QuantLinear {
         match self {
             QuantLinear::Dense(l) => l.forward(x),
             QuantLinear::Quant { w, bias } => {
-                let in_dt = x.dtype();
-                let y = if in_dt == DType::F16 {
-                    x.linear_quant(w)?
-                } else {
-                    x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt)?
-                };
+                let y = quant_matmul(x, w)?;
                 match bias {
                     Some(b) => y.broadcast_add(b),
                     None => Ok(y),
