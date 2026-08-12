@@ -515,6 +515,8 @@ pub fn denoise_av(
         }
     };
 
+    crate::memory::trim_pool(device);
+
     let steps = sched.steps();
     let patch = cfg.patch_size;
     let mut old_denoised_v: Option<Tensor> = None;
@@ -533,8 +535,25 @@ pub fn denoise_av(
 
         let v_emb = dit.embed_video(&v_rows)?;
         let a_emb = dit.embed_audio(&a_rows)?;
+        drop(v_rows_t);
+        drop(a_rows_t);
+        drop(v_rows);
+        drop(a_rows);
 
         let hidden = assemble_hidden(prep, &prep.refined_cond, &v_emb, &a_emb)?;
+        let need_neg = prep.refined_negative.is_some() && req.guider.needs_uncond(step);
+        let embs = if need_neg {
+            Some((v_emb, a_emb))
+        } else {
+            drop(v_emb);
+            drop(a_emb);
+            None
+        };
+        if step == 0 && runtime::h3_prof() {
+            for (bytes, count) in synaptix_core::memory::cuda_pool::live_alloc_top(8) {
+                eprintln!("[pre-fwd] {bytes} B × {count}");
+            }
+        }
         let (v_out, a_out) = dit.forward(
             &hidden,
             cache,
@@ -544,10 +563,11 @@ pub fn denoise_av(
             prep.video_seg,
             prep.audio_seg,
         )?;
+        drop(hidden);
 
-        let (v_out, a_out) = match (&prep.refined_negative, req.guider.needs_uncond(step)) {
-            (Some(neg), true) => {
-                let n_hidden = assemble_hidden(prep, neg, &v_emb, &a_emb)?;
+        let (v_out, a_out) = match (&prep.refined_negative, &embs) {
+            (Some(neg), Some((v_emb, a_emb))) => {
+                let n_hidden = assemble_hidden(prep, neg, v_emb, a_emb)?;
                 let (nv, na) = dit.forward(
                     &n_hidden,
                     cache,

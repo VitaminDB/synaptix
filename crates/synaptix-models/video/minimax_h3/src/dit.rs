@@ -44,7 +44,7 @@ impl Lin {
         head_dim: usize,
         qdt: DType,
         compute: DType,
-    ) -> Result<Self, H3Error> {
+    ) -> Result<[Self; 3], H3Error> {
         let mut w = ckpt.get_raw(&format!("{key}.weight"))?;
         if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
             w = w.add(&d)?;
@@ -53,12 +53,17 @@ impl Lin {
             w = w.add(&d)?;
         }
         let k = w.dims()[1];
-        let w = w
-            .reshape(vec![heads, 3, head_dim, k])?
-            .permute([1, 0, 2, 3])?
-            .contiguous()?
-            .reshape(vec![heads * 3 * head_dim, k])?;
-        Ok(Self(QuantLinear::build(w, None, qdt, compute).map_err(H3Error::from)?))
+        let w = w.reshape(vec![heads, 3, head_dim, k])?;
+        let mut out = Vec::with_capacity(3);
+        for s in 0..3 {
+            let ws = w
+                .narrow(1, s, 1)?
+                .contiguous()?
+                .reshape(vec![heads * head_dim, k])?;
+            out.push(Self(QuantLinear::build(ws, None, qdt, compute).map_err(H3Error::from)?));
+        }
+        let [q, kk, v] = <[Self; 3]>::try_from(out).map_err(|_| H3Error::Layout("qkv split".into()))?;
+        Ok([q, kk, v])
     }
 
     pub fn load_exact(
@@ -87,16 +92,24 @@ impl Lin {
         if rows <= LIN_CHUNK_ROWS || !self.0.is_quant() {
             return self.0.forward(x);
         }
-        let mut parts = Vec::with_capacity(rows.div_ceil(LIN_CHUNK_ROWS));
+        let mut out: Option<Tensor> = None;
+        let mut cols = 0;
         let mut off = 0;
         while off < rows {
             let n = LIN_CHUNK_ROWS.min(rows - off);
             let chunk = x.narrow(0, off, n)?.contiguous()?;
-            parts.push(self.0.forward(&chunk)?);
+            let y = self.0.forward(&chunk)?;
+            drop(chunk);
+            cols = y.dims()[1];
+            if out.is_none() {
+                out = Some(Tensor::zeros(vec![1, rows, cols], y.dtype(), y.device())?);
+            }
+            out.as_mut()
+                .unwrap()
+                .copy_rows_from(off, &y.reshape(vec![1, n, cols])?)?;
             off += n;
         }
-        let refs: Vec<&Tensor> = parts.iter().collect();
-        Tensor::cat(&refs, 0)
+        out.unwrap().reshape(vec![rows, cols])
     }
 }
 
@@ -108,7 +121,9 @@ fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> R<Tensor> {
 }
 
 pub struct Attention {
-    qkv: Lin,
+    q_proj: Lin,
+    k_proj: Lin,
+    v_proj: Lin,
     out: Lin,
     q_norm: Tensor,
     k_norm: Tensor,
@@ -128,8 +143,12 @@ impl Attention {
     ) -> Result<Self, H3Error> {
         let heads = cfg.num_attention_heads;
         let head_dim = cfg.attention_head_dim;
+        let [q_proj, k_proj, v_proj] =
+            Lin::load_qkv(ckpt, &format!("{prefix}.qkv_proj"), heads, head_dim, qdt, compute)?;
         Ok(Self {
-            qkv: Lin::load_qkv(ckpt, &format!("{prefix}.qkv_proj"), heads, head_dim, qdt, compute)?,
+            q_proj,
+            k_proj,
+            v_proj,
             out: Lin::load(ckpt, &format!("{prefix}.out_proj"), false, qdt, compute)?,
             q_norm: ckpt.get_as(&format!("{prefix}.q_norm.weight"), compute)?,
             k_norm: ckpt.get_as(&format!("{prefix}.k_norm.weight"), compute)?,
@@ -143,11 +162,6 @@ impl Attention {
     pub fn forward(&self, x: &Tensor, rope: Option<&RopeTables>) -> R<Tensor> {
         let s = x.dims()[0];
         let inner = self.heads * self.head_dim;
-        let qkv = self.qkv.forward(x)?;
-        let q = qkv.narrow(1, 0, inner)?.contiguous()?;
-        let k = qkv.narrow(1, inner, inner)?.contiguous()?;
-        let v = qkv.narrow(1, 2 * inner, inner)?.contiguous()?;
-        drop(qkv);
 
         let to_hsd = |t: Tensor| -> R<Tensor> {
             t.reshape(vec![s, self.heads, self.head_dim])?
@@ -155,11 +169,13 @@ impl Attention {
                 .contiguous()
         };
 
+        let q = self.q_proj.forward(x)?;
         let q = rms_norm(&q.reshape(vec![s, self.heads, self.head_dim])?, &self.q_norm, self.eps)?;
-        let k = rms_norm(&k.reshape(vec![s, self.heads, self.head_dim])?, &self.k_norm, self.eps)?;
         let mut q = q.transpose(0, 1)?.contiguous()?;
+        let k = self.k_proj.forward(x)?;
+        let k = rms_norm(&k.reshape(vec![s, self.heads, self.head_dim])?, &self.k_norm, self.eps)?;
         let mut k = k.transpose(0, 1)?.contiguous()?;
-        let v = to_hsd(v)?;
+        let v = to_hsd(self.v_proj.forward(x)?)?;
 
         if let Some(rt) = rope {
             q = rt.apply(&q).map_err(to_tensor_err)?;
@@ -180,6 +196,9 @@ impl Attention {
                 .or_else(|_| scaled_dot_attention(&q, &k, &v, self.scale, None))?,
             _ => scaled_dot_attention(&q, &k, &v, self.scale, None)?,
         };
+        drop(q);
+        drop(k);
+        drop(v);
         let attn = attn
             .reshape(vec![self.heads, s, self.head_dim])?
             .transpose(0, 1)?
@@ -434,6 +453,8 @@ fn check_coverage(rows: usize, segments: &[ModSegment]) -> R<()> {
     Ok(())
 }
 
+const MOD_CHUNK_ROWS: usize = 16384;
+
 fn mod_scale_shift(
     h: &Tensor,
     shift: &Tensor,
@@ -444,18 +465,22 @@ fn mod_scale_shift(
     check_coverage(dims[0], segments)?;
     let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], h.dtype(), h.device())?;
     for seg in segments {
-        let n = seg.stop - seg.start;
-        if n == 0 {
+        if seg.stop == seg.start {
             continue;
         }
-        let part = h.narrow(0, seg.start, n)?.contiguous()?;
         let s = row_of(scale, seg.row)?;
         let sh = row_of(shift, seg.row)?;
-        let y = match part.fused_mod_row(&s, &sh) {
-            Ok(y) => y,
-            Err(_) => part.broadcast_mul(&s.add_scalar(1.0)?)?.broadcast_add(&sh)?,
-        };
-        out.copy_rows_from(seg.start, &y.reshape(vec![1, n, dims[1]])?)?;
+        let mut off = seg.start;
+        while off < seg.stop {
+            let n = MOD_CHUNK_ROWS.min(seg.stop - off);
+            let part = h.narrow(0, off, n)?.contiguous()?;
+            let y = match part.fused_mod_row(&s, &sh) {
+                Ok(y) => y,
+                Err(_) => part.broadcast_mul(&s.add_scalar(1.0)?)?.broadcast_add(&sh)?,
+            };
+            out.copy_rows_from(off, &y.reshape(vec![1, n, dims[1]])?)?;
+            off += n;
+        }
     }
     out.reshape(dims)
 }
@@ -465,18 +490,22 @@ fn mod_gate(x: &Tensor, other: &Tensor, gate: &Tensor, segments: &[ModSegment]) 
     check_coverage(dims[0], segments)?;
     let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], x.dtype(), x.device())?;
     for seg in segments {
-        let n = seg.stop - seg.start;
-        if n == 0 {
+        if seg.stop == seg.start {
             continue;
         }
-        let xp = x.narrow(0, seg.start, n)?.contiguous()?;
-        let op = other.narrow(0, seg.start, n)?.contiguous()?;
         let g = row_of(gate, seg.row)?;
-        let y = match xp.fused_gate_residual(&op, &g) {
-            Ok(y) => y,
-            Err(_) => xp.add(&op.broadcast_mul(&g)?)?,
-        };
-        out.copy_rows_from(seg.start, &y.reshape(vec![1, n, dims[1]])?)?;
+        let mut off = seg.start;
+        while off < seg.stop {
+            let n = MOD_CHUNK_ROWS.min(seg.stop - off);
+            let xp = x.narrow(0, off, n)?.contiguous()?;
+            let op = other.narrow(0, off, n)?.contiguous()?;
+            let y = match xp.fused_gate_residual(&op, &g) {
+                Ok(y) => y,
+                Err(_) => xp.add(&op.broadcast_mul(&g)?)?,
+            };
+            out.copy_rows_from(off, &y.reshape(vec![1, n, dims[1]])?)?;
+            off += n;
+        }
     }
     out.reshape(dims)
 }
@@ -567,6 +596,7 @@ impl H3Dit {
         let mut blocks = Vec::with_capacity(nblocks);
         for i in 0..nblocks {
             blocks.push(DiTBlock::load(ckpt, i, &cfg, quant, compute)?);
+            crate::memory::trim_pool(device);
         }
         let final_layer = FinalLayer::load(ckpt, &cfg, compute)?;
 
@@ -707,6 +737,7 @@ impl H3Dit {
                 per_step.push(proj.forward(t)?);
             }
             blocks.push(crate::adaln::stack_steps(per_step, cache_dtype)?);
+            crate::memory::trim_pool(self.device);
         }
 
         let mut per_step = Vec::with_capacity(steps);
