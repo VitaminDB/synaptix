@@ -219,6 +219,53 @@ fn splitq_cfg(b: u32, nh: u32, t_q: u32, d: u32) -> LaunchConfig {
 
 /// FA-5 из untyped `u8`-storage. HD ∈ {64,128,256}.
 #[allow(clippy::too_many_arguments)]
+pub struct FlashSplitQ6Kernels {
+    _module: Arc<CudaModule>,
+    f16_hd128: CudaFunction,
+    bf16_hd128: CudaFunction,
+    f16_hd128_bshd: CudaFunction,
+    bf16_hd128_bshd: CudaFunction,
+}
+
+static CACHE6: OnceLock<Mutex<Vec<(usize, Arc<FlashSplitQ6Kernels>)>>> = OnceLock::new();
+
+impl FlashSplitQ6Kernels {
+    pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        let cache = CACHE6.get_or_init(|| Mutex::new(Vec::new()));
+        let key = Arc::as_ptr(ctx) as usize;
+        if let Some((_, k)) = cache.lock().iter().find(|(p, _)| *p == key) {
+            return Ok(k.clone());
+        }
+        let src = include_str!("../cu/fused/attention/flash_splitq6.cu");
+        let module = compile_module_with_opts(ctx, src, "flash_splitq6.cu", &[], Some("sm_90"))?;
+        let f16_hd128 = load_fn(&module, "flash_splitq6_f16_hd128")?;
+        let bf16_hd128 = load_fn(&module, "flash_splitq6_bf16_hd128")?;
+        let f16_hd128_bshd = load_fn(&module, "flash_splitq6_f16_hd128_bshd")?;
+        let bf16_hd128_bshd = load_fn(&module, "flash_splitq6_bf16_hd128_bshd")?;
+        for func in [&f16_hd128, &bf16_hd128, &f16_hd128_bshd, &bf16_hd128_bshd] {
+            func.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                96 * 1024,
+            )
+            .map_err(|e| SynaptixError::Cuda(format!("set_attribute flash_splitq6 shared: {e:?}")))?;
+        }
+        let new = Arc::new(Self {
+            _module: module,
+            f16_hd128,
+            bf16_hd128,
+            f16_hd128_bshd,
+            bf16_hd128_bshd,
+        });
+        cache.lock().push((key, new.clone()));
+        Ok(new)
+    }
+}
+
+fn flash_v6_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYN_FLASH_V6").as_deref(), Ok("1")))
+}
+
 pub fn flash_splitq_u8(
     kernels: &FlashSplitQKernels,
     stream: &Arc<CudaStream>,
@@ -250,9 +297,20 @@ pub fn flash_splitq_u8(
             "flash_splitq: NH={nh} must be a multiple of NKV={nkv}"
         )));
     }
+    let use_v6 = flash_v6_enabled() && d == 128 && t_q >= 1024;
+    let k6;
     // v5 (BM=64/BN=64, split K/V commit) для large-Tq HD=128.
-    let use_v5 = !bshd && d == 128 && t_q >= 1024;
-    let func = if use_v5 {
+    let use_v5 = !use_v6 && !bshd && d == 128 && t_q >= 1024;
+    let func = if use_v6 {
+        k6 = FlashSplitQ6Kernels::for_context(&stream.context())?;
+        match (dtype, bshd) {
+            (DType::F16, false) => &k6.f16_hd128,
+            (DType::BF16, false) => &k6.bf16_hd128,
+            (DType::F16, true) => &k6.f16_hd128_bshd,
+            (DType::BF16, true) => &k6.bf16_hd128_bshd,
+            _ => return Err(SynaptixError::Unsupported("flash_splitq_u8: dtype (F16/BF16)")),
+        }
+    } else if use_v5 {
         match dtype {
             DType::F16 => &kernels.f16_hd128_v5,
             DType::BF16 => &kernels.bf16_hd128_v5,
@@ -261,7 +319,13 @@ pub fn flash_splitq_u8(
     } else {
         splitq_pick_func(kernels, dtype, d, bshd)?
     };
-    let cfg = if use_v5 {
+    let cfg = if use_v6 {
+        LaunchConfig {
+            grid_dim: (t_q.div_ceil(64), b * nh, 1),
+            block_dim: (160, 1, 1),
+            shared_mem_bytes: 2 * 2 * 32 * (d + 8) * 2,
+        }
+    } else if use_v5 {
         LaunchConfig {
             grid_dim: (t_q.div_ceil(BM), b * nh, 1),
             block_dim: (THREADS, 1, 1),
