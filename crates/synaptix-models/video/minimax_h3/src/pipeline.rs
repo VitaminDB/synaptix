@@ -526,6 +526,11 @@ pub fn denoise_av(
         }
         hooks.report(step, steps, sched.video_sigma(step));
 
+        if step == dump_step() {
+            dump_tensor("step_v_lat", &v_lat);
+            dump_tensor("step_a_lat", &a_lat);
+            dump_text("step_sigma", &format!("{}", sched.video_sigma(step)));
+        }
         let v_rows_t = patchify_video(&v_lat, patch)?;
         let a_rows_t = pack_audio(&a_lat)?;
         let v_rows = merge_stream_rows(&v_rows_t, req.cond_rows.video.as_ref(), &prep.layout.img_update)?;

@@ -175,10 +175,13 @@ impl Attention {
             let mut p = proj.forward(&xc)?.reshape(vec![1, n, self.heads, self.head_dim])?;
             drop(xc);
             if let Some(w) = norm {
-                p = rms_norm(&p, w, self.eps)?;
+                p = rms_norm(&p.to_dtype(DType::F32)?, w, self.eps)?;
             }
             if let Some(rt) = rt {
                 p = rt.apply_bshd_at(&p, off).map_err(to_tensor_err)?;
+            }
+            if p.dtype() != x.dtype() {
+                p = p.to_dtype(x.dtype())?;
             }
             if out.is_none() {
                 out = Some(Tensor::zeros(
@@ -196,7 +199,9 @@ impl Attention {
     fn forward_bshd(&self, x: &Tensor, rt: &RopeTables) -> R<Tensor> {
         let s = x.dims()[0];
         let inner = self.heads * self.head_dim;
-        let k = self.stream_bshd(x, &self.k_proj, Some(&self.k_norm), Some(rt))?;
+        let q_norm = self.q_norm.to_dtype(DType::F32)?;
+        let k_norm = self.k_norm.to_dtype(DType::F32)?;
+        let k = self.stream_bshd(x, &self.k_proj, Some(&k_norm), Some(rt))?;
         let v = self.stream_bshd(x, &self.v_proj, None, None)?;
 
         let mut res: Option<Tensor> = None;
@@ -207,8 +212,9 @@ impl Attention {
             let xq = x.narrow(0, off, n)?.contiguous()?;
             let q = self.q_proj.forward(&xq)?.reshape(vec![1, n, self.heads, self.head_dim])?;
             drop(xq);
-            let q = rms_norm(&q, &self.q_norm, self.eps)?;
+            let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
             let q = rt.apply_bshd_at(&q, off).map_err(to_tensor_err)?;
+            let q = q.to_dtype(x.dtype())?;
             let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
             drop(q);
             let y = self.out.forward(&a.reshape(vec![n, inner])?)?;
@@ -225,6 +231,32 @@ impl Attention {
         drop(k);
         drop(v);
         res.unwrap().reshape(vec![s, cols])
+    }
+
+    fn forward_bshd_prequant(
+        &self,
+        packed: &Tensor,
+        scales: &Tensor,
+        s: usize,
+        rt: &RopeTables,
+        out_dt: DType,
+    ) -> R<Tensor> {
+        let inner = self.heads * self.head_dim;
+        let q_norm = self.q_norm.to_dtype(DType::F32)?;
+        let k_norm = self.k_norm.to_dtype(DType::F32)?;
+        let shape = vec![1, s, self.heads, self.head_dim];
+        let q = self.q_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape.clone())?;
+        let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
+        let q = rt.apply_bshd(&q).map_err(to_tensor_err)?.to_dtype(out_dt)?;
+        let k = self.k_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape.clone())?;
+        let k = rms_norm(&k.to_dtype(DType::F32)?, &k_norm, self.eps)?;
+        let k = rt.apply_bshd(&k).map_err(to_tensor_err)?.to_dtype(out_dt)?;
+        let v = self.v_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape)?;
+        let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
+        drop(q);
+        drop(k);
+        drop(v);
+        self.out.forward(&a.reshape(vec![s, inner])?)
     }
 
     pub fn forward(&self, x: &Tensor, rope: Option<&RopeTables>) -> R<Tensor> {
@@ -331,6 +363,17 @@ impl Mlp {
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
         Tensor::cat(&refs, 0)
+    }
+
+    fn forward_prequant(&self, packed: &Tensor, scales: &Tensor, rows: usize, out_dt: DType) -> R<Tensor> {
+        let h = self.fc1.0.forward_prequant(packed, scales, rows, out_dt)?;
+        let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
+        let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
+        drop(h);
+        let act = gate.silu_and_mul(&up)?;
+        drop(gate);
+        drop(up);
+        self.fc2.forward(&act)
     }
 
     fn forward_chunk(&self, x: &Tensor) -> R<Tensor> {
@@ -461,6 +504,11 @@ impl DiTBlock {
             eprintln!("[h3-mod] {} · {}", st("gate_msa", &mods.gate_msa), st("gate_mlp", &mods.gate_mlp));
             eprintln!("[h3-mod] {} · {}", st("shift_mlp", &mods.shift_mlp), st("scale_mlp", &mods.scale_mlp));
         }
+        if !prof && x.dtype() == DType::BF16 && self.attn.q_proj.0.is_nvfp4() && self.mlp.fc1.0.is_nvfp4() {
+            if let Some(y) = self.forward_fused(x, mods, segments, rope)? {
+                return Ok(y);
+            }
+        }
         let hn = rms_norm(x, &self.norm1, self.eps)?;
         if prof {
             eprintln!("[h3-mod] {}", st("norm1", &hn));
@@ -491,6 +539,96 @@ impl DiTBlock {
         }
         mod_gate(&x, &m, &mods.gate_mlp, segments)
     }
+
+    fn forward_fused(
+        &self,
+        x: &Tensor,
+        mods: &BlockMods,
+        segments: &[ModSegment],
+        rope: &RopeTables,
+    ) -> R<Option<Tensor>> {
+        let s = x.dims()[0];
+        let hidden = x.dims()[1];
+        let (sc1, sh1) = match (
+            expand_mod_scale(&mods.scale_msa, &self.norm1, segments, s, hidden, x.dtype()),
+            expand_mod_rows(&mods.shift_msa, segments, s, hidden, x.dtype()),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return Ok(None),
+        };
+        let Ok((_, packed, scales)) = x.rms_mod_quant_nvfp4(&sc1, &sh1, self.eps) else {
+            return Ok(None);
+        };
+        drop(sc1);
+        drop(sh1);
+        let a = self.attn.forward_bshd_prequant(&packed, &scales, s, rope, x.dtype())?;
+        drop(packed);
+        drop(scales);
+        let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
+        drop(a);
+
+        let sc2 = expand_mod_scale(&mods.scale_mlp, &self.norm2, segments, s, hidden, x.dtype())?;
+        let sh2 = expand_mod_rows(&mods.shift_mlp, segments, s, hidden, x.dtype())?;
+        let Ok((_, packed, scales)) = x.rms_mod_quant_nvfp4(&sc2, &sh2, self.eps) else {
+            return Ok(Some(
+                {
+                    let hn = rms_norm(&x, &self.norm2, self.eps)?;
+                    let h = mod_scale_shift(&hn, &mods.shift_mlp, &mods.scale_mlp, segments)?;
+                    let m = self.mlp.forward(&h)?;
+                    mod_gate(&x, &m, &mods.gate_mlp, segments)?
+                },
+            ));
+        };
+        drop(sc2);
+        drop(sh2);
+        let m = self.mlp.forward_prequant(&packed, &scales, s, x.dtype())?;
+        drop(packed);
+        drop(scales);
+        Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?))
+    }
+}
+
+fn expand_mod_rows(
+    mod_rows: &Tensor,
+    segments: &[ModSegment],
+    s: usize,
+    hidden: usize,
+    dt: DType,
+) -> R<Tensor> {
+    check_coverage(s, segments)?;
+    let mut parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        if seg.stop == seg.start {
+            continue;
+        }
+        let row = mod_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
+        parts.push(row.broadcast_as(vec![seg.stop - seg.start, hidden])?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
+}
+
+fn expand_mod_scale(
+    mod_rows: &Tensor,
+    norm_w: &Tensor,
+    segments: &[ModSegment],
+    s: usize,
+    hidden: usize,
+    dt: DType,
+) -> R<Tensor> {
+    check_coverage(s, segments)?;
+    let w = norm_w.to_dtype(dt)?.reshape(vec![1, hidden])?;
+    let mut parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        if seg.stop == seg.start {
+            continue;
+        }
+        let row = mod_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
+        let row = w.broadcast_mul(&row.add_scalar(1.0)?)?.add_scalar(-1.0)?;
+        parts.push(row.broadcast_as(vec![seg.stop - seg.start, hidden])?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
 }
 
 pub struct BlockMods {
@@ -875,6 +1013,9 @@ impl H3Dit {
         for (i, block) in self.blocks.iter().enumerate() {
             let mods = BlockMods::from_cache(cache, i, step)?;
             h = block.forward(&h, &mods, segments, rope, i)?;
+            if step == crate::pipeline::dump_step() && (i < 2 || i % 5 == 0) {
+                crate::pipeline::dump_tensor(&format!("blk_{i}"), &h);
+            }
             if prof {
                 eprintln!("[h3-blk] блок {i} · {}", crate::pipeline::tensor_stats("h", &h));
             }
