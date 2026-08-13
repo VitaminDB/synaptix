@@ -186,7 +186,8 @@ __device__ __forceinline__ void rope_split_partial_impl(
     const float* __restrict__ sin,
     unsigned int S,
     unsigned int D,
-    unsigned int rot_dim
+    unsigned int rot_dim,
+    unsigned int pos_div
 ) {
     unsigned int row = blockIdx.x;
     unsigned int d   = threadIdx.x;
@@ -196,7 +197,7 @@ __device__ __forceinline__ void rope_split_partial_impl(
         out[base + d] = x[base + d];
         return;
     }
-    unsigned int s    = row % S;
+    unsigned int s    = (row / pos_div) % S;
     unsigned int half = rot_dim >> 1;
     unsigned int idx  = (d < half) ? d : (d - half);
     float c  = cos[(size_t)s * half + idx];
@@ -216,20 +217,20 @@ __device__ __forceinline__ void rope_split_partial_impl(
 extern "C" __global__ void rope_split_partial_f16(
     const __half* __restrict__ x, __half* __restrict__ out,
     const float* __restrict__ cos, const float* __restrict__ sin,
-    unsigned int S, unsigned int D, unsigned int rot_dim
-) { rope_split_partial_impl<__half>(x, out, cos, sin, S, D, rot_dim); }
+    unsigned int S, unsigned int D, unsigned int rot_dim, unsigned int pos_div
+) { rope_split_partial_impl<__half>(x, out, cos, sin, S, D, rot_dim, pos_div); }
 
 extern "C" __global__ void rope_split_partial_bf16(
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
     const float* __restrict__ cos, const float* __restrict__ sin,
-    unsigned int S, unsigned int D, unsigned int rot_dim
-) { rope_split_partial_impl<__nv_bfloat16>(x, out, cos, sin, S, D, rot_dim); }
+    unsigned int S, unsigned int D, unsigned int rot_dim, unsigned int pos_div
+) { rope_split_partial_impl<__nv_bfloat16>(x, out, cos, sin, S, D, rot_dim, pos_div); }
 
 extern "C" __global__ void rope_split_partial_f32(
     const float* __restrict__ x, float* __restrict__ out,
     const float* __restrict__ cos, const float* __restrict__ sin,
-    unsigned int S, unsigned int D, unsigned int rot_dim
-) { rope_split_partial_impl<float>(x, out, cos, sin, S, D, rot_dim); }
+    unsigned int S, unsigned int D, unsigned int rot_dim, unsigned int pos_div
+) { rope_split_partial_impl<float>(x, out, cos, sin, S, D, rot_dim, pos_div); }
 
 // ── Interleaved (GPT-NeoX adjacent-pair / FLUX use_real_unbind_dim=-1) RoPE ──
 //   out[2j]   = x[2j]*cos[s,2j]   - x[2j+1]*sin[s,2j]

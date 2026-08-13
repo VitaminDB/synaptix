@@ -327,6 +327,7 @@ pub fn run_rope_split_partial_u8(
     s_len: u32,
     d: u32,
     rot_dim: u32,
+    pos_div: u32,
     dtype: DType,
 ) -> Result<()> {
     if rows == 0 || d == 0 {
@@ -381,7 +382,8 @@ pub fn run_rope_split_partial_u8(
                 .arg(&sin_v)
                 .arg(&s_len)
                 .arg(&d)
-                .arg(&rot_dim);
+                .arg(&rot_dim)
+                .arg(&pos_div);
             unsafe {
                 b.launch(cfg).map_err(|e| {
                     SynaptixError::Cuda(format!("launch rope_split_partial: {e:?}"))

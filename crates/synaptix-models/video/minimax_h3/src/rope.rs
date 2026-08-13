@@ -140,6 +140,17 @@ impl RopeTables {
         })
     }
 
+    pub fn apply_bshd(&self, x: &Tensor) -> Result<Tensor, H3Error> {
+        let dims = x.dims();
+        if dims.len() != 4 || dims[1] != self.seq_len {
+            return Err(H3Error::Layout(format!(
+                "rope bshd: ожидалось [1,{},H,D], получено {:?}",
+                self.seq_len, dims
+            )));
+        }
+        Ok(x.rope_split_partial_fused(&self.cos, &self.sin, self.rot_dim)?)
+    }
+
     pub fn apply(&self, x: &Tensor) -> Result<Tensor, H3Error> {
         let dims = x.dims();
         let rank = dims.len();

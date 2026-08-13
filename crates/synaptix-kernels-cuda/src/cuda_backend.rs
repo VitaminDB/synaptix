@@ -1569,13 +1569,21 @@ impl Backend for CudaBackend {
             return Err(SynaptixError::Unsupported("cuda rope_split_partial: x rank < 2"));
         }
         let d = x_lo.dims()[xr - 1];
-        let s_len = x_lo.dims()[xr - 2];
+        let mut s_len = x_lo.dims()[xr - 2];
+        let mut pos_div = 1usize;
         if rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > d {
             return Err(SynaptixError::Unsupported("cuda rope_split_partial: rot_dim"));
         }
-        if cos_lo.dims().len() != 2 || cos_lo.dims()[0] != s_len || cos_lo.dims()[1] * 2 != rot_dim
-        {
+        if cos_lo.dims().len() != 2 || cos_lo.dims()[1] * 2 != rot_dim {
             return Err(SynaptixError::Unsupported("cuda rope_split_partial: cos shape"));
+        }
+        if cos_lo.dims()[0] != s_len {
+            if xr >= 3 && cos_lo.dims()[0] == x_lo.dims()[xr - 3] {
+                pos_div = s_len;
+                s_len = x_lo.dims()[xr - 3];
+            } else {
+                return Err(SynaptixError::Unsupported("cuda rope_split_partial: cos shape"));
+            }
         }
         if sin_lo.dims() != cos_lo.dims() {
             return Err(SynaptixError::Unsupported("cuda rope_split_partial: sin shape"));
@@ -1615,6 +1623,7 @@ impl Backend for CudaBackend {
             s_len as u32,
             d as u32,
             rot_dim as u32,
+            pos_div as u32,
             dtype,
         )
     }
