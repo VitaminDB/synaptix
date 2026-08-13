@@ -235,8 +235,7 @@ impl Attention {
 
     fn forward_bshd_prequant(
         &self,
-        packed: &Tensor,
-        scales: &Tensor,
+        chunks: &[(Tensor, Tensor, usize, usize)],
         s: usize,
         rt: &RopeTables,
         out_dt: DType,
@@ -244,19 +243,43 @@ impl Attention {
         let inner = self.heads * self.head_dim;
         let q_norm = self.q_norm.to_dtype(DType::F32)?;
         let k_norm = self.k_norm.to_dtype(DType::F32)?;
-        let shape = vec![1, s, self.heads, self.head_dim];
-        let q = self.q_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape.clone())?;
-        let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
-        let q = rt.apply_bshd(&q).map_err(to_tensor_err)?.to_dtype(out_dt)?;
-        let k = self.k_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape.clone())?;
-        let k = rms_norm(&k.to_dtype(DType::F32)?, &k_norm, self.eps)?;
-        let k = rt.apply_bshd(&k).map_err(to_tensor_err)?.to_dtype(out_dt)?;
-        let v = self.v_proj.0.forward_prequant(packed, scales, s, out_dt)?.reshape(shape)?;
-        let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
-        drop(q);
-        drop(k);
-        drop(v);
-        self.out.forward(&a.reshape(vec![s, inner])?)
+        let mut k_full: Option<Tensor> = None;
+        let mut v_full: Option<Tensor> = None;
+        for (packed, scales, off, n) in chunks {
+            let shape = vec![1, *n, self.heads, self.head_dim];
+            let k = self.k_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape.clone())?;
+            let k = rms_norm(&k.to_dtype(DType::F32)?, &k_norm, self.eps)?;
+            let k = rt.apply_bshd_at(&k, *off).map_err(to_tensor_err)?.to_dtype(out_dt)?;
+            let v = self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape)?;
+            if k_full.is_none() {
+                k_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], out_dt, k.device())?);
+                v_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], out_dt, v.device())?);
+            }
+            k_full.as_mut().unwrap().copy_rows_from(*off, &k)?;
+            v_full.as_mut().unwrap().copy_rows_from(*off, &v)?;
+        }
+        let k_full = k_full.ok_or_else(|| SynaptixError::Other("prequant: пустые чанки".into()))?;
+        let v_full = v_full.unwrap();
+
+        let mut res: Option<Tensor> = None;
+        for (packed, scales, off, n) in chunks {
+            let shape = vec![1, *n, self.heads, self.head_dim];
+            let q = self.q_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape)?;
+            let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
+            let q = rt.apply_bshd_at(&q, *off).map_err(to_tensor_err)?.to_dtype(out_dt)?;
+            let a = q.flash_attention_bshd(&k_full, &v_full, self.scale, false)?;
+            drop(q);
+            let y = self.out.forward(&a.reshape(vec![*n, inner])?)?;
+            drop(a);
+            if res.is_none() {
+                res = Some(Tensor::zeros(vec![1, s, y.dims()[1]], y.dtype(), y.device())?);
+            }
+            let cols = y.dims()[1];
+            res.as_mut().unwrap().copy_rows_from(*off, &y.reshape(vec![1, *n, cols])?)?;
+        }
+        let res = res.unwrap();
+        let cols = res.dims()[2];
+        res.reshape(vec![s, cols])
     }
 
     pub fn forward(&self, x: &Tensor, rope: Option<&RopeTables>) -> R<Tensor> {
@@ -365,15 +388,26 @@ impl Mlp {
         Tensor::cat(&refs, 0)
     }
 
-    fn forward_prequant(&self, packed: &Tensor, scales: &Tensor, rows: usize, out_dt: DType) -> R<Tensor> {
-        let h = self.fc1.0.forward_prequant(packed, scales, rows, out_dt)?;
-        let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
-        let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
-        drop(h);
-        let act = gate.silu_and_mul(&up)?;
-        drop(gate);
-        drop(up);
-        self.fc2.forward(&act)
+    fn forward_prequant(&self, chunks: &[(Tensor, Tensor, usize, usize)], rows: usize, out_dt: DType) -> R<Tensor> {
+        let mut res: Option<Tensor> = None;
+        for (packed, scales, off, n) in chunks {
+            let h = self.fc1.0.forward_prequant(packed, scales, *n, out_dt)?;
+            let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
+            let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
+            drop(h);
+            let act = gate.silu_and_mul(&up)?;
+            drop(gate);
+            drop(up);
+            let y = self.fc2.forward(&act)?;
+            if res.is_none() {
+                res = Some(Tensor::zeros(vec![1, rows, y.dims()[1]], y.dtype(), y.device())?);
+            }
+            let cols = y.dims()[1];
+            res.as_mut().unwrap().copy_rows_from(*off, &y.reshape(vec![1, *n, cols])?)?;
+        }
+        let res = res.ok_or_else(|| SynaptixError::Other("mlp prequant: пустые чанки".into()))?;
+        let cols = res.dims()[2];
+        res.reshape(vec![rows, cols])
     }
 
     fn forward_chunk(&self, x: &Tensor) -> R<Tensor> {
@@ -548,87 +582,82 @@ impl DiTBlock {
         rope: &RopeTables,
     ) -> R<Option<Tensor>> {
         let s = x.dims()[0];
-        let hidden = x.dims()[1];
-        let (sc1, sh1) = match (
-            expand_mod_scale(&mods.scale_msa, &self.norm1, segments, s, hidden, x.dtype()),
-            expand_mod_rows(&mods.shift_msa, segments, s, hidden, x.dtype()),
-        ) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => return Ok(None),
-        };
-        let Ok((_, packed, scales)) = x.rms_mod_quant_nvfp4(&sc1, &sh1, self.eps) else {
+        let Some(chunks) = self.quant_chunks(x, &mods.scale_msa, &mods.shift_msa, &self.norm1, segments)? else {
             return Ok(None);
         };
-        drop(sc1);
-        drop(sh1);
-        let a = self.attn.forward_bshd_prequant(&packed, &scales, s, rope, x.dtype())?;
-        drop(packed);
-        drop(scales);
+        let a = self.attn.forward_bshd_prequant(&chunks, s, rope, x.dtype())?;
+        drop(chunks);
         let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
         drop(a);
 
-        let sc2 = expand_mod_scale(&mods.scale_mlp, &self.norm2, segments, s, hidden, x.dtype())?;
-        let sh2 = expand_mod_rows(&mods.shift_mlp, segments, s, hidden, x.dtype())?;
-        let Ok((_, packed, scales)) = x.rms_mod_quant_nvfp4(&sc2, &sh2, self.eps) else {
-            return Ok(Some(
-                {
-                    let hn = rms_norm(&x, &self.norm2, self.eps)?;
-                    let h = mod_scale_shift(&hn, &mods.shift_mlp, &mods.scale_mlp, segments)?;
-                    let m = self.mlp.forward(&h)?;
-                    mod_gate(&x, &m, &mods.gate_mlp, segments)?
-                },
-            ));
+        let Some(chunks) = self.quant_chunks(&x, &mods.scale_mlp, &mods.shift_mlp, &self.norm2, segments)? else {
+            let hn = rms_norm(&x, &self.norm2, self.eps)?;
+            let h = mod_scale_shift(&hn, &mods.shift_mlp, &mods.scale_mlp, segments)?;
+            let m = self.mlp.forward(&h)?;
+            return Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?));
         };
-        drop(sc2);
-        drop(sh2);
-        let m = self.mlp.forward_prequant(&packed, &scales, s, x.dtype())?;
-        drop(packed);
-        drop(scales);
+        let m = self.mlp.forward_prequant(&chunks, s, x.dtype())?;
+        drop(chunks);
         Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?))
     }
-}
 
-fn expand_mod_rows(
-    mod_rows: &Tensor,
-    segments: &[ModSegment],
-    s: usize,
-    hidden: usize,
-    dt: DType,
-) -> R<Tensor> {
-    check_coverage(s, segments)?;
-    let mut parts: Vec<Tensor> = Vec::with_capacity(segments.len());
-    for seg in segments {
-        if seg.stop == seg.start {
-            continue;
+    fn quant_chunks(
+        &self,
+        x: &Tensor,
+        scale_rows: &Tensor,
+        shift_rows: &Tensor,
+        norm_w: &Tensor,
+        segments: &[ModSegment],
+    ) -> R<Option<Vec<(Tensor, Tensor, usize, usize)>>> {
+        let s = x.dims()[0];
+        let hidden = x.dims()[1];
+        check_coverage(s, segments)?;
+        let dt = x.dtype();
+        let w = norm_w.to_dtype(dt)?.reshape(vec![1, hidden])?;
+        let mut out = Vec::with_capacity(s.div_ceil(LIN_CHUNK_ROWS));
+        let mut off = 0;
+        while off < s {
+            let n = LIN_CHUNK_ROWS.min(s - off);
+            let (sc, sh) = expand_mod_range(scale_rows, shift_rows, &w, segments, off, n, hidden, dt)?;
+            let xc = x.narrow(0, off, n)?.contiguous()?;
+            let Ok((_, packed, scales)) = xc.rms_mod_quant_nvfp4(&sc, &sh, self.eps) else {
+                return Ok(None);
+            };
+            out.push((packed, scales, off, n));
+            off += n;
         }
-        let row = mod_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
-        parts.push(row.broadcast_as(vec![seg.stop - seg.start, hidden])?.contiguous()?);
+        Ok(Some(out))
     }
-    let refs: Vec<&Tensor> = parts.iter().collect();
-    Tensor::cat(&refs, 0)
 }
 
-fn expand_mod_scale(
-    mod_rows: &Tensor,
+fn expand_mod_range(
+    scale_rows: &Tensor,
+    shift_rows: &Tensor,
     norm_w: &Tensor,
     segments: &[ModSegment],
-    s: usize,
+    off: usize,
+    n: usize,
     hidden: usize,
     dt: DType,
-) -> R<Tensor> {
-    check_coverage(s, segments)?;
-    let w = norm_w.to_dtype(dt)?.reshape(vec![1, hidden])?;
-    let mut parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+) -> R<(Tensor, Tensor)> {
+    let mut sc_parts: Vec<Tensor> = Vec::new();
+    let mut sh_parts: Vec<Tensor> = Vec::new();
     for seg in segments {
-        if seg.stop == seg.start {
+        let a = seg.start.max(off);
+        let b = seg.stop.min(off + n);
+        if a >= b {
             continue;
         }
-        let row = mod_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
-        let row = w.broadcast_mul(&row.add_scalar(1.0)?)?.add_scalar(-1.0)?;
-        parts.push(row.broadcast_as(vec![seg.stop - seg.start, hidden])?.contiguous()?);
+        let len = b - a;
+        let sc = scale_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
+        let sc = norm_w.broadcast_mul(&sc.add_scalar(1.0)?)?.add_scalar(-1.0)?;
+        sc_parts.push(sc.broadcast_as(vec![len, hidden])?.contiguous()?);
+        let sh = shift_rows.narrow(0, seg.row, 1)?.to_dtype(dt)?;
+        sh_parts.push(sh.broadcast_as(vec![len, hidden])?.contiguous()?);
     }
-    let refs: Vec<&Tensor> = parts.iter().collect();
-    Tensor::cat(&refs, 0)
+    let sc_refs: Vec<&Tensor> = sc_parts.iter().collect();
+    let sh_refs: Vec<&Tensor> = sh_parts.iter().collect();
+    Ok((Tensor::cat(&sc_refs, 0)?, Tensor::cat(&sh_refs, 0)?))
 }
 
 pub struct BlockMods {
