@@ -91,8 +91,8 @@ fn run(
 
     let mut w_deq: CudaSlice<f16> = stream.alloc_zeros((n * k) as usize).unwrap();
     let mut x_deq: CudaSlice<f16> = stream.alloc_zeros(k as usize).unwrap();
-    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq, n, k).unwrap();
-    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq, 1, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq.as_view_mut(), n, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq.as_view_mut(), 1, k).unwrap();
     stream.synchronize().unwrap();
 
     let w_deq_host: Vec<f16> = stream.clone_dtoh(&w_deq).unwrap();

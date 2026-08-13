@@ -19,12 +19,17 @@ fn prescale_enabled() -> bool {
     *ON.get_or_init(|| !matches!(std::env::var("SYNAPTIX_NO_ACT_PRESCALE").as_deref(), Ok("1")))
 }
 
+fn nvfp4_weight_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYNAPTIX_NVFP4_WO").as_deref(), Ok("1")))
+}
+
 fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     let in_dt = x.dtype();
     if in_dt == DType::F16 {
         return x.linear_quant(w);
     }
-    let native = in_dt == DType::BF16 && w.dtype() == DType::NVFP4;
+    let native = in_dt == DType::BF16 && w.dtype() == DType::NVFP4 && !nvfp4_weight_only();
     if !prescale_enabled() {
         if native {
             return x.linear_quant(w);

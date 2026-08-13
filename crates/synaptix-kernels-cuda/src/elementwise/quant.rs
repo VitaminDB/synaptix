@@ -206,7 +206,7 @@ pub fn nvfp4_dequant_f16(
     stream: &Arc<CudaStream>,
     packed: &CudaSlice<u8>,
     scales_e4m3: &CudaSlice<u8>,
-    out: &mut CudaSlice<f16>,
+    out: &mut CudaViewMut<f16>,
     outer_dim: u32,
     inner_dim: u32,
 ) -> Result<()> {

@@ -161,8 +161,8 @@ fn run(
     // CPU F32 reference через dequant.
     let mut w_deq: CudaSlice<f16> = stream.alloc_zeros((n * k) as usize).unwrap();
     let mut x_deq: CudaSlice<f16> = stream.alloc_zeros((batch * k) as usize).unwrap();
-    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq, n, k).unwrap();
-    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq, batch, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq.as_view_mut(), n, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq.as_view_mut(), batch, k).unwrap();
     stream.synchronize().unwrap();
 
     let w_deq_host: Vec<f16> = stream.clone_dtoh(&w_deq).unwrap();
@@ -684,8 +684,8 @@ fn diag_perrow_a_vs_n8_vs_2dr_m256() {
     // CPU F32 ref from dequant.
     let mut w_deq: CudaSlice<f16> = stream.alloc_zeros((n * k) as usize).unwrap();
     let mut x_deq: CudaSlice<f16> = stream.alloc_zeros((batch * k) as usize).unwrap();
-    nvfp4_dequant_f16(&q, &stream, &w_packed, &w_scales, &mut w_deq, n, k).unwrap();
-    nvfp4_dequant_f16(&q, &stream, &x_packed, &x_scales, &mut x_deq, batch, k).unwrap();
+    nvfp4_dequant_f16(&q, &stream, &w_packed, &w_scales, &mut w_deq.as_view_mut(), n, k).unwrap();
+    nvfp4_dequant_f16(&q, &stream, &x_packed, &x_scales, &mut x_deq.as_view_mut(), batch, k).unwrap();
     stream.synchronize().unwrap();
     let w_f32: Vec<f32> = stream
         .clone_dtoh(&w_deq)
@@ -803,8 +803,8 @@ fn full_perrow_vs_dense() {
     // dense f32-ref из dequant.
     let mut w_deq: CudaSlice<f16> = stream.alloc_zeros((n * k) as usize).unwrap();
     let mut x_deq: CudaSlice<f16> = stream.alloc_zeros((batch * k) as usize).unwrap();
-    nvfp4_dequant_f16(&q, &stream, &w_packed, &w_scales, &mut w_deq, n, k).unwrap();
-    nvfp4_dequant_f16(&q, &stream, &x_packed, &x_scales, &mut x_deq, batch, k).unwrap();
+    nvfp4_dequant_f16(&q, &stream, &w_packed, &w_scales, &mut w_deq.as_view_mut(), n, k).unwrap();
+    nvfp4_dequant_f16(&q, &stream, &x_packed, &x_scales, &mut x_deq.as_view_mut(), batch, k).unwrap();
     stream.synchronize().unwrap();
     let wf: Vec<f32> = stream.clone_dtoh(&w_deq).unwrap().iter().map(|v| v.to_f32()).collect();
     let xf: Vec<f32> = stream.clone_dtoh(&x_deq).unwrap().iter().map(|v| v.to_f32()).collect();
