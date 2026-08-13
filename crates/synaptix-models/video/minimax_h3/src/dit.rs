@@ -14,7 +14,7 @@ use crate::H3Error;
 
 type R<T> = Result<T, SynaptixError>;
 
-const LIN_CHUNK_ROWS: usize = 8192;
+const LIN_CHUNK_ROWS: usize = 16384;
 
 pub struct Lin(QuantLinear);
 
