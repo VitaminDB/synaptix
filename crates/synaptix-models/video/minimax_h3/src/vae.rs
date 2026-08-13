@@ -680,7 +680,53 @@ impl VaeDecoder {
     }
 
     fn decode_pixels(&self, z: &Tensor) -> R<Tensor> {
-        self.vit_forward(&self.post_quant.forward(z)?)
+        let ratio = self.vit.patch_size;
+        let dims = z.dims();
+        let (lat_h, lat_w) = (dims[3], dims[4]);
+        let tile_lat = VAE_TILE_SIZE / ratio;
+        if lat_h <= tile_lat && lat_w <= tile_lat {
+            return self.vit_forward(&self.post_quant.forward(z)?);
+        }
+        let (ys, yl, yo) = split_tiles(lat_h * ratio, VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
+        let (xs, xl, xo) = split_tiles(lat_w * ratio, VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
+        let mut rows: Vec<Vec<Tensor>> = Vec::with_capacity(ys.len());
+        for (&y0, &ylen) in ys.iter().zip(&yl) {
+            let mut row = Vec::with_capacity(xs.len());
+            for (&x0, &xlen) in xs.iter().zip(&xl) {
+                let zt = z
+                    .narrow(3, y0 / ratio, ylen / ratio)?
+                    .narrow(4, x0 / ratio, xlen / ratio)?
+                    .contiguous()?;
+                row.push(self.vit_forward(&self.post_quant.forward(&zt)?)?);
+            }
+            rows.push(row);
+        }
+        let mut result_rows: Vec<Tensor> = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let mut parts: Vec<Tensor> = Vec::with_capacity(rows[i].len());
+            for j in 0..rows[i].len() {
+                let mut tile = rows[i][j].clone();
+                if i > 0 {
+                    tile = blend_axis(&rows[i - 1][j], &tile, yo[i - 1], 3)?;
+                }
+                if j > 0 {
+                    tile = blend_axis(&rows[i][j - 1], &tile, xo[j - 1], 4)?;
+                }
+                if i + 1 < rows.len() {
+                    let hl = tile.dims()[3];
+                    tile = tile.narrow(3, 0, hl - yo[i])?.contiguous()?;
+                }
+                if j + 1 < rows[i].len() {
+                    let wl = tile.dims()[4];
+                    tile = tile.narrow(4, 0, wl - xo[j])?.contiguous()?;
+                }
+                parts.push(tile);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            result_rows.push(Tensor::cat(&refs, 4)?);
+        }
+        let refs: Vec<&Tensor> = result_rows.iter().collect();
+        Tensor::cat(&refs, 3)
     }
 
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor, H3Error> {
@@ -858,6 +904,61 @@ impl VaeDecoder {
             .map(|k| if (z_len + k) % tcs == 0 { intra_tail } else { ratio_t })
             .sum()
     }
+}
+
+const VAE_TILE_SIZE: usize = 256;
+const VAE_TILE_OVERLAP_MIN: usize = 64;
+
+fn split_tiles(
+    len: usize,
+    tile: usize,
+    overlap_min: usize,
+    ratio: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    if tile >= len {
+        return (vec![0], vec![len], vec![]);
+    }
+    let mut n = len.div_ceil(tile);
+    loop {
+        let sum = overlap_min * (n - 1);
+        if tile * n >= sum + len {
+            break;
+        }
+        n += 1;
+    }
+    let mut overlaps = vec![overlap_min; n - 1];
+    let remaining = tile * n - overlap_min * (n - 1) - len;
+    for i in 0..remaining / ratio {
+        overlaps[i % (n - 1)] += ratio;
+    }
+    let mut starts = vec![0];
+    for i in 0..n - 1 {
+        starts.push(starts[i] + tile - overlaps[i]);
+    }
+    (starts, vec![tile; n], overlaps)
+}
+
+fn blend_axis(a: &Tensor, b: &Tensor, extent: usize, axis: usize) -> R<Tensor> {
+    let extent = extent.min(a.dims()[axis]).min(b.dims()[axis]);
+    if extent == 0 {
+        return Ok(b.clone());
+    }
+    let n_a = a.dims()[axis];
+    let tail = a.narrow(axis, n_a - extent, extent)?.contiguous()?;
+    let head = b.narrow(axis, 0, extent)?.contiguous()?;
+    let wa: Vec<f32> = (0..extent).map(|i| 1.0 - i as f32 / extent as f32).collect();
+    let wb: Vec<f32> = (0..extent).map(|i| i as f32 / extent as f32).collect();
+    let mut shape = vec![1usize; a.dims().len()];
+    shape[axis] = extent;
+    let wa = Tensor::from_vec(wa, shape.clone(), a.device())?.to_dtype(a.dtype())?;
+    let wb = Tensor::from_vec(wb, shape, b.device())?.to_dtype(b.dtype())?;
+    let blended = tail.broadcast_mul(&wa)?.add(&head.broadcast_mul(&wb)?)?;
+    let rest = b.dims()[axis] - extent;
+    if rest == 0 {
+        return Ok(blended);
+    }
+    let tailb = b.narrow(axis, extent, rest)?.contiguous()?;
+    Tensor::cat(&[&blended, &tailb], axis)
 }
 
 fn blend_time(a: &Tensor, b: &Tensor, extent: usize) -> R<Tensor> {
