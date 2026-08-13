@@ -182,7 +182,7 @@ fn run_dispatch(
     // shuffled-W — единственный читаемый формат). Поэтому дека́нтим эталонный вес ЗДЕСЬ,
     // пока локальные w_packed/w_scales ещё живы (до перемещения в QuantWeight).
     let mut w_deq: CudaSlice<f16> = stream.alloc_zeros((n * k) as usize).unwrap();
-    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq, n, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &w_packed, &w_scales, &mut w_deq.as_view_mut(), n, k).unwrap();
     stream.synchronize().unwrap();
     let w_deq_host: Vec<f16> = stream.clone_dtoh(&w_deq).unwrap();
 
@@ -214,7 +214,7 @@ fn run_dispatch(
 
     // x дека́нтим из локальных буферов (в qw не перемещались, packed-вес уже освобождён).
     let mut x_deq: CudaSlice<f16> = stream.alloc_zeros((m * k) as usize).unwrap();
-    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq, m, k).unwrap();
+    nvfp4_dequant_f16(&q, stream, &x_packed, &x_scales, &mut x_deq.as_view_mut(), m, k).unwrap();
     stream.synchronize().unwrap();
     let x_deq_host: Vec<f16> = stream.clone_dtoh(&x_deq).unwrap();
     let out_bytes: Vec<u8> = stream

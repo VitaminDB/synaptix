@@ -21,6 +21,11 @@ pub fn ensure_registered() {
 }
 
 
+fn nvfp4_weight_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYNAPTIX_NVFP4_WO").as_deref(), Ok("1")))
+}
+
 fn stream_is_capturing(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> bool {
     matches!(
         stream.capture_status(),
@@ -389,6 +394,68 @@ impl Backend for CudaBackend {
         let bf16 = x_lo.dtype() == DType::BF16;
         match w.dtype() {
             DType::NVFP4 => {
+                if !bf16 && nvfp4_weight_only() {
+                    use half::f16;
+                    let nn = w.n();
+                    if k % 16 != 0 {
+                        return Err(SynaptixError::Cuda(format!(
+                            "linear_quant NVFP4 WO: K={k} должно быть кратно 16"
+                        )));
+                    }
+                    let qk = crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?;
+                    let bk =
+                        crate::best_cu::gemm::gemm_bf16::BestGemmBf16Kernels::for_context(&ctx)?;
+                    let w_packed_arc = w.packed_arc().ok_or_else(|| {
+                        SynaptixError::Cuda("linear_quant NVFP4 WO: packed W освобождён".into())
+                    })?;
+                    let w_packed = w_packed_arc
+                        .as_cuda()
+                        .ok_or(SynaptixError::Unsupported(
+                            "linear_quant NVFP4 WO: packed W non-cuda",
+                        ))?
+                        .slice();
+                    let w_scales = w
+                        .scales()
+                        .as_cuda()
+                        .ok_or(SynaptixError::Unsupported(
+                            "linear_quant NVFP4 WO: scales W non-cuda",
+                        ))?
+                        .slice();
+                    let nk = nn * k;
+                    let mut w_f16_u8 = stream.alloc_zeros::<u8>(nk * 2).map_err(|e| {
+                        SynaptixError::Cuda(format!("linear_quant NVFP4 WO: alloc W f16: {e:?}"))
+                    })?;
+                    {
+                        let mut w_view = unsafe { w_f16_u8.transmute_mut::<f16>(nk) }
+                            .ok_or_else(|| {
+                                SynaptixError::Cuda(
+                                    "linear_quant NVFP4 WO: transmute W→f16".into(),
+                                )
+                            })?;
+                        crate::elementwise::quant::nvfp4_dequant_f16(
+                            &qk,
+                            &stream,
+                            w_packed,
+                            w_scales,
+                            &mut w_view,
+                            nn as u32,
+                            k as u32,
+                        )?;
+                    }
+                    crate::best_cu::gemm::gemm_bf16::best_gemm_f16tn_linear_u8(
+                        &bk,
+                        &stream,
+                        &w_f16_u8,
+                        x_buf.slice(),
+                        out_buf.slice_mut(),
+                        nn as u32,
+                        k as u32,
+                        m,
+                        None,
+                        None,
+                    )?;
+                    return Ok(());
+                }
                 let (gemm_k, gemv_k, quant_k) = if bf16 {
                     (
                         crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context_bf16(&ctx)?,

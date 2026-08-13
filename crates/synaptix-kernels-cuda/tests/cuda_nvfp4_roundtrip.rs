@@ -73,7 +73,7 @@ fn run_roundtrip(
         stream,
         &packed,
         &scales,
-        &mut dev_y,
+        &mut dev_y.as_view_mut(),
         outer as u32,
         inner as u32,
     )
