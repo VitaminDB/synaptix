@@ -649,6 +649,17 @@ __global__ void FSQ_BOUNDS flash_splitq_bf16_hd64_bshd(
     int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
   flash_splitq_impl<__nv_bfloat16, 64>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
 }
+__global__ void FSQ_BOUNDS flash_splitq_f16_hd128_bshd(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__half, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+__global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_bshd(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__nv_bfloat16, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
 
 __global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_win(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,

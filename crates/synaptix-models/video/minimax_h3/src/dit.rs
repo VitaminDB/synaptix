@@ -14,7 +14,7 @@ use crate::H3Error;
 
 type R<T> = Result<T, SynaptixError>;
 
-const LIN_CHUNK_ROWS: usize = 16384;
+const LIN_CHUNK_ROWS: usize = 8192;
 
 pub struct Lin(QuantLinear);
 
@@ -159,27 +159,72 @@ impl Attention {
         })
     }
 
+    fn stream_bshd(
+        &self,
+        x: &Tensor,
+        proj: &Lin,
+        norm: Option<&Tensor>,
+        rt: Option<&RopeTables>,
+    ) -> R<Tensor> {
+        let s = x.dims()[0];
+        let mut out: Option<Tensor> = None;
+        let mut off = 0;
+        while off < s {
+            let n = LIN_CHUNK_ROWS.min(s - off);
+            let xc = x.narrow(0, off, n)?.contiguous()?;
+            let mut p = proj.forward(&xc)?.reshape(vec![1, n, self.heads, self.head_dim])?;
+            drop(xc);
+            if let Some(w) = norm {
+                p = rms_norm(&p, w, self.eps)?;
+            }
+            if let Some(rt) = rt {
+                p = rt.apply_bshd_at(&p, off).map_err(to_tensor_err)?;
+            }
+            if out.is_none() {
+                out = Some(Tensor::zeros(
+                    vec![1, s, self.heads, self.head_dim],
+                    p.dtype(),
+                    p.device(),
+                )?);
+            }
+            out.as_mut().unwrap().copy_rows_from(off, &p)?;
+            off += n;
+        }
+        Ok(out.unwrap())
+    }
+
     fn forward_bshd(&self, x: &Tensor, rt: &RopeTables) -> R<Tensor> {
         let s = x.dims()[0];
         let inner = self.heads * self.head_dim;
-        let bshd = vec![1, s, self.heads, self.head_dim];
-        let q = self.q_proj.forward(x)?.reshape(bshd.clone())?;
-        let q = rms_norm(&q, &self.q_norm, self.eps)?;
-        let q = rt.apply_bshd(&q).map_err(to_tensor_err)?;
-        let k = self.k_proj.forward(x)?.reshape(bshd.clone())?;
-        let k = rms_norm(&k, &self.k_norm, self.eps)?;
-        let k = rt.apply_bshd(&k).map_err(to_tensor_err)?;
-        let v = self.v_proj.forward(x)?.reshape(bshd)?;
-        if runtime::h3_attn_prof() {
-            let st = crate::pipeline::tensor_stats;
-            eprintln!("[h3-attn] {} · {} · {}", st("q", &q), st("k", &k), st("v", &v));
+        let k = self.stream_bshd(x, &self.k_proj, Some(&self.k_norm), Some(rt))?;
+        let v = self.stream_bshd(x, &self.v_proj, None, None)?;
+
+        let mut res: Option<Tensor> = None;
+        let mut cols = 0;
+        let mut off = 0;
+        while off < s {
+            let n = LIN_CHUNK_ROWS.min(s - off);
+            let xq = x.narrow(0, off, n)?.contiguous()?;
+            let q = self.q_proj.forward(&xq)?.reshape(vec![1, n, self.heads, self.head_dim])?;
+            drop(xq);
+            let q = rms_norm(&q, &self.q_norm, self.eps)?;
+            let q = rt.apply_bshd_at(&q, off).map_err(to_tensor_err)?;
+            let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
+            drop(q);
+            let y = self.out.forward(&a.reshape(vec![n, inner])?)?;
+            drop(a);
+            cols = y.dims()[1];
+            if res.is_none() {
+                res = Some(Tensor::zeros(vec![1, s, cols], y.dtype(), y.device())?);
+            }
+            res.as_mut()
+                .unwrap()
+                .copy_rows_from(off, &y.reshape(vec![1, n, cols])?)?;
+            off += n;
         }
-        let attn = q.flash_attention_bshd(&k, &v, self.scale, false)?;
-        drop(q);
         drop(k);
         drop(v);
-        let attn = attn.reshape(vec![s, inner])?;
-        self.out.forward(&attn)
+        res.unwrap().reshape(vec![s, cols])
     }
 
     pub fn forward(&self, x: &Tensor, rope: Option<&RopeTables>) -> R<Tensor> {
@@ -416,26 +461,31 @@ impl DiTBlock {
             eprintln!("[h3-mod] {} · {}", st("gate_msa", &mods.gate_msa), st("gate_mlp", &mods.gate_mlp));
             eprintln!("[h3-mod] {} · {}", st("shift_mlp", &mods.shift_mlp), st("scale_mlp", &mods.scale_mlp));
         }
-        let h = rms_norm(x, &self.norm1, self.eps)?;
+        let hn = rms_norm(x, &self.norm1, self.eps)?;
         if prof {
-            eprintln!("[h3-mod] {}", st("norm1", &h));
+            eprintln!("[h3-mod] {}", st("norm1", &hn));
         }
-        let h = mod_scale_shift(&h, &mods.shift_msa, &mods.scale_msa, segments)?;
+        let h = mod_scale_shift(&hn, &mods.shift_msa, &mods.scale_msa, segments)?;
+        drop(hn);
         if prof {
             eprintln!("[h3-mod] {}", st("после mod1", &h));
         }
         let a = self.attn.forward(&h, Some(rope))?;
+        drop(h);
         if prof {
             eprintln!("[h3-mod] {}", st("attn", &a));
         }
         let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
+        drop(a);
         if prof {
             eprintln!("[h3-mod] {}", st("x после attn", &x));
         }
 
-        let h = rms_norm(&x, &self.norm2, self.eps)?;
-        let h = mod_scale_shift(&h, &mods.shift_mlp, &mods.scale_mlp, segments)?;
+        let hn = rms_norm(&x, &self.norm2, self.eps)?;
+        let h = mod_scale_shift(&hn, &mods.shift_mlp, &mods.scale_mlp, segments)?;
+        drop(hn);
         let m = self.mlp.forward(&h)?;
+        drop(h);
         if prof {
             eprintln!("[h3-mod] {}", st("mlp", &m));
         }
