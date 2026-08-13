@@ -501,7 +501,11 @@ pub fn frames_for_duration(seconds: f64) -> usize {
 }
 
 pub fn latent_frames(frame_count: usize) -> usize {
-    frame_count.div_ceil(VAE_TEMPORAL_RATIO)
+    if frame_count <= FRAME_GRID_BASE {
+        2
+    } else {
+        (frame_count - FRAME_GRID_BASE) / FRAME_GRID_STEP * 5 + 2
+    }
 }
 
 pub fn audio_latent_frames(frame_count: usize) -> usize {
