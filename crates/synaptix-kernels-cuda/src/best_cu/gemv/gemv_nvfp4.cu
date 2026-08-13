@@ -6,7 +6,7 @@ typedef __nv_bfloat16 syn_out_t;
 #define SYN_TO_OUT(v) __float2bfloat16(v)
 #else
 typedef __half syn_out_t;
-#define SYN_TO_OUT(v) SYN_TO_OUT(v)
+#define SYN_TO_OUT(v) __float2half(v)
 #endif
 
 extern "C" __global__ void nvfp4_w_repack(
