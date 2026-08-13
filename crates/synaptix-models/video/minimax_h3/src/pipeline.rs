@@ -515,8 +515,6 @@ pub fn denoise_av(
         }
     };
 
-    crate::memory::trim_pool(device);
-
     let steps = sched.steps();
     let patch = cfg.patch_size;
     let mut old_denoised_v: Option<Tensor> = None;

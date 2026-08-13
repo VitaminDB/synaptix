@@ -159,9 +159,44 @@ impl Attention {
         })
     }
 
+    fn forward_bshd(&self, x: &Tensor, rt: &RopeTables) -> R<Tensor> {
+        let s = x.dims()[0];
+        let inner = self.heads * self.head_dim;
+        let bshd = vec![1, s, self.heads, self.head_dim];
+        let q = self.q_proj.forward(x)?.reshape(bshd.clone())?;
+        let q = rms_norm(&q, &self.q_norm, self.eps)?;
+        let q = rt.apply_bshd(&q).map_err(to_tensor_err)?;
+        let k = self.k_proj.forward(x)?.reshape(bshd.clone())?;
+        let k = rms_norm(&k, &self.k_norm, self.eps)?;
+        let k = rt.apply_bshd(&k).map_err(to_tensor_err)?;
+        let v = self.v_proj.forward(x)?.reshape(bshd)?;
+        if runtime::h3_attn_prof() {
+            let st = crate::pipeline::tensor_stats;
+            eprintln!("[h3-attn] {} · {} · {}", st("q", &q), st("k", &k), st("v", &v));
+        }
+        let attn = q.flash_attention_bshd(&k, &v, self.scale, false)?;
+        drop(q);
+        drop(k);
+        drop(v);
+        let attn = attn.reshape(vec![s, inner])?;
+        self.out.forward(&attn)
+    }
+
     pub fn forward(&self, x: &Tensor, rope: Option<&RopeTables>) -> R<Tensor> {
         let s = x.dims()[0];
         let inner = self.heads * self.head_dim;
+
+        if let Some(rt) = rope {
+            if x.dtype() == DType::BF16 {
+                match self.forward_bshd(x, rt) {
+                    Ok(out) => return Ok(out),
+                    Err(e) => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| eprintln!("[h3-attn] bshd-путь недоступен: {e}"));
+                    }
+                }
+            }
+        }
 
         let to_hsd = |t: Tensor| -> R<Tensor> {
             t.reshape(vec![s, self.heads, self.head_dim])?
@@ -737,7 +772,6 @@ impl H3Dit {
                 per_step.push(proj.forward(t)?);
             }
             blocks.push(crate::adaln::stack_steps(per_step, cache_dtype)?);
-            crate::memory::trim_pool(self.device);
         }
 
         let mut per_step = Vec::with_capacity(steps);
