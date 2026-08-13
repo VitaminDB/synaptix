@@ -33,6 +33,8 @@ pub struct FlashSplitQKernels {
     bf16_hd256: CudaFunction,
     f16_hd64_bshd: CudaFunction,
     bf16_hd64_bshd: CudaFunction,
+    f16_hd128_bshd: CudaFunction,
+    bf16_hd128_bshd: CudaFunction,
     f16_hd64_dev: CudaFunction,
     f16_hd128_dev: CudaFunction,
     f16_hd256_dev: CudaFunction,
@@ -71,6 +73,8 @@ impl FlashSplitQKernels {
         let bf16_hd256 = load_fn(&module, "flash_splitq_bf16_hd256")?;
         let f16_hd64_bshd = load_fn(&module, "flash_splitq_f16_hd64_bshd")?;
         let bf16_hd64_bshd = load_fn(&module, "flash_splitq_bf16_hd64_bshd")?;
+        let f16_hd128_bshd = load_fn(&module, "flash_splitq_f16_hd128_bshd")?;
+        let bf16_hd128_bshd = load_fn(&module, "flash_splitq_bf16_hd128_bshd")?;
         let f16_hd64_dev = load_fn(&module, "flash_splitq_f16_hd64_dev")?;
         let f16_hd128_dev = load_fn(&module, "flash_splitq_f16_hd128_dev")?;
         let f16_hd256_dev = load_fn(&module, "flash_splitq_f16_hd256_dev")?;
@@ -102,6 +106,8 @@ impl FlashSplitQKernels {
             &bf16_hd256,
             &f16_hd64_bshd,
             &bf16_hd64_bshd,
+            &f16_hd128_bshd,
+            &bf16_hd128_bshd,
             &bf16_hd128_win,
             &f16_hd64_dev,
             &f16_hd128_dev,
@@ -125,6 +131,8 @@ impl FlashSplitQKernels {
             bf16_hd256,
             f16_hd64_bshd,
             bf16_hd64_bshd,
+            f16_hd128_bshd,
+            bf16_hd128_bshd,
             f16_hd64_dev,
             f16_hd128_dev,
             f16_hd256_dev,
@@ -172,6 +180,8 @@ fn splitq_pick_func(
         return match (dtype, d) {
             (DType::F16, 64) => Ok(&kernels.f16_hd64_bshd),
             (DType::BF16, 64) => Ok(&kernels.bf16_hd64_bshd),
+            (DType::F16, 128) => Ok(&kernels.f16_hd128_bshd),
+            (DType::BF16, 128) => Ok(&kernels.bf16_hd128_bshd),
             _ => Err(SynaptixError::Unsupported("flash_splitq bshd: only HD=64 F16/BF16")),
         };
     }

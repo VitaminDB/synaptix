@@ -2020,8 +2020,8 @@ impl Backend for CudaBackend {
         // [B, S, H, D].
         let (b, s_q, h, d) = (q_lo.dims()[0], q_lo.dims()[1], q_lo.dims()[2], q_lo.dims()[3]);
         let (s_kv, hkv) = (k_lo.dims()[1], k_lo.dims()[2]);
-        if d != 64 || k_lo.dims()[0] != b || k_lo.dims()[3] != d || v_lo.dims() != k_lo.dims() {
-            return Err(SynaptixError::Unsupported("flash_bshd: shape/HD!=64"));
+        if !(d == 64 || d == 128) || k_lo.dims()[0] != b || k_lo.dims()[3] != d || v_lo.dims() != k_lo.dims() {
+            return Err(SynaptixError::Unsupported("flash_bshd: shape/HD"));
         }
         if hkv == 0 || h % hkv != 0 {
             return Err(SynaptixError::Unsupported("flash_bshd: GQA"));
