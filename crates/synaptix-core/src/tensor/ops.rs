@@ -786,6 +786,44 @@ impl Tensor {
         ))
     }
 
+    pub fn silu_mul_quant_nvfp4(&self, inv_pre: f32) -> Result<(Tensor, Tensor)> {
+        if !matches!(self.dtype(), DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: dtype не F16/BF16"));
+        }
+        let dims = self.dims();
+        if dims.is_empty() {
+            return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: scalar x"));
+        }
+        let k2 = dims[dims.len() - 1];
+        if k2 == 0 || k2 % 32 != 0 {
+            return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: K%32 != 0"));
+        }
+        let k = k2 / 2;
+        let m = self.layout.numel() / k2;
+        let packed_bytes = m * k / 2;
+        let scales_bytes = (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128);
+        let x = self.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
+        let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
+        let stream = Stream::default_for(self.device())?;
+        backend.silu_mul_quant_nvfp4(
+            (&x.storage, &x.layout),
+            (&mut packed_st, &packed_layout),
+            (&mut scales_st, &scales_layout),
+            m,
+            k,
+            inv_pre,
+            &stream,
+        )?;
+        Ok((
+            Tensor::from_parts(Arc::new(packed_st), packed_layout),
+            Tensor::from_parts(Arc::new(scales_st), scales_layout),
+        ))
+    }
+
     /// Fused «adaLN-модуляция + NVFP4-квант» (эпилог нормы): за один launch
     /// `y = rms(self)·(1+scale)+shift` (бит-в-бит с decomposed-цепочкой
     /// rms→add_scalar→broadcast_mul→broadcast_add) и `(packed, scales) =`
@@ -1249,10 +1287,14 @@ impl Tensor {
         scales: &Tensor,
         w: &QuantWeight,
         m: usize,
+        out_dt: DType,
     ) -> Result<Tensor> {
+        if !matches!(out_dt, DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("linear_quant_prequant: out_dt не F16/BF16"));
+        }
         let backend = registry::backend_for(self.device())?;
-        let out_layout = Layout::contiguous(Shape::new(vec![m, w.n()]), DType::F16);
-        let out_bytes = DType::F16.bytes_for_numel(out_layout.numel());
+        let out_layout = Layout::contiguous(Shape::new(vec![m, w.n()]), out_dt);
+        let out_bytes = out_dt.bytes_for_numel(out_layout.numel());
         let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.linear_quant_prequant(

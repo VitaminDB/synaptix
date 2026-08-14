@@ -392,13 +392,29 @@ impl Mlp {
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let h = self.fc1.0.forward_prequant(packed, scales, *n, out_dt)?;
-            let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
-            let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
-            drop(h);
-            let act = gate.silu_and_mul(&up)?;
-            drop(gate);
-            drop(up);
-            let y = self.fc2.forward(&act)?;
+            let y = if self.fc2.0.is_nvfp4() {
+                match h.silu_mul_quant_nvfp4(1.0 / 32.0) {
+                    Ok((p2, s2)) => {
+                        drop(h);
+                        self.fc2.0.forward_prequant(&p2, &s2, *n, out_dt)?.mul_scalar(32.0)?
+                    }
+                    Err(_) => {
+                        let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
+                        let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
+                        drop(h);
+                        let act = gate.silu_and_mul(&up)?;
+                        self.fc2.forward(&act)?
+                    }
+                }
+            } else {
+                let gate = h.narrow(1, 0, self.ffn)?.contiguous()?;
+                let up = h.narrow(1, self.ffn, self.ffn)?.contiguous()?;
+                drop(h);
+                let act = gate.silu_and_mul(&up)?;
+                drop(gate);
+                drop(up);
+                self.fc2.forward(&act)?
+            };
             if res.is_none() {
                 res = Some(Tensor::zeros(vec![1, rows, y.dims()[1]], y.dtype(), y.device())?);
             }

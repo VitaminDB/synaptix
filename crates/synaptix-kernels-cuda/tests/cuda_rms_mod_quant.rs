@@ -286,7 +286,7 @@ fn linear_quant_prequant_mxfp8_bitexact() {
         let qw = w.quantize_to_mxfp8().unwrap();
         let y_ref = x.linear_quant(&qw).unwrap();
         let (p, s) = x.mxfp8_quantize_act().unwrap();
-        let y = p.linear_quant_prequant(&s, &qw, m).unwrap();
+        let y = p.linear_quant_prequant(&s, &qw, m, DType::F16).unwrap();
         let a: Vec<f32> = y_ref.to_dtype(DType::F32).unwrap().reshape(vec![m * n]).unwrap().to_vec1().unwrap();
         let b: Vec<f32> = y.to_dtype(DType::F32).unwrap().reshape(vec![m * n]).unwrap().to_vec1().unwrap();
         let mut worst = 0f32;

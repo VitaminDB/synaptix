@@ -77,7 +77,7 @@ impl QLinear {
     ) -> Result<Tensor, ModelError> {
         match self {
             QLinear::Quant(w) if matches!(w.dtype(), DType::NVFP4 | DType::MXFP8) => packed
-                .linear_quant_prequant(scales, w, m)
+                .linear_quant_prequant(scales, w, m, DType::F16)
                 .map_err(|e| ModelError::Forward(e.to_string())),
             _ => Err(ModelError::Forward("forward_prequant: вес не NVFP4/MXFP8".into())),
         }

@@ -154,8 +154,13 @@ impl QuantLinear {
     ) -> Result<Tensor> {
         match self {
             QuantLinear::Quant { w, bias } => {
-                let y = packed.linear_quant_prequant(scales, w, m)?;
-                let y = if out_dt == DType::F16 { y } else { y.to_dtype(out_dt)? };
+                let gemm_dt = if matches!(out_dt, DType::F16 | DType::BF16) {
+                    out_dt
+                } else {
+                    DType::F16
+                };
+                let y = packed.linear_quant_prequant(scales, w, m, gemm_dt)?;
+                let y = if y.dtype() == out_dt { y } else { y.to_dtype(out_dt)? };
                 match bias {
                     Some(b) => y.broadcast_add(b),
                     None => Ok(y),
