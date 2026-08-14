@@ -18,6 +18,11 @@ static VAE_TILE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_h3_prof(on: bool) {
     PROF.store(on, Ordering::Relaxed);
 }
+pub fn h3_attn_f16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYN_FLASH_F16ACC").as_deref(), Ok("1")))
+}
+
 pub fn h3_prof() -> bool {
     PROF.load(Ordering::Relaxed)
 }

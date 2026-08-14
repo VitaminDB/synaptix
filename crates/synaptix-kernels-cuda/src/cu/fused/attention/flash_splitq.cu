@@ -121,6 +121,19 @@ __device__ __forceinline__ void fsq_mma16x8x16<__half>(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
         "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
+__device__ __forceinline__ void fsq_mma16x8x16_f16acc(
+    unsigned int& d0, unsigned int& d1,
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1,
+    unsigned int c0, unsigned int c1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+      "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
+      : "=r"(d0), "=r"(d1)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+        "r"(c0), "r"(c1));
+}
+
 template <>
 __device__ __forceinline__ void fsq_mma16x8x16<__nv_bfloat16>(
     float& d0, float& d1, float& d2, float& d3,
@@ -171,7 +184,7 @@ __device__ __forceinline__ void fsq_ldmatrix_x4_trans(
 // BM/BN/WARPS/STAGES параметризованы: v1 = 64/32/4/1 (single-buffer, 128
 // потоков), v2 = 128/64/8/2 (double-buffer конвейер cp.async, 256 потоков —
 // load(blk+1) перекрывается с compute(blk), wait_group(1)).
-template <typename T, int HD, int BM = FSQ_BM, int BN = FSQ_BN, int WARPS = FSQ_WARPS, int STAGES = 1>
+template <typename T, int HD, int BM = FSQ_BM, int BN = FSQ_BN, int WARPS = FSQ_WARPS, int STAGES = 1, int PV16 = 0>
 __device__ __forceinline__ void flash_splitq_impl(
     const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
     T* __restrict__ out, float scale,
@@ -249,10 +262,16 @@ __device__ __forceinline__ void flash_splitq_impl(
   }
 
   // O-аккумулятор warp'а: 16 строк × HD, ON_TILES n-tiles × 4 f32.
-  float o_acc[ON_TILES][4];
-  #pragma unroll
-  for (int n = 0; n < ON_TILES; ++n) {
-    o_acc[n][0] = 0.0f; o_acc[n][1] = 0.0f; o_acc[n][2] = 0.0f; o_acc[n][3] = 0.0f;
+  float o_acc[PV16 ? 1 : ON_TILES][4];
+  unsigned int o_acc16[PV16 ? ON_TILES : 1][2];
+  if constexpr (PV16) {
+    #pragma unroll
+    for (int n = 0; n < ON_TILES; ++n) { o_acc16[n][0] = 0u; o_acc16[n][1] = 0u; }
+  } else {
+    #pragma unroll
+    for (int n = 0; n < ON_TILES; ++n) {
+      o_acc[n][0] = 0.0f; o_acc[n][1] = 0.0f; o_acc[n][2] = 0.0f; o_acc[n][3] = 0.0f;
+    }
   }
   // online-softmax состояние (exp2-домен): на поток — 2 строки (row_lo, row_hi).
   float m_lo = FSQ_NEG_INF, m_hi = FSQ_NEG_INF;
@@ -451,17 +470,40 @@ __device__ __forceinline__ void flash_splitq_impl(
     rs_hi += __shfl_xor_sync(0xffffffffu, rs_hi, 1);
     rs_hi += __shfl_xor_sync(0xffffffffu, rs_hi, 2);
 
+    float l_old_lo = l_lo, l_old_hi = l_hi;
     m_lo = mn_lo; m_hi = mn_hi;
     l_lo = l_lo * alpha_lo + rs_lo;
     l_hi = l_hi * alpha_hi + rs_hi;
+    float pnorm_lo = 1.0f, pnorm_hi = 1.0f;
 
     // ─── O *= alpha (пропуск, если max не вырос ни у одной строки warp'а —
     // на поздних тайлах частый случай: 2·ON_TILES FMUL/поток экономии) ───
-    if (!__all_sync(0xffffffffu, alpha_lo == 1.0f && alpha_hi == 1.0f)) {
-      #pragma unroll
-      for (int n = 0; n < ON_TILES; ++n) {
-        o_acc[n][0] *= alpha_lo; o_acc[n][1] *= alpha_lo;
-        o_acc[n][2] *= alpha_hi; o_acc[n][3] *= alpha_hi;
+    if constexpr (PV16) {
+      float f_lo = (l_lo > 0.0f) ? (l_old_lo * alpha_lo / l_lo) : 0.0f;
+      float f_hi = (l_hi > 0.0f) ? (l_old_hi * alpha_hi / l_hi) : 0.0f;
+      pnorm_lo = (l_lo > 0.0f) ? (1.0f / l_lo) : 0.0f;
+      pnorm_hi = (l_hi > 0.0f) ? (1.0f / l_hi) : 0.0f;
+      if (!__all_sync(0xffffffffu, f_lo == 1.0f && f_hi == 1.0f)) {
+        unsigned int fl2 = fsq_pack2(f_lo, f_lo, __half{});
+        unsigned int fh2 = fsq_pack2(f_hi, f_hi, __half{});
+        #pragma unroll
+        for (int n = 0; n < ON_TILES; ++n) {
+          union { __half2 h; unsigned int u; } a, b;
+          a.u = o_acc16[n][0];
+          a.h = __hmul2(a.h, *reinterpret_cast<__half2*>(&fl2));
+          o_acc16[n][0] = a.u;
+          b.u = o_acc16[n][1];
+          b.h = __hmul2(b.h, *reinterpret_cast<__half2*>(&fh2));
+          o_acc16[n][1] = b.u;
+        }
+      }
+    } else if (!__all_sync(0xffffffffu, alpha_lo == 1.0f && alpha_hi == 1.0f)) {
+      {
+        #pragma unroll
+        for (int n = 0; n < ON_TILES; ++n) {
+          o_acc[n][0] *= alpha_lo; o_acc[n][1] *= alpha_lo;
+          o_acc[n][2] *= alpha_hi; o_acc[n][3] *= alpha_hi;
+        }
       }
     }
 
@@ -487,17 +529,33 @@ __device__ __forceinline__ void flash_splitq_impl(
         int kk = i / PV_NP;
         int np = i % PV_NP;
         if (np == 0) {
-          a0 = fsq_pack2(s_frag[2 * kk][0],     s_frag[2 * kk][1],     T{});
-          a1 = fsq_pack2(s_frag[2 * kk][2],     s_frag[2 * kk][3],     T{});
-          a2 = fsq_pack2(s_frag[2 * kk + 1][0], s_frag[2 * kk + 1][1], T{});
-          a3 = fsq_pack2(s_frag[2 * kk + 1][2], s_frag[2 * kk + 1][3], T{});
+          if constexpr (PV16) {
+            a0 = fsq_pack2(s_frag[2 * kk][0] * pnorm_lo,     s_frag[2 * kk][1] * pnorm_lo,     T{});
+            a1 = fsq_pack2(s_frag[2 * kk][2] * pnorm_hi,     s_frag[2 * kk][3] * pnorm_hi,     T{});
+            a2 = fsq_pack2(s_frag[2 * kk + 1][0] * pnorm_lo, s_frag[2 * kk + 1][1] * pnorm_lo, T{});
+            a3 = fsq_pack2(s_frag[2 * kk + 1][2] * pnorm_hi, s_frag[2 * kk + 1][3] * pnorm_hi, T{});
+          } else {
+            a0 = fsq_pack2(s_frag[2 * kk][0],     s_frag[2 * kk][1],     T{});
+            a1 = fsq_pack2(s_frag[2 * kk][2],     s_frag[2 * kk][3],     T{});
+            a2 = fsq_pack2(s_frag[2 * kk + 1][0], s_frag[2 * kk + 1][1], T{});
+            a3 = fsq_pack2(s_frag[2 * kk + 1][2], s_frag[2 * kk + 1][3], T{});
+          }
         }
-        fsq_mma16x8x16<T>(o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3],
-            a0, a1, a2, a3, vb[cur][0], vb[cur][1],
-            o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3]);
-        fsq_mma16x8x16<T>(o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3],
-            a0, a1, a2, a3, vb[cur][2], vb[cur][3],
-            o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3]);
+        if constexpr (PV16) {
+          fsq_mma16x8x16_f16acc(o_acc16[2 * np][0], o_acc16[2 * np][1],
+              a0, a1, a2, a3, vb[cur][0], vb[cur][1],
+              o_acc16[2 * np][0], o_acc16[2 * np][1]);
+          fsq_mma16x8x16_f16acc(o_acc16[2 * np + 1][0], o_acc16[2 * np + 1][1],
+              a0, a1, a2, a3, vb[cur][2], vb[cur][3],
+              o_acc16[2 * np + 1][0], o_acc16[2 * np + 1][1]);
+        } else {
+          fsq_mma16x8x16<T>(o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3],
+              a0, a1, a2, a3, vb[cur][0], vb[cur][1],
+              o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3]);
+          fsq_mma16x8x16<T>(o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3],
+              a0, a1, a2, a3, vb[cur][2], vb[cur][3],
+              o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3]);
+        }
       }
     }
     __syncthreads();  // MMA дочитал k_sm/v_sm → можно перезаписывать
@@ -506,22 +564,33 @@ __device__ __forceinline__ void flash_splitq_impl(
   // ─── Epilogue: normalize + store ───
   {
     int col_lo = (lane % 4) * 2;
-    float inv_lo = (l_lo > 0.0f) ? 1.0f / l_lo : 0.0f;
-    float inv_hi = (l_hi > 0.0f) ? 1.0f / l_hi : 0.0f;
+    float inv_lo = PV16 ? 1.0f : ((l_lo > 0.0f) ? 1.0f / l_lo : 0.0f);
+    float inv_hi = PV16 ? 1.0f : ((l_hi > 0.0f) ? 1.0f / l_hi : 0.0f);
     bool lo_valid = wrow_lo < q_count;
     bool hi_valid = wrow_hi < q_count;
     #pragma unroll
     for (int n = 0; n < ON_TILES; ++n) {
       int d_lo = n * 8 + col_lo;
+      float e0, e1, e2, e3;
+      if constexpr (PV16) {
+        union { __half2 h; unsigned int u; } a, b;
+        a.u = o_acc16[n][0];
+        b.u = o_acc16[n][1];
+        float2 fa = __half22float2(a.h);
+        float2 fb = __half22float2(b.h);
+        e0 = fa.x; e1 = fa.y; e2 = fb.x; e3 = fb.y;
+      } else {
+        e0 = o_acc[n][0]; e1 = o_acc[n][1]; e2 = o_acc[n][2]; e3 = o_acc[n][3];
+      }
       if (lo_valid) {
         size_t off = q_base_offset + (size_t)(q_base + wrow_lo) * q_row_stride + d_lo;
-        fsq_store_f(&out[off], o_acc[n][0] * inv_lo);
-        fsq_store_f(&out[off + 1], o_acc[n][1] * inv_lo);
+        fsq_store_f(&out[off], e0 * inv_lo);
+        fsq_store_f(&out[off + 1], e1 * inv_lo);
       }
       if (hi_valid) {
         size_t off = q_base_offset + (size_t)(q_base + wrow_hi) * q_row_stride + d_lo;
-        fsq_store_f(&out[off], o_acc[n][2] * inv_hi);
-        fsq_store_f(&out[off + 1], o_acc[n][3] * inv_hi);
+        fsq_store_f(&out[off], e2 * inv_hi);
+        fsq_store_f(&out[off + 1], e3 * inv_hi);
       }
     }
   }
@@ -659,6 +728,17 @@ __global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_bshd(
     __nv_bfloat16* out, float scale,
     int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
   flash_splitq_impl<__nv_bfloat16, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+
+__global__ void FSQ_BOUNDS flash_splitq_f16_hd128_bshd_facc(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__half, 128, FSQ_BM, FSQ_BN, FSQ_WARPS, 1, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+__global__ void FSQ_BOUNDS flash_splitq5_f16_hd128_facc(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__half, 128, 64, 64, 4, 1, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride);
 }
 
 __global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_win(

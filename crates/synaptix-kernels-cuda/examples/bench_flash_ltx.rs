@@ -12,6 +12,13 @@ fn sync() {
     synaptix_core::device::cuda::synchronize(0).unwrap();
 }
 
+fn bench_dt() -> DType {
+    match std::env::var("SYN_BENCH_DT").as_deref() {
+        Ok("f16") => DType::F16,
+        _ => DType::BF16,
+    }
+}
+
 fn mk(shape: Vec<usize>, dev: Device, seed_mul: f32) -> Tensor {
     Tensor::randn(shape, Device::Cpu)
         .unwrap()
@@ -19,7 +26,7 @@ fn mk(shape: Vec<usize>, dev: Device, seed_mul: f32) -> Tensor {
         .unwrap()
         .to_device(dev)
         .unwrap()
-        .to_dtype(DType::BF16)
+        .to_dtype(bench_dt())
         .unwrap()
 }
 
@@ -87,7 +94,8 @@ fn main() {
     let dt = t0.elapsed().as_secs_f64() / iters as f64;
     let flops = 4.0 * (h as f64) * (tq as f64) * (tkv as f64) * (hd as f64);
     println!(
-        "FLASH B=1 H={h} Tq={tq} Tkv={tkv} HD={hd} bf16: {:.2} ms  {:.1} TFLOP/s",
+        "FLASH B=1 H={h} Tq={tq} Tkv={tkv} HD={hd} {:?}: {:.2} ms  {:.1} TFLOP/s",
+        bench_dt(),
         dt * 1e3,
         flops / dt / 1e12
     );

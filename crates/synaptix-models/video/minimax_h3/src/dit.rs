@@ -240,6 +240,7 @@ impl Attention {
         rt: &RopeTables,
         out_dt: DType,
     ) -> R<Tensor> {
+        let attn_dt = if runtime::h3_attn_f16() { DType::F16 } else { out_dt };
         let inner = self.heads * self.head_dim;
         let q_norm = self.q_norm.to_dtype(DType::F32)?;
         let k_norm = self.k_norm.to_dtype(DType::F32)?;
@@ -247,13 +248,21 @@ impl Attention {
         let mut v_full: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
-            let k = self.k_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape.clone())?;
+            let k = self.k_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape.clone())?;
             let k = rms_norm(&k.to_dtype(DType::F32)?, &k_norm, self.eps)?;
-            let k = rt.apply_bshd_at(&k, *off).map_err(to_tensor_err)?.to_dtype(out_dt)?;
-            let v = self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape)?;
+            let k = rt.apply_bshd_at(&k, *off).map_err(to_tensor_err)?.to_dtype(attn_dt)?;
+            let v = if attn_dt == DType::F16 && out_dt != DType::F16 {
+                self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?
+                    .mul_scalar(1.0 / 16.0)?
+                    .clamp(-60000.0, 60000.0)?
+                    .to_dtype(DType::F16)?
+                    .reshape(shape)?
+            } else {
+                self.v_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape)?
+            };
             if k_full.is_none() {
-                k_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], out_dt, k.device())?);
-                v_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], out_dt, v.device())?);
+                k_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], attn_dt, k.device())?);
+                v_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], attn_dt, v.device())?);
             }
             k_full.as_mut().unwrap().copy_rows_from(*off, &k)?;
             v_full.as_mut().unwrap().copy_rows_from(*off, &v)?;
@@ -264,13 +273,19 @@ impl Attention {
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
-            let q = self.q_proj.0.forward_prequant(packed, scales, *n, out_dt)?.reshape(shape)?;
+            let q = self.q_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape)?;
             let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
-            let q = rt.apply_bshd_at(&q, *off).map_err(to_tensor_err)?.to_dtype(out_dt)?;
+            let q = rt.apply_bshd_at(&q, *off).map_err(to_tensor_err)?.to_dtype(attn_dt)?;
             let a = q.flash_attention_bshd(&k_full, &v_full, self.scale, false)?;
             drop(q);
             let y = self.out.forward(&a.reshape(vec![*n, inner])?)?;
             drop(a);
+            let y = if y.dtype() == out_dt { y } else { y.to_dtype(out_dt)? };
+            let y = if attn_dt == DType::F16 && out_dt != DType::F16 {
+                y.mul_scalar(16.0)?
+            } else {
+                y
+            };
             if res.is_none() {
                 res = Some(Tensor::zeros(vec![1, s, y.dims()[1]], y.dtype(), y.device())?);
             }
