@@ -414,6 +414,156 @@ pub fn build_adaln_cache(
     dit.build_adaln_cache(&prep.plan, ckpt, cache_dtype)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TwoStageParams {
+    pub refine_sigma: f64,
+    pub refine_steps: usize,
+}
+
+impl Default for TwoStageParams {
+    fn default() -> Self {
+        Self { refine_sigma: 0.85, refine_steps: 4 }
+    }
+}
+
+pub fn half_geometry(g: Geometry) -> Geometry {
+    let h2 = ((g.latent_h / 2) & !1).max(4);
+    let w2 = ((g.latent_w / 2) & !1).max(4);
+    Geometry {
+        width: w2 * (g.width / g.latent_w),
+        height: h2 * (g.height / g.latent_h),
+        latent_h: h2,
+        latent_w: w2,
+        ..g
+    }
+}
+
+fn resize_matrix(dst: usize, src: usize, device: Device) -> Result<Tensor, H3Error> {
+    let mut w = vec![0f32; dst * src];
+    for i in 0..dst {
+        let pos = (i as f32 + 0.5) * src as f32 / dst as f32 - 0.5;
+        let lo = pos.floor();
+        let frac = pos - lo;
+        let j0 = (lo as isize).clamp(0, src as isize - 1) as usize;
+        let j1 = ((lo as isize) + 1).clamp(0, src as isize - 1) as usize;
+        w[i * src + j0] += 1.0 - frac;
+        w[i * src + j1] += frac;
+    }
+    Ok(Tensor::from_vec(w, vec![dst, src], device)?)
+}
+
+pub fn resize_latent_bilinear(v: &Tensor, out_h: usize, out_w: usize) -> Result<Tensor, H3Error> {
+    let dims = v.dims().to_vec();
+    let (c, t, h, w) = (dims[1], dims[2], dims[3], dims[4]);
+    let dt = v.dtype();
+    let ww_t = resize_matrix(out_w, w, v.device())?.transpose(0, 1)?.contiguous()?;
+    let x = v
+        .to_dtype(DType::F32)?
+        .reshape(vec![c * t * h, w])?
+        .matmul(&ww_t)?;
+    let wh_t = resize_matrix(out_h, h, v.device())?.transpose(0, 1)?.contiguous()?;
+    let x = x
+        .reshape(vec![c * t, h, out_w])?
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape(vec![c * t * out_w, h])?
+        .matmul(&wh_t)?;
+    let x = x
+        .reshape(vec![c * t, out_w, out_h])?
+        .transpose(1, 2)?
+        .contiguous()?;
+    Ok(x.reshape(vec![1, c, t, out_h, out_w])?.to_dtype(dt)?)
+}
+
+pub fn denoise_av_two_stage(
+    dit: &H3Dit,
+    ckpt: &H3Checkpoint,
+    req: &DenoiseRequest<'_>,
+    sched: &H3Scheduler,
+    ts: &TwoStageParams,
+    cache_dtype: DType,
+    hooks: &DenoiseHooks<'_>,
+) -> Result<DenoiseOutput, H3Error> {
+    if !req.keyframes.is_empty()
+        || !req.refs.is_empty()
+        || req.cond_rows.video.is_some()
+        || req.cond_rows.audio.is_some()
+        || req.init_video.is_some()
+        || req.init_audio.is_some()
+    {
+        return Err(H3Error::Layout(
+            "двухстадийный денойз не поддерживает keyframes/refs/cond_rows/init".into(),
+        ));
+    }
+    let g_full = req.geometry;
+    let g_half = half_geometry(g_full);
+
+    let mut req1 = DenoiseRequest::new(g_half, req.cond);
+    req1.negative = req.negative;
+    req1.guider = req.guider;
+    req1.sampler = req.sampler;
+    req1.seed = req.seed;
+    req1.visual_cond_aug = req.visual_cond_aug;
+    req1.audio_cond_aug = req.audio_cond_aug;
+    let prep1 = prepare(dit, &req1, sched)?;
+    let cache1 = build_adaln_cache(dit, ckpt, &prep1, cache_dtype)?;
+    let out1 = denoise_av(dit, &cache1, &prep1, &req1, sched, hooks)?;
+    drop(cache1);
+    dump_tensor("ts_stage1_v", &out1.video_latent);
+
+    let v_up = resize_latent_bilinear(&out1.video_latent, g_full.latent_h, g_full.latent_w)?;
+    dump_tensor("ts_up_v", &v_up);
+
+    let sig_v = ts.refine_sigma.clamp(0.05, 0.95);
+    let sig_a = time_shift_sigma_pub(sig_v, sched.shift_video, sched.shift_audio);
+    let (nv, na) = init_latents(
+        g_full,
+        dit.cfg.latents_dim,
+        dit.cfg.audio_latents_dim,
+        dit.device(),
+        dit.compute_dtype(),
+        Some(req.seed.unwrap_or(0).wrapping_add(0x5157A6E)),
+    )?;
+    let v_init = v_up
+        .to_dtype(DType::F32)?
+        .mul_scalar(1.0 - sig_v as f32)?
+        .add(&nv.to_dtype(DType::F32)?.mul_scalar(sig_v as f32)?)?
+        .to_dtype(dit.compute_dtype())?;
+    let a_init = out1
+        .audio_latent
+        .to_dtype(DType::F32)?
+        .mul_scalar(1.0 - sig_a as f32)?
+        .add(&na.to_dtype(DType::F32)?.mul_scalar(sig_a as f32)?)?
+        .to_dtype(dit.compute_dtype())?;
+
+    let base_start = crate::scheduler::unshift_sigma(sig_v, sched.shift_video);
+    let n2 = ts.refine_steps.max(1);
+    let sigmas2: Vec<f64> = (0..=n2)
+        .map(|i| {
+            let b = base_start * (1.0 - i as f64 / n2 as f64);
+            crate::scheduler::shift_sigma(b, sched.shift_video)
+        })
+        .collect();
+    let sched2 = H3Scheduler::from_sigmas(sigmas2, sched.shift_video, sched.shift_audio);
+
+    let mut req2 = DenoiseRequest::new(g_full, req.cond);
+    req2.negative = req.negative;
+    req2.guider = req.guider;
+    req2.sampler = req.sampler;
+    req2.seed = req.seed;
+    req2.init_video = Some(v_init);
+    req2.init_audio = Some(a_init);
+    req2.visual_cond_aug = req.visual_cond_aug;
+    req2.audio_cond_aug = req.audio_cond_aug;
+    let prep2 = prepare(dit, &req2, &sched2)?;
+    let cache2 = build_adaln_cache(dit, ckpt, &prep2, cache_dtype)?;
+    denoise_av(dit, &cache2, &prep2, &req2, &sched2, hooks)
+}
+
+fn time_shift_sigma_pub(sigma: f64, from: f64, to: f64) -> f64 {
+    crate::scheduler::time_shift_sigma(sigma, from, to)
+}
+
 pub fn init_latents(
     geometry: Geometry,
     latents_dim: usize,
