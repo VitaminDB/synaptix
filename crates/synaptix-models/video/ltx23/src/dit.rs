@@ -270,7 +270,7 @@ impl Lin {
                         let sc0 = m0 * sc_row;
                         let sc_len = (mc.div_ceil(128) * 128 * sc_row).min(sc_total - sc0);
                         let sc_sl = scales.narrow(0, sc0, sc_len)?.contiguous()?;
-                        let y = p_sl.linear_quant_prequant(&sc_sl, w, mc)?;
+                        let y = p_sl.linear_quant_prequant(&sc_sl, w, mc, DType::F16)?;
                         let y = if out_dt == DType::F16 { y } else { y.to_dtype(out_dt)? };
                         let y = match bias {
                             Some(b) => y.broadcast_add(b)?,
@@ -290,7 +290,7 @@ impl Lin {
                     let n_out = out.dims()[2];
                     return Ok(out.reshape(vec![m, n_out])?);
                 }
-                let y = packed.linear_quant_prequant(scales, w, m)?;
+                let y = packed.linear_quant_prequant(scales, w, m, DType::F16)?;
                 let y = if out_dt == DType::F16 { y } else { y.to_dtype(out_dt)? };
                 match bias {
                     Some(b) => y.broadcast_add(b),

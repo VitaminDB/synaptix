@@ -1044,6 +1044,53 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn silu_mul_quant_nvfp4(
+        &self,
+        x: (&Storage, &Layout),
+        packed_out: (&mut Storage, &Layout),
+        scales_out: (&mut Storage, &Layout),
+        m: usize,
+        k: usize,
+        inv_pre: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (x_st, x_lo) = x;
+        if !x_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let x_buf = x_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: x non-cuda"))?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let quant_k = match x_lo.dtype() {
+            DType::F16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: dtype")),
+        };
+        let p_buf = packed_out
+            .0
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: packed non-cuda"))?;
+        let p_slice = p_buf.slice_mut();
+        let s_buf = scales_out
+            .0
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: scales non-cuda"))?;
+        crate::elementwise::quant::silu_mul_quantize_nvfp4_u8(
+            &quant_k,
+            &stream,
+            x_buf.slice(),
+            x_lo.byte_offset(),
+            p_slice,
+            s_buf.slice_mut(),
+            m as u32,
+            k as u32,
+            inv_pre,
+        )
+    }
+
     fn rms_mod_quant_nvfp4(
         &self,
         x: (&Storage, &Layout),
@@ -1285,13 +1332,22 @@ impl Backend for CudaBackend {
             .0
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("linear_quant_prequant: out non-cuda"))?;
+        let out_bf16 = out.1.dtype() == DType::BF16;
         match w.dtype() {
             DType::NVFP4 => {
-                let gemm_k =
-                    crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context(&ctx)?;
-                let gemv_k =
-                    crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?;
-                let quant_k = crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?;
+                let (gemm_k, gemv_k, quant_k) = if out_bf16 {
+                    (
+                        crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context_bf16(&ctx)?,
+                        crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context_bf16(&ctx)?,
+                        crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+                    )
+                } else {
+                    (
+                        crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context(&ctx)?,
+                        crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?,
+                        crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+                    )
+                };
                 crate::gemm::dispatch::nvfp4_linear_f16(
                     &gemm_k,
                     &gemv_k,
@@ -1303,10 +1359,13 @@ impl Backend for CudaBackend {
                     out_buf.slice_mut(),
                     w,
                     m as u32,
-                    false,
+                    out_bf16,
                     Some((p_buf.slice(), s_buf.slice())),
                 )?;
                 Ok(())
+            }
+            DType::MXFP8 if out_bf16 => {
+                Err(SynaptixError::Unsupported("linear_quant_prequant MXFP8: BF16-выход не поддержан"))
             }
             DType::MXFP8 => crate::gemm::dispatch::mxfp8_linear_prequant(
                 &ctx,

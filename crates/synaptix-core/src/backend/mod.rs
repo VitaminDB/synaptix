@@ -211,6 +211,19 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("nvfp4_quantize_act не поддержан этим backend"))
     }
 
+    fn silu_mul_quant_nvfp4(
+        &self,
+        _x: (&Storage, &Layout),
+        _packed_out: (&mut Storage, &Layout),
+        _scales_out: (&mut Storage, &Layout),
+        _m: usize,
+        _k: usize,
+        _inv_pre: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4 не поддержан этим backend"))
+    }
+
     /// Fused ternary elementwise: kind 0 = gated-residual `out=x+b*c` (формы
     /// равны), 1 = то же с `c`-строкой `[D]`, 2 = adaLN-мод `out=x*(1+b)+c`
     /// (`b`/`c` строки `[D]`). Раунды повторяют decomposed → бит-в-бит.

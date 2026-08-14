@@ -35,6 +35,7 @@ pub struct Nvfp4QuantKernels {
     _module: Arc<CudaModule>,
     quantize_f16_to_nvfp4: CudaFunction,
     quantize_f16_to_nvfp4_fast: CudaFunction,
+    silu_mul_quantize_nvfp4_fast: CudaFunction,
     nvfp4_dequant_f16: CudaFunction,
 }
 
@@ -75,6 +76,7 @@ impl Nvfp4QuantKernels {
         let new = Arc::new(Self {
             quantize_f16_to_nvfp4: load_fn(&module, "quantize_f16_to_nvfp4")?,
             quantize_f16_to_nvfp4_fast: load_fn(&module, "quantize_f16_to_nvfp4_fast")?,
+            silu_mul_quantize_nvfp4_fast: load_fn(&module, "silu_mul_quantize_nvfp4_fast")?,
             nvfp4_dequant_f16: load_fn(&module, "nvfp4_dequant_f16")?,
             _module: module,
         });
@@ -197,6 +199,54 @@ pub fn quantize_f16_to_nvfp4_view(
                 .map_err(|e| SynaptixError::Cuda(format!("launch quantize_nvfp4: {e:?}")))?;
         }
         outer_offset += rows_this;
+    }
+    Ok(())
+}
+
+pub fn silu_mul_quantize_nvfp4_u8(
+    kernels: &Nvfp4QuantKernels,
+    stream: &Arc<CudaStream>,
+    x: &CudaSlice<u8>,
+    x_off_bytes: usize,
+    packed: &mut CudaSlice<u8>,
+    scales_e4m3: &mut CudaSlice<u8>,
+    outer_dim: u32,
+    inner_dim: u32,
+    inv_pre: f32,
+) -> Result<()> {
+    if inner_dim % 16 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "silu_mul_quantize_nvfp4: inner_dim={inner_dim} must be multiple of 16"
+        )));
+    }
+    let n = (outer_dim as usize) * (inner_dim as usize) * 2;
+    let x_v = unsafe {
+        x.slice(x_off_bytes..x_off_bytes + n * 2)
+            .transmute::<f16>(n)
+            .ok_or_else(|| SynaptixError::Cuda("silu_mul_quantize_nvfp4: transmute x".into()))?
+    };
+    let num_blocks_per_row = inner_dim / 16;
+    let sf_inner_dim = inner_dim.div_ceil(64) * 4;
+    let outer_cov = outer_dim.div_ceil(128) * 128;
+    let total = (outer_cov as u64) * (num_blocks_per_row as u64);
+    let blocks = total.div_ceil(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&kernels.silu_mul_quantize_nvfp4_fast);
+    b.arg(&x_v)
+        .arg(&mut *packed)
+        .arg(&mut *scales_e4m3)
+        .arg(&outer_dim)
+        .arg(&inner_dim)
+        .arg(&sf_inner_dim)
+        .arg(&outer_cov)
+        .arg(&inv_pre);
+    unsafe {
+        b.launch(cfg)
+            .map_err(|e| SynaptixError::Cuda(format!("launch silu_mul_quantize_nvfp4: {e:?}")))?;
     }
     Ok(())
 }
