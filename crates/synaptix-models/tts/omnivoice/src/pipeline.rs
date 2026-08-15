@@ -65,7 +65,13 @@ impl OmniVoicePipeline {
 
         let tok_bytes = bundle
             .read_file("tokenizer.json")
-            .map_err(|e| OmniVoiceError::Bundle(format!("tokenizer.json: {e}")))?;
+            .map_err(|e| {
+                OmniVoiceError::Bundle(format!(
+                    "tokenizer.json: {e} — бандл `{}` не похож на модель OmniVoice \
+                     (выберите OmniVoice `.syn`, например omnivoice.syn)",
+                    bundle.id()
+                ))
+            })?;
         let text = TextFrontend::from_tokenizer_bytes(
             &tok_bytes,
             cfg.num_audio_codebook,
