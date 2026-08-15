@@ -76,7 +76,13 @@ impl GigaAmWeights {
             .into_owned();
         let tokenizer_model = bundle
             .read_file("tokenizer.model")
-            .map_err(|e| GigaAmError::Bundle(format!("tokenizer.model: {e}")))?
+            .map_err(|e| {
+                GigaAmError::Bundle(format!(
+                    "tokenizer.model: {e} — бандл `{}` не похож на модель GigaAM \
+                     (выберите GigaAM `.syn`, например gigaam-v3.syn)",
+                    bundle.id()
+                ))
+            })?
             .into_owned();
         let config = GigaAmConfig::from_json_bytes(&config_bytes)?;
 
