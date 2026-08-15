@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod rope;
 pub mod runtime;
 pub mod scheduler;
+pub mod source;
 pub mod spec;
 pub mod text_encoder;
 pub mod vae;
@@ -17,6 +18,7 @@ pub mod vae;
 pub use config::{AudioVaeConfig, H3Config, H3Variant, VaeConfig};
 pub use layout::{PackedLayout, SegmentKind};
 pub use loader::{H3Checkpoint, H3Paths, LoraWeights};
+pub use source::{H3Component, H3EncoderSource, H3Source};
 pub use memory::H3MemoryMode;
 pub use scheduler::{time_shift_sigma, H3Scheduler};
 

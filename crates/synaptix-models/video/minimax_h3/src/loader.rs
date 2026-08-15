@@ -6,6 +6,7 @@ use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader, TensorIn
 use synaptix_io::weights::WeightLoader;
 
 use crate::config::{AudioVaeConfig, H3Config, H3Variant, VaeConfig};
+use crate::source::{H3Component, H3Source};
 use crate::H3Error;
 
 #[derive(Debug, Clone)]
@@ -149,7 +150,7 @@ impl LoraWeights {
 pub struct H3Checkpoint {
     loader: SafetensorsLoader,
     pub config: H3Config,
-    pub paths: H3Paths,
+    pub source: H3Source,
     device: Device,
     dtype: DType,
     lora: Option<Arc<LoraWeights>>,
@@ -157,19 +158,22 @@ pub struct H3Checkpoint {
 
 impl H3Checkpoint {
     pub fn open(paths: H3Paths, device: Device, dtype: DType) -> Result<Self, H3Error> {
-        let config = H3Config::from_dir(&paths.root)?;
-        let dir = paths.transformer_dir();
-        let shards = scan_shards(&dir).map_err(|e| H3Error::Load(format!("{}: {e}", dir.display())))?;
-        if shards.is_empty() {
-            return Err(H3Error::Load(format!("нет safetensors в {}", dir.display())));
-        }
-        let loader = SafetensorsLoader::open_sharded(&shards)
-            .map_err(|e| H3Error::Load(e.to_string()))?
-            .with_device(device);
-        Ok(Self { loader, config, paths, device, dtype, lora: None })
+        Self::open_source(H3Source::Dir { root: paths.root, variant: paths.variant }, device, dtype)
+    }
+
+    /// Открыть DiT из каталога либо `.syn`-бандла — веса берутся из компонента
+    /// `transformer` (в бандле — zero-copy срез mmap, без распаковки).
+    pub fn open_source(source: H3Source, device: Device, dtype: DType) -> Result<Self, H3Error> {
+        let config = H3Config::from_source(&source)?;
+        let loader = source.loader(H3Component::Transformer, device)?;
+        Ok(Self { loader, config, source, device, dtype, lora: None })
     }
 
     pub fn open_root(root: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, H3Error> {
+        let root = root.as_ref();
+        if root.is_file() {
+            return Self::open_source(H3Source::open_bundle(root, H3Variant::Fl2va)?, device, dtype);
+        }
         Self::open(H3Paths::open(root)?, device, dtype)
     }
 
@@ -242,7 +246,7 @@ impl H3Checkpoint {
         Self {
             loader: self.loader.clone_with_device(device),
             config: self.config.clone(),
-            paths: self.paths.clone(),
+            source: self.source.clone(),
             device,
             dtype: self.dtype,
             lora: self.lora.clone(),
@@ -257,12 +261,16 @@ impl H3Checkpoint {
         self.loader.raw_bytes(name)
     }
 
+    pub fn source(&self) -> &H3Source {
+        &self.source
+    }
+
     pub fn vae_config(&self) -> Result<VaeConfig, H3Error> {
-        VaeConfig::from_dir(&self.paths.root)
+        VaeConfig::from_source(&self.source)
     }
 
     pub fn audio_vae_config(&self) -> Result<AudioVaeConfig, H3Error> {
-        AudioVaeConfig::from_dir(&self.paths.root)
+        AudioVaeConfig::from_source(&self.source)
     }
 }
 
@@ -280,6 +288,16 @@ impl ComponentLoader {
         let loader = SafetensorsLoader::open(path)
             .map_err(|e| H3Error::Load(e.to_string()))?
             .with_device(device);
+        Ok(Self { loader, device })
+    }
+
+    /// Подмодель (VAE / audio-VAE / энкодер) из каталога или `.syn`-бандла.
+    pub fn open_component(
+        source: &H3Source,
+        component: H3Component,
+        device: Device,
+    ) -> Result<Self, H3Error> {
+        let loader = source.loader(component, device)?;
         Ok(Self { loader, device })
     }
 
