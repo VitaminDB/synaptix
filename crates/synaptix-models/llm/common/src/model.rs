@@ -1743,13 +1743,7 @@ impl LinearAttn {
             && matches!(compute, DType::F16 | DType::BF16 | DType::F32)
         {
             if s <= SMALL_CHUNK_DEV && compute == DType::F16 && self.norm_w_f16.is_some() {
-                let mut parts = Vec::with_capacity(s);
-                for t in 0..s {
-                    let ht = h.narrow(1, t, 1).coerr()?.contiguous().coerr()?;
-                    parts.push(self.forward_decode_dev(&ht, cache)?);
-                }
-                let refs: Vec<&Tensor> = parts.iter().collect();
-                return Tensor::cat(&refs, 1).coerr();
+                return self.forward_small_batch_dev(h, cache, s);
             }
             let state = match cache {
                 LayerCache::Linear(s) => s,
@@ -1995,17 +1989,89 @@ impl LinearAttn {
         if s == 0 || s > SMALL_CHUNK_DEV || compute != DType::F16 || self.norm_w_f16.is_none() {
             return Ok(None);
         }
+        Ok(Some(self.forward_small_batch_dev(h, cache, s)?))
+    }
+
+    /// s <= SMALL_CHUNK_DEV токенов одним проходом: проекции (in_qkv/a/b/z) и
+    /// out_proj — батчем M=s (веса читаются ОДИН раз, а не s раз, как в старом
+    /// цикле полных decode-шагов), рекуррентное ядро (conv1d-update +
+    /// gated-delta-rule + RmsNormGated) — последовательно по токенам: оно
+    /// state-зависимо, но весов не читает. Для MTP verify (s=2) это убирает
+    /// ~2× чтение весов linear-слоёв (~3 ГБ/шаг на 27B).
+    /// SYN_LA_SMALLBATCH=0 возвращает старый цикл (A/B: нумерика M=2-GEMM
+    /// слегка отличается от GEMV и меняет greedy-траекторию).
+    fn forward_small_batch_dev(
+        &self,
+        h: &Tensor,
+        cache: &mut LayerCache,
+        s: usize,
+    ) -> Result<Tensor, ModelError> {
+        if s > 1 && !small_batch_on() {
+            let mut parts = Vec::with_capacity(s);
+            for t in 0..s {
+                let ht = h.narrow(1, t, 1).coerr()?.contiguous().coerr()?;
+                parts.push(self.forward_decode_dev(&ht, cache)?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            return Tensor::cat(&refs, 1).coerr();
+        }
+        let state = match cache {
+            LayerCache::Linear(st) => st,
+            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+        };
+        let conv_w = self.conv_w_dev.as_ref().ok_or_else(|| missing("conv_w_dev"))?;
+        let a_log = self.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
+        let dt_bias = self.dt_bias_dev.as_ref().ok_or_else(|| missing("dt_bias_dev"))?;
+        let norm_w = self.norm_w_f16.as_ref().ok_or_else(|| missing("norm_w_f16"))?;
+        if state.conv_state_dev.is_none() || state.ssm_state_dev.is_none() {
+            state
+                .sync_to_device(h.device(), self.conv_dim, self.conv_k, self.num_v_heads, self.dk, self.dv)
+                .coerr()?;
+        }
+        let cs = state.conv_state_dev.as_mut().ok_or_else(|| missing("conv_state_dev (sync_to_device?)"))?;
+        let ss = state.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev (sync_to_device?)"))?;
+
+        let dev = h.device();
+        let act = quant_act_shared(h);
+        let qkv = proj_shared(&self.in_proj_qkv, h, &act, dev, "lin_in_qkv")?;
+        let a = prof(dev, "lin_in_a", || self.in_proj_a.forward(h))?;
+        let b = prof(dev, "lin_in_b", || self.in_proj_b.forward(h))?;
+        let z = proj_shared(&self.in_proj_z, h, &act, dev, "lin_in_z")?;
+
         let mut parts = Vec::with_capacity(s);
         for t in 0..s {
-            let ht = h.narrow(1, t, 1).coerr()?.contiguous().coerr()?;
-            parts.push(self.forward_decode_dev(&ht, cache)?);
+            let sl = |x: &Tensor| -> Result<Tensor, ModelError> {
+                x.narrow(1, t, 1).coerr()?.contiguous().coerr()
+            };
+            let (qkv_t, a_t, b_t, z_t) = (sl(&qkv)?, sl(&a)?, sl(&b)?, sl(&z)?);
+            let out_t = prof(dev, "lin_gdr_step", || qkv_t
+                .linear_attn_decode_step(
+                    conv_w, &a_t, &b_t, dt_bias, a_log, &z_t, norm_w, cs, ss,
+                    self.num_k_heads, self.num_v_heads, self.dk, self.dv, self.conv_k,
+                    self.q_scale, self.rms_eps,
+                ))
+                .coerr()?;
+            parts.push(out_t.reshape(vec![1usize, 1, self.value_dim]).coerr()?);
         }
-        let refs: Vec<&Tensor> = parts.iter().collect();
-        Ok(Some(Tensor::cat(&refs, 1).coerr()?))
+        let normed = if s == 1 {
+            parts.pop().expect("s >= 1")
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 1).coerr()?
+        };
+        prof(dev, "lin_oproj", || self.out_proj.forward(&normed))
     }
 }
 
 const SMALL_CHUNK_DEV: usize = 8;
+
+/// Батчевые проекции в small-s пути linear-attn (см.
+/// `forward_small_batch_dev`). Дефолт ВКЛ; SYN_LA_SMALLBATCH=0 — старый
+/// потокенный цикл (для A/B-сравнений нумерики/скорости).
+fn small_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_LA_SMALLBATCH").as_deref() != Ok("0"))
+}
 
 fn missing(what: &str) -> ModelError {
     ModelError::Forward(format!("forward_decode_dev: {what} не инициализирован"))

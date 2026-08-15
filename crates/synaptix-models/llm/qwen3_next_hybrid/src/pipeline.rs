@@ -13,6 +13,20 @@ use crate::model::{DecoderModel, ModelError};
 
 pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink};
 
+/// Дефолтный chunk префилла гибрида. Ограничивает пик VRAM активаций
+/// (single-shot M>=512 не влезает в 24 ГБ поверх ~18 ГБ весов) при скорости
+/// ~1.6k ток/с (M=256 уже насыщает NVFP4-GEMM'ы).
+pub const DEFAULT_PREFILL_CHUNK: usize = 256;
+
+/// Границы чанков ОБЯЗАНЫ быть кратны CS=64 GDN-скана: не-кратный разрез
+/// mid-stream оставляет состояние частичного внутреннего чанка, расходящееся
+/// с single-shot (проверено prefill_chunk_divergence: 64/128/256 bit-exact,
+/// 47/73/100 — max_abs_diff ~2.5-3.0). 0 → дефолт; иное — округление к 64.
+fn effective_prefill_chunk(requested: usize) -> usize {
+    let c = if requested == 0 { DEFAULT_PREFILL_CHUNK } else { requested };
+    (c.max(64) / 64) * 64
+}
+
 pub struct HybridPipeline {
     pub model: DecoderModel,
     pub mtp: Option<synaptix_llm_common::mtp::MtpModule>,
@@ -516,6 +530,7 @@ impl HybridPipeline {
             .alloc_linear_snapshot()
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
 
+        let mut mprof = MtpProf::new(device);
         let dec_t0 = std::time::Instant::now();
         while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
             let pos = kv.seq_len;
@@ -562,11 +577,14 @@ impl HybridPipeline {
             let (second, was_draft) = match forced.take() {
                 Some(t) => (t, false),
                 None => {
+                    mprof.begin();
                     let next = Tensor::from_vec(vec![cur], vec![1usize, 1], device)
                         .map_err(|e| PipelineError::Forward(e.to_string()))?;
                     let dl = no_grad(|| mtp.draft_logits(&self.model, &h_prev, &next, &mut mtp_kv))
                         .map_err(|e| PipelineError::Forward(format!("mtp draft: {e}")))?;
                     stats.drafted += 1;
+                    mprof.end("draft");
+                    mprof.begin();
                     let tok = if stochastic {
                         let q = sampler.probs(&dl).map_err(PipelineError::from)?;
                         let t = sampler.sample_from_probs(&q);
@@ -575,17 +593,21 @@ impl HybridPipeline {
                     } else {
                         argmax(&dl)?
                     };
+                    mprof.end("draft_sample");
                     (tok, true)
                 }
             };
             stats.steps += 1;
 
             if was_draft {
+                mprof.begin();
                 kv.save_linear_into(&mut snap_buf)
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                mprof.end("snapshot");
             }
             let seq_before = kv.seq_len;
 
+            mprof.begin();
             let step = {
                 {
                     match graph_ctx.as_mut() {
@@ -594,6 +616,8 @@ impl HybridPipeline {
                     }
                 }
             };
+            mprof.end("verify");
+            mprof.begin();
             let (a, draft_accepted) = if !was_draft {
                 (second, false)
             } else if stochastic {
@@ -630,18 +654,23 @@ impl HybridPipeline {
                 let acc = a == second;
                 (a, acc)
             };
+            mprof.end("accept_sample");
 
+            mprof.begin();
             let fill = Tensor::from_vec(vec![a], vec![1usize, 1], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             no_grad(|| mtp.advance(&self.model, &step.hidden0, &fill, &mut mtp_kv))
                 .map_err(|e| PipelineError::Forward(format!("mtp advance: {e}")))?;
+            mprof.end("advance");
 
             if !was_draft {
+                mprof.begin();
                 let b = if stochastic {
                     sampler.sample(&step.logits1).map_err(PipelineError::from)?
                 } else {
                     argmax(&step.logits1)?
                 };
+                mprof.end("emit_sample");
                 out.push(b);
                 cancelled = !sink.on_token(b);
                 h_prev = step.hidden1;
@@ -658,23 +687,28 @@ impl HybridPipeline {
                     cur = a;
                     continue;
                 }
+                mprof.begin();
                 let b = if stochastic {
                     sampler.sample(&step.logits1).map_err(PipelineError::from)?
                 } else {
                     argmax(&step.logits1)?
                 };
+                mprof.end("emit_sample");
                 out.push(b);
                 cancelled = !sink.on_token(b);
                 h_prev = step.hidden1;
                 cur = b;
             } else {
+                mprof.begin();
                 kv.restore_linear(&snap_buf)
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
                 kv.seq_len = seq_before;
+                mprof.end("restore");
                 forced = Some(a);
             }
         }
         let decode_ms = dec_t0.elapsed().as_millis();
+        mprof.report();
 
         let stats_gen = GenerationStats {
             prompt_tokens: l,
@@ -715,6 +749,7 @@ impl HybridPipeline {
         if cfg.eos_token_id.is_none() && cfg.eos_token_ids.is_empty() {
             cfg.eos_token_ids = self.config.eos_ids();
         }
+        cfg.prefill_batch = effective_prefill_chunk(cfg.prefill_batch);
         cfg
     }
 
@@ -848,10 +883,9 @@ impl HybridPipeline {
         // иначе длинный первый prefill упирается в VRAM. Стейт linear/conv и KV
         // переносятся между чанками внутри одного `kv`. Берём логиты последнего чанка.
         let suffix = &prompt_ids[prefix..];
-        // КОРРЕКТНОСТЬ: prefill_batch=0 → single-shot (весь промпт за один forward),
-        // как документировано. Чанкование (>1 чанк) сейчас НЕ bit-exact к single
-        // (теряет ранний контекст — known chunked-prefill баг), поэтому дефолт = весь
-        // промпт. --prefill-batch (gen_cfg.prefill_batch) — для перф-тестов large-M.
+        // prepare_cfg гарантирует prefill_batch > 0 и кратность 64 (границы
+        // чанков на не-кратных CS=64 позициях ломают состояние GDN-скана; на
+        // кратных чанкование bit-exact к single-shot — prefill_chunk_divergence).
         let chunk = if gen_cfg.prefill_batch > 0 {
             gen_cfg.prefill_batch
         } else {
@@ -970,6 +1004,69 @@ struct VerifyStep {
     logits1: synaptix_core::tensor::Tensor,
     hidden0: synaptix_core::tensor::Tensor,
     hidden1: synaptix_core::tensor::Tensor,
+}
+
+/// Пофазный профиль MTP-цикла (SYN_MTP_PROF=1): draft / snapshot / verify /
+/// sample / advance / restore, с device-sync на границах фаз. Перф-инструмент,
+/// в проде выключен (env не выставлен → нулевые накладные).
+struct MtpProf {
+    on: bool,
+    ord: Option<usize>,
+    t0: std::time::Instant,
+    acc: std::collections::BTreeMap<&'static str, (f64, u64)>,
+}
+
+impl MtpProf {
+    fn new(device: Device) -> Self {
+        let on = std::env::var("SYN_MTP_PROF").as_deref() == Ok("1");
+        let ord = match device {
+            Device::Cuda(o) if on => Some(o),
+            _ => None,
+        };
+        Self { on, ord, t0: std::time::Instant::now(), acc: Default::default() }
+    }
+
+    fn sync(&self) {
+        if let Some(o) = self.ord {
+            let _ = synaptix_core::device::cuda::synchronize(o);
+        }
+    }
+
+    fn begin(&mut self) {
+        if !self.on {
+            return;
+        }
+        self.sync();
+        self.t0 = std::time::Instant::now();
+    }
+
+    fn end(&mut self, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        self.sync();
+        let dt = self.t0.elapsed().as_secs_f64() * 1000.0;
+        let e = self.acc.entry(name).or_insert((0.0, 0));
+        e.0 += dt;
+        e.1 += 1;
+    }
+
+    fn report(&self) {
+        if !self.on {
+            return;
+        }
+        let total: f64 = self.acc.values().map(|(t, _)| t).sum();
+        let mut lines: Vec<_> = self.acc.iter().collect();
+        lines.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        eprintln!("=== MTP loop breakdown (synced, {total:.1} ms) ===");
+        for (k, (t, c)) in lines {
+            eprintln!(
+                "  {k:12} {t:9.2} ms  {:5.1}%  ({c} шагов, {:.3} ms/шаг)",
+                100.0 * t / total.max(1e-9),
+                t / *c as f64
+            );
+        }
+    }
 }
 
 pub struct MtpGraph {

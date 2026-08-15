@@ -36,9 +36,12 @@ fn prefill_logits(pipe: &HybridPipeline, ids: &[u32], chunk: usize) -> Vec<f32> 
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: MODEL.syn [T] [chunk]");
+    let path = args.next().expect("usage: MODEL.syn [T] [chunk] [ref_chunk]");
     let target: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(827);
     let chunk: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(512);
+    // Референс: 0/отсутствует → single-shot; иначе — чанкованный prefill с этим
+    // размером (для T, где single-shot не влезает в VRAM: чанк-vs-чанк).
+    let ref_chunk: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
@@ -56,8 +59,9 @@ fn main() {
     let ids = pipe.encode(&s).unwrap();
     eprintln!("T={} токенов, chunk={chunk} (→ {} чанков)\n", ids.len(), ids.len().div_ceil(chunk));
 
-    let single = prefill_logits(&pipe, &ids, ids.len() + 16); // один чанк
-    let single2 = prefill_logits(&pipe, &ids, ids.len() + 16); // ТОТ ЖЕ путь повторно (детерминизм?)
+    let ref_sz = if ref_chunk == 0 { ids.len() + 16 } else { ref_chunk };
+    let single = prefill_logits(&pipe, &ids, ref_sz); // референс (single или ref_chunk)
+    let single2 = prefill_logits(&pipe, &ids, ref_sz); // ТОТ ЖЕ путь повторно (детерминизм?)
     let chunked = prefill_logits(&pipe, &ids, chunk);          // chunked
     {
         let m = single.iter().zip(&single2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
