@@ -144,7 +144,9 @@ impl TtsPipeline {
                     .inner
                     .create_voice_clone_prompt(&p.audio_path, ref_text)
                     .map_err(map_err)?;
-                self.inner.generate_clone(text, &vcp, &gen).map_err(map_err)
+                self.inner
+                    .generate_clone_styled(text, &vcp, speed, &gen)
+                    .map_err(map_err)
             }
             GenerationMode::Design { instruct } => self
                 .inner
