@@ -421,8 +421,15 @@ impl HybridPipeline {
             .model
             .make_kv_cache(1, kv_max)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        // mtp_kv растёт быстрее основного kv: +1 на draft и +1 на advance за шаг,
+        // а rollback отклонённого драфта основного kv его не откатывает — до
+        // 2×max_new_tokens сверх префилла. Тесный kv_max (l+max_new+2)
+        // переполнялся к концу генерации без явного --max-seq. Выше RoPE-ёмкости
+        // MTP-модуля аллоцировать нельзя — при исчерпании кэша цикл ниже
+        // доработает остаток обычным decode.
+        let mtp_cap = (kv_max + cfg.max_new_tokens + 2).min(mtp.rope_capacity());
         let mut mtp_kv = mtp
-            .make_kv_cache(1, kv_max)
+            .make_kv_cache(1, mtp_cap)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
 
         let argmax = |t: &Tensor| -> Result<u32, PipelineError> {
@@ -513,6 +520,43 @@ impl HybridPipeline {
         while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
             let pos = kv.seq_len;
             if pos + 2 > kv.max_seq {
+                break;
+            }
+            // MTP-кэш исчерпан (draft+advance добавляют 1-2 слота за шаг и не
+            // откатываются при reject) — дорабатываем остаток обычным
+            // autoregressive decode на основном kv, MTP больше не трогаем.
+            let mtp_need = if forced.is_some() { 1 } else { 2 };
+            if mtp_kv.seq_len + mtp_need > mtp_kv.max_seq {
+                // Отложенный forced-токен уже эмитирован (push при reject), но в
+                // kv ещё не проведён — прогоняем [cur, forced] без повторного
+                // emit и продолжаем с него.
+                if let Some(second) = forced.take() {
+                    if pos + 2 > kv.max_seq {
+                        break;
+                    }
+                    let chunk = Tensor::from_vec(vec![cur, second], vec![1usize, 2], device)
+                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    let _ = no_grad(|| self.model.forward(&chunk, &mut kv))
+                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    cur = second;
+                }
+                while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
+                    if kv.seq_len >= kv.max_seq {
+                        break;
+                    }
+                    let t = Tensor::from_vec(vec![cur], vec![1usize, 1], device)
+                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    let logits = no_grad(|| self.model.forward(&t, &mut kv))
+                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    let tok = if stochastic {
+                        sampler.sample(&logits).map_err(PipelineError::from)?
+                    } else {
+                        argmax(&logits)?
+                    };
+                    out.push(tok);
+                    cancelled = !sink.on_token(tok);
+                    cur = tok;
+                }
                 break;
             }
             let (second, was_draft) = match forced.take() {

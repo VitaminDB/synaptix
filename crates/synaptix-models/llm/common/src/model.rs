@@ -1922,6 +1922,14 @@ impl LinearAttn {
         let a_log = self.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
         let dt_bias = self.dt_bias_dev.as_ref().ok_or_else(|| missing("dt_bias_dev"))?;
         let norm_w = self.norm_w_f16.as_ref().ok_or_else(|| missing("norm_w_f16"))?;
+        // Свежий KV (короткий s<=SMALL_CHUNK_DEV префилл идёт этим же путём) —
+        // зеркала ещё не созданы: засеять из host-векторов (нулевое состояние).
+        // Существующие зеркала не трогаем: во время decode host отстаёт от dev.
+        if state.conv_state_dev.is_none() || state.ssm_state_dev.is_none() {
+            state
+                .sync_to_device(h.device(), self.conv_dim, self.conv_k, self.num_v_heads, self.dk, self.dv)
+                .coerr()?;
+        }
         let cs = state.conv_state_dev.as_mut().ok_or_else(|| missing("conv_state_dev (sync_to_device?)"))?;
         let ss = state.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev (sync_to_device?)"))?;
 
