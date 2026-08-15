@@ -277,26 +277,41 @@ impl OmniVoicePipeline {
     }
 
     /// Оценка числа target-токенов voice-clone (порт `_estimate_target_tokens` с
-    /// реальным ref_text/num_ref из промпта).
+    /// реальным ref_text/num_ref из промпта). `speed` > 1.0 — быстрее (короче),
+    /// < 1.0 — медленнее; upstream передаёт его и в clone-путь.
     pub fn estimate_target_tokens_clone(
         &self,
         text: &str,
         prompt: &VoiceClonePrompt,
+        speed: f64,
     ) -> usize {
         let num_ref = prompt.ref_audio_tokens.dims()[prompt.ref_audio_tokens.dims().len() - 1];
         self.duration
-            .estimate_target_tokens(text, Some(&prompt.ref_text), Some(num_ref), 1.0)
+            .estimate_target_tokens(text, Some(&prompt.ref_text), Some(num_ref), speed)
     }
 
     /// Voice-clone e2e: текст → волна 24кГц с клон-голосом из `prompt`.
     /// `target_len` оценивается duration-estimator'ом с учётом ref.
+    /// = `generate_clone_styled(text, prompt, 1.0, gen)`.
     pub fn generate_clone(
         &self,
         text: &str,
         prompt: &VoiceClonePrompt,
         gen: &OmniVoiceGenerationConfig,
     ) -> Result<Vec<f32>> {
-        let target_len = self.estimate_target_tokens_clone(text, prompt);
+        self.generate_clone_styled(text, prompt, 1.0, gen)
+    }
+
+    /// Voice-clone e2e со скоростью речи: `speed` масштабирует duration-оценку
+    /// (est /= speed), как `generate_styled` в auto/design-режиме.
+    pub fn generate_clone_styled(
+        &self,
+        text: &str,
+        prompt: &VoiceClonePrompt,
+        speed: f64,
+        gen: &OmniVoiceGenerationConfig,
+    ) -> Result<Vec<f32>> {
+        let target_len = self.estimate_target_tokens_clone(text, prompt, speed);
         self.generate_clone_with_target(
             text,
             &prompt.ref_audio_tokens,
