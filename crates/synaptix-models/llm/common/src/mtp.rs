@@ -131,6 +131,10 @@ impl MtpModule {
         })
     }
 
+    pub fn rope_capacity(&self) -> usize {
+        self.layers.rope_capacity()
+    }
+
     pub fn make_kv_cache(&self, batch: usize, max_seq: usize) -> Result<KvCache, ModelError> {
         self.layers.make_kv_cache(batch, max_seq)
     }
