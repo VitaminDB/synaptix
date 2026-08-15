@@ -31,7 +31,13 @@ impl DirWeights {
         let loader = SafetensorsLoader::open_sharded(&shards)
             .map_err(|e| VisionError::Load(e.to_string()))?
             .with_device(device);
-        Ok(Self { loader })
+        Ok(Self::from_loader(loader))
+    }
+
+    /// Обёртка над готовым loader'ом — источником может быть каталог шардов
+    /// или компонент `.syn`-бандла (`SafetensorsLoader::from_bundle`).
+    pub fn from_loader(loader: SafetensorsLoader) -> Self {
+        Self { loader }
     }
 
     pub fn contains(&self, key: &str) -> bool {
@@ -73,17 +79,34 @@ impl H3Encoder {
         let dir = encoder_dir.as_ref();
         let cfg_bytes = std::fs::read(dir.join("config.json"))
             .map_err(|e| VisionError::Load(format!("config.json: {e}")))?;
-        let vcfg = VisionConfig::from_hf_bytes(&cfg_bytes)
-            .map_err(|e| VisionError::Load(e.to_string()))?;
-        let tcfg = TextConfig::from_hf_bytes(&cfg_bytes)?;
-
-        let weights = DirWeights::open(dir, device)?;
-        let vision = VisionTower::build(vcfg, &weights, device, compute)?;
-        let text = TextEncoder::build(tcfg, &weights, device, compute, quant, layers)?;
-
         let tok_path = tokenizer_json.unwrap_or_else(|| dir.join("tokenizer.json"));
-        let tokenizer = HfTokenizer::from_file(&tok_path)
+        let tok_bytes = std::fs::read(&tok_path)
             .map_err(|e| VisionError::Load(format!("{}: {e}", tok_path.display())))?;
+        let weights = DirWeights::open(dir, device)?;
+        Self::from_parts(&cfg_bytes, &tok_bytes, &weights, device, compute, quant, layers)
+    }
+
+    /// Собрать энкодер из уже прочитанных `config.json` / `tokenizer.json` и
+    /// произвольного источника весов. Позволяет грузить энкодер как из
+    /// каталога, так и из `.syn`-бандла, не дублируя логику сборки башен.
+    pub fn from_parts(
+        cfg_bytes: &[u8],
+        tokenizer_json: &[u8],
+        weights: &dyn VisionWeights,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        layers: usize,
+    ) -> Result<Self, VisionError> {
+        let vcfg = VisionConfig::from_hf_bytes(cfg_bytes)
+            .map_err(|e| VisionError::Load(e.to_string()))?;
+        let tcfg = TextConfig::from_hf_bytes(cfg_bytes)?;
+
+        let vision = VisionTower::build(vcfg, weights, device, compute)?;
+        let text = TextEncoder::build(tcfg, weights, device, compute, quant, layers)?;
+
+        let tokenizer = HfTokenizer::from_bytes(tokenizer_json)
+            .map_err(|e| VisionError::Load(format!("tokenizer.json: {e}")))?;
 
         Ok(Self {
             vision,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+use synaptix_bundle::Bundle;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 
 use crate::error::{IoError, Result};
@@ -22,17 +23,36 @@ fn st_dtype_to_synaptix(dtype: safetensors::Dtype) -> Option<DType> {
     }
 }
 
-struct MmapShard {
-    _mmap: Mmap,
+/// Владелец памяти, на которую указывает `Shard::data`: либо собственный
+/// mmap одного `.safetensors`-файла, либо mmap `.syn`-бандла, внутри которого
+/// лежит safetensors-поток компонента.
+// Варианты только держат владение памятью — читается всегда `Shard::data`.
+#[allow(dead_code)]
+enum ShardOwner {
+    Mmap(Mmap),
+    Bundle(Arc<Bundle>),
+}
+
+struct Shard {
+    _owner: ShardOwner,
     data: &'static [u8],
 }
 
-impl MmapShard {
+impl Shard {
     fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(IoError::Io)?;
         let mmap = unsafe { Mmap::map(&file).map_err(IoError::Io)? };
         let data: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
-        Ok(Self { _mmap: mmap, data })
+        Ok(Self { _owner: ShardOwner::Mmap(mmap), data })
+    }
+
+    /// Слайс safetensors-потока компонента внутри `.syn`. Bundle держится
+    /// `Arc`-ом в самом шарде, поэтому слайс живёт ровно столько же.
+    fn from_bundle(bundle: Arc<Bundle>, ptr: *const u8, len: usize) -> Self {
+        // SAFETY: `ptr/len` описывают слайс внутри mmap бандла; `Arc<Bundle>`
+        // переезжает в шард, так что mmap переживёт слайс.
+        let data: &'static [u8] = unsafe { std::slice::from_raw_parts(ptr, len) };
+        Self { _owner: ShardOwner::Bundle(bundle), data }
     }
 }
 
@@ -54,7 +74,7 @@ struct Entry {
 pub struct SafetensorsLoader {
     // SAFETY: `entries`/`metadata` держат `&'static`-слайсы в эти mmap'ы, поэтому
     // шарды обязаны жить не меньше loader'а.
-    _shards: Vec<Arc<MmapShard>>,
+    _shards: Vec<Arc<Shard>>,
     entries: HashMap<String, Entry>,
     metadata: HashMap<String, String>,
     default_device: Device,
@@ -63,7 +83,7 @@ pub struct SafetensorsLoader {
 
 impl SafetensorsLoader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let shard = Arc::new(MmapShard::open(path.as_ref())?);
+        let shard = Arc::new(Shard::open(path.as_ref())?);
         let mut entries = HashMap::new();
         let mut metadata = HashMap::new();
         index_shard(&shard, &mut entries, &mut metadata)?;
@@ -81,11 +101,52 @@ impl SafetensorsLoader {
         let mut entries = HashMap::new();
         let mut metadata = HashMap::new();
         for path in paths.iter() {
-            let shard = Arc::new(MmapShard::open(path.as_ref())?);
+            let shard = Arc::new(Shard::open(path.as_ref())?);
             index_shard(&shard, &mut entries, &mut metadata)?;
             shards.push(shard);
         }
         Ok(Self { _shards: shards, entries, metadata, default_device: Device::Cpu, prefix: None })
+    }
+
+    /// Открыть safetensors-поток компонента из `.syn`-бандла.
+    ///
+    /// `component=None` — канонический (единственный) Tensors-чанк бандла;
+    /// `Some(name)` — либо выделенный чанк `tensors:<name>`, либо (legacy-layout)
+    /// общий чанк с автоматически подставленным tensor-префиксом компонента.
+    ///
+    /// Зеркалит [`Self::open`]: тензоры отдаются zero-copy прямо из mmap
+    /// бандла, без распаковки во временный файл.
+    pub fn open_bundle(path: impl AsRef<Path>, component: Option<&str>) -> Result<Self> {
+        let bundle = Bundle::open(path.as_ref()).map_err(|e| IoError::Bundle(e.to_string()))?;
+        Self::from_bundle(Arc::new(bundle), component)
+    }
+
+    /// То же, что [`Self::open_bundle`], но поверх уже открытого бандла —
+    /// несколько компонентов одного `.syn` делят один mmap.
+    pub fn from_bundle(bundle: Arc<Bundle>, component: Option<&str>) -> Result<Self> {
+        let (bytes, prefix) = match component {
+            Some(c) => bundle
+                .tensors_slice_for(c)
+                .map_err(|e| IoError::Bundle(format!("component `{c}`: {e}")))?,
+            None => (
+                bundle.tensors_slice().map_err(|e| IoError::Bundle(e.to_string()))?,
+                None,
+            ),
+        };
+        // Указатель снимаем до move `bundle` в шард — сам слайс заимствует mmap,
+        // который живёт внутри Arc и переезжает вместе с ним.
+        let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        let shard = Arc::new(Shard::from_bundle(bundle, ptr, len));
+        let mut entries = HashMap::new();
+        let mut metadata = HashMap::new();
+        index_shard(&shard, &mut entries, &mut metadata)?;
+        Ok(Self {
+            _shards: vec![shard],
+            entries,
+            metadata,
+            default_device: Device::Cpu,
+            prefix,
+        })
     }
 
     pub fn with_device(mut self, device: Device) -> Self {
@@ -170,7 +231,7 @@ impl SafetensorsLoader {
 }
 
 fn index_shard(
-    shard: &Arc<MmapShard>,
+    shard: &Arc<Shard>,
     entries: &mut HashMap<String, Entry>,
     metadata: &mut HashMap<String, String>,
 ) -> Result<()> {

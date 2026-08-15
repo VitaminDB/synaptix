@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::source::H3Source;
 use crate::H3Error;
 
 pub const DEFAULT_SIGMA_SHIFT_VIDEO: f32 = 12.0;
@@ -110,20 +111,21 @@ impl Default for H3Config {
 
 impl H3Config {
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, H3Error> {
-        let dir = dir.as_ref();
-        let cfg_path = dir.join("transformer").join("config.json");
-        let bytes = std::fs::read(&cfg_path)
-            .map_err(|e| H3Error::Config(format!("{}: {e}", cfg_path.display())))?;
+        Self::from_source(&H3Source::plain_dir(dir.as_ref()))
+    }
+
+    /// Конфиг DiT из каталога или `.syn`-бандла (одинаковые относительные пути).
+    pub fn from_source(src: &H3Source) -> Result<Self, H3Error> {
+        let bytes = src.read("transformer/config.json")?;
         let mut cfg: Self = serde_json::from_slice(&bytes)
             .map_err(|e| H3Error::Config(format!("transformer/config.json: {e}")))?;
-        cfg.apply_model_index(dir)?;
+        cfg.apply_model_index(src)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    fn apply_model_index(&mut self, dir: &Path) -> Result<(), H3Error> {
-        let path = dir.join("model_index.json");
-        let Ok(bytes) = std::fs::read(&path) else {
+    fn apply_model_index(&mut self, src: &H3Source) -> Result<(), H3Error> {
+        let Some(bytes) = src.read_opt("model_index.json") else {
             return Ok(());
         };
         let root: serde_json::Value = serde_json::from_slice(&bytes)
@@ -319,16 +321,16 @@ impl VitDecoderConfig {
 
 impl VaeConfig {
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, H3Error> {
-        let dir = dir.as_ref().join("video_vae");
-        let src = dir.join("source").join("config.json");
-        let bytes = std::fs::read(&src)
-            .map_err(|e| H3Error::Config(format!("{}: {e}", src.display())))?;
+        Self::from_source(&H3Source::plain_dir(dir.as_ref()))
+    }
+
+    /// Конфиг видео-VAE из каталога или `.syn`-бандла.
+    pub fn from_source(src: &H3Source) -> Result<Self, H3Error> {
+        let bytes = src.read("video_vae/source/config.json")?;
         let mut cfg: Self = serde_json::from_slice(&bytes)
             .map_err(|e| H3Error::Config(format!("video_vae/source/config.json: {e}")))?;
 
-        let outer = dir.join("config.json");
-        let bytes = std::fs::read(&outer)
-            .map_err(|e| H3Error::Config(format!("{}: {e}", outer.display())))?;
+        let bytes = src.read("video_vae/config.json")?;
         let root: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| H3Error::Config(format!("video_vae/config.json: {e}")))?;
         let num = |k: &str, d: usize| {
@@ -398,11 +400,14 @@ impl Default for AudioVaeConfig {
 
 impl AudioVaeConfig {
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, H3Error> {
-        let dir = dir.as_ref().join("audio_vae");
+        Self::from_source(&H3Source::plain_dir(dir.as_ref()))
+    }
+
+    /// Конфиг аудио-VAE из каталога или `.syn`-бандла.
+    pub fn from_source(src: &H3Source) -> Result<Self, H3Error> {
         let mut cfg = Self::default();
 
-        let meta_path = dir.join("metadata.json");
-        if let Ok(bytes) = std::fs::read(&meta_path) {
+        if let Some(bytes) = src.read_opt("audio_vae/metadata.json") {
             let root: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| H3Error::Config(format!("audio_vae/metadata.json: {e}")))?;
             if let Some(kw) = root.get("metadata").and_then(|m| m.get("kwargs")) {
@@ -439,9 +444,7 @@ impl AudioVaeConfig {
             }
         }
 
-        let cfg_path = dir.join("config.json");
-        let bytes = std::fs::read(&cfg_path)
-            .map_err(|e| H3Error::Config(format!("{}: {e}", cfg_path.display())))?;
+        let bytes = src.read("audio_vae/config.json")?;
         let root: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| H3Error::Config(format!("audio_vae/config.json: {e}")))?;
         if let Some(v) = root.get("latent_channels").and_then(|v| v.as_u64()) {
