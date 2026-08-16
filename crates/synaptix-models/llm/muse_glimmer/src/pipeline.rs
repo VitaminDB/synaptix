@@ -34,6 +34,50 @@ pub struct VideoPromptInfo {
     pub timestamps: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LookupStats {
+    pub steps: usize,
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
+impl LookupStats {
+    pub fn acceptance(&self) -> f32 {
+        if self.drafted == 0 {
+            0.0
+        } else {
+            self.accepted as f32 / self.drafted as f32
+        }
+    }
+}
+
+const LOOKUP_NGRAM: usize = 3;
+const LOOKUP_SPAN: usize = 12;
+
+fn lookup_draft(ids: &[u32], max_ngram: usize, span: usize) -> Vec<u32> {
+    if span == 0 || ids.len() < 2 {
+        return Vec::new();
+    }
+    for n in (1..=max_ngram.min(ids.len() - 1)).rev() {
+        let needle = &ids[ids.len() - n..];
+        let hay_end = ids.len() - 1;
+        let mut i = hay_end;
+        while i >= n {
+            let start = i - n;
+            if &ids[start..i] == needle {
+                let cont_start = i;
+                let cont_end = (cont_start + span).min(ids.len());
+                if cont_end > cont_start {
+                    return ids[cont_start..cont_end].to_vec();
+                }
+                break;
+            }
+            i -= 1;
+        }
+    }
+    Vec::new()
+}
+
 impl VideoPromptInfo {
     pub fn prompt_block(&self) -> String {
         let mut s = String::from("<|vid_start|>");
@@ -296,19 +340,29 @@ impl MusePipeline {
 
         let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
         let dec_t0 = std::time::Instant::now();
-        loop {
-            let tok = sampler.sample(&logits).map_err(PipelineError::from)?;
-            out.push(tok);
-            if !sink.on_token(tok) || out.len() >= cfg.max_new_tokens || eos.contains(&tok) {
-                break;
+        if cfg.temperature == 0.0 {
+            let first = sampler.sample(&logits).map_err(PipelineError::from)?;
+            out.push(first);
+            let mut all_ids: Vec<u32> = prompt_ids.to_vec();
+            all_ids.push(first);
+            if sink.on_token(first) && !eos.contains(&first) {
+                self.lookup_loop(&mut kv, &mut all_ids, &mut out, &cfg, &eos, sink)?;
             }
-            if kv.seq_len >= kv.max_seq {
-                break;
+        } else {
+            loop {
+                let tok = sampler.sample(&logits).map_err(PipelineError::from)?;
+                out.push(tok);
+                if !sink.on_token(tok) || out.len() >= cfg.max_new_tokens || eos.contains(&tok) {
+                    break;
+                }
+                if kv.seq_len >= kv.max_seq {
+                    break;
+                }
+                let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                logits = no_grad(|| self.model.forward(&step, &mut kv))
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
             }
-            let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            logits = no_grad(|| self.model.forward(&step, &mut kv))
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
         }
         let decode_ms = dec_t0.elapsed().as_millis();
         let new_tokens = out.len();
@@ -409,6 +463,313 @@ impl MusePipeline {
         let (new_ids, stats) = self.generate(&ids, gen_cfg)?;
         let text = self.decode(&new_ids)?;
         Ok((text, stats))
+    }
+
+    pub fn generate_lookup_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        use synaptix_core::grad::no_grad;
+
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg);
+        if cfg.temperature > 0.0 {
+            return Err(PipelineError::Model(
+                "lookup-декод реализован для greedy (--temperature 0)".into(),
+            ));
+        }
+        let device = self.model.device;
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let l = prompt.len();
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let eos = synaptix_llm_common::generate::eos_set(&cfg);
+
+        let argmax_rows = |logits: &Tensor| -> Result<Vec<u32>, PipelineError> {
+            let dims = logits.dims().to_vec();
+            let vocab = dims[dims.len() - 1];
+            let rows = logits.numel() / vocab;
+            let v = logits
+                .to_dtype(DType::F32)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            Ok((0..rows)
+                .map(|r| {
+                    let row = &v[r * vocab..(r + 1) * vocab];
+                    row.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
+                })
+                .collect())
+        };
+
+        let t0 = std::time::Instant::now();
+        let chunk = cfg.prefill_batch.max(1);
+        let mut off = 0usize;
+        let mut logits_opt = None;
+        while off < l {
+            let end = (off + chunk).min(l);
+            let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let lg = no_grad(|| self.model.forward(&part, &mut kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            logits_opt = Some(lg);
+            off = end;
+        }
+        let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut all_ids: Vec<u32> = prompt.clone();
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        let first = argmax_rows(&logits)?[0];
+        out.push(first);
+        all_ids.push(first);
+        let cancelled = !sink.on_token(first);
+
+        let dec_t0 = std::time::Instant::now();
+        let stats = if cancelled {
+            LookupStats::default()
+        } else {
+            self.lookup_loop(&mut kv, &mut all_ids, &mut out, &cfg, &eos, sink)?
+        };
+        let decode_ms = dec_t0.elapsed().as_millis();
+        let new_tokens = out.len();
+        Ok((
+            out,
+            GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms },
+            stats,
+        ))
+    }
+
+    fn lookup_loop(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        all_ids: &mut Vec<u32>,
+        out: &mut Vec<u32>,
+        cfg: &GenerationConfig,
+        eos: &std::collections::HashSet<u32>,
+        sink: &mut dyn StreamSink,
+    ) -> Result<LookupStats, PipelineError> {
+        use synaptix_core::grad::no_grad;
+        let device = self.model.device;
+        let mut stats = LookupStats::default();
+        let argmax_rows = |logits: &Tensor| -> Result<Vec<u32>, PipelineError> {
+            let dims = logits.dims().to_vec();
+            let vocab = dims[dims.len() - 1];
+            let rows = logits.numel() / vocab;
+            let v = logits
+                .to_dtype(DType::F32)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            Ok((0..rows)
+                .map(|r| {
+                    let row = &v[r * vocab..(r + 1) * vocab];
+                    row.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
+                })
+                .collect())
+        };
+        let mut cancelled = false;
+        'outer: while !cancelled && out.len() < cfg.max_new_tokens {
+            let cur = *out.last().unwrap();
+            if eos.contains(&cur) {
+                break;
+            }
+            let pos = kv.seq_len;
+            if pos + 1 > kv.max_seq {
+                break;
+            }
+            let budget = (cfg.max_new_tokens - out.len()).min(kv.max_seq - pos - 1);
+            let draft = lookup_draft(all_ids, LOOKUP_NGRAM, LOOKUP_SPAN.min(budget));
+            let mut chunk_ids = Vec::with_capacity(1 + draft.len());
+            chunk_ids.push(cur);
+            chunk_ids.extend_from_slice(&draft);
+            let s = chunk_ids.len();
+            let t = Tensor::from_vec(chunk_ids, vec![1usize, s], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let hidden = no_grad(|| self.model.forward_trunk(&t, kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let lg = self
+                .model
+                .heads_all(&hidden)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let preds = argmax_rows(&lg)?;
+            stats.steps += 1;
+            stats.drafted += draft.len();
+
+            let mut accepted = 0usize;
+            while accepted < draft.len() && preds[accepted] == draft[accepted] {
+                accepted += 1;
+            }
+            stats.accepted += accepted;
+            kv.seq_len = pos + 1 + accepted;
+
+            for &tok in preds.iter().take(accepted + 1) {
+                out.push(tok);
+                all_ids.push(tok);
+                cancelled = !sink.on_token(tok);
+                if cancelled || out.len() >= cfg.max_new_tokens || eos.contains(&tok) {
+                    break 'outer;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    pub fn graph_decode_supported(&self) -> bool {
+        matches!(self.model.device, Device::Cuda(_))
+            && matches!(self.model.dtype, DType::F16 | DType::BF16)
+            && self.model.kv_dtype != DType::MXFP8
+            && !self.model.has_mxfp8_head_or_embed()
+    }
+
+    pub fn generate_with_graph_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt.len() + gen_cfg.max_new_tokens);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_graph_resume(&mut kv, &prompt, gen_cfg, sink)
+    }
+
+    pub fn generate_with_graph_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_infer::graph_capture::GraphCapturer;
+        use synaptix_infer::InferError;
+
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let device = self.model.device;
+        let ord = match device {
+            Device::Cuda(o) => o,
+            _ => return Err(PipelineError::Forward("generate_with_graph требует CUDA".into())),
+        };
+        let l = prompt_ids.len();
+        let cfg = self.prepare_cfg(gen_cfg);
+        let eos = synaptix_llm_common::generate::eos_set(&cfg);
+        let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+
+        let suffix = &prompt_ids[prefix..];
+        let chunk = cfg.prefill_batch.max(1);
+        let t0 = std::time::Instant::now();
+        let mut logits_opt = None;
+        let mut off = 0usize;
+        while off < suffix.len() {
+            let end = (off + chunk).min(suffix.len());
+            let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let lg = no_grad(|| self.model.forward(&part, kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            logits_opt = Some(lg);
+            off = end;
+        }
+        let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill suffix".into()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
+        out.push(tok0);
+        let mut cancelled = !sink.on_token(tok0);
+
+        let mut state = self
+            .model
+            .make_decode_state()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let start0 = self
+            .model
+            .ring_prepare_decode(kv, l)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        state
+            .update_ring(tok0, l as u32, start0 as u32)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)
+            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
+
+        let mut capturer = GraphCapturer::new(3);
+        let graph = {
+            let model = &self.model;
+            let state_ref = &mut state;
+            let kv_ref = &mut *kv;
+            no_grad(|| {
+                capturer.capture_with(&stream, |_s| {
+                    model
+                        .forward_decode_dev(state_ref, kv_ref)
+                        .map_err(|e| InferError::Other(e.to_string()))
+                })
+            })
+        }
+        .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
+        let _ = graph.upload();
+
+        let dec_t0 = std::time::Instant::now();
+        while !cancelled && out.len() < cfg.max_new_tokens {
+            let last = *out.last().unwrap();
+            if eos.contains(&last) {
+                break;
+            }
+            let pos = l + out.len() - 1;
+            if pos >= kv.max_seq {
+                break;
+            }
+            let start = self
+                .model
+                .ring_prepare_decode(kv, pos)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            state
+                .update_ring(last, pos as u32, start as u32)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            graph
+                .launch()
+                .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
+            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
+            out.push(tok);
+            cancelled = !sink.on_token(tok);
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
+        let new_tokens = out.len();
+
+        Ok((
+            out,
+            GenerationStats {
+                prompt_tokens: l,
+                new_tokens,
+                prefill_ms,
+                decode_ms,
+            },
+        ))
     }
 }
 

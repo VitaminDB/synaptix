@@ -13,6 +13,7 @@ default = []
 synaptix-llm-common = { workspace = true }
 synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
+synaptix-infer     = { workspace = true }
 synaptix-tokenizer = { workspace = true }
 synaptix-io        = { workspace = true, features = ["image"] }
 synaptix-bundle    = { workspace = true }

@@ -2788,6 +2788,42 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    pub fn flash_attention_window_dev(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        t_cache: &Tensor,
+        scale: f32,
+        window: i32,
+        causal: bool,
+    ) -> Result<Self> {
+        if self.rank() != 4 {
+            return Err(SynaptixError::Unsupported("flash_attention_window_dev: q rank != 4"));
+        }
+        let dims = self.dims();
+        let (b, nh, t_q, d) = (dims[0], dims[1], dims[2], dims[3]);
+        let q = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let k_c = if kv_layout_passthrough_ok(&k.layout) { k.clone() } else { k.contiguous()? };
+        let v_c = if kv_layout_passthrough_ok(&v.layout) { v.clone() } else { v.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
+        let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
+        let backend = registry::backend_for(self.device())?;
+        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.flash_attention_window_dev(
+            (&q.storage, &q.layout),
+            (&k_c.storage, &k_c.layout),
+            (&v_c.storage, &v_c.layout),
+            (&t_cache.storage, &t_cache.layout),
+            (&mut storage, &out_layout),
+            scale,
+            window,
+            causal,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     /// Device-pos MXFP8-KV квантизующий append (CUDA-graph). Как
     /// [`Self::kv_append_quant_mxfp8_inplace`], но `seq_pos` device-резидентный
     /// U32[1] тензор (один граф валиден для всех позиций).

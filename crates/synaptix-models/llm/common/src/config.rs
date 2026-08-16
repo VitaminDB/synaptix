@@ -132,21 +132,20 @@ impl DecoderConfig {
     /// attn-output-gate, partial-RoPE и Q/K-norm. НЕ поддержаны sandwich-нормы,
     /// sliding-window и отдельный local-RoPE (нужен per-layer rope-кэш в графе).
     pub fn graph_decode_ok(&self) -> bool {
+        self.rope_local.is_none() || self.rope_global.rotary_dim == 0
+    }
+
+    /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph
+    /// prefill chunk'а). Строже decode-профиля: без sandwich-норм, sliding-окон,
+    /// local-RoPE, embed-нормы и softcap'а — chunked-prefill dev-путь их не
+    /// реализует (муза префиллится host-путём). Linear-слои допустимы только в
+    /// MTP-verify гибрида.
+    pub fn graph_prefill_ok(&self) -> bool {
         !self.sandwich_norms
             && self.sliding_window.is_none()
             && self.rope_local.is_none()
             && !self.embed_rms_norm
             && self.logit_softcap.is_none()
             && self.logit_scale.is_none()
-    }
-
-    /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph
-    /// prefill chunk'а). Strictly subset of `graph_decode_ok`: дополнительно
-    /// требует **отсутствия linear-слоёв** — chunked GatedDeltaNet prefill ещё не
-    /// портирован на device-резидентный путь (host-loop через
-    /// `gated_delta_rule_prefill` остаётся валиден для hybrid). Hybrid-prefill
-    /// граф — отдельная сессия.
-    pub fn graph_prefill_ok(&self) -> bool {
-        self.graph_decode_ok()
     }
 }

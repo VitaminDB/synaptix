@@ -233,9 +233,30 @@ fn run_muse(
         return Ok(());
     }
 
-    let (new_ids, stats) = pipeline
-        .generate(&prompt_ids, gen_cfg)
-        .map_err(|e| format!("generate: {e}"))?;
+    let use_graph = args.graph && !device.is_cpu() && pipeline.graph_decode_supported();
+    let (new_ids, stats) = if args.temperature == 0.0 && !device.is_cpu() {
+        let mut noop = |_: u32| true;
+        let (ids, stats, lk) = pipeline
+            .generate_lookup_streaming(&prompt_ids, gen_cfg, &mut noop)
+            .map_err(|e| format!("generate(lookup): {e}"))?;
+        eprintln!(
+            "synaptix run: lookup шагов {} | черновиков {} | принято {} ({:.1}%)",
+            lk.steps,
+            lk.drafted,
+            lk.accepted,
+            lk.acceptance() * 100.0
+        );
+        (ids, stats)
+    } else if use_graph {
+        let mut noop = |_: u32| true;
+        pipeline
+            .generate_with_graph_streaming(&prompt_ids, gen_cfg, &mut noop)
+            .map_err(|e| format!("generate(graph): {e}"))?
+    } else {
+        pipeline
+            .generate(&prompt_ids, gen_cfg)
+            .map_err(|e| format!("generate: {e}"))?
+    };
     let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
     print_run_result(
         &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,

@@ -613,6 +613,18 @@ __device__ __forceinline__ void flash_splitq_dev_impl(
   flash_splitq_impl<T, HD>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_sh, causal, t_stride);
 }
 
+template <typename T, int HD>
+__device__ __forceinline__ void flash_splitq_win_dev_impl(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    T* __restrict__ out, float scale,
+    int B, int NH, int NKV, int Tq, const int* __restrict__ Tkv_ptr, int causal, int t_stride,
+    int window) {
+  __shared__ int Tkv_sh;
+  if (threadIdx.x == 0) Tkv_sh = *Tkv_ptr;
+  __syncthreads();
+  flash_splitq_impl<T, HD>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_sh, causal, t_stride, 0, window);
+}
+
 extern "C" {
 
 __global__ void FSQ_BOUNDS flash_splitq_f16_hd64_dev(
@@ -765,6 +777,18 @@ __global__ void FSQ_BOUNDS flash_splitq5_f16_hd128_win(
     __half* out, float scale,
     int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride, int window) {
   flash_splitq_impl<__half, 128, 64, 64, 4, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 0, window);
+}
+
+__global__ void FSQ_BOUNDS flash_splitq_f16_hd128_win_dev(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride, int window) {
+  flash_splitq_win_dev_impl<__half, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride, window);
+}
+__global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_win_dev(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride, int window) {
+  flash_splitq_win_dev_impl<__nv_bfloat16, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride, window);
 }
 
 }  // extern "C"

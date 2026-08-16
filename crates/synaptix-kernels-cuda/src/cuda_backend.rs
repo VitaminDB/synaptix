@@ -2450,6 +2450,115 @@ impl Backend for CudaBackend {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_window_dev(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        t_cache: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        scale: f32,
+        window: i32,
+        causal: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (q_st, q_lo) = q;
+        let (k_st, k_lo) = k;
+        let (v_st, v_lo) = v;
+        let (tc_st, tc_lo) = t_cache;
+        let (out_st, _out_lo) = out;
+        let dtype = q_lo.dtype();
+        if !matches!(dtype, DType::BF16 | DType::F16) || k_lo.dtype() != dtype || v_lo.dtype() != dtype {
+            return Err(SynaptixError::Unsupported("flash_window_dev: f16/bf16 only"));
+        }
+        if tc_lo.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("flash_window_dev: t_cache must be U32"));
+        }
+        if q_lo.dims().len() != 4 || k_lo.dims().len() != 4 || v_lo.dims().len() != 4 {
+            return Err(SynaptixError::Unsupported("flash_window_dev: rank-4"));
+        }
+        let b = q_lo.dims()[0];
+        let nh = q_lo.dims()[1];
+        let t_q = q_lo.dims()[2];
+        let d = q_lo.dims()[3];
+        let nkv = k_lo.dims()[1];
+        if d != 128 {
+            return Err(SynaptixError::Unsupported("flash_window_dev: HD=128 only"));
+        }
+        if k_lo.dims()[0] != b || k_lo.dims()[3] != d || v_lo.dims() != k_lo.dims() {
+            return Err(SynaptixError::Unsupported("flash_window_dev: k/v shape"));
+        }
+        if nkv == 0 || nh % nkv != 0 {
+            return Err(SynaptixError::Unsupported("flash_window_dev: GQA"));
+        }
+        if !q_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let derive_tstride = |lo: &Layout| -> Option<u32> {
+            let s = lo.strides().as_slice();
+            let dd = lo.dims();
+            let hd_i = dd[3] as isize;
+            let nkv_i = dd[1] as isize;
+            if hd_i > 0
+                && s[3] == 1
+                && s[2] == hd_i
+                && s[1] > 0
+                && s[1] % hd_i == 0
+                && s[0] == nkv_i * s[1]
+            {
+                Some((s[1] / hd_i) as u32)
+            } else {
+                None
+            }
+        };
+        let t_stride_k = derive_tstride(k_lo).ok_or(SynaptixError::NonContiguous)?;
+        let t_stride_v = derive_tstride(v_lo).ok_or(SynaptixError::NonContiguous)?;
+        if t_stride_k != t_stride_v {
+            return Err(SynaptixError::Unsupported("flash_window_dev: k/v t_stride"));
+        }
+        let ctx = q_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_window_dev: q non-cuda"))?
+            .device()
+            .clone();
+        let ord = q_st.as_cuda().unwrap().ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let tc_buf = tc_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_window_dev: t_cache non-cuda"))?;
+        let q_buf = q_st.as_cuda().unwrap();
+        let k_buf = k_st.as_cuda().unwrap();
+        let v_buf = v_st.as_cuda().unwrap();
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("flash_window_dev: out non-cuda"))?;
+        let kernels = crate::attention::flash_splitq::FlashSplitQKernels::for_context(&ctx)?;
+        crate::attention::flash_splitq::flash_splitq_window_u8_dev(
+            &kernels,
+            &stream,
+            dtype,
+            q_buf.slice(),
+            q_lo.byte_offset(),
+            k_buf.slice(),
+            k_lo.byte_offset(),
+            v_buf.slice(),
+            v_lo.byte_offset(),
+            out_buf.slice_mut(),
+            0,
+            tc_buf.slice(),
+            tc_lo.byte_offset(),
+            b as u32,
+            nh as u32,
+            nkv as u32,
+            t_q as u32,
+            scale,
+            causal,
+            t_stride_k,
+            window,
+        )
+    }
+
     fn flash_attention_dev(
         &self,
         q: (&Storage, &Layout),

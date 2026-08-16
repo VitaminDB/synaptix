@@ -486,7 +486,8 @@ mod tests {
         assert!(d.is_global_layer(7));
         assert_eq!(d.window_for(0), Some(2048));
         assert_eq!(d.window_for(3), None);
-        assert!(!d.graph_decode_ok());
+        assert!(d.graph_decode_ok());
+        assert!(!d.graph_prefill_ok());
     }
 
     #[test]

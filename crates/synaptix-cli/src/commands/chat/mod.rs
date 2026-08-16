@@ -123,6 +123,11 @@ impl ChatPipeline {
                         .generate_with_graph_resume(kv, ids, cfg, &mut *sink)
                         .map_err(|e| e.to_string());
                 }
+                ChatPipeline::MuseGlimmer(p) if p.graph_decode_supported() => {
+                    return p
+                        .generate_with_graph_resume(kv, ids, cfg, &mut *sink)
+                        .map_err(|e| e.to_string());
+                }
                 _ => {}
             }
         }
