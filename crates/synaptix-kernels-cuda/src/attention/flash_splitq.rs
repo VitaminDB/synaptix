@@ -47,6 +47,8 @@ pub struct FlashSplitQKernels {
     bf16_hd128_v5: CudaFunction,
     bf16_hd128_win: CudaFunction,
     bf16_hd128_v5_win: CudaFunction,
+    f16_hd128_win: CudaFunction,
+    f16_hd128_v5_win: CudaFunction,
     f16_hd128_bshd_facc: CudaFunction,
     f16_hd128_v5_facc: CudaFunction,
 }
@@ -87,11 +89,13 @@ impl FlashSplitQKernels {
         let bf16_hd128_v5 = load_fn(&module, "flash_splitq5_bf16_hd128")?;
         let bf16_hd128_win = load_fn(&module, "flash_splitq_bf16_hd128_win")?;
         let bf16_hd128_v5_win = load_fn(&module, "flash_splitq5_bf16_hd128_win")?;
+        let f16_hd128_win = load_fn(&module, "flash_splitq_f16_hd128_win")?;
+        let f16_hd128_v5_win = load_fn(&module, "flash_splitq5_f16_hd128_win")?;
         let f16_hd128_bshd_facc = load_fn(&module, "flash_splitq_f16_hd128_bshd_facc")?;
         let f16_hd128_v5_facc = load_fn(&module, "flash_splitq5_f16_hd128_facc")?;
 
         // v5: smem = 2 (K,V) × 64 × 136 × 2 = 34816 Б < 48 KB, но ставим с запасом.
-        for func in [&f16_hd128_v5, &bf16_hd128_v5, &bf16_hd128_v5_win, &f16_hd128_v5_facc] {
+        for func in [&f16_hd128_v5, &bf16_hd128_v5, &bf16_hd128_v5_win, &f16_hd128_v5_win, &f16_hd128_v5_facc] {
             func.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 96 * 1024,
@@ -114,6 +118,7 @@ impl FlashSplitQKernels {
             &bf16_hd128_bshd,
             &f16_hd128_bshd_facc,
             &bf16_hd128_win,
+            &f16_hd128_win,
             &f16_hd64_dev,
             &f16_hd128_dev,
             &f16_hd256_dev,
@@ -148,6 +153,8 @@ impl FlashSplitQKernels {
             bf16_hd128_v5,
             bf16_hd128_win,
             bf16_hd128_v5_win,
+            f16_hd128_win,
+            f16_hd128_v5_win,
             f16_hd128_bshd_facc,
             f16_hd128_v5_facc,
             _module: module,
@@ -422,6 +429,7 @@ pub fn flash_splitq_u8(
 pub fn flash_splitq_window_u8(
     kernels: &FlashSplitQKernels,
     stream: &Arc<CudaStream>,
+    dtype: DType,
     q: &CudaSlice<u8>,
     q_off: usize,
     k: &CudaSlice<u8>,
@@ -450,10 +458,12 @@ pub fn flash_splitq_window_u8(
     }
     let d: u32 = 128;
     let use_v5 = t_q >= 1024;
-    let func = if use_v5 {
-        &kernels.bf16_hd128_v5_win
-    } else {
-        &kernels.bf16_hd128_win
+    let func = match (dtype, use_v5) {
+        (DType::BF16, true) => &kernels.bf16_hd128_v5_win,
+        (DType::BF16, false) => &kernels.bf16_hd128_win,
+        (DType::F16, true) => &kernels.f16_hd128_v5_win,
+        (DType::F16, false) => &kernels.f16_hd128_win,
+        _ => return Err(SynaptixError::Unsupported("flash_splitq_window: dtype (F16/BF16)")),
     };
     let cfg = if use_v5 {
         LaunchConfig {
@@ -467,7 +477,8 @@ pub fn flash_splitq_window_u8(
     let esz = 2usize;
     let t_stride_eff = if t_stride > 0 { t_stride } else { t_kv } as usize;
     let q_n = (b as usize) * (nh as usize) * (t_q as usize) * (d as usize);
-    let kv_n = (b as usize) * (nkv as usize) * t_stride_eff * (d as usize);
+    let kv_n = ((b as usize - 1) * (nkv as usize) + (nkv as usize - 1)) * t_stride_eff * (d as usize)
+        + (t_kv as usize) * (d as usize);
     let (b_i, nh_i, nkv_i, tq_i, tkv_i) =
         (b as i32, nh as i32, nkv as i32, t_q as i32, t_kv as i32);
     let causal_i: i32 = if causal { 1 } else { 0 };

@@ -134,7 +134,7 @@ impl Attn {
                 } else {
                     (q.to_dtype(DType::BF16)?, k.to_dtype(DType::BF16)?, v.to_dtype(DType::BF16)?)
                 };
-                match qb.flash_attention_window(&kb, &vb, scale, window as i32) {
+                match qb.flash_attention_window(&kb, &vb, scale, window as i32, false) {
                     Ok(a) => a.to_dtype(qd)?,
                     Err(_) => scaled_dot_attention(&q, &rep(&k)?, &rep(&v)?, scale, Some(m))?,
                 }

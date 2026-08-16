@@ -351,7 +351,10 @@ pub struct KvCacheLayer {
     pub v: Tensor,
     pub k_scale: Option<Tensor>,
     pub v_scale: Option<Tensor>,
+    pub start: usize,
 }
+
+pub const RING_SLACK: usize = 2048;
 
 pub enum LayerCache {
     Full(KvCacheLayer),
@@ -464,8 +467,9 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in &mut self.layers {
-            if let LayerCache::Linear(s) = l {
-                s.reset();
+            match l {
+                LayerCache::Linear(s) => s.reset(),
+                LayerCache::Full(f) => f.start = 0,
             }
         }
     }
@@ -885,10 +889,21 @@ impl DecoderModel {
             (self.dtype.size_in_bits() / 8).max(1)
         };
         let per_full = c.num_key_value_heads * c.head_dim * 2 * elem;
+        let ring_ok = self.ring_kv_ok();
         let full_layers = (0..self.blocks.len())
-            .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
+            .filter(|l| {
+                matches!(c.layer_kind(*l), LayerKind::Full)
+                    && !(ring_ok && c.window_for(*l).is_some())
+            })
             .count();
         per_full * full_layers
+    }
+
+    fn ring_kv_ok(&self) -> bool {
+        matches!(self.device, Device::Cuda(_))
+            && self.kv_dtype != DType::MXFP8
+            && self.config.head_dim == 128
+            && matches!(self.dtype, DType::F16 | DType::BF16)
     }
 
     pub fn has_mxfp8_head_or_embed(&self) -> bool {
@@ -944,22 +959,27 @@ impl DecoderModel {
             )));
         }
         let kv_dt = if mxfp8 { DType::MXFP8 } else { self.dtype };
+        let ring_ok = self.ring_kv_ok();
         let mut layers = Vec::with_capacity(self.blocks.len());
         for l in 0..self.blocks.len() {
             let lc = match c.layer_kind(l) {
                 LayerKind::Full => {
-                    let k = Tensor::zeros(vec![batch, n_kv, max_seq, hd], kv_dt, self.device).coerr()?;
-                    let v = Tensor::zeros(vec![batch, n_kv, max_seq, hd], kv_dt, self.device).coerr()?;
+                    let cap = match c.window_for(l) {
+                        Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
+                        _ => max_seq,
+                    };
+                    let k = Tensor::zeros(vec![batch, n_kv, cap, hd], kv_dt, self.device).coerr()?;
+                    let v = Tensor::zeros(vec![batch, n_kv, cap, hd], kv_dt, self.device).coerr()?;
                     let (k_scale, v_scale) = if mxfp8 {
                         let nb = hd / 32;
                         (
-                            Some(Tensor::zeros(vec![batch, n_kv, max_seq, nb], DType::U8, self.device).coerr()?),
-                            Some(Tensor::zeros(vec![batch, n_kv, max_seq, nb], DType::U8, self.device).coerr()?),
+                            Some(Tensor::zeros(vec![batch, n_kv, cap, nb], DType::U8, self.device).coerr()?),
+                            Some(Tensor::zeros(vec![batch, n_kv, cap, nb], DType::U8, self.device).coerr()?),
                         )
                     } else {
                         (None, None)
                     };
-                    LayerCache::Full(KvCacheLayer { k, v, k_scale, v_scale })
+                    LayerCache::Full(KvCacheLayer { k, v, k_scale, v_scale, start: 0 })
                 }
                 LayerKind::Linear => {
                     let lin = c.linear.as_ref().unwrap();
@@ -1566,7 +1586,7 @@ impl FullAttn {
         let _core_dev = device;
         let attn = prof(_core_dev, "attn_core", || -> Result<Tensor, ModelError> {
         Ok(if flash_eligible && kv_dtype == DType::MXFP8 {
-            let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc } = kv;
+            let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kv;
             kc.kv_append_quant_mxfp8_inplace(ksc.as_mut().unwrap(), &k, past).coerr()?;
             vc.kv_append_quant_mxfp8_inplace(vsc.as_mut().unwrap(), &v, past).coerr()?;
             let k_q = kc.narrow(2, 0, new_len).coerr()?;
@@ -1577,13 +1597,56 @@ impl FullAttn {
             q.flash_attention_mxfp8kv(&k_q, &v_q, &ks, &vs, self.attn_scale, true)
                 .map_err(|e| ModelError::Forward(e.to_string()))?
         } else {
-            kv.k.kv_append_inplace(&k, past).coerr()?;
-            kv.v.kv_append_inplace(&v, past).coerr()?;
-            let k_total = kv.k.narrow(2, 0, new_len).coerr()?;
-            let v_total = kv.v.narrow(2, 0, new_len).coerr()?;
-            let do_flash = flash_eligible;
-            let flashed = if do_flash {
+            let cap = kv.k.dims()[2];
+            let mut local_past = past - kv.start;
+            if local_past + s > cap {
+                let Some(w) = self.sliding_window else {
+                    return Err(ModelError::Shape(format!(
+                        "KV overflow: past {past} + s {s} > cap {cap}"
+                    )));
+                };
+                let lo_global = (past + 1).saturating_sub(w);
+                if lo_global <= kv.start || past + s - lo_global > cap {
+                    return Err(ModelError::Shape(format!(
+                        "ring KV: chunk s={s} не помещается (cap {cap}, окно {w}) — уменьшите prefill-chunk"
+                    )));
+                }
+                let keep = past - lo_global;
+                if keep > 0 {
+                    let src = lo_global - kv.start;
+                    let tk = kv.k.narrow(2, src, keep).coerr()?.contiguous().coerr()?;
+                    let tv = kv.v.narrow(2, src, keep).coerr()?.contiguous().coerr()?;
+                    kv.k.kv_append_inplace(&tk, 0).coerr()?;
+                    kv.v.kv_append_inplace(&tv, 0).coerr()?;
+                }
+                kv.start = lo_global;
+                local_past = past - kv.start;
+            }
+            kv.k.kv_append_inplace(&k, local_past).coerr()?;
+            kv.v.kv_append_inplace(&v, local_past).coerr()?;
+            let local_len = local_past + s;
+            let (att_lo, att_len) = match self.sliding_window {
+                Some(w) => {
+                    let lo_global = (past + 1).saturating_sub(w).max(kv.start);
+                    (lo_global - kv.start, past + s - lo_global)
+                }
+                None => (0, local_len),
+            };
+            let k_total = kv.k.narrow(2, att_lo, att_len).coerr()?;
+            let v_total = kv.v.narrow(2, att_lo, att_len).coerr()?;
+            let flash_win = self.sliding_window.is_some()
+                && self.use_flash
+                && pad_bias.is_none()
+                && hd == 128;
+            let flashed = if flash_eligible {
                 match q.flash_attention(&k_total, &v_total, self.attn_scale, true) {
+                    Ok(a) => Some(a),
+                    Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => None,
+                    Err(e) => return Err(ModelError::Forward(e.to_string())),
+                }
+            } else if flash_win {
+                let w = self.sliding_window.unwrap();
+                match q.flash_attention_window(&k_total, &v_total, self.attn_scale, (w - 1) as i32, true) {
                     Ok(a) => Some(a),
                     Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => None,
                     Err(e) => return Err(ModelError::Forward(e.to_string())),
@@ -1600,7 +1663,8 @@ impl FullAttn {
                     if s == 1 && window.is_none() && pad_bias.is_none() {
                         scaled_dot_attention(&q, &k_rep, &v_rep, self.attn_scale, None).coerr()?
                     } else {
-                        let mask = build_mask(s, new_len, past, window, device, compute).coerr()?;
+                        let past_rel = past - kv.start - att_lo;
+                        let mask = build_mask(s, att_len, past_rel, window, device, compute).coerr()?;
                         let mask = match pad_bias {
                             Some(pb) => mask.broadcast_add(pb).coerr()?,
                             None => mask,
@@ -1662,7 +1726,7 @@ impl FullAttn {
         let k = prof(dev, "attn_rope", || k.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
 
         let attn = if kvl.k.dtype() == DType::MXFP8 {
-            let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc } = kvl;
+            let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kvl;
             prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
                 kc.kv_append_quant_mxfp8_dev(ksc.as_mut().unwrap(), &k, &state.pos_dev).coerr()?;
                 vc.kv_append_quant_mxfp8_dev(vsc.as_mut().unwrap(), &v, &state.pos_dev).coerr()

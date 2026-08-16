@@ -19,6 +19,17 @@ use crate::tensor::storage::Storage;
 /// (stride[3]==1, stride[2]==hd) и регулярным per-head/per-batch шагом, где
 /// per-head stride кратен hd. Покрывает contiguous (t_stride==T) И strided view
 /// preallocated буфера (t_stride==max_seq). Backend выводит t_stride = stride[1]/hd.
+fn kv_layout_passthrough_offset_ok(lo: &Layout) -> bool {
+    let d = lo.dims();
+    if d.len() != 4 {
+        return false;
+    }
+    let s = lo.strides().as_slice();
+    let nkv = d[1] as isize;
+    let hd = d[3] as isize;
+    hd > 0 && s[3] == 1 && s[2] == hd && s[1] > 0 && s[1] % hd == 0 && s[0] == nkv * s[1]
+}
+
 fn kv_layout_passthrough_ok(lo: &Layout) -> bool {
     if lo.offset() != 0 {
         return false;
@@ -2521,6 +2532,7 @@ impl Tensor {
         v: &Tensor,
         scale: f32,
         window: i32,
+        causal: bool,
     ) -> Result<Self> {
         if self.rank() != 4 {
             return Err(SynaptixError::Unsupported("flash_attention_window: q rank != 4"));
@@ -2528,8 +2540,8 @@ impl Tensor {
         let dims = self.dims();
         let (b, nh, t_q, d) = (dims[0], dims[1], dims[2], dims[3]);
         let q = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
-        let k_c = if kv_layout_passthrough_ok(&k.layout) { k.clone() } else { k.contiguous()? };
-        let v_c = if kv_layout_passthrough_ok(&v.layout) { v.clone() } else { v.contiguous()? };
+        let k_c = if kv_layout_passthrough_offset_ok(&k.layout) { k.clone() } else { k.contiguous()? };
+        let v_c = if kv_layout_passthrough_offset_ok(&v.layout) { v.clone() } else { v.contiguous()? };
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
@@ -2542,6 +2554,7 @@ impl Tensor {
             (&mut storage, &out_layout),
             scale,
             window,
+            causal,
             &stream,
         )?;
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))

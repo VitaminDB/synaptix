@@ -31,6 +31,10 @@ criterion.workspace = true
 tempfile.workspace = true
 
 [[bin]]
+name = "syn-meta"
+path = "src/bin/syn_meta.rs"
+
+[[bin]]
 name = "syn-pack"
 path = "src/bin/syn_pack.rs"
 

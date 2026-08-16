@@ -68,7 +68,11 @@ enum Commands {
     },
     Run {
         model: PathBuf,
+        #[arg(default_value = "")]
         prompt: String,
+        /// Прочитать prompt из файла (для длинных контекстов, обходит лимит argv).
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
         #[arg(long, default_value_t = 1.0)]
@@ -661,10 +665,15 @@ fn main() -> ExitCode {
             bench::run(bench::BenchArgs { model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype })
         }
         Commands::Run {
-            model, prompt, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
+            model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
             warmup, mtp, no_mtp, no_graph_mtp, image, video,
         } => {
+            let prompt = match prompt_file {
+                Some(pf) => std::fs::read_to_string(&pf)
+                    .unwrap_or_else(|e| { eprintln!("prompt-file {}: {e}", pf.display()); std::process::exit(2) }),
+                None => prompt,
+            };
             run_cmd::run(run_cmd::RunArgs {
                 model,
                 prompt,

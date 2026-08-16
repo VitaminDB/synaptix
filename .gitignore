@@ -33,3 +33,4 @@ tests/reference_data/
 
 # Клон референсного репозитория MiniMax-H3 (вложенный git, только для паритета)
 /third_party/minimax-h3
+models/
