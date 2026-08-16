@@ -6,12 +6,13 @@
 //! не меняется.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::{parse_dtype, PrecisionConfig};
+use synaptix_core::tensor::Tensor;
 use synaptix_llm_common::{GenerationConfig, StreamSink};
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
@@ -366,6 +367,23 @@ impl LlmPipeline {
         }
     }
 
+    fn generate_streaming_media(
+        &self,
+        prompt_ids: &[u32],
+        images: Option<&Tensor>,
+        video: Option<&Tensor>,
+        cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(), LlmError> {
+        match self {
+            LlmPipeline::MuseGlimmer(p) => p
+                .generate_with_mixed_media(prompt_ids, images, video, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
+            _ => Err(LlmError("архитектура не принимает медиа-вход".into())),
+        }
+    }
+
     fn generate_streaming(
         &self,
         prompt_ids: &[u32],
@@ -468,6 +486,11 @@ pub struct Llm {
     config: LlmConfig,
     device: Device,
     vocab_size: usize,
+    /// Путь к бандлу/каталогу модели — нужен для ленивой догрузки
+    /// vision-башни уже после `load_llm` (см. [`Llm::ensure_media_tower`]).
+    model_path: PathBuf,
+    /// Compute-dtype, с которым загружены веса: тем же грузится и башня.
+    compute_dtype: DType,
 }
 
 impl Llm {
@@ -506,6 +529,149 @@ impl Llm {
         pipeline.generate_streaming(prompt_ids, cfg, sink)
     }
 }
+
+// ── Мультимодальный вход: картинки и видео ──────────────────────────────────
+
+/// Модальность вложения. Определяет, каким токеном-заполнителем вложение
+/// представлено в промпте и в какой поток эмбеддингов оно попадёт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+/// Закодированное vision-башней вложение.
+///
+/// `prompt_block` — готовая строка-заполнитель, которую вызывающий вставляет
+/// в текст user-сообщения ДО применения chat-шаблона: у картинки это
+/// `<|image_start|>` + `tokens` штук `<|patch|>` + `<|image_end|>`, у видео —
+/// блок с таймкодами кадровых групп. Число заполнителей обязано совпасть с
+/// числом строк в `embeds`, иначе генерация вернёт ошибку.
+#[derive(Clone)]
+pub struct MediaEmbedding {
+    pub kind: MediaKind,
+    pub embeds: Tensor,
+    pub tokens: usize,
+    pub prompt_block: String,
+}
+
+impl MediaEmbedding {
+    /// Сколько токенов контекста займёт вложение.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+}
+
+impl Llm {
+    /// Умеет ли архитектура принимать медиа-вход и есть ли в конфиге
+    /// `vision_config` (т.е. это multimodal-сборка, а не text-only).
+    pub fn supports_media(&self) -> bool {
+        match self.pipeline.lock() {
+            Ok(p) => match &*p {
+                LlmPipeline::MuseGlimmer(m) => m.config.vision.is_some(),
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Загружена ли vision-башня в память устройства.
+    pub fn media_tower_loaded(&self) -> bool {
+        match self.pipeline.lock() {
+            Ok(p) => match &*p {
+                LlmPipeline::MuseGlimmer(m) => m.has_vision(),
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Идемпотентно догружает vision-башню из того же бандла, что и веса LLM.
+    ///
+    /// `Ok(false)` — в бандле нет тензоров башни (text-only сборка). Башня
+    /// стоит ощутимой VRAM, поэтому вызывающий обычно грузит её на время
+    /// кодирования вложений и сразу отпускает через [`Self::release_media_tower`].
+    pub fn ensure_media_tower(&self) -> Result<bool, LlmError> {
+        let mut guard = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        match &mut *guard {
+            LlmPipeline::MuseGlimmer(m) => {
+                if m.has_vision() {
+                    return Ok(true);
+                }
+                m.load_vision(&self.model_path, self.compute_dtype)
+                    .map_err(|e| LlmError(format!("vision load: {e}")))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Выгружает vision-башню и возвращает её память пулу устройства.
+    pub fn release_media_tower(&self) {
+        if let Ok(mut guard) = self.pipeline.lock() {
+            if let LlmPipeline::MuseGlimmer(m) = &mut *guard {
+                m.release_vision();
+            }
+        }
+    }
+
+    /// Кодирует картинку в эмбеддинги vision-башни.
+    ///
+    /// `max_tokens` ограничивает число vision-токенов сверху (даунскейл в
+    /// препроцессинге). `None` — потолок из конфига модели (у Muse Glimmer 4096).
+    pub fn encode_image(
+        &self,
+        path: &Path,
+        max_tokens: Option<usize>,
+    ) -> Result<MediaEmbedding, LlmError> {
+        let guard = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let LlmPipeline::MuseGlimmer(m) = &*guard else {
+            return Err(LlmError("архитектура не принимает картинки".into()));
+        };
+        let embeds = m
+            .encode_image_limited(path, max_tokens)
+            .map_err(|e| LlmError(format!("image encode: {e}")))?;
+        let tokens = embeds.dims()[0];
+        let prompt_block = format!(
+            "{IMAGE_START_TOKEN}{}{IMAGE_END_TOKEN}",
+            IMAGE_PAD_TOKEN.repeat(tokens)
+        );
+        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block })
+    }
+
+    /// Кодирует видео: сэмплинг кадров (ffmpeg) → vision-башня. Блок промпта
+    /// несёт таймкоды кадровых групп, поэтому модель видит временну́ю шкалу.
+    pub fn encode_video(&self, path: &Path) -> Result<MediaEmbedding, LlmError> {
+        let guard = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let LlmPipeline::MuseGlimmer(m) = &*guard else {
+            return Err(LlmError("архитектура не принимает видео".into()));
+        };
+        let (embeds, info) = m
+            .encode_video(path)
+            .map_err(|e| LlmError(format!("video encode: {e}")))?;
+        let tokens = embeds.dims()[0];
+        Ok(MediaEmbedding {
+            kind: MediaKind::Video,
+            embeds,
+            tokens,
+            prompt_block: info.prompt_block(),
+        })
+    }
+}
+
+/// Обёртки блока картинки в промпте (см. `MediaEmbedding::prompt_block`).
+const IMAGE_START_TOKEN: &str = "<|image_start|>";
+const IMAGE_END_TOKEN: &str = "<|image_end|>";
+/// Заполнитель одного vision-токена картинки — `config.image_token_id`.
+const IMAGE_PAD_TOKEN: &str = "<|patch|>";
 
 pub struct LlmTokenizer {
     tokenizer: HfTokenizer,
@@ -630,6 +796,84 @@ impl<'a> LlmGeneration<'a> {
     }
 }
 
+impl<'a> LlmGeneration<'a> {
+    /// Стриминг по промпту с медиа-вложениями.
+    ///
+    /// `media` перечисляется **в том же порядке, в каком блоки-заполнители
+    /// стоят в промпте**: эмбеддинги одной модальности склеиваются по этому
+    /// порядку и разбираются курсором по прогонам её токена-заполнителя.
+    /// Спекулятивные пути (DFlash / lookup / CUDA-graph) на медиа-промпте не
+    /// применяются — prefill идёт по готовым эмбеддингам.
+    pub fn generate_streaming_media<F>(
+        &mut self,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        media: &[&MediaEmbedding],
+        on_token: F,
+    ) -> Result<(), LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        let images = concat_media(media, MediaKind::Image)?;
+        let video = concat_media(media, MediaKind::Video)?;
+        if images.is_none() && video.is_none() {
+            return Err(LlmError("generate_streaming_media без вложений".into()));
+        }
+
+        let cfg = GenerationConfig {
+            max_new_tokens: self.opts.max_new_tokens,
+            temperature: self.opts.temperature,
+            top_k: self.opts.top_k,
+            top_p: self.opts.top_p,
+            min_p: self.opts.min_p,
+            repetition_penalty: self.opts.repeat_penalty,
+            seed: self.opts.seed,
+            eos_token_id: None,
+            eos_token_ids: self.stop_tokens.clone(),
+            max_seq: Some(self.opts.max_seq_len.max(1)),
+            prefill_batch: prefill_chunk_size(),
+        };
+
+        let mut sink = DeltaSink {
+            tokenizer,
+            on_token,
+            acc: Vec::new(),
+            decoded: String::new(),
+            stop_sequences: &self.stop_sequences,
+        };
+
+        let pipeline = self
+            .model
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        pipeline.generate_streaming_media(
+            prompt_ids,
+            images.as_ref(),
+            video.as_ref(),
+            cfg,
+            &mut sink,
+        )
+    }
+}
+
+/// Склеивает эмбеддинги одной модальности в порядке следования вложений.
+/// `None` — вложений этой модальности нет.
+fn concat_media(media: &[&MediaEmbedding], kind: MediaKind) -> Result<Option<Tensor>, LlmError> {
+    let parts: Vec<&Tensor> = media
+        .iter()
+        .filter(|m| m.kind == kind)
+        .map(|m| &m.embeds)
+        .collect();
+    match parts.len() {
+        0 => Ok(None),
+        1 => Ok(Some(parts[0].clone())),
+        _ => Tensor::cat(&parts, 0)
+            .map(Some)
+            .map_err(|e| LlmError(format!("media cat: {e}"))),
+    }
+}
+
 /// Sink, восстанавливающий текстовую дельту из id-токенов нативного стрима.
 /// На каждый токен: накапливает id, декодит весь буфер, диффит против прежнего
 /// decoded → дельта. Зовёт `on_token(id, delta)`; `false` → отмена. Накопленный
@@ -723,6 +967,7 @@ fn build_facade(
     path: &Path,
     device: Device,
     max_seq: Option<usize>,
+    compute_dtype: DType,
 ) -> Result<(Llm, LlmTokenizer), LlmError> {
     let tokenizer = build_tokenizer(path)?;
     let specials = tokenizer.special_tokens().clone();
@@ -741,6 +986,8 @@ fn build_facade(
         config: LlmConfig { max_seq_len },
         device,
         vocab_size,
+        model_path: path.to_path_buf(),
+        compute_dtype,
     };
     let tok = LlmTokenizer { tokenizer, template, eos_ids };
     Ok((model, tok))
@@ -788,7 +1035,7 @@ pub fn load_llm(
         }
     };
 
-    build_facade(pipeline, path, device, max_seq)
+    build_facade(pipeline, path, device, max_seq, precision.compute)
 }
 
 /// Удобная загрузка из квант-политики (synthos-путь): строит precision из

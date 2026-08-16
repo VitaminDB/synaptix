@@ -226,12 +226,37 @@ impl MusePipeline {
     }
 
     pub fn encode_image(&self, path: impl AsRef<Path>) -> Result<Tensor, PipelineError> {
+        self.encode_image_limited(path, None)
+    }
+
+    /// То же, что [`Self::encode_image`], но с потолком на число vision-токенов.
+    ///
+    /// `max_image_tokens` из `processor_config.json` у Muse Glimmer — 4096, то
+    /// есть одна крупная картинка съедает контекст сопоставимо с длинной
+    /// статьёй и заметно удлиняет prefill. Интерактивным вызывающим (чат)
+    /// нужен свой, более скромный лимит, поэтому здесь мы работаем на копии
+    /// `VisionConfig`: башня резолюционно-агностична (window-attention +
+    /// интерполяция pos-таблицы по grid), меняется только `smart_resize`
+    /// в препроцессинге.
+    pub fn encode_image_limited(
+        &self,
+        path: impl AsRef<Path>,
+        max_image_tokens: Option<usize>,
+    ) -> Result<Tensor, PipelineError> {
         use synaptix_core::grad::no_grad;
         let tower = self
             .vision
             .as_ref()
             .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
-        let PreparedImage { patches, grid } = prepare_image(path, &tower.config, self.model.device)
+        let cfg = match max_image_tokens {
+            Some(n) if n > 0 && n < tower.config.max_image_tokens => {
+                let mut c = tower.config.clone();
+                c.max_image_tokens = n;
+                c
+            }
+            _ => tower.config.clone(),
+        };
+        let PreparedImage { patches, grid } = prepare_image(path, &cfg, self.model.device)
             .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
         no_grad(|| tower.forward(&patches, grid))
             .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))
@@ -270,25 +295,37 @@ impl MusePipeline {
         Ok((nh / cfg.patch_size) * (nw / cfg.patch_size) / cfg.merge_unit())
     }
 
-    fn embed_with_media(
+    /// Собирает входные эмбеддинги промпта, подменяя прогоны медиа-плейсхолдеров
+    /// строками из `media`.
+    ///
+    /// `media` — список пар «id токена-заполнителя → матрица эмбеддингов
+    /// `[tokens, hidden]`». Пар может быть несколько (картинки и видео в одном
+    /// промпте живут под разными id: `image_token_id` / `video_token_id`), у
+    /// каждой — свой курсор, поэтому модальности читаются независимо, но
+    /// строго в порядке появления их токенов в промпте.
+    fn embed_with_media_pads(
         &self,
         ids: &[u32],
-        pad: u32,
-        feats: &Tensor,
+        media: &[(u32, &Tensor)],
     ) -> Result<Tensor, PipelineError> {
         let device = self.model.device;
         let hidden = self.config.hidden_size;
-        let total = feats.dims()[0];
+        let is_pad = |t: u32| media.iter().any(|(p, _)| *p == t);
+        // Курсор на каждую модальность — индекс следующей неиспользованной строки.
+        let mut cursors = vec![0usize; media.len()];
         let mut segments: Vec<Tensor> = Vec::new();
-        let mut cursor = 0usize;
         let mut i = 0usize;
         while i < ids.len() {
-            if ids[i] == pad {
+            let tok = ids[i];
+            if let Some(slot) = media.iter().position(|(p, _)| *p == tok) {
                 let start = i;
-                while i < ids.len() && ids[i] == pad {
+                while i < ids.len() && ids[i] == tok {
                     i += 1;
                 }
                 let run = i - start;
+                let feats = media[slot].1;
+                let total = feats.dims()[0];
+                let cursor = cursors[slot];
                 if cursor + run > total {
                     return Err(PipelineError::Forward(format!(
                         "медиа-токенов в промпте больше, чем строк эмбеддингов: {} > {total}",
@@ -301,11 +338,11 @@ impl MusePipeline {
                     .and_then(|t| t.to_dtype(self.model.dtype))
                     .and_then(|t| t.reshape(vec![1usize, run, hidden]))
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
-                cursor += run;
+                cursors[slot] = cursor + run;
                 segments.push(e);
             } else {
                 let start = i;
-                while i < ids.len() && ids[i] != pad {
+                while i < ids.len() && !is_pad(ids[i]) {
                     i += 1;
                 }
                 let chunk = Tensor::from_vec(ids[start..i].to_vec(), vec![1usize, i - start], device)
@@ -317,10 +354,14 @@ impl MusePipeline {
                 segments.push(e);
             }
         }
-        if cursor != total {
-            return Err(PipelineError::Forward(format!(
-                "vision дал {total} эмбеддингов, а промпт использует {cursor}"
-            )));
+        for (slot, (_, feats)) in media.iter().enumerate() {
+            let total = feats.dims()[0];
+            if cursors[slot] != total {
+                return Err(PipelineError::Forward(format!(
+                    "vision дал {total} эмбеддингов, а промпт использует {}",
+                    cursors[slot]
+                )));
+            }
         }
         let refs: Vec<&Tensor> = segments.iter().collect();
         Tensor::cat(&refs, 1).map_err(|e| PipelineError::Forward(e.to_string()))
@@ -333,13 +374,9 @@ impl MusePipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        let pad = self
-            .config
-            .image_token_id
-            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
         let refs: Vec<&Tensor> = image_embeds.iter().collect();
         let feats = Tensor::cat(&refs, 0).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        self.generate_with_media(prompt_ids, pad, &feats, gen_cfg, sink)
+        self.generate_with_mixed_media(prompt_ids, Some(&feats), None, gen_cfg, sink)
     }
 
     pub fn generate_with_video(
@@ -349,18 +386,48 @@ impl MusePipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        let pad = self
-            .config
-            .video_token_id
-            .ok_or_else(|| PipelineError::Model("config.json без video_token_id".into()))?;
-        self.generate_with_media(prompt_ids, pad, video_embeds, gen_cfg, sink)
+        self.generate_with_mixed_media(prompt_ids, None, Some(video_embeds), gen_cfg, sink)
+    }
+
+    /// Генерация по промпту, где встречаются картинки и/или видео.
+    ///
+    /// `image_embeds` / `video_embeds` — конкатенация эмбеддингов всех
+    /// вложений своей модальности **в порядке их появления в промпте**;
+    /// прогоны `image_token_id` и `video_token_id` разбираются независимыми
+    /// курсорами, поэтому одно сообщение может нести и то, и другое.
+    pub fn generate_with_mixed_media(
+        &self,
+        prompt_ids: &[u32],
+        image_embeds: Option<&Tensor>,
+        video_embeds: Option<&Tensor>,
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let mut media: Vec<(u32, &Tensor)> = Vec::new();
+        if let Some(t) = image_embeds {
+            let pad = self
+                .config
+                .image_token_id
+                .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+            media.push((pad, t));
+        }
+        if let Some(t) = video_embeds {
+            let pad = self
+                .config
+                .video_token_id
+                .ok_or_else(|| PipelineError::Model("config.json без video_token_id".into()))?;
+            media.push((pad, t));
+        }
+        if media.is_empty() {
+            return Err(PipelineError::Model("generate_with_mixed_media без медиа".into()));
+        }
+        self.generate_with_media(prompt_ids, &media, gen_cfg, sink)
     }
 
     fn generate_with_media(
         &self,
         prompt_ids: &[u32],
-        pad: u32,
-        feats: &Tensor,
+        media: &[(u32, &Tensor)],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
@@ -381,7 +448,7 @@ impl MusePipeline {
         let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
 
         let t0 = std::time::Instant::now();
-        let emb = self.embed_with_media(prompt_ids, pad, feats)?;
+        let emb = self.embed_with_media_pads(prompt_ids, media)?;
         let chunk = match cfg.prefill_batch {
             0 => 512,
             n => n.min(synaptix_llm_common::model::RING_SLACK),
