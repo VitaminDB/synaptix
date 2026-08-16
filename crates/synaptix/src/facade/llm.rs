@@ -378,6 +378,12 @@ impl LlmPipeline {
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
             LlmPipeline::MuseGlimmer(p) => {
+                if cfg.temperature == 0.0 && dflash_enabled() && p.has_dflash() {
+                    return p
+                        .generate_dflash_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
                 if cfg.temperature == 0.0 && matches!(p.model.device, Device::Cuda(_)) {
                     return p
                         .generate_lookup_streaming(prompt_ids, cfg, sink)
@@ -769,9 +775,16 @@ pub fn load_llm(
             .map(LlmPipeline::Gemma3)
             .map_err(|e| LlmError(format!("load gemma3: {e}")))?,
         LlmArch::MuseGlimmer => {
-            MusePipeline::load_with_precision(path, device, precision, max_seq)
-                .map(LlmPipeline::MuseGlimmer)
-                .map_err(|e| LlmError(format!("load muse_glimmer: {e}")))?
+            let mut p = MusePipeline::load_with_precision(path, device, precision, max_seq)
+                .map_err(|e| LlmError(format!("load muse_glimmer: {e}")))?;
+            if dflash_enabled() {
+                match p.load_dflash(path, precision) {
+                    Ok(true) => eprintln!("[synaptix] muse_glimmer: DFlash-драфтер подключён"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[synaptix] muse_glimmer: DFlash пропущен: {e}"),
+                }
+            }
+            LlmPipeline::MuseGlimmer(p)
         }
     };
 
@@ -800,6 +813,18 @@ pub fn set_mtp_enabled(on: bool) {
 
 pub fn mtp_enabled() -> bool {
     MTP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// DFlash — блочный спекулятивный декод Muse-Glimmer на драфтере-ассистенте
+/// (компонент `dflash` в бандле). Аналог MTP у гибрида: greedy-путь lossless.
+static DFLASH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_dflash_enabled(on: bool) {
+    DFLASH_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn dflash_enabled() -> bool {
+    DFLASH_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn set_flash_attn_mode(_mode: FlashAttnMode) {}

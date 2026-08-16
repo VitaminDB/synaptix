@@ -49,6 +49,8 @@ pub struct RunArgs {
     pub image: Option<PathBuf>,
     /// Видео для мультимодального промпта (Muse Glimmer).
     pub video: Option<PathBuf>,
+    /// Запретить DFlash-спекуляцию (Muse Glimmer), даже если драфтер в бандле.
+    pub no_dflash: bool,
 }
 
 /// `--kv-dtype` → DType KV-кеша. Делегирует в единый фасад.
@@ -142,6 +144,13 @@ fn run_muse(
     let t0 = std::time::Instant::now();
     let mut pipeline = MusePipeline::load_with_precision(&args.model, device, precision, args.max_seq)
         .map_err(|e| format!("load: {e}"))?;
+    if !args.no_dflash && args.temperature == 0.0 {
+        match pipeline.load_dflash(&args.model, precision) {
+            Ok(true) => eprintln!("synaptix run: DFlash-драфтер подключён"),
+            Ok(false) => {}
+            Err(e) => eprintln!("synaptix run: DFlash пропущен: {e}"),
+        }
+    }
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
     let need_vision = args.image.is_some() || args.video.is_some();
@@ -234,7 +243,20 @@ fn run_muse(
     }
 
     let use_graph = args.graph && !device.is_cpu() && pipeline.graph_decode_supported();
-    let (new_ids, stats) = if args.temperature == 0.0 && !device.is_cpu() {
+    let (new_ids, stats) = if args.temperature == 0.0 && pipeline.has_dflash() {
+        let mut noop = |_: u32| true;
+        let (ids, stats, dfs) = pipeline
+            .generate_dflash_streaming(&prompt_ids, gen_cfg, &mut noop)
+            .map_err(|e| format!("generate(dflash): {e}"))?;
+        eprintln!(
+            "synaptix run: DFlash блоков {} | черновиков {} | принято {} ({:.1}%)",
+            dfs.steps,
+            dfs.drafted,
+            dfs.accepted,
+            dfs.acceptance() * 100.0
+        );
+        (ids, stats)
+    } else if args.temperature == 0.0 && !device.is_cpu() {
         let mut noop = |_: u32| true;
         let (ids, stats, lk) = pipeline
             .generate_lookup_streaming(&prompt_ids, gen_cfg, &mut noop)

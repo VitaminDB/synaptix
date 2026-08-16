@@ -10,6 +10,7 @@ use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 
 use crate::config::MuseConfig;
+use crate::dflash::{self, DFlashConfig, DFlashModule};
 use crate::loader::MuseWeights;
 use crate::preprocess::{prepare_image, prepare_video, PreparedImage, PreparedVideo};
 use crate::vision::{BundleVisionWeights, VisionTower, VIS_PREFIX};
@@ -23,6 +24,7 @@ pub fn set_offload_mode_for_tests() {
 pub struct MusePipeline {
     pub model: DecoderModel,
     pub vision: Option<VisionTower>,
+    pub dflash: Option<DFlashModule>,
     pub tokenizer: HfTokenizer,
     pub config: MuseConfig,
     pub add_bos: bool,
@@ -126,7 +128,52 @@ impl MusePipeline {
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         .with_kv_cache_dtype(precision.kv);
-        Ok(Self { model, vision: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, vision: None, dflash: None, tokenizer, config, add_bos: false })
+    }
+
+    /// Подключить DFlash-драфтер из того же бандла (компонент `dflash`).
+    /// Возвращает `false`, если драфтера в бандле нет.
+    pub fn load_dflash(
+        &mut self,
+        path: impl AsRef<Path>,
+        precision: PrecisionConfig,
+    ) -> Result<bool, PipelineError> {
+        let path = path.as_ref();
+        let weights = MuseWeights::load(path, self.model.device, precision.compute)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        if !dflash::present(&weights) {
+            return Ok(false);
+        }
+        let cfg_bytes = synaptix_bundle::Bundle::open(path)
+            .and_then(|b| b.read_file("dflash_config.json").map(|c| c.into_owned()))
+            .map_err(|e| PipelineError::Load(format!("dflash_config.json: {e}")))?;
+        let dcfg = DFlashConfig::from_hf_bytes(&cfg_bytes)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        if dcfg.hidden_size != self.config.hidden_size {
+            return Err(PipelineError::Load(format!(
+                "dflash hidden {} != target hidden {}",
+                dcfg.hidden_size, self.config.hidden_size
+            )));
+        }
+        if let Some(&max_tap) = dcfg.target_layer_ids.iter().max() {
+            if max_tap >= self.config.num_hidden_layers {
+                return Err(PipelineError::Load(format!(
+                    "dflash target_layer_ids содержит слой {max_tap} ≥ {} слоёв target'а",
+                    self.config.num_hidden_layers
+                )));
+            }
+        }
+        let module = DFlashModule::build(
+            dcfg,
+            &weights,
+            self.model.device,
+            precision.compute,
+            precision.attn_w,
+            precision.mlp_w,
+        )
+        .map_err(|e| PipelineError::Load(format!("dflash: {e}")))?;
+        self.dflash = Some(module);
+        Ok(true)
     }
 
     pub fn load_vision(&mut self, path: impl AsRef<Path>, dtype: DType) -> Result<bool, PipelineError> {
@@ -463,6 +510,188 @@ impl MusePipeline {
         let (new_ids, stats) = self.generate(&ids, gen_cfg)?;
         let text = self.decode(&new_ids)?;
         Ok((text, stats))
+    }
+
+    pub fn has_dflash(&self) -> bool {
+        self.dflash.is_some()
+    }
+
+    /// Спекулятивный декод на DFlash-драфтере: блок из `draft_len` кандидатов за
+    /// один forward драфтера, верификация одним чанком target'а. Greedy-путь
+    /// lossless: принимаются только токены, совпавшие с argmax target'а.
+    pub fn generate_dflash_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        use synaptix_core::grad::no_grad;
+
+        let dflash = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("DFlash-драфтер не загружен".into()))?;
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg);
+        if cfg.temperature > 0.0 {
+            return Err(PipelineError::Model(
+                "DFlash-декод реализован для greedy (--temperature 0)".into(),
+            ));
+        }
+        let device = self.model.device;
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let l = prompt.len();
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut dcache = dflash
+            .make_cache()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let eos = synaptix_llm_common::generate::eos_set(&cfg);
+        let taps = dflash.config.target_layer_ids.clone();
+        let draft_len = dflash.config.draft_len();
+
+        let t0 = std::time::Instant::now();
+        let chunk = cfg.prefill_batch.max(1);
+        let mut off = 0usize;
+        let mut last_hidden: Option<Tensor> = None;
+        // Контекст драфтера после prefill — hidden ВСЕХ токенов промпта:
+        // anchor'ом диффузионного окна становится первый сгенерированный токен.
+        let mut tap_chunks: Vec<Vec<Tensor>> = vec![Vec::new(); taps.len()];
+        let ctx_pos0 = 0usize;
+        while off < l {
+            let end = (off + chunk).min(l);
+            let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let (h, tapped) = no_grad(|| self.model.forward_trunk_tapped(&part, &mut kv, &taps))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            for (slot, t) in tap_chunks.iter_mut().zip(tapped.into_iter()) {
+                slot.push(t);
+            }
+            last_hidden = Some(h);
+            off = end;
+        }
+        let hidden = last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
+        let mut ctx_pos = ctx_pos0;
+        let mut ctx_taps: Vec<Tensor> = tap_chunks
+            .iter()
+            .map(|parts| {
+                if parts.len() == 1 {
+                    Ok(parts[0].clone())
+                } else {
+                    let refs: Vec<&Tensor> = parts.iter().collect();
+                    Tensor::cat(&refs, 1)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let logits = self
+            .model
+            .head_at(&hidden, hidden.dims()[1] - 1)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let argmax_rows = |t: &Tensor| -> Result<Vec<u32>, PipelineError> {
+            let dims = t.dims().to_vec();
+            let vocab = dims[dims.len() - 1];
+            let rows = t.numel() / vocab;
+            let v = t
+                .to_dtype(DType::F32)
+                .and_then(|x| x.flatten_all())
+                .and_then(|x| x.to_vec1::<f32>())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            Ok((0..rows)
+                .map(|r| {
+                    v[r * vocab..(r + 1) * vocab]
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
+                })
+                .collect())
+        };
+
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        let mut anchor = argmax_rows(&logits)?[0];
+        out.push(anchor);
+        let mut cancelled = !sink.on_token(anchor);
+        let mut stats = LookupStats::default();
+
+        let dec_t0 = std::time::Instant::now();
+        'outer: while !cancelled && out.len() < cfg.max_new_tokens {
+            if eos.contains(&anchor) {
+                break;
+            }
+            let pos = kv.seq_len;
+            if pos + 1 >= kv.max_seq {
+                break;
+            }
+            let budget = (cfg.max_new_tokens - out.len()).min(kv.max_seq - pos - 1);
+            if budget == 0 {
+                break;
+            }
+
+            let dlogits = no_grad(|| {
+                dflash.draft_logits(&self.model, &mut dcache, &ctx_taps, ctx_pos, anchor)
+            })
+            .map_err(|e| PipelineError::Forward(format!("dflash draft: {e}")))?;
+            let mut draft = argmax_rows(&dlogits)?;
+            draft.truncate(draft_len.min(budget));
+            stats.steps += 1;
+            stats.drafted += draft.len();
+
+            let mut chunk_ids = Vec::with_capacity(1 + draft.len());
+            chunk_ids.push(anchor);
+            chunk_ids.extend_from_slice(&draft);
+            let s = chunk_ids.len();
+            let t = Tensor::from_vec(chunk_ids, vec![1usize, s], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let (hh, tapped) = no_grad(|| self.model.forward_trunk_tapped(&t, &mut kv, &taps))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let lg = self
+                .model
+                .heads_all(&hh)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let preds = argmax_rows(&lg)?;
+
+            let mut accepted = 0usize;
+            while accepted < draft.len() && preds[accepted] == draft[accepted] {
+                accepted += 1;
+            }
+            stats.accepted += accepted;
+            kv.seq_len = pos + 1 + accepted;
+
+            // Контекст следующего блока — принятые токены этого чанка
+            // (anchor + accepted), их hidden берём из tap-слоёв verify-прохода.
+            let keep = accepted + 1;
+            ctx_pos = pos;
+            ctx_taps = tapped
+                .iter()
+                .map(|x| x.narrow(1, 0, keep).and_then(|y| y.contiguous()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+
+            for &tok in preds.iter().take(keep) {
+                out.push(tok);
+                cancelled = !sink.on_token(tok);
+                anchor = tok;
+                if cancelled || out.len() >= cfg.max_new_tokens || eos.contains(&tok) {
+                    break 'outer;
+                }
+            }
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+        let new_tokens = out.len();
+        Ok((
+            out,
+            GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms },
+            stats,
+        ))
     }
 
     pub fn generate_lookup_streaming(
