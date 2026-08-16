@@ -132,11 +132,12 @@ pub struct WindowPlan {
 
 pub fn window_plan(grid: ImageGrid, window: usize) -> WindowPlan {
     let (gh, gw) = (grid.h, grid.w);
-    let mut index = Vec::with_capacity(gh * gw);
+    let mut index = Vec::with_capacity(grid.patches());
     let mut cu = vec![0usize];
     let nwh = gh.div_ceil(window);
     let nww = gw.div_ceil(window);
-    for _t in 0..grid.t {
+    for t in 0..grid.t {
+        let off = (t * gh * gw) as u32;
         for wh in 0..nwh {
             for ww in 0..nww {
                 let r0 = wh * window;
@@ -146,7 +147,7 @@ pub fn window_plan(grid: ImageGrid, window: usize) -> WindowPlan {
                 let mut count = 0usize;
                 for r in r0..r1 {
                     for c in c0..c1 {
-                        index.push((r * gw + c) as u32);
+                        index.push(off + (r * gw + c) as u32);
                         count += 1;
                     }
                 }
@@ -356,16 +357,22 @@ impl VisionTower {
         };
         let (q, k, v) = (heads_first(&q)?, heads_first(&k)?, heads_first(&v)?);
         let scale = 1.0 / (hd as f32).sqrt();
+        let q_chunk = 1024usize;
         let mut outs = Vec::with_capacity(cu.len().saturating_sub(1));
         for wi in 0..cu.len() - 1 {
             let start = cu[wi];
             let len = cu[wi + 1] - start;
-            let qs = e(q.narrow(1, start, len).and_then(|t| t.contiguous()))?;
             let ks = e(k.narrow(1, start, len).and_then(|t| t.contiguous()))?;
             let vs = e(v.narrow(1, start, len).and_then(|t| t.contiguous()))?;
-            let a = scaled_dot_attention(&qs, &ks, &vs, scale, None)
-                .map_err(|e| VisionError::Forward(e.to_string()))?;
-            outs.push(a);
+            let mut off = 0usize;
+            while off < len {
+                let step = q_chunk.min(len - off);
+                let qs = e(q.narrow(1, start + off, step).and_then(|t| t.contiguous()))?;
+                let a = scaled_dot_attention(&qs, &ks, &vs, scale, None)
+                    .map_err(|e| VisionError::Forward(e.to_string()))?;
+                outs.push(a);
+                off += step;
+            }
         }
         let refs: Vec<&Tensor> = outs.iter().collect();
         let attn = e(Tensor::cat(&refs, 1))?;
@@ -420,7 +427,8 @@ impl VisionTower {
         let idx = e(Tensor::from_vec(plan.index.clone(), vec![n], self.device))?;
         x = e(x.index_select(0, &idx))?;
 
-        let cu_full = vec![0usize, n];
+        let frame = grid.h * grid.w;
+        let cu_full: Vec<usize> = (0..=grid.t).map(|t| t * frame).collect();
         let (cos, sin) = self.rope_tables(grid, &plan.index);
         let hd = cfg.head_dim();
         let cos = e(Tensor::from_vec(cos, vec![n, 1, hd], self.device))?;

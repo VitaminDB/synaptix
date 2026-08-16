@@ -11,7 +11,7 @@ use synaptix_tokenizer::Tokenizer;
 
 use crate::config::MuseConfig;
 use crate::loader::MuseWeights;
-use crate::preprocess::{prepare_image, PreparedImage};
+use crate::preprocess::{prepare_image, prepare_video, PreparedImage, PreparedVideo};
 use crate::vision::{BundleVisionWeights, VisionTower, VIS_PREFIX};
 
 pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink};
@@ -26,6 +26,29 @@ pub struct MusePipeline {
     pub tokenizer: HfTokenizer,
     pub config: MuseConfig,
     pub add_bos: bool,
+}
+
+pub struct VideoPromptInfo {
+    pub groups: usize,
+    pub tokens_per_group: usize,
+    pub timestamps: Vec<f32>,
+}
+
+impl VideoPromptInfo {
+    pub fn prompt_block(&self) -> String {
+        let mut s = String::from("<|vid_start|>");
+        for g in 0..self.groups {
+            let ts = self.timestamps.get(g).copied().unwrap_or(0.0);
+            s.push_str(&format!("Time: {ts:.1}s"));
+            s.push_str(&"<|video|>".repeat(self.tokens_per_group));
+            if g + 1 < self.groups {
+                s.push_str("<|vid_frame_separator|>");
+            } else {
+                s.push_str("<|vid_end|>");
+            }
+        }
+        s
+    }
 }
 
 impl MusePipeline {
@@ -82,6 +105,14 @@ impl MusePipeline {
         self.vision.is_some()
     }
 
+    pub fn release_vision(&mut self) {
+        if self.vision.take().is_some() {
+            if let Device::Cuda(o) = self.model.device {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+            }
+        }
+    }
+
     pub fn encode_image(&self, path: impl AsRef<Path>) -> Result<Tensor, PipelineError> {
         use synaptix_core::grad::no_grad;
         let tower = self
@@ -92,6 +123,25 @@ impl MusePipeline {
             .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
         no_grad(|| tower.forward(&patches, grid))
             .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))
+    }
+
+    pub fn encode_video(&self, path: impl AsRef<Path>) -> Result<(Tensor, VideoPromptInfo), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let PreparedVideo { patches, grid, group_timestamps } =
+            prepare_video(path, &tower.config, self.model.device)
+                .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
+        let feats = no_grad(|| tower.forward(&patches, grid))
+            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        let info = VideoPromptInfo {
+            groups: grid.t,
+            tokens_per_group: (grid.h * grid.w) / tower.config.merge_unit(),
+            timestamps: group_timestamps,
+        };
+        Ok((feats, info))
     }
 
     pub fn image_token_count(&self, path: impl AsRef<Path>) -> Result<usize, PipelineError> {
@@ -108,19 +158,17 @@ impl MusePipeline {
         Ok((nh / cfg.patch_size) * (nw / cfg.patch_size) / cfg.merge_unit())
     }
 
-    fn embed_with_images(
+    fn embed_with_media(
         &self,
         ids: &[u32],
-        image_embeds: &[Tensor],
+        pad: u32,
+        feats: &Tensor,
     ) -> Result<Tensor, PipelineError> {
         let device = self.model.device;
-        let pad = self
-            .config
-            .image_token_id
-            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
         let hidden = self.config.hidden_size;
+        let total = feats.dims()[0];
         let mut segments: Vec<Tensor> = Vec::new();
-        let mut img_idx = 0usize;
+        let mut cursor = 0usize;
         let mut i = 0usize;
         while i < ids.len() {
             if ids[i] == pad {
@@ -129,22 +177,19 @@ impl MusePipeline {
                     i += 1;
                 }
                 let run = i - start;
-                let emb = image_embeds.get(img_idx).ok_or_else(|| {
-                    PipelineError::Forward(format!(
-                        "изображений меньше, чем блоков <|patch|> (нужен #{img_idx})"
-                    ))
-                })?;
-                img_idx += 1;
-                if emb.dims()[0] != run {
+                if cursor + run > total {
                     return Err(PipelineError::Forward(format!(
-                        "<|patch|>-блок {run} токенов, а vision дал {}",
-                        emb.dims()[0]
+                        "медиа-токенов в промпте больше, чем строк эмбеддингов: {} > {total}",
+                        cursor + run
                     )));
                 }
-                let e = emb
-                    .to_dtype(self.model.dtype)
+                let e = feats
+                    .narrow(0, cursor, run)
+                    .and_then(|t| t.contiguous())
+                    .and_then(|t| t.to_dtype(self.model.dtype))
                     .and_then(|t| t.reshape(vec![1usize, run, hidden]))
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                cursor += run;
                 segments.push(e);
             } else {
                 let start = i;
@@ -160,6 +205,11 @@ impl MusePipeline {
                 segments.push(e);
             }
         }
+        if cursor != total {
+            return Err(PipelineError::Forward(format!(
+                "vision дал {total} эмбеддингов, а промпт использует {cursor}"
+            )));
+        }
         let refs: Vec<&Tensor> = segments.iter().collect();
         Tensor::cat(&refs, 1).map_err(|e| PipelineError::Forward(e.to_string()))
     }
@@ -168,6 +218,37 @@ impl MusePipeline {
         &self,
         prompt_ids: &[u32],
         image_embeds: &[Tensor],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let pad = self
+            .config
+            .image_token_id
+            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+        let refs: Vec<&Tensor> = image_embeds.iter().collect();
+        let feats = Tensor::cat(&refs, 0).map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_media(prompt_ids, pad, &feats, gen_cfg, sink)
+    }
+
+    pub fn generate_with_video(
+        &self,
+        prompt_ids: &[u32],
+        video_embeds: &Tensor,
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let pad = self
+            .config
+            .video_token_id
+            .ok_or_else(|| PipelineError::Model("config.json без video_token_id".into()))?;
+        self.generate_with_media(prompt_ids, pad, video_embeds, gen_cfg, sink)
+    }
+
+    fn generate_with_media(
+        &self,
+        prompt_ids: &[u32],
+        pad: u32,
+        feats: &Tensor,
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
@@ -188,12 +269,25 @@ impl MusePipeline {
         let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
 
         let t0 = std::time::Instant::now();
-        let emb = self.embed_with_images(prompt_ids, image_embeds)?;
-        let hidden = no_grad(|| self.model.forward_from_hidden(&emb, &mut kv))
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let emb = self.embed_with_media(prompt_ids, pad, feats)?;
+        let chunk = if cfg.prefill_batch == 0 { 512 } else { cfg.prefill_batch };
+        let mut off = 0usize;
+        let mut last_hidden = None;
+        while off < l {
+            let step = chunk.min(l - off);
+            let part = emb
+                .narrow(1, off, step)
+                .and_then(|t| t.contiguous())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let h = no_grad(|| self.model.forward_from_hidden(&part, &mut kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            last_hidden = Some(h);
+            off += step;
+        }
+        let hidden = last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
         let mut logits = self
             .model
-            .head_at(&hidden, l - 1)
+            .head_at(&hidden, hidden.dims()[1] - 1)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
         let prefill_ms = t0.elapsed().as_millis();
 

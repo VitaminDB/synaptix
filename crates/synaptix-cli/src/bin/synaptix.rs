@@ -123,6 +123,9 @@ enum Commands {
         /// Изображение для мультимодального промпта.
         #[arg(long)]
         image: Option<PathBuf>,
+        /// Видео для мультимодального промпта (Muse Glimmer).
+        #[arg(long)]
+        video: Option<PathBuf>,
     },
     Chat {
         model: PathBuf,
@@ -660,7 +663,7 @@ fn main() -> ExitCode {
         Commands::Run {
             model, prompt, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, mtp, no_mtp, no_graph_mtp, image,
+            warmup, mtp, no_mtp, no_graph_mtp, image, video,
         } => {
             run_cmd::run(run_cmd::RunArgs {
                 model,
@@ -682,6 +685,7 @@ fn main() -> ExitCode {
                 no_mtp,
                 no_graph_mtp,
                 image,
+                video,
                 warmup,
             })
         }

@@ -47,6 +47,8 @@ pub struct RunArgs {
     pub no_graph_mtp: bool,
     /// Изображение для мультимодального промпта (Qwen3.6-VL).
     pub image: Option<PathBuf>,
+    /// Видео для мультимодального промпта (Muse Glimmer).
+    pub video: Option<PathBuf>,
 }
 
 /// `--kv-dtype` → DType KV-кеша. Делегирует в единый фасад.
@@ -113,6 +115,9 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.kv_dtype.as_deref(),
     )?;
     let arch = detect_arch(&args.model)?;
+    if args.video.is_some() && arch != Arch::MuseGlimmer {
+        return Err("--video поддержан только для muse_glimmer".into());
+    }
     eprintln!(
         "synaptix run: loading model from {} (arch={arch:?}, compute={:?}, attn_w={:?}, mlp_w={:?}, lm_head={:?}, embed={:?}, kv={:?}, {:?})",
         args.model.display(),
@@ -139,14 +144,16 @@ fn run_muse(
         .map_err(|e| format!("load: {e}"))?;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
+    let need_vision = args.image.is_some() || args.video.is_some();
+    if need_vision
+        && !pipeline
+            .load_vision(&args.model, compute)
+            .map_err(|e| format!("vision load: {e}"))?
+    {
+        return Err("в бандле нет vision-башни (model.vision_tower.*)".into());
+    }
     let image_embeds = match &args.image {
         Some(path) => {
-            if !pipeline
-                .load_vision(&args.model, compute)
-                .map_err(|e| format!("vision load: {e}"))?
-            {
-                return Err("в бандле нет vision-башни (model.vision_tower.*)".into());
-            }
             let n = pipeline.image_token_count(path).map_err(|e| format!("image: {e}"))?;
             let emb = pipeline.encode_image(path).map_err(|e| format!("image: {e}"))?;
             eprintln!("synaptix run: image {} → {} vision-токенов", path.display(), n);
@@ -154,17 +161,38 @@ fn run_muse(
         }
         None => None,
     };
+    let video_embeds = match &args.video {
+        Some(path) => {
+            let (emb, info) = pipeline.encode_video(path).map_err(|e| format!("video: {e}"))?;
+            eprintln!(
+                "synaptix run: video {} → {} групп × {} токенов",
+                path.display(),
+                info.groups,
+                info.tokens_per_group
+            );
+            Some((emb, info))
+        }
+        None => None,
+    };
+    if need_vision {
+        pipeline.release_vision();
+    }
     let pipeline = pipeline;
 
-    let prompt_text = match &image_embeds {
-        Some((n, _)) => {
-            let pad = "<|patch|>".repeat(*n);
-            format!(
-                "<|begin_of_text|><|start|>user<|message|><|image_start|>{pad}<|image_end|>{}<|eot|><|start|>assistant",
-                args.prompt
-            )
-        }
-        None => args.prompt.clone(),
+    let prompt_text = if let Some((n, _)) = &image_embeds {
+        let pad = "<|patch|>".repeat(*n);
+        format!(
+            "<|begin_of_text|><|start|>user<|message|><|image_start|>{pad}<|image_end|>{}<|eot|><|start|>assistant",
+            args.prompt
+        )
+    } else if let Some((_, info)) = &video_embeds {
+        format!(
+            "<|begin_of_text|><|start|>user<|message|>{}{}<|eot|><|start|>assistant",
+            info.prompt_block(),
+            args.prompt
+        )
+    } else {
+        args.prompt.clone()
     };
     let prompt_ids = pipeline.encode(&prompt_text).map_err(|e| format!("tokenize: {e}"))?;
     eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
@@ -177,12 +205,20 @@ fn run_muse(
         ..Default::default()
     };
 
-    if let Some((_, emb)) = &image_embeds {
+    let media = if let Some((_, emb)) = &image_embeds {
+        Some((emb.clone(), true))
+    } else {
+        video_embeds.as_ref().map(|(emb, _)| (emb.clone(), false))
+    };
+    if let Some((emb, is_image)) = media {
         let mut noop = |_: u32| true;
         let t = std::time::Instant::now();
-        let (ids, stats) = pipeline
-            .generate_with_images(&prompt_ids, std::slice::from_ref(emb), gen_cfg, &mut noop)
-            .map_err(|e| format!("vlm generate: {e}"))?;
+        let res = if is_image {
+            pipeline.generate_with_images(&prompt_ids, std::slice::from_ref(&emb), gen_cfg, &mut noop)
+        } else {
+            pipeline.generate_with_video(&prompt_ids, &emb, gen_cfg, &mut noop)
+        };
+        let (ids, stats) = res.map_err(|e| format!("vlm generate: {e}"))?;
         let text = pipeline.decode(&ids).map_err(|e| format!("decode: {e}"))?;
         println!("{text}");
         eprintln!(
