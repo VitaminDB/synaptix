@@ -425,7 +425,19 @@ fn dflash_matches_reference() {
     })
     .expect("draft");
 
-    compare("dflash candidate logits", &to_f32(&logits), &logits_ref, 0.99);
+    // Мы прогоняем драфт-логиты через тот же lm_head-эпилог, что и основную
+    // модель (output_multiplier + tanh-softcap); HF в DFlash-генераторе зовёт
+    // голый lm_head. Для argmax это эквивалентно, но для сверки значений
+    // приводим эталон к тому же виду.
+    let softcap: Vec<f32> = logits_ref
+        .iter()
+        .map(|x| {
+            let m = 0.196_116_14f32;
+            let cap = 20.0f32;
+            cap * (x * m / cap).tanh()
+        })
+        .collect();
+    compare("dflash candidate logits", &to_f32(&logits), &softcap, 0.99);
 
     let dims = logits.dims().to_vec();
     let vocab = dims[dims.len() - 1];
