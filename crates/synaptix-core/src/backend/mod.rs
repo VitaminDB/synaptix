@@ -448,6 +448,22 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("flash_attention_window не поддержан этим backend"))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_window_dev(
+        &self,
+        _q: (&Storage, &Layout),
+        _k: (&Storage, &Layout),
+        _v: (&Storage, &Layout),
+        _t_cache: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _scale: f32,
+        _window: i32,
+        _causal: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("flash_attention_window_dev не поддержан этим backend"))
+    }
+
     /// Flash-attention в layout [B,S,H,D] (head-минорный) — image-attn без
     /// permute+contiguous транспоза. Default Unsupported → caller fallback.
     #[allow(clippy::too_many_arguments)]

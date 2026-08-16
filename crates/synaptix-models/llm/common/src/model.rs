@@ -479,6 +479,8 @@ pub struct DecodeState {
     pub input: Tensor,
     pub pos_dev: Tensor,
     pub tcache_dev: Tensor,
+    pub ring_pos_dev: Tensor,
+    pub ring_len_dev: Tensor,
     pub rope_cos: Tensor,
     pub rope_sin: Tensor,
     pub logits: Tensor,
@@ -486,9 +488,15 @@ pub struct DecodeState {
 
 impl DecodeState {
     pub fn update(&mut self, token: u32, pos: u32) -> Result<(), ModelError> {
+        self.update_ring(token, pos, 0)
+    }
+
+    pub fn update_ring(&mut self, token: u32, pos: u32, ring_start: u32) -> Result<(), ModelError> {
         self.input.write_host_u32(&[token]).coerr()?;
         self.pos_dev.write_host_u32(&[pos]).coerr()?;
         self.tcache_dev.write_host_u32(&[pos + 1]).coerr()?;
+        self.ring_pos_dev.write_host_u32(&[pos - ring_start]).coerr()?;
+        self.ring_len_dev.write_host_u32(&[pos + 1 - ring_start]).coerr()?;
         Ok(())
     }
 
@@ -1037,6 +1045,17 @@ impl DecoderModel {
         self.lm_head_forward(&row)
     }
 
+    pub fn heads_all(&self, hidden: &Tensor) -> Result<Tensor, ModelError> {
+        let normed = prof(self.device, "norm", || {
+            rms_norm(hidden, &self.final_norm, self.config.rms_norm_eps).coerr()
+        })?;
+        let dims = normed.dims().to_vec();
+        let flat = normed
+            .reshape(vec![dims[0] * dims[1], dims[2]])
+            .coerr()?;
+        self.lm_head_forward(&flat)
+    }
+
     pub fn forward_trunk(&self, input_ids: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {
         if input_ids.rank() != 2 {
             return Err(ModelError::Shape(format!("input_ids must be [B, S], got {:?}", input_ids.dims())));
@@ -1276,18 +1295,59 @@ impl DecoderModel {
     /// position). `batch==1` is the ordinary single-sequence decode.
     pub fn make_decode_state_batched(&self, batch: usize) -> Result<DecodeState, ModelError> {
         if !self.config.graph_decode_ok() {
-            return Err(ModelError::Forward("make_decode_state: профиль не поддержан CUDA-graph (sandwich/sliding/local-rope)".into()));
+            return Err(ModelError::Forward("make_decode_state: профиль не поддержан CUDA-graph (два реальных RoPE)".into()));
+        }
+        if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
+            return Err(ModelError::Forward(
+                "make_decode_state: sliding-профиль требует ring-KV (CUDA, f16/bf16, hd=128)".into(),
+            ));
         }
         let dev = self.device;
         let input = Tensor::from_vec(vec![0u32; batch], vec![batch, 1], dev).coerr()?;
         let pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let tcache_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
-        let cos = self.rope_global.cos();
-        let sin = self.rope_global.sin();
+        let ring_pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
+        let ring_len_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
+        let rope = if self.config.rope_global.rotary_dim > 0 {
+            &self.rope_global
+        } else {
+            self.rope_local.as_ref().unwrap_or(&self.rope_global)
+        };
+        let cos = rope.cos();
+        let sin = rope.sin();
         let rope_cos = Tensor::cat(&[cos, cos], 1).coerr()?.to_dtype(self.dtype).coerr()?;
         let rope_sin = Tensor::cat(&[sin, sin], 1).coerr()?.to_dtype(self.dtype).coerr()?;
         let logits = Tensor::zeros(vec![batch, self.config.vocab_size], self.dtype, dev).coerr()?;
-        Ok(DecodeState { input, pos_dev, tcache_dev, rope_cos, rope_sin, logits })
+        Ok(DecodeState { input, pos_dev, tcache_dev, ring_pos_dev, ring_len_dev, rope_cos, rope_sin, logits })
+    }
+
+    pub fn ring_prepare_decode(&self, kv: &mut KvCache, pos: usize) -> Result<usize, ModelError> {
+        let Some(w) = self.config.sliding_window else { return Ok(0) };
+        if !self.ring_kv_ok() {
+            return Ok(0);
+        }
+        let mut start = 0usize;
+        for l in 0..self.blocks.len() {
+            if self.config.window_for(l).is_none() {
+                continue;
+            }
+            let LayerCache::Full(kvl) = &mut kv.layers[l] else { continue };
+            let cap = kvl.k.dims()[2];
+            if pos - kvl.start + 1 > cap {
+                let lo_global = (pos + 1).saturating_sub(w);
+                let keep = pos - lo_global;
+                if keep > 0 {
+                    let src = lo_global - kvl.start;
+                    let tk = kvl.k.narrow(2, src, keep).coerr()?.contiguous().coerr()?;
+                    let tv = kvl.v.narrow(2, src, keep).coerr()?.contiguous().coerr()?;
+                    kvl.k.kv_append_inplace(&tk, 0).coerr()?;
+                    kvl.v.kv_append_inplace(&tv, 0).coerr()?;
+                }
+                kvl.start = lo_global;
+            }
+            start = kvl.start;
+        }
+        Ok(start)
     }
 
     /// Засеять/восстановить device-зеркала linear-слоёв из host-состояния KV.
@@ -1340,7 +1400,10 @@ impl DecoderModel {
 
     pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
         if !self.config.graph_decode_ok() {
-            return Err(ModelError::Forward("forward_decode_dev: профиль не поддержан (sandwich/sliding/local-rope)".into()));
+            return Err(ModelError::Forward("forward_decode_dev: профиль не поддержан (два реальных RoPE)".into()));
+        }
+        if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
+            return Err(ModelError::Forward("forward_decode_dev: sliding без ring-KV не поддержан".into()));
         }
         let dev = self.device;
         // Batch B: state.input is [B, 1]; B>1 runs a batched decode (e.g. CFG
@@ -1351,6 +1414,9 @@ impl DecoderModel {
         let mut hidden = emb.reshape(vec![b, 1, self.config.hidden_size]).coerr()?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
+        }
+        if let Some(w) = &self.embed_norm {
+            hidden = rms_norm(&hidden, w, self.config.rms_norm_eps).coerr()?;
         }
 
         // Fused residual+norm цепочкой: каждая пара (add, следующий rms_norm)
@@ -1368,11 +1434,13 @@ impl DecoderModel {
                 Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[idx], state)?,
                 Mixer::Linear(la) => la.forward_decode_dev(&h, &mut kv.layers[idx])?,
             };
+            let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
             // hidden = hidden + mixed; h_mlp = norm(hidden, pre_mlp).
             let (new_hidden, h_mlp) =
                 fused_add_norm(dev, &mixed, &hidden, &blk.pre_mlp_norm, blk.rms_eps)?;
             hidden = new_hidden;
             let mlp_out = blk.mlp.forward(&h_mlp)?;
+            let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             if idx + 1 < nb {
                 // hidden = hidden + mlp_out; h = norm(hidden, next.pre_attn).
                 let nb_next = &self.blocks[idx + 1];
@@ -1387,7 +1455,7 @@ impl DecoderModel {
 
         let normed = prof(dev, "rms_norm", || rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)).coerr()?;
         let last = normed.narrow(1, 0, 1).coerr()?.squeeze(1).coerr()?;
-        let logits = prof(dev, "lm_head", || self.lm_head.forward(&last))?;
+        let logits = self.lm_head_forward(&last)?;
         prof(dev, "logits_copy", || state.logits.copy_from(&logits)).coerr()?;
         Ok(())
     }
@@ -1722,8 +1790,38 @@ impl FullAttn {
             .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
-        let q = prof(dev, "attn_rope", || q.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
-        let k = prof(dev, "attn_rope", || k.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
+        let (q, k) = if self.rotary_dim > 0 {
+            let q = prof(dev, "attn_rope", || q.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
+            let k = prof(dev, "attn_rope", || k.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
+            (q, k)
+        } else {
+            (q, k)
+        };
+
+        if let Some(w) = self.sliding_window {
+            prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
+                kvl.k.kv_append_dev(&k, &state.ring_pos_dev).coerr()?;
+                kvl.v.kv_append_dev(&v, &state.ring_pos_dev).coerr()
+            })?;
+            let attn = prof(dev, "attn_flash", || {
+                q.flash_attention_window_dev(
+                    &kvl.k,
+                    &kvl.v,
+                    &state.ring_len_dev,
+                    self.attn_scale,
+                    (w - 1) as i32,
+                    true,
+                )
+            })
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+            let attn = attn.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
+            let attn = match gate {
+                Some(g) => prof(dev, "attn_gate", || attn.mul(&g.sigmoid()?)).coerr()?,
+                None => attn,
+            };
+            let attn = attn.reshape(vec![b, 1, nh * hd]).coerr()?;
+            return prof(dev, "attn_oproj", || self.o_proj.forward(&attn));
+        }
 
         let attn = if kvl.k.dtype() == DType::MXFP8 {
             let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kvl;

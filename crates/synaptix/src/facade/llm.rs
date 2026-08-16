@@ -377,10 +377,23 @@ impl LlmPipeline {
                 .generate_streaming(prompt_ids, cfg, sink)
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
-            LlmPipeline::MuseGlimmer(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::MuseGlimmer(p) => {
+                if cfg.temperature == 0.0 && matches!(p.model.device, Device::Cuda(_)) {
+                    return p
+                        .generate_lookup_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                if p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             LlmPipeline::Hybrid(p) => {
                 if mtp_enabled() && p.has_mtp() {
                     {
