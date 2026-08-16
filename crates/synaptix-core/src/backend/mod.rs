@@ -442,6 +442,7 @@ pub trait Backend: Send + Sync + 'static {
         _out: (&mut Storage, &Layout),
         _scale: f32,
         _window: i32,
+        _causal: bool,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("flash_attention_window не поддержан этим backend"))

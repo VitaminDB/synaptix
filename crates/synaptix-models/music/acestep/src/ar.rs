@@ -230,7 +230,7 @@ fn merge_kv2(
                 }
                 let k = Tensor::cat(&[&ka.k, &kb.k], 0)?;
                 let v = Tensor::cat(&[&ka.v, &kb.v], 0)?;
-                layers.push(LayerCache::Full(KvCacheLayer { k, v, k_scale: None, v_scale: None }));
+                layers.push(LayerCache::Full(KvCacheLayer { k, v, k_scale: None, v_scale: None, start: 0 }));
             }
             _ => return Err(AceError::Other("batched AR decode: non-full layer cache".into())),
         }

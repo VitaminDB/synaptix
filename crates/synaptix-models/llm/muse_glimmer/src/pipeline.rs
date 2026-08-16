@@ -270,7 +270,10 @@ impl MusePipeline {
 
         let t0 = std::time::Instant::now();
         let emb = self.embed_with_media(prompt_ids, pad, feats)?;
-        let chunk = if cfg.prefill_batch == 0 { 512 } else { cfg.prefill_batch };
+        let chunk = match cfg.prefill_batch {
+            0 => 512,
+            n => n.min(synaptix_llm_common::model::RING_SLACK),
+        };
         let mut off = 0usize;
         let mut last_hidden = None;
         while off < l {
@@ -345,6 +348,11 @@ impl MusePipeline {
         if cfg.eos_token_id.is_none() && cfg.eos_token_ids.is_empty() {
             cfg.eos_token_ids = self.config.eos_token_ids.clone();
         }
+        let cap = synaptix_llm_common::model::RING_SLACK;
+        cfg.prefill_batch = match cfg.prefill_batch {
+            0 => 1024,
+            n => n.min(cap),
+        };
         cfg
     }
 

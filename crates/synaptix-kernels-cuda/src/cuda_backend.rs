@@ -2031,6 +2031,7 @@ impl Backend for CudaBackend {
         out: (&mut Storage, &Layout),
         scale: f32,
         window: i32,
+        causal: bool,
         _stream: &Stream,
     ) -> Result<()> {
         let (q_st, q_lo) = q;
@@ -2038,8 +2039,8 @@ impl Backend for CudaBackend {
         let (v_st, v_lo) = v;
         let (out_st, _out_lo) = out;
         let dtype = q_lo.dtype();
-        if dtype != DType::BF16 || k_lo.dtype() != dtype || v_lo.dtype() != dtype {
-            return Err(SynaptixError::Unsupported("flash_window: bf16 only"));
+        if !matches!(dtype, DType::BF16 | DType::F16) || k_lo.dtype() != dtype || v_lo.dtype() != dtype {
+            return Err(SynaptixError::Unsupported("flash_window: f16/bf16 only"));
         }
         if q_lo.dims().len() != 4 || k_lo.dims().len() != 4 || v_lo.dims().len() != 4 {
             return Err(SynaptixError::Unsupported("flash_window: rank-4"));
@@ -2102,6 +2103,7 @@ impl Backend for CudaBackend {
         crate::attention::flash_splitq::flash_splitq_window_u8(
             &kernels,
             &stream,
+            dtype,
             q_buf.slice(),
             q_lo.byte_offset(),
             k_buf.slice(),
@@ -2116,7 +2118,7 @@ impl Backend for CudaBackend {
             t_q as u32,
             t_kv as u32,
             scale,
-            false,
+            causal,
             t_stride,
             window,
         )

@@ -754,4 +754,17 @@ __global__ void FSQ_BOUNDS flash_splitq5_bf16_hd128_win(
   flash_splitq_impl<__nv_bfloat16, 128, 64, 64, 4, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 0, window);
 }
 
+__global__ void FSQ_BOUNDS flash_splitq_f16_hd128_win(
+    const __half* q, const __half* k, const __half* v,
+    __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride, int window) {
+  flash_splitq_impl<__half, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 0, window);
+}
+__global__ void FSQ_BOUNDS flash_splitq5_f16_hd128_win(
+    const __half* q, const __half* k, const __half* v,
+    __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride, int window) {
+  flash_splitq_impl<__half, 128, 64, 64, 4, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 0, window);
+}
+
 }  // extern "C"
