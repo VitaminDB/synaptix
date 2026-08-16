@@ -10,8 +10,10 @@ use synaptix_ops::norm::rms_norm::rms_norm;
 use synaptix_ops::pos::rope::{apply_rope_range, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
 
-pub const DFLASH_PREFIX: &str = "dflash";
 pub const DFLASH_COMPONENT: &str = "dflash";
+/// Имена тензоров внутри компонента уже несут префикс компонента —
+/// `syn-pack --component dflash:<dir>:dflash` пишет их как `dflash.<orig>`.
+pub const DFLASH_PREFIX: &str = "dflash";
 
 const RING_SLACK: usize = 2048;
 
@@ -170,6 +172,36 @@ pub struct DFlashModule {
     rope: RopeCache,
     device: Device,
     compute: DType,
+}
+
+/// Веса драфтера лежат отдельным компонентом бандла (`tensors:dflash`) — со
+/// своими, не префиксованными именами (`encoder.fc.weight`, `layers.N.*`).
+pub struct BundleDFlashWeights {
+    loader: synaptix_io::weights::syn_bundle::SynBundleLoader,
+}
+
+impl BundleDFlashWeights {
+    pub fn open(path: impl AsRef<std::path::Path>, device: Device) -> Result<Self, ModelError> {
+        let loader = synaptix_io::weights::syn_bundle::SynBundleLoader::open(path)
+            .map_err(|e| ModelError::Load(e.to_string()))?
+            .with_component(DFLASH_COMPONENT)
+            .with_device(device);
+        Ok(Self { loader })
+    }
+}
+
+impl WeightSource for BundleDFlashWeights {
+    fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, ModelError> {
+        use synaptix_io::weights::WeightLoader;
+        self.loader
+            .load_to(key, device, dtype)
+            .map_err(|e| ModelError::Load(format!("dflash {key}: {e}")))
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        use synaptix_io::weights::WeightLoader;
+        self.loader.names().iter().any(|n| *n == key)
+    }
 }
 
 pub fn present(weights: &dyn WeightSource) -> bool {

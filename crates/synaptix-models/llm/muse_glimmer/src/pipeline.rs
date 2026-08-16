@@ -53,6 +53,11 @@ impl LookupStats {
     }
 }
 
+/// Черновик усечён до 8 токенов: замеры на RTX 5090 (NVFP4) дают 61.6 tok/s
+/// против 56.8 на полном блоке из 15 — хвост блока почти не принимается,
+/// а verify-чанк дорожает.
+const DFLASH_DEFAULT_SPAN: usize = 8;
+
 const LOOKUP_NGRAM: usize = 3;
 const LOOKUP_SPAN: usize = 12;
 
@@ -139,7 +144,7 @@ impl MusePipeline {
         precision: PrecisionConfig,
     ) -> Result<bool, PipelineError> {
         let path = path.as_ref();
-        let weights = MuseWeights::load(path, self.model.device, precision.compute)
+        let weights = dflash::BundleDFlashWeights::open(path, self.model.device)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         if !dflash::present(&weights) {
             return Ok(false);
@@ -163,13 +168,29 @@ impl MusePipeline {
                 )));
             }
         }
+        // Драфтер маленький (2.3B), но его черновики напрямую определяют
+        // приёмку — агрессивный квант съедает выигрыш. Дефолт MXFP8 (2.6 ГБ),
+        // переопределяется `SYN_DFLASH_W=nvfp4|mxfp8|f16|bf16`.
+        let dw = match std::env::var("SYN_DFLASH_W").as_deref() {
+            Ok("nvfp4") => DType::NVFP4,
+            Ok("f16") => DType::F16,
+            Ok("bf16") => DType::BF16,
+            Ok("mxfp8") => DType::MXFP8,
+            _ => {
+                if precision.attn_w.is_quantized() {
+                    DType::MXFP8
+                } else {
+                    precision.attn_w
+                }
+            }
+        };
         let module = DFlashModule::build(
             dcfg,
             &weights,
             self.model.device,
             precision.compute,
-            precision.attn_w,
-            precision.mlp_w,
+            dw,
+            dw,
         )
         .map_err(|e| PipelineError::Load(format!("dflash: {e}")))?;
         self.dflash = Some(module);
@@ -553,7 +574,14 @@ impl MusePipeline {
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
         let taps = dflash.config.target_layer_ids.clone();
-        let draft_len = dflash.config.draft_len();
+        // Драфтер денойзит весь блок сразу, поэтому хвост блока угадывается
+        // хуже головы: усечение черновика удешевляет verify-чанк, почти не
+        // теряя принятых токенов. Подбирается `SYN_DFLASH_SPAN`.
+        let draft_len = std::env::var("SYN_DFLASH_SPAN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, dflash.config.draft_len()))
+            .unwrap_or_else(|| DFLASH_DEFAULT_SPAN.min(dflash.config.draft_len()));
 
         let t0 = std::time::Instant::now();
         let chunk = cfg.prefill_batch.max(1);
@@ -595,6 +623,8 @@ impl MusePipeline {
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
         let prefill_ms = t0.elapsed().as_millis();
 
+        // CUDA-argmax по словарю 202k оказался в 2.5× медленнее host-пути
+        // (generic-reduce без специализации), поэтому логиты уезжают в host.
         let argmax_rows = |t: &Tensor| -> Result<Vec<u32>, PipelineError> {
             let dims = t.dims().to_vec();
             let vocab = dims[dims.len() - 1];
@@ -621,6 +651,10 @@ impl MusePipeline {
         out.push(anchor);
         let mut cancelled = !sink.on_token(anchor);
         let mut stats = LookupStats::default();
+        // Диагностика: пересобирать контекст драфтера с нуля каждый блок
+        // (проверка инкрементального кэша). Дорого по памяти, только для отладки.
+        let full_ctx = std::env::var("SYN_DFLASH_FULLCTX").is_ok();
+        let mut all_taps: Vec<Vec<Tensor>> = ctx_taps.iter().map(|t| vec![t.clone()]).collect();
 
         let dec_t0 = std::time::Instant::now();
         'outer: while !cancelled && out.len() < cfg.max_new_tokens {
@@ -636,8 +670,22 @@ impl MusePipeline {
                 break;
             }
 
+            let (draft_ctx, draft_pos) = if full_ctx {
+                dcache.reset();
+                let joined: Vec<Tensor> = all_taps
+                    .iter()
+                    .map(|parts| {
+                        let refs: Vec<&Tensor> = parts.iter().collect();
+                        if refs.len() == 1 { Ok(refs[0].clone()) } else { Tensor::cat(&refs, 1) }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                (joined, 0usize)
+            } else {
+                (ctx_taps.clone(), ctx_pos)
+            };
             let dlogits = no_grad(|| {
-                dflash.draft_logits(&self.model, &mut dcache, &ctx_taps, ctx_pos, anchor)
+                dflash.draft_logits(&self.model, &mut dcache, &draft_ctx, draft_pos, anchor)
             })
             .map_err(|e| PipelineError::Forward(format!("dflash draft: {e}")))?;
             let mut draft = argmax_rows(&dlogits)?;
@@ -663,6 +711,16 @@ impl MusePipeline {
             while accepted < draft.len() && preds[accepted] == draft[accepted] {
                 accepted += 1;
             }
+            if std::env::var("SYN_DFLASH_DEBUG").is_ok() && stats.steps <= 4 {
+                let n = draft.len().min(8);
+                eprintln!(
+                    "[dflash#{}] anchor={anchor} ctx_pos={ctx_pos} m={} draft={:?} preds={:?} accepted={accepted}",
+                    stats.steps,
+                    ctx_taps[0].dims()[1],
+                    &draft[..n],
+                    &preds[..n],
+                );
+            }
             stats.accepted += accepted;
             kv.seq_len = pos + 1 + accepted;
 
@@ -675,6 +733,11 @@ impl MusePipeline {
                 .map(|x| x.narrow(1, 0, keep).and_then(|y| y.contiguous()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            if full_ctx {
+                for (slot, t) in all_taps.iter_mut().zip(ctx_taps.iter()) {
+                    slot.push(t.clone());
+                }
+            }
 
             for &tok in preds.iter().take(keep) {
                 out.push(tok);

@@ -6,7 +6,7 @@ pub mod preprocess;
 pub mod vision;
 
 pub use config::{ConfigError, MuseConfig, VisionConfig};
-pub use dflash::{DFlashCache, DFlashConfig, DFlashModule};
+pub use dflash::{BundleDFlashWeights, DFlashCache, DFlashConfig, DFlashModule};
 pub use loader::{LoadError, MuseWeights};
 pub use pipeline::{
     GenerationConfig, GenerationStats, LookupStats, MusePipeline, PipelineError, StreamSink,
