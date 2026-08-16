@@ -939,7 +939,9 @@ impl DecoderModel {
         }
     }
 
-    fn embed_rows(&self, ids_flat: &Tensor) -> Result<Tensor, ModelError> {
+    /// Сырой gather эмбеддингов без `embed_scale`/`embed_rms_norm` — DFlash-драфтер
+    /// эмбеддит anchor/mask-токены именно так (норма target'а к ним не применяется).
+    pub fn embed_rows(&self, ids_flat: &Tensor) -> Result<Tensor, ModelError> {
         match (&self.embed_q, &self.embed) {
             (Some(q), _) => q.embed_gather(ids_flat).coerr(),
             (None, Some(t)) => t.embed_gather(ids_flat).coerr(),
@@ -1077,12 +1079,46 @@ impl DecoderModel {
         self.run_blocks(hidden.clone(), kv_cache, batch, s)
     }
 
+    /// Как [`Self::forward_trunk`], но дополнительно возвращает выходы блоков
+    /// `taps` (в порядке `taps`) — hidden-фичи для внешних потребителей
+    /// (DFlash-драфтер берёт слои target'а). Индексация как у HF
+    /// `hidden_states[i+1]` = выход блока `i`.
+    pub fn forward_trunk_tapped(
+        &self,
+        input_ids: &Tensor,
+        kv_cache: &mut KvCache,
+        taps: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>), ModelError> {
+        if input_ids.rank() != 2 {
+            return Err(ModelError::Shape(format!("input_ids must be [B, S], got {:?}", input_ids.dims())));
+        }
+        let batch = input_ids.dims()[0];
+        let s = input_ids.dims()[1];
+        let hidden = self.embed_ids(input_ids)?;
+        let mut tapped = Vec::with_capacity(taps.len());
+        let out = self.run_blocks_tapped(hidden, kv_cache, batch, s, taps, &mut tapped)?;
+        Ok((out, tapped))
+    }
+
     fn run_blocks(
+        &self,
+        hidden: Tensor,
+        kv_cache: &mut KvCache,
+        batch: usize,
+        s: usize,
+    ) -> Result<Tensor, ModelError> {
+        let mut sink = Vec::new();
+        self.run_blocks_tapped(hidden, kv_cache, batch, s, &[], &mut sink)
+    }
+
+    fn run_blocks_tapped(
         &self,
         mut hidden: Tensor,
         kv_cache: &mut KvCache,
         batch: usize,
         s: usize,
+        taps: &[usize],
+        tapped: &mut Vec<Tensor>,
     ) -> Result<Tensor, ModelError> {
         let past = kv_cache.seq_len;
         if past + s > kv_cache.max_seq {
@@ -1144,6 +1180,9 @@ impl DecoderModel {
                             None
                         };
                         hidden = step(idx, &cur, &hidden, kv_cache)?;
+                        if taps.contains(&idx) {
+                            tapped.push(hidden.clone());
+                        }
                         match h {
                             Some(h) => Ok(Some(h.join().map_err(|_| {
                                 ModelError::Forward("llm prefetch thread panicked".into())
@@ -1164,6 +1203,9 @@ impl DecoderModel {
             };
             for (idx, blk) in self.blocks.iter().enumerate() {
                 hidden = step(idx, blk, &hidden, kv_cache)?;
+                if taps.contains(&idx) {
+                    tapped.push(hidden.clone());
+                }
                 if let Some(o) = sync_ord {
                     synaptix_core::device::cuda::layer_sync(o, s > 1);
                 }

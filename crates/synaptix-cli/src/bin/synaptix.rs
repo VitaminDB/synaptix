@@ -130,6 +130,9 @@ enum Commands {
         /// Видео для мультимодального промпта (Muse Glimmer).
         #[arg(long)]
         video: Option<PathBuf>,
+        /// Отключить DFlash-спекуляцию (Muse Glimmer).
+        #[arg(long, default_value_t = false)]
+        no_dflash: bool,
     },
     Chat {
         model: PathBuf,
@@ -667,7 +670,7 @@ fn main() -> ExitCode {
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, mtp, no_mtp, no_graph_mtp, image, video,
+            warmup, mtp, no_mtp, no_graph_mtp, image, video, no_dflash,
         } => {
             let prompt = match prompt_file {
                 Some(pf) => std::fs::read_to_string(&pf)
@@ -695,6 +698,7 @@ fn main() -> ExitCode {
                 no_graph_mtp,
                 image,
                 video,
+                no_dflash,
                 warmup,
             })
         }

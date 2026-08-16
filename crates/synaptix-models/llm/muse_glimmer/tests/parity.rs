@@ -282,3 +282,169 @@ fn text_logits_and_greedy_match_reference() {
         greedy_ref.len()
     );
 }
+
+/// Ядро flash-window в bidirectional-режиме (`causal=false`) — путь DFlash:
+/// Tq=16 (диффузионное окно) против Tkv=контекст+окно, band |i-j| < window.
+/// Сверка с reference sdpa + явной band-маской.
+#[test]
+fn flash_window_bidirectional_matches_reference() {
+    if std::env::var("SYN_MUSE_KERNEL").is_err() {
+        return;
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let device = Device::Cuda(0);
+    let (nh, nkv, hd) = (32usize, 8usize, 128usize);
+    let tq = 16usize;
+
+    for (tkv, window) in [(48usize, 2048usize), (600, 128), (4096, 2048)] {
+        let mk = |n: usize, t: usize, seed: u64| -> Tensor {
+            let mut s = seed;
+            let v: Vec<f32> = (0..n * t * hd)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.6
+                })
+                .collect();
+            Tensor::from_vec(v, vec![1, n, t, hd], device)
+                .and_then(|t| t.to_dtype(DType::F16))
+                .expect("mk")
+        };
+        let q = mk(nh, tq, 1);
+        let k = mk(nkv, tkv, 2);
+        let v = mk(nkv, tkv, 3);
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        let got = q
+            .flash_attention_window(&k, &v, scale, (window - 1) as i32, false)
+            .expect("flash window bidirectional");
+
+        // reference: repeat_kv + маска band |i-j| < window, q — последние tq позиций
+        let group = nh / nkv;
+        let rep = |x: &Tensor| -> Tensor {
+            let reps = Tensor::zeros(vec![1, nkv, group, tkv, hd], x.dtype(), device).unwrap();
+            x.unsqueeze(2)
+                .and_then(|t| t.broadcast_add(&reps))
+                .and_then(|t| t.reshape(vec![1, nh, tkv, hd]))
+                .unwrap()
+        };
+        let base = tkv - tq;
+        let mut mask = vec![0f32; tq * tkv];
+        for i in 0..tq {
+            for j in 0..tkv {
+                if ((base + i) as i64 - j as i64).unsigned_abs() as usize >= window {
+                    mask[i * tkv + j] = -1.0e4;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask, vec![tq, tkv], device)
+            .and_then(|t| t.to_dtype(DType::F16))
+            .unwrap();
+        let want = synaptix_ops::attention::softmax::scaled_dot_attention(
+            &q,
+            &rep(&k),
+            &rep(&v),
+            scale,
+            Some(&mask),
+        )
+        .expect("reference sdpa");
+
+        compare(
+            &format!("flash_window bidir tkv={tkv} win={window}"),
+            &to_f32(&got),
+            &to_f32(&want),
+            0.9995,
+        );
+    }
+}
+
+/// Паритет DFlash-драфтера с transformers: один draft-forward на контексте
+/// промпта. Сверяются hidden блока, логиты кандидатов и сами id кандидатов.
+#[test]
+fn dflash_matches_reference() {
+    let Some(bundle) = env_path("SYN_MUSE_BUNDLE") else { return };
+    let Some(ref_dir) = env_path("SYN_MUSE_REF") else { return };
+    let ref_path = ref_dir.join("dflash_ref.safetensors");
+    if !ref_path.exists() {
+        eprintln!("skip: {} отсутствует", ref_path.display());
+        return;
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let device = Device::Cuda(0);
+
+    let refs = SafetensorsLoader::open(&ref_path).expect("open ref");
+    let ids: Vec<u32> = refs
+        .load_to("input_ids", Device::Cpu, DType::I64)
+        .expect("ids")
+        .to_vec1::<i64>()
+        .expect("ids vec")
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
+    let anchor = refs
+        .load_to("anchor", Device::Cpu, DType::I64)
+        .expect("anchor")
+        .to_vec1::<i64>()
+        .expect("anchor vec")[0] as u32;
+    let cand_ref: Vec<u32> = refs
+        .load_to("candidate_ids", Device::Cpu, DType::I64)
+        .expect("cand")
+        .to_vec1::<i64>()
+        .expect("cand vec")
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
+    let logits_ref = to_f32(
+        &refs
+            .load_to("candidate_logits", Device::Cpu, DType::F32)
+            .expect("cand logits"),
+    );
+
+    let precision = PrecisionConfig::dense(DType::BF16);
+    synaptix_llm_muse_glimmer::pipeline::set_offload_mode_for_tests();
+    let mut pipeline = MusePipeline::load_with_precision(&bundle, device, precision, Some(1024))
+        .expect("load muse");
+    assert!(
+        pipeline.load_dflash(&bundle, precision).expect("load dflash"),
+        "в бандле нет компонента dflash"
+    );
+    let dflash = pipeline.dflash.as_ref().expect("dflash");
+
+    let mut kv = pipeline.model.make_kv_cache(1, 1024).expect("kv");
+    let input = Tensor::from_vec(ids.clone(), vec![1usize, ids.len()], device).expect("input");
+    let taps = dflash.config.target_layer_ids.clone();
+    let (_, tapped) = synaptix_core::grad::no_grad(|| {
+        pipeline.model.forward_trunk_tapped(&input, &mut kv, &taps)
+    })
+    .expect("prefill tapped");
+
+    let mut dcache = dflash.make_cache().expect("dflash cache");
+    let logits = synaptix_core::grad::no_grad(|| {
+        dflash.draft_logits(&pipeline.model, &mut dcache, &tapped, 0, anchor)
+    })
+    .expect("draft");
+
+    compare("dflash candidate logits", &to_f32(&logits), &logits_ref, 0.99);
+
+    let dims = logits.dims().to_vec();
+    let vocab = dims[dims.len() - 1];
+    let v = to_f32(&logits);
+    let ours: Vec<u32> = (0..dims[0])
+        .map(|r| {
+            v[r * vocab..(r + 1) * vocab]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        })
+        .collect();
+    let same = ours.iter().zip(&cand_ref).filter(|(a, b)| a == b).count();
+    eprintln!("[dflash] ours={ours:?}\n         ref ={cand_ref:?}\n         совпало {same}/{}", cand_ref.len());
+    assert!(
+        same * 4 >= cand_ref.len() * 3,
+        "кандидаты DFlash расходятся с эталоном: {same}/{}",
+        cand_ref.len()
+    );
+}
