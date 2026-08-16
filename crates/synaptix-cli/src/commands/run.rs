@@ -80,6 +80,7 @@ pub fn build_precision(
 pub enum Arch {
     Qwen3,
     Hybrid,
+    MuseGlimmer,
 }
 
 /// Детекция архитектуры через единый `synaptix::facade::arch`. Llama/Gemma3 в
@@ -89,8 +90,9 @@ pub fn detect_arch(path: &Path) -> Result<Arch, String> {
     match detect_llm_arch(path)? {
         LlmArch::Qwen3 => Ok(Arch::Qwen3),
         LlmArch::Hybrid => Ok(Arch::Hybrid),
+        LlmArch::MuseGlimmer => Ok(Arch::MuseGlimmer),
         other => Err(format!(
-            "CLI run/chat поддерживает qwen3/hybrid; детектирован {other:?} — используйте synthos"
+            "CLI run/chat поддерживает qwen3/hybrid/muse_glimmer; детектирован {other:?} — используйте synthos"
         )),
     }
 }
@@ -120,7 +122,89 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     match arch {
         Arch::Qwen3 => run_qwen3(&args, device, precision),
         Arch::Hybrid => run_hybrid(&args, device, precision),
+        Arch::MuseGlimmer => run_muse(&args, device, precision),
     }
+}
+
+fn run_muse(
+    args: &RunArgs,
+    device: Device,
+    precision: PrecisionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_llm_muse_glimmer::pipeline::{GenerationConfig, MusePipeline};
+
+    let compute = precision.compute;
+    let t0 = std::time::Instant::now();
+    let mut pipeline = MusePipeline::load_with_precision(&args.model, device, precision, args.max_seq)
+        .map_err(|e| format!("load: {e}"))?;
+    eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+
+    let image_embeds = match &args.image {
+        Some(path) => {
+            if !pipeline
+                .load_vision(&args.model, compute)
+                .map_err(|e| format!("vision load: {e}"))?
+            {
+                return Err("в бандле нет vision-башни (model.vision_tower.*)".into());
+            }
+            let n = pipeline.image_token_count(path).map_err(|e| format!("image: {e}"))?;
+            let emb = pipeline.encode_image(path).map_err(|e| format!("image: {e}"))?;
+            eprintln!("synaptix run: image {} → {} vision-токенов", path.display(), n);
+            Some((n, emb))
+        }
+        None => None,
+    };
+    let pipeline = pipeline;
+
+    let prompt_text = match &image_embeds {
+        Some((n, _)) => {
+            let pad = "<|patch|>".repeat(*n);
+            format!(
+                "<|begin_of_text|><|start|>user<|message|><|image_start|>{pad}<|image_end|>{}<|eot|><|start|>assistant",
+                args.prompt
+            )
+        }
+        None => args.prompt.clone(),
+    };
+    let prompt_ids = pipeline.encode(&prompt_text).map_err(|e| format!("tokenize: {e}"))?;
+    eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
+
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_tokens,
+        temperature: args.temperature,
+        seed: args.seed,
+        max_seq: args.max_seq,
+        ..Default::default()
+    };
+
+    if let Some((_, emb)) = &image_embeds {
+        let mut noop = |_: u32| true;
+        let t = std::time::Instant::now();
+        let (ids, stats) = pipeline
+            .generate_with_images(&prompt_ids, std::slice::from_ref(emb), gen_cfg, &mut noop)
+            .map_err(|e| format!("vlm generate: {e}"))?;
+        let text = pipeline.decode(&ids).map_err(|e| format!("decode: {e}"))?;
+        println!("{text}");
+        eprintln!(
+            "synaptix run: {} prompt + {} new tokens in {} ms | prefill {} ms | decode {} ms ({:.2} tok/s)",
+            stats.prompt_tokens,
+            stats.new_tokens,
+            t.elapsed().as_millis(),
+            stats.prefill_ms,
+            stats.decode_ms,
+            stats.new_tokens as f64 / (stats.decode_ms.max(1) as f64 / 1000.0)
+        );
+        return Ok(());
+    }
+
+    let (new_ids, stats) = pipeline
+        .generate(&prompt_ids, gen_cfg)
+        .map_err(|e| format!("generate: {e}"))?;
+    let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
+    print_run_result(
+        &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
+    );
+    Ok(())
 }
 
 fn run_qwen3(

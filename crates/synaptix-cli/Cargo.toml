@@ -19,6 +19,7 @@ synaptix-debug        = { workspace = true }
 synaptix-llm-common   = { workspace = true }
 synaptix-llm-qwen3    = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
+synaptix-llm-muse-glimmer = { workspace = true }
 synaptix-vlm-qwen3    = { workspace = true }
 synaptix-asr-whisper  = { workspace = true }
 synaptix-image-sdxl   = { workspace = true }

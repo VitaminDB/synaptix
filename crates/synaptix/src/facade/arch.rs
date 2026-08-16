@@ -65,6 +65,7 @@ pub enum LlmArch {
     Hybrid,
     Llama,
     Gemma3,
+    MuseGlimmer,
 }
 
 /// `qwen3_next`/`qwen3_5`/`qwen3_6` → гибрид (GatedDeltaNet + full-attn);
@@ -76,6 +77,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         "qwen3_next" | "qwen3_5" | "qwen3_6" => LlmArch::Hybrid,
         "llama" => LlmArch::Llama,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,
+        "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,
         _ => LlmArch::Qwen3,
     })
 }

@@ -17,6 +17,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 
 use synaptix_llm_common::{GenerationConfig, GenerationStats, StreamSink};
+use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
 use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
 use synaptix_tokenizer::{SpecialTokens, Tokenizer as _};
@@ -53,6 +54,7 @@ pub struct ChatArgs {
 pub enum ChatPipeline {
     Qwen3(Qwen3Pipeline),
     Hybrid(HybridPipeline),
+    MuseGlimmer(MusePipeline),
 }
 
 impl ChatPipeline {
@@ -60,6 +62,7 @@ impl ChatPipeline {
         match self {
             ChatPipeline::Qwen3(p) => p.encode(s).map_err(|e| e.to_string()),
             ChatPipeline::Hybrid(p) => p.encode(s).map_err(|e| e.to_string()),
+            ChatPipeline::MuseGlimmer(p) => p.encode(s).map_err(|e| e.to_string()),
         }
     }
 
@@ -67,6 +70,7 @@ impl ChatPipeline {
         match self {
             ChatPipeline::Qwen3(p) => p.decode(ids).map_err(|e| e.to_string()),
             ChatPipeline::Hybrid(p) => p.decode(ids).map_err(|e| e.to_string()),
+            ChatPipeline::MuseGlimmer(p) => p.decode(ids).map_err(|e| e.to_string()),
         }
     }
 
@@ -74,6 +78,7 @@ impl ChatPipeline {
         match self {
             ChatPipeline::Qwen3(p) => p.tokenizer.special_tokens().clone(),
             ChatPipeline::Hybrid(p) => p.tokenizer.special_tokens().clone(),
+            ChatPipeline::MuseGlimmer(p) => p.tokenizer.special_tokens().clone(),
         }
     }
 
@@ -81,6 +86,7 @@ impl ChatPipeline {
         match self {
             ChatPipeline::Qwen3(p) => p.tokenizer.token_to_id(token),
             ChatPipeline::Hybrid(p) => p.tokenizer.token_to_id(token),
+            ChatPipeline::MuseGlimmer(p) => p.tokenizer.token_to_id(token),
         }
     }
 
@@ -88,6 +94,7 @@ impl ChatPipeline {
         match self {
             ChatPipeline::Qwen3(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
             ChatPipeline::Hybrid(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
+            ChatPipeline::MuseGlimmer(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
         }
     }
 
@@ -126,6 +133,9 @@ impl ChatPipeline {
             ChatPipeline::Hybrid(p) => {
                 p.generate_streaming_resume(kv, ids, cfg, sink).map_err(|e| e.to_string())
             }
+            ChatPipeline::MuseGlimmer(p) => {
+                p.generate_streaming_resume(kv, ids, cfg, sink).map_err(|e| e.to_string())
+            }
         }
     }
 }
@@ -161,6 +171,10 @@ pub fn run(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         ),
         Arch::Hybrid => ChatPipeline::Hybrid(
             HybridPipeline::load_with_precision(&args.model, device, precision, Some(args.context))
+                .map_err(|e| format!("load: {e}"))?,
+        ),
+        Arch::MuseGlimmer => ChatPipeline::MuseGlimmer(
+            MusePipeline::load_with_precision(&args.model, device, precision, Some(args.context))
                 .map_err(|e| format!("load: {e}"))?,
         ),
     };
@@ -209,6 +223,7 @@ fn arch_label(arch: Arch) -> &'static str {
     match arch {
         Arch::Qwen3 => "qwen3",
         Arch::Hybrid => "qwen3-next-hybrid",
+        Arch::MuseGlimmer => "muse-glimmer",
     }
 }
 

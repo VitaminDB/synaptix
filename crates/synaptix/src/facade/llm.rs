@@ -15,6 +15,7 @@ use synaptix_core::precision::{parse_dtype, PrecisionConfig};
 use synaptix_llm_common::{GenerationConfig, StreamSink};
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
+use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
 use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
@@ -341,6 +342,7 @@ enum LlmPipeline {
     Hybrid(HybridPipeline),
     Llama(LlamaPipeline),
     Gemma3(GemmaPipeline),
+    MuseGlimmer(MusePipeline),
 }
 
 impl LlmPipeline {
@@ -350,6 +352,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => p.model.rope_capacity(),
             Self::Llama(p) => p.model.rope_capacity(),
             Self::Gemma3(p) => p.model.rope_capacity(),
+            Self::MuseGlimmer(p) => p.model.rope_capacity(),
         }
     }
 
@@ -359,6 +362,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => p.model.kv_bytes_per_token(),
             Self::Llama(p) => p.model.kv_bytes_per_token(),
             Self::Gemma3(p) => p.model.kv_bytes_per_token(),
+            Self::MuseGlimmer(p) => p.model.kv_bytes_per_token(),
         }
     }
 
@@ -370,6 +374,10 @@ impl LlmPipeline {
     ) -> Result<(), LlmError> {
         match self {
             LlmPipeline::Qwen3(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::MuseGlimmer(p) => p
                 .generate_streaming(prompt_ids, cfg, sink)
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
@@ -678,6 +686,7 @@ fn build_eos_ids(tok: &HfTokenizer, specials: &SpecialTokens) -> Vec<u32> {
     push(specials.eos_id());
     push(specials.id_of(SpecialTokenKind::ImEnd));
     push(tok.token_to_id("<|im_end|>"));
+    push(tok.token_to_id("<|eot|>"));
     ids
 }
 
@@ -746,6 +755,11 @@ pub fn load_llm(
         LlmArch::Gemma3 => GemmaPipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Gemma3)
             .map_err(|e| LlmError(format!("load gemma3: {e}")))?,
+        LlmArch::MuseGlimmer => {
+            MusePipeline::load_with_precision(path, device, precision, max_seq)
+                .map(LlmPipeline::MuseGlimmer)
+                .map_err(|e| LlmError(format!("load muse_glimmer: {e}")))?
+        }
     };
 
     build_facade(pipeline, path, device, max_seq)

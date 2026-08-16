@@ -204,6 +204,7 @@ pub struct Block {
     mixer: Mixer,
     mlp: Mlp,
     rms_eps: f32,
+    post_eps: f32,
 }
 
 impl FullAttn {
@@ -320,6 +321,7 @@ impl Block {
             mixer,
             mlp: self.mlp.to_device(dev)?,
             rms_eps: self.rms_eps,
+            post_eps: self.post_eps,
         })
     }
 }
@@ -331,6 +333,7 @@ pub struct DecoderModel {
     pub kv_dtype: DType,
     embed: Option<Tensor>,
     embed_q: Option<QuantWeight>,
+    embed_norm: Option<Tensor>,
     final_norm: Tensor,
     lm_head: QLinear,
     blocks: Vec<Block>,
@@ -686,6 +689,15 @@ impl DecoderModel {
         let final_norm = norm("model.norm.weight")?
             .to_device(device)
             .map_err(|e| ModelError::Load(e.to_string()))?;
+        let embed_norm = if cfg.embed_rms_norm {
+            Some(
+                Tensor::from_vec(vec![1.0_f32; cfg.hidden_size], vec![cfg.hidden_size], device)
+                    .and_then(|t| t.to_dtype(compute))
+                    .map_err(|e| ModelError::Load(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         // lm_head: при tie_word_embeddings = embed (Dense, не квантуем — embed нужен
         // для gather). Иначе грузим lm_head.weight и квантуем по `lm_head_dtype`
         // (NVFP4 [vocab,hidden] %64==0 → GEMV; экономит 2.5GB→0.7GB чтения/токен).
@@ -806,11 +818,16 @@ impl DecoderModel {
                 mixer,
                 mlp,
                 rms_eps: eps,
+                post_eps: cfg.post_norm_eps.unwrap_or(eps),
             });
         }
 
         let rope_capacity = rope_capacity.max(1);
         let build_rope = |spec: &crate::config::RopeSpec| -> Result<RopeCache, ModelError> {
+            if spec.rotary_dim == 0 {
+                return RopeCache::new(2, 1, 10_000.0, device)
+                    .map_err(|e| ModelError::Build(e.to_string()));
+            }
             match &spec.scaled_freqs {
                 Some(freqs) => RopeCache::with_scaled_freqs(spec.rotary_dim, rope_capacity, spec.theta, freqs, device),
                 None => RopeCache::new(spec.rotary_dim, rope_capacity, spec.theta, device),
@@ -830,6 +847,7 @@ impl DecoderModel {
             kv_dtype: compute,
             embed: embed_dense,
             embed_q: embed_quant,
+            embed_norm,
             final_norm,
             lm_head,
             blocks,
@@ -965,6 +983,9 @@ impl DecoderModel {
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
         }
+        if let Some(w) = &self.embed_norm {
+            hidden = rms_norm(&hidden, w, self.config.rms_norm_eps).coerr()?;
+        }
         Ok(hidden)
     }
 
@@ -977,7 +998,18 @@ impl DecoderModel {
     }
 
     pub fn lm_head_forward(&self, x: &Tensor) -> Result<Tensor, ModelError> {
-        prof(self.device, "lm_head", || self.lm_head.forward(x))
+        let mut logits = prof(self.device, "lm_head", || self.lm_head.forward(x))?;
+        if let Some(scale) = self.config.logit_scale {
+            logits = logits.mul_scalar(scale).coerr()?;
+        }
+        if let Some(cap) = self.config.logit_softcap {
+            logits = logits
+                .mul_scalar(1.0 / cap)
+                .and_then(|t| t.tanh())
+                .and_then(|t| t.mul_scalar(cap))
+                .coerr()?;
+        }
+        Ok(logits)
     }
 
     pub fn head_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
@@ -1032,14 +1064,14 @@ impl DecoderModel {
                 Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None))?,
                 Mixer::Linear(la) => prof(dev, "attn_linear", || la.forward(&h, &mut kv_cache.layers[idx], s, self.device, self.dtype))?,
             };
-            let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.rms_eps)?;
+            let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
             let hidden = prof(dev, "residual", || residual.add(&mixed).coerr())?;
             if dump_layers { record_layer_norm(idx, if is_lin { "lin_attn" } else { "full_attn" }, &hidden, s, past); }
 
             let residual2 = hidden.clone();
             let h = prof(dev, "norm", || rms_norm(&hidden, &blk.pre_mlp_norm, blk.rms_eps).coerr())?;
             let mlp_out = prof(dev, "mlp", || blk.mlp.forward(&h))?;
-            let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.rms_eps)?;
+            let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             let out = prof(dev, "residual", || residual2.add(&mlp_out).coerr())?;
             if dump_layers { record_layer_norm(idx, "mlp", &out, s, past); }
             Ok(out)
@@ -1139,10 +1171,7 @@ impl DecoderModel {
         };
         let pad_ref = pad_bias.as_ref();
 
-        let mut hidden = self.embed_tokens(input_ids)?;
-        if let Some(scale) = self.embed_scale {
-            hidden = hidden.mul_scalar(scale).coerr()?;
-        }
+        let mut hidden = self.embed_ids(input_ids)?;
         let mut states: Vec<Tensor> = Vec::with_capacity(self.blocks.len() + 1);
         let mut step = |idx: usize, blk: &Block, hidden: &Tensor, kv: &mut KvCache|
             -> Result<Tensor, ModelError> {
@@ -1160,13 +1189,13 @@ impl DecoderModel {
                     ))
                 }
             };
-            let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.rms_eps)?;
+            let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
             let hidden = residual.add(&mixed).coerr()?;
 
             let residual2 = hidden.clone();
             let h = rms_norm(&hidden, &blk.pre_mlp_norm, blk.rms_eps).coerr()?;
             let mlp_out = blk.mlp.forward(&h)?;
-            let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.rms_eps)?;
+            let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             residual2.add(&mlp_out).coerr()
         };
         if self.host_stream_blocks && matches!(dev, Device::Cuda(_)) {
@@ -2237,6 +2266,9 @@ pub fn layer_dump_take() -> Vec<(usize, String, Vec<f32>)> {
 }
 
 fn partial_rope(x: &Tensor, rope: &RopeCache, start: usize, len: usize, rotary_dim: usize, head_dim: usize) -> CoreResult<Tensor> {
+    if rotary_dim == 0 {
+        return Ok(x.clone());
+    }
     if rotary_dim == head_dim {
         return apply_rope_range(x, rope, start, len, RopeLayout::Split);
     }
