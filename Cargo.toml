@@ -37,6 +37,7 @@ members = [
     "crates/synaptix-models/llm/qwen3",
     "crates/synaptix-models/llm/gemma3",
     "crates/synaptix-models/llm/qwen3_next_hybrid",
+    "crates/synaptix-models/llm/muse_glimmer",
     "crates/synaptix-models/llm/phi4",
     "crates/synaptix-models/llm/mamba",
     "crates/synaptix-models/llm/rwkv",
@@ -238,6 +239,7 @@ synaptix-distributed  = { path = "crates/synaptix-distributed" }
 synaptix-cli          = { path = "crates/synaptix-cli" }
 synaptix-llm-qwen3    = { path = "crates/synaptix-models/llm/qwen3" }
 synaptix-llm-qwen3-next-hybrid = { path = "crates/synaptix-models/llm/qwen3_next_hybrid" }
+synaptix-llm-muse-glimmer = { path = "crates/synaptix-models/llm/muse_glimmer" }
 synaptix-vlm-qwen3    = { path = "crates/synaptix-models/vlm/qwen3_vl" }
 synaptix-llm-common   = { path = "crates/synaptix-models/llm/common" }
 synaptix-asr-whisper  = { path = "crates/synaptix-models/asr/whisper" }

@@ -1,0 +1,25 @@
+[package]
+name = "synaptix-llm-muse-glimmer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Muse Glimmer 30B (dense sliding/NoPE attention, gated attention, softcapped logits, ViT perception encoder) native Rust port."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-io        = { workspace = true, features = ["image"] }
+synaptix-bundle    = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

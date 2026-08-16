@@ -62,10 +62,14 @@ pub struct DecoderConfig {
     pub norm_gain: NormGain,
     pub activation: Activation,
     pub sandwich_norms: bool,
+    pub post_norm_eps: Option<f32>,
     pub qk_norm: bool,
     pub attn_output_gate: bool,
     pub attn_scale: f32,
     pub embed_scale: Option<f32>,
+    pub embed_rms_norm: bool,
+    pub logit_scale: Option<f32>,
+    pub logit_softcap: Option<f32>,
 
     pub rope_global: RopeSpec,
     pub rope_local: Option<RopeSpec>,
@@ -128,7 +132,12 @@ impl DecoderConfig {
     /// attn-output-gate, partial-RoPE и Q/K-norm. НЕ поддержаны sandwich-нормы,
     /// sliding-window и отдельный local-RoPE (нужен per-layer rope-кэш в графе).
     pub fn graph_decode_ok(&self) -> bool {
-        !self.sandwich_norms && self.sliding_window.is_none() && self.rope_local.is_none()
+        !self.sandwich_norms
+            && self.sliding_window.is_none()
+            && self.rope_local.is_none()
+            && !self.embed_rms_norm
+            && self.logit_softcap.is_none()
+            && self.logit_scale.is_none()
     }
 
     /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph

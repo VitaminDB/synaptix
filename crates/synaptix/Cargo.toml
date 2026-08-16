@@ -29,6 +29,7 @@ synaptix-llm-qwen3    = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
 synaptix-llm-llama    = { workspace = true }
 synaptix-llm-gemma3   = { workspace = true }
+synaptix-llm-muse-glimmer = { workspace = true }
 
 # ASR / embeddings / rerank / диаризация / TTS.
 synaptix-asr-whisper  = { workspace = true }
