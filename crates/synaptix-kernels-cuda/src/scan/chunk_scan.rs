@@ -22,7 +22,7 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use crate::attention::chunk_fla::ChunkFlaKernels;
 use crate::kernels::compile::{compile_module, load_fn};
-use crate::wsalloc::{WsAlloc, WsBuf};
+use crate::wsalloc::WsBuf;
 
 pub struct ChunkScanKernels {
     _module: Arc<CudaModule>,

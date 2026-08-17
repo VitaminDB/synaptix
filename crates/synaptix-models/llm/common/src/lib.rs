@@ -11,5 +11,7 @@ pub use generate::{
     eos_set, generate, generate_streaming, generate_streaming_resume, GenerationConfig,
     GenerationStats, StreamSink, TokenSampler,
 };
-pub use model::{DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, ModelError};
+pub use model::{
+    DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
+};
 pub use weights::{QLinear, WeightSource};

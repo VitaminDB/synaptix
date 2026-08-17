@@ -440,6 +440,33 @@ impl KvCache {
         Ok(out)
     }
 
+    /// Полный снимок linear-состояния: и host-векторы, и device-зеркала.
+    ///
+    /// [`Self::snapshot_linear`] берёт ТОЛЬКО одну половину (dev, если зеркала
+    /// уже созданы, иначе host) — для префикс-KV между ходами этого мало:
+    /// префилл живёт в dev-зеркалах, а `sync_decode_dev_state` перед декодом
+    /// пересеивает их из host. Расхождение любой из половин ломает
+    /// продолжение диалога с сохранённой точки.
+    pub fn snapshot_linear_full(&self) -> Result<Vec<LinearSnapshot>, ModelError> {
+        let mut out = Vec::new();
+        for l in &self.layers {
+            let LayerCache::Linear(st) = l else { continue };
+            out.push(LinearSnapshot {
+                conv_dev: match &st.conv_state_dev {
+                    Some(t) => Some(deep_copy(t)?),
+                    None => None,
+                },
+                ssm_dev: match &st.ssm_state_dev {
+                    Some(t) => Some(deep_copy(t)?),
+                    None => None,
+                },
+                conv_host: Some(st.conv_state.clone()),
+                ssm_host: Some(st.ssm_state.clone()),
+            });
+        }
+        Ok(out)
+    }
+
     pub fn restore_linear(&mut self, snap: &[LinearSnapshot]) -> Result<(), ModelError> {
         let mut i = 0;
         for l in self.layers.iter_mut() {
