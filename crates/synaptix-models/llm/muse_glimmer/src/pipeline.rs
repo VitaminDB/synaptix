@@ -44,14 +44,24 @@ fn tower_block_bytes(cfg: &VisionConfig, dtype: DType) -> usize {
     per_layer * cfg.num_hidden_layers * dtype.size_in_bits() / 8
 }
 
-/// Свободная память устройства; `None` — для CPU и когда драйвер не ответил.
+/// Память устройства, доступная под новые аллокации; `None` — для CPU и
+/// когда драйвер не ответил.
+///
+/// Это не только «свободно» по `cuMemGetInfo`: свободные блоки, которые уже
+/// держит пул аллокатора, драйвер считает занятыми, а башня садится ровно в
+/// них. После генерации `reserved` пула выше `used` на размер отработавшего
+/// KV-ринга — по одному лишь `cuMemGetInfo` башня выглядит невлезающей там,
+/// где на деле места вдвое больше.
 fn free_vram(device: Device) -> Option<usize> {
-    match device {
-        Device::Cuda(ordinal) => {
-            synaptix_core::device::cuda::mem_info(ordinal).ok().map(|(free, _)| free)
-        }
-        _ => None,
-    }
+    let Device::Cuda(ordinal) = device else {
+        return None;
+    };
+    let (free, _) = synaptix_core::device::cuda::mem_info(ordinal).ok()?;
+    let slack = |(reserved, used): (u64, u64)| reserved.saturating_sub(used) as usize;
+    let pool = synaptix_core::memory::cuda_pool::cuda_mempool_stats(ordinal)
+        .map(slack)
+        .unwrap_or(0);
+    Some(free + pool)
 }
 
 pub struct MusePipeline {
