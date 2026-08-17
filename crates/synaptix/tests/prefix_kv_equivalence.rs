@@ -30,9 +30,12 @@ fn opts(max_seq_len: usize, max_new: usize) -> GenerationOptions {
     }
 }
 
-fn collect(n: usize) -> (Vec<u32>, impl FnMut(u32, &str) -> bool) {
-    let out = Vec::with_capacity(n);
-    (out, |_id: u32, _d: &str| true)
+/// Вернуть драйверу VRAM модели предыдущего теста: пулы держат её с
+/// `RELEASE_THRESHOLD=MAX`, и без трима следующая модель в этом же процессе не
+/// влезает (в приложении это делает выгрузка модели).
+fn reclaim_vram() {
+    synaptix::facade::llm::cuda_release_kernel_caches();
+    synaptix::facade::llm::cuda_trim_pool(0);
 }
 
 #[test]
@@ -41,6 +44,7 @@ fn prefix_kv_matches_full_prefill() {
         eprintln!("SYN_QWEN38_BUNDLE не задан — пропускаем");
         return;
     };
+    reclaim_vram();
     let (model, tok) = load_llm_with_policy(
         Path::new(&path),
         QuantPolicy::balance(),
@@ -134,6 +138,7 @@ fn prefix_kv_saves_prefill_time() {
         eprintln!("SYN_QWEN38_BUNDLE не задан — пропускаем");
         return;
     };
+    reclaim_vram();
     let (model, tok) = load_llm_with_policy(
         Path::new(&path),
         QuantPolicy::balance(),
@@ -182,4 +187,172 @@ fn prefix_kv_saves_prefill_time() {
         cached_ms * 2 < fresh_ms,
         "префикс-KV должен экономить кратно: {cached_ms} мс против {fresh_ms} мс"
     );
+}
+
+/// Muse-Glimmer БЕЗ спекуляции (temperature>0 → graph/eager-декод): здесь путь
+/// численно один и тот же, поэтому продолжение с кэша обязано совпасть с полным
+/// префиллом токен в токен. Это и есть проверка самой логики префикс-KV.
+#[test]
+fn prefix_kv_muse_matches_full_prefill() {
+    let Ok(path) = std::env::var("SYN_MUSE_BUNDLE") else {
+        eprintln!("SYN_MUSE_BUNDLE не задан — пропускаем");
+        return;
+    };
+    reclaim_vram();
+    let (model, tok) = load_llm_with_policy(
+        Path::new(&path),
+        QuantPolicy::balance(),
+        &Device::Cuda(0),
+    )
+    .expect("load");
+
+    // temperature>0 уводит с DFlash/lookup-путей на обычный декод.
+    let sampled = |ctx: usize, max_new: usize| GenerationOptions {
+        temperature: 0.7,
+        top_k: 0,
+        top_p: 1.0,
+        seed: 12345,
+        ..opts(ctx, max_new)
+    };
+    let head = "Расскажи, чем отличается TCP от UDP. Отвечай по-русски. ".repeat(10);
+    let ids1 = tok.encode(&head).expect("encode 1");
+    let mut ids2 = ids1.clone();
+    ids2.extend_from_slice(&tok.encode("Добавь абзац про QUIC. ").expect("encode 2"));
+    let ctx = 8192usize;
+    let max_new = 24usize;
+
+    let mut fresh2 = Vec::new();
+    {
+        let mut r = LlmGeneration::new(&model, sampled(ctx, max_new));
+        r.generate_streaming(&ids1, &tok, |_, _| true).expect("fresh turn 1");
+        let mut r = LlmGeneration::new(&model, sampled(ctx, max_new));
+        r.generate_streaming(&ids2, &tok, |id, _| {
+            fresh2.push(id);
+            true
+        })
+        .expect("fresh turn 2");
+    }
+
+    let mut session = model
+        .new_kv_session(ctx, max_new)
+        .expect("session")
+        .expect("Muse-Glimmer умеет префикс-KV");
+    let mut cached2 = Vec::new();
+    {
+        let mut r = LlmGeneration::new(&model, sampled(ctx, max_new));
+        r.generate_streaming_cached(&mut session, &ids1, &tok, |_, _| true)
+            .expect("cached turn 1");
+        let mut r = LlmGeneration::new(&model, sampled(ctx, max_new));
+        let reused = r
+            .generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+                cached2.push(id);
+                true
+            })
+            .expect("cached turn 2");
+        println!(
+            "muse (без спекуляции): переиспользовано {reused} из {} ток",
+            ids2.len()
+        );
+        assert_eq!(reused, ids1.len(), "у Muse точка возврата — весь промпт");
+    }
+    assert_eq!(
+        tok.decode(&cached2).unwrap_or_default(),
+        tok.decode(&fresh2).unwrap_or_default(),
+        "продолжение с префикс-KV расходится с полным префиллом"
+    );
+    assert_eq!(cached2, fresh2, "токены расходятся");
+}
+
+/// Muse-Glimmer с DFlash: контекст драфтера при возобновлении набирается только
+/// по хвосту промпта (роллинг-окно кэша драфтера откатывается на границу), и
+/// продолжение обязано совпасть с полным префиллом токен в токен.
+///
+/// Важно, что оба хода идут ОДНИМ путём декода: спекуляция «lossless» лишь в
+/// точной арифметике — длина verify-чанка меняет план GEMM, а с ним последние
+/// биты логитов, так что сравнение спекулятивного пути с обычным на ничьих
+/// расходится (ловилось именно так, когда DFlash не загрузился и кэш-ход уходил
+/// на graph-декод).
+#[test]
+fn prefix_kv_muse_dflash_matches_full_prefill() {
+    let Ok(path) = std::env::var("SYN_MUSE_BUNDLE") else {
+        eprintln!("SYN_MUSE_BUNDLE не задан — пропускаем");
+        return;
+    };
+    reclaim_vram();
+    let (model, tok) = load_llm_with_policy(
+        Path::new(&path),
+        QuantPolicy::balance(),
+        &Device::Cuda(0),
+    )
+    .expect("load");
+
+    let head = "Опиши кратко разницу между TCP и UDP. Отвечай по-русски. ".repeat(60);
+    let tail = "Добавь абзац про QUIC. ".repeat(6);
+    let ids1 = tok.encode(&head).expect("encode 1");
+    let mut ids2 = ids1.clone();
+    ids2.extend_from_slice(&tok.encode(&tail).expect("encode 2"));
+    let ctx = 8192usize;
+    let max_new = 24usize;
+
+    let mut fresh2 = Vec::new();
+    let fresh_ms;
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.generate_streaming(&ids1, &tok, |_, _| true).expect("fresh turn 1");
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        let t = std::time::Instant::now();
+        r.generate_streaming(&ids2, &tok, |id, _| {
+            fresh2.push(id);
+            true
+        })
+        .expect("fresh turn 2");
+        fresh_ms = t.elapsed().as_millis();
+    }
+
+    let mut session = model
+        .new_kv_session(ctx, max_new)
+        .expect("session")
+        .expect("Muse-Glimmer умеет префикс-KV");
+    let mut cached2 = Vec::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        let reused = r
+            .generate_streaming_cached(&mut session, &ids1, &tok, |_, _| true)
+            .expect("cached turn 1");
+        assert_eq!(reused, 0, "первый ход переиспользовать нечего");
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        let t = std::time::Instant::now();
+        let reused = r
+            .generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+                cached2.push(id);
+                true
+            })
+            .expect("cached turn 2");
+        let cached_ms = t.elapsed().as_millis();
+        println!(
+            "muse: переиспользовано {reused} из {} токенов промпта (история {} ток); \
+             ход: без кэша {fresh_ms} мс, с префикс-KV {cached_ms} мс",
+            ids2.len(),
+            ids1.len()
+        );
+        // У Muse точка возврата — весь промпт прошлого хода (linear-слоёв нет,
+        // выравнивать не нужно).
+        assert_eq!(reused, ids1.len());
+    }
+
+    println!(
+        "muse+dflash: с кэшем {:?}\n              без кэша {:?}",
+        tok.decode(&cached2).unwrap_or_default(),
+        tok.decode(&fresh2).unwrap_or_default()
+    );
+    assert_eq!(cached2, fresh2, "продолжение с префикс-KV расходится с полным префиллом");
+
+    let other = tok
+        .encode("Совсем другой промпт про кофе. Отвечай по-русски.")
+        .expect("encode other");
+    let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+    let reused = r
+        .generate_streaming_cached(&mut session, &other, &tok, |_, _| true)
+        .expect("cached turn 3");
+    assert_eq!(reused, 0, "при расхождении префикса переиспользовать нельзя");
 }

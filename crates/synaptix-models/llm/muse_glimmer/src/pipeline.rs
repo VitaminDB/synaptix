@@ -590,7 +590,9 @@ impl MusePipeline {
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
-    fn maybe_prepend_bos(&self, prompt_ids: &[u32]) -> Vec<u32> {
+    /// Промпт в том виде, в каком его видит движок (с BOS, если модель его
+    /// добавляет) — вызывающему нужен именно он, чтобы сравнивать префиксы.
+    pub fn maybe_prepend_bos(&self, prompt_ids: &[u32]) -> Vec<u32> {
         match self.config.bos_token_id {
             Some(bos) if self.add_bos && prompt_ids.first() != Some(&bos) => {
                 let mut v = Vec::with_capacity(prompt_ids.len() + 1);
@@ -676,8 +678,62 @@ impl MusePipeline {
     /// Спекулятивный декод на DFlash-драфтере: блок из `draft_len` кандидатов за
     /// один forward драфтера, верификация одним чанком target'а. Greedy-путь
     /// lossless: принимаются только токены, совпавшие с argmax target'а.
+    /// Пара кэшей DFlash-декода: основной KV на `ctx_tokens` и роллинг-окно
+    /// контекста драфтера. Вынесено, чтобы вызывающий мог держать их на весь
+    /// диалог и переиспользовать префикс между ходами
+    /// ([`Self::generate_dflash_resume`]).
+    pub fn make_dflash_caches(
+        &self,
+        ctx_tokens: usize,
+    ) -> Result<(synaptix_llm_common::KvCache, crate::dflash::DFlashCache), PipelineError> {
+        let dflash = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("DFlash-драфтер не загружен".into()))?;
+        let kv = self
+            .model
+            .make_kv_cache(1, ctx_tokens.max(2))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let dcache = dflash
+            .make_cache()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        Ok((kv, dcache))
+    }
+
     pub fn generate_dflash_streaming(
         &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        let l = self.maybe_prepend_bos(prompt_ids).len();
+        let ctx = gen_cfg
+            .max_seq
+            .unwrap_or(l + gen_cfg.max_new_tokens + 1);
+        let (mut kv, mut dcache) = self.make_dflash_caches(ctx)?;
+        self.generate_dflash_inner(&mut kv, &mut dcache, prompt_ids, gen_cfg, sink)
+    }
+
+    /// DFlash-декод по ГОТОВЫМ кэшам: префилл стартует с `kv.seq_len`, история
+    /// прошлого хода не считается заново (префикс-KV). Вызывающий отвечает за
+    /// то, что `prompt_ids[..kv.seq_len]` — ровно те токены, что лежат в кэше, а
+    /// контекст драфтера откачен на ту же границу
+    /// ([`crate::dflash::DFlashCache::truncate_to`]).
+    pub fn generate_dflash_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        dcache: &mut crate::dflash::DFlashCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        self.generate_dflash_inner(kv, dcache, prompt_ids, gen_cfg, sink)
+    }
+
+    fn generate_dflash_inner(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        dcache: &mut crate::dflash::DFlashCache,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
@@ -700,14 +756,12 @@ impl MusePipeline {
         let device = self.model.device;
         let prompt = self.maybe_prepend_bos(prompt_ids);
         let l = prompt.len();
-        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let mut dcache = dflash
-            .make_cache()
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > kv.max_seq {
+            return Err(PipelineError::Forward(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
         let taps = dflash.config.target_layer_ids.clone();
         // Драфтер денойзит весь блок сразу, поэтому хвост блока угадывается
@@ -721,17 +775,27 @@ impl MusePipeline {
 
         let t0 = std::time::Instant::now();
         let chunk = cfg.prefill_batch.max(1);
-        let mut off = 0usize;
+        // Префикс-KV: до `kv.seq_len` всё посчитано на прошлом ходу. Минус один
+        // токен — логиты нужно получить хотя бы из одного forward'а.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        if prefix == 0 {
+            // Полный префилл: контекст драфтера набирается с нуля.
+            dcache.reset();
+        }
+        let mut off = prefix;
         let mut last_hidden: Option<Tensor> = None;
-        // Контекст драфтера после prefill — hidden ВСЕХ токенов промпта:
-        // anchor'ом диффузионного окна становится первый сгенерированный токен.
+        // Контекст драфтера после prefill — hidden токенов промпта, посчитанных
+        // на этом ходу: anchor'ом диффузионного окна становится первый
+        // сгенерированный токен. При возобновлении префикс уже лежит в кэше
+        // драфтера, поэтому дописываем только хвост (см. `truncate_to`).
         let mut tap_chunks: Vec<Vec<Tensor>> = vec![Vec::new(); taps.len()];
-        let ctx_pos0 = 0usize;
+        let ctx_pos0 = prefix;
         while off < l {
             let end = (off + chunk).min(l);
             let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let (h, tapped) = no_grad(|| self.model.forward_trunk_tapped(&part, &mut kv, &taps))
+            let (h, tapped) = no_grad(|| self.model.forward_trunk_tapped(&part, &mut *kv, &taps))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             for (slot, t) in tap_chunks.iter_mut().zip(tapped.into_iter()) {
                 slot.push(t);
@@ -821,7 +885,7 @@ impl MusePipeline {
                 (ctx_taps.clone(), ctx_pos)
             };
             let dlogits = no_grad(|| {
-                dflash.draft_logits(&self.model, &mut dcache, &draft_ctx, draft_pos, anchor)
+                dflash.draft_logits(&self.model, &mut *dcache, &draft_ctx, draft_pos, anchor)
             })
             .map_err(|e| PipelineError::Forward(format!("dflash draft: {e}")))?;
             let mut draft = argmax_rows(&dlogits)?;
@@ -835,7 +899,7 @@ impl MusePipeline {
             let s = chunk_ids.len();
             let t = Tensor::from_vec(chunk_ids, vec![1usize, s], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let (hh, tapped) = no_grad(|| self.model.forward_trunk_tapped(&t, &mut kv, &taps))
+            let (hh, tapped) = no_grad(|| self.model.forward_trunk_tapped(&t, &mut *kv, &taps))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             let lg = self
                 .model
@@ -899,6 +963,36 @@ impl MusePipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        let l = self.maybe_prepend_bos(prompt_ids).len();
+        let ctx = gen_cfg.max_seq.unwrap_or(l + gen_cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, ctx.max(2))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_lookup_inner(&mut kv, prompt_ids, gen_cfg, sink)
+    }
+
+    /// Prompt-lookup декод по ГОТОВОМУ кэшу: префилл стартует с `kv.seq_len`
+    /// (префикс-KV). Нужен для паритета путей: без него ход с кэшем уходил бы на
+    /// обычный декод, а ход без кэша — на спекулятивный, и greedy-ничьи
+    /// разрешались бы по-разному.
+    pub fn generate_lookup_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
+        self.generate_lookup_inner(kv, prompt_ids, gen_cfg, sink)
+    }
+
+    fn generate_lookup_inner(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, LookupStats), PipelineError> {
         use synaptix_core::grad::no_grad;
 
         if prompt_ids.is_empty() {
@@ -913,11 +1007,12 @@ impl MusePipeline {
         let device = self.model.device;
         let prompt = self.maybe_prepend_bos(prompt_ids);
         let l = prompt.len();
-        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > kv.max_seq {
+            return Err(PipelineError::Forward(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
 
         let argmax_rows = |logits: &Tensor| -> Result<Vec<u32>, PipelineError> {
@@ -943,13 +1038,16 @@ impl MusePipeline {
 
         let t0 = std::time::Instant::now();
         let chunk = cfg.prefill_batch.max(1);
-        let mut off = 0usize;
+        // Префикс-KV: до `kv.seq_len` всё посчитано на прошлом ходу.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        let mut off = prefix;
         let mut logits_opt = None;
         while off < l {
             let end = (off + chunk).min(l);
             let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let lg = no_grad(|| self.model.forward(&part, &mut kv))
+            let lg = no_grad(|| self.model.forward(&part, &mut *kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             logits_opt = Some(lg);
             off = end;
@@ -968,7 +1066,7 @@ impl MusePipeline {
         let stats = if cancelled {
             LookupStats::default()
         } else {
-            self.lookup_loop(&mut kv, &mut all_ids, &mut out, &cfg, &eos, sink)?
+            self.lookup_loop(&mut *kv, &mut all_ids, &mut out, &cfg, &eos, sink)?
         };
         let decode_ms = dec_t0.elapsed().as_millis();
         let new_tokens = out.len();

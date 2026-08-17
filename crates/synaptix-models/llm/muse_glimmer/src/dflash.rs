@@ -154,6 +154,18 @@ impl DFlashCache {
         self.start = 0;
     }
 
+    /// Откатить контекст к абсолютной позиции `pos`: точка возврата префикс-KV
+    /// стоит на конце промпта, а декод успел дописать в кэш дальше.
+    /// `false` — позиция уже вне окна (буфер прокрутился), контекст драфтера
+    /// придётся набирать заново.
+    pub fn truncate_to(&mut self, pos: usize) -> bool {
+        if pos < self.start || pos > self.start + self.len {
+            return false;
+        }
+        self.len = pos - self.start;
+        true
+    }
+
     pub fn context_len(&self) -> usize {
         self.len
     }
