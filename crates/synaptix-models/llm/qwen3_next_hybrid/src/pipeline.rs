@@ -22,6 +22,10 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 256;
 /// mid-stream оставляет состояние частичного внутреннего чанка, расходящееся
 /// с single-shot (проверено prefill_chunk_divergence: 64/128/256 bit-exact,
 /// 47/73/100 — max_abs_diff ~2.5-3.0). 0 → дефолт; иное — округление к 64.
+/// Внутренний чанк GDN-скана (`CS` в `model.rs`): границы префилла и точки
+/// возврата префикс-KV обязаны быть кратны ему.
+pub const GDN_CHUNK: usize = 64;
+
 fn effective_prefill_chunk(requested: usize) -> usize {
     // `SYN_PREFILL_CHUNK` перебивает и запрос вызывающего — knob для замеров
     // «пик VRAM / скорость» без пересборки хоста.
@@ -448,13 +452,50 @@ impl HybridPipeline {
         ))
     }
 
+    /// Размеры кэшей MTP-декода под контекст `ctx_tokens` и `max_new` токенов
+    /// ответа: `(kv_max, mtp_cap)`. Вынесено, чтобы вызывающий мог аллоцировать
+    /// кэши один раз на диалог и переиспользовать префикс между ходами
+    /// ([`Self::generate_mtp_resume`]).
+    pub fn mtp_cache_caps(&self, ctx_tokens: usize, max_new: usize) -> (usize, usize) {
+        let kv_max = ctx_tokens.max(2);
+        // mtp_kv растёт быстрее основного kv: +1 на draft и +1 на advance за шаг,
+        // а rollback отклонённого драфта основного kv его не откатывает — до
+        // 2×max_new_tokens сверх префилла. Выше RoPE-ёмкости MTP-модуля
+        // аллоцировать нельзя — при исчерпании кэша decode доработает остаток
+        // обычным путём.
+        let cap = self.mtp.as_ref().map(|m| m.rope_capacity()).unwrap_or(kv_max);
+        (kv_max, (kv_max + max_new + 2).min(cap))
+    }
+
+    /// Создать пару кэшей под MTP-декод (основной + кэш MTP-головы).
+    pub fn make_mtp_caches(
+        &self,
+        ctx_tokens: usize,
+        max_new: usize,
+    ) -> Result<(synaptix_llm_common::KvCache, synaptix_llm_common::KvCache), PipelineError> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("MTP-голова не загружена".into()))?;
+        let (kv_max, mtp_cap) = self.mtp_cache_caps(ctx_tokens, max_new);
+        let kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mtp_kv = mtp
+            .make_kv_cache(1, mtp_cap)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        Ok((kv, mtp_kv))
+    }
+
     pub fn generate_mtp(
         &self,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, false)
+        let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
+        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, false, None)
     }
 
     pub fn generate_mtp_with_graph(
@@ -464,15 +505,63 @@ impl HybridPipeline {
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
         let use_graph = !self.model.has_mxfp8_head_or_embed();
-        self.generate_mtp_inner(prompt_ids, gen_cfg, sink, use_graph)
+        let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
+        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, use_graph, None)
     }
 
+    /// MTP-декод по ГОТОВЫМ кэшам: префилл стартует с `kv.seq_len`, то есть
+    /// история, уже посчитанная на прошлом ходу, не считается заново
+    /// (префикс-KV). Вызывающий отвечает за то, что `prompt_ids[..kv.seq_len]`
+    /// — ровно те токены, что лежат в кэше, а linear-состояние GDN
+    /// восстановлено на эту же границу (см. `KvCache::snapshot_linear_full`).
+    ///
+    /// `on_prefill` зовётся сразу после префилла — там вызывающий снимает новую
+    /// точку возврата (снапшот GDN + позицию `mtp_kv`), пока декод её не
+    /// продвинул.
+    pub fn generate_mtp_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        mtp_kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+        on_prefill: &mut dyn FnMut(
+            usize,
+            &synaptix_llm_common::KvCache,
+            &synaptix_llm_common::KvCache,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
+        let use_graph = !self.model.has_mxfp8_head_or_embed();
+        self.generate_mtp_inner(kv, mtp_kv, prompt_ids, gen_cfg, sink, use_graph, Some(on_prefill))
+    }
+
+    fn mtp_caches_for(
+        &self,
+        prompt_ids: &[u32],
+        cfg: &GenerationConfig,
+    ) -> Result<(synaptix_llm_common::KvCache, synaptix_llm_common::KvCache), PipelineError> {
+        let ctx = cfg
+            .max_seq
+            .unwrap_or(prompt_ids.len() + cfg.max_new_tokens + 2);
+        self.make_mtp_caches(ctx, cfg.max_new_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn generate_mtp_inner(
         &self,
+        mut kv: &mut synaptix_llm_common::KvCache,
+        mut mtp_kv: &mut synaptix_llm_common::KvCache,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
         use_graph: bool,
+        mut on_prefill: Option<
+            &mut dyn FnMut(
+                usize,
+                &synaptix_llm_common::KvCache,
+                &synaptix_llm_common::KvCache,
+            ) -> Result<(), PipelineError>,
+        >,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
         use synaptix_core::grad::no_grad;
         use synaptix_core::tensor::Tensor;
@@ -489,22 +578,12 @@ impl HybridPipeline {
         let prompt = self.maybe_prepend_bos(prompt_ids);
         let l = prompt.len();
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
-        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 2);
-
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        // mtp_kv растёт быстрее основного kv: +1 на draft и +1 на advance за шаг,
-        // а rollback отклонённого драфта основного kv его не откатывает — до
-        // 2×max_new_tokens сверх префилла. Тесный kv_max (l+max_new+2)
-        // переполнялся к концу генерации без явного --max-seq. Выше RoPE-ёмкости
-        // MTP-модуля аллоцировать нельзя — при исчерпании кэша цикл ниже
-        // доработает остаток обычным decode.
-        let mtp_cap = (kv_max + cfg.max_new_tokens + 2).min(mtp.rope_capacity());
-        let mut mtp_kv = mtp
-            .make_kv_cache(1, mtp_cap)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > kv.max_seq {
+            return Err(PipelineError::Forward(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
 
         let argmax = |t: &Tensor| -> Result<u32, PipelineError> {
             let v = t
@@ -527,10 +606,28 @@ impl HybridPipeline {
             n => n.max(1),
         };
         let mut hidden = None;
-        let mut off = 0usize;
-        trace_prefill_mem(device, 0, l);
+        // Префикс-KV: всё до `kv.seq_len` уже посчитано на прошлом ходу.
+        // Минус один токен — логиты нужно получить хотя бы из одного forward'а.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        let mut off = prefix;
+        // Точку возврата для следующего хода ставим на границу, КРАТНУЮ CS=64
+        // GDN-скана: разрез посередине его внутреннего чанка оставляет
+        // состояние частичного чанка и расходится с непрерывным префиллом
+        // (проверено `prefill_chunk_divergence`: 64/128/256 — bit-exact,
+        // 47/73/100 — нет). Поэтому хвост промпта после последней кратной
+        // границы в кэш-точку не входит и на следующем ходу считается заново.
+        let snap_at = if on_prefill.is_some() {
+            (l / GDN_CHUNK) * GDN_CHUNK
+        } else {
+            0
+        };
+        trace_prefill_mem(device, off, l);
         while off < l {
-            let end = (off + chunk).min(l);
+            let mut end = (off + chunk).min(l);
+            if snap_at > off && end > snap_at {
+                end = snap_at;
+            }
             let part = Tensor::from_vec(
                 prompt[off..end].to_vec(),
                 vec![1usize, end - off],
@@ -557,6 +654,24 @@ impl HybridPipeline {
             hidden = Some(h);
             off = end;
             trace_prefill_mem(device, off, l);
+            // Точка возврата снимается ЗДЕСЬ, до декода: он продвинет и kv, и
+            // linear-состояние, и mtp_kv. Перед снимком выравниваем host и dev
+            // половины GDN-состояния: префилл живёт в dev-зеркалах, а
+            // `sync_decode_dev_state` перед декодом пересеивает их из host —
+            // снимок обязан застать обе половины согласованными, иначе
+            // восстановление на следующем ходу подсунет декоду устаревший host.
+            // Round-trip f16→f32→f16 точный, поэтому на сам префилл не влияет.
+            if off == snap_at && snap_at > 0 {
+                if let Some(cb) = on_prefill.as_mut() {
+                    self.model
+                        .sync_decode_host_state(kv)
+                        .map_err(|e| PipelineError::Forward(format!("prefix sync host: {e}")))?;
+                    self.model
+                        .sync_decode_dev_state(kv)
+                        .map_err(|e| PipelineError::Forward(format!("prefix sync dev: {e}")))?;
+                    cb(off, kv, mtp_kv)?;
+                }
+            }
         }
         let hidden = hidden.ok_or_else(|| PipelineError::Forward("prefill: пустой промпт".into()))?;
         let last = hidden.dims()[1] - 1;
@@ -795,7 +910,9 @@ impl HybridPipeline {
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
-    fn maybe_prepend_bos(&self, prompt_ids: &[u32]) -> Vec<u32> {
+    /// Промпт в том виде, в каком его видит движок (с BOS, если модель его
+    /// добавляет) — вызывающему нужен именно он, чтобы сравнивать префиксы.
+    pub fn maybe_prepend_bos(&self, prompt_ids: &[u32]) -> Vec<u32> {
         match self.config.bos_token_id {
             Some(bos) if self.add_bos && prompt_ids.first() != Some(&bos) => {
                 let mut v = Vec::with_capacity(prompt_ids.len() + 1);

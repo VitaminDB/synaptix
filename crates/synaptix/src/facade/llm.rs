@@ -13,7 +13,9 @@ use std::sync::Mutex;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::{parse_dtype, PrecisionConfig};
 use synaptix_core::tensor::Tensor;
-use synaptix_llm_common::{GenerationConfig, StreamSink};
+use synaptix_llm_common::{
+    GenerationConfig, KvCache as LlmKvCache, LinearSnapshot, StreamSink,
+};
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
@@ -499,6 +501,69 @@ impl LlmPipeline {
     }
 }
 
+/// Персистентный KV-кэш диалога («префикс-KV»).
+///
+/// Держит посчитанный префикс и токены, которым он соответствует, поэтому ход
+/// дописывает в кэш только НОВЫЙ хвост промпта, а не считает историю заново.
+/// Для гибрида (Qwen3.6/3.8) одного `kv.seq_len` мало: у linear-слоёв
+/// (GatedDeltaNet) состояние рекуррентное и «откатить» его нельзя, поэтому
+/// точка возврата — снимок GDN-состояния ровно на границе `ids` плюс позиция
+/// кэша MTP-головы на той же границе.
+///
+/// Точка возврата ставится на КОНЕЦ ПРОМПТА, а не на конец хода: chat-шаблон
+/// Qwen3 перерисовывает реплику ассистента (`<think>` из промпта + сгенерённый
+/// текст → `<think>\n\n</think>\n\n` + текст), так что сгенерённые токены
+/// новому промпту префиксом не являются, а вот весь промпт прошлого хода — да.
+pub struct LlmKvSession {
+    kv: LlmKvCache,
+    mtp_kv: Option<LlmKvCache>,
+    snap: Option<Vec<LinearSnapshot>>,
+    mtp_len: usize,
+    ids: Vec<u32>,
+    ctx_tokens: usize,
+}
+
+impl LlmKvSession {
+    /// Сколько токенов контекста рассчитан кэш.
+    pub fn ctx_tokens(&self) -> usize {
+        self.ctx_tokens
+    }
+
+    /// Токенов в точке возврата.
+    pub fn cached_tokens(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Сколько токенов промпта уже посчитано.
+    ///
+    /// Ноль, если кэш не является полным префиксом промпта: частичное
+    /// совпадение бесполезно, откатить GDN-состояние на середину нельзя.
+    /// Последний токен промпта всегда считается заново — из него берутся
+    /// логиты первого шага.
+    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+        let n = self.ids.len();
+        if n == 0 || self.snap.is_none() || prompt_ids.len() <= n {
+            return 0;
+        }
+        if prompt_ids[..n] == self.ids[..] {
+            n
+        } else {
+            0
+        }
+    }
+
+    /// Забыть префикс (смена чата/модели, сжатие истории).
+    pub fn invalidate(&mut self) {
+        self.ids.clear();
+        self.snap = None;
+        self.mtp_len = 0;
+        self.kv.reset();
+        if let Some(m) = self.mtp_kv.as_mut() {
+            m.reset();
+        }
+    }
+}
+
 pub struct Llm {
     pipeline: Mutex<LlmPipeline>,
     config: LlmConfig,
@@ -522,6 +587,42 @@ impl Llm {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Сессия префикс-KV на `ctx_tokens` токенов контекста и `max_new` токенов
+    /// ответа (последнее нужно кэшу MTP-головы: он растёт быстрее основного).
+    ///
+    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша
+    /// (реализован гибрид Qwen3.6/3.8 с MTP; у Muse-Glimmer спекулятивные
+    /// декодеры DFlash/lookup своих resume-путей ещё не имеют). Тогда
+    /// вызывающий просто работает как раньше — без переиспользования.
+    pub fn new_kv_session(
+        &self,
+        ctx_tokens: usize,
+        max_new: usize,
+    ) -> Result<Option<LlmKvSession>, LlmError> {
+        let pipeline = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let LlmPipeline::Hybrid(p) = &*pipeline else {
+            return Ok(None);
+        };
+        if !(mtp_enabled() && p.has_mtp()) {
+            return Ok(None);
+        }
+        let ctx = ctx_tokens.max(2);
+        let (kv, mtp_kv) = p
+            .make_mtp_caches(ctx, max_new)
+            .map_err(|e| LlmError(e.to_string()))?;
+        Ok(Some(LlmKvSession {
+            kv,
+            mtp_kv: Some(mtp_kv),
+            snap: None,
+            mtp_len: 0,
+            ids: Vec::new(),
+            ctx_tokens: ctx,
+        }))
     }
 
     pub fn kv_bytes_per_token(&self) -> usize {
@@ -822,6 +923,119 @@ impl<'a> LlmGeneration<'a> {
 }
 
 impl<'a> LlmGeneration<'a> {
+    /// Как [`Self::generate_streaming`], но с префикс-KV: всё, что уже лежит в
+    /// `session`, не считается заново. Возвращает, сколько токенов промпта
+    /// удалось переиспользовать.
+    ///
+    /// Сессия обновляется на КОНЕЦ ПРОМПТА этого хода — следующий ход,
+    /// дописавший в историю ответ модели и результаты инструментов, продолжит с
+    /// этой точки. Расхождение промпта с кэшем (сжали историю, отредактировали
+    /// сообщение, сменили системный prompt) обнаруживается сравнением токенов и
+    /// просто приводит к полному префиллу.
+    pub fn generate_streaming_cached<F>(
+        &mut self,
+        session: &mut LlmKvSession,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        on_token: F,
+    ) -> Result<usize, LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        let pipeline = self
+            .model
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let LlmPipeline::Hybrid(p) = &*pipeline else {
+            return Err(LlmError("префикс-KV: архитектура не поддержана".into()));
+        };
+        let mtp_kv_present = session.mtp_kv.is_some();
+        if !mtp_kv_present {
+            return Err(LlmError("префикс-KV: сессия без MTP-кэша".into()));
+        }
+        // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
+        let ids = p.maybe_prepend_bos(prompt_ids);
+        let reuse = session.reusable(&ids);
+        if reuse > 0 {
+            session.kv.seq_len = reuse;
+            if let Some(snap) = session.snap.as_ref() {
+                session
+                    .kv
+                    .restore_linear(snap)
+                    .map_err(|e| LlmError(e.to_string()))?;
+            }
+            if let Some(m) = session.mtp_kv.as_mut() {
+                m.seq_len = session.mtp_len;
+            }
+        } else {
+            // Полный префилл: GDN-состояние обязано быть нулевым, иначе новый
+            // ход продолжит чужую рекуррентность.
+            session.kv.reset();
+            if let Some(m) = session.mtp_kv.as_mut() {
+                m.reset();
+            }
+            session.snap = None;
+            session.mtp_len = 0;
+        }
+
+        let cfg = GenerationConfig {
+            max_new_tokens: self.opts.max_new_tokens,
+            temperature: self.opts.temperature,
+            top_k: self.opts.top_k,
+            top_p: self.opts.top_p,
+            min_p: self.opts.min_p,
+            repetition_penalty: self.opts.repeat_penalty,
+            seed: self.opts.seed,
+            eos_token_id: None,
+            eos_token_ids: self.stop_tokens.clone(),
+            max_seq: Some(session.ctx_tokens),
+            prefill_batch: prefill_chunk_size(),
+        };
+        let mut sink = DeltaSink {
+            tokenizer,
+            on_token,
+            acc: Vec::new(),
+            decoded: String::new(),
+            stop_sequences: &self.stop_sequences,
+        };
+
+        // Поля сессии берём по отдельности: кэши уходят в вызов по `&mut`, а
+        // снимок и позиция MTP пишутся из колбэка.
+        let LlmKvSession { kv, mtp_kv, snap, mtp_len, ids: sess_ids, .. } = session;
+        let mtp_kv = mtp_kv.as_mut().expect("checked above");
+        let mut new_snap: Option<Vec<LinearSnapshot>> = None;
+        let mut new_mtp_len = 0usize;
+        let mut new_len = 0usize;
+        let res = p.generate_mtp_resume(
+            kv,
+            mtp_kv,
+            &ids,
+            cfg,
+            &mut sink,
+            &mut |at: usize, kv_at_prefill: &LlmKvCache, mtp_at_prefill: &LlmKvCache| {
+                new_snap = Some(kv_at_prefill.snapshot_linear_full()?);
+                new_mtp_len = mtp_at_prefill.seq_len;
+                new_len = at;
+                Ok(())
+            },
+        );
+        // Точка возврата обновляется, только если движок её действительно снял
+        // (он ставит её на границу, кратную чанку GDN-скана, — короткий промпт
+        // такой границы может не иметь). Иначе прежняя остаётся в силе: она
+        // по-прежнему префикс этого промпта. Это верно и при ошибке генерации —
+        // хвост за точкой всё равно перезапишется следующим ходом.
+        if let Some(sn) = new_snap {
+            *snap = Some(sn);
+            *mtp_len = new_mtp_len;
+            *sess_ids = ids[..new_len].to_vec();
+        }
+        match res {
+            Ok(_) => Ok(reuse),
+            Err(e) => Err(LlmError(e.to_string())),
+        }
+    }
+
     /// Стриминг по промпту с медиа-вложениями.
     ///
     /// `media` перечисляется **в том же порядке, в каком блоки-заполнители

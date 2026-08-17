@@ -29,7 +29,7 @@ use crate::conv::causal_conv1d::{
     causal_conv1d_chunk_bf16, causal_conv1d_chunk_f16, causal_conv1d_chunk_f32, CausalConv1dKernels,
 };
 use crate::scan::chunk_scan::{chunk_gated_delta_rule, ChunkScanKernels};
-use crate::wsalloc::{WsAlloc, WsBuf};
+use crate::wsalloc::WsBuf;
 
 fn tm<T>() -> usize {
     std::mem::size_of::<T>()
