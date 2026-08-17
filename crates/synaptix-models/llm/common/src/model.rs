@@ -491,6 +491,20 @@ impl KvCache {
         Ok(())
     }
 
+    /// Самое дальнее начало ring-окна среди full-attention слоёв: ниже этой
+    /// позиции префикс уже вытеснен, и продолжать с неё нельзя (для
+    /// sliding-слоёв кэш держит только последние W токенов).
+    pub fn ring_start_max(&self) -> usize {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                LayerCache::Full(f) => Some(f.start),
+                LayerCache::Linear(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in &mut self.layers {

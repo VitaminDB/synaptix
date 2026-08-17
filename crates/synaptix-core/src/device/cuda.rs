@@ -440,7 +440,28 @@ mod inner {
             return stream.alloc::<u8>(len);
         }
         let ord = stream.context().ordinal();
-        let pool = if WEIGHTS_ALLOC.with(|c| c.get()) {
+        let loading = WEIGHTS_ALLOC.with(|c| c.get());
+        if loading {
+            // Staging-буферы разных размеров оставляют в пуле по блоку на
+            // size-класс, и за загрузку это набегает гигабайтами. Пока грузятся
+            // только веса, это неважно (трим на выходе из
+            // `WeightsAllocGuard`), но модель тянет за собой и компоненты
+            // ПОСЛЕ основных весов — MTP-голову, DFlash-драфтер, vision-башню:
+            // им квантоваться уже негде (проверено: DFlash Muse-Glimmer падал
+            // с OOM на `quantize_mxfp8`). Поэтому крупные staging-аллокации
+            // сначала возвращают пулу слабину.
+            const BIG: usize = 32 * 1024 * 1024;
+            const SLACK_LIMIT: u64 = 1536 * 1024 * 1024;
+            if len >= BIG {
+                if let Ok((rsv, used)) = weights_pool_stats(ord) {
+                    if rsv.saturating_sub(used) > SLACK_LIMIT {
+                        let _ = synchronize_all(ord);
+                        let _ = trim_weights_pool(ord);
+                    }
+                }
+            }
+        }
+        let pool = if loading {
             weights_pool(ord)
         } else {
             activations_pool(ord)

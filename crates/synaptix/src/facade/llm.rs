@@ -19,6 +19,7 @@ use synaptix_llm_common::{
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
+use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
 use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
@@ -505,22 +506,32 @@ impl LlmPipeline {
 ///
 /// Держит посчитанный префикс и токены, которым он соответствует, поэтому ход
 /// дописывает в кэш только НОВЫЙ хвост промпта, а не считает историю заново.
-/// Для гибрида (Qwen3.6/3.8) одного `kv.seq_len` мало: у linear-слоёв
-/// (GatedDeltaNet) состояние рекуррентное и «откатить» его нельзя, поэтому
-/// точка возврата — снимок GDN-состояния ровно на границе `ids` плюс позиция
-/// кэша MTP-головы на той же границе.
 ///
 /// Точка возврата ставится на КОНЕЦ ПРОМПТА, а не на конец хода: chat-шаблон
-/// Qwen3 перерисовывает реплику ассистента (`<think>` из промпта + сгенерённый
-/// текст → `<think>\n\n</think>\n\n` + текст), так что сгенерённые токены
-/// новому промпту префиксом не являются, а вот весь промпт прошлого хода — да.
+/// перерисовывает реплику ассистента (у Qwen3 — `<think>` из промпта плюс
+/// сгенерённый текст → `<think>\n\n</think>\n\n` + текст), так что
+/// сгенерированные токены новому промпту префиксом не являются, а весь промпт
+/// прошлого хода — является.
 pub struct LlmKvSession {
     kv: LlmKvCache,
-    mtp_kv: Option<LlmKvCache>,
-    snap: Option<Vec<LinearSnapshot>>,
-    mtp_len: usize,
     ids: Vec<u32>,
     ctx_tokens: usize,
+    kind: SessionKind,
+}
+
+/// Что, кроме основного KV, нужно донести до следующего хода.
+enum SessionKind {
+    /// Гибрид (Qwen3.6/3.8): кэш MTP-головы плюс снимок GDN-состояния — у
+    /// linear-слоёв рекуррентность, её нельзя «откатить» одним `seq_len`.
+    Hybrid {
+        mtp_kv: LlmKvCache,
+        snap: Option<Vec<LinearSnapshot>>,
+        mtp_len: usize,
+    },
+    /// Muse-Glimmer: роллинг-окно контекста DFlash-драфтера. Linear-слоёв нет,
+    /// поэтому снимок не нужен; зато у sliding-слоёв кэш держит лишь последние
+    /// W токенов — граница должна попадать в окно.
+    Muse { dcache: Option<DFlashCache> },
 }
 
 impl LlmKvSession {
@@ -537,29 +548,66 @@ impl LlmKvSession {
     /// Сколько токенов промпта уже посчитано.
     ///
     /// Ноль, если кэш не является полным префиксом промпта: частичное
-    /// совпадение бесполезно, откатить GDN-состояние на середину нельзя.
-    /// Последний токен промпта всегда считается заново — из него берутся
-    /// логиты первого шага.
+    /// совпадение бесполезно — GDN-состояние на середину не откатить, а у
+    /// sliding-слоёв ниже начала окна данных уже нет. Последний токен промпта
+    /// всегда считается заново: из него берутся логиты первого шага.
     pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
         let n = self.ids.len();
-        if n == 0 || self.snap.is_none() || prompt_ids.len() <= n {
+        if n == 0 || prompt_ids.len() <= n || prompt_ids[..n] != self.ids[..] {
             return 0;
         }
-        if prompt_ids[..n] == self.ids[..] {
-            n
-        } else {
-            0
+        match &self.kind {
+            SessionKind::Hybrid { snap, .. } => {
+                if snap.is_some() {
+                    n
+                } else {
+                    0
+                }
+            }
+            // Граница обязана лежать в ring-окне sliding-слоёв: всё, что ниже
+            // их `start`, декод прошлого хода уже вытеснил.
+            SessionKind::Muse { .. } => {
+                if n >= self.kv.ring_start_max() {
+                    n
+                } else {
+                    0
+                }
+            }
         }
     }
 
     /// Забыть префикс (смена чата/модели, сжатие истории).
     pub fn invalidate(&mut self) {
         self.ids.clear();
-        self.snap = None;
-        self.mtp_len = 0;
         self.kv.reset();
-        if let Some(m) = self.mtp_kv.as_mut() {
-            m.reset();
+        match &mut self.kind {
+            SessionKind::Hybrid { mtp_kv, snap, mtp_len } => {
+                mtp_kv.reset();
+                *snap = None;
+                *mtp_len = 0;
+            }
+            SessionKind::Muse { dcache } => {
+                if let Some(d) = dcache.as_mut() {
+                    d.reset();
+                }
+            }
+        }
+    }
+
+    /// Сбросить кэш к пустому состоянию перед полным префиллом.
+    fn reset_for_full(&mut self) {
+        self.kv.reset();
+        match &mut self.kind {
+            SessionKind::Hybrid { mtp_kv, snap, mtp_len } => {
+                mtp_kv.reset();
+                *snap = None;
+                *mtp_len = 0;
+            }
+            SessionKind::Muse { dcache } => {
+                if let Some(d) = dcache.as_mut() {
+                    d.reset();
+                }
+            }
         }
     }
 }
@@ -590,12 +638,12 @@ impl Llm {
     }
 
     /// Сессия префикс-KV на `ctx_tokens` токенов контекста и `max_new` токенов
-    /// ответа (последнее нужно кэшу MTP-головы: он растёт быстрее основного).
+    /// ответа (последнее нужно кэшу MTP-головы гибрида: он растёт быстрее
+    /// основного).
     ///
-    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша
-    /// (реализован гибрид Qwen3.6/3.8 с MTP; у Muse-Glimmer спекулятивные
-    /// декодеры DFlash/lookup своих resume-путей ещё не имеют). Тогда
-    /// вызывающий просто работает как раньше — без переиспользования.
+    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша.
+    /// Поддержаны гибрид Qwen3.6/3.8 (с MTP) и Muse-Glimmer (включая
+    /// DFlash-декод); остальные работают как раньше, без переиспользования.
     pub fn new_kv_session(
         &self,
         ctx_tokens: usize,
@@ -605,24 +653,46 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let LlmPipeline::Hybrid(p) = &*pipeline else {
-            return Ok(None);
-        };
-        if !(mtp_enabled() && p.has_mtp()) {
-            return Ok(None);
-        }
         let ctx = ctx_tokens.max(2);
-        let (kv, mtp_kv) = p
-            .make_mtp_caches(ctx, max_new)
-            .map_err(|e| LlmError(e.to_string()))?;
-        Ok(Some(LlmKvSession {
-            kv,
-            mtp_kv: Some(mtp_kv),
-            snap: None,
-            mtp_len: 0,
-            ids: Vec::new(),
-            ctx_tokens: ctx,
-        }))
+        match &*pipeline {
+            LlmPipeline::Hybrid(p) => {
+                if !(mtp_enabled() && p.has_mtp()) {
+                    return Ok(None);
+                }
+                let (kv, mtp_kv) = p
+                    .make_mtp_caches(ctx, max_new)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(Some(LlmKvSession {
+                    kv,
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Hybrid { mtp_kv, snap: None, mtp_len: 0 },
+                }))
+            }
+            LlmPipeline::MuseGlimmer(p) => {
+                // Кэш драфтера нужен только greedy-пути DFlash; на прочих
+                // (lookup / graph / eager) сессия — это просто основной KV.
+                let (kv, dcache) = if p.has_dflash() {
+                    let (kv, d) = p
+                        .make_dflash_caches(ctx)
+                        .map_err(|e| LlmError(e.to_string()))?;
+                    (kv, Some(d))
+                } else {
+                    let kv = p
+                        .model
+                        .make_kv_cache(1, ctx)
+                        .map_err(|e| LlmError(e.to_string()))?;
+                    (kv, None)
+                };
+                Ok(Some(LlmKvSession {
+                    kv,
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Muse { dcache },
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub fn kv_bytes_per_token(&self) -> usize {
@@ -947,38 +1017,6 @@ impl<'a> LlmGeneration<'a> {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let LlmPipeline::Hybrid(p) = &*pipeline else {
-            return Err(LlmError("префикс-KV: архитектура не поддержана".into()));
-        };
-        let mtp_kv_present = session.mtp_kv.is_some();
-        if !mtp_kv_present {
-            return Err(LlmError("префикс-KV: сессия без MTP-кэша".into()));
-        }
-        // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
-        let ids = p.maybe_prepend_bos(prompt_ids);
-        let reuse = session.reusable(&ids);
-        if reuse > 0 {
-            session.kv.seq_len = reuse;
-            if let Some(snap) = session.snap.as_ref() {
-                session
-                    .kv
-                    .restore_linear(snap)
-                    .map_err(|e| LlmError(e.to_string()))?;
-            }
-            if let Some(m) = session.mtp_kv.as_mut() {
-                m.seq_len = session.mtp_len;
-            }
-        } else {
-            // Полный префилл: GDN-состояние обязано быть нулевым, иначе новый
-            // ход продолжит чужую рекуррентность.
-            session.kv.reset();
-            if let Some(m) = session.mtp_kv.as_mut() {
-                m.reset();
-            }
-            session.snap = None;
-            session.mtp_len = 0;
-        }
-
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
@@ -1000,39 +1038,128 @@ impl<'a> LlmGeneration<'a> {
             stop_sequences: &self.stop_sequences,
         };
 
-        // Поля сессии берём по отдельности: кэши уходят в вызов по `&mut`, а
-        // снимок и позиция MTP пишутся из колбэка.
-        let LlmKvSession { kv, mtp_kv, snap, mtp_len, ids: sess_ids, .. } = session;
-        let mtp_kv = mtp_kv.as_mut().expect("checked above");
-        let mut new_snap: Option<Vec<LinearSnapshot>> = None;
-        let mut new_mtp_len = 0usize;
-        let mut new_len = 0usize;
-        let res = p.generate_mtp_resume(
-            kv,
-            mtp_kv,
-            &ids,
-            cfg,
-            &mut sink,
-            &mut |at: usize, kv_at_prefill: &LlmKvCache, mtp_at_prefill: &LlmKvCache| {
-                new_snap = Some(kv_at_prefill.snapshot_linear_full()?);
-                new_mtp_len = mtp_at_prefill.seq_len;
-                new_len = at;
-                Ok(())
-            },
-        );
-        // Точка возврата обновляется, только если движок её действительно снял
-        // (он ставит её на границу, кратную чанку GDN-скана, — короткий промпт
-        // такой границы может не иметь). Иначе прежняя остаётся в силе: она
-        // по-прежнему префикс этого промпта. Это верно и при ошибке генерации —
-        // хвост за точкой всё равно перезапишется следующим ходом.
-        if let Some(sn) = new_snap {
-            *snap = Some(sn);
-            *mtp_len = new_mtp_len;
-            *sess_ids = ids[..new_len].to_vec();
-        }
-        match res {
-            Ok(_) => Ok(reuse),
-            Err(e) => Err(LlmError(e.to_string())),
+        match &*pipeline {
+            LlmPipeline::Hybrid(p) => {
+                if !matches!(session.kind, SessionKind::Hybrid { .. }) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
+                let ids = p.maybe_prepend_bos(prompt_ids);
+                let reuse = session.reusable(&ids);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                    let SessionKind::Hybrid { mtp_kv, snap, mtp_len } = &mut session.kind else {
+                        unreachable!("проверено выше")
+                    };
+                    if let Some(sn) = snap.as_ref() {
+                        session
+                            .kv
+                            .restore_linear(sn)
+                            .map_err(|e| LlmError(e.to_string()))?;
+                    }
+                    mtp_kv.seq_len = *mtp_len;
+                } else {
+                    // Полный префилл: GDN-состояние обязано быть нулевым, иначе
+                    // ход продолжит чужую рекуррентность.
+                    session.reset_for_full();
+                }
+
+                let LlmKvSession { kv, ids: sess_ids, kind, .. } = session;
+                let SessionKind::Hybrid { mtp_kv, snap, mtp_len } = kind else {
+                    unreachable!("проверено выше")
+                };
+                let mut new_snap: Option<Vec<LinearSnapshot>> = None;
+                let mut new_mtp_len = 0usize;
+                let mut new_len = 0usize;
+                let res = p.generate_mtp_resume(
+                    kv,
+                    mtp_kv,
+                    &ids,
+                    cfg,
+                    &mut sink,
+                    &mut |at: usize, kv_at: &LlmKvCache, mtp_at: &LlmKvCache| {
+                        new_snap = Some(kv_at.snapshot_linear_full()?);
+                        new_mtp_len = mtp_at.seq_len;
+                        new_len = at;
+                        Ok(())
+                    },
+                );
+                // Точку возврата обновляем, только если движок её действительно
+                // снял (он ставит её на границу, кратную чанку GDN-скана, —
+                // короткий промпт такой границы может не иметь). Иначе прежняя
+                // остаётся в силе: она по-прежнему префикс этого промпта. Это
+                // верно и при ошибке генерации — хвост за точкой всё равно
+                // перезапишется следующим ходом.
+                if let Some(sn) = new_snap {
+                    *snap = Some(sn);
+                    *mtp_len = new_mtp_len;
+                    *sess_ids = ids[..new_len].to_vec();
+                }
+                match res {
+                    Ok(_) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            LlmPipeline::MuseGlimmer(p) => {
+                if !matches!(session.kind, SessionKind::Muse { .. }) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let ids = p.maybe_prepend_bos(prompt_ids);
+                let mut reuse = session.reusable(&ids);
+                // Путь декода выбирается так же, как в `generate_streaming`.
+                let dflash_path =
+                    cfg.temperature == 0.0 && dflash_enabled() && p.has_dflash();
+                let SessionKind::Muse { dcache } = &mut session.kind else {
+                    unreachable!("проверено выше")
+                };
+                if reuse > 0 && dflash_path {
+                    // Контекст драфтера — роллинг-окно: если граница из него
+                    // уже вышла, набирать его заново нечем (tap-hidden'ы
+                    // префикса не хранятся), поэтому честно префиллим всё.
+                    let ok = dcache
+                        .as_mut()
+                        .map(|d| d.truncate_to(reuse))
+                        .unwrap_or(false);
+                    if !ok {
+                        reuse = 0;
+                    }
+                }
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                let LlmKvSession { kv, ids: sess_ids, kind, .. } = session;
+                let SessionKind::Muse { dcache } = kind else {
+                    unreachable!("проверено выше")
+                };
+                // Порядок ровно как в `LlmPipeline::generate_streaming`: иначе
+                // ход с кэшем и ход без кэша разрешали бы greedy-ничьи разными
+                // путями (спекулятивный против обычного) и расходились в тексте.
+                let res = if dflash_path {
+                    let d = dcache
+                        .as_mut()
+                        .ok_or_else(|| LlmError("префикс-KV: сессия без кэша DFlash".into()))?;
+                    p.generate_dflash_resume(kv, d, &ids, cfg, &mut sink)
+                        .map(|_| ())
+                } else if cfg.temperature == 0.0
+                    && matches!(p.model.device, synaptix_core::device::Device::Cuda(_))
+                {
+                    p.generate_lookup_resume(kv, &ids, cfg, &mut sink).map(|_| ())
+                } else if p.graph_decode_supported() {
+                    p.generate_with_graph_resume(kv, &ids, cfg, &mut sink).map(|_| ())
+                } else {
+                    p.generate_streaming_resume(kv, &ids, cfg, &mut sink).map(|_| ())
+                };
+                // У Muse точка возврата — весь промпт: linear-слоёв нет, а
+                // attention-кэш усекается по `seq_len` (в пределах ring-окна).
+                *sess_ids = ids;
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            _ => Err(LlmError("префикс-KV: архитектура не поддержана".into())),
         }
     }
 
