@@ -712,9 +712,16 @@ impl LlmTokenizer {
         let msgs: Vec<TokMessage> = messages.iter().map(Message::to_tok).collect();
         match &self.template {
             Some(tmpl) => {
+                // Канальные шаблоны (Muse Glimmer) не знают про
+                // `enable_thinking`: у них глубина рассуждений задаётся
+                // строкой `reasoning_strength` в системном блоке, а совсем
+                // отключить reasoning протокол не позволяет. Отдаём обе
+                // переменные — лишнюю шаблон просто не прочитает.
+                let strength = if enable_thinking { "high" } else { "low" };
                 let mut opts = RenderOptions::new()
                     .with_generation_prompt(add_generation_prompt)
-                    .with_var("enable_thinking", serde_json::Value::Bool(enable_thinking));
+                    .with_var("enable_thinking", serde_json::Value::Bool(enable_thinking))
+                    .with_var("reasoning_strength", serde_json::Value::String(strength.into()));
                 if let Some(t) = tools {
                     if !t.is_empty() {
                         opts = opts.with_var("tools", serde_json::Value::Array(t.to_vec()));
