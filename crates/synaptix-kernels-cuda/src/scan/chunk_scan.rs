@@ -11,6 +11,7 @@
 //!
 //! Требование: `T % CS == 0` (без паддинга). Layout входов — `(BH, T, *)`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
@@ -21,6 +22,7 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use crate::attention::chunk_fla::ChunkFlaKernels;
 use crate::kernels::compile::{compile_module, load_fn};
+use crate::wsalloc::{WsAlloc, WsBuf};
 
 pub struct ChunkScanKernels {
     _module: Arc<CudaModule>,
@@ -197,6 +199,61 @@ impl ChunkScanKernels {
     }
 }
 
+/// Скретчи `chunk_gated_delta_rule`, живущие между вызовами (по одному
+/// набору на устройство). Размеры зависят только от (BH,T,HK,HV,CS) — на
+/// префилле они постоянны от чанка к чанку и от слоя к слою, так что после
+/// первого вызова аллокаций не остаётся. Отдаются драйверу в
+/// [`clear_chunk_scan_ws`] (вызывается из `release_device_caches`).
+#[derive(Default)]
+struct ChunkWs {
+    q_n: WsBuf<f32>,
+    k_n: WsBuf<f32>,
+    v_beta: WsBuf<f32>,
+    k_beta: WsBuf<f32>,
+    g_cumsum: WsBuf<f32>,
+    attn: WsBuf<f32>,
+    dm: WsBuf<f32>,
+    value_proc: WsBuf<f32>,
+    k_cumdecay: WsBuf<f32>,
+    k_cumdecay_input: WsBuf<f32>,
+    q_scaled: WsBuf<f32>,
+    v_prime: WsBuf<f32>,
+    attn_intra: WsBuf<f32>,
+    k_decayed: WsBuf<f32>,
+}
+
+impl ChunkWs {
+    /// Сколько байт держат все буферы набора.
+    fn bytes(&self) -> usize {
+        self.q_n.bytes()
+            + self.k_n.bytes()
+            + self.v_beta.bytes()
+            + self.k_beta.bytes()
+            + self.g_cumsum.bytes()
+            + self.attn.bytes()
+            + self.dm.bytes()
+            + self.value_proc.bytes()
+            + self.k_cumdecay.bytes()
+            + self.k_cumdecay_input.bytes()
+            + self.q_scaled.bytes()
+            + self.v_prime.bytes()
+            + self.attn_intra.bytes()
+            + self.k_decayed.bytes()
+    }
+}
+
+static WS: OnceLock<Mutex<HashMap<usize, ChunkWs>>> = OnceLock::new();
+
+/// Отдать пулу скретчи chunk-scan'а (десятки МБ на устройство). Вызывается
+/// при выгрузке модели — до трима пулов.
+pub fn clear_chunk_scan_ws() -> usize {
+    let Some(cache) = WS.get() else { return 0 };
+    let mut g = cache.lock();
+    let freed = g.values().map(ChunkWs::bytes).sum();
+    g.clear();
+    freed
+}
+
 /// Chunked gated delta rule (prefill). Layout входов `(BH, T, *)`, state
 /// `(BH, HK, HV)` in/out, out `(BH, T, HV)`. Требует `T % cs == 0`.
 ///
@@ -237,49 +294,72 @@ pub fn chunk_gated_delta_rule(
         nc as usize,
     );
 
-    let alloc = |n: usize| -> Result<CudaSlice<f32>> {
-        stream
-            .alloc_zeros::<f32>(n)
-            .map_err(|e| SynaptixError::Cuda(format!("alloc chunk_scan ws: {e:?}")))
+    // ── Workspace: кэш на устройство (см. `WsBuf`). Все 14 буферов сайзятся
+    // по (BH,T,HK,HV,CS) и на префилле от чанка к чанку не меняются, поэтому
+    // после первого вызова аллокаций тут нет — прежний вариант брал 14 свежих
+    // блоков на КАЖДЫЙ слой каждого чанка и дробил пул до OOM'а на 6 МБ.
+    let ord = stream.context().ordinal();
+    let cache = WS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock();
+    let ws: &mut ChunkWs = guard.entry(ord).or_default();
+    let werr = |what: &str, e: cudarc::driver::DriverError| {
+        SynaptixError::Cuda(format!("alloc chunk_scan ws {what}: {e:?}"))
     };
 
     // ── Препроцессинг.
-    let mut q_n = alloc(bh_u * t_u * hk_u)?;
-    let mut k_n = alloc(bh_u * t_u * hk_u)?;
-    let mut v_beta = alloc(bh_u * t_u * hv_u)?;
-    let mut k_beta = alloc(bh_u * t_u * hk_u)?;
-    let mut g_cumsum = alloc(bh_u * t_u)?;
+    let q_n = ws.q_n.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("q_n", e))?;
+    let k_n = ws.k_n.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_n", e))?;
+    let v_beta = ws.v_beta.fit_zeros(stream, bh_u * t_u * hv_u).map_err(|e| werr("v_beta", e))?;
+    let k_beta = ws.k_beta.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_beta", e))?;
+    let g_cumsum = ws.g_cumsum.fit_zeros(stream, bh_u * t_u).map_err(|e| werr("g_cumsum", e))?;
 
-    csk.l2norm_scale_lastdim(stream, q_in, &mut q_n, bh * t, hk, q_scale, 1e-6)?;
-    csk.l2norm_scale_lastdim(stream, k_in, &mut k_n, bh * t, hk, 1.0, 1e-6)?;
-    csk.mul_rowwise(stream, v_in, beta_in, &mut v_beta, bh * t, hv)?;
-    csk.mul_rowwise(stream, &k_n, beta_in, &mut k_beta, bh * t, hk)?;
+    csk.l2norm_scale_lastdim(stream, q_in, &mut *q_n, bh * t, hk, q_scale, 1e-6)?;
+    csk.l2norm_scale_lastdim(stream, k_in, &mut *k_n, bh * t, hk, 1.0, 1e-6)?;
+    csk.mul_rowwise(stream, v_in, beta_in, &mut *v_beta, bh * t, hv)?;
+    csk.mul_rowwise(stream, &*k_n, beta_in, &mut *k_beta, bh * t, hk)?;
     // g_in (BH, T) = (BH*NC, CS) — cumsum по чанку.
-    csk.cumsum_lastdim(stream, g_in, &mut g_cumsum, bh * nc, cs)?;
+    csk.cumsum_lastdim(stream, g_in, &mut *g_cumsum, bh * nc, cs)?;
 
-    // ── Workspace.
-    let mut attn = alloc(bh_u * nc_u * cs_u * cs_u)?;
-    let mut dm = alloc(bh_u * nc_u * cs_u * cs_u)?;
-    let mut value_proc = alloc(bh_u * nc_u * cs_u * hv_u)?;
-    let mut k_cumdecay = alloc(bh_u * nc_u * cs_u * hk_u)?;
-    let mut k_cumdecay_input = alloc(bh_u * nc_u * cs_u * hk_u)?;
-    let mut q_scaled = alloc(bh_u * nc_u * cs_u * hk_u)?;
-    let mut v_prime = alloc(bh_u * cs_u * hv_u)?;
-    let mut attn_intra = alloc(bh_u * cs_u * cs_u)?;
-    let mut k_decayed = alloc(bh_u * cs_u * hk_u)?;
+    let attn = ws.attn.fit_zeros(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("attn", e))?;
+    let dm = ws.dm.fit_zeros(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("dm", e))?;
+    let value_proc = ws
+        .value_proc
+        .fit_zeros(stream, bh_u * nc_u * cs_u * hv_u)
+        .map_err(|e| werr("value_proc", e))?;
+    let k_cumdecay = ws
+        .k_cumdecay
+        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .map_err(|e| werr("k_cumdecay", e))?;
+    let k_cumdecay_input = ws
+        .k_cumdecay_input
+        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .map_err(|e| werr("k_cumdecay_input", e))?;
+    let q_scaled = ws
+        .q_scaled
+        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .map_err(|e| werr("q_scaled", e))?;
+    let v_prime = ws.v_prime.fit_zeros(stream, bh_u * cs_u * hv_u).map_err(|e| werr("v_prime", e))?;
+    let attn_intra = ws
+        .attn_intra
+        .fit_zeros(stream, bh_u * cs_u * cs_u)
+        .map_err(|e| werr("attn_intra", e))?;
+    let k_decayed = ws
+        .k_decayed
+        .fit_zeros(stream, bh_u * cs_u * hk_u)
+        .map_err(|e| werr("k_decayed", e))?;
 
     // ── intra-chunk attn + decay_mask.
     cfk.compute_chunk_attn(
-        stream, &k_beta, &k_n, &g_cumsum, &mut attn, &mut dm, bh, nc, cs, hk,
+        stream, &*k_beta, &*k_n, &*g_cumsum, &mut *attn, &mut *dm, bh, nc, cs, hk,
     )?;
 
     // ── k_cumdecay_input = k_beta * exp(g_cumsum); q_scaled = q_n * exp(g_cumsum).
     cfk.scale_by_exp_diff(
         stream,
-        &mut k_cumdecay_input,
-        &k_beta,
+        &mut *k_cumdecay_input,
+        &*k_beta,
         None,
-        &g_cumsum,
+        &*g_cumsum,
         bh * nc * cs,
         hk,
         cs,
@@ -287,10 +367,10 @@ pub fn chunk_gated_delta_rule(
     )?;
     cfk.scale_by_exp_diff(
         stream,
-        &mut q_scaled,
-        &q_n,
+        &mut *q_scaled,
+        &*q_n,
         None,
-        &g_cumsum,
+        &*g_cumsum,
         bh * nc * cs,
         hk,
         cs,
@@ -301,11 +381,11 @@ pub fn chunk_gated_delta_rule(
     let bnc = bh * nc;
     csk.bmm(
         stream,
-        &attn,
+        &*attn,
         0,
-        &v_beta,
+        &*v_beta,
         0,
-        &mut value_proc,
+        &mut *value_proc,
         0,
         false,
         false,
@@ -321,11 +401,11 @@ pub fn chunk_gated_delta_rule(
     )?;
     csk.bmm(
         stream,
-        &attn,
+        &*attn,
         0,
-        &k_cumdecay_input,
+        &*k_cumdecay_input,
         0,
-        &mut k_cumdecay,
+        &mut *k_cumdecay,
         0,
         false,
         false,
@@ -348,11 +428,11 @@ pub fn chunk_gated_delta_rule(
         // 9.1 v_prime = k_cumdecay[:, ci] @ state. (CS,HK)@(HK,HV) per-BH.
         csk.bmm(
             stream,
-            &k_cumdecay,
+            &*k_cumdecay,
             off_hk,
             state,
             0,
-            &mut v_prime,
+            &mut *v_prime,
             0,
             false,
             false,
@@ -368,12 +448,12 @@ pub fn chunk_gated_delta_rule(
         )?;
 
         // 9.2 value_proc[:, ci] -= v_prime.
-        cfk.sub_chunk(stream, &mut value_proc, &v_prime, bh, nc, cs, hv, ci)?;
+        cfk.sub_chunk(stream, &mut *value_proc, &*v_prime, bh, nc, cs, hv, ci)?;
 
         // 9.3 out[:, ci] = q_scaled[:, ci] @ state.
         csk.bmm(
             stream,
-            &q_scaled,
+            &*q_scaled,
             off_hk,
             state,
             0,
@@ -395,11 +475,11 @@ pub fn chunk_gated_delta_rule(
         // 9.4 attn_intra = q_n[:, ci] @ k_n[:, ci]^T.
         csk.bmm(
             stream,
-            &q_n,
+            &*q_n,
             off_hk,
-            &k_n,
+            &*k_n,
             off_hk,
-            &mut attn_intra,
+            &mut *attn_intra,
             0,
             false,
             true,
@@ -415,14 +495,14 @@ pub fn chunk_gated_delta_rule(
         )?;
 
         // 9.5 attn_intra *= decay_mask[:, ci].
-        cfk.mul_decay_mask_chunk(stream, &mut attn_intra, &dm, bh, nc, cs, ci)?;
+        cfk.mul_decay_mask_chunk(stream, &mut *attn_intra, &*dm, bh, nc, cs, ci)?;
 
         // 9.6 out[:, ci] += attn_intra @ v_new (v_new = value_proc[:, ci]).
         csk.bmm(
             stream,
-            &attn_intra,
+            &*attn_intra,
             0,
-            &value_proc,
+            &*value_proc,
             off_hv,
             out,
             off_hv,
@@ -440,17 +520,17 @@ pub fn chunk_gated_delta_rule(
         )?;
 
         // 9.7 state *= exp(g_cumsum[:, ci, CS-1]).
-        cfk.state_decay_from_gcumsum_chunk(stream, state, &g_cumsum, bh, nc, cs, hk, hv, ci)?;
+        cfk.state_decay_from_gcumsum_chunk(stream, state, &*g_cumsum, bh, nc, cs, hk, hv, ci)?;
 
         // 9.8 k_decayed = k_n[:, ci] * exp(g_last - g_cumsum[:, ci]).
-        cfk.scale_k_decayed_chunk(stream, &mut k_decayed, &k_n, &g_cumsum, bh, nc, cs, hk, ci)?;
+        cfk.scale_k_decayed_chunk(stream, &mut *k_decayed, &*k_n, &*g_cumsum, bh, nc, cs, hk, ci)?;
 
         // 9.9 state += k_decayed^T @ v_new.
         csk.bmm(
             stream,
-            &k_decayed,
+            &*k_decayed,
             0,
-            &value_proc,
+            &*value_proc,
             off_hv,
             state,
             0,

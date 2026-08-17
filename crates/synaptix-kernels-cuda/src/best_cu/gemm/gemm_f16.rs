@@ -9,6 +9,7 @@ use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::wsalloc::WsAlloc;
 
 const BM: u32 = 128;
 const BN: u32 = 128;
@@ -248,10 +249,10 @@ pub fn gemm_nn_u8(
     } else {
         let k_pad = (k.div_ceil(16) * 16).max(MIN_K);
         let mut a_pad = stream
-            .alloc_zeros::<u8>((batch as usize) * (m as usize) * (k_pad as usize) * 2)
+            .ws_alloc_zeros::<u8>((batch as usize) * (m as usize) * (k_pad as usize) * 2)
             .map_err(|e| SynaptixError::Cuda(format!("gemm_nn K-pad alloc a: {e:?}")))?;
         let mut b_pad = stream
-            .alloc_zeros::<u8>((bb as usize) * (k_pad as usize) * (n as usize) * 2)
+            .ws_alloc_zeros::<u8>((bb as usize) * (k_pad as usize) * (n as usize) * 2)
             .map_err(|e| SynaptixError::Cuda(format!("gemm_nn K-pad alloc b: {e:?}")))?;
         crate::best_cu::gemm::gemm_bf16::pad_copy_k_bytes(stream, a, &mut a_pad, batch * m, k, k_pad)?;
         crate::best_cu::gemm::gemm_bf16::pad_copy_k_bytes(stream, b, &mut b_pad, bb, k * n, k_pad * n)?;
@@ -266,7 +267,7 @@ pub fn gemm_nn_u8(
     let n_eff = if need_n { n.div_ceil(8) * 8 } else { n };
     let b_npad = if need_n {
         let mut b_n = stream
-            .alloc_zeros::<u8>((bb as usize) * (k as usize) * (n_eff as usize) * 2)
+            .ws_alloc_zeros::<u8>((bb as usize) * (k as usize) * (n_eff as usize) * 2)
             .map_err(|e| SynaptixError::Cuda(format!("gemm_nn N-pad alloc b: {e:?}")))?;
         crate::best_cu::gemm::gemm_bf16::pad_copy_k_bytes(stream, b, &mut b_n, bb * k, n, n_eff)?;
         Some(b_n)
@@ -277,7 +278,7 @@ pub fn gemm_nn_u8(
     let mut c_pad = if need_n {
         Some(
             stream
-                .alloc_zeros::<u8>((batch as usize) * (m as usize) * (n_eff as usize) * 2)
+                .ws_alloc_zeros::<u8>((batch as usize) * (m as usize) * (n_eff as usize) * 2)
                 .map_err(|e| SynaptixError::Cuda(format!("gemm_nn N-pad alloc c: {e:?}")))?,
         )
     } else {
@@ -340,6 +341,7 @@ pub fn gemm_nn_u8(
             (n as usize) * 2,
             (n_eff as usize) * 2,
             (n as usize) * 2,
+            0,
         )?;
     }
     Ok(())

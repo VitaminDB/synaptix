@@ -379,11 +379,14 @@ pub fn mxfp8_quant_natural(
 }
 
 /// MXFP8 → f16 dequant [rows,K]: value = e4m3(packed) * 2^(E8M0[row,k/32]-127).
+/// Деквант MXFP8 → f16. `packed`/`scales` — вьюхи: позволяют дековантовать
+/// полосу строк веса (натуральная раскладка [n,k] / [n,k/32] — строки лежат
+/// подряд, полоса = байтовое подокно), не материализуя W целиком.
 pub fn mxfp8_dequant_f16(
     kernels: &Mxfp8QuantKernels,
     stream: &Arc<CudaStream>,
-    packed: &CudaSlice<u8>,
-    scales: &CudaSlice<u8>,
+    packed: &CudaView<'_, u8>,
+    scales: &CudaView<'_, u8>,
     out: &mut CudaViewMut<f16>,
     rows: u32,
     k: u32,

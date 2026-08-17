@@ -147,6 +147,10 @@ impl VideoPromptInfo {
 
 impl MusePipeline {
     pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         Self::load_with_precision(path, device, PrecisionConfig::dense(dtype), None)
     }
 
@@ -156,6 +160,10 @@ impl MusePipeline {
         precision: PrecisionConfig,
         max_seq: Option<usize>,
     ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let weights = MuseWeights::load(path, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();

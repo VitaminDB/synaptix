@@ -58,6 +58,10 @@ pub enum KvDtypePolicy {
     F16,
     BF16,
     F32,
+    /// MXFP8 (Blackwell block-scale): байт на элемент + E8M0-масштаб на блок
+    /// из 32 → KV почти вдвое дешевле F16 (у гибрида 27B 33 КБ против 64 КБ на
+    /// токен). Именно этот режим делает реальным контекст в 80k+ на 24 ГБ.
+    MXFP8,
 }
 
 impl KvDtypePolicy {
@@ -66,6 +70,9 @@ impl KvDtypePolicy {
             "f16" | "fp16" | "half" => Some(Self::F16),
             "bf16" => Some(Self::BF16),
             "f32" | "fp32" => Some(Self::F32),
+            // `fp8e4m3` — имя из дропдауна настроек synthos; `fp8`/`mxfp8` —
+            // как у CLI-флага `--kv-dtype`.
+            "fp8e4m3" | "fp8_e4m3" | "fp8" | "mxfp8" => Some(Self::MXFP8),
             _ => None,
         }
     }
@@ -75,6 +82,7 @@ impl KvDtypePolicy {
             Self::F16 => "f16",
             Self::BF16 => "bf16",
             Self::F32 => "f32",
+            Self::MXFP8 => "fp8e4m3",
         }
     }
 
@@ -83,6 +91,7 @@ impl KvDtypePolicy {
             Self::F16 => DType::F16,
             Self::BF16 => DType::BF16,
             Self::F32 => DType::F32,
+            Self::MXFP8 => DType::MXFP8,
         }
     }
 }
@@ -1063,6 +1072,11 @@ pub fn load_llm_with_policy(
 ) -> Result<(Llm, LlmTokenizer), LlmError> {
     let precision = policy.to_precision()?;
     let max_seq = config_max_seq(path);
+    // Веса (и транзиенты деквантизации/переквантизации) — в default-пул,
+    // отдельно от пула активаций: смешанный пул за один длинный префилл
+    // деградирует в «решето» и упирается в OOM при неизменном живом объёме
+    // (см. `synaptix_core::device::cuda::activations_pool`).
+    let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(*device);
     load_llm(path, *device, precision, max_seq)
 }
 

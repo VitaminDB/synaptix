@@ -23,6 +23,23 @@ type DescKey = (u64, u32, u32, u32, u32, u32, u64, u64);
 static DESC_CACHE: OnceLock<Mutex<std::collections::HashMap<DescKey, Arc<CudaSlice<u8>>>>> =
     OnceLock::new();
 
+/// Сбросить кэш TMA-дескрипторов. Ключ записи — АДРЕС тензора, поэтому после
+/// выгрузки модели весь кэш мёртв: 128-байтовые дескрипторы висят живыми
+/// аллокациями, рассыпанными по сегментам mempool'а, и не дают
+/// `cuMemPoolTrimTo` вернуть драйверу зарезервированное. Дескрипторы
+/// восстанавливаются лениво на первом же вызове.
+pub fn clear_desc_cache() -> usize {
+    match DESC_CACHE.get() {
+        Some(c) => {
+            let mut g = c.lock();
+            let n = g.len();
+            g.clear();
+            n
+        }
+        None => 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cached_desc_2d(
     stream: &Arc<CudaStream>,

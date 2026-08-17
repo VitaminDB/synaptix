@@ -74,10 +74,15 @@ impl GraphCapturer {
         let prev_tracking = ctx.is_event_tracking();
         unsafe { ctx.disable_event_tracking() };
 
+        // Под capture аллокации становятся узлами графа — пул для них выбирает
+        // драйвер, свой пул активаций тут не навязываем (см.
+        // `synaptix_core::device::cuda::set_graph_capturing`).
+        synaptix_core::device::cuda::set_graph_capturing(true);
         let begin_res = stream
             .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| InferError::Other(format!("cuStreamBeginCapture: {e}")));
         if begin_res.is_err() {
+            synaptix_core::device::cuda::set_graph_capturing(false);
             if prev_tracking {
                 unsafe { ctx.enable_event_tracking() };
             }
@@ -90,6 +95,7 @@ impl GraphCapturer {
         let end_res = stream
             .end_capture(CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
 
+        synaptix_core::device::cuda::set_graph_capturing(false);
         if prev_tracking {
             unsafe { ctx.enable_event_tracking() };
         }

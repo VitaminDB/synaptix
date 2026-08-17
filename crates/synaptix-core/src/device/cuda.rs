@@ -238,6 +238,232 @@ mod inner {
         Ok(pool)
     }
 
+    /// Пул АКТИВАЦИЙ — отдельный от default'ного, где живут веса.
+    ///
+    /// Зачем: async-пул с `RELEASE_THRESHOLD=MAX` (см. [`get`]) не отдаёт
+    /// освобождённые блоки драйверу, а страницы, в которых лежит хоть один
+    /// живой блок, `cuMemPoolTrimTo` вернуть не может. Пока веса (17-19 ГБ
+    /// резидента) и транзиенты префилла (≈20 МБ на токен трафика аллокаций)
+    /// делят один пул, его free-list за проход по промпту деградирует
+    /// («решето»): на 27B/24 ГБ пул прибавлял ~0.5 МБ на токен промпта и на
+    /// 8k токенов упирался в OOM при неизменных 17.4 ГБ живого — а trim не
+    /// возвращал НИЧЕГО, потому что каждая страница держала вес.
+    ///
+    /// С раздельными пулами транзиенты крутятся в своём: между чанками он
+    /// пуст, поэтому trim-on-OOM реально возвращает всю его резервацию, и
+    /// длина промпта перестаёт определять пик. Веса остаются в default'ном
+    /// (их карусель size-класcов стабильна).
+    fn activations_pool(ord: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
+        use cudarc::driver::sys;
+        static POOLS: Lazy<RwLock<std::collections::HashMap<usize, usize>>> =
+            Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
+        if let Some(&p) = POOLS.read().get(&ord) {
+            return Ok(p as sys::CUmemoryPool);
+        }
+        let mut wr = POOLS.write();
+        if let Some(&p) = wr.get(&ord) {
+            return Ok(p as sys::CUmemoryPool);
+        }
+        let ctx = get(ord)?;
+        ctx.bind_to_thread()
+            .map_err(|e| SynaptixError::Cuda(format!("bind_to_thread: {e:?}")))?;
+        let mut props: sys::CUmemPoolProps = unsafe { std::mem::zeroed() };
+        props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        props.location.__bindgen_anon_1.id = ord as i32;
+        let pool = unsafe { cudarc::driver::result::mem_pool::create(&props) }
+            .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolCreate(activations): {e:?}")))?;
+        let thr: u64 = u64::MAX;
+        unsafe {
+            let _ = cudarc::driver::result::mem_pool::set_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &thr as *const u64 as *mut std::ffi::c_void,
+            );
+        }
+        wr.insert(ord, pool as usize);
+        Ok(pool)
+    }
+
+    pub fn activations_pool_stats(ordinal: usize) -> Result<(u64, u64)> {
+        use cudarc::driver::sys;
+        let pool = activations_pool(ordinal)?;
+        let mut rsv: u64 = 0;
+        let mut used: u64 = 0;
+        unsafe {
+            let _ = cudarc::driver::result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                &mut rsv as *mut u64 as *mut std::ffi::c_void,
+            );
+            let _ = cudarc::driver::result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                &mut used as *mut u64 as *mut std::ffi::c_void,
+            );
+        }
+        Ok((rsv, used))
+    }
+
+    /// Вернуть драйверу всё, что пул активаций не держит живым.
+    pub fn trim_activations_pool(ordinal: usize) -> Result<()> {
+        let pool = activations_pool(ordinal)?;
+        unsafe { cudarc::driver::result::mem_pool::trim_to(pool, 0) }
+            .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolTrimTo(activations): {e:?}")))
+    }
+
+    thread_local! {
+        /// Идёт загрузка весов на этом потоке → аллокации в default-пул.
+        static WEIGHTS_ALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Пометить поток как загружающий веса; возвращает прежнее значение
+    /// (восстановить через повторный вызов — см. [`WeightsAllocGuard`]).
+    pub fn set_weights_alloc(on: bool) -> bool {
+        WEIGHTS_ALLOC.with(|c| c.replace(on))
+    }
+
+    /// RAII-обёртка над [`set_weights_alloc`]: всё, что аллоцируется в её
+    /// области видимости, ложится в default-пул (веса и транзиенты
+    /// деквантизации), а не в пул активаций.
+    pub struct WeightsAllocGuard {
+        prev: bool,
+        trim_ord: Option<usize>,
+    }
+
+    impl WeightsAllocGuard {
+        pub fn new() -> Self {
+            Self { prev: set_weights_alloc(true), trim_ord: None }
+        }
+
+        /// Как [`Self::new`], но на выходе из области видимости отдаёт драйверу
+        /// свободное в staging-пуле: у квантованных моделей это все временные
+        /// bf16-буферы загрузки (гигабайты), и без трима они так и остаются
+        /// зарезервированными — при том что KV-рингу их не видно.
+        pub fn for_device(device: crate::device::Device) -> Self {
+            let ord = match device {
+                crate::device::Device::Cuda(o) => Some(o),
+                _ => None,
+            };
+            Self { prev: set_weights_alloc(true), trim_ord: ord }
+        }
+    }
+
+    impl Default for WeightsAllocGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for WeightsAllocGuard {
+        fn drop(&mut self) {
+            set_weights_alloc(self.prev);
+            if self.prev {
+                return; // вложенный guard — тримит внешний
+            }
+            if let Some(ord) = self.trim_ord {
+                let _ = synchronize_all(ord);
+                let _ = trim_weights_pool(ord);
+            }
+        }
+    }
+
+    static GRAPH_CAPTURING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Взводится на время `cuStreamBeginCapture`/`EndCapture`: аллокации под
+    /// capture становятся узлами графа, и пул для них выбирает драйвер —
+    /// свой пул тут не навязываем.
+    pub fn set_graph_capturing(on: bool) {
+        GRAPH_CAPTURING.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn graph_capturing() -> bool {
+        GRAPH_CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Аварийный выключатель разделения пулов: `SYN_ACT_POOL=0` возвращает
+    /// прежнее поведение (всё в default-пуле).
+    fn act_pool_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SYN_ACT_POOL").as_deref() != Ok("0"))
+    }
+
+    fn alloc_in_activations_pool() -> bool {
+        act_pool_enabled() && !WEIGHTS_ALLOC.with(|c| c.get()) && !graph_capturing()
+    }
+
+    /// Аллокация под АКТИВАЦИИ: из пула активаций, если он включён и мы не в
+    /// загрузке весов / не под graph-capture; иначе — обычный stream-alloc
+    /// (default-пул). Память НЕ инициализирована.
+    ///
+    /// # Safety
+    /// Как `CudaStream::alloc`: читать до записи нельзя.
+    pub unsafe fn alloc_act_uninit<T: cudarc::driver::DeviceRepr>(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
+        if !alloc_in_activations_pool() {
+            return stream.alloc::<T>(len);
+        }
+        let ord = stream.context().ordinal();
+        let Ok(pool) = activations_pool(ord) else {
+            return stream.alloc::<T>(len);
+        };
+        let bytes = len.max(1) * std::mem::size_of::<T>();
+        let ptr = unsafe {
+            cudarc::driver::result::mem_pool::alloc_async(pool, bytes, stream.cu_stream())
+        }?;
+        Ok(unsafe { stream.upgrade_device_ptr::<T>(ptr, len) })
+    }
+
+    /// Аллокация под H2D-байты: staging весов при загрузке или мелкие входы
+    /// на инференсе (id токенов, device-скаляры).
+    ///
+    /// Под загрузкой ([`WeightsAllocGuard`]) — в weights-пул, а НЕ в
+    /// default'ный: у квантованных моделей это временные bf16-буферы (по 170 МБ
+    /// на MLP-вес), которые после кванта умирают. Пока они лежали рядом с
+    /// готовыми nvfp4-весами, пул после загрузки держал ~3.7 ГБ нераздаваемой
+    /// слабины (страницу с живым весом trim не вернёт) — ровно тех гигабайт,
+    /// которых потом не хватало KV-рингу на 80k контекста. В отдельном пуле
+    /// они умирают все вместе, и `trim_weights_pool` возвращает всё. У dense
+    /// моделей в этом пуле остаются сами веса — тоже правильно: стабильная
+    /// карусель size-класcов без транзиентов.
+    ///
+    /// # Safety
+    /// Как `CudaStream::alloc`.
+    pub unsafe fn alloc_bytes_uninit(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> std::result::Result<cudarc::driver::CudaSlice<u8>, cudarc::driver::DriverError> {
+        if !act_pool_enabled() || graph_capturing() {
+            return stream.alloc::<u8>(len);
+        }
+        let ord = stream.context().ordinal();
+        let pool = if WEIGHTS_ALLOC.with(|c| c.get()) {
+            weights_pool(ord)
+        } else {
+            activations_pool(ord)
+        };
+        let Ok(pool) = pool else {
+            return stream.alloc::<u8>(len);
+        };
+        let ptr = unsafe {
+            cudarc::driver::result::mem_pool::alloc_async(pool, len.max(1), stream.cu_stream())
+        }?;
+        Ok(unsafe { stream.upgrade_device_ptr::<u8>(ptr, len) })
+    }
+
+    /// [`alloc_act_uninit`] + memset в нули (эквивалент `alloc_zeros`).
+    pub fn alloc_act_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
+        let mut buf = unsafe { alloc_act_uninit::<T>(stream, len) }?;
+        stream.memset_zeros(&mut buf)?;
+        Ok(buf)
+    }
+
     static LAYER_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
     pub fn set_layer_sync_mode(mode: u8) {
@@ -709,7 +935,7 @@ mod inner {
         bytes: &[u8],
     ) -> Result<cudarc::driver::CudaSlice<u8>> {
         let mut stage = PINNED_STAGE.lock();
-        let mut dst = match unsafe { stream.alloc::<u8>(bytes.len()) } {
+        let mut dst = match unsafe { alloc_bytes_uninit(stream, bytes.len()) } {
             Ok(b) => b,
             Err(_) => {
                 // OOM: trim-ретрай как CudaBackend::alloc_* (фрагментация пула;
@@ -719,8 +945,8 @@ mod inner {
                 if let Ok(ls) = loader_stream(ord) {
                     let _ = ls.synchronize();
                 }
-                let _ = crate::memory::cuda_pool::trim_cuda_mempool_device(ord);
-                unsafe { stream.alloc::<u8>(bytes.len()) }.map_err(|e| {
+                let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                unsafe { alloc_bytes_uninit(stream, bytes.len()) }.map_err(|e| {
                     SynaptixError::Cuda(format!("pinned_htod alloc({}) after trim: {e:?}", bytes.len()))
                 })?
             }

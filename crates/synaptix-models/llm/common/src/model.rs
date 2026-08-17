@@ -891,12 +891,17 @@ impl DecoderModel {
     pub fn kv_bytes_per_token(&self) -> usize {
         let c = &self.config;
         let mxfp8 = self.kv_dtype == DType::MXFP8;
-        let elem = if mxfp8 {
-            1 + 1usize.div_ceil(32)
+        // Ровно то, что аллоцирует `make_kv_cache`: K и V по слою и токену.
+        // MXFP8 — байт на элемент плюс один E8M0-байт на блок из 32 (а не
+        // «2 байта на элемент», как считала прежняя формула: она завышала
+        // ринг почти вдвое, и бюджет контекста выходил вполовину меньше
+        // реального).
+        let per_full = if mxfp8 {
+            2 * c.num_key_value_heads * (c.head_dim + c.head_dim.div_ceil(32))
         } else {
-            (self.dtype.size_in_bits() / 8).max(1)
+            let elem = (self.dtype.size_in_bits() / 8).max(1);
+            2 * c.num_key_value_heads * c.head_dim * elem
         };
-        let per_full = c.num_key_value_heads * c.head_dim * 2 * elem;
         let ring_ok = self.ring_kv_ok();
         let full_layers = (0..self.blocks.len())
             .filter(|l| {
@@ -1742,6 +1747,40 @@ impl FullAttn {
                 }
                 None => (0, local_len),
             };
+            // T>1 на CUDA: FA-4 prefill ЧИТАЕТ preallocated KV как есть
+            // (strided, активная длина — device-скаляр). Без этого путь ниже
+            // отдаёт `flash_attention` narrow-view'ы, та отвечает
+            // NonContiguous, и всё скатывается в SDPA с `repeat_kv`: на
+            // каждый слой каждого чанка материализуются k_rep/v_rep размером
+            // nh×Tkv×hd (на 6.6k контекста ≈160 МБ), пул с
+            // RELEASE_THRESHOLD=MAX растёт с позицией и на 8k промпте
+            // упирается в OOM при неизменном used.
+            let dev_prefill = if s > 1
+                && flash_eligible
+                && self.sliding_window.is_none()
+                && matches!(device, Device::Cuda(_))
+                && matches!(kv_dtype, DType::F16 | DType::BF16)
+                && matches!(hd, 64 | 128 | 256)
+            {
+                let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device).coerr()?;
+                match q.flash_attention_prefill_dev(&kv.k, &kv.v, &tc, self.attn_scale, true) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                            eprintln!("[FA4_PREFILL_SKIP] {e:?}");
+                        }
+                        match e {
+                            SynaptixError::Unsupported(_) | SynaptixError::NonContiguous => None,
+                            other => return Err(ModelError::Forward(other.to_string())),
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(a) = dev_prefill {
+                return Ok(a);
+            }
             let k_total = kv.k.narrow(2, att_lo, att_len).coerr()?;
             let v_total = kv.v.narrow(2, att_lo, att_len).coerr()?;
             let flash_win = self.sliding_window.is_some()
@@ -1767,6 +1806,9 @@ impl FullAttn {
             match flashed {
                 Some(a) => a,
                 None => {
+                    if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                        eprintln!("[ATTN_FALLBACK] s={s} att_len={att_len} hd={hd} nh={nh} nkv={nkv} flash_eligible={flash_eligible} kv_dtype={kv_dtype:?} sw={:?}", self.sliding_window);
+                    }
                     let k_rep = repeat_kv(&k_total, group).coerr()?;
                     let v_rep = repeat_kv(&v_total, group).coerr()?;
                     let window = self.sliding_window;

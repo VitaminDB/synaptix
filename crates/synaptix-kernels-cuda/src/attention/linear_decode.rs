@@ -23,6 +23,7 @@ use synaptix_core::error::{Result, SynaptixError};
 use crate::attention::linear_attn_raw::LinearAttnRawKernels;
 use crate::conv::causal_conv1d::CausalConv1dKernels;
 use crate::ssm::gated_delta_rule::GatedDeltaRuleKernels;
+use crate::wsalloc::WsAlloc;
 
 const CONV_BLOCK: u32 = 128;
 
@@ -84,18 +85,18 @@ pub fn linear_attn_decode_step_u8_dev(
     };
 
     let mut post_conv = stream
-        .alloc_zeros::<f16>(conv_dim)
+        .ws_alloc_zeros::<f16>(conv_dim)
         .map_err(|e| aerr("post_conv", e))?;
-    let mut beta = stream.alloc_zeros::<f32>(nv).map_err(|e| aerr("beta", e))?;
-    let mut g = stream.alloc_zeros::<f32>(nv).map_err(|e| aerr("g", e))?;
+    let mut beta = stream.ws_alloc_zeros::<f32>(nv).map_err(|e| aerr("beta", e))?;
+    let mut g = stream.ws_alloc_zeros::<f32>(nv).map_err(|e| aerr("g", e))?;
     let mut q = stream
-        .alloc_zeros::<f32>(nv * hk)
+        .ws_alloc_zeros::<f32>(nv * hk)
         .map_err(|e| aerr("q", e))?;
     let mut k = stream
-        .alloc_zeros::<f32>(nv * hk)
+        .ws_alloc_zeros::<f32>(nv * hk)
         .map_err(|e| aerr("k", e))?;
     let mut v = stream
-        .alloc_zeros::<f32>(nv * hv)
+        .ws_alloc_zeros::<f32>(nv * hv)
         .map_err(|e| aerr("v", e))?;
 
     // 1. causal conv1d update (in-place state) + SiLU.

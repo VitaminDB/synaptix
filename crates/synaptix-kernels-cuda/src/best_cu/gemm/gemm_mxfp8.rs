@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::wsalloc::WsAlloc;
 
 // КОРРЕКТНОЕ MXFP8 GEMM (sm_120a), порт gau-nernst/learn-cuda 09a_block_scaled_mm_sm120 v1:
 // cp.async-конвейер (БЕЗ TMA), натуральные E8M0-scale, cos=0.999999 на outlier. См. gemm_mxfp8.cu.
@@ -395,16 +396,16 @@ pub fn gemm_mxfp8_linear(
     let ctx = stream.context();
     let gk = GemmMxFp8Kernels::for_context(&ctx)?;
     let mut xq = stream
-        .alloc_zeros::<u8>((m * k) as usize)
+        .ws_alloc_zeros::<u8>((m * k) as usize)
         .map_err(|e| SynaptixError::Cuda(format!("mxfp8 alloc xq: {e:?}")))?;
     let mut wq = stream
-        .alloc_zeros::<u8>((n * k) as usize)
+        .ws_alloc_zeros::<u8>((n * k) as usize)
         .map_err(|e| SynaptixError::Cuda(format!("mxfp8 alloc wq: {e:?}")))?;
     let mut sa = stream
-        .alloc_zeros::<u8>((m * k / 32) as usize)
+        .ws_alloc_zeros::<u8>((m * k / 32) as usize)
         .map_err(|e| SynaptixError::Cuda(format!("mxfp8 alloc sa: {e:?}")))?;
     let mut sb = stream
-        .alloc_zeros::<u8>((n * k / 32) as usize)
+        .ws_alloc_zeros::<u8>((n * k / 32) as usize)
         .map_err(|e| SynaptixError::Cuda(format!("mxfp8 alloc sb: {e:?}")))?;
     mxfp8_quant_natural(qk, stream, &x.as_view(), &mut xq, &mut sa, m, k)?;
     mxfp8_quant_natural(qk, stream, &w.as_view(), &mut wq, &mut sb, n, k)?;

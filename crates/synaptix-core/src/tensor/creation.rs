@@ -372,7 +372,7 @@ fn cat_cuda(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
 pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage> {
     let ord = device.ordinal();
     let stream = crate::device::cuda::alloc_stream(ord)?;
-    let buf = match stream.alloc_zeros::<u8>(n_bytes) {
+    let buf = match crate::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
         Ok(b) => b,
         Err(_) => {
             // OOM: пул async-аллокатора держит освобождённые блоки (фрагментация)
@@ -380,15 +380,15 @@ pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage
             // Сперва sync ВСЕХ стримов: cuMemFreeAsync-освобождения исполняются
             // в порядке СВОЕГО стрима, до sync trim их не видит.
             let _ = crate::device::cuda::synchronize_all(ord);
-            let _ = crate::memory::cuda_pool::trim_cuda_mempool_device(ord);
+            let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
             {
                 // ретраи с эскалацией — фрагментация транзиентна (см. CudaBackend)
                 let mut got = None;
                 for attempt in 0..5u32 {
                     std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
                     let _ = crate::device::cuda::synchronize_all(ord);
-                    let _ = crate::memory::cuda_pool::trim_cuda_mempool_device(ord);
-                    if let Ok(b) = stream.alloc_zeros::<u8>(n_bytes) {
+                    let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                    if let Ok(b) = crate::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
                         got = Some(b);
                         break;
                     }
@@ -431,9 +431,15 @@ pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Stor
     } else if crate::device::cuda::offload_pinned_enabled() && !bytes.is_empty() {
         crate::device::cuda::pinned_htod(&stream, bytes)?
     } else {
+        // Как `clone_htod`, но аллокация — из staging-пула (см.
+        // `cuda::alloc_bytes_uninit`): байты весов не должны оседать в пуле
+        // рядом с готовыми квантованными весами.
+        let mut dst = unsafe { crate::device::cuda::alloc_bytes_uninit(&stream, bytes.len()) }
+            .map_err(|e| SynaptixError::Cuda(format!("alloc H2D({} bytes): {e:?}", bytes.len())))?;
         stream
-            .clone_htod(bytes)
-            .map_err(|e| SynaptixError::Cuda(format!("clone_htod({} bytes): {e:?}", bytes.len())))?
+            .memcpy_htod(bytes, &mut dst)
+            .map_err(|e| SynaptixError::Cuda(format!("memcpy_htod({} bytes): {e:?}", bytes.len())))?;
+        dst
     };
     let ctx = crate::device::cuda::get(ord)?;
     Ok(Storage::Cuda(crate::tensor::storage::CudaBuf::new(ctx, stream, buf, ord)))
