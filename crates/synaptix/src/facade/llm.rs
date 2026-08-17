@@ -300,20 +300,29 @@ pub struct GenerationOptions {
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Имя инструмента для `role = "tool"`. Chat-шаблоны подписывают им блок
+    /// результата (`<tool_output name="...">` у Muse Glimmer, `name` в
+    /// ChatML-вариантах), поэтому без него модель не понимает, чей это вывод.
+    pub name: Option<String>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self { role: "system".into(), content: content.into(), name: None }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), name: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), content: content.into(), name: None }
     }
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: content.into() }
+        Self { role: "tool".into(), content: content.into(), name: None }
+    }
+
+    /// Результат инструмента с именем вызванной функции.
+    pub fn tool_named(name: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: "tool".into(), content: content.into(), name: Some(name.into()) }
     }
 
     fn to_tok(&self) -> TokMessage {
@@ -323,7 +332,7 @@ impl Message {
             "tool" => TokMessage {
                 role: MessageRole::Tool,
                 content: self.content.clone(),
-                name: None,
+                name: self.name.clone(),
                 tool_call_id: None,
                 tool_calls: Vec::new(),
             },
@@ -1102,6 +1111,14 @@ pub fn set_layer_sync_mode(mode: LayerSyncMode) {
         LayerSyncMode::On => 2,
     };
     synaptix_core::device::cuda::set_layer_sync_mode(code);
+}
+
+/// Отдать драйверу device-кэши CUDA-ядер (TMA-дескрипторы, MXFP8-скретчи).
+/// Они живут в статиках и переживают выгрузку модели: мелкие, но рассыпаны по
+/// сегментам mempool'а и не дают [`cuda_trim_pool`] вернуть зарезервированное.
+/// Возвращает (сброшено дескрипторов, освобождено байт скретчей).
+pub fn cuda_release_kernel_caches() -> (usize, usize) {
+    synaptix_kernels_cuda::release_device_caches()
 }
 
 /// Trim CUDA-mempool после Drop KV-кэша. На non-CUDA сборках `hard_trim_all_pools_device`

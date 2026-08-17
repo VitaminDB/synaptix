@@ -109,6 +109,51 @@ struct Block {
     full: bool,
 }
 
+impl Block {
+    fn load(
+        w: &dyn VisionWeights,
+        index: usize,
+        full: bool,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, VisionError> {
+        let bp = format!("{VIS_PREFIX}.layers.{index}");
+        Ok(Self {
+            norm1: Norm::load(w, &format!("{bp}.norm1"), device, dtype)?,
+            norm2: Norm::load(w, &format!("{bp}.norm2"), device, dtype)?,
+            q_proj: Lin::load(w, &format!("{bp}.attn.q_proj"), device, dtype, true)?,
+            k_proj: Lin::load(w, &format!("{bp}.attn.k_proj"), device, dtype, true)?,
+            v_proj: Lin::load(w, &format!("{bp}.attn.v_proj"), device, dtype, true)?,
+            proj: Lin::load(w, &format!("{bp}.attn.proj"), device, dtype, true)?,
+            fc1: Lin::load(w, &format!("{bp}.mlp.fc1"), device, dtype, true)?,
+            fc2: Lin::load(w, &format!("{bp}.mlp.fc2"), device, dtype, true)?,
+            full,
+        })
+    }
+}
+
+/// Откуда башня берёт трансформерные блоки.
+///
+/// Веса всех 50 блоков — 3.45 ГБ в BF16, и поверх весов 30B-модели они в
+/// VRAM уже не помещаются. [`BlockSource::Streaming`] грузит блок прямо
+/// перед его forward'ом и отпускает сразу после: пик — один блок (~74 МБ)
+/// вместо всей башни, ценой чтения весов с диска на каждое кодирование.
+/// Вызывающий кэширует готовые эмбеддинги, так что чтение — один раз на
+/// новое вложение, а не на каждый prompt.
+enum BlockSource {
+    Resident(Vec<Block>),
+    Streaming { weights: BundleVisionWeights, count: usize },
+}
+
+impl BlockSource {
+    fn len(&self) -> usize {
+        match self {
+            Self::Resident(v) => v.len(),
+            Self::Streaming { count, .. } => *count,
+        }
+    }
+}
+
 pub struct VisionTower {
     pub config: VisionConfig,
     pub device: Device,
@@ -117,7 +162,7 @@ pub struct VisionTower {
     patch_embed: Lin,
     pos_table: Vec<f32>,
     ln_pre: Norm,
-    blocks: Vec<Block>,
+    blocks: BlockSource,
     ln_post: Norm,
     adapter_fc1: Lin,
     adapter_fc2: Lin,
@@ -184,7 +229,52 @@ fn interp_axis(i: usize, size: usize, side: usize) -> [(usize, f32); 2] {
 }
 
 impl VisionTower {
+    /// Башня целиком в памяти устройства.
     pub fn build(
+        config: VisionConfig,
+        rms_eps: f32,
+        weights: &dyn VisionWeights,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, VisionError> {
+        let mut blocks = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            blocks.push(Block::load(weights, i, config.full_layers[i], device, dtype)?);
+        }
+        Self::assemble(config, rms_eps, weights, BlockSource::Resident(blocks), device, dtype)
+    }
+
+    /// Башня с послойной подгрузкой блоков (см. [`BlockSource::Streaming`]).
+    ///
+    /// В памяти остаётся только обвязка — patch-embedder, нормировки,
+    /// адаптер и проекция (~250 МБ); блоки читаются из `weights` по одному
+    /// во время forward'а, поэтому источник весов забирается во владение.
+    pub fn build_streaming(
+        config: VisionConfig,
+        rms_eps: f32,
+        weights: BundleVisionWeights,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, VisionError> {
+        let count = config.num_hidden_layers;
+        let tower = Self::assemble_parts(config, rms_eps, &weights, device, dtype)?;
+        Ok(Self { blocks: BlockSource::Streaming { weights, count }, ..tower })
+    }
+
+    fn assemble(
+        config: VisionConfig,
+        rms_eps: f32,
+        weights: &dyn VisionWeights,
+        blocks: BlockSource,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, VisionError> {
+        let tower = Self::assemble_parts(config, rms_eps, weights, device, dtype)?;
+        Ok(Self { blocks, ..tower })
+    }
+
+    /// Всё, кроме трансформерных блоков: их подставляет вызывающий.
+    fn assemble_parts(
         config: VisionConfig,
         rms_eps: f32,
         weights: &dyn VisionWeights,
@@ -202,22 +292,6 @@ impl VisionTower {
             .flatten_all()
             .and_then(|t| t.to_vec1::<f32>())
             .map_err(|e| VisionError::Load(e.to_string()))?;
-
-        let mut blocks = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            let bp = p(&format!("layers.{i}"));
-            blocks.push(Block {
-                norm1: Norm::load(weights, &format!("{bp}.norm1"), device, dtype)?,
-                norm2: Norm::load(weights, &format!("{bp}.norm2"), device, dtype)?,
-                q_proj: Lin::load(weights, &format!("{bp}.attn.q_proj"), device, dtype, true)?,
-                k_proj: Lin::load(weights, &format!("{bp}.attn.k_proj"), device, dtype, true)?,
-                v_proj: Lin::load(weights, &format!("{bp}.attn.v_proj"), device, dtype, true)?,
-                proj: Lin::load(weights, &format!("{bp}.attn.proj"), device, dtype, true)?,
-                fc1: Lin::load(weights, &format!("{bp}.mlp.fc1"), device, dtype, true)?,
-                fc2: Lin::load(weights, &format!("{bp}.mlp.fc2"), device, dtype, true)?,
-                full: config.full_layers[i],
-            });
-        }
 
         let projection = Lin::load(weights, "model.vision_projection", device, dtype, false)?;
         let out_dim = projection.wt.dims()[1];
@@ -237,7 +311,7 @@ impl VisionTower {
             rms_eps,
             patch_embed,
             pos_table,
-            blocks,
+            blocks: BlockSource::Resident(Vec::new()),
             ones_hidden,
         })
     }
@@ -439,7 +513,23 @@ impl VisionTower {
             p.push(("rope_sin".into(), sin.clone()));
         }
 
-        for (li, blk) in self.blocks.iter().enumerate() {
+        for li in 0..self.blocks.len() {
+            // В streaming-режиме блок живёт только эту итерацию: `staged`
+            // дропается на её конце и возвращает свои ~74 МБ в пул.
+            let staged;
+            let blk = match &self.blocks {
+                BlockSource::Resident(v) => &v[li],
+                BlockSource::Streaming { weights, .. } => {
+                    staged = Block::load(
+                        weights,
+                        li,
+                        cfg.full_layers[li],
+                        self.device,
+                        self.dtype,
+                    )?;
+                    &staged
+                }
+            };
             let cu = if blk.full { &cu_full } else { &plan.cu_windows };
             let residual = x.clone();
             let h = blk.norm1.forward(&x, eps)?;

@@ -10,6 +10,7 @@ use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 
 use crate::config::MuseConfig;
+use crate::config::VisionConfig;
 use crate::dflash::{self, DFlashConfig, DFlashModule};
 use crate::loader::MuseWeights;
 use crate::preprocess::{prepare_image, prepare_video, PreparedImage, PreparedVideo};
@@ -19,6 +20,30 @@ pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, Strea
 
 pub fn set_offload_mode_for_tests() {
     synaptix_llm_common::model::set_offload_mode(synaptix_llm_common::model::OffloadMode::Offload);
+}
+
+/// Запас VRAM поверх весов башни: активации forward'а и фрагментация пула.
+/// Меньше — и резидентная загрузка проходит впритык, а падает уже на первой
+/// картинке.
+const VISION_VRAM_RESERVE: usize = 512 * 1024 * 1024;
+
+/// Сколько весят трансформерные блоки башни в выбранном dtype.
+/// На блок: attn (q/k/v/proj с bias) + mlp (fc1/fc2 с bias) + две нормы.
+fn tower_block_bytes(cfg: &VisionConfig, dtype: DType) -> usize {
+    let h = cfg.hidden_size;
+    let i = cfg.intermediate_size;
+    let per_layer = 4 * h * h + 4 * h + 2 * h * i + i + h + 4 * h;
+    per_layer * cfg.num_hidden_layers * dtype.size_in_bits() / 8
+}
+
+/// Свободная память устройства; `None` — для CPU и когда драйвер не ответил.
+fn free_vram(device: Device) -> Option<usize> {
+    match device {
+        Device::Cuda(ordinal) => {
+            synaptix_core::device::cuda::mem_info(ordinal).ok().map(|(free, _)| free)
+        }
+        _ => None,
+    }
 }
 
 pub struct MusePipeline {
@@ -207,8 +232,26 @@ impl MusePipeline {
         if !weights.has(&format!("{VIS_PREFIX}.ln_pre.weight")) {
             return Ok(false);
         }
-        let tower = VisionTower::build(vcfg, self.config.rms_norm_eps, &weights, self.model.device, dtype)
-            .map_err(|e| PipelineError::Load(format!("vision: {e}")))?;
+        let eps = self.config.rms_norm_eps;
+        let device = self.model.device;
+        // Веса блоков башни (у 30B — 3.45 ГБ в BF16) кладутся поверх уже
+        // поднятой LLM: если свободной VRAM меньше, чем нужно, резидентная
+        // загрузка упирается в OOM на середине. В этом случае идём послойно —
+        // медленнее по диску, но помещается всегда.
+        let need = tower_block_bytes(&vcfg, dtype);
+        let free = free_vram(device);
+        let tower = if free.is_some_and(|f| f < need.saturating_add(VISION_VRAM_RESERVE)) {
+            eprintln!(
+                "[muse_glimmer] vision-башня {} MB не влезает в {} MB свободной VRAM — \
+                 послойная загрузка",
+                need / (1024 * 1024),
+                free.unwrap_or(0) / (1024 * 1024)
+            );
+            VisionTower::build_streaming(vcfg, eps, weights, device, dtype)
+        } else {
+            VisionTower::build(vcfg, eps, &weights, device, dtype)
+        }
+        .map_err(|e| PipelineError::Load(format!("vision: {e}")))?;
         self.vision = Some(tower);
         Ok(true)
     }

@@ -460,3 +460,87 @@ fn dflash_matches_reference() {
         cand_ref.len()
     );
 }
+
+/// Послойная загрузка башни должна давать ровно тот же результат, что и
+/// резидентная: веса и порядок операций те же, отличается только момент
+/// выделения памяти под блок.
+///
+/// Запуск: `SYN_MUSE_BUNDLE=<bundle.syn> SYN_MUSE_IMAGE=<pic.png> cargo test
+/// -p synaptix-llm-muse-glimmer --test parity vision_streaming -- --nocapture`
+#[test]
+fn vision_streaming_matches_resident() {
+    let Some(bundle) = env_path("SYN_MUSE_BUNDLE") else { return };
+    let Some(image) = env_path("SYN_MUSE_IMAGE") else { return };
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let device = Device::Cuda(0);
+    let dtype = DType::BF16;
+
+    let cfg_bytes = synaptix_bundle::Bundle::open(&bundle)
+        .and_then(|b| b.read_file("config.json").map(|c| c.into_owned()))
+        .expect("config.json");
+    let cfg = MuseConfig::from_hf_bytes(&cfg_bytes).expect("config");
+    let vcfg = cfg.vision.clone().expect("vision cfg");
+    let prepared = synaptix_llm_muse_glimmer::preprocess::prepare_image(&image, &vcfg, device)
+        .expect("prepare_image");
+
+    let free_mb = || {
+        synaptix_core::device::cuda::mem_info(0)
+            .map(|(free, _)| free / (1024 * 1024))
+            .unwrap_or(0)
+    };
+    let baseline = free_mb();
+
+    let resident = {
+        let weights = BundleVisionWeights::open(&bundle, device).expect("vision weights");
+        let t0 = std::time::Instant::now();
+        let tower = VisionTower::build(vcfg.clone(), cfg.rms_norm_eps, &weights, device, dtype)
+            .expect("resident tower");
+        eprintln!(
+            "[streaming-parity] резидентная загрузка за {:?}, VRAM {} MB",
+            t0.elapsed(),
+            baseline.saturating_sub(free_mb())
+        );
+        let t0 = std::time::Instant::now();
+        let out = tower.forward(&prepared.patches, prepared.grid).expect("resident forward");
+        eprintln!("[streaming-parity] резидентный forward за {:?}", t0.elapsed());
+        to_f32(&out)
+    };
+
+    // Резидентная башня дропнута, но её сегменты остались в пуле аллокатора —
+    // без возврата драйверу замер ниже показал бы её память как «занятую».
+    let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(0);
+    let baseline = free_mb();
+
+    let streaming = {
+        let weights = BundleVisionWeights::open(&bundle, device).expect("vision weights");
+        let t0 = std::time::Instant::now();
+        let tower = VisionTower::build_streaming(vcfg, cfg.rms_norm_eps, weights, device, dtype)
+            .expect("streaming tower");
+        let resident_mb = baseline.saturating_sub(free_mb());
+        eprintln!(
+            "[streaming-parity] послойная загрузка за {:?}, VRAM {resident_mb} MB",
+            t0.elapsed()
+        );
+        // Смысл режима — не держать 3.45 ГБ блоков: в памяти только обвязка.
+        assert!(resident_mb < 1024, "послойная башня заняла {resident_mb} MB");
+        let t0 = std::time::Instant::now();
+        let out = tower.forward(&prepared.patches, prepared.grid).expect("streaming forward");
+        let peak_mb = baseline.saturating_sub(free_mb());
+        eprintln!(
+            "[streaming-parity] послойный forward за {:?}, VRAM с активациями {peak_mb} MB",
+            t0.elapsed()
+        );
+        // Ради этого всё и затевалось: башня целиком — 3.45 ГБ, а тут пик
+        // должен остаться в пределах пары сотен мегабайт сверх обвязки.
+        assert!(peak_mb < 1500, "послойный forward занял {peak_mb} MB");
+        to_f32(&out)
+    };
+
+    assert_eq!(resident.len(), streaming.len(), "разная длина эмбеддингов");
+    compare("vision streaming vs resident", &streaming, &resident, 0.99999);
+    assert!(
+        resident.iter().zip(&streaming).all(|(a, b)| a == b),
+        "послойный режим обязан совпадать с резидентным побитово"
+    );
+}
