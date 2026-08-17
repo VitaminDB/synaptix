@@ -48,7 +48,7 @@ impl Backend for CudaBackend {
             }
         };
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let buf = match stream.alloc_zeros::<u8>(n_bytes) {
+        let buf = match synaptix_core::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
             Ok(b) => b,
             Err(_) => {
                 // OOM: пул async-аллокатора держит освобождённые блоки (фрагментация)
@@ -57,7 +57,7 @@ impl Backend for CudaBackend {
                 // стримов (default+alloc+loader) — cuMemFreeAsync исполняется в
                 // порядке СВОЕГО стрима, до sync trim pending-frees не видит.
                 let _ = synaptix_core::device::cuda::synchronize_all(ord);
-                let _ = synaptix_core::memory::cuda_pool::trim_cuda_mempool_device(ord);
+                let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
                 {
                     // Ретраи с эскалацией: фрагментация транзиентна (соседние
                     // frees на стримах подходят с задержкой) — sync+trim+пауза
@@ -66,8 +66,8 @@ impl Backend for CudaBackend {
                     for attempt in 0..5u32 {
                         std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
                         let _ = synaptix_core::device::cuda::synchronize_all(ord);
-                        let _ = synaptix_core::memory::cuda_pool::trim_cuda_mempool_device(ord);
-                        if let Ok(b) = stream.alloc_zeros::<u8>(n_bytes) {
+                        let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
+                        if let Ok(b) = synaptix_core::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
                             got = Some(b);
                             break;
                         }
@@ -100,20 +100,20 @@ impl Backend for CudaBackend {
             }
         };
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let buf = match unsafe { stream.alloc::<u8>(n_bytes) } {
+        let buf = match unsafe { synaptix_core::device::cuda::alloc_act_uninit::<u8>(&stream, n_bytes) } {
             Ok(b) => b,
             Err(_) => {
                 // см. alloc_zeros: sync ВСЕХ стримов до trim, иначе pending-frees не видны
                 let _ = synaptix_core::device::cuda::synchronize_all(ord);
-                let _ = synaptix_core::memory::cuda_pool::trim_cuda_mempool_device(ord);
+                let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
                 {
                     // ретраи с эскалацией — см. alloc_zeros
                     let mut got = None;
                     for attempt in 0..5u32 {
                         std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
                         let _ = synaptix_core::device::cuda::synchronize_all(ord);
-                        let _ = synaptix_core::memory::cuda_pool::trim_cuda_mempool_device(ord);
-                        if let Ok(b) = unsafe { stream.alloc::<u8>(n_bytes) } {
+                        let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
+                        if let Ok(b) = unsafe { synaptix_core::device::cuda::alloc_act_uninit::<u8>(&stream, n_bytes) } {
                             got = Some(b);
                             break;
                         }
@@ -569,38 +569,18 @@ impl Backend for CudaBackend {
                         m,
                     )?;
                     if !handled {
-                        let bk =
-                            crate::best_cu::gemm::gemm_bf16::BestGemmBf16Kernels::for_context(&ctx)?;
-                        let nk = nn * k;
-                        let mut w_f16_u8 = stream.alloc_zeros::<u8>(nk * 2).map_err(|e| {
-                            SynaptixError::Cuda(format!("linear_quant MXFP8: alloc W f16: {e:?}"))
-                        })?;
-                        {
-                            let mut w_view =
-                                unsafe { w_f16_u8.transmute_mut::<f16>(nk) }.ok_or_else(|| {
-                                    SynaptixError::Cuda("linear_quant MXFP8: transmute W→f16".into())
-                                })?;
-                            crate::elementwise::quant::mxfp8_dequant_f16(
-                                &qk,
-                                &stream,
-                                w_packed,
-                                w_scales,
-                                &mut w_view,
-                                nn as u32,
-                                k as u32,
-                            )?;
-                        }
-                        crate::best_cu::gemm::gemm_bf16::best_gemm_f16tn_linear_u8(
-                            &bk,
+                        // Голова N (кратная 128) — тем же tiled-ядром, хвост —
+                        // деквант полосами. Прежний путь дековантовал W целиком
+                        // (N*K*2 = 2.5 ГиБ на lm_head 202048×6656) и на полной
+                        // карте падал в OOM на каждом шаге спекуляции.
+                        crate::gemm::dispatch::mxfp8_linear_dequant_fallback(
+                            &qk,
+                            &ctx,
                             &stream,
-                            &w_f16_u8,
                             x_buf.slice(),
                             out_buf.slice_mut(),
-                            nn as u32,
-                            k as u32,
+                            w,
                             m,
-                            None,
-                            None,
                         )?;
                     }
                 }

@@ -23,7 +23,17 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 256;
 /// с single-shot (проверено prefill_chunk_divergence: 64/128/256 bit-exact,
 /// 47/73/100 — max_abs_diff ~2.5-3.0). 0 → дефолт; иное — округление к 64.
 fn effective_prefill_chunk(requested: usize) -> usize {
-    let c = if requested == 0 { DEFAULT_PREFILL_CHUNK } else { requested };
+    // `SYN_PREFILL_CHUNK` перебивает и запрос вызывающего — knob для замеров
+    // «пик VRAM / скорость» без пересборки хоста.
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var("SYN_PREFILL_CHUNK").ok().and_then(|v| v.trim().parse().ok())
+    });
+    let c = match (env, requested) {
+        (Some(e), _) if e > 0 => e,
+        (_, 0) => DEFAULT_PREFILL_CHUNK,
+        (_, r) => r,
+    };
     (c.max(64) / 64) * 64
 }
 
@@ -53,8 +63,50 @@ impl MtpStats {
     }
 }
 
+/// Трасса VRAM по чанкам префилла (`SYN_TRACE_PREFILL_MEM=1`). Показывает, что
+/// именно растёт на длинном промпте: живые аллокации (утечка/кэш) или
+/// зарезервированное пулом (churn скретчей). Без переменной — ноль накладных.
+fn trace_prefill_mem(device: Device, off: usize, total: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("SYN_TRACE_PREFILL_MEM").is_ok()) {
+        return;
+    }
+    let Device::Cuda(ord) = device else { return };
+    let mb = |b: u64| b / (1024 * 1024);
+    let (free, _) = synaptix_core::device::cuda::mem_info(ord).unwrap_or((0, 0));
+    let (rsv, used) = synaptix_core::memory::cuda_pool::cuda_mempool_stats(ord).unwrap_or((0, 0));
+    let (arsv, aused) = synaptix_core::device::cuda::activations_pool_stats(ord).unwrap_or((0, 0));
+    let (wrsv, wused) = synaptix_core::device::cuda::weights_pool_stats(ord).unwrap_or((0, 0));
+    eprintln!(
+        "[PREFILL_MEM] {off}/{total} ток: free={} MB, default rsv={}/{} MB, активации rsv={}/{} MB, staging rsv={}/{} MB, наш учёт={:.0} MB",
+        (free / (1024 * 1024)) as u64,
+        mb(rsv),
+        mb(used),
+        mb(arsv),
+        mb(aused),
+        mb(wrsv),
+        mb(wused),
+        synaptix_core::memory::cuda_pool::cuda_allocated_mb()
+    );
+    if std::env::var("SYN_TRACE_PREFILL_MEM").as_deref() == Ok("trim") {
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let (free2, _) = synaptix_core::device::cuda::mem_info(ord).unwrap_or((0, 0));
+        let (rsv2, used2) = synaptix_core::memory::cuda_pool::cuda_mempool_stats(ord).unwrap_or((0, 0));
+        eprintln!(
+            "[PREFILL_MEM]   после sync+trim: free={} MB, пул rsv={} MB used={} MB",
+            (free2 / (1024 * 1024)) as u64,
+            mb(rsv2),
+            mb(used2)
+        );
+    }
+}
+
 impl HybridPipeline {
     pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let weights =
             HybridWeights::load(path, device, dtype).map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();
@@ -73,6 +125,10 @@ impl HybridPipeline {
         precision: PrecisionConfig,
         max_seq: Option<usize>,
     ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let weights = HybridWeights::load(path, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();
@@ -98,6 +154,10 @@ impl HybridPipeline {
         max_seq: Option<usize>,
         enable_mtp: bool,
     ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let path = path.as_ref();
         let mut me = Self::load_with_precision(path, device, precision, max_seq)?;
         if !enable_mtp || me.config.mtp_num_hidden_layers == 0 {
@@ -468,6 +528,7 @@ impl HybridPipeline {
         };
         let mut hidden = None;
         let mut off = 0usize;
+        trace_prefill_mem(device, 0, l);
         while off < l {
             let end = (off + chunk).min(l);
             let part = Tensor::from_vec(
@@ -495,6 +556,7 @@ impl HybridPipeline {
             }
             hidden = Some(h);
             off = end;
+            trace_prefill_mem(device, off, l);
         }
         let hidden = hidden.ok_or_else(|| PipelineError::Forward("prefill: пустой промпт".into()))?;
         let last = hidden.dims()[1] - 1;

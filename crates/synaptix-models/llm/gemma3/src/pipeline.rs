@@ -43,6 +43,10 @@ pub struct GenerationStats {
 
 impl GemmaPipeline {
     pub fn load(model_dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         Self::load_with_max_seq(model_dir, device, dtype, None)
     }
 
@@ -74,6 +78,10 @@ impl GemmaPipeline {
         precision: PrecisionConfig,
         max_seq: Option<usize>,
     ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         // НЕ validate(): Gemma сознательно использует смешанную точность —
         // residual BF16 (massive activations >65504 переполняют F16) + NVFP4-веса,
         // что `validate` (требует compute==F16 при кванте) отверг бы. Каст

@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::wsalloc::WsAlloc;
 
 const BM: u32 = 128;
 const BN: u32 = 128;
@@ -871,10 +872,10 @@ fn launch_tn_u8(
     } else {
         let k_pad = ((k + k_step - 1) / k_step).max(run_cfg.stages) * k_step;
         let mut xp = stream
-            .alloc_zeros::<u8>((m as usize) * (k_pad as usize) * 2)
+            .ws_alloc_zeros::<u8>((m as usize) * (k_pad as usize) * 2)
             .map_err(|e| SynaptixError::Cuda(format!("{tag} K-pad alloc x: {e:?}")))?;
         let mut wp = stream
-            .alloc_zeros::<u8>((n as usize) * (k_pad as usize) * 2)
+            .ws_alloc_zeros::<u8>((n as usize) * (k_pad as usize) * 2)
             .map_err(|e| SynaptixError::Cuda(format!("{tag} K-pad alloc w: {e:?}")))?;
         pad_copy_k_bytes(stream, x, &mut xp, m, k, k_pad)?;
         pad_copy_k_bytes(stream, w, &mut wp, n, k, k_pad)?;
@@ -1006,6 +1007,8 @@ fn launch_tn_u8(
 // Общая pitched-копия одним cuMemcpy2D: `rows` строк по `width_bytes`, из src
 // (шаг src_pitch_bytes) в dst (шаг dst_pitch_bytes). Используется для pad (src
 // узкий → dst широкий) и unpad (src широкий → берём первые width_bytes).
+// `dst_x_bytes` — сдвиг по колонкам в приёмнике: split-N кладёт очередной
+// кусок [m, cn] в общий выход [m, n] на позицию своей колонки.
 pub(crate) fn copy_2d_bytes(
     stream: &Arc<CudaStream>,
     src: &CudaSlice<u8>,
@@ -1014,6 +1017,7 @@ pub(crate) fn copy_2d_bytes(
     width_bytes: usize,
     src_pitch_bytes: usize,
     dst_pitch_bytes: usize,
+    dst_x_bytes: usize,
 ) -> Result<()> {
     use cudarc::driver::{sys, DevicePtr, DevicePtrMut};
     let src_p: sys::CUdeviceptr = {
@@ -1032,7 +1036,7 @@ pub(crate) fn copy_2d_bytes(
         srcDevice: src_p,
         srcArray: std::ptr::null_mut(),
         srcPitch: src_pitch_bytes,
-        dstXInBytes: 0,
+        dstXInBytes: dst_x_bytes,
         dstY: 0,
         dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
         dstHost: std::ptr::null_mut(),
@@ -1060,5 +1064,5 @@ pub(crate) fn pad_copy_k_bytes(
     k_pad: u32,
 ) -> Result<()> {
     let row_bytes = (k as usize) * 2;
-    copy_2d_bytes(stream, src, dst, rows, row_bytes, row_bytes, (k_pad as usize) * 2)
+    copy_2d_bytes(stream, src, dst, rows, row_bytes, row_bytes, (k_pad as usize) * 2, 0)
 }

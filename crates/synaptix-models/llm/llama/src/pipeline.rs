@@ -44,6 +44,10 @@ pub struct GenerationStats {
 
 impl LlamaPipeline {
     pub fn load(model_dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         Self::load_with_max_seq(model_dir, device, dtype, None)
     }
 
@@ -77,6 +81,10 @@ impl LlamaPipeline {
         precision: PrecisionConfig,
         max_seq: Option<usize>,
     ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         precision.validate().map_err(PipelineError::Load)?;
         let dir: PathBuf = model_dir.as_ref().to_path_buf();
         let weights = LlamaWeights::load(&dir, device, precision.compute)

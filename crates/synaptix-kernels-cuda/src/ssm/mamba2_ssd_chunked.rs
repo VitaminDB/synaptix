@@ -38,6 +38,7 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use super::mamba2_bmm::Mamba2BmmKernels;
 use super::mamba2_chunked_helpers::Mamba2ChunkedHelpersKernels;
+use crate::wsalloc::WsAlloc;
 
 pub struct Mamba2SsdChunkedKernels {
     bmm: Arc<Mamba2BmmKernels>,
@@ -129,24 +130,24 @@ impl Mamba2SsdChunkedKernels {
         let bh_qq_total = (t as usize) * (bh as usize) * qq_per_chunk_per_bh;
         let bh_qp_total = (t as usize) * bh_qp;
 
-        let mut alpha_cum = stream.alloc_zeros::<f32>(alpha_cum_n).map_err(cuda_err)?;
+        let mut alpha_cum = stream.ws_alloc_zeros::<f32>(alpha_cum_n).map_err(cuda_err)?;
 
-        let mut c_qn = stream.alloc_zeros::<bf16>(bh_qn_total).map_err(cuda_err)?;
-        let mut b_qn = stream.alloc_zeros::<bf16>(bh_qn_total).map_err(cuda_err)?;
-        let mut dt_x_qp = stream.alloc_zeros::<bf16>(bh_qp_total).map_err(cuda_err)?;
-        let mut b_nq = stream.alloc_zeros::<bf16>(bh_nq_total).map_err(cuda_err)?;
-        let mut dt_x_pq = stream.alloc_zeros::<bf16>(bh_pq_total).map_err(cuda_err)?;
+        let mut c_qn = stream.ws_alloc_zeros::<bf16>(bh_qn_total).map_err(cuda_err)?;
+        let mut b_qn = stream.ws_alloc_zeros::<bf16>(bh_qn_total).map_err(cuda_err)?;
+        let mut dt_x_qp = stream.ws_alloc_zeros::<bf16>(bh_qp_total).map_err(cuda_err)?;
+        let mut b_nq = stream.ws_alloc_zeros::<bf16>(bh_nq_total).map_err(cuda_err)?;
+        let mut dt_x_pq = stream.ws_alloc_zeros::<bf16>(bh_pq_total).map_err(cuda_err)?;
 
-        let mut a_intra = stream.alloc_zeros::<f32>(bh_qq_total).map_err(cuda_err)?;
-        let mut a_decayed = stream.alloc_zeros::<bf16>(bh_qq_total).map_err(cuda_err)?;
-        let mut y_intra = stream.alloc_zeros::<f32>(bh_qp_total).map_err(cuda_err)?;
+        let mut a_intra = stream.ws_alloc_zeros::<f32>(bh_qq_total).map_err(cuda_err)?;
+        let mut a_decayed = stream.ws_alloc_zeros::<bf16>(bh_qq_total).map_err(cuda_err)?;
+        let mut y_intra = stream.ws_alloc_zeros::<f32>(bh_qp_total).map_err(cuda_err)?;
 
-        let mut state_pn = stream.alloc_zeros::<f32>(bh_pn).map_err(cuda_err)?;
-        let mut state_pn_bf16 = stream.alloc_zeros::<bf16>(bh_pn).map_err(cuda_err)?;
-        let mut c_scaled = stream.alloc_zeros::<bf16>(bh_qn).map_err(cuda_err)?;
-        let mut dt_x_scaled_pq = stream.alloc_zeros::<bf16>(bh_pq).map_err(cuda_err)?;
-        let mut y_off_chunk = stream.alloc_zeros::<f32>(bh_qp).map_err(cuda_err)?;
-        let mut state_upd_chunk = stream.alloc_zeros::<f32>(bh_pn).map_err(cuda_err)?;
+        let mut state_pn = stream.ws_alloc_zeros::<f32>(bh_pn).map_err(cuda_err)?;
+        let mut state_pn_bf16 = stream.ws_alloc_zeros::<bf16>(bh_pn).map_err(cuda_err)?;
+        let mut c_scaled = stream.ws_alloc_zeros::<bf16>(bh_qn).map_err(cuda_err)?;
+        let mut dt_x_scaled_pq = stream.ws_alloc_zeros::<bf16>(bh_pq).map_err(cuda_err)?;
+        let mut y_off_chunk = stream.ws_alloc_zeros::<f32>(bh_qp).map_err(cuda_err)?;
+        let mut state_upd_chunk = stream.ws_alloc_zeros::<f32>(bh_pn).map_err(cuda_err)?;
 
         // ── 1. alpha_cum ──
         self.helpers

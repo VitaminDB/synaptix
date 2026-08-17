@@ -24,6 +24,7 @@ use crate::elementwise::quant::{
 };
 use crate::best_cu::gemm::gemm_mxfp8::{gemm_mxfp8, GemmMxFp8Kernels};
 use crate::elementwise::quant::Mxfp8QuantKernels;
+use crate::wsalloc::WsAlloc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nvfp4Plan {
@@ -297,7 +298,7 @@ pub fn nvfp4_linear_f16(
             .ok_or_else(|| SynaptixError::Cuda("nvfp4_linear: transmute x→f16".into()))?;
         // uninit + zero ТОЛЬКО хвоста (alloc_zeros делал CE-memset всего буфера
         // на каждый вызов — 109MB на 26624; квант пишет первые m строк целиком).
-        let mut packed_x = unsafe { stream.alloc::<u8>(mk_run / 2) }
+        let mut packed_x = unsafe { stream.ws_alloc::<u8>(mk_run / 2) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: alloc packed_x: {e:?}")))?;
         if padded {
             let mut tail = packed_x.slice_mut((m as usize) * (k as usize) / 2..);
@@ -310,7 +311,7 @@ pub fn nvfp4_linear_f16(
         // через outer_cov; slow-fallback зануляет буфер сам). CE-memset скейлов
         // на каждый вызов ел до 9% e2e на attn-128 (A/B 2026-06-05).
         let scales_sz = nvfp4_scale_buffer_size(m_run as usize, k as usize);
-        let mut scales_x = unsafe { stream.alloc::<u8>(scales_sz) }
+        let mut scales_x = unsafe { stream.ws_alloc::<u8>(scales_sz) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: alloc scales_x: {e:?}")))?;
         // квантуем m РЕАЛЬНЫХ строк; хвост m..m_run остаётся нулевым.
         quantize_f16_to_nvfp4_view(quant_k, stream, &x_view, &mut packed_x, &mut scales_x, m, k)?;
@@ -325,7 +326,7 @@ pub fn nvfp4_linear_f16(
     let owned_pad_p: Option<CudaSlice<u8>> = match prequant {
         Some((p, _)) if padded => {
             let copy_bytes = p.len().min(mk_run / 2);
-            let mut padded_p = unsafe { stream.alloc::<u8>(mk_run / 2) }
+            let mut padded_p = unsafe { stream.ws_alloc::<u8>(mk_run / 2) }
                 .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: alloc padded prequant: {e:?}")))?;
             {
                 let mut tail = padded_p.slice_mut(copy_bytes..);
@@ -361,7 +362,7 @@ pub fn nvfp4_linear_f16(
     // пишем прямо в out_u8 (m×n). Хвостовые строки копией ниже отбрасываются.
     let mut owned_out: Option<CudaSlice<u8>> = if padded {
         // uninit: ядро пишет все m_run×n строк (alloc_zeros memset'ил 218MB).
-        Some(unsafe { stream.alloc::<u8>(mn_run * 2) }
+        Some(unsafe { stream.ws_alloc::<u8>(mn_run * 2) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: alloc out_pad: {e:?}")))?)
     } else {
         None
@@ -379,7 +380,7 @@ pub fn nvfp4_linear_f16(
             .slice();
         let nbytes = raw_w.len();
         let buf = stream
-            .alloc_zeros::<u8>(nbytes)
+            .cache_alloc_zeros::<u8>(nbytes)
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: alloc shuf W: {e:?}")))?;
         let mut storage = Storage::Cuda(CudaBuf::new(ctx.clone(), stream.clone(), buf, ordinal));
         {
@@ -506,26 +507,51 @@ fn with_mxfp8_scratch<R>(
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
             let xq = stream
-                .alloc_zeros::<u8>(xq_need.max(1))
+                .cache_alloc_zeros::<u8>(xq_need.max(1))
                 .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc xq scratch: {e:?}")))?;
             let sa = stream
-                .alloc_zeros::<u8>(sa_need.max(1))
+                .cache_alloc_zeros::<u8>(sa_need.max(1))
                 .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc sa scratch: {e:?}")))?;
             e.insert(Mxfp8Scratch { xq, sa })
         }
     };
     if entry.xq.len() < xq_need {
         entry.xq = stream
-            .alloc_zeros::<u8>(xq_need)
+            .cache_alloc_zeros::<u8>(xq_need)
             .map_err(|e| SynaptixError::Cuda(format!("mxfp8: grow xq scratch: {e:?}")))?;
     }
     if entry.sa.len() < sa_need {
         entry.sa = stream
-            .alloc_zeros::<u8>(sa_need)
+            .cache_alloc_zeros::<u8>(sa_need)
             .map_err(|e| SynaptixError::Cuda(format!("mxfp8: grow sa scratch: {e:?}")))?;
     }
     let Mxfp8Scratch { xq, sa } = entry;
     f(xq, sa)
+}
+
+/// Отдать драйверу скретчи MXFP8-путей (квант активации + деквант-полоса и
+/// узкий выход фолбэка). Живут в статиках между моделями; вызывается при
+/// выгрузке, чтобы `cuMemPoolTrimTo` смог вернуть сегменты. Возвращает,
+/// сколько байт освобождено.
+pub fn clear_mxfp8_scratch() -> usize {
+    let mut freed = 0usize;
+    if let Some(c) = MXFP8_SCRATCH.get() {
+        if let Ok(mut g) = c.lock() {
+            for s in g.values() {
+                freed += s.xq.len() + s.sa.len();
+            }
+            g.clear();
+        }
+    }
+    if let Some(c) = MXFP8_DEQ_SCRATCH.get() {
+        if let Ok(mut g) = c.lock() {
+            for s in g.values() {
+                freed += s.w.len() + s.y.len();
+            }
+            g.clear();
+        }
+    }
+    freed
 }
 
 pub fn mxfp8_linear_tiled(
@@ -537,7 +563,24 @@ pub fn mxfp8_linear_tiled(
     w: &QuantWeight,
     m: u32,
 ) -> Result<bool> {
-    let n = w.n() as u32;
+    mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, out_u8, w, m, w.n() as u32)
+}
+
+/// Как [`mxfp8_linear_tiled`], но считает только ПЕРВЫЕ `n` строк веса
+/// (натуральная раскладка [N,K] → префикс строк = префикс байт, указатели те
+/// же). `out_u8` при этом плотный `[m, n]`. Нужен для N вне 128-кратности:
+/// голова идёт быстрым ядром, хвост — фолбэком.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_linear_tiled_n(
+    qk: &Mxfp8QuantKernels,
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    x_u8: &CudaSlice<u8>,
+    out_u8: &mut CudaSlice<u8>,
+    w: &QuantWeight,
+    m: u32,
+    n: u32,
+) -> Result<bool> {
     let k = w.k() as u32;
     let m_pad = (m + 127) & !127;
     if n % 128 != 0 || k % 128 != 0 {
@@ -666,7 +709,7 @@ fn run_mxfp8_gemm(
             .ok_or_else(|| SynaptixError::Cuda("mxfp8: transmute out→f16".into()))?;
         gemm_mxfp8(&gk, stream, &xq, w_packed, &sa, w_scales, &mut out_view, m_pad, n, k)?;
     } else {
-        let mut y = unsafe { stream.alloc::<f16>(mp_us * n_us) }
+        let mut y = unsafe { stream.ws_alloc::<f16>(mp_us * n_us) }
             .map_err(|e| SynaptixError::Cuda(format!("mxfp8: alloc y: {e:?}")))?;
         gemm_mxfp8(&gk, stream, &xq, w_packed, &sa, w_scales, &mut y.slice_mut(0..mp_us * n_us), m_pad, n, k)?;
         let mut out_view = unsafe { out_u8.transmute_mut::<f16>(m_us * n_us) }
@@ -679,3 +722,162 @@ fn run_mxfp8_gemm(
     Ok(true)
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Фолбэк prefill'а MXFP8 для форм вне tiled-ядра (N%128 != 0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Скретчи фолбэка: `w` — деквант-полоса весов в f16, `y` — узкий выход GEMM.
+/// Держим по устройству и растим на месте (как [`Mxfp8Scratch`]): фолбэк
+/// дёргается на каждом спекулятивном шаге, разовые аллокации там дороги.
+struct Mxfp8DeqScratch {
+    w: CudaSlice<u8>,
+    y: CudaSlice<u8>,
+}
+
+static MXFP8_DEQ_SCRATCH: OnceLock<Mutex<HashMap<usize, Mxfp8DeqScratch>>> = OnceLock::new();
+
+fn with_mxfp8_deq_scratch<R>(
+    stream: &Arc<CudaStream>,
+    ordinal: usize,
+    w_need: usize,
+    y_need: usize,
+    f: impl FnOnce(&mut CudaSlice<u8>, &mut CudaSlice<u8>) -> Result<R>,
+) -> Result<R> {
+    let cache = MXFP8_DEQ_SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| SynaptixError::Cuda("mxfp8 deq scratch: poisoned".into()))?;
+    let entry = match guard.entry(ordinal) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // uninit: деквант пишет всю полосу, GEMM — весь узкий выход.
+            let w = unsafe { stream.cache_alloc_uninit::<u8>(w_need.max(1)) }
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8 deq: alloc W: {e:?}")))?;
+            let y = unsafe { stream.cache_alloc_uninit::<u8>(y_need.max(1)) }
+                .map_err(|e| SynaptixError::Cuda(format!("mxfp8 deq: alloc Y: {e:?}")))?;
+            e.insert(Mxfp8DeqScratch { w, y })
+        }
+    };
+    if entry.w.len() < w_need {
+        entry.w = unsafe { stream.cache_alloc_uninit::<u8>(w_need) }
+            .map_err(|e| SynaptixError::Cuda(format!("mxfp8 deq: grow W: {e:?}")))?;
+    }
+    if entry.y.len() < y_need {
+        entry.y = unsafe { stream.cache_alloc_uninit::<u8>(y_need) }
+            .map_err(|e| SynaptixError::Cuda(format!("mxfp8 deq: grow Y: {e:?}")))?;
+    }
+    let Mxfp8DeqScratch { w, y } = entry;
+    f(w, y)
+}
+
+/// Бюджет одной деквант-полосы в байтах — `SYN_MXFP8_DEQ_MB` (дефолт 64 МиБ).
+fn mxfp8_deq_budget_bytes() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SYN_MXFP8_DEQ_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64)
+            * 1024
+            * 1024
+    })
+}
+
+/// Prefill MXFP8 (m>1) для форм, которые не берёт [`mxfp8_linear_tiled`]
+/// (N%128 != 0 — например lm_head 202048×6656 у muse-glimmer).
+///
+/// Прямолинейный путь «деквант ВСЕГО W в f16 → f16-GEMM» стоит `N*K*2` байт
+/// (2.5 ГиБ на этом lm_head) и вчетверо больше трафика, чем сам вес: на
+/// заполненной карте он падал в `CUDA_ERROR_OUT_OF_MEMORY` на каждом
+/// спекулятивном шаге (DFlash/lookup зовут голову с m>1). Здесь:
+///   • голова `n_head = N - N%128` считается tiled-ядром по тем же указателям
+///     веса (строки натуральные, префикс строк = префикс байт) в узкий
+///     скретч `[m, n_head]`;
+///   • остаток (<128 строк; при K%128 != 0 — весь N) дековантуется полосами
+///     по [`mxfp8_deq_budget_bytes`] и умножается f16-GEMM'ом;
+///   • куски сшиваются в `out` pitched-копиями (один cuMemcpy2D на кусок).
+///
+/// Пик памяти — `max(m*n_head, m*chunk)*2 + chunk*K*2` вместо `N*K*2`.
+pub fn mxfp8_linear_dequant_fallback(
+    qk: &Mxfp8QuantKernels,
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    x_u8: &CudaSlice<u8>,
+    out_u8: &mut CudaSlice<u8>,
+    w: &QuantWeight,
+    m: u32,
+) -> Result<()> {
+    use crate::best_cu::gemm::gemm_bf16::{
+        best_gemm_f16tn_linear_u8, copy_2d_bytes, BestGemmBf16Kernels,
+    };
+    use crate::elementwise::quant::mxfp8_dequant_f16;
+
+    let n = w.n() as u32;
+    let k = w.k() as u32;
+    let (m_us, n_us, k_us) = (m as usize, n as usize, k as usize);
+    let row_bytes = k_us * 2;
+    if k % 32 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "mxfp8 fallback: K={k} должно быть кратно 32"
+        )));
+    }
+
+    // Голова доступна, только если tiled-ядро вообще применимо по K.
+    let n_head = if k % 128 == 0 { n - n % 128 } else { 0 };
+    let rest = n - n_head;
+    let chunk = if rest == 0 {
+        0
+    } else {
+        ((mxfp8_deq_budget_bytes() / row_bytes.max(1)).max(1) as u32).min(rest)
+    };
+    let y_need = m_us * (n_head.max(chunk) as usize) * 2;
+    let w_need = (chunk as usize) * row_bytes;
+
+    with_mxfp8_deq_scratch(stream, ctx.ordinal(), w_need, y_need, |w_f16, y| {
+        if n_head > 0 {
+            if !mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, y, w, m, n_head)? {
+                return Err(SynaptixError::Cuda(format!(
+                    "mxfp8 fallback: голова {n_head}×{k} не взялась tiled-ядром"
+                )));
+            }
+            let head_bytes = (n_head as usize) * 2;
+            copy_2d_bytes(stream, y, out_u8, m, head_bytes, head_bytes, n_us * 2, 0)?;
+        }
+        if rest > 0 {
+            let bk = BestGemmBf16Kernels::for_context(ctx)?;
+            let packed_arc = w.packed_arc().ok_or_else(|| {
+                SynaptixError::Cuda("mxfp8 fallback: packed W освобождён".into())
+            })?;
+            let w_packed = packed_arc
+                .as_cuda()
+                .ok_or(SynaptixError::Unsupported("mxfp8 fallback: packed non-cuda"))?
+                .slice();
+            let w_scales = w
+                .scales()
+                .as_cuda()
+                .ok_or(SynaptixError::Unsupported("mxfp8 fallback: scales non-cuda"))?
+                .slice();
+            let sc_row = k_us / 32;
+            let mut n0 = n_head;
+            while n0 < n {
+                let cn = chunk.min(n - n0);
+                let (o, cn_us) = (n0 as usize, cn as usize);
+                {
+                    let p = w_packed.slice(o * k_us..(o + cn_us) * k_us);
+                    let sc = w_scales.slice(o * sc_row..(o + cn_us) * sc_row);
+                    let mut wv = unsafe { w_f16.transmute_mut::<f16>(cn_us * k_us) }
+                        .ok_or_else(|| {
+                            SynaptixError::Cuda("mxfp8 fallback: transmute W→f16".into())
+                        })?;
+                    mxfp8_dequant_f16(qk, stream, &p, &sc, &mut wv, cn, k)?;
+                }
+                best_gemm_f16tn_linear_u8(&bk, stream, w_f16, x_u8, y, cn, k, m, None, None)?;
+                copy_2d_bytes(stream, y, out_u8, m, cn_us * 2, cn_us * 2, n_us * 2, o * 2)?;
+                n0 += cn;
+            }
+        }
+        Ok(())
+    })
+}

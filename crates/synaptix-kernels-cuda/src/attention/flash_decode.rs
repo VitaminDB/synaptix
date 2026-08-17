@@ -22,6 +22,7 @@ use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module, load_fn};
+use crate::wsalloc::WsAlloc;
 
 const BLOCK: u32 = 128;
 const SPLIT_K_MAX: u32 = 32;
@@ -144,13 +145,13 @@ pub fn flash_decode<T: DeviceRepr>(
     let rows = b * nh * t_q;
     let n_partials = (rows as usize) * (split_k as usize);
     let mut partial_acc = stream
-        .alloc_zeros::<f32>(n_partials * d as usize)
+        .ws_alloc_zeros::<f32>(n_partials * d as usize)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_acc: {e:?}")))?;
     let mut partial_m = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_m: {e:?}")))?;
     let mut partial_l = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_l: {e:?}")))?;
 
     let (b_i, nh_i, nkv_i, tq_i, tkv_i, d_i, sk_i) = (
@@ -258,13 +259,13 @@ pub fn flash_decode_u8(
     let rows = b * nh * t_q;
     let n_partials = (rows as usize) * (split_k as usize);
     let mut partial_acc = stream
-        .alloc_zeros::<f32>(n_partials * d as usize)
+        .ws_alloc_zeros::<f32>(n_partials * d as usize)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_acc: {e:?}")))?;
     let mut partial_m = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_m: {e:?}")))?;
     let mut partial_l = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_l: {e:?}")))?;
     let (b_i, nh_i, nkv_i, tq_i, tkv_i, d_i, sk_i) = (
         b as i32,
@@ -409,13 +410,13 @@ pub fn flash_decode_u8_dev(
     let rows = b * nh * t_q;
     let n_partials = (rows as usize) * (split_k as usize);
     let mut partial_acc = stream
-        .alloc_zeros::<f32>(n_partials * d as usize)
+        .ws_alloc_zeros::<f32>(n_partials * d as usize)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_acc: {e:?}")))?;
     let mut partial_m = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_m: {e:?}")))?;
     let mut partial_l = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_l: {e:?}")))?;
     let (b_i, nh_i, nkv_i, tq_i, d_i, sk_i) = (
         b as i32,
@@ -563,13 +564,13 @@ pub fn flash_decode_mxfp8_u8(
     let rows = b * nh * t_q;
     let n_partials = (rows as usize) * (split_k as usize);
     let mut partial_acc = stream
-        .alloc_zeros::<f32>(n_partials * d as usize)
+        .ws_alloc_zeros::<f32>(n_partials * d as usize)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_acc: {e:?}")))?;
     let mut partial_m = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_m: {e:?}")))?;
     let mut partial_l = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_l: {e:?}")))?;
     let (b_i, nh_i, nkv_i, tq_i, tkv_i, d_i, sk_i) = (
         b as i32,
@@ -719,13 +720,13 @@ pub fn flash_decode_mxfp8_u8_dev(
     let rows = b * nh * t_q;
     let n_partials = (rows as usize) * (split_k as usize);
     let mut partial_acc = stream
-        .alloc_zeros::<f32>(n_partials * d as usize)
+        .ws_alloc_zeros::<f32>(n_partials * d as usize)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_acc: {e:?}")))?;
     let mut partial_m = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_m: {e:?}")))?;
     let mut partial_l = stream
-        .alloc_zeros::<f32>(n_partials)
+        .ws_alloc_zeros::<f32>(n_partials)
         .map_err(|e| SynaptixError::Cuda(format!("alloc partial_l: {e:?}")))?;
     let (b_i, nh_i, nkv_i, tq_i, d_i, sk_i) =
         (b as i32, nh as i32, nkv as i32, t_q as i32, d as i32, split_k as i32);

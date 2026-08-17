@@ -31,7 +31,28 @@ fn trace_sizes() -> &'static [usize] {
     })
 }
 
+/// Порог (байт) для `SYNAPTIX_TRACE_ALLOC_MIN`: печатать КАЖДУЮ device-аллокацию
+/// не меньше него (только размер, без backtrace). Дешёвый способ увидеть, какие
+/// буферы растут по ходу префилла — `SYNAPTIX_TRACE_ALLOC` для этого не годится
+/// (нужно знать размер заранее, а печать backtrace'ов на каждый alloc топит лог).
+pub fn trace_alloc_min() -> usize {
+    trace_min()
+}
+
+fn trace_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("SYNAPTIX_TRACE_ALLOC_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
 pub fn record_cuda_alloc(bytes: usize) {
+    if bytes >= trace_min() {
+        eprintln!("[TRACE_ALLOC_MIN] {bytes}");
+    }
     if trace_sizes().contains(&bytes) {
         eprintln!(
             "[TRACE_ALLOC {bytes}]\n{}",
@@ -126,11 +147,23 @@ pub fn trim_graph_mem_device(ordinal: usize) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Полный трим default-пула И weights-пула (перед фазами, меряющими свободную
-/// VRAM, — иначе удержанные пулами блоки занижают бюджет недетерминированно).
+/// Полный трим ВСЕХ пулов (default + weights + activations) — перед фазами,
+/// меряющими свободную VRAM, иначе удержанные пулами блоки занижают бюджет
+/// недетерминированно.
 pub fn hard_trim_all_pools_device(ordinal: usize) -> crate::error::Result<()> {
     let _ = crate::device::cuda::synchronize_all(ordinal);
     let r = hard_trim_cuda_mempool_device(ordinal);
+    let _ = crate::device::cuda::trim_weights_pool(ordinal);
+    let _ = crate::device::cuda::trim_activations_pool(ordinal);
+    r
+}
+
+/// Трим всех пулов на OOM-ретрае, с текущим threshold'ом. В отличие от
+/// [`trim_cuda_mempool_device`] не забывает пул активаций — а именно он и
+/// раздувается на префилле длинного промпта.
+pub fn trim_pools_on_oom(ordinal: usize) -> crate::error::Result<()> {
+    let r = trim_cuda_mempool_device(ordinal);
+    let _ = crate::device::cuda::trim_activations_pool(ordinal);
     let _ = crate::device::cuda::trim_weights_pool(ordinal);
     r
 }
