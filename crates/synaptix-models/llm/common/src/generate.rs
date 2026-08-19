@@ -5,8 +5,9 @@ use synaptix_core::dtype::DType;
 use synaptix_core::grad::no_grad;
 use synaptix_core::tensor::Tensor;
 use synaptix_infer::sampling::{
-    GreedySampler, LogitPipeline, MinPProcessor, MultinomialSampler, ProcessorContext,
-    RepetitionPenaltyProcessor, Sampler, TemperatureProcessor, TopKProcessor, TopPProcessor,
+    GreedySampler, LogitPipeline, MinPProcessor, MultinomialSampler, PresenceFrequencyProcessor,
+    ProcessorContext, RepetitionPenaltyProcessor, Sampler, TemperatureProcessor, TopKProcessor,
+    TopPProcessor,
 };
 use synaptix_ops::rng::Philox4x32;
 
@@ -20,6 +21,13 @@ pub struct GenerationConfig {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    /// Окно штрафов (`repetition_penalty`, presence/frequency) по хвосту
+    /// контекста в токенах. `0` — весь контекст.
+    pub repeat_last_n: usize,
+    /// Аддитивный штраф за сам факт появления токена в окне (OpenAI-семантика).
+    pub presence_penalty: f32,
+    /// Аддитивный штраф, пропорциональный числу повторов токена в окне.
+    pub frequency_penalty: f32,
     pub seed: u64,
     pub eos_token_id: Option<u32>,
     pub eos_token_ids: Vec<u32>,
@@ -36,6 +44,9 @@ impl Default for GenerationConfig {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            repeat_last_n: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
             eos_token_id: None,
             eos_token_ids: Vec::new(),
@@ -77,16 +88,36 @@ pub struct TokenSampler {
     rng: Philox4x32,
     context: Vec<u32>,
     step: usize,
+    /// Сколько токенов хвоста контекста реально нужно процессорам штрафов:
+    /// `None` — штрафы выключены, `Some(0)` — весь контекст, `Some(n)` — окно.
+    ///
+    /// Нужно не для семантики, а чтобы не копировать весь контекст в
+    /// `ProcessorContext` на каждом шаге декода: на промпте агента в 30k
+    /// токенов это 120 КБ memcpy и 30k итераций штрафа на каждый токен.
+    penalty_window: Option<usize>,
 }
 
 impl TokenSampler {
     pub fn new(cfg: &GenerationConfig, prompt_ids: &[u32]) -> Self {
+        let penalties_on = cfg.repetition_penalty != 1.0
+            || cfg.presence_penalty != 0.0
+            || cfg.frequency_penalty != 0.0;
         Self {
             pipeline: build_logit_pipeline(cfg),
             sampler: build_sampler(cfg),
             rng: Philox4x32::new(cfg.seed),
             context: prompt_ids.to_vec(),
             step: 0,
+            penalty_window: penalties_on.then_some(cfg.repeat_last_n),
+        }
+    }
+
+    /// Хвост контекста для процессоров штрафов (см. `penalty_window`).
+    fn penalty_ids(&self) -> Vec<u32> {
+        match self.penalty_window {
+            None => Vec::new(),
+            Some(0) => self.context.clone(),
+            Some(n) => self.context[self.context.len().saturating_sub(n)..].to_vec(),
         }
     }
 
@@ -97,7 +128,7 @@ impl TokenSampler {
             .and_then(|t| t.to_vec1::<f32>())
             .map_err(|e| ModelError::Forward(e.to_string()))?;
         let ctx = ProcessorContext {
-            input_ids: self.context.clone(),
+            input_ids: self.penalty_ids(),
             step: self.step,
             batch_idx: 0,
         };
@@ -120,7 +151,7 @@ impl TokenSampler {
             .and_then(|t| t.to_vec1::<f32>())
             .map_err(|e| ModelError::Forward(e.to_string()))?;
         let ctx = ProcessorContext {
-            input_ids: self.context.clone(),
+            input_ids: self.penalty_ids(),
             step: self.step,
             batch_idx: 0,
         };
@@ -273,7 +304,17 @@ pub fn generate_streaming_resume(
 fn build_logit_pipeline(cfg: &GenerationConfig) -> LogitPipeline {
     let mut p = LogitPipeline::new();
     if cfg.repetition_penalty != 1.0 {
-        p = p.add(RepetitionPenaltyProcessor { penalty: cfg.repetition_penalty });
+        p = p.add(RepetitionPenaltyProcessor {
+            penalty: cfg.repetition_penalty,
+            last_n: cfg.repeat_last_n,
+        });
+    }
+    if cfg.presence_penalty != 0.0 || cfg.frequency_penalty != 0.0 {
+        p = p.add(PresenceFrequencyProcessor {
+            presence: cfg.presence_penalty,
+            frequency: cfg.frequency_penalty,
+            last_n: cfg.repeat_last_n,
+        });
     }
     if cfg.temperature > 0.0 && cfg.temperature != 1.0 {
         p = p.add(TemperatureProcessor { temperature: cfg.temperature });

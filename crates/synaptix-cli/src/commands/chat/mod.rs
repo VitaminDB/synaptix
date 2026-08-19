@@ -216,6 +216,11 @@ fn build_gen_config(args: &ChatArgs) -> GenerationConfig {
         top_p: args.top_p,
         min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
+        // Окно штрафа и presence/frequency у CLI-чата не настраиваются —
+        // дефолты сохраняют прежнее поведение (штраф по всему контексту).
+        repeat_last_n: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: args.seed,
         eos_token_id: None,
         eos_token_ids: Vec::new(),
