@@ -113,9 +113,13 @@ fn to_bf16(v: &[f32]) -> Vec<bf16> {
 
 // Прогон: append t_kv токенов в MXFP8-кеш, flash для q (t_q токенов), сверка с CPU.
 fn run(b: usize, nh: usize, nkv: usize, t_q: usize, t_kv: usize, hd: usize, label: &str) {
+    run_ms(b, nh, nkv, t_q, t_kv, hd, 64, label)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ms(b: usize, nh: usize, nkv: usize, t_q: usize, t_kv: usize, hd: usize, max_seq: usize, label: &str) {
     let dev = Device::Cuda(0);
     let nb = hd / MXFP8_BLOCK;
-    let max_seq = 64usize;
     let scale = 1.0 / (hd as f32).sqrt();
 
     let q_f = det(11, b * nh * t_q * hd, 1.0);
@@ -168,6 +172,34 @@ fn mxfp8_kv_decode_m1() {
     }
     // decode: один query-токен (Tq=1) аттендит к 40 KV-токенам.
     run(2, 4, 2, 1, 40, 128, "decode_t1_kv40");
+}
+
+#[test]
+fn mxfp8_kv_decode_v2_qwen38_shape() {
+    if !setup() {
+        return;
+    }
+    // Форма Qwen3.8-27B: 24Q/4KV×256 → v2-ядро GROUP=6. Tq=1 (decode) и
+    // Tq=2 (MTP-verify), длины вокруг границ тайла (128) и сплитов.
+    run_ms(1, 24, 4, 1, 40, 256, 64, "v2_g6_t1_kv40");
+    run_ms(1, 24, 4, 1, 127, 256, 160, "v2_g6_t1_kv127");
+    run_ms(1, 24, 4, 1, 128, 256, 160, "v2_g6_t1_kv128");
+    run_ms(1, 24, 4, 1, 129, 256, 160, "v2_g6_t1_kv129");
+    run_ms(1, 24, 4, 2, 700, 256, 704, "v2_g6_t2_kv700");
+    run_ms(1, 24, 4, 8, 1100, 256, 1152, "v2_g6_t8_kv1100");
+}
+
+#[test]
+fn mxfp8_kv_decode_v2_groups() {
+    if !setup() {
+        return;
+    }
+    // GROUP=1 (n_rep=1), GROUP=4 (16/4), GROUP=2 при hd=256, батч b=2.
+    run_ms(1, 4, 4, 1, 300, 256, 320, "v2_g1_t1_kv300");
+    run_ms(1, 16, 4, 1, 300, 256, 320, "v2_g4_t1_kv300");
+    run_ms(2, 8, 4, 2, 200, 256, 256, "v2_g2_b2_t2_kv200");
+    // n_rep=3 → GROUP=1, три сабгруппы.
+    run_ms(1, 12, 4, 1, 200, 128, 256, "v2_nrep3_t1_kv200");
 }
 
 #[test]

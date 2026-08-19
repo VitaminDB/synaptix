@@ -3011,6 +3011,46 @@ impl Backend for CudaBackend {
         let out_buf = out_st
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8 dev: out non-cuda"))?;
+        // GQA-групповое v2-ядро (sm_120a): KV читается один раз на группу голов,
+        // деквант E4M3 аппаратным cvt. Недоступно/чужая форма → скалярный путь.
+        if crate::attention::flash_decode_mxfp8_v2::v2_shape_ok(
+            d as u32,
+            t_q as u32,
+            q_dtype,
+            k_lo.byte_offset(),
+            v_lo.byte_offset(),
+        ) {
+            if let Some(k2) =
+                crate::attention::flash_decode_mxfp8_v2::FlashDecodeMxfp8V2Kernels::try_for_context(&ctx)
+            {
+                return crate::attention::flash_decode_mxfp8_v2::flash_decode_mxfp8_v2_u8_dev(
+                    &k2,
+                    &stream,
+                    q_buf.slice(),
+                    q_lo.byte_offset(),
+                    k_buf.slice(),
+                    k_lo.byte_offset(),
+                    v_buf.slice(),
+                    v_lo.byte_offset(),
+                    ks_buf.slice(),
+                    ks_lo.byte_offset(),
+                    vs_buf.slice(),
+                    vs_lo.byte_offset(),
+                    out_buf.slice_mut(),
+                    0,
+                    b as u32,
+                    nh as u32,
+                    nkv as u32,
+                    t_q as u32,
+                    &tc_view,
+                    d as u32,
+                    scale,
+                    causal,
+                    t_stride,
+                    q_dtype,
+                );
+            }
+        }
         let kernels = crate::attention::flash_decode::FlashDecodeKernels::for_context(&ctx)?;
         crate::attention::flash_decode::flash_decode_mxfp8_u8_dev(
             &kernels,
@@ -3367,6 +3407,48 @@ impl Backend for CudaBackend {
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8: out non-cuda"))?;
 
+        // Малые Tq (decode Tq=1, MTP-verify 2..8) + hd∈{128,256} + F16/BF16 q:
+        // GQA-групповое v2-ядро (sm_120a; недоступно → фолбэк ниже). WMMA-путь
+        // для Tq=2..8 на длинном контексте не годится: grid = B·NH блоков, каждый
+        // сканирует весь Tkv (замер 47k: 45 мс/слой против 0,2 мс у v2).
+        if crate::attention::flash_decode_mxfp8_v2::v2_shape_ok(
+            d as u32,
+            t_q as u32,
+            q_dtype,
+            k_lo.byte_offset(),
+            v_lo.byte_offset(),
+        ) {
+            if let Some(k2) =
+                crate::attention::flash_decode_mxfp8_v2::FlashDecodeMxfp8V2Kernels::try_for_context(&ctx)
+            {
+                return crate::attention::flash_decode_mxfp8_v2::flash_decode_mxfp8_v2_u8(
+                    &k2,
+                    &stream,
+                    q_buf.slice(),
+                    q_lo.byte_offset(),
+                    k_buf.slice(),
+                    k_lo.byte_offset(),
+                    v_buf.slice(),
+                    v_lo.byte_offset(),
+                    ks_buf.slice(),
+                    ks_lo.byte_offset(),
+                    vs_buf.slice(),
+                    vs_lo.byte_offset(),
+                    out_buf.slice_mut(),
+                    0,
+                    b as u32,
+                    nh as u32,
+                    nkv as u32,
+                    t_q as u32,
+                    t_kv as u32,
+                    d as u32,
+                    scale,
+                    causal,
+                    t_stride,
+                    q_dtype,
+                );
+            }
+        }
         // Prefill (Tq>1) + hd∈{128,256}: MXFP8 tensor-core (block-dequant в smem
         // → WMMA). Decode (Tq=1) и прочие формы: scalar split-K flash_decode_mxfp8.
         if t_q > 1 && (d == 128 || d == 256) {
