@@ -1259,13 +1259,7 @@ impl<'t, 's, F: FnMut(u32, &str) -> bool> StreamSink for DeltaSink<'t, 's, F> {
             Ok(s) => s,
             Err(_) => return true,
         };
-        let delta: String =
-            if full.len() >= self.decoded.len() && full.starts_with(&self.decoded) {
-                full[self.decoded.len()..].to_string()
-            } else {
-                String::new()
-            };
-        self.decoded = full;
+        let delta = stream_delta(full, &mut self.decoded);
 
         if !(self.on_token)(token_id, &delta) {
             return false;
@@ -1276,6 +1270,75 @@ impl<'t, 's, F: FnMut(u32, &str) -> bool> StreamSink for DeltaSink<'t, 's, F> {
             }
         }
         true
+    }
+}
+
+/// Дельта стрима: `full` — декод ВСЕХ накопленных токенов, `decoded` — что уже
+/// ушло наружу.
+///
+/// Байтовый BPE режет многобайтовые символы (эмодзи, CJK) на несколько
+/// токенов, и декод частичной последовательности ставит в хвост U+FFFD «�».
+/// Раньше этот «�» уходил дельтой в UI, а на следующем токене
+/// `full.starts_with(decoded)` не сходился («😀» ≠ «�») и настоящий символ
+/// молча терялся — в чате эмодзи просто пропадали. Поэтому недописанный хвост
+/// придерживаем: `decoded` не двигается, дельта пустая, символ уйдёт целиком
+/// со следующим токеном.
+fn stream_delta(full: String, decoded: &mut String) -> String {
+    if full.ends_with('\u{FFFD}') {
+        return String::new();
+    }
+    let delta = if full.len() >= decoded.len() && full.starts_with(decoded.as_str()) {
+        full[decoded.len()..].to_string()
+    } else {
+        // Ресинк: декод «переписал» уже показанный текст (смена нормализации
+        // токенайзера и т. п.) — дельту не выдумываем, просто догоняем.
+        String::new()
+    };
+    *decoded = full;
+    delta
+}
+
+#[cfg(test)]
+mod stream_delta_tests {
+    use super::stream_delta;
+
+    /// Прогоняет последовательность decode-снапшотов через stream_delta.
+    fn run(fulls: &[&str]) -> (Vec<String>, String) {
+        let mut decoded = String::new();
+        let deltas = fulls
+            .iter()
+            .map(|f| stream_delta(f.to_string(), &mut decoded))
+            .collect();
+        (deltas, decoded)
+    }
+
+    #[test]
+    fn plain_text_streams_as_diffs() {
+        let (deltas, decoded) = run(&["При", "Привет", "Привет!"]);
+        assert_eq!(deltas, vec!["При", "вет", "!"]);
+        assert_eq!(decoded, "Привет!");
+    }
+
+    #[test]
+    fn split_emoji_is_held_back_then_emitted_whole() {
+        // Эмодзи разрезан BPE: decode частичной последовательности даёт «�».
+        let (deltas, decoded) = run(&["Привет ", "Привет \u{FFFD}", "Привет 😀"]);
+        assert_eq!(deltas, vec!["Привет ", "", "😀"]);
+        assert_eq!(decoded, "Привет 😀");
+    }
+
+    #[test]
+    fn multi_token_emoji_with_double_replacement() {
+        // 4-байтовый эмодзи может ехать три токена: «��» в хвосте оба раза.
+        let (deltas, _) = run(&["ок ", "ок \u{FFFD}", "ок \u{FFFD}\u{FFFD}", "ок 🎉"]);
+        assert_eq!(deltas, vec!["ок ", "", "", "🎉"]);
+    }
+
+    #[test]
+    fn resync_after_rewrite_does_not_invent_delta() {
+        let (deltas, decoded) = run(&["abc", "xyz"]);
+        assert_eq!(deltas, vec!["abc", ""]);
+        assert_eq!(decoded, "xyz");
     }
 }
 
