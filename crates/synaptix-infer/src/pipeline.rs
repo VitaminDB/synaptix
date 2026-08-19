@@ -38,7 +38,10 @@ impl InferPipeline {
             pipe = pipe.add(TemperatureProcessor { temperature: params.temperature });
         }
         if params.repetition_penalty != 1.0 {
-            pipe = pipe.add(RepetitionPenaltyProcessor { penalty: params.repetition_penalty });
+            pipe = pipe.add(RepetitionPenaltyProcessor {
+                penalty: params.repetition_penalty,
+                last_n: 0,
+            });
         }
         if params.top_k > 0 {
             pipe = pipe.add(TopKProcessor { k: params.top_k });

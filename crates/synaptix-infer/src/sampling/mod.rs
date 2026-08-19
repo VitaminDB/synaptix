@@ -51,6 +51,6 @@ pub use multinomial::MultinomialSampler;
 pub use top_k::TopKProcessor;
 pub use top_p::TopPProcessor;
 pub use min_p::MinPProcessor;
-pub use repetition::RepetitionPenaltyProcessor;
+pub use repetition::{PresenceFrequencyProcessor, RepetitionPenaltyProcessor};
 pub use stop_criteria::{StopCriteria, StopReason};
 pub use logit_processor::TemperatureProcessor;

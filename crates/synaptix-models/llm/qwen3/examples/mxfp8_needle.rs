@@ -48,7 +48,8 @@ fn main() {
     let im_end = pipe.tokenizer.token_to_id("<|im_end|>");
     let cfg = GenerationConfig {
         max_new_tokens: 64, temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0,
-        repetition_penalty: 1.0, seed: 1, eos_token_id: None,
+        repetition_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0,
+        frequency_penalty: 0.0, seed: 1, eos_token_id: None,
         eos_token_ids: im_end.into_iter().collect(), max_seq: Some(4096), prefill_batch: 512,
     };
     let run = |ids: &[u32], batch: usize| -> (bool, String) {
