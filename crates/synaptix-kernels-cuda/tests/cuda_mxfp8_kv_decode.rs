@@ -203,6 +203,19 @@ fn mxfp8_kv_decode_v2_groups() {
 }
 
 #[test]
+fn mxfp8_kv_prefill_splitq() {
+    if !setup() {
+        return;
+    }
+    // split-Q prefill (Tq>8): мульти-тайл по Q (BM=64) с хвостом, форма
+    // Qwen3.8 (24/4×256), причинная маска чанка в хвосте контекста
+    // (Tkv > Tq), ринг t_stride > Tkv.
+    run_ms(1, 8, 2, 100, 300, 128, 320, "sq_t100_kv300");
+    run_ms(1, 24, 4, 256, 1000, 256, 1024, "sq_qwen38_t256_kv1000");
+    run_ms(1, 24, 4, 65, 65, 256, 128, "sq_qwen38_t65_kv65");
+}
+
+#[test]
 fn mxfp8_kv_prefill_tensorcore() {
     if !setup() {
         return;
