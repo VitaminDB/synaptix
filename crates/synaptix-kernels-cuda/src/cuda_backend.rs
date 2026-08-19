@@ -3449,6 +3449,48 @@ impl Backend for CudaBackend {
                 );
             }
         }
+        // Prefill (Tq>8) + hd∈{128,256}: сперва split-Q v2 (схема flash_splitq
+        // с деквант-fill, sm_120a), фолбэк — старый WMMA-путь (BM=16, серийный
+        // softmax; на 47k давал 135 мс/слой против ~0,5 мс у split-Q).
+        if t_q > 1
+            && crate::attention::flash_mxfp8_splitq::splitq_shape_ok(
+                d as u32,
+                q_dtype,
+                k_lo.byte_offset(),
+                v_lo.byte_offset(),
+            )
+        {
+            if let Some(k2) =
+                crate::attention::flash_mxfp8_splitq::FlashMxfp8SplitqKernels::try_for_context(&ctx)
+            {
+                return crate::attention::flash_mxfp8_splitq::flash_mxfp8_splitq_u8(
+                    &k2,
+                    &stream,
+                    q_buf.slice(),
+                    q_lo.byte_offset(),
+                    k_buf.slice(),
+                    k_lo.byte_offset(),
+                    v_buf.slice(),
+                    v_lo.byte_offset(),
+                    ks_buf.slice(),
+                    ks_lo.byte_offset(),
+                    vs_buf.slice(),
+                    vs_lo.byte_offset(),
+                    out_buf.slice_mut(),
+                    0,
+                    b as u32,
+                    nh as u32,
+                    nkv as u32,
+                    t_q as u32,
+                    t_kv as u32,
+                    d as u32,
+                    scale,
+                    causal,
+                    t_stride,
+                    q_dtype,
+                );
+            }
+        }
         // Prefill (Tq>1) + hd∈{128,256}: MXFP8 tensor-core (block-dequant в smem
         // → WMMA). Decode (Tq=1) и прочие формы: scalar split-K flash_decode_mxfp8.
         if t_q > 1 && (d == 128 || d == 256) {

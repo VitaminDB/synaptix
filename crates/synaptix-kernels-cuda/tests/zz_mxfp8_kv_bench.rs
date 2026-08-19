@@ -85,3 +85,22 @@ fn bench_verify_tq2_47k() {
 fn bench_decode_tq1_8k() {
     bench(1, 8192, "decode");
 }
+
+// Префилл: чанк 256 токенов в хвосте контекста (Tkv = позиция + 256).
+#[test]
+#[ignore]
+fn bench_prefill_tq256_8k() {
+    bench(256, 8192, "prefill");
+}
+
+#[test]
+#[ignore]
+fn bench_prefill_tq256_24k() {
+    bench(256, 24576, "prefill");
+}
+
+#[test]
+#[ignore]
+fn bench_prefill_tq256_47k() {
+    bench(256, 47000, "prefill");
+}
