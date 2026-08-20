@@ -1,9 +1,15 @@
-//! Загрузка чекпойнта LTX-2.3 из одного safetensors-файла.
+//! Загрузка чекпойнта LTX-2.3 из одного safetensors-файла или `.syn`-бандла.
 //!
 //! В отличие от FLUX (diffusers-раскладка по подкаталогам), LTX держит ВСЕ
 //! подмодели в одном файле под top-level префиксами. [`LtxCheckpoint`] открывает
 //! его zero-copy (mmap, без host-копии — см. урок о .syn-регрессии), разбирает
-//! конфиг из `__metadata__` и отдаёт тензоры по имени. [`Component`] — лёгкое
+//! конфиг из `__metadata__` и отдаёт тензоры по имени.
+//!
+//! `.syn`-бандл (`syn-pack <dir> --arch ltx-2.3`) читается тем же путём:
+//! [`SafetensorsLoader::open_bundle`] отдаёт tensors-чанк прямо из mmap
+//! бандла — без распаковки во временный файл и без host-копии. Однофайловый
+//! чекпойнт при паковке копируется побайтово, поэтому `__metadata__` с
+//! `config` доезжает до [`Ltx23Config::from_metadata`] как есть. [`Component`] — лёгкое
 //! представление подмодели с автодобавлением префикса (`model.diffusion_model.`,
 //! `vae.`, …) в стиле `get`-замыкания FLUX.
 
@@ -31,12 +37,30 @@ pub struct LoraWeights {
     device: Device,
 }
 
+/// `.syn`-бандл или сырой safetensors — определяется по расширению.
+///
+/// Внутри бандла тензоры лежат готовым safetensors-потоком, поэтому оба пути
+/// дают одинаковый [`SafetensorsLoader`] (zero-copy mmap), а `__metadata__`
+/// однофайлового чекпойнта переживает паковку.
+fn is_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("syn"))
+}
+
+pub(crate) fn open_weights(path: &Path) -> Result<SafetensorsLoader, LtxError> {
+    if is_bundle(path) {
+        SafetensorsLoader::open_bundle(path, None)
+            .map_err(|e| LtxError::Load(format!("{}: {e}", path.display())))
+    } else {
+        SafetensorsLoader::open(path).map_err(|e| LtxError::Load(e.to_string()))
+    }
+}
+
 impl LoraWeights {
     /// Открыть LoRA-файл (zero-copy mmap) со `strength` (официальный дефолт 1.0).
     pub fn open(path: impl AsRef<Path>, device: Device, strength: f32) -> Result<Self, LtxError> {
-        let loader = SafetensorsLoader::open(path.as_ref())
-            .map_err(|e| LtxError::Load(e.to_string()))?
-            .with_device(device);
+        let loader = open_weights(path.as_ref())?.with_device(device);
         Ok(Self { loader, strength, device })
     }
 
@@ -72,7 +96,8 @@ pub struct LtxCheckpoint {
 }
 
 impl LtxCheckpoint {
-    /// Открыть `ltx-2.3-*.safetensors` (один файл). Разбирает `__metadata__["config"]`.
+    /// Открыть `ltx-2.3-*.safetensors` (один файл) или `.syn`-бандл с тем же
+    /// содержимым. Разбирает `__metadata__["config"]`.
     pub fn open(
         path: impl AsRef<Path>,
         device: Device,
@@ -82,9 +107,7 @@ impl LtxCheckpoint {
         if !path.exists() {
             return Err(LtxError::Load(format!("not found: {}", path.display())));
         }
-        let loader = SafetensorsLoader::open(path)
-            .map_err(|e| LtxError::Load(e.to_string()))?
-            .with_device(device);
+        let loader = open_weights(path)?.with_device(device);
         let config = Ltx23Config::from_metadata(loader.metadata())?;
         Ok(Self { loader, config, device, dtype, lora: None })
     }
@@ -200,5 +223,45 @@ impl<'a> Component<'a> {
 
     pub fn tensor_info(&self, name: &str) -> Option<TensorInfo> {
         self.ckpt.tensor_info(&self.full(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.syn`-бандл открывается тем же путём, что и сырой safetensors:
+    /// `__metadata__["config"]` переживает паковку (fast-path побайтовой
+    /// копии в `syn-pack`), тензоры видны под теми же именами.
+    ///
+    /// Запуск: `SYN_LTX_BUNDLE=/путь/ltx-2.3-22b-dev.syn cargo test -p
+    /// synaptix-video-ltx23 -- --ignored bundle_open`.
+    #[test]
+    #[ignore = "нужен локальный .syn-бандл LTX (SYN_LTX_BUNDLE)"]
+    fn bundle_open_reads_config_and_tensors() {
+        let Ok(path) = std::env::var("SYN_LTX_BUNDLE") else {
+            panic!("SYN_LTX_BUNDLE не задан");
+        };
+        let ckpt = LtxCheckpoint::open(&path, Device::Cpu, DType::BF16).expect("открыть бандл");
+        assert!(ckpt.config.transformer.num_layers > 0);
+        let dit = ckpt.infos().filter(|(n, _, _)| n.starts_with(DIT_PREFIX)).count();
+        assert!(dit > 0, "в бандле нет тензоров DiT");
+    }
+
+    /// LoRA-адаптер из `.syn` — тот же путь, что у чекпойнта.
+    ///
+    /// Запуск: `SYN_LTX_LORA_BUNDLE=/путь/ic-lora.syn cargo test -p
+    /// synaptix-video-ltx23 --lib -- --ignored bundle_lora`.
+    #[test]
+    #[ignore = "нужен локальный .syn-бандл LoRA (SYN_LTX_LORA_BUNDLE)"]
+    fn bundle_lora_open() {
+        let Ok(path) = std::env::var("SYN_LTX_LORA_BUNDLE") else {
+            panic!("SYN_LTX_LORA_BUNDLE не задан");
+        };
+        let lora = LoraWeights::open(&path, Device::Cpu, 1.0).expect("открыть LoRA-бандл");
+        assert!(
+            lora.loader.names().iter().any(|n| n.ends_with(".lora_A.weight")),
+            "в бандле нет lora_A-весов"
+        );
     }
 }

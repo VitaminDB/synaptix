@@ -8,7 +8,6 @@
 use std::path::Path;
 
 use synaptix_core::{device::Device, dtype::DType, error::SynaptixError, tensor::Tensor};
-use synaptix_io::weights::safetensors::SafetensorsLoader;
 use synaptix_io::weights::WeightLoader;
 use synaptix_ops::conv::conv2d::conv2d;
 use synaptix_ops::conv::conv3d::conv3d;
@@ -82,9 +81,8 @@ impl Upsampler {
         vae_std: &Tensor,
         device: Device,
     ) -> Result<Self, LtxError> {
-        let ld = SafetensorsLoader::open(path.as_ref())
-            .map_err(|e| LtxError::Load(e.to_string()))?
-            .with_device(device);
+        // `.syn`-бандл или сырой safetensors — как у чекпойнта/LoRA.
+        let ld = crate::loader::open_weights(path.as_ref())?.with_device(device);
         let g = |n: &str| -> Result<Tensor, LtxError> {
             ld.load_to(n, device, DType::F32).map_err(|e| LtxError::Load(format!("{n}: {e}")))
         };

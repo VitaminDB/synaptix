@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
+use synaptix_bundle::Bundle;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -33,12 +35,32 @@ pub struct GemmaWeights {
 impl GemmaWeights {
     /// Открывает (mmap) шарды и парсит конфиг. Тензоры НЕ читаются. `device`/`dtype`
     /// — дефолтные подсказки (модель может грузить на другое устройство явно).
-    pub fn load(dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
-        let dir = dir.as_ref();
-        let config = Gemma3Config::from_hf_json(dir.join("config.json"))
-            .map_err(|e| LoadError::Config(e.to_string()))?;
-        let shards = resolve_shards(dir)?;
-        let loader = SafetensorsLoader::open_sharded(&shards).map_err(|e| LoadError::Io(e.to_string()))?;
+    ///
+    /// `path` — HF-каталог или `.syn`-бандл (`syn-pack <hf_dir>`): у бандла
+    /// шарды слиты в один tensors-чанк, а `config.json` лежит файловым чанком.
+    pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
+        let path = path.as_ref();
+        let (config, loader) = if is_bundle(path) {
+            let bundle = Arc::new(
+                Bundle::open(path)
+                    .map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?,
+            );
+            let cfg_bytes = bundle
+                .read_file("config.json")
+                .map_err(|e| LoadError::Config(format!("{}:config.json: {e}", path.display())))?;
+            let config = Gemma3Config::from_hf_json_slice(&cfg_bytes, "config.json")
+                .map_err(|e| LoadError::Config(e.to_string()))?;
+            let loader = SafetensorsLoader::from_bundle(bundle, None)
+                .map_err(|e| LoadError::Io(e.to_string()))?;
+            (config, loader)
+        } else {
+            let config = Gemma3Config::from_hf_json(path.join("config.json"))
+                .map_err(|e| LoadError::Config(e.to_string()))?;
+            let shards = resolve_shards(path)?;
+            let loader = SafetensorsLoader::open_sharded(&shards)
+                .map_err(|e| LoadError::Io(e.to_string()))?;
+            (config, loader)
+        };
         let prefix = if loader.names().iter().any(|n| n.starts_with(LM_PREFIX)) {
             LM_PREFIX
         } else {
@@ -78,6 +100,28 @@ impl synaptix_llm_common::WeightSource for GemmaWeights {
     fn contains(&self, key: &str) -> bool {
         GemmaWeights::contains(self, key)
     }
+}
+
+/// `.syn`-бандл (файл) или HF-каталог — различаем по расширению.
+pub fn is_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("syn"))
+}
+
+/// Прочитать вспомогательный файл модели (`tokenizer.json`, …) из каталога
+/// или из `.syn`-бандла — вызывающему не нужно знать, что за раскладка.
+pub fn read_aux(path: &Path, rel: &str) -> Result<Vec<u8>, LoadError> {
+    if is_bundle(path) {
+        let bundle =
+            Bundle::open(path).map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?;
+        return bundle
+            .read_file(rel)
+            .map(|c| c.into_owned())
+            .map_err(|e| LoadError::Io(format!("{}:{rel}: {e}", path.display())));
+    }
+    let p = path.join(rel);
+    std::fs::read(&p).map_err(|e| LoadError::Io(format!("read {}: {e}", p.display())))
 }
 
 fn resolve_shards(dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
@@ -144,5 +188,24 @@ mod tests {
         assert_eq!(qn.dims(), &[w.config.head_dim]);
         assert!(w.contains("model.layers.0.pre_feedforward_layernorm.weight"));
         assert!(w.contains("model.layers.0.post_feedforward_layernorm.weight"));
+    }
+
+    /// `.syn`-бандл Gemma (`syn-pack <hf_dir>`) отдаёт конфиг, tokenizer и
+    /// веса так же, как HF-каталог: config.json/tokenizer.json лежат файловыми
+    /// чанками, шарды слиты в один tensors-чанк.
+    ///
+    /// Запуск: `SYN_GEMMA_BUNDLE=/путь/gemma.syn cargo test -p
+    /// synaptix-llm-gemma3 --lib -- --ignored bundle_load`.
+    #[test]
+    #[ignore = "нужен локальный .syn-бандл Gemma (SYN_GEMMA_BUNDLE)"]
+    fn bundle_load_config_tokenizer_weights() {
+        let Ok(path) = std::env::var("SYN_GEMMA_BUNDLE") else {
+            panic!("SYN_GEMMA_BUNDLE не задан");
+        };
+        let path = PathBuf::from(path);
+        let w = GemmaWeights::load(&path, Device::Cpu, DType::BF16).expect("открыть бандл");
+        assert!(w.config.num_hidden_layers > 0);
+        let tok = read_aux(&path, "tokenizer.json").expect("tokenizer.json из бандла");
+        assert!(tok.len() > 1_000_000, "tokenizer.json подозрительно мал: {}", tok.len());
     }
 }
