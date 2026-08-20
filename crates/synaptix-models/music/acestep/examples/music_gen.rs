@@ -31,7 +31,7 @@ fn main() {
     let edit = synaptix_music_acestep::pipeline::EditOptions::default();
     let extras = synaptix_music_acestep::pipeline::GenExtras::ar_on();
     let (samples, sr, _latent) =
-        generate_music(&paths, &caption, "", dur, Device::Cuda(0), DType::F32, DType::F32, DType::F32, &opts, &copts, use_cot, &edit, &extras)
+        generate_music(&paths, &caption, "", dur, Device::Cuda(0), DType::F32, DType::F32, DType::F32, &opts, &copts, use_cot, &edit, &extras, None)
             .expect("generate_music");
     let out = "/tmp/acestep_out.wav";
     synaptix_audio::write_wav_mono_f32(out, &samples, sr).expect("write wav");

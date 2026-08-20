@@ -171,7 +171,7 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let t0 = std::time::Instant::now();
     let (samples, sr, _latent) = generate_music(
-        &paths, &args.caption, &args.lyrics, duration_sec, dev, compute, dit_quant, enc_quant, &opts, &copts, args.use_cot, &edit, &extras,
+        &paths, &args.caption, &args.lyrics, duration_sec, dev, compute, dit_quant, enc_quant, &opts, &copts, args.use_cot, &edit, &extras, None,
     )?;
     let dur = samples.len() as f32 / sr as f32;
     let infer = t0.elapsed().as_secs_f32();

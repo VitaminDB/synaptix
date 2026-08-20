@@ -1,5 +1,5 @@
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_tokenizer::hf::HfTokenizer;
@@ -550,6 +550,63 @@ pub struct MusicPaths<'a> {
     pub vae: &'a Path,
 }
 
+/// Ключ валидности резидентного кэша компонентов: пути бандлов +
+/// device/dtype'ы. Несовпадение — кэш очищается целиком (веса другие).
+#[derive(Clone, PartialEq)]
+struct CacheKey {
+    lm: PathBuf,
+    text_encoder: PathBuf,
+    dit: PathBuf,
+    vae: PathBuf,
+    device: Device,
+    compute: DType,
+    dit_quant: DType,
+    enc_quant: DType,
+}
+
+/// Кэш тяжёлых компонентов между вызовами [`generate_music`].
+///
+/// Владеет ВЫЗЫВАЮЩИЙ (нода synthos с чекбоксом «Держать в памяти»):
+/// `Some(&mut cache)` — LM/TextEncoder/DiT/VAE остаются загруженными между
+/// прогонами и повторный запуск не платит загрузку и квантизацию;
+/// `None` — прежний sequential-drop, компоненты живут один вызов (режим
+/// «влезть в 24 ГБ»). Смена путей/девайса/квантов инвалидирует кэш сама.
+#[derive(Default)]
+pub struct MusicComponentCache {
+    key: Option<CacheKey>,
+    lm: Option<AceStepLm>,
+    /// rope-ёмкость закэшированной LM: запрос длиннее — перезагрузка.
+    lm_capacity: usize,
+    text_encoder: Option<TextEncoder>,
+    dit: Option<Dit>,
+    vae: Option<AceStepVae>,
+}
+
+impl MusicComponentCache {
+    fn ensure_key(&mut self, key: &CacheKey) {
+        if self.key.as_ref() != Some(key) {
+            *self = Self::default();
+            self.key = Some(key.clone());
+        }
+    }
+
+    /// Загружено ли хоть что-то (для панели «Модели в памяти»).
+    pub fn is_loaded(&self) -> bool {
+        self.lm.is_some() || self.text_encoder.is_some() || self.dit.is_some() || self.vae.is_some()
+    }
+}
+
+/// Взять из слота или загрузить и оставить в нём.
+fn cached_or_load<'c, T>(
+    slot: &'c mut Option<T>,
+    load: impl FnOnce() -> Result<T, AceError>,
+) -> Result<&'c T, AceError> {
+    if slot.is_none() {
+        *slot = Some(load()?);
+    }
+    Ok(slot.as_ref().expect("slot just filled"))
+}
+
 /// Output loudness normalization mode (matches the old Rust output node).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NormMode {
@@ -594,11 +651,26 @@ pub fn generate_music(
     use_cot: bool,
     edit: &EditOptions,
     extras: &GenExtras,
+    // Резидентный кэш компонентов; None — прежний sequential-drop.
+    mut cache: Option<&mut MusicComponentCache>,
 ) -> Result<(Vec<f32>, u32, Tensor), AceError> {
     use crate::ar::ar_generate;
     let cfg = DitConfig::xl_base();
     let seed = codes_opts.seed;
     let enc_compute = compute;
+
+    if let Some(c) = cache.as_deref_mut() {
+        c.ensure_key(&CacheKey {
+            lm: paths.lm.to_path_buf(),
+            text_encoder: paths.text_encoder.to_path_buf(),
+            dit: paths.dit.to_path_buf(),
+            vae: paths.vae.to_path_buf(),
+            device,
+            compute,
+            dit_quant,
+            enc_quant,
+        });
+    }
 
     let auto = duration_sec == 0;
     let cot = use_cot || auto;
@@ -615,12 +687,33 @@ pub fn generate_music(
             ..Metadata::default()
         };
         if extras.use_ar {
-            let t_open = std::time::Instant::now();
-            let lm = AceStepLm::open(paths.lm, device, enc_compute, enc_quant, cap_sec * 5 + 2048)?;
-            eprintln!("[t] LM load: {:.1}s", t_open.elapsed().as_secs_f32());
+            let cap = cap_sec * 5 + 2048;
+            let load_lm = || -> Result<AceStepLm, AceError> {
+                let t_open = std::time::Instant::now();
+                let m = AceStepLm::open(paths.lm, device, enc_compute, enc_quant, cap)?;
+                eprintln!("[t] LM load: {:.1}s", t_open.elapsed().as_secs_f32());
+                Ok(m)
+            };
+            let lm_owned;
+            let lm: &AceStepLm = match cache.as_deref_mut() {
+                Some(c) => {
+                    // Ёмкость rope у кэшированной LM меньше запроса — перезагрузка.
+                    if c.lm.is_some() && c.lm_capacity < cap {
+                        c.lm = None;
+                    }
+                    if c.lm.is_none() {
+                        c.lm_capacity = cap;
+                    }
+                    cached_or_load(&mut c.lm, load_lm)?
+                }
+                None => {
+                    lm_owned = load_lm()?;
+                    &lm_owned
+                }
+            };
             let lm_tok = AceTokenizer::from_bytes(&read_bundle_file(paths.lm, "tokenizer.json")?)?;
             let t_ar = std::time::Instant::now();
-            let r = ar_generate(&lm, &lm_tok, caption, lyric, &base, codes_opts, cot)?;
+            let r = ar_generate(lm, &lm_tok, caption, lyric, &base, codes_opts, cot)?;
             eprintln!("[t] AR generate ({} codes): {:.1}s", r.0.len(), t_ar.elapsed().as_secs_f32());
             r
         } else {
@@ -640,7 +733,16 @@ pub fn generate_music(
     let t2 = std::time::Instant::now();
     let (text_hidden, lyric_hidden) = {
         use crate::text_encoder::{build_lyric_prompt, build_text_prompt};
-        let te = TextEncoder::open(paths.text_encoder, device, enc_compute, enc_quant, 4096)?;
+        let te_owned;
+        let te: &TextEncoder = match cache.as_deref_mut() {
+            Some(c) => cached_or_load(&mut c.text_encoder, || {
+                TextEncoder::open(paths.text_encoder, device, enc_compute, enc_quant, 4096)
+            })?,
+            None => {
+                te_owned = TextEncoder::open(paths.text_encoder, device, enc_compute, enc_quant, 4096)?;
+                &te_owned
+            }
+        };
         let tok = HfTokenizer::from_bytes(&read_bundle_file(paths.text_encoder, "tokenizer.json")?)
             .map_err(|e| AceError::Load(e.to_string()))?;
         let enc_ids = |s: &str| -> Result<Tensor, AceError> {
@@ -705,9 +807,20 @@ pub fn generate_music(
     eprintln!("[t] cond (dit_ck load + fsq/detok/cond/silence): {:.1}s", t3.elapsed().as_secs_f32());
 
     let latent = {
-        let t_dl = std::time::Instant::now();
-        let dit = Dit::load(&dit_ck, &cfg, compute, dit_quant)?;
-        eprintln!("[t] DiT load: {:.1}s", t_dl.elapsed().as_secs_f32());
+        let load_dit = || -> Result<Dit, AceError> {
+            let t_dl = std::time::Instant::now();
+            let d = Dit::load(&dit_ck, &cfg, compute, dit_quant)?;
+            eprintln!("[t] DiT load: {:.1}s", t_dl.elapsed().as_secs_f32());
+            Ok(d)
+        };
+        let dit_owned;
+        let dit: &Dit = match cache.as_deref_mut() {
+            Some(c) => cached_or_load(&mut c.dit, load_dit)?,
+            None => {
+                dit_owned = load_dit()?;
+                &dit_owned
+            }
+        };
         let x0 = {
             let base = Tensor::randn_seeded(vec![1usize, t_frames, 64], seed, Device::Cpu)?;
             let mixed = if matches!(edit.mode, EditMode::Retake) && edit.retake_variance > 0.0 {
@@ -739,7 +852,7 @@ pub fn generate_music(
                     device,
                 )?;
                 denoise_repaint(
-                    &dit, &x0, &context, &enc_cond, Some(&null), opts, &src, &x0, &mask, &soft,
+                    dit, &x0, &context, &enc_cond, Some(&null), opts, &src, &x0, &mask, &soft,
                     cutoff,
                 )?
             }
@@ -750,16 +863,23 @@ pub fn generate_music(
                     .ok_or_else(|| AceError::Other("edit: нужен src_latent на входе".into()))?;
                 let src = align_latent_len(src, t_frames, device)?;
                 let t_start = edit.edit_n_max.clamp(0.0, 1.0);
-                denoise_sdedit(&dit, &src, &x0, &context, &enc_cond, Some(&null), opts, t_start)?
+                denoise_sdedit(dit, &src, &x0, &context, &enc_cond, Some(&null), opts, t_start)?
             }
-            _ => denoise(&dit, &x0, &context, &enc_cond, Some(&null), opts)?,
+            _ => denoise(dit, &x0, &context, &enc_cond, Some(&null), opts)?,
         };
         eprintln!("[t] denoise ({} steps, T={}): {:.1}s", opts.steps, t_frames, t_dn.elapsed().as_secs_f32());
         r
     };
 
     let t6 = std::time::Instant::now();
-    let vae = AceStepVae::open(paths.vae, device)?;
+    let vae_owned;
+    let vae: &AceStepVae = match cache.as_deref_mut() {
+        Some(c) => cached_or_load(&mut c.vae, || AceStepVae::open(paths.vae, device))?,
+        None => {
+            vae_owned = AceStepVae::open(paths.vae, device)?;
+            &vae_owned
+        }
+    };
     let latent_ncl = latent.transpose(1, 2)?.contiguous()?;
     let audio = vae.decode_tiled(&latent_ncl, 500, 32)?;
     let ch0 = audio.narrow(1, 0, 1)?.contiguous()?;
