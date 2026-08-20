@@ -258,9 +258,9 @@ pub struct BaseVocoder {
 }
 impl BaseVocoder {
     pub fn load(path: impl AsRef<std::path::Path>, device: Device) -> Result<Self, LtxError> {
-        let ld = SafetensorsLoader::open(path.as_ref())
-            .map_err(|e| LtxError::Load(e.to_string()))?
-            .with_device(device);
+        // `.syn`-бандл или сырой safetensors — как у чекпойнта (вокодер лежит
+        // в том же файле под префиксом `vocoder.`).
+        let ld = crate::loader::open_weights(path.as_ref())?.with_device(device);
         let generator = load_generator(
             &ld, "vocoder.vocoder",
             &[5, 2, 2, 2, 2, 2], &[11, 4, 4, 4, 4, 4],
@@ -374,9 +374,9 @@ pub struct VocoderWithBwe {
 }
 impl VocoderWithBwe {
     pub fn load(path: impl AsRef<std::path::Path>, device: Device) -> Result<Self, LtxError> {
-        let ld = SafetensorsLoader::open(path.as_ref())
-            .map_err(|e| LtxError::Load(e.to_string()))?
-            .with_device(device);
+        // `.syn`-бандл или сырой safetensors — как у чекпойнта (вокодер лежит
+        // в том же файле под префиксом `vocoder.`).
+        let ld = crate::loader::open_weights(path.as_ref())?.with_device(device);
         let base = load_generator(
             &ld, "vocoder.vocoder",
             &[5, 2, 2, 2, 2, 2], &[11, 4, 4, 4, 4, 4],
