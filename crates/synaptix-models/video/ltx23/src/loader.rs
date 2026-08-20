@@ -248,6 +248,23 @@ mod tests {
         assert!(dit > 0, "в бандле нет тензоров DiT");
     }
 
+    /// Любой LTX-бандл открывается и отдаёт тензоры — проверка пачки
+    /// бандлов перед удалением исходных `.safetensors`.
+    ///
+    /// Запуск: `SYN_LTX_ANY_BUNDLE=/путь/x.syn cargo test -p
+    /// synaptix-video-ltx23 --lib -- --ignored bundle_tensors_present`.
+    #[test]
+    #[ignore = "нужен локальный .syn-бандл (SYN_LTX_ANY_BUNDLE)"]
+    fn bundle_tensors_present() {
+        let Ok(path) = std::env::var("SYN_LTX_ANY_BUNDLE") else {
+            panic!("SYN_LTX_ANY_BUNDLE не задан");
+        };
+        let ld = open_weights(std::path::Path::new(&path)).expect("открыть бандл");
+        let n = ld.names().len();
+        assert!(n > 0, "в бандле нет тензоров");
+        println!("{path}: тензоров {n}");
+    }
+
     /// LoRA-адаптер из `.syn` — тот же путь, что у чекпойнта.
     ///
     /// Запуск: `SYN_LTX_LORA_BUNDLE=/путь/ic-lora.syn cargo test -p
