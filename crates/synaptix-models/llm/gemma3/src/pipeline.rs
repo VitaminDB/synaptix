@@ -41,6 +41,16 @@ pub struct GenerationStats {
     pub decode_ms: u128,
 }
 
+/// `tokenizer.json` из HF-каталога или из `.syn`-бандла: 33 МБ JSON
+/// десериализуются одинаково, различается лишь способ достать байты.
+fn load_tokenizer(path: &Path) -> Result<HfTokenizer, String> {
+    if crate::loader::is_bundle(path) {
+        let bytes = crate::loader::read_aux(path, "tokenizer.json").map_err(|e| e.to_string())?;
+        return HfTokenizer::from_bytes(&bytes).map_err(|e| e.to_string());
+    }
+    HfTokenizer::from_file(path.join("tokenizer.json")).map_err(|e| e.to_string())
+}
+
 impl GemmaPipeline {
     pub fn load(model_dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
         // Веса — в default-пул, отдельно от пула активаций (иначе free-list
@@ -60,7 +70,7 @@ impl GemmaPipeline {
         let weights = GemmaWeights::load(&dir, device, dtype)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();
-        let tokenizer = HfTokenizer::from_file(dir.join("tokenizer.json"))
+        let tokenizer = load_tokenizer(&dir)
             .map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
@@ -91,9 +101,7 @@ impl GemmaPipeline {
         // ~13s — дольше, чем веса+build (5.8s); ни от чего не зависит → фоновый
         // поток, join после сборки модели.
         let tok_dir = dir.clone();
-        let tok_handle = std::thread::spawn(move || {
-            HfTokenizer::from_file(tok_dir.join("tokenizer.json"))
-        });
+        let tok_handle = std::thread::spawn(move || load_tokenizer(&tok_dir));
         let weights = GemmaWeights::load(&dir, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();

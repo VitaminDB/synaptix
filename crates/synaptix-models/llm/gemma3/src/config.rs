@@ -93,8 +93,14 @@ impl Gemma3Config {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
             .map_err(|e| ConfigError::Io(format!("read {}: {e}", path.display())))?;
-        let root: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ConfigError::Parse(format!("parse {}: {e}", path.display())))?;
+        Self::from_hf_json_slice(&bytes, &path.display().to_string())
+    }
+
+    /// То же, но из уже прочитанных байт: `config.json` внутри `.syn`-бандла
+    /// живёт чанком, а не файлом на диске. `origin` — только для сообщений.
+    pub fn from_hf_json_slice(bytes: &[u8], origin: &str) -> Result<Self, ConfigError> {
+        let root: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| ConfigError::Parse(format!("parse {origin}: {e}")))?;
         let mut merged = match root.as_object() {
             Some(m) => m.clone(),
             None => return Err(ConfigError::Parse("config root not an object".into())),
