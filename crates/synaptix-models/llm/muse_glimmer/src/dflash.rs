@@ -363,6 +363,28 @@ impl DFlashModule {
                 cache.start + cache.len
             )));
         }
+        // Блок контекста длиннее окна (первый ход длинного промпта: сюда
+        // приходят tap-hidden'ы ВСЕГО промпта) режем по хвосту. Внимание
+        // драфтера — band |i-j| < sliding_window, а контекстные K/V каждый слой
+        // считает из выхода энкодера, а не из предыдущего слоя, поэтому
+        // receptive field по слоям не растёт: всё, что дальше окна, на логиты
+        // не влияет. Без обрезки блок физически не влезает в ring-кэш
+        // (cap = sliding_window + RING_SLACK + block_size) и `kv_append` падает
+        // с «seq_pos + t_new > max_seq».
+        let (trimmed, ctx_hidden, ctx_pos, m) = if m > c.sliding_window {
+            let keep = c.sliding_window;
+            let cut: Vec<Tensor> = ctx_hidden
+                .iter()
+                .map(|t| e(t.narrow(1, m - keep, keep).and_then(|x| x.contiguous())))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Отброшенный префикс старше окна — кэш начинается с нового хвоста.
+            cache.start = ctx_pos + (m - keep);
+            cache.len = 0;
+            (Some(cut), ctx_hidden, ctx_pos + (m - keep), keep)
+        } else {
+            (None, ctx_hidden, ctx_pos, m)
+        };
+        let ctx_hidden: &[Tensor] = trimmed.as_deref().unwrap_or(ctx_hidden);
         self.roll_if_needed(cache, m)?;
 
         let refs: Vec<&Tensor> = ctx_hidden.iter().collect();
