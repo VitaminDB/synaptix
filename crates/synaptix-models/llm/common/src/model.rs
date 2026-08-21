@@ -931,31 +931,73 @@ impl DecoderModel {
 
     pub fn kv_bytes_per_token(&self) -> usize {
         let c = &self.config;
-        let mxfp8 = self.kv_dtype == DType::MXFP8;
         // Ровно то, что аллоцирует `make_kv_cache`: K и V по слою и токену.
         // MXFP8 — байт на элемент плюс один E8M0-байт на блок из 32 (а не
         // «2 байта на элемент», как считала прежняя формула: она завышала
         // ринг почти вдвое, и бюджет контекста выходил вполовину меньше
-        // реального).
-        let per_full = if mxfp8 {
-            2 * c.num_key_value_heads * (c.head_dim + c.head_dim.div_ceil(32))
-        } else {
+        // реального). Dtype — ПОСЛОЙНЫЙ: sliding-слои остаются плотными
+        // (см. `layer_kv_mxfp8`), поэтому суммируем по слоям, а не умножаем
+        // одну ставку на их количество.
+        let dense = {
             let elem = (self.dtype.size_in_bits() / 8).max(1);
             2 * c.num_key_value_heads * c.head_dim * elem
         };
+        let quant = 2 * c.num_key_value_heads * (c.head_dim + c.head_dim.div_ceil(32));
         let ring_ok = self.ring_kv_ok();
-        let full_layers = (0..self.blocks.len())
-            .filter(|l| {
-                matches!(c.layer_kind(*l), LayerKind::Full)
-                    && !(ring_ok && c.window_for(*l).is_some())
+        (0..self.blocks.len())
+            .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
+            .map(|l| {
+                // Ring-KV: sliding-слой держит окно фиксированного размера
+                // (w + RING_SLACK), с длиной контекста не растёт → в ставке
+                // «на токен» его нет.
+                if ring_ok && c.window_for(l).is_some() {
+                    0
+                } else if self.layer_kv_mxfp8(l) {
+                    quant
+                } else {
+                    dense
+                }
             })
-            .count();
-        per_full * full_layers
+            .sum()
+    }
+
+    /// VRAM под те KV-слои, чей размер НЕ зависит от длины контекста:
+    /// sliding-слои на ring-KV держат окно `w + RING_SLACK` и с ростом
+    /// контекста не растут (в [`Self::kv_bytes_per_token`] их ставка = 0).
+    /// Полный размер кэша ≈ `kv_fixed_bytes(batch, max_seq) + ctx *
+    /// kv_bytes_per_token()`. Без ring-KV (CPU, hd≠128) — 0: там все слои
+    /// считаются на токен.
+    pub fn kv_fixed_bytes(&self, batch: usize, max_seq: usize) -> usize {
+        if !self.ring_kv_ok() {
+            return 0;
+        }
+        let c = &self.config;
+        let elem = (self.dtype.size_in_bits() / 8).max(1);
+        (0..self.blocks.len())
+            .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
+            .filter_map(|l| c.window_for(l))
+            .map(|w| 2 * batch * c.num_key_value_heads * max_seq.min(w + RING_SLACK) * c.head_dim * elem)
+            .sum()
+    }
+
+    /// Держится ли KV слоя `l` в MXFP8. Квантованный кэш умеет читать только
+    /// `flash_attention_mxfp8kv` (causal, без окна), поэтому MXFP8 достаётся
+    /// строго слоям, которые по этому ядру и пойдут: full-attention (без
+    /// sliding-окна) и с включённым flash. Остальные слои — плотный
+    /// compute-dtype: иначе `kv_append` получил бы BF16-источник на
+    /// MXFP8-буфер и падал с «dtype mismatch src/dst».
+    fn layer_kv_mxfp8(&self, l: usize) -> bool {
+        if self.kv_dtype != DType::MXFP8 || self.config.head_dim % 32 != 0 {
+            return false;
+        }
+        match self.blocks.get(l).map(|b| &b.mixer) {
+            Some(Mixer::Full(fa)) => fa.use_flash && fa.sliding_window.is_none(),
+            _ => false,
+        }
     }
 
     fn ring_kv_ok(&self) -> bool {
         matches!(self.device, Device::Cuda(_))
-            && self.kv_dtype != DType::MXFP8
             && self.config.head_dim == 128
             && matches!(self.dtype, DType::F16 | DType::BF16)
     }
@@ -996,6 +1038,19 @@ impl DecoderModel {
     }
 
     pub fn make_kv_cache(&self, batch: usize, max_seq: usize) -> Result<KvCache, ModelError> {
+        self.make_kv_cache_ext(batch, max_seq, true)
+    }
+
+    /// Как [`Self::make_kv_cache`], но `allow_mxfp8=false` форсит плотный KV на
+    /// всех слоях. Нужен вызывающим, которые читают кэш не flash-ядром —
+    /// например энкодерный проход с key-padding маской
+    /// ([`Self::forward_hidden_states`]): MXFP8-кэш там прочитать нечем.
+    pub fn make_kv_cache_ext(
+        &self,
+        batch: usize,
+        max_seq: usize,
+        allow_mxfp8: bool,
+    ) -> Result<KvCache, ModelError> {
         if max_seq == 0 {
             return Err(ModelError::Shape("make_kv_cache: max_seq must be > 0".into()));
         }
@@ -1008,13 +1063,11 @@ impl DecoderModel {
         let c = &self.config;
         let n_kv = c.num_key_value_heads;
         let hd = c.head_dim;
-        let mxfp8 = self.kv_dtype == DType::MXFP8;
-        if mxfp8 && hd % 32 != 0 {
+        if self.kv_dtype == DType::MXFP8 && hd % 32 != 0 {
             return Err(ModelError::Shape(format!(
                 "make_kv_cache: --kv-dtype mxfp8 требует head_dim % 32 == 0 (hd={hd})"
             )));
         }
-        let kv_dt = if mxfp8 { DType::MXFP8 } else { self.dtype };
         let ring_ok = self.ring_kv_ok();
         let mut layers = Vec::with_capacity(self.blocks.len());
         for l in 0..self.blocks.len() {
@@ -1024,6 +1077,11 @@ impl DecoderModel {
                         Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
                         _ => max_seq,
                     };
+                    // Послойно: MXFP8 достаётся только слоям, чей путь чтения —
+                    // flash_attention_mxfp8kv. Sliding-слои и любой слой без
+                    // flash остаются в compute-dtype.
+                    let mxfp8 = allow_mxfp8 && self.layer_kv_mxfp8(l);
+                    let kv_dt = if mxfp8 { DType::MXFP8 } else { self.dtype };
                     let k = Tensor::zeros(vec![batch, n_kv, cap, hd], kv_dt, self.device).coerr()?;
                     let v = Tensor::zeros(vec![batch, n_kv, cap, hd], kv_dt, self.device).coerr()?;
                     let (k_scale, v_scale) = if mxfp8 {
@@ -1279,7 +1337,9 @@ impl DecoderModel {
         let batch = input_ids.dims()[0];
         let s = input_ids.dims()[1];
         let dev = self.device;
-        let mut kv = self.make_kv_cache(batch, s)?;
+        // Энкодерный проход читает KV через sdpa/flash-window, не через
+        // mxfp8kv-ядро → кэш всегда плотный, даже если политика модели MXFP8.
+        let mut kv = self.make_kv_cache_ext(batch, s, false)?;
 
         // key-padding bias [1,S]: 0 для valid, MASK_NEG для pad → broadcast_add к
         // causal-маске [s,s] внутри FullAttn (scaled_dot_attention бродкастит [s,s]
@@ -1740,8 +1800,22 @@ impl FullAttn {
         let flash_eligible =
             self.use_flash && self.sliding_window.is_none() && pad_bias.is_none();
         let _core_dev = device;
+        // Квант KV — по фактическому dtype буфера слоя, а не по политике модели:
+        // `make_kv_cache` держит MXFP8 только там, где кэш читает
+        // flash_attention_mxfp8kv (full-attention + flash). Sliding-слои того же
+        // прогона плотные, и ветка ниже для них — обычный `kv_append`.
+        let kv_mxfp8 = kv.k.dtype() == DType::MXFP8;
         let attn = prof(_core_dev, "attn_core", || -> Result<Tensor, ModelError> {
-        Ok(if flash_eligible && kv_dtype == DType::MXFP8 {
+        Ok(if kv_mxfp8 {
+            if !flash_eligible {
+                return Err(ModelError::Forward(format!(
+                    "MXFP8 KV читается только flash-ядром (causal, без окна и key-padding): \
+                     use_flash={} sliding={:?} pad_bias={}",
+                    self.use_flash,
+                    self.sliding_window,
+                    pad_bias.is_some()
+                )));
+            }
             let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kv;
             kc.kv_append_quant_mxfp8_inplace(ksc.as_mut().unwrap(), &k, past).coerr()?;
             vc.kv_append_quant_mxfp8_inplace(vsc.as_mut().unwrap(), &v, past).coerr()?;
@@ -1800,7 +1874,7 @@ impl FullAttn {
                 && flash_eligible
                 && self.sliding_window.is_none()
                 && matches!(device, Device::Cuda(_))
-                && matches!(kv_dtype, DType::F16 | DType::BF16)
+                && matches!(kv.k.dtype(), DType::F16 | DType::BF16)
                 && matches!(hd, 64 | 128 | 256)
             {
                 let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device).coerr()?;
@@ -1848,7 +1922,7 @@ impl FullAttn {
                 Some(a) => a,
                 None => {
                     if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
-                        eprintln!("[ATTN_FALLBACK] s={s} att_len={att_len} hd={hd} nh={nh} nkv={nkv} flash_eligible={flash_eligible} kv_dtype={kv_dtype:?} sw={:?}", self.sliding_window);
+                        eprintln!("[ATTN_FALLBACK] s={s} att_len={att_len} hd={hd} nh={nh} nkv={nkv} flash_eligible={flash_eligible} kv_dtype={kv_dtype:?} kv_buf={:?} sw={:?}", kv.k.dtype(), self.sliding_window);
                     }
                     let k_rep = repeat_kv(&k_total, group).coerr()?;
                     let v_rep = repeat_kv(&v_total, group).coerr()?;

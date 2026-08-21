@@ -388,6 +388,16 @@ impl LlmPipeline {
         }
     }
 
+    fn kv_fixed_bytes(&self, batch: usize, max_seq: usize) -> usize {
+        match self {
+            Self::Qwen3(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Hybrid(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Llama(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Gemma3(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::MuseGlimmer(p) => p.model.kv_fixed_bytes(batch, max_seq),
+        }
+    }
+
     fn generate_streaming_media(
         &self,
         prompt_ids: &[u32],
@@ -699,6 +709,17 @@ impl Llm {
         self.pipeline
             .lock()
             .map(|p| p.kv_bytes_per_token())
+            .unwrap_or(0)
+    }
+
+    /// VRAM под KV-слои постоянного размера (ring-окно sliding-слоёв) — их нет
+    /// в ставке [`Self::kv_bytes_per_token`], но при аллокации кэша они
+    /// занимают память. Бюджет контекста должен вычитать эту величину, иначе
+    /// на sliding-моделях он завышен ровно на размер окон.
+    pub fn kv_fixed_bytes(&self, max_seq: usize) -> usize {
+        self.pipeline
+            .lock()
+            .map(|p| p.kv_fixed_bytes(1, max_seq))
             .unwrap_or(0)
     }
 
