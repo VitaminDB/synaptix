@@ -33,6 +33,50 @@ fn interp(x: f64, xp_len: usize, fp: &[f64]) -> f64 {
     fp[lo] * (1.0 - frac) + fp[hi] * frac
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PlanStep {
+    pub convert_alpha: f32,
+    pub convert_sigma: f32,
+    pub first_order: bool,
+    pub ca: f32,
+    pub cb: f32,
+    pub cc: f32,
+    pub r0_inv: f32,
+}
+
+pub fn apply_plan_step(
+    p: &PlanStep,
+    eps: &Tensor,
+    sample: &Tensor,
+    prev: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    let m0 = sample
+        .mul_scalar(p.convert_alpha)
+        .and_then(|a| {
+            let b = eps.mul_scalar(p.convert_sigma)?;
+            a.sub(&b)
+        })
+        .map_err(err)?;
+    let mut x = sample
+        .mul_scalar(p.ca)
+        .and_then(|a| {
+            let b = m0.mul_scalar(p.cb)?;
+            a.add(&b)
+        })
+        .map_err(err)?;
+    if !p.first_order {
+        let m1 = prev.ok_or_else(|| {
+            VibeVoiceError::Inference("plan: второй порядок без предыдущего выхода".into())
+        })?;
+        let d1 = m0
+            .sub(m1)
+            .and_then(|d| d.mul_scalar(p.r0_inv))
+            .map_err(err)?;
+        x = x.add(&d1.mul_scalar(p.cc).map_err(err)?).map_err(err)?;
+    }
+    Ok((x, m0))
+}
+
 pub struct DpmSolverMultistep {
     sigmas_train: Vec<f64>,
     num_train_timesteps: usize,
@@ -169,6 +213,40 @@ impl DpmSolverMultistep {
         }
         self.step_index += 1;
         Ok(prev)
+    }
+
+    pub fn plan(&mut self, num_inference_steps: usize) -> Vec<PlanStep> {
+        self.set_timesteps(num_inference_steps);
+        let last = self.timesteps.len() - 1;
+        let mut out = Vec::with_capacity(self.timesteps.len());
+        for i in 0..=last {
+            let (alpha_i, sigma_i) = Self::alpha_sigma(self.sigmas[i]);
+            let (alpha_t, sigma_t) = Self::alpha_sigma(self.sigmas[i + 1]);
+            let (alpha_s0, sigma_s0) = Self::alpha_sigma(self.sigmas[i]);
+            let lambda_t = alpha_t.ln() - sigma_t.ln();
+            let lambda_s0 = alpha_s0.ln() - sigma_s0.ln();
+            let h = lambda_t - lambda_s0;
+            let base = alpha_t * ((-h).exp() - 1.0);
+            let first_order = i == 0 || i == last;
+            let (cc, r0_inv) = if first_order {
+                (0.0, 0.0)
+            } else {
+                let (alpha_s1, sigma_s1) = Self::alpha_sigma(self.sigmas[i - 1]);
+                let lambda_s1 = alpha_s1.ln() - sigma_s1.ln();
+                let h0 = lambda_s0 - lambda_s1;
+                (-0.5 * base, h / h0)
+            };
+            out.push(PlanStep {
+                convert_alpha: alpha_i as f32,
+                convert_sigma: sigma_i as f32,
+                first_order,
+                ca: (sigma_t / sigma_s0) as f32,
+                cb: (-base) as f32,
+                cc: cc as f32,
+                r0_inv: r0_inv as f32,
+            });
+        }
+        out
     }
 
     pub fn reset(&mut self) {

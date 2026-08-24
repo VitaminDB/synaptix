@@ -374,6 +374,15 @@ pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage
     let stream = crate::device::cuda::alloc_stream(ord)?;
     let buf = match crate::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
         Ok(b) => b,
+        Err(e) if crate::device::cuda::graph_capturing() => {
+            if std::env::var("SYN_CAPTURE_BT").is_ok() {
+                eprintln!("[CAPTURE_BT] alloc_zeros({n_bytes}): {e:?}\n{}",
+                    std::backtrace::Backtrace::force_capture());
+            }
+            return Err(SynaptixError::Cuda(format!(
+                "alloc_zeros({n_bytes}) под graph capture: {e:?}"
+            )));
+        }
         Err(_) => {
             // OOM: пул async-аллокатора держит освобождённые блоки (фрагментация)
             // — вернуть их драйверу (trim) и повторить, как CudaBackend::alloc_*.

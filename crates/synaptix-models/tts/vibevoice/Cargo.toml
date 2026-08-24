@@ -19,6 +19,7 @@ synaptix-bundle    = { workspace = true }
 synaptix-config    = { workspace = true }
 synaptix-audio     = { workspace = true }
 synaptix-io        = { workspace = true }
+synaptix-infer     = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

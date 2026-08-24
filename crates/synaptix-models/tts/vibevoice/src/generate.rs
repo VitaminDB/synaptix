@@ -2,9 +2,10 @@ use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 
 use crate::config::GenerationConfig;
+use crate::graph::{graphs_enabled, SamplerGraph};
 use crate::model::VibeVoiceModel;
 use crate::processor::{PromptEncoding, VibeVoiceProcessor};
-use crate::schedule::DpmSolverMultistep;
+use crate::schedule::{apply_plan_step, DpmSolverMultistep, PlanStep};
 use crate::{err, Result, VibeVoiceError};
 
 pub struct NormalRng {
@@ -63,6 +64,44 @@ impl NormalRng {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn sample_latent_plan(
+    model: &VibeVoiceModel,
+    plan: &[PlanStep],
+    timesteps: &[f32],
+    cond: &Tensor,
+    cfg_scale: f32,
+    batch: usize,
+    init_noise: &Tensor,
+) -> Result<Tensor> {
+    let mut x = init_noise.clone();
+    let mut prev: Option<Tensor> = None;
+    for (i, p) in plan.iter().enumerate() {
+        let combined = Tensor::cat(&[&x, &x], 0).map_err(err)?;
+        let ts = vec![timesteps[i]; batch * 2];
+        let temb = model.head.time_embeddings(&ts)?;
+        let eps = model.head.forward_with_temb(&combined, &temb, cond)?;
+        let guided = guide(&eps, cfg_scale, batch)?;
+        let (next, m0) = apply_plan_step(p, &guided, &x, prev.as_ref())?;
+        x = next;
+        prev = Some(m0);
+    }
+    Ok(x)
+}
+
+pub fn guide(eps: &Tensor, cfg_scale: f32, batch: usize) -> Result<Tensor> {
+    let cond_eps = eps.narrow(0, 0, batch).and_then(|t| t.contiguous()).map_err(err)?;
+    let uncond_eps = eps
+        .narrow(0, batch, batch)
+        .and_then(|t| t.contiguous())
+        .map_err(err)?;
+    cond_eps
+        .sub(&uncond_eps)
+        .and_then(|d| d.mul_scalar(cfg_scale))
+        .and_then(|d| d.add(&uncond_eps))
+        .map_err(err)
+}
+
 pub struct GenerationOutput {
     pub audio: Vec<f32>,
     pub tokens: Vec<i64>,
@@ -74,6 +113,7 @@ pub struct SpeechGenerator<'a> {
     processor: &'a VibeVoiceProcessor,
     scheduler: DpmSolverMultistep,
     rng: NormalRng,
+    sampler_graph: Option<SamplerGraph>,
 }
 
 impl<'a> SpeechGenerator<'a> {
@@ -95,6 +135,7 @@ impl<'a> SpeechGenerator<'a> {
             model,
             processor,
             rng,
+            sampler_graph: None,
         })
     }
 
@@ -207,32 +248,32 @@ impl<'a> SpeechGenerator<'a> {
         steps: usize,
         init_noise: &Tensor,
     ) -> Result<Tensor> {
-        self.scheduler.set_timesteps(steps);
         let condition = Tensor::cat(&[positive, negative], 0).map_err(err)?;
         let cond = self.model.head.project_condition(&condition)?;
-        let mut x = init_noise.clone();
-        let batch = x.dims()[0];
-        let timesteps = self.scheduler.timesteps.clone();
-        for t in timesteps {
-            let combined = Tensor::cat(&[&x, &x], 0).map_err(err)?;
-            let ts = vec![t; batch * 2];
-            let eps = self
-                .model
-                .head
-                .forward_projected(&combined, &ts, &cond)?;
-            let cond_eps = eps.narrow(0, 0, batch).and_then(|t| t.contiguous()).map_err(err)?;
-            let uncond_eps = eps
-                .narrow(0, batch, batch)
-                .and_then(|t| t.contiguous())
-                .map_err(err)?;
-            let guided = cond_eps
-                .sub(&uncond_eps)
-                .and_then(|d| d.mul_scalar(cfg_scale))
-                .and_then(|d| d.add(&uncond_eps))
-                .map_err(err)?;
-            x = self.scheduler.step(&guided, &x)?;
+        let batch = init_noise.dims()[0];
+        if graphs_enabled() && matches!(self.model.device, synaptix_core::device::Device::Cuda(_)) {
+            let need_build = !self
+                .sampler_graph
+                .as_ref()
+                .is_some_and(|g| g.matches(batch, steps, cfg_scale));
+            if need_build {
+                match SamplerGraph::build(self.model, &mut self.scheduler, batch, steps, cfg_scale) {
+                    Ok(g) => self.sampler_graph = Some(g),
+                    Err(e) => {
+                        if std::env::var("SYN_VV_GRAPH_DEBUG").is_ok() {
+                            eprintln!("[vv-graph] build failed: {e}");
+                        }
+                        self.sampler_graph = None;
+                    }
+                }
+            }
+            if let Some(g) = self.sampler_graph.as_mut() {
+                return g.run(init_noise, &cond);
+            }
         }
-        Ok(x)
+        let plan = self.scheduler.plan(steps);
+        let timesteps = self.scheduler.timesteps.clone();
+        sample_latent_plan(self.model, &plan, &timesteps, &cond, cfg_scale, batch, init_noise)
     }
 
     #[allow(clippy::too_many_arguments)]

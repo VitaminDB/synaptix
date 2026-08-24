@@ -228,3 +228,31 @@ fn reduce_offset_view_matches_cpu() {
         "mean_keepdim со смещением",
     );
 }
+
+#[test]
+fn copy_from_view_over_larger_buffer() {
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    if !have_gpu() {
+        return;
+    }
+    let src = Tensor::from_vec(det(0xA11CE, 4 * 64), vec![4usize, 64], Device::Cpu)
+        .unwrap()
+        .to_device(Device::Cuda(0))
+        .unwrap();
+    let view = src.narrow(0, 0, 2).unwrap().contiguous().unwrap();
+    assert!(view.is_contiguous(), "narrow по ведущей оси даёт contiguous-вью");
+
+    let mut dst = Tensor::zeros(vec![2usize, 64], DType::F32, Device::Cuda(0)).unwrap();
+    dst.copy_from(&view).expect("copy_from вью в меньший буфер");
+
+    let want = host(&view);
+    let got = host(&dst);
+    close(&got, &want, 0.0, "copy_from вью");
+
+    let mut tail = Tensor::zeros(vec![2usize, 64], DType::F32, Device::Cuda(0)).unwrap();
+    let view_tail = src.narrow(0, 2, 2).unwrap();
+    tail.copy_from(&view_tail).expect("copy_from вью со смещением");
+    let want_tail: Vec<f32> = host(&src)[2 * 64..].to_vec();
+    close(&host(&tail), &want_tail, 0.0, "copy_from вью со смещением");
+}

@@ -50,6 +50,15 @@ impl Backend for CudaBackend {
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let buf = match synaptix_core::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
             Ok(b) => b,
+            Err(e) if synaptix_core::device::cuda::graph_capturing() => {
+                if std::env::var("SYN_CAPTURE_BT").is_ok() {
+                    eprintln!("[CAPTURE_BT] backend alloc_zeros({n_bytes}): {e:?}\n{}",
+                        std::backtrace::Backtrace::force_capture());
+                }
+                return Err(SynaptixError::Cuda(format!(
+                    "alloc_zeros({n_bytes}) под graph capture: {e:?}"
+                )));
+            }
             Err(_) => {
                 // OOM: пул async-аллокатора держит освобождённые блоки (фрагментация)
                 // — вернуть их драйверу (cuMemPoolTrimTo→0) и повторить. Спасает
@@ -102,6 +111,11 @@ impl Backend for CudaBackend {
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let buf = match unsafe { synaptix_core::device::cuda::alloc_act_uninit::<u8>(&stream, n_bytes) } {
             Ok(b) => b,
+            Err(e) if synaptix_core::device::cuda::graph_capturing() => {
+                return Err(SynaptixError::Cuda(format!(
+                    "alloc_uninit({n_bytes}) под graph capture: {e:?}"
+                )));
+            }
             Err(_) => {
                 // см. alloc_zeros: sync ВСЕХ стримов до trim, иначе pending-frees не видны
                 let _ = synaptix_core::device::cuda::synchronize_all(ord);
@@ -156,20 +170,33 @@ impl Backend for CudaBackend {
         let src_lo = src.1;
         let dst_lo = dst.1;
         // Быстрый путь: contiguous src без offset + contiguous dst → raw dtod memcpy.
+        // Только когда буферы совпадают по длине: memcpy_dtod копирует слайсы
+        // ЦЕЛИКОМ, а contiguous-вью может смотреть в буфер большего размера
+        // (narrow по ведущей оси даёт offset 0 и contiguous strides).
         if src_lo.is_contiguous() && src_lo.offset() == 0 && dst_lo.is_contiguous() {
             let src_buf = src
                 .0
                 .as_cuda()
                 .ok_or(SynaptixError::Unsupported("cuda copy: src non-cuda"))?;
-            let dst_buf = dst
-                .0
-                .as_cuda_mut()
-                .ok_or(SynaptixError::Unsupported("cuda copy: dst non-cuda"))?;
-            let stream = synaptix_core::device::cuda::compute_stream_for(src_buf.stream(), src_buf.ordinal())?;
-            stream
-                .memcpy_dtod(src_buf.slice(), dst_buf.slice_mut())
-                .map_err(|e| SynaptixError::Cuda(format!("memcpy_dtod: {e:?}")))?;
-            return Ok(());
+            let same_len = src_buf.slice().len()
+                == dst
+                    .0
+                    .as_cuda()
+                    .map(|b| b.slice().len())
+                    .unwrap_or(usize::MAX);
+            if same_len {
+                let ord = src_buf.ordinal();
+                let src_stream = src_buf.stream().clone();
+                let dst_buf = dst
+                    .0
+                    .as_cuda_mut()
+                    .ok_or(SynaptixError::Unsupported("cuda copy: dst non-cuda"))?;
+                let stream = synaptix_core::device::cuda::compute_stream_for(&src_stream, ord)?;
+                stream
+                    .memcpy_dtod(src_buf.slice(), dst_buf.slice_mut())
+                    .map_err(|e| SynaptixError::Cuda(format!("memcpy_dtod: {e:?}")))?;
+                return Ok(());
+            }
         }
         // Общий путь (используется `Tensor::contiguous()` на permuted/narrowed
         // тензорах): strided gather из src → contiguous write в dst. dst обязан

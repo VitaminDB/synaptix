@@ -8,30 +8,50 @@ use crate::{err, Result};
 #[derive(Default)]
 pub struct StreamingCache {
     states: Vec<Option<Tensor>>,
+    reallocated: bool,
 }
 
 impl StreamingCache {
     pub fn new(slots: usize) -> Self {
         Self {
             states: vec![None; slots],
+            reallocated: false,
         }
+    }
+
+    pub fn begin_pass(&mut self) {
+        self.reallocated = false;
+    }
+
+    pub fn was_stable(&self) -> bool {
+        !self.reallocated
     }
 
     pub fn get(&self, id: usize) -> Option<&Tensor> {
         self.states.get(id).and_then(|s| s.as_ref())
     }
 
-    pub fn set(&mut self, id: usize, state: Tensor) {
+    pub fn store(&mut self, id: usize, state: &Tensor) -> Result<()> {
         if id >= self.states.len() {
             self.states.resize(id + 1, None);
         }
-        self.states[id] = Some(state);
+        let reusable = self.states[id]
+            .as_ref()
+            .is_some_and(|b| b.dims() == state.dims() && b.dtype() == state.dtype());
+        if reusable {
+            let buf = self.states[id].as_mut().expect("slot");
+            return buf.copy_from(state).map_err(err);
+        }
+        self.reallocated = true;
+        self.states[id] = Some(state.contiguous().map_err(err)?);
+        Ok(())
     }
 
     pub fn zero_all(&mut self) -> Result<()> {
         for slot in self.states.iter_mut() {
             if let Some(t) = slot {
-                *t = t.zeros_like().map_err(err)?;
+                let z = Tensor::zeros(t.dims().to_vec(), t.dtype(), t.device()).map_err(err)?;
+                t.copy_from(&z).map_err(err)?;
             }
         }
         Ok(())
@@ -203,9 +223,11 @@ impl SConv1d {
         } else {
             x.contiguous().map_err(err)?
         };
+        drop(cached);
         let out = self.apply(&combined)?;
         if self.context_size > 0 {
-            cache.set(self.id, tail(&combined, self.context_size)?);
+            let next = tail(&combined, self.context_size)?;
+            cache.store(self.id, &next)?;
         }
         Ok(out)
     }
@@ -280,7 +302,11 @@ impl SConvTranspose1d {
         let cached = cache.get(self.id).cloned();
         let had_cache = cached.as_ref().map(|c| c.dims()[2] > 0).unwrap_or(false);
         let combined = match cached {
-            Some(c) if c.dims()[2] > 0 => Tensor::cat(&[&c, &xc], 2).map_err(err)?,
+            Some(c) if c.dims()[2] > 0 => {
+                let joined = Tensor::cat(&[&c, &xc], 2).map_err(err)?;
+                drop(c);
+                joined
+            }
             _ => xc,
         };
         let full = self.apply(&combined)?;
@@ -298,7 +324,8 @@ impl SConvTranspose1d {
                 full
             }
         };
-        cache.set(self.id, tail(&combined, self.context_size)?);
+        let next = tail(&combined, self.context_size)?;
+        cache.store(self.id, &next)?;
         Ok(out)
     }
 }

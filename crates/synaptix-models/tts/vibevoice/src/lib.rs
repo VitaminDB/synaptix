@@ -1,6 +1,7 @@
 pub mod config;
 pub mod conv;
 pub mod generate;
+pub mod graph;
 pub mod head;
 pub mod loader;
 pub mod model;

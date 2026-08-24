@@ -151,25 +151,39 @@ impl DiffusionHead {
         self.forward_projected(noisy, timesteps, &cond)
     }
 
+    pub fn time_embeddings(&self, timesteps: &[f32]) -> Result<Tensor> {
+        let dtype = self.noisy_proj.dtype();
+        let device = self.noisy_proj.device();
+        let tfreq = self.timestep_embedding(timesteps, device, dtype)?;
+        tfreq
+            .linear(&self.t_mlp0)
+            .and_then(|t| t.silu())
+            .and_then(|t| t.linear(&self.t_mlp2))
+            .map_err(err)
+    }
+
     pub fn forward_projected(
         &self,
         noisy: &Tensor,
         timesteps: &[f32],
         cond: &Tensor,
     ) -> Result<Tensor> {
+        let temb = self.time_embeddings(timesteps)?;
+        self.forward_with_temb(noisy, &temb, cond)
+    }
+
+    pub fn forward_with_temb(
+        &self,
+        noisy: &Tensor,
+        temb: &Tensor,
+        cond: &Tensor,
+    ) -> Result<Tensor> {
         let dtype = self.noisy_proj.dtype();
-        let device = self.noisy_proj.device();
         let x = noisy
             .to_dtype(dtype)
             .and_then(|t| t.linear(&self.noisy_proj))
             .map_err(err)?;
-        let tfreq = self.timestep_embedding(timesteps, device, dtype)?;
-        let temb = tfreq
-            .linear(&self.t_mlp0)
-            .and_then(|t| t.silu())
-            .and_then(|t| t.linear(&self.t_mlp2))
-            .map_err(err)?;
-        let c = cond.broadcast_add(&temb).map_err(err)?;
+        let c = cond.broadcast_add(temb).map_err(err)?;
         let c_act = c.silu().map_err(err)?;
 
         let mut h = x;

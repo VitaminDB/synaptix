@@ -288,6 +288,32 @@ fn cfg_sampling_matches_reference() {
 }
 
 #[test]
+fn sampler_graph_matches_eager() {
+    let Some(fx) = setup() else { return };
+    if !matches!(fx.device, Device::Cuda(_)) {
+        return;
+    }
+    let pos = fx.reference.tensor("cfg_pos", fx.device);
+    let neg = fx.reference.tensor("cfg_neg", fx.device);
+    let init_full = fx.reference.tensor("cfg_init_noise", fx.device);
+    let batch = pos.dims()[0];
+    let init = init_full.narrow(0, 0, batch).unwrap().contiguous().unwrap();
+
+    synaptix_tts_vibevoice::graph::set_graphs_enabled(false);
+    let mut eager_gen = SpeechGenerator::new(&fx.model, &fx.processor, 0).expect("generator");
+    let eager = host(&eager_gen.sample_latent(&pos, &neg, 1.3, 20, &init).expect("eager"));
+
+    synaptix_tts_vibevoice::graph::set_graphs_enabled(true);
+    let mut graph_gen = SpeechGenerator::new(&fx.model, &fx.processor, 0).expect("generator");
+    let first = host(&graph_gen.sample_latent(&pos, &neg, 1.3, 20, &init).expect("graph 1"));
+    let second = host(&graph_gen.sample_latent(&pos, &neg, 1.3, 20, &init).expect("graph 2"));
+    synaptix_tts_vibevoice::graph::set_graphs_enabled(false);
+
+    report("cuda-graph vs eager", &first, &eager, 0.999_999);
+    assert_eq!(first, second, "повторный replay графа обязан быть детерминирован");
+}
+
+#[test]
 fn prompt_tokens_match_reference() {
     let Some(fx) = setup() else { return };
     let want = fx.reference.ids("prompt_input_ids");
