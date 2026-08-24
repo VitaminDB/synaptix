@@ -20,6 +20,27 @@ fn det_bf16(seed: u64, n: usize, scale: f32) -> Vec<bf16> {
         .collect()
 }
 
+fn gemv_bf16_view(
+    kernels: &MmaGemvKernels,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    w: &cudarc::driver::CudaView<bf16>,
+    x: &cudarc::driver::CudaView<bf16>,
+    y: &mut cudarc::driver::CudaViewMut<bf16>,
+    n: u32,
+    k: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let cfg = LaunchConfig {
+        grid_dim: (n, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(kernels.bf16_fn());
+    b.arg(w).arg(x).arg(&mut *y).arg(&n).arg(&k);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
 fn bytes_of(v: &[bf16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for b in v {
@@ -52,6 +73,11 @@ fn main() {
         ("qwen7_qo    ", 3584, 3584),
         ("qwen7_gate  ", 18944, 3584),
         ("lm_head     ", 151936, 1536),
+        ("vae_ffn1_2048", 8192, 2048),
+        ("vae_ffn2_2048", 2048, 8192),
+        ("vae_ffn1_1024", 4096, 1024),
+        ("vae_ffn2_1024", 1024, 4096),
+        ("vae_pixshuf1 ", 8192, 4096),
     ];
 
     {
@@ -92,6 +118,49 @@ fn main() {
             stream.synchronize().unwrap();
             let raw_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
             println!("{:<14}{:>8}{:>8}{:>12.2}{:>12.2}", name, n, k, tensor_us, raw_us);
+        }
+        println!();
+    }
+
+    {
+        println!("== холодные веса (ротация копий > L2) ==");
+        println!("{:<14}{:>8}{:>8}{:>10}{:>10}{:>9}", "shape", "N", "K", "M", "us/call", "GB/s");
+        for &(name, n, k) in &[("qwen2_gate  ", 8960u32, 1536u32), ("head_adaln  ", 4608, 1536)] {
+            let wbytes = (n as usize) * (k as usize) * 2;
+            let copies = (768 * 1024 * 1024 / wbytes).clamp(2, 40);
+            let mut ws: Vec<CudaSlice<u8>> = Vec::with_capacity(copies);
+            for _ in 0..copies {
+                ws.push(stream.alloc_zeros(wbytes).unwrap());
+            }
+            for m in [1u32, 2, 4] {
+                let x_host = bytes_of(&det_bf16(0xC0DE, (m as usize) * (k as usize), 0.5));
+                let x: CudaSlice<u8> = stream.clone_htod(&x_host).unwrap();
+                let mut y: CudaSlice<u8> =
+                    stream.alloc_zeros((m as usize) * (n as usize) * 2).unwrap();
+                let run = |i: usize, y: &mut CudaSlice<u8>| {
+                    if m == 1 {
+                        let wv = unsafe { ws[i].transmute::<bf16>(wbytes / 2).unwrap() };
+                        let xv = unsafe { x.transmute::<bf16>(k as usize).unwrap() };
+                        let mut yv = unsafe { y.transmute_mut::<bf16>(n as usize).unwrap() };
+                        gemv_bf16_view(&gemv, &stream, &wv, &xv, &mut yv, n, k).unwrap();
+                    } else {
+                        best_gemm_bf16_linear_u8(&gemm, &stream, &ws[i], &x, y, n, k, m, None, None)
+                            .unwrap();
+                    }
+                };
+                for i in 0..warmup as usize {
+                    run(i % copies, &mut y);
+                }
+                stream.synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                for i in 0..iters as usize {
+                    run(i % copies, &mut y);
+                }
+                stream.synchronize().unwrap();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                let gbps = wbytes as f64 / (us * 1e3);
+                println!("{:<14}{:>8}{:>8}{:>10}{:>10.2}{:>10.1}", name, n, k, m, us, gbps);
+            }
         }
         println!();
     }

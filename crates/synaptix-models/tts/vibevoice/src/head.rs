@@ -71,12 +71,13 @@ impl HeadLayer {
         let parts = chunk_last(&m, 3)?;
         let h = rms_norm(x, &self.norm, eps).map_err(err)?;
         let h = modulate(&h, &parts[0], &parts[1])?;
-        let gate = h.linear(&self.gate_proj).and_then(|t| t.silu()).map_err(err)?;
+        let gate = h.linear(&self.gate_proj).map_err(err)?;
         let up = h.linear(&self.up_proj).map_err(err)?;
-        let ffn = gate
-            .mul(&up)
-            .and_then(|t| t.linear(&self.down_proj))
-            .map_err(err)?;
+        let act = match gate.silu_and_mul(&up) {
+            Ok(t) => t,
+            Err(_) => gate.silu().and_then(|g| g.mul(&up)).map_err(err)?,
+        };
+        let ffn = act.linear(&self.down_proj).map_err(err)?;
         if let Ok(out) = x.fused_gate_residual(&ffn, &parts[2]) {
             return Ok(out);
         }

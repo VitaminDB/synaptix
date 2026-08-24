@@ -7,19 +7,24 @@ use crate::conv::{ConvIds, SConv1d, SConvTranspose1d, StreamingCache};
 use crate::loader::WeightSource;
 use crate::{err, Result, VibeVoiceError};
 
-fn conv_rms(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    let t = x
-        .transpose(1, 2)
-        .and_then(|t| t.contiguous())
-        .map_err(err)?;
-    let n = rms_norm(&t, weight, eps).map_err(err)?;
-    n.transpose(1, 2).and_then(|t| t.contiguous()).map_err(err)
+fn to_channels_last(x: &Tensor) -> Result<Tensor> {
+    x.transpose(1, 2).and_then(|t| t.contiguous()).map_err(err)
 }
 
-fn scale_channels(x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
-    let c = gamma.dims()[0];
-    let g = gamma.reshape(vec![1usize, c, 1usize]).map_err(err)?;
-    x.broadcast_mul(&g).map_err(err)
+fn to_channels_first(x: &Tensor) -> Result<Tensor> {
+    x.transpose(1, 2).and_then(|t| t.contiguous()).map_err(err)
+}
+
+fn gated_residual(residual: &Tensor, h: &Tensor, gamma: Option<&Tensor>) -> Result<Tensor> {
+    let Some(g) = gamma else {
+        return residual.add(h).map_err(err);
+    };
+    if let Ok(out) = residual.fused_gate_residual(h, g) {
+        return Ok(out);
+    }
+    residual
+        .add(&h.broadcast_mul(g).map_err(err)?)
+        .map_err(err)
 }
 
 struct Ffn {
@@ -41,12 +46,10 @@ impl Ffn {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = x
-            .linear(&self.w1)
-            .and_then(|t| t.broadcast_add(&self.b1))
+            .linear_bias_residual(&self.w1, Some(&self.b1), None)
             .and_then(|t| t.gelu_exact())
             .map_err(err)?;
-        h.linear(&self.w2)
-            .and_then(|t| t.broadcast_add(&self.b2))
+        h.linear_bias_residual(&self.w2, Some(&self.b2), None)
             .map_err(err)
     }
 }
@@ -96,34 +99,18 @@ impl Block {
     }
 
     fn forward(&self, x: &Tensor, cache: Option<&mut StreamingCache>) -> Result<Tensor> {
-        let residual = x.clone();
-        let h = conv_rms(x, &self.norm, self.eps)?;
+        let h = rms_norm(x, &self.norm, self.eps).map_err(err)?;
+        let h = to_channels_first(&h)?;
         let h = match cache {
             Some(c) => self.mixer.forward_streaming(&h, c)?,
             None => self.mixer.forward(&h)?,
         };
-        let h = match &self.gamma {
-            Some(g) => scale_channels(&h, g)?,
-            None => h,
-        };
-        let x = residual.add(&h).map_err(err)?;
+        let h = to_channels_last(&h)?;
+        let x = gated_residual(x, &h, self.gamma.as_ref())?;
 
-        let residual = x.clone();
-        let h = conv_rms(&x, &self.ffn_norm, self.eps)?;
-        let h = h
-            .permute(vec![0usize, 2, 1])
-            .and_then(|t| t.contiguous())
-            .map_err(err)?;
+        let h = rms_norm(&x, &self.ffn_norm, self.eps).map_err(err)?;
         let h = self.ffn.forward(&h)?;
-        let h = h
-            .permute(vec![0usize, 2, 1])
-            .and_then(|t| t.contiguous())
-            .map_err(err)?;
-        let h = match &self.ffn_gamma {
-            Some(g) => scale_channels(&h, g)?,
-            None => h,
-        };
-        residual.add(&h).map_err(err)
+        gated_residual(&x, &h, self.ffn_gamma.as_ref())
     }
 }
 
@@ -189,9 +176,14 @@ impl TokenizerEncoder {
                 Some(c) => down.forward_streaming(&h, c)?,
                 None => down.forward(&h)?,
             };
-            for block in &self.stages[i] {
-                h = block.forward(&h, cache.as_deref_mut())?;
+            if self.stages[i].is_empty() {
+                continue;
             }
+            let mut b = to_channels_last(&h)?;
+            for block in &self.stages[i] {
+                b = block.forward(&b, cache.as_deref_mut())?;
+            }
+            h = to_channels_first(&b)?;
         }
         match cache.as_deref_mut() {
             Some(c) => self.head.forward_streaming(&h, c),
@@ -278,9 +270,14 @@ impl TokenizerDecoder {
                 (UpLayer::Trans(c), Some(cc)) => c.forward_streaming(&h, cc)?,
                 (UpLayer::Trans(c), None) => c.forward(&h)?,
             };
-            for block in &self.stages[i] {
-                h = block.forward(&h, cache.as_deref_mut())?;
+            if self.stages[i].is_empty() {
+                continue;
             }
+            let mut b = to_channels_last(&h)?;
+            for block in &self.stages[i] {
+                b = block.forward(&b, cache.as_deref_mut())?;
+            }
+            h = to_channels_first(&b)?;
         }
         match cache.as_deref_mut() {
             Some(c) => self.head.forward_streaming(&h, c),

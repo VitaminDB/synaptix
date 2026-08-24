@@ -231,22 +231,19 @@ impl Qwen2Model {
         let scale = 1.0f32 / (hd as f32).sqrt();
 
         let q = h
-            .linear(&a.q_w)
-            .and_then(|t| t.broadcast_add(&a.q_b))
+            .linear_bias_residual(&a.q_w, Some(&a.q_b), None)
             .and_then(|t| t.reshape(vec![1usize, s, nh, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
             .map_err(err)?;
         let k = h
-            .linear(&a.k_w)
-            .and_then(|t| t.broadcast_add(&a.k_b))
+            .linear_bias_residual(&a.k_w, Some(&a.k_b), None)
             .and_then(|t| t.reshape(vec![1usize, s, nkv, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
             .map_err(err)?;
         let v = h
-            .linear(&a.v_w)
-            .and_then(|t| t.broadcast_add(&a.v_b))
+            .linear_bias_residual(&a.v_w, Some(&a.v_b), None)
             .and_then(|t| t.reshape(vec![1usize, s, nkv, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
@@ -287,9 +284,113 @@ impl Qwen2Model {
 
     fn mlp(&self, layer_idx: usize, h: &Tensor) -> Result<Tensor> {
         let m = &self.layers[layer_idx].mlp;
-        let gate = h.linear(&m.gate).and_then(|t| t.silu()).map_err(err)?;
+        let gate = h.linear(&m.gate).map_err(err)?;
         let up = h.linear(&m.up).map_err(err)?;
-        gate.mul(&up).and_then(|t| t.linear(&m.down)).map_err(err)
+        let act = match gate.silu_and_mul(&up) {
+            Ok(t) => t,
+            Err(_) => gate.silu().and_then(|g| g.mul(&up)).map_err(err)?,
+        };
+        act.linear(&m.down).map_err(err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_pair(
+        &self,
+        layer_idx: usize,
+        h: &Tensor,
+        cache_a: &mut KvCache,
+        cache_b: &mut KvCache,
+    ) -> Result<Tensor> {
+        let layer = &self.layers[layer_idx];
+        let a = &layer.attn;
+        let nh = self.cfg.num_attention_heads;
+        let nkv = self.cfg.num_key_value_heads;
+        let hd = self.cfg.head_dim();
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        let proj = |w: &Tensor, b: &Tensor, heads: usize| -> Result<Tensor> {
+            h.linear_bias_residual(w, Some(b), None)
+                .and_then(|t| t.reshape(vec![2usize, 1, heads, hd]))
+                .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
+                .and_then(|t| t.contiguous())
+                .map_err(err)
+        };
+        let q = proj(&a.q_w, &a.q_b, nh)?;
+        let k = proj(&a.k_w, &a.k_b, nkv)?;
+        let v = proj(&a.v_w, &a.v_b, nkv)?;
+
+        let mut outs: Vec<Tensor> = Vec::with_capacity(2);
+        for slot in 0..2usize {
+            let cache = if slot == 0 { &mut *cache_a } else { &mut *cache_b };
+            let past = cache.len;
+            let qi = q.narrow(0, slot, 1).and_then(|t| t.contiguous()).map_err(err)?;
+            let ki = k.narrow(0, slot, 1).and_then(|t| t.contiguous()).map_err(err)?;
+            let vi = v.narrow(0, slot, 1).and_then(|t| t.contiguous()).map_err(err)?;
+            let qi = apply_rope_range(&qi, &self.rope, past, 1, RopeLayout::Split).map_err(err)?;
+            let ki = apply_rope_range(&ki, &self.rope, past, 1, RopeLayout::Split).map_err(err)?;
+            cache.k[layer_idx].kv_append_inplace(&ki, past).map_err(err)?;
+            cache.v[layer_idx].kv_append_inplace(&vi, past).map_err(err)?;
+            let total = past + 1;
+            let k_all = cache.k[layer_idx].narrow(2, 0, total).map_err(err)?;
+            let v_all = cache.v[layer_idx].narrow(2, 0, total).map_err(err)?;
+            let attn = match qi.flash_attention(&k_all, &v_all, scale, true) {
+                Ok(o) => o,
+                Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
+                    let group = nh / nkv;
+                    let kr = repeat_kv(&k_all, group)?;
+                    let vr = repeat_kv(&v_all, group)?;
+                    scaled_dot_attention(&qi, &kr, &vr, scale, None).map_err(err)?
+                }
+                Err(e) => return Err(err(e)),
+            };
+            outs.push(attn);
+        }
+        let merged = Tensor::cat(&[&outs[0], &outs[1]], 0).map_err(err)?;
+        merged
+            .permute(vec![0usize, 2, 1, 3])
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.reshape(vec![2usize, 1, nh * hd]))
+            .and_then(|t| t.linear(&a.o_w))
+            .map_err(err)
+    }
+
+    pub fn forward_pair(
+        &self,
+        x_a: &Tensor,
+        x_b: &Tensor,
+        cache_a: &mut KvCache,
+        cache_b: &mut KvCache,
+    ) -> Result<(Tensor, Tensor)> {
+        if cache_a.len + 1 > cache_a.cap || cache_b.len + 1 > cache_b.cap {
+            return Err(VibeVoiceError::Inference("kv cache overflow (pair)".into()));
+        }
+        let eps = self.cfg.rms_norm_eps;
+        let hidden_size = self.cfg.hidden_size;
+        let a = x_a.to_dtype(self.dtype).and_then(|t| t.reshape(vec![1usize, 1, hidden_size])).map_err(err)?;
+        let b = x_b.to_dtype(self.dtype).and_then(|t| t.reshape(vec![1usize, 1, hidden_size])).map_err(err)?;
+        let mut hidden = Tensor::cat(&[&a, &b], 0).map_err(err)?;
+
+        for i in 0..self.layers.len() {
+            let residual = hidden.clone();
+            let h = rms_norm(&hidden, &self.layers[i].input_ln, eps).map_err(err)?;
+            let mixed = self.attention_pair(i, &h, cache_a, cache_b)?;
+            hidden = residual.add(&mixed).map_err(err)?;
+
+            let residual = hidden.clone();
+            let h = rms_norm(&hidden, &self.layers[i].post_ln, eps).map_err(err)?;
+            let m = self.mlp(i, &h)?;
+            hidden = residual.add(&m).map_err(err)?;
+        }
+        cache_a.len += 1;
+        cache_b.len += 1;
+        let hidden = rms_norm(&hidden, &self.final_norm, eps).map_err(err)?;
+        let ha = hidden.narrow(0, 0, 1).and_then(|t| t.contiguous()).map_err(err)?;
+        let hb = hidden.narrow(0, 1, 1).and_then(|t| t.contiguous()).map_err(err)?;
+        Ok((ha, hb))
+    }
+
+    pub fn rollback(&self, cache: &mut KvCache, n: usize) {
+        cache.len = cache.len.saturating_sub(n);
     }
 
     pub fn forward(&self, inputs_embeds: &Tensor, cache: &mut KvCache) -> Result<Tensor> {

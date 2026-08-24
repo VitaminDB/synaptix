@@ -23,6 +23,10 @@ pub struct MmaGemvKernels {
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<MmaGemvKernels>)>>> = OnceLock::new();
 
 impl MmaGemvKernels {
+    pub fn bf16_fn(&self) -> &CudaFunction {
+        &self.gemv_bf16
+    }
+
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
         let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
         let key = Arc::as_ptr(ctx) as usize;

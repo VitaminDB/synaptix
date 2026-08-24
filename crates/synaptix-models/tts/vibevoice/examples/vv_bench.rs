@@ -39,7 +39,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = model.lm.forward(&embed, &mut lm_cache)?;
     }
     sync(device);
-    println!("lm decode step: {:.2} ms", ms(t, iters));
+    println!("lm decode step (1 ветвь): {:.2} ms", ms(t, iters));
+
+    let mut lm_cache_b = model.lm.new_cache(512)?;
+    let warm_b = model.lm.embed_tokens(&[processor.speech_start_id])?;
+    let _ = model.lm.forward(&warm_b, &mut lm_cache_b)?;
+    let single = model.lm.embed_tokens(&[processor.speech_diffusion_id])?;
+    let _ = model
+        .lm
+        .forward_pair(&single, &single, &mut lm_cache, &mut lm_cache_b)?;
+    sync(device);
+    let t = Instant::now();
+    for _ in 0..iters {
+        let _ = model
+            .lm
+            .forward_pair(&single, &single, &mut lm_cache, &mut lm_cache_b)?;
+    }
+    sync(device);
+    println!("lm decode pair (2 ветви): {:.2} ms", ms(t, iters));
 
     let pos = Tensor::zeros(vec![1usize, hidden], dtype, device)?;
     let neg = Tensor::zeros(vec![1usize, hidden], dtype, device)?;

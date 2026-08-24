@@ -320,7 +320,6 @@ impl<'a> SpeechGenerator<'a> {
         let mut audio: Vec<f32> = Vec::new();
         let mut inputs_embeds: Option<Tensor> = None;
         let mut neg_pending_reset = true;
-        let mut neg_started = false;
         let mut reached_max = false;
         let vae_dim = model.config.acoustic_vae_dim();
 
@@ -329,17 +328,30 @@ impl<'a> SpeechGenerator<'a> {
                 reached_max = true;
                 break;
             }
-            let step_input = match &inputs_embeds {
-                Some(e) => e.clone(),
-                None => prompt_embeds.clone(),
+            if neg_pending_reset {
+                neg_cache.reset();
+                neg_pending_reset = false;
+            }
+            let (last_hidden, neg_candidate) = match &inputs_embeds {
+                None => {
+                    let hidden = model.lm.forward(&prompt_embeds, &mut pos_cache)?;
+                    let last = hidden.dims()[1] - 1;
+                    let h = hidden
+                        .narrow(1, last, 1)
+                        .and_then(|t| t.contiguous())
+                        .and_then(|t| t.reshape(vec![1usize, model.lm.hidden_size()]))
+                        .map_err(err)?;
+                    (h, None)
+                }
+                Some(e) => {
+                    let (ha, hb) =
+                        model.lm.forward_pair(e, e, &mut pos_cache, &mut neg_cache)?;
+                    let flat = |t: Tensor| -> Result<Tensor> {
+                        t.reshape(vec![1usize, model.lm.hidden_size()]).map_err(err)
+                    };
+                    (flat(ha)?, Some(flat(hb)?))
+                }
             };
-            let hidden = model.lm.forward(&step_input, &mut pos_cache)?;
-            let last = hidden.dims()[1] - 1;
-            let last_hidden = hidden
-                .narrow(1, last, 1)
-                .and_then(|t| t.contiguous())
-                .and_then(|t| t.reshape(vec![1usize, model.lm.hidden_size()]))
-                .map_err(err)?;
             let scores = last_hidden
                 .linear(&head_rows)
                 .and_then(|t| t.to_dtype(DType::F32))
@@ -354,6 +366,10 @@ impl<'a> SpeechGenerator<'a> {
             }
             let next_token = valid_ids[best];
             tokens.push(next_token);
+            let is_diffusion = next_token == proc.speech_diffusion_id;
+            if !is_diffusion && neg_candidate.is_some() {
+                model.lm.rollback(&mut neg_cache, 1);
+            }
 
             if let Some(cb) = on_step.as_deref_mut() {
                 cb(step + 1, max_steps);
@@ -372,28 +388,19 @@ impl<'a> SpeechGenerator<'a> {
 
             let mut next_embed = model.lm.embed_tokens(&[next_token])?;
 
-            if next_token == proc.speech_diffusion_id {
-                if neg_pending_reset {
-                    neg_cache.reset();
-                    neg_started = false;
-                    neg_pending_reset = false;
-                }
-                let neg_input = if !neg_started {
-                    neg_started = true;
-                    model.lm.embed_tokens(&[proc.speech_start_id])?
-                } else {
-                    match &inputs_embeds {
-                        Some(e) => e.clone(),
-                        None => model.lm.embed_tokens(&[proc.speech_start_id])?,
+            if is_diffusion {
+                let neg_last = match neg_candidate {
+                    Some(h) => h,
+                    None => {
+                        let ni = model.lm.embed_tokens(&[proc.speech_start_id])?;
+                        let nh = model.lm.forward(&ni, &mut neg_cache)?;
+                        let nlast = nh.dims()[1] - 1;
+                        nh.narrow(1, nlast, 1)
+                            .and_then(|t| t.contiguous())
+                            .and_then(|t| t.reshape(vec![1usize, model.lm.hidden_size()]))
+                            .map_err(err)?
                     }
                 };
-                let neg_hidden = model.lm.forward(&neg_input, &mut neg_cache)?;
-                let nlast = neg_hidden.dims()[1] - 1;
-                let neg_last = neg_hidden
-                    .narrow(1, nlast, 1)
-                    .and_then(|t| t.contiguous())
-                    .and_then(|t| t.reshape(vec![1usize, model.lm.hidden_size()]))
-                    .map_err(err)?;
 
                 let init = self.randn(vec![1usize, vae_dim])?;
                 let latent = self.sample_latent(
