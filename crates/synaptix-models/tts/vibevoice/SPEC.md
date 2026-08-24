@@ -1,0 +1,161 @@
+# VibeVoice — порт на synaptix
+
+Длинный многоголосый TTS (microsoft/VibeVoice): авторегрессионный Qwen2-LM
+управляет диффузионной головой, которая покадрово порождает акустические
+латенты; акустический σ-VAE стримингово декодирует их в звук 24 кГц, а
+семантический энкодер тем же шагом возвращает признаки обратно в LM.
+
+Источник истины — upstream `/home/master/Storage/VibeVoice` (`vibevoice/`),
+конвертация весов не требуется: имена тензоров в `.syn` совпадают с HF.
+
+## Компоненты и раскладка весов
+
+| Компонент | Префикс в чекпойнте | Файл порта |
+|---|---|---|
+| Qwen2-декодер (28 слоёв, GQA, qkv-bias) | `model.language_model.*`, `lm_head.weight` | `qwen2.rs` |
+| Акустический σ-VAE (энкодер + декодер) | `model.acoustic_tokenizer.*` | `vae.rs`, `conv.rs` |
+| Семантический энкодер | `model.semantic_tokenizer.*` | `vae.rs` |
+| Коннекторы латент → hidden | `model.{acoustic,semantic}_connector.*` | `vae.rs` |
+| Диффузионная голова (4 слоя, adaLN) | `model.prediction_head.*` | `head.rs` |
+| Скаляры нормировки латентов | `model.speech_{scaling,bias}_factor` | `model.rs` |
+
+`fix_std` (0.5) и `std_dist_type` живут только в `config.json` — в чекпойнте
+их нет (не-персистентный буфер).
+
+### σ-VAE
+
+Энкодер: stem `SConv1d(1→32, k7)` + 6 страйдовых свёрток по
+`reversed(encoder_ratios) = [2,2,4,5,5,8]` (суммарно ×3200 = один латентный
+кадр на 3200 сэмплов) и 7 стадий `Block1D` глубиной `3-3-3-3-3-3-8`.
+`Block1D` = ConvRMSNorm → depthwise `SConv1d(k7)` → `γ` → residual, затем
+ConvRMSNorm → FFN(4×, GELU, с bias) → `ffn_γ` → residual. Финальная норма
+выключена (`disable_last_norm`), голова — `SConv1d(2048→64, k7)`.
+
+Декодер зеркальный: stem `SConv1d(64→2048)`, 6 `SConvTranspose1d` по
+`decoder_ratios = [8,5,5,4,2,2]`, глубины — реверс энкодерных.
+
+Все свёртки причинные: `SConv1d` слева добивает `padding_total =
+(k-1)·dilation − (stride−1)` нулей, справа — `extra_padding` до кратности
+страйду; `SConvTranspose1d` срезает `k − stride` справа. В стриминге вместо
+padding'а используется кэш последних `context_size` отсчётов входа
+(`conv.rs::StreamingCache`, слоты нумеруются при сборке через `ConvIds`).
+
+### Диффузионная голова
+
+`x = noisy_images_proj(z)`, `c = cond_proj(hidden) + t_embedder(t)`; четыре
+`HeadLayer` с adaLN-модуляцией (`shift, scale, gate = Linear(silu(c))`) над
+SwiGLU-FFN (`ffn_dim = 3·hidden`), финальный слой — RMSNorm без веса +
+модуляция + `Linear(hidden→64)`. `t_embedder` — синусоидальные частоты
+(256, `max_period=10000`) → `Linear→SiLU→Linear` без bias.
+
+### Шедулер
+
+DPM-Solver++ multistep, порядок 2, `midpoint`, `final_sigmas_type=zero`,
+`timestep_spacing=linspace`, cosine-β. `alphas_cumprod` считается в f32 —
+как в torch, иначе σ расходятся на 0.1 (upstream кастует βs в float32 до
+кумпроизведения).
+
+## Промпт
+
+```
+<system> Voice input:\n Speaker 0:<vs>[<vp>×N]<ve>\n … Text input:\n Speaker 0: …\n Speech output:\n<vs>
+```
+
+`<vs>/<ve>/<vp>` = `<|vision_start|>` / `<|vision_end|>` / `<|vision_pad|>`
+(151652 / 151653 / 151654), pad = `<|image_pad|>` 151655, eos =
+`<|endoftext|>` 151643. Токенизатор — Qwen2.5 (`tokenizer.json` кладётся в
+бандл при упаковке; в HF-снапшоте VibeVoice его нет).
+
+Референсное аудио нормируется до −25 dBFS с защитой от клиппинга, кодируется
+акустическим энкодером, сэмплируется (`std = randn(B)·fix_std/0.8`),
+масштабируется `(z + bias)·scaling` и через `acoustic_connector` подставляется
+на позиции `<vp>`.
+
+## Генерация
+
+Ограниченный словарь: argmax только по `{speech_start, speech_end,
+speech_diffusion, eos}`. На каждом `speech_diffusion`:
+
+1. отдельная «негативная» ветвь LM даёт безусловный контекст для CFG;
+2. `sample_latent` — 20 шагов DPM-Solver++ с CFG по `(pos, neg)`;
+3. латент разнормируется, стримингово декодируется в 3200 сэмплов;
+4. чанк тут же кодируется семантическим энкодером;
+5. `acoustic_connector(latent) + semantic_connector(sem)` становится входом
+   следующего шага LM.
+
+`speech_end` обнуляет стриминговые кэши обоих VAE.
+
+### Негативная ветвь (важно)
+
+В upstream negative-ветвь ведёт собственный KV-кэш и `attention_mask` длиной
+`cache_len + 1`. На токене `speech_start` маска обнуляется целиком, кроме
+последней позиции — то есть **все** прошлые записи кэша выпадают, а
+`position_ids = cumsum(mask) − 1` даёт новой позиции 0. Копирование
+`k[-1] = k[0]` попадает в навсегда замаскированный слот и ни на что не
+влияет. Эквивалент: полный сброс кэша и счётчика позиций. Порт делает именно
+это (`generate.rs`, `neg_pending_reset`).
+
+Ветвь стартует с эмбеддинга `speech_start` и на каждом последующем
+диффузионном шаге получает тот же эмбеддинг, что и позитивная.
+
+Батч фиксирован B=1: сценарий озвучивается целиком одним прогоном.
+
+## Паритет
+
+`tests/parity.rs` (`SYN_VV_BUNDLE`, `SYN_VV_REF`) против дампов
+`reference/dump_components.py` (torch f32, sdpa):
+
+| Проба | cosine |
+|---|---|
+| acoustic encode / semantic encode | 1.0000 |
+| acoustic decode (полный / стриминг) | 0.99999 |
+| semantic streaming encode | 1.0000 |
+| diffusion head, коннекторы | 1.0000 |
+| LM hidden / logits / decode-шаг | 1.0000 |
+| CFG-сэмплинг 20 шагов | 1.0000 |
+| токены промпта, маски, нормировка аудио | побайтово |
+
+`tests/e2e.rs` (`SYN_VV_BUNDLE`, `SYN_VV_GEN_REF`) — полный `generate`
+против `reference/dump_generate.py` с `torch.randn`, подменённым на нули
+(`zero_noise: true` на нашей стороне): последовательность токенов совпадает
+побайтово (33/33 и 236/236 шагов), длина аудио — тоже, cosine по звучащим
+кадрам 0.9999.
+
+Замечание про длинный прогон: в zero-noise режиме модель уходит в тишину, и
+общий cosine по всей дорожке падает до 0.98 — но это сравнение цифрового
+нуля с −70 dBFS. Собственный шум эталона (sdpa vs eager, обе f32) на тех же
+кадрах даёт такой же разброс, поэтому гейт считает cosine только по кадрам с
+RMS > 1e-3.
+
+Независимая проверка: сгенерированная дорожка прогоняется через
+`synaptix transcribe` (whisper-large-v3-turbo) и распознаётся дословно.
+
+## Запуск гейтов
+
+```
+SYN_VV_BUNDLE=/run/media/storage/syn_models/vibevoice-1.5b.syn \
+SYN_VV_REF=/run/media/storage/tmp/vv_ref/components.safetensors \
+SYN_VV_GEN_REF=/run/media/storage/tmp/vv_ref/generate.safetensors \
+  cargo test -p synaptix-tts-vibevoice --release
+```
+
+Модель в фикстуре паритета грузится один раз (`OnceLock`), поэтому
+`--test-threads` ограничивать не нужно. Эталоны пересобираются скриптами из
+`reference/` под venv с torch+cu13 и transformers 4.51.3
+(`/home/master/Temp/LTX-2/.venv`), тяжёлые прогоны — под
+`systemd-run --user --scope -p MemoryMax=48G`.
+
+Профилировка компонентов: `cargo run -p synaptix-tts-vibevoice --release
+--example vv_bench -- <bundle.syn> [bf16|f16|f32]`.
+
+## Ограничения
+
+- Батч 1. Батчевая генерация из upstream (маски по сэмплам, сдвиги кэша для
+  не-диффузионных семплов) не портирована — она нужна только для пакетной
+  озвучки нескольких сценариев сразу.
+- Стриминг наружу есть на уровне колбэка (`synthesize_with`, `on_chunk`), но
+  без отдельного async-стримера.
+- Скорость упирается в общий для всего репозитория small-GEMM/GEMV путь
+  `synaptix-kernels-cuda` (~25-40 ГБ/с на весах): RTF ≈ 3.3 для 1.5B и ≈ 13
+  для 7B на RTX 5090 Laptop. Большие GEMM на той же карте дают 51 TFLOP/s,
+  так что потолок здесь не в модели.

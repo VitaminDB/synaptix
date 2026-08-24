@@ -9,6 +9,7 @@ pub mod h3;
 pub mod imagine;
 pub mod inspect;
 pub mod music;
+pub mod podcast;
 pub mod quantize;
 pub mod run;
 pub mod speak;

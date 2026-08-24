@@ -62,6 +62,7 @@ members = [
     "crates/synaptix-models/asr/nemo_streaming",
     "crates/synaptix-models/tts/qwen3_tts",
     "crates/synaptix-models/tts/omnivoice",
+    "crates/synaptix-models/tts/vibevoice",
     "crates/synaptix-models/tts/voxcpm",
     "crates/synaptix-models/tts/f5_tts",
     "crates/synaptix-models/tts/style_tts2",
@@ -256,6 +257,7 @@ synaptix-asr-gigaam   = { path = "crates/synaptix-models/asr/gigaam" }
 synaptix-embedding-bge-m3 = { path = "crates/synaptix-models/embedding/bge_m3" }
 synaptix-diarization-sortformer = { path = "crates/synaptix-models/diarization/sortformer" }
 synaptix-tts-omnivoice = { path = "crates/synaptix-models/tts/omnivoice" }
+synaptix-tts-vibevoice = { path = "crates/synaptix-models/tts/vibevoice" }
 
 
 [profile.release]

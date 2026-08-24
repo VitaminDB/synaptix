@@ -213,17 +213,29 @@ pub fn run_conv2d_implicit_nhwc_u8(
             let bias_v = match bias {
                 Some(b) => unsafe { b.slice(..nbias * esz).transmute::<$t>(nbias) }
                     .ok_or(SynaptixError::Cuda("implicit_conv: transmute bias".into()))?,
-                None => unsafe { input.slice(input_off..input_off + nbias * esz).transmute::<$t>(nbias) }.unwrap(),
+                None => {
+                    let dummy = nbias.min(n_in);
+                    unsafe { input.slice(input_off..input_off + dummy * esz).transmute::<$t>(dummy) }
+                        .ok_or(SynaptixError::Cuda("implicit_conv: dummy bias slice".into()))?
+                }
             };
             let res_v = match residual {
                 Some(r) => unsafe { r.slice(..n_out * esz).transmute::<$t>(n_out) }
                     .ok_or(SynaptixError::Cuda("implicit_conv: transmute residual".into()))?,
-                None => unsafe { input.slice(input_off..input_off + n_in.min(n_out) * esz).transmute::<$t>(n_in.min(n_out)) }.unwrap(),
+                None => {
+                    let dummy = n_in.min(n_out);
+                    unsafe { input.slice(input_off..input_off + dummy * esz).transmute::<$t>(dummy) }
+                        .ok_or(SynaptixError::Cuda("implicit_conv: dummy residual slice".into()))?
+                }
             };
             let temb_v = match temb {
                 Some(t) => unsafe { t.slice(..ntemb * esz).transmute::<$t>(ntemb) }
                     .ok_or(SynaptixError::Cuda("implicit_conv: transmute temb".into()))?,
-                None => unsafe { input.slice(input_off..input_off + ntemb.min(n_in) * esz).transmute::<$t>(ntemb.min(n_in)) }.unwrap(),
+                None => {
+                    let dummy = ntemb.min(n_in);
+                    unsafe { input.slice(input_off..input_off + dummy * esz).transmute::<$t>(dummy) }
+                        .ok_or(SynaptixError::Cuda("implicit_conv: dummy temb slice".into()))?
+                }
             };
             let hb: i32 = if bias.is_some() { 1 } else { 0 };
             let hr: i32 = if residual.is_some() { 1 } else { 0 };

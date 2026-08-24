@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
-    bench, chat, convert, diff, h3, imagine, inspect, music, quantize, run as run_cmd, speak,
+    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd,
+    speak,
     train, transcribe, video,
 };
 
@@ -272,6 +273,40 @@ enum Commands {
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
+    },
+    /// Многоголосый длинный синтез (VibeVoice): SCRIPT → WAV (24 кГц).
+    Podcast {
+        /// Бандл vibevoice-1.5b.syn / vibevoice-7b.syn.
+        bundle: PathBuf,
+        /// Сценарий: строки вида "Speaker 1: текст". Без префикса — Speaker 1.
+        script: Option<String>,
+        /// Файл со сценарием (.txt) вместо позиционного SCRIPT.
+        #[arg(long)]
+        script_file: Option<PathBuf>,
+        #[arg(short, long, default_value = "podcast.wav")]
+        output: PathBuf,
+        /// Аудио-референс голоса (wav|mp3|ogg|flac). Повторяется по одному на спикера.
+        #[arg(long = "voice")]
+        voices: Vec<PathBuf>,
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// Compute dtype: cpu→f32, cuda→bf16 по умолчанию; f32|f16|bf16.
+        #[arg(long)]
+        compute_dtype: Option<String>,
+        /// Classifier-free guidance диффузионной головы.
+        #[arg(long, default_value_t = 1.3)]
+        cfg: f32,
+        /// Число шагов DPM-Solver++ на один акустический кадр.
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Потолок числа шагов = max_length_times × длина промпта.
+        #[arg(long, default_value_t = 2.0)]
+        max_length_times: f32,
+        /// Детерминированный прогон без шума (для сверки с эталоном).
+        #[arg(long, default_value_t = false)]
+        zero_noise: bool,
     },
     /// Генерация музыки по тексту (ACE-Step v1.5): CAPTION → WAV (48 кГц).
     Music {
@@ -771,6 +806,13 @@ fn main() -> ExitCode {
         } => speak::run(speak::SpeakArgs {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,
             cfg, steps, seed, max_len,
+        }),
+        Commands::Podcast {
+            bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
+            max_length_times, zero_noise,
+        } => podcast::run(podcast::PodcastArgs {
+            bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
+            max_length_times, zero_noise,
         }),
         Commands::Music {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
