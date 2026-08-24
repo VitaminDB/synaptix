@@ -332,6 +332,42 @@ MOD_ROWB_KERNEL(mod_rowb_f32,  float,         4, f32_to_f32,  f32_from_f32)
 MOD_ROWB_KERNEL(mod_rowb_f16,  __half,        8, f16_to_f32,  f16_from_f32)
 MOD_ROWB_KERNEL(mod_rowb_bf16, __nv_bfloat16, 8, bf16_to_f32, bf16_from_f32)
 
+#define MOD_FLAT_KERNEL(name, T, VEC_N, to_f32, from_f32) \
+extern "C" __global__ void name( \
+    const T* __restrict__ x, const T* __restrict__ s, const T* __restrict__ sh, \
+    T* __restrict__ out, long long numel, long long x_off, long long s_off, long long sh_off \
+) { \
+    x += x_off; s += s_off; sh += sh_off; \
+    long long i = ((long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x) * VEC_N; \
+    if (i + VEC_N <= numel) { \
+        uint4 xv = *reinterpret_cast<const uint4*>(x + i); \
+        uint4 sv = *reinterpret_cast<const uint4*>(s + i); \
+        uint4 shv = *reinterpret_cast<const uint4*>(sh + i); \
+        T xe[VEC_N], se[VEC_N], she[VEC_N], oe[VEC_N]; \
+        *reinterpret_cast<uint4*>(xe) = xv; \
+        *reinterpret_cast<uint4*>(se) = sv; \
+        *reinterpret_cast<uint4*>(she) = shv; \
+        _Pragma("unroll") \
+        for (int k = 0; k < VEC_N; ++k) { \
+            float s1 = to_f32(from_f32(1.0f + to_f32(se[k]))); \
+            float t1 = to_f32(from_f32(to_f32(xe[k]) * s1)); \
+            oe[k] = from_f32(t1 + to_f32(she[k])); \
+        } \
+        *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<uint4*>(oe); \
+    } else { \
+        for (; i < numel; ++i) { \
+            float s1 = to_f32(from_f32(1.0f + to_f32(s[i]))); \
+            float t1 = to_f32(from_f32(to_f32(x[i]) * s1)); \
+            out[i] = from_f32(t1 + to_f32(sh[i])); \
+        } \
+    } \
+}
+
+MOD_FLAT_KERNEL(mod_flat_f32,  float,         4, f32_to_f32,  f32_from_f32)
+MOD_FLAT_KERNEL(mod_flat_f16,  __half,        8, f16_to_f32,  f16_from_f32)
+MOD_FLAT_KERNEL(mod_flat_bf16, __nv_bfloat16, 8, bf16_to_f32, bf16_from_f32)
+
+
 // Flat-unary (in/out contiguous): 16Б-вектор, та же f32-математика → бит-в-бит
 // с generic (gelu/sigmoid/affine на [*,16384] душились strided-ядром).
 #define UNARY_FLAT_KERNEL(name, T, VEC_N, to_f32, from_f32) \

@@ -37,6 +37,9 @@ pub struct ReduceKernels {
     reduce_f32: CudaFunction,
     reduce_f16: CudaFunction,
     reduce_bf16: CudaFunction,
+    reduce_rows_f32: CudaFunction,
+    reduce_rows_f16: CudaFunction,
+    reduce_rows_bf16: CudaFunction,
     argmax_f32: CudaFunction,
     argmax_f16: CudaFunction,
     argmax_bf16: CudaFunction,
@@ -62,6 +65,9 @@ impl ReduceKernels {
             reduce_f32: load_fn(&module, "reduce_f32")?,
             reduce_f16: load_fn(&module, "reduce_f16")?,
             reduce_bf16: load_fn(&module, "reduce_bf16")?,
+            reduce_rows_f32: load_fn(&module, "reduce_rows_f32")?,
+            reduce_rows_f16: load_fn(&module, "reduce_rows_f16")?,
+            reduce_rows_bf16: load_fn(&module, "reduce_rows_bf16")?,
             argmax_f32: load_fn(&module, "argmax_f32")?,
             argmax_f16: load_fn(&module, "argmax_f16")?,
             argmax_bf16: load_fn(&module, "argmax_bf16")?,
@@ -78,6 +84,70 @@ fn launch_cfg(numel: i64) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (grid.min(u32::MAX as u64) as u32, 1, 1),
         block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+static ROWS_PATH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static ROWS_PATH_INIT: OnceLock<()> = OnceLock::new();
+
+pub fn set_reduce_rows_enabled(on: bool) {
+    ROWS_PATH_INIT.get_or_init(|| ());
+    ROWS_PATH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn rows_path_enabled() -> bool {
+    ROWS_PATH_INIT.get_or_init(|| {
+        if matches!(std::env::var("SYN_REDUCE_ROWS").as_deref(), Ok("0")) {
+            ROWS_PATH.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ROWS_PATH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn trailing_contiguous_reduce(
+    src_lo: &Layout,
+    dims_reduced: &[usize],
+) -> Option<(i64, i64)> {
+    if !src_lo.is_contiguous() {
+        return None;
+    }
+    let rank = src_lo.dims().len();
+    let n = dims_reduced.len();
+    if n == 0 || n > rank {
+        return None;
+    }
+    let mut axes: Vec<usize> = dims_reduced.to_vec();
+    axes.sort_unstable();
+    axes.dedup();
+    if axes.len() != n {
+        return None;
+    }
+    for (i, &a) in axes.iter().enumerate() {
+        if a != rank - n + i {
+            return None;
+        }
+    }
+    let dims = src_lo.dims();
+    let inner: i64 = dims[rank - n..].iter().map(|d| *d as i64).product();
+    let rows: i64 = dims[..rank - n].iter().map(|d| *d as i64).product();
+    if inner <= 0 || rows <= 0 || rows > u32::MAX as i64 {
+        return None;
+    }
+    Some((rows, inner))
+}
+
+fn rows_launch_cfg(rows: i64, inner: i64) -> LaunchConfig {
+    let threads = if inner >= 8192 {
+        1024u32
+    } else if inner >= 1024 {
+        256u32
+    } else {
+        128u32
+    };
+    LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -161,6 +231,37 @@ pub fn run_reduce(
         return Err(SynaptixError::dtype_mismatch(dtype, dst_lo.dtype()));
     }
 
+    if !is_argmax && rows_path_enabled() {
+        if let Some((rows, inner)) = trailing_contiguous_reduce(src_lo, dims_reduced) {
+            let rows_func = match dtype {
+                DType::F32 => Some(&kernels.reduce_rows_f32),
+                DType::F16 => Some(&kernels.reduce_rows_f16),
+                DType::BF16 => Some(&kernels.reduce_rows_bf16),
+                _ => None,
+            };
+            if let Some(f) = rows_func {
+                let rcfg = rows_launch_cfg(rows, inner);
+                let opc = op_code(op);
+                let off = src_lo.offset() as i64;
+                unsafe {
+                    match dtype {
+                        DType::F32 => launch_reduce_rows::<f32>(
+                            &stream, f, src_buf, dst_buf, inner, off, opc, rcfg,
+                        )?,
+                        DType::F16 => launch_reduce_rows::<half::f16>(
+                            &stream, f, src_buf, dst_buf, inner, off, opc, rcfg,
+                        )?,
+                        DType::BF16 => launch_reduce_rows::<half::bf16>(
+                            &stream, f, src_buf, dst_buf, inner, off, opc, rcfg,
+                        )?,
+                        _ => unreachable!(),
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
     let func = if is_argmax {
         match dtype {
             DType::F32 => &kernels.argmax_f32,
@@ -193,6 +294,39 @@ pub fn run_reduce(
             }
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_reduce_rows<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    func: &CudaFunction,
+    src_buf: &CudaBuf,
+    dst_buf: &mut CudaBuf,
+    inner: i64,
+    in_offset: i64,
+    op_code: i32,
+    cfg: LaunchConfig,
+) -> Result<()> {
+    let elem = std::mem::size_of::<T>();
+    let src_v = src_buf.slice().as_view();
+    let src_t = src_v
+        .transmute::<T>(src_buf.slice().len() / elem)
+        .ok_or_else(|| SynaptixError::Cuda("reduce_rows: transmute src".into()))?;
+    let mut dst_v = dst_buf.slice_mut().as_view_mut();
+    let mut dst_t = dst_v
+        .transmute_mut::<T>(dst_v.len() / elem)
+        .ok_or_else(|| SynaptixError::Cuda("reduce_rows: transmute dst".into()))?;
+    let mut builder = stream.launch_builder(func);
+    builder
+        .arg(&src_t)
+        .arg(&mut dst_t)
+        .arg(&inner)
+        .arg(&in_offset)
+        .arg(&op_code);
+    builder
+        .launch(cfg)
+        .map_err(|e| SynaptixError::Cuda(format!("launch reduce_rows: {e:?}")))?;
     Ok(())
 }
 

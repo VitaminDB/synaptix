@@ -258,6 +258,7 @@ impl Backend for CudaBackend {
             0 => TernaryFusedKind::FmaFlat,
             1 => TernaryFusedKind::FmaRowb,
             2 => TernaryFusedKind::ModRowb,
+            3 => TernaryFusedKind::ModFlat,
             _ => return Err(SynaptixError::Unsupported("ternary fused: kind")),
         };
         crate::kernels::elementwise::run_ternary_fused(&kernels, k, x, b, c, dst)

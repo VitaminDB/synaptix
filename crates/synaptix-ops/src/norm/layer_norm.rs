@@ -11,8 +11,8 @@ pub fn layer_norm(
     // Fused backend-путь (CUDA: один kernel-launch на строку вместо ~12 decomposed-
     // ops + промежуточных аллокаций — критично для CUDA-graph decode). Требует
     // gamma (weight); inference-only (no-grad). На CPU/неподдержке/grad → decomposed.
-    if !synaptix_core::grad::is_grad_enabled() {
-        if let Some(w) = weight {
+    if let Some(w) = weight {
+        if !synaptix_core::grad::needs_graph(&[x, w]) {
             match x.layer_norm_fused(w, bias, eps) {
                 Ok(out) => return Ok(out),
                 Err(synaptix_core::error::SynaptixError::Unsupported(_))

@@ -101,6 +101,9 @@ pub struct ElementwiseKernels {
     mod_rowb_f32: CudaFunction,
     mod_rowb_f16: CudaFunction,
     mod_rowb_bf16: CudaFunction,
+    mod_flat_f32: CudaFunction,
+    mod_flat_f16: CudaFunction,
+    mod_flat_bf16: CudaFunction,
     cast_flat_f16_bf16: CudaFunction,
     cast_flat_bf16_f16: CudaFunction,
     cast_flat_f32_bf16: CudaFunction,
@@ -168,6 +171,9 @@ impl ElementwiseKernels {
             mod_rowb_f32: load_fn(&module, "mod_rowb_f32")?,
             mod_rowb_f16: load_fn(&module, "mod_rowb_f16")?,
             mod_rowb_bf16: load_fn(&module, "mod_rowb_bf16")?,
+            mod_flat_f32: load_fn(&module, "mod_flat_f32")?,
+            mod_flat_f16: load_fn(&module, "mod_flat_f16")?,
+            mod_flat_bf16: load_fn(&module, "mod_flat_bf16")?,
             cast_flat_f16_bf16: load_fn(&module, "cast_flat_f16_bf16")?,
             cast_flat_bf16_f16: load_fn(&module, "cast_flat_bf16_f16")?,
             cast_flat_f32_bf16: load_fn(&module, "cast_flat_f32_bf16")?,
@@ -649,6 +655,7 @@ pub enum TernaryFusedKind {
     FmaFlat,
     FmaRowb,
     ModRowb,
+    ModFlat,
 }
 
 pub fn run_ternary_fused(
@@ -693,6 +700,9 @@ pub fn run_ternary_fused(
         (TernaryFusedKind::ModRowb, DType::F32) => (&kernels.mod_rowb_f32, true),
         (TernaryFusedKind::ModRowb, DType::F16) => (&kernels.mod_rowb_f16, true),
         (TernaryFusedKind::ModRowb, _) => (&kernels.mod_rowb_bf16, true),
+        (TernaryFusedKind::ModFlat, DType::F32) => (&kernels.mod_flat_f32, false),
+        (TernaryFusedKind::ModFlat, DType::F16) => (&kernels.mod_flat_f16, false),
+        (TernaryFusedKind::ModFlat, _) => (&kernels.mod_flat_bf16, false),
     };
     match kind {
         TernaryFusedKind::FmaFlat => {
@@ -712,6 +722,13 @@ pub fn run_ternary_fused(
         TernaryFusedKind::ModRowb => {
             if !(row_ok(b_lo) && row_ok(c_lo) && d > 0 && d % vec_n == 0) {
                 return Err(SynaptixError::Unsupported("mod rowb: s/sh"));
+            }
+        }
+        TernaryFusedKind::ModFlat => {
+            if !(b_lo.is_contiguous() && aligned(b_lo) && b_lo.dims() == dst_lo.dims()
+                && c_lo.is_contiguous() && aligned(c_lo) && c_lo.dims() == dst_lo.dims())
+            {
+                return Err(SynaptixError::Unsupported("mod flat: s/sh"));
             }
         }
     }

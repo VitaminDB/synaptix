@@ -114,6 +114,10 @@ pub fn is_grad_enabled() -> bool {
     GRAD_ENABLED.with(|c| c.get())
 }
 
+pub fn needs_graph(inputs: &[&Tensor]) -> bool {
+    is_grad_enabled() && inputs.iter().any(|t| t.requires_grad())
+}
+
 pub struct NoGradGuard {
     prev: bool,
 }

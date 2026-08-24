@@ -19,6 +19,7 @@ thiserror     = { workspace = true }
 cudarc        = { workspace = true }
 
 [dev-dependencies]
+synaptix-autograd = { workspace = true }
 synaptix-kernels-cpu = { workspace = true }
 synaptix-ops = { workspace = true }
 half = { workspace = true }

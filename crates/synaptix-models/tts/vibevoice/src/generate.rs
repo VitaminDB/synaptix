@@ -209,13 +209,17 @@ impl<'a> SpeechGenerator<'a> {
     ) -> Result<Tensor> {
         self.scheduler.set_timesteps(steps);
         let condition = Tensor::cat(&[positive, negative], 0).map_err(err)?;
+        let cond = self.model.head.project_condition(&condition)?;
         let mut x = init_noise.clone();
         let batch = x.dims()[0];
         let timesteps = self.scheduler.timesteps.clone();
         for t in timesteps {
             let combined = Tensor::cat(&[&x, &x], 0).map_err(err)?;
             let ts = vec![t; batch * 2];
-            let eps = self.model.head.forward(&combined, &ts, &condition)?;
+            let eps = self
+                .model
+                .head
+                .forward_projected(&combined, &ts, &cond)?;
             let cond_eps = eps.narrow(0, 0, batch).and_then(|t| t.contiguous()).map_err(err)?;
             let uncond_eps = eps
                 .narrow(0, batch, batch)

@@ -1,0 +1,171 @@
+use cudarc::driver::CudaSlice;
+use half::bf16;
+
+use synaptix_kernels_cuda::best_cu::gemm::gemm_bf16::{
+    best_gemm_bf16_linear_u8, BestGemmBf16Kernels,
+};
+use synaptix_kernels_cuda::best_cu::gemv::mma_gemv::{gemv_bf16, MmaGemvKernels};
+
+fn det_bf16(seed: u64, n: usize, scale: f32) -> Vec<bf16> {
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    (0..n)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let u = (x >> 33) as u32;
+            let f = (u as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            bf16::from_f32(f * scale)
+        })
+        .collect()
+}
+
+fn bytes_of(v: &[bf16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for b in v {
+        out.extend_from_slice(&b.to_bits().to_le_bytes());
+    }
+    out
+}
+
+fn main() {
+    let ctx = synaptix_core::device::cuda::get(0).expect("cuda ctx");
+    let stream = synaptix_core::device::cuda::default_stream(0).expect("stream");
+    let gemv = MmaGemvKernels::for_context(&ctx).expect("gemv kernels");
+    let gemm = BestGemmBf16Kernels::for_context(&ctx).expect("gemm kernels");
+
+    let peak_gbps = std::env::var("PEAK_GBPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(896.0);
+    let iters = 300u32;
+    let warmup = 50u32;
+
+    let shapes: &[(&str, u32, u32)] = &[
+        ("tiny        ", 64, 64),
+        ("head_adaln  ", 4608, 1536),
+        ("head_ffn    ", 4608, 1536),
+        ("qwen2_qo    ", 1536, 1536),
+        ("qwen2_kv    ", 256, 1536),
+        ("qwen2_gate  ", 8960, 1536),
+        ("qwen2_down  ", 1536, 8960),
+        ("qwen7_qo    ", 3584, 3584),
+        ("qwen7_gate  ", 18944, 3584),
+        ("lm_head     ", 151936, 1536),
+    ];
+
+    {
+        use synaptix_core::device::Device;
+        use synaptix_core::dtype::DType;
+        use synaptix_core::tensor::Tensor;
+        synaptix_kernels_cuda::ensure_registered();
+        let dev = Device::Cuda(0);
+        println!("== Tensor::linear (обвязка) vs raw kernel ==");
+        println!("{:<14}{:>8}{:>8}{:>12}{:>12}", "shape", "N", "K", "tensor us", "raw us");
+        for &(name, n, k) in shapes {
+            let wt = Tensor::zeros(vec![n as usize, k as usize], DType::BF16, dev).unwrap();
+            let xt = Tensor::zeros(vec![1usize, 1, k as usize], DType::BF16, dev).unwrap();
+            for _ in 0..warmup {
+                let _ = xt.linear(&wt).unwrap();
+            }
+            stream.synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = xt.linear(&wt).unwrap();
+            }
+            stream.synchronize().unwrap();
+            let tensor_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+            let w_host = det_bf16(0xA110_C8E1, (n as usize) * (k as usize), 0.5);
+            let x_host = det_bf16(0xC0DE_BA5E, k as usize, 0.5);
+            let w: CudaSlice<bf16> = stream.clone_htod(&w_host).unwrap();
+            let x: CudaSlice<bf16> = stream.clone_htod(&x_host).unwrap();
+            let mut y: CudaSlice<bf16> = stream.alloc_zeros(n as usize).unwrap();
+            for _ in 0..warmup {
+                gemv_bf16(&gemv, &stream, &w, &x, &mut y, n, k).unwrap();
+            }
+            stream.synchronize().unwrap();
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters {
+                gemv_bf16(&gemv, &stream, &w, &x, &mut y, n, k).unwrap();
+            }
+            stream.synchronize().unwrap();
+            let raw_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{:<14}{:>8}{:>8}{:>12.2}{:>12.2}", name, n, k, tensor_us, raw_us);
+        }
+        println!();
+    }
+
+    println!("== M=1 (GEMV) ==");
+    println!(
+        "{:<14}{:>8}{:>8}{:>10}{:>10}{:>9}",
+        "shape", "N", "K", "us/call", "GB/s", "%peak"
+    );
+    for &(name, n, k) in shapes {
+        let w_host = det_bf16(0xA110_C8E1, (n as usize) * (k as usize), 0.5);
+        let x_host = det_bf16(0xC0DE_BA5E, k as usize, 0.5);
+        let w: CudaSlice<bf16> = stream.clone_htod(&w_host).unwrap();
+        let x: CudaSlice<bf16> = stream.clone_htod(&x_host).unwrap();
+        let mut y: CudaSlice<bf16> = stream.alloc_zeros(n as usize).unwrap();
+
+        for _ in 0..warmup {
+            gemv_bf16(&gemv, &stream, &w, &x, &mut y, n, k).unwrap();
+        }
+        stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gemv_bf16(&gemv, &stream, &w, &x, &mut y, n, k).unwrap();
+        }
+        stream.synchronize().unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let bytes = (n as f64) * (k as f64) * 2.0 + (k as f64) * 2.0 + (n as f64) * 2.0;
+        let gbps = bytes / (us * 1e3);
+        println!(
+            "{:<14}{:>8}{:>8}{:>10.2}{:>10.1}{:>8.1}%",
+            name,
+            n,
+            k,
+            us,
+            gbps,
+            100.0 * gbps / peak_gbps
+        );
+    }
+
+    for m in [2u32, 8, 64] {
+        println!("\n== M={m} (GEMM) ==");
+        println!(
+            "{:<14}{:>8}{:>8}{:>10}{:>10}{:>12}",
+            "shape", "N", "K", "us/call", "GB/s", "TFLOP/s"
+        );
+        for &(name, n, k) in shapes {
+            let w_host = bytes_of(&det_bf16(0xA110_C8E1, (n as usize) * (k as usize), 0.5));
+            let x_host = bytes_of(&det_bf16(0xC0DE_BA5E, (m as usize) * (k as usize), 0.5));
+            let w: CudaSlice<u8> = stream.clone_htod(&w_host).unwrap();
+            let x: CudaSlice<u8> = stream.clone_htod(&x_host).unwrap();
+            let mut y: CudaSlice<u8> =
+                stream.alloc_zeros((m as usize) * (n as usize) * 2).unwrap();
+
+            for _ in 0..warmup {
+                best_gemm_bf16_linear_u8(&gemm, &stream, &w, &x, &mut y, n, k, m, None, None)
+                    .unwrap();
+            }
+            stream.synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                best_gemm_bf16_linear_u8(&gemm, &stream, &w, &x, &mut y, n, k, m, None, None)
+                    .unwrap();
+            }
+            stream.synchronize().unwrap();
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let bytes = (n as f64) * (k as f64) * 2.0
+                + (m as f64) * (k as f64) * 2.0
+                + (m as f64) * (n as f64) * 2.0;
+            let gbps = bytes / (us * 1e3);
+            let tflops = 2.0 * (m as f64) * (n as f64) * (k as f64) / (us * 1e-6) / 1e12;
+            println!(
+                "{:<14}{:>8}{:>8}{:>10.2}{:>10.1}{:>12.2}",
+                name, n, k, us, gbps, tflops
+            );
+        }
+    }
+}

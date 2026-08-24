@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
 use synaptix_core::{
     error::{Result, SynaptixError},
     tensor::Tensor,
@@ -116,6 +119,39 @@ pub fn conv_transpose1d(
 /// For residue `sr` in `[0,S)`, `out[b,co,t*S+sr] = Σ_pp x[b,:,t-pp]·w[:,co,sr+pp*S]`,
 /// a Conv1d of size `P=⌈K/S⌉`. Stacking the S residues over `Cout·S` channels and
 /// interleaving (pixel-shuffle) reconstructs the full transposed output.
+type WcKey = (usize, Vec<usize>, usize);
+type WcEntry = (Weak<synaptix_core::tensor::storage::Storage>, Tensor);
+static WC_CACHE: OnceLock<Mutex<HashMap<WcKey, WcEntry>>> = OnceLock::new();
+
+fn cached_pixelshuffle_weight(weight: &Tensor, stride: usize) -> Result<Option<Tensor>> {
+    let key = (
+        Arc::as_ptr(&weight.storage_arc()) as usize,
+        weight.dims().to_vec(),
+        stride,
+    );
+    let cache = WC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(g) = cache.lock() else {
+        return Ok(None);
+    };
+    let Some((wk, t)) = g.get(&key) else {
+        return Ok(None);
+    };
+    if wk.upgrade().is_some_and(|s| Arc::as_ptr(&s) as usize == key.0) {
+        return Ok(Some(t.clone()));
+    }
+    Ok(None)
+}
+
+fn store_pixelshuffle_weight(weight: &Tensor, stride: usize, wc: &Tensor) {
+    let storage = weight.storage_arc();
+    let key = (Arc::as_ptr(&storage) as usize, weight.dims().to_vec(), stride);
+    let cache = WC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut g) = cache.lock() {
+        g.retain(|_, (wk, _)| wk.upgrade().is_some());
+        g.insert(key, (Arc::downgrade(&storage), wc.clone()));
+    }
+}
+
 fn convt1d_pixelshuffle(
     input: &Tensor,
     weight: &Tensor,
@@ -132,6 +168,9 @@ fn convt1d_pixelshuffle(
 
     // Rearranged Conv1d weight Wc: [Cout*S, Cin, P], cheap (weight-sized).
     //   Wc[co*S + sr, ci, pp] = w[ci, co, sr + (P-1-pp)*S]   (0 if index >= K)
+    if let Some(wc) = cached_pixelshuffle_weight(weight, s)? {
+        return convt1d_pixelshuffle_apply(input, &wc, b, c_out, k, s, p, padding);
+    }
     let mut p_slices: Vec<Tensor> = Vec::with_capacity(p);
     for pp in 0..p {
         let mut s_mats: Vec<Tensor> = Vec::with_capacity(s);
@@ -149,10 +188,24 @@ fn convt1d_pixelshuffle(
         p_slices.push(inter.reshape(vec![c_out * s, c_in, 1])?);
     }
     let refs: Vec<&Tensor> = p_slices.iter().collect();
-    let wc = Tensor::cat(&refs, 2)?; // [Cout*S, Cin, P]
+    let wc = Tensor::cat(&refs, 2)?.contiguous()?; // [Cout*S, Cin, P]
+    store_pixelshuffle_weight(weight, s, &wc);
+    convt1d_pixelshuffle_apply(input, &wc, b, c_out, k, s, p, padding)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn convt1d_pixelshuffle_apply(
+    input: &Tensor,
+    wc: &Tensor,
+    b: usize,
+    c_out: usize,
+    k: usize,
+    s: usize,
+    p: usize,
+    padding: usize,
+) -> Result<Tensor> {
     // Conv1d(stride 1, padding P-1) -> [B, Cout*S, L+P-1] (single tensor-core GEMM).
-    let conv = super::conv1d::conv1d_dilated(input, &wc, None, 1, p - 1, 1)?;
+    let conv = super::conv1d::conv1d_dilated(input, wc, None, 1, p - 1, 1)?;
     let lc = conv.dims()[2];
 
     // Pixel-shuffle: out[b,co,t*S+sr] = conv[b, co*S+sr, t].
@@ -162,7 +215,7 @@ fn convt1d_pixelshuffle(
         .contiguous()?
         .reshape(vec![b, c_out, lc * s])?;
 
-    let out_len_full = (l - 1) * s + k;
+    let out_len_full = (input.dims()[2] - 1) * s + k;
     let out_full = if lc * s > out_len_full {
         out_full.narrow(2, 0, out_len_full)?
     } else {
@@ -229,6 +282,27 @@ mod tests {
         assert_eq!(fast.dims(), refr.dims(), "shape c{c_in}/{c_out} k{k} s{s} l{l} p{pad}");
         for (i, (xa, xb)) in a.iter().zip(b.iter()).enumerate() {
             assert!((xa - xb).abs() < 1e-3, "idx{i}: {xa} vs {xb} (c{c_in}/{c_out} k{k} s{s} l{l} p{pad})");
+        }
+    }
+
+    #[test]
+    fn cached_weight_survives_repeat_calls() {
+        synaptix_kernels_cpu::ensure_registered();
+        let dev = Device::Cpu;
+        let (c_in, c_out, k, s, pad) = (4usize, 3usize, 6usize, 3usize, 2usize);
+        let w: Vec<f32> = (0..c_in * c_out * k).map(|i| ((i * 5 % 11) as f32) * 0.1 - 0.5).collect();
+        let wt = Tensor::from_vec(w, vec![c_in, c_out, k], dev).unwrap();
+        for l in [4usize, 9, 4, 17] {
+            let x: Vec<f32> = (0..c_in * l).map(|i| ((i * 7 % 13) as f32) * 0.1 - 0.6).collect();
+            let xt = Tensor::from_vec(x, vec![1, c_in, l], dev).unwrap();
+            let fast = conv_transpose1d(&xt, &wt, None, s, pad, 0, 1, 1).unwrap();
+            let refr = crate::conv::transposed::transposed_conv(&xt, &wt, None, s, pad).unwrap();
+            let a: Vec<f32> = fast.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let b: Vec<f32> = refr.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(fast.dims(), refr.dims(), "shape при L={l}");
+            for (i, (xa, xb)) in a.iter().zip(b.iter()).enumerate() {
+                assert!((xa - xb).abs() < 1e-3, "L={l} idx{i}: {xa} vs {xb}");
+            }
         }
     }
 

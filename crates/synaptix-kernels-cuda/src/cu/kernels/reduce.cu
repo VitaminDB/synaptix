@@ -25,6 +25,61 @@ __device__ __forceinline__ float pass_f32(float x) { return x; }
 __device__ __forceinline__ float pass_f16(__half x) { return __half2float(x); }
 __device__ __forceinline__ float pass_bf16(__nv_bfloat16 x) { return __bfloat162float(x); }
 
+
+#define ROWS_BLOCK_MAX 1024
+
+__device__ __forceinline__ float id_f32(float x) { return x; }
+
+__device__ __forceinline__ float rows_init(int op_code) {
+    return (op_code == 2) ? -3.4028235e38f : 0.0f;
+}
+
+__device__ __forceinline__ float rows_combine(int op_code, float a, float b) {
+    return (op_code == 2) ? fmaxf(a, b) : (a + b);
+}
+
+__device__ __forceinline__ float rows_block_reduce(int op_code, float acc) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc = rows_combine(op_code, acc, __shfl_xor_sync(0xFFFFFFFFu, acc, off));
+    }
+    __shared__ float part[ROWS_BLOCK_MAX / 32];
+    unsigned lane = threadIdx.x & 31u;
+    unsigned warp = threadIdx.x >> 5;
+    unsigned nwarps = (blockDim.x + 31u) >> 5;
+    if (lane == 0u) part[warp] = acc;
+    __syncthreads();
+    if (warp == 0u) {
+        acc = (lane < nwarps) ? part[lane] : rows_init(op_code);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc = rows_combine(op_code, acc, __shfl_xor_sync(0xFFFFFFFFu, acc, off));
+        }
+    }
+    return acc;
+}
+
+#define REDUCE_ROWS(NAME, T, TO_F32, FROM_F32)                                      \
+extern "C" __global__ void NAME(                                                    \
+    const T* __restrict__ in, T* __restrict__ out,                                  \
+    long long inner, long long in_offset, int op_code)                              \
+{                                                                                   \
+    const T* src = in + in_offset + (long long)blockIdx.x * inner;                  \
+    float acc = rows_init(op_code);                                                 \
+    for (long long j = (long long)threadIdx.x; j < inner; j += (long long)blockDim.x) { \
+        acc = rows_combine(op_code, acc, TO_F32(src[j]));                           \
+    }                                                                               \
+    acc = rows_block_reduce(op_code, acc);                                          \
+    if (threadIdx.x == 0u) {                                                        \
+        if (op_code == 1 && inner > 0) acc /= (float)inner;                         \
+        out[blockIdx.x] = FROM_F32(acc);                                            \
+    }                                                                               \
+}
+
+REDUCE_ROWS(reduce_rows_f32, float, pass_f32, id_f32)
+REDUCE_ROWS(reduce_rows_f16, __half, pass_f16, __float2half)
+REDUCE_ROWS(reduce_rows_bf16, __nv_bfloat16, pass_bf16, __float2bfloat16)
+
 extern "C" __global__ void reduce_f32(
     const float* __restrict__ in, float* __restrict__ out, ReduceParams p
 ) {

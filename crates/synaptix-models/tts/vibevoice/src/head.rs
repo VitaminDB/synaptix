@@ -9,7 +9,10 @@ use crate::{err, Result};
 const FREQ_EMBED_SIZE: usize = 256;
 const MAX_PERIOD: f64 = 10_000.0;
 
-fn rms_norm_plain(x: &Tensor, eps: f32) -> Result<Tensor> {
+fn rms_norm_plain(x: &Tensor, ones: &Tensor, eps: f32) -> Result<Tensor> {
+    if let Ok(out) = rms_norm(x, ones, eps) {
+        return Ok(out);
+    }
     let orig = x.dtype();
     let xf = x.to_dtype(DType::F32).map_err(err)?;
     let last = xf.rank() - 1;
@@ -21,6 +24,9 @@ fn rms_norm_plain(x: &Tensor, eps: f32) -> Result<Tensor> {
 }
 
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    if let Ok(out) = x.fused_mod_row(scale, shift) {
+        return Ok(out);
+    }
     let s = scale.affine(1.0, 1.0).map_err(err)?;
     x.broadcast_mul(&s)
         .and_then(|t| t.broadcast_add(shift))
@@ -71,6 +77,9 @@ impl HeadLayer {
             .mul(&up)
             .and_then(|t| t.linear(&self.down_proj))
             .map_err(err)?;
+        if let Ok(out) = x.fused_gate_residual(&ffn, &parts[2]) {
+            return Ok(out);
+        }
         x.add(&parts[2].mul(&ffn).map_err(err)?).map_err(err)
     }
 }
@@ -83,6 +92,7 @@ pub struct DiffusionHead {
     layers: Vec<HeadLayer>,
     final_linear: Tensor,
     final_adaln: Tensor,
+    final_ones: Tensor,
     eps: f32,
     pub latent_size: usize,
     pub hidden_size: usize,
@@ -102,6 +112,10 @@ impl DiffusionHead {
             layers,
             final_linear: src.get(&format!("{prefix}.final_layer.linear.weight"))?,
             final_adaln: src.get(&format!("{prefix}.final_layer.adaLN_modulation.1.weight"))?,
+            final_ones: {
+                let w = src.get(&format!("{prefix}.cond_proj.weight"))?;
+                Tensor::ones(vec![cfg.hidden_size], w.dtype(), w.device()).map_err(err)?
+            },
             eps: cfg.rms_norm_eps,
             latent_size: cfg.latent_size,
             hidden_size: cfg.hidden_size,
@@ -125,7 +139,24 @@ impl DiffusionHead {
             .map_err(err)
     }
 
+    pub fn project_condition(&self, condition: &Tensor) -> Result<Tensor> {
+        condition
+            .to_dtype(self.noisy_proj.dtype())
+            .and_then(|t| t.linear(&self.cond_proj))
+            .map_err(err)
+    }
+
     pub fn forward(&self, noisy: &Tensor, timesteps: &[f32], condition: &Tensor) -> Result<Tensor> {
+        let cond = self.project_condition(condition)?;
+        self.forward_projected(noisy, timesteps, &cond)
+    }
+
+    pub fn forward_projected(
+        &self,
+        noisy: &Tensor,
+        timesteps: &[f32],
+        cond: &Tensor,
+    ) -> Result<Tensor> {
         let dtype = self.noisy_proj.dtype();
         let device = self.noisy_proj.device();
         let x = noisy
@@ -138,10 +169,6 @@ impl DiffusionHead {
             .and_then(|t| t.silu())
             .and_then(|t| t.linear(&self.t_mlp2))
             .map_err(err)?;
-        let cond = condition
-            .to_dtype(dtype)
-            .and_then(|t| t.linear(&self.cond_proj))
-            .map_err(err)?;
         let c = cond.broadcast_add(&temb).map_err(err)?;
         let c_act = c.silu().map_err(err)?;
 
@@ -151,7 +178,7 @@ impl DiffusionHead {
         }
         let m = c_act.linear(&self.final_adaln).map_err(err)?;
         let parts = chunk_last(&m, 2)?;
-        let normed = rms_norm_plain(&h, self.eps)?;
+        let normed = rms_norm_plain(&h, &self.final_ones, self.eps)?;
         let modulated = modulate(&normed, &parts[0], &parts[1])?;
         modulated.linear(&self.final_linear).map_err(err)
     }

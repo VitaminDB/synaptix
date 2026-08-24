@@ -338,7 +338,7 @@ pub(crate) fn run_linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     // Быстрый backend-путь (CUDA: GEMV для M=1, CUTLASS Linear для M>1) — только
     // в no-grad (inference). На CPU/неподдержке backend вернёт Unsupported → fallback.
     // set_force_unfused_linear форсит общий matmul-путь.
-    if !grad::is_grad_enabled() && !force_unfused_linear() {
+    if !grad::needs_graph(&[x, w]) && !force_unfused_linear() {
         let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
         let w_c = if w.is_contiguous() { w.clone() } else { w.contiguous()? };
         let mut out_dims = x.dims()[..xr - 1].to_vec();
@@ -375,7 +375,11 @@ pub(crate) fn run_linear_epilogue(
     bias: Option<&Tensor>,
     residual: Option<&Tensor>,
 ) -> Result<Tensor> {
-    if !grad::is_grad_enabled() && !force_unfused_linear() {
+    let epilogue_inputs: Vec<&Tensor> = [Some(x), Some(w), bias, residual]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !grad::needs_graph(&epilogue_inputs) && !force_unfused_linear() {
         let xr = x.rank();
         if xr >= 1 && w.rank() == 2 {
             let k = x.dims()[xr - 1];
@@ -872,12 +876,17 @@ impl Tensor {
     /// broadcast-строки `[..,1,d]` (раунды как decomposed
     /// add_scalar→broadcast_mul→broadcast_add → бит-в-бит).
     pub fn fused_mod_row(&self, s: &Tensor, sh: &Tensor) -> Result<Tensor> {
+        let kind = if s.dims() == self.dims() && sh.dims() == self.dims() {
+            3u8
+        } else {
+            2u8
+        };
         let backend = registry::backend_for(self.device())?;
         let out_layout = Layout::contiguous(Shape::new(self.dims().to_vec()), self.dtype());
         let mut out_st = backend.alloc_uninit(self.dtype().bytes_for_numel(out_layout.numel()), self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.ternary_fused(
-            2,
+            kind,
             (&self.storage, &self.layout),
             (&s.storage, &s.layout),
             (&sh.storage, &sh.layout),
