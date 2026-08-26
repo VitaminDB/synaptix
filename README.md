@@ -1,5 +1,7 @@
 # synaptix
 
+[![Donate via PayPal](https://img.shields.io/badge/donate-PayPal-0070ba?logo=paypal&logoColor=white)](https://paypal.me/vitamindbnfkz)
+
 A native Rust engine for running and training neural networks — hand-written CUDA
 kernels compiled at runtime via NVRTC, with no PyTorch, no libtorch, and no Python
 runtime.
@@ -56,6 +58,10 @@ requires sm_120 (Blackwell).
 ## Status
 
 Young, single-author, and moving fast. The API is not stable; expect breaking changes.
+
+## Support
+
+synaptix is free and open source. If it is useful to you, you can support its development with a donation via [PayPal](https://paypal.me/vitamindbnfkz).
 
 ## License
 
