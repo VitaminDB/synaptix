@@ -123,6 +123,69 @@ fn main() {
     }
 
     {
+        use synaptix_core::device::Device;
+        use synaptix_core::dtype::DType;
+        use synaptix_core::tensor::Tensor;
+        use synaptix_ops::norm::rms_norm::rms_norm;
+        synaptix_kernels_cuda::ensure_registered();
+        let dev = Device::Cuda(0);
+        let h = 1536usize;
+        let m = Tensor::zeros(vec![2usize, 3 * h], DType::BF16, dev).unwrap();
+        let x = Tensor::zeros(vec![2usize, h], DType::BF16, dev).unwrap();
+        let w = Tensor::ones(vec![h], DType::BF16, dev).unwrap();
+        let n = 2000usize;
+
+        let chunk3 = || {
+            for i in 0..3 {
+                let _ = m.narrow(1, i * h, h).unwrap().contiguous().unwrap();
+            }
+        };
+        chunk3();
+        stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            chunk3();
+        }
+        stream.synchronize().unwrap();
+        let chunk_us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        let parts: Vec<Tensor> = (0..3)
+            .map(|i| m.narrow(1, i * h, h).unwrap().contiguous().unwrap())
+            .collect();
+        let one = || {
+            let nrm = rms_norm(&x, &w, 1e-5).unwrap();
+            let _ = nrm.fused_mod_row(&parts[1], &parts[0]).unwrap();
+        };
+        one();
+        stream.synchronize().unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..n {
+            one();
+        }
+        stream.synchronize().unwrap();
+        let rmsmod_us = t1.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        let only_rms = || {
+            let _ = rms_norm(&x, &w, 1e-5).unwrap();
+        };
+        only_rms();
+        stream.synchronize().unwrap();
+        let t2 = std::time::Instant::now();
+        for _ in 0..n {
+            only_rms();
+        }
+        stream.synchronize().unwrap();
+        let rms_us = t2.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        println!("== мелкие операции головы, [2,1536] bf16 ==");
+        println!("  chunk_last(m,3) = 3×(narrow+contiguous): {chunk_us:.2} мкс  ({:.2} мкс/копию)", chunk_us / 3.0);
+        println!("  rms_norm + fused_mod_row:               {rmsmod_us:.2} мкс");
+        println!("  только rms_norm:                        {rms_us:.2} мкс");
+        println!("  => слияние rms+mod сэкономит:           {:.2} мкс/вызов", rmsmod_us - rms_us);
+        println!();
+    }
+
+    {
         println!("== холодные веса (ротация копий > L2) ==");
         println!("{:<14}{:>8}{:>8}{:>10}{:>10}{:>9}", "shape", "N", "K", "M", "us/call", "GB/s");
         for &(name, n, k) in &[("qwen2_gate  ", 8960u32, 1536u32), ("head_adaln  ", 4608, 1536)] {
