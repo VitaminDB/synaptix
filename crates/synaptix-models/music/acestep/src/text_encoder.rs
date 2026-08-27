@@ -3,7 +3,7 @@ use std::path::Path;
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_llm_common::{
-    Activation, DecoderConfig, DecoderModel, LayerKind, NormGain, RopeSpec,
+    Activation, DecoderConfig, DecoderModel, LayerKind, NormGain, RopeSpec, WeightSource,
 };
 
 use crate::lm::BundleWeightSource;
@@ -88,9 +88,11 @@ impl TextEncoder {
         rope_capacity: usize,
     ) -> Result<Self, AceError> {
         let path = path.as_ref();
-        let embed = CompLoader::open(path, None, device)?.get("embed_tokens.weight", compute)?;
-        let hidden = embed.dims()[1];
         let src = BundleWeightSource::new(CompLoader::open(path, None, device)?);
+        let embed = src
+            .tensor("model.embed_tokens.weight", device, compute)
+            .map_err(|e| AceError::Load(e.to_string()))?;
+        let hidden = embed.dims()[1];
         let dcfg = qwen3_embedding_config();
         let model = DecoderModel::build(
             &dcfg, &src, device, compute, quant_w, quant_w, compute, compute, rope_capacity,

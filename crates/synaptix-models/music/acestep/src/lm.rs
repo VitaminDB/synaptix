@@ -8,13 +8,19 @@ use synaptix_llm_common::{
 };
 
 use crate::config::LmConfig;
-use crate::loader::CompLoader;
+use crate::loader::{read_bundle_file, CompLoader};
 use crate::AceError;
 
 fn strip(key: &str) -> &str {
     key.strip_prefix("model.").unwrap_or(key)
 }
 
+/// `WeightSource` поверх .syn-бандла. `DecoderModel` просит ключи в HF-раскладке
+/// (`model.embed_tokens.weight`, `model.layers.N.…`); в бандле они лежат либо
+/// так же (`acestep_5hz_lm_4b.syn` — упакован из Qwen3ForCausalLM), либо без
+/// префикса `model.` (`acestep_5hz_lm_1.7b.syn`, `qwen3-embedding-0.6b.syn` —
+/// Qwen3Model). Берём то имя, которое есть; раньше префикс срезался всегда, и
+/// 4b-бандл падал на `embed_tokens.weight: tensor not found`.
 pub struct BundleWeightSource {
     loader: CompLoader,
 }
@@ -23,16 +29,24 @@ impl BundleWeightSource {
     pub fn new(loader: CompLoader) -> Self {
         Self { loader }
     }
+
+    fn resolve<'a>(&self, key: &'a str) -> &'a str {
+        if self.loader.has(key) {
+            key
+        } else {
+            strip(key)
+        }
+    }
 }
 
 impl WeightSource for BundleWeightSource {
     fn tensor(&self, key: &str, _device: Device, dtype: DType) -> Result<Tensor, ModelError> {
         self.loader
-            .get(strip(key), dtype)
+            .get(self.resolve(key), dtype)
             .map_err(|e| ModelError::Load(e.to_string()))
     }
     fn contains(&self, key: &str) -> bool {
-        self.loader.has(strip(key))
+        self.loader.has(key) || self.loader.has(strip(key))
     }
 }
 
@@ -89,9 +103,24 @@ impl AceStepLm {
         quant_w: DType,
         rope_capacity: usize,
     ) -> Result<Self, AceError> {
+        let path = path.as_ref();
         let loader = CompLoader::open(path, None, device)?;
         let src = BundleWeightSource { loader };
-        let config = LmConfig::lm_1_7b();
+        // Архитектура — из config.json бандла (1.7b и 4b различаются числом
+        // слоёв/голов/hidden); без него — прежний захардкоженный 1.7b.
+        let config = match read_bundle_file(path, "config.json") {
+            Ok(bytes) => LmConfig::from_hf_json(&bytes)?,
+            Err(_) => LmConfig::lm_1_7b(),
+        };
+        eprintln!(
+            "[acestep-lm] {}: layers={} hidden={} heads={}/{} inter={}",
+            path.display(),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.intermediate_size
+        );
         let dcfg = to_decoder_config(&config);
         let model = DecoderModel::build(
             &dcfg, &src, device, compute, quant_w, quant_w, compute, compute, rope_capacity,

@@ -25,4 +25,5 @@ synaptix-tokenizer = { workspace = true }
 synaptix-bundle    = { workspace = true }
 synaptix-config    = { workspace = true }
 safetensors        = { workspace = true }
+serde_json         = { workspace = true }
 thiserror          = { workspace = true }

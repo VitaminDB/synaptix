@@ -1,4 +1,6 @@
 
+use crate::AceError;
+
 #[derive(Debug, Clone)]
 pub struct DitConfig {
     pub hidden_size: usize,
@@ -114,6 +116,41 @@ impl LmConfig {
             bos_token_id: 151643,
             eos_token_id: 151645,
         }
+    }
+
+    /// Конфиг из HF `config.json`, лежащего в .syn-бандле рядом с весами.
+    ///
+    /// Одним загрузчиком читаются оба 5Hz-LM: `acestep_5hz_lm_1.7b.syn`
+    /// (Qwen3Model: 28 слоёв, hidden 2048, 16 голов) и `acestep_5hz_lm_4b.syn`
+    /// (Qwen3ForCausalLM: 36 слоёв, hidden 2560, 32 головы, intermediate 9728).
+    /// Поля, которых в json нет, берутся из [`Self::lm_1_7b`]; `eos_token_id`
+    /// может быть списком — берём первый.
+    pub fn from_hf_json(bytes: &[u8]) -> Result<Self, AceError> {
+        let v: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| AceError::Config(format!("config.json: {e}")))?;
+        let base = Self::lm_1_7b();
+        let num = |k: &str| -> Option<u64> {
+            let x = v.get(k)?;
+            x.as_u64().or_else(|| x.as_array()?.first()?.as_u64())
+        };
+        let u = |k: &str, d: usize| num(k).map(|x| x as usize).unwrap_or(d);
+        let f = |k: &str, d: f32| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+        let hidden_size = u("hidden_size", base.hidden_size);
+        let num_attention_heads = u("num_attention_heads", base.num_attention_heads).max(1);
+        Ok(Self {
+            hidden_size,
+            num_hidden_layers: u("num_hidden_layers", base.num_hidden_layers),
+            num_attention_heads,
+            num_key_value_heads: u("num_key_value_heads", base.num_key_value_heads),
+            head_dim: u("head_dim", hidden_size / num_attention_heads),
+            intermediate_size: u("intermediate_size", base.intermediate_size),
+            max_position_embeddings: u("max_position_embeddings", base.max_position_embeddings),
+            rope_theta: f("rope_theta", base.rope_theta),
+            rms_norm_eps: f("rms_norm_eps", base.rms_norm_eps),
+            vocab_size: u("vocab_size", base.vocab_size),
+            bos_token_id: u("bos_token_id", base.bos_token_id as usize) as u32,
+            eos_token_id: u("eos_token_id", base.eos_token_id as usize) as u32,
+        })
     }
 }
 
