@@ -353,8 +353,7 @@ impl VisionTower {
                 q = e(self.apply_rope(&qf, cos, sin)?.to_dtype(self.dtype))?;
                 k = e(self.apply_rope(&kf, cos, sin)?.to_dtype(self.dtype))?;
             }
-            let attn = scaled_dot_attention(&q, &k, &v, scale, None)
-                .map_err(|err| VisionError::Forward(err.to_string()))?;
+            let attn = attention_chunked(&q, &k, &v, scale, ATTN_Q_CHUNK)?;
             let attn = e(attn.permute(vec![1, 0, 2]))?;
             let attn = e(e(attn.contiguous())?.reshape(vec![n, cfg.hidden_size]))?;
             let attn = blk.proj.forward(&attn)?;
@@ -386,6 +385,45 @@ impl VisionTower {
     }
 }
 
+/// Сколько query-строк внимания считать за один вызов `scaled_dot_attention`.
+///
+/// Тот держит матрицу score'ов `[heads, Nq, Nk]` в F32 целиком: на картинке
+/// в ~1000 vision-токенов (≈4000 патчей) это ≈1 ГБ на score'ы и столько же на
+/// softmax — поверх весов LLM такой цельный кусок из фрагментированного
+/// пула не выкраивается (`alloc_uninit(999571456) … OOM` при 4 ГБ
+/// «свободной» VRAM). Softmax построчный, поэтому разрез по запросам
+/// результата не меняет, а пик падает пропорционально чанку.
+pub const ATTN_Q_CHUNK: usize = 1024;
+
+/// Внимание `[heads, N, hd]` с разрезом по строкам запросов (см.
+/// [`ATTN_Q_CHUNK`]). При `chunk >= N` — один вызов без копий.
+pub fn attention_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    chunk: usize,
+) -> Result<Tensor, VisionError> {
+    let e = |r: Result<Tensor, synaptix_core::error::SynaptixError>| {
+        r.map_err(|err| VisionError::Forward(err.to_string()))
+    };
+    let n = q.dims()[1];
+    let chunk = chunk.max(1);
+    if n <= chunk {
+        return e(scaled_dot_attention(q, k, v, scale, None));
+    }
+    let mut parts: Vec<Tensor> = Vec::with_capacity(n.div_ceil(chunk));
+    let mut off = 0usize;
+    while off < n {
+        let len = chunk.min(n - off);
+        let qc = e(e(q.narrow(1, off, len))?.contiguous())?;
+        parts.push(e(scaled_dot_attention(&qc, k, v, scale, None))?);
+        off += len;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    e(Tensor::cat(&refs, 1))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VisionError {
     #[error("vision load: {0}")]
@@ -397,6 +435,35 @@ pub enum VisionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Разрез по запросам не меняет результат: softmax построчный.
+    #[test]
+    fn chunked_attention_matches_single_shot() {
+        synaptix_kernels_cpu::ensure_registered();
+        let (nh, n, hd) = (2usize, 37usize, 8usize);
+        let mut seed = 12345u32;
+        let mut rnd = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+                })
+                .collect()
+        };
+        let mk = |data: Vec<f32>| Tensor::from_vec(data, vec![nh, n, hd], Device::Cpu).unwrap();
+        let (q, k, v) = (mk(rnd(nh * n * hd)), mk(rnd(nh * n * hd)), mk(rnd(nh * n * hd)));
+        let scale = 1.0 / (hd as f32).sqrt();
+        let full = attention_chunked(&q, &k, &v, scale, usize::MAX).unwrap();
+        let chunked = attention_chunked(&q, &k, &v, scale, 7).unwrap();
+        assert_eq!(full.dims(), chunked.dims());
+        let a = full.to_vec3::<f32>().unwrap();
+        let b = chunked.to_vec3::<f32>().unwrap();
+        for (ra, rb) in a.iter().flatten().zip(b.iter().flatten()) {
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+            }
+        }
+    }
 
     #[test]
     fn token_coords_follow_merge_blocks() {
