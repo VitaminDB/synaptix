@@ -400,9 +400,9 @@ impl LlmPipeline {
 
     /// Генерация по промпту с медиа-вложениями (см. `LlmRunner::generate_streaming_media`).
     ///
-    /// Muse Glimmer принимает картинки и видео (склейка эмбеддингов по
-    /// модальности), Qwen-гибрид — только картинки, каждая своим тензором
-    /// (по одному на прогон `image_pad`).
+    /// Обе мультимодальные архитектуры (Muse Glimmer, Qwen-гибрид) берут
+    /// эмбеддинги склеенными по модальности в порядке появления в промпте
+    /// и разбирают их курсорами по прогонам своих токенов-заполнителей.
     fn generate_streaming_media(
         &self,
         prompt_ids: &[u32],
@@ -419,13 +419,9 @@ impl LlmPipeline {
                     .map_err(|e| LlmError(e.to_string()))
             }
             LlmPipeline::Hybrid(p) => {
-                if media.iter().any(|m| m.kind == MediaKind::Video) {
-                    return Err(LlmError(
-                        "Qwen-гибрид принимает только картинки, видео — нет".into(),
-                    ));
-                }
-                let images: Vec<Tensor> = media.iter().map(|m| m.embeds.clone()).collect();
-                p.generate_with_images(prompt_ids, &images, cfg, sink)
+                let images = concat_media(media, MediaKind::Image)?;
+                let video = concat_media(media, MediaKind::Video)?;
+                p.generate_with_media(prompt_ids, images.as_ref(), video.as_ref(), cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
@@ -911,24 +907,27 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let m = match &*guard {
-            LlmPipeline::MuseGlimmer(m) => m,
-            LlmPipeline::Hybrid(_) => {
-                return Err(LlmError(
-                    "Qwen-гибрид принимает только картинки, видео — нет".into(),
-                ))
+        let (embeds, prompt_block) = match &*guard {
+            LlmPipeline::MuseGlimmer(m) => {
+                let (embeds, info) = m
+                    .encode_video(path)
+                    .map_err(|e| LlmError(format!("video encode: {e}")))?;
+                (embeds, info.prompt_block())
+            }
+            LlmPipeline::Hybrid(h) => {
+                let (embeds, info) = h
+                    .encode_video(path)
+                    .map_err(|e| LlmError(format!("video encode: {e}")))?;
+                (embeds, info.prompt_block())
             }
             _ => return Err(LlmError("архитектура не принимает видео".into())),
         };
-        let (embeds, info) = m
-            .encode_video(path)
-            .map_err(|e| LlmError(format!("video encode: {e}")))?;
         let tokens = embeds.dims()[0];
         Ok(MediaEmbedding {
             kind: MediaKind::Video,
             embeds,
             tokens,
-            prompt_block: info.prompt_block(),
+            prompt_block,
         })
     }
 }

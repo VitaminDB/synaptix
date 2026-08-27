@@ -50,6 +50,37 @@ pub struct HybridPipeline {
     pub add_bos: bool,
 }
 
+/// Разметка видео в промпте: сколько групп кадров, сколько токенов на
+/// группу и таймкод каждой.
+#[derive(Debug, Clone)]
+pub struct VideoPromptInfo {
+    pub groups: usize,
+    pub tokens_per_group: usize,
+    pub timestamps: Vec<f32>,
+}
+
+impl VideoPromptInfo {
+    /// Всего vision-токенов видео.
+    pub fn tokens(&self) -> usize {
+        self.groups * self.tokens_per_group
+    }
+
+    /// Блок промпта как у HF-процессора Qwen3-VL: на каждую группу кадров
+    /// `<{t:.1} seconds><|vision_start|><|video_pad|>…<|vision_end|>`.
+    /// Таймкод — обычный текст, так модель видит временну́ю шкалу и без
+    /// M-RoPE по оси времени.
+    pub fn prompt_block(&self) -> String {
+        let mut s = String::new();
+        for g in 0..self.groups {
+            let ts = self.timestamps.get(g).copied().unwrap_or(0.0);
+            s.push_str(&format!("<{ts:.1} seconds><|vision_start|>"));
+            s.push_str(&"<|video_pad|>".repeat(self.tokens_per_group));
+            s.push_str("<|vision_end|>");
+        }
+        s
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtpStats {
     pub steps: usize,
@@ -377,48 +408,83 @@ impl HybridPipeline {
         Ok((nh / p) * (nw / p) / tower.config.merge_unit())
     }
 
-    fn embed_with_images(
+    /// Кодирует видео: сэмплинг кадров (ffprobe/ffmpeg) → башня по группам
+    /// кадров. Блок промпта собирает [`VideoPromptInfo::prompt_block`] —
+    /// с таймкодом каждой группы, как у HF-процессора Qwen3-VL.
+    pub fn encode_video(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps } =
+            synaptix_vlm_qwen3::prepare_video(
+                path,
+                &tower.config,
+                synaptix_vlm_qwen3::VideoLimits::default(),
+                self.model.device,
+            )
+            .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
+        let feats = no_grad(|| tower.forward(&patches, grid))
+            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        let info = VideoPromptInfo {
+            groups: grid.t,
+            tokens_per_group: (grid.h * grid.w) / tower.config.merge_unit(),
+            timestamps: group_timestamps,
+        };
+        Ok((feats, info))
+    }
+
+    /// Эмбеддинги промпта, где прогоны токенов-заполнителей заменены
+    /// строками vision-эмбеддингов. `media` — `(pad_id, тензор)` по
+    /// модальностям; тензор модальности — конкатенация всех её вложений в
+    /// порядке появления в промпте, каждый прогон заполнителя забирает
+    /// следующие `run` строк своим курсором (у видео таких прогонов —
+    /// по одному на группу кадров).
+    fn embed_with_media(
         &self,
         ids: &[u32],
-        image_embeds: &[synaptix_core::tensor::Tensor],
+        media: &[(u32, &synaptix_core::tensor::Tensor)],
     ) -> Result<synaptix_core::tensor::Tensor, PipelineError> {
         use synaptix_core::tensor::Tensor;
         let device = self.model.device;
-        let pad = self
-            .config
-            .image_token_id
-            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
         let hidden = self.config.hidden_size;
+        let mut cursors = vec![0usize; media.len()];
+        let is_pad = |id: u32| media.iter().position(|(pad, _)| *pad == id);
         let mut segments: Vec<Tensor> = Vec::new();
-        let mut img_idx = 0usize;
         let mut i = 0usize;
         while i < ids.len() {
-            if ids[i] == pad {
+            if let Some(mi) = is_pad(ids[i]) {
+                let pad = ids[i];
                 let start = i;
                 while i < ids.len() && ids[i] == pad {
                     i += 1;
                 }
                 let run = i - start;
-                let emb = image_embeds.get(img_idx).ok_or_else(|| {
-                    PipelineError::Forward(format!(
-                        "изображений меньше, чем блоков image_pad (нужен #{img_idx})"
-                    ))
-                })?;
-                img_idx += 1;
-                if emb.dims()[0] != run {
+                let (_, emb) = media[mi];
+                let avail = emb.dims()[0];
+                let off = cursors[mi];
+                if off + run > avail {
                     return Err(PipelineError::Forward(format!(
-                        "image_pad-блок {run} токенов, а vision дал {}",
-                        emb.dims()[0]
+                        "блок заполнителя {pad}: нужно строк {}..{}, а vision дал {avail}",
+                        off,
+                        off + run
                     )));
                 }
+                cursors[mi] += run;
                 let e = emb
-                    .to_dtype(self.model.dtype)
+                    .narrow(0, off, run)
+                    .and_then(|t| t.contiguous())
+                    .and_then(|t| t.to_dtype(self.model.dtype))
                     .and_then(|t| t.reshape(vec![1usize, run, hidden]))
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
                 segments.push(e);
             } else {
                 let start = i;
-                while i < ids.len() && ids[i] != pad {
+                while i < ids.len() && is_pad(ids[i]).is_none() {
                     i += 1;
                 }
                 let chunk = Tensor::from_vec(ids[start..i].to_vec(), vec![1usize, i - start], device)
@@ -430,14 +496,43 @@ impl HybridPipeline {
                 segments.push(e);
             }
         }
+        for (mi, (pad, emb)) in media.iter().enumerate() {
+            if cursors[mi] != emb.dims()[0] {
+                return Err(PipelineError::Forward(format!(
+                    "заполнитель {pad}: в промпте {} строк эмбеддингов, а vision дал {}",
+                    cursors[mi],
+                    emb.dims()[0]
+                )));
+            }
+        }
         let refs: Vec<&Tensor> = segments.iter().collect();
         Tensor::cat(&refs, 1).map_err(|e| PipelineError::Forward(e.to_string()))
     }
 
+    /// Генерация по промпту с картинками: `image_embeds` — по тензору на
+    /// картинку в порядке появления в промпте.
     pub fn generate_with_images(
         &self,
         prompt_ids: &[u32],
         image_embeds: &[synaptix_core::tensor::Tensor],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        use synaptix_core::tensor::Tensor;
+        let refs: Vec<&Tensor> = image_embeds.iter().collect();
+        let feats = Tensor::cat(&refs, 0).map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_media(prompt_ids, Some(&feats), None, gen_cfg, sink)
+    }
+
+    /// Генерация по промпту с картинками и/или видео. Эмбеддинги каждой
+    /// модальности — конкатенация по порядку появления в промпте (см.
+    /// [`Self::embed_with_media`]). Спекулятивные пути (MTP / CUDA-graph)
+    /// здесь не применяются — префилл идёт по готовым эмбеддингам.
+    pub fn generate_with_media(
+        &self,
+        prompt_ids: &[u32],
+        image_embeds: Option<&synaptix_core::tensor::Tensor>,
+        video_embeds: Option<&synaptix_core::tensor::Tensor>,
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
@@ -446,6 +541,24 @@ impl HybridPipeline {
 
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let mut media: Vec<(u32, &Tensor)> = Vec::new();
+        if let Some(t) = image_embeds {
+            let pad = self
+                .config
+                .image_token_id
+                .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+            media.push((pad, t));
+        }
+        if let Some(t) = video_embeds {
+            let pad = self
+                .config
+                .video_token_id
+                .ok_or_else(|| PipelineError::Model("config.json без video_token_id".into()))?;
+            media.push((pad, t));
+        }
+        if media.is_empty() {
+            return Err(PipelineError::Model("generate_with_media без медиа".into()));
         }
         let cfg = self.prepare_cfg(gen_cfg);
         let device = self.model.device;
@@ -459,7 +572,7 @@ impl HybridPipeline {
         let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
 
         let t0 = std::time::Instant::now();
-        let emb = self.embed_with_images(prompt_ids, image_embeds)?;
+        let emb = self.embed_with_media(prompt_ids, &media)?;
         // Префилл чанками, как в текстовом пути: пик активаций гибрида
         // растёт с длиной чанка, и single-shot по длинной истории с
         // картинкой упирался в OOM. `prepare_cfg` уже выровнял чанк по

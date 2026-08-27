@@ -300,7 +300,47 @@ impl VisionTower {
         self.deepstack.len()
     }
 
+    /// Прямой проход башни. У видео (`grid.t > 1`) внимание живёт внутри
+    /// группы кадров — у HF это `cu_seqlens` по t, — поэтому группы
+    /// кодируются независимо и склеиваются по порядку; так же склеиваются
+    /// deepstack-фичи каждого слота.
     pub fn forward_deepstack(
+        &self,
+        patches: &Tensor,
+        grid: ImageGrid,
+    ) -> Result<(Tensor, Vec<Tensor>), VisionError> {
+        if grid.t <= 1 {
+            return self.forward_group(patches, grid);
+        }
+        let e = |r: Result<Tensor, synaptix_core::error::SynaptixError>| {
+            r.map_err(|err| VisionError::Forward(err.to_string()))
+        };
+        let per = grid.h * grid.w;
+        let single = ImageGrid { t: 1, h: grid.h, w: grid.w };
+        let mut outs: Vec<Tensor> = Vec::with_capacity(grid.t);
+        let mut taps: Vec<Vec<Tensor>> = Vec::new();
+        for g in 0..grid.t {
+            let part = e(e(patches.narrow(0, g * per, per))?.contiguous())?;
+            let (o, t) = self.forward_group(&part, single)?;
+            outs.push(o);
+            for (slot, feat) in t.into_iter().enumerate() {
+                while taps.len() <= slot {
+                    taps.push(Vec::new());
+                }
+                taps[slot].push(feat);
+            }
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        let out = e(Tensor::cat(&refs, 0))?;
+        let mut merged_taps = Vec::with_capacity(taps.len());
+        for slot in &taps {
+            let refs: Vec<&Tensor> = slot.iter().collect();
+            merged_taps.push(e(Tensor::cat(&refs, 0))?);
+        }
+        Ok((out, merged_taps))
+    }
+
+    fn forward_group(
         &self,
         patches: &Tensor,
         grid: ImageGrid,

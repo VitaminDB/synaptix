@@ -11,7 +11,8 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_vlm_qwen3::{
-    bundle_has_vision, load_from_bundle, prepare_tensor, BundleVisionWeights, PreprocessLimits,
+    bundle_has_vision, load_from_bundle, prepare_tensor, prepare_video, BundleVisionWeights,
+    PreprocessLimits, VideoLimits,
 };
 
 fn bundle() -> Option<PathBuf> {
@@ -61,4 +62,59 @@ fn tower_in_main_component_is_found_and_encodes_on_cpu() {
     let energy: f32 = rows[0].iter().map(|v| v * v).sum();
     assert!(energy > 0.0, "нулевые эмбеддинги");
     eprintln!("ok: {expected_tokens} vision-токенов, ||row0||² = {energy:.3}");
+}
+
+/// Видео: синтетический ролик ffmpeg (lavfi testsrc) → сэмплинг кадров →
+/// башня по группам кадров → `[groups·tokens_per_group, out_hidden_size]`.
+/// Пропуск без бандла или без ffmpeg.
+#[test]
+fn tower_encodes_synthetic_video_on_cpu() {
+    let Some(path) = bundle() else {
+        eprintln!("SYN_QWEN38_BUNDLE не задан или файла нет — пропуск");
+        return;
+    };
+    let dir = std::env::temp_dir().join("synaptix_vlm_qwen3_video_test");
+    let _ = std::fs::create_dir_all(&dir);
+    let video = dir.join("testsrc.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=3:size=160x120:rate=10"])
+        .args(["-pix_fmt", "yuv420p"])
+        .arg(&video)
+        .status();
+    match status {
+        Ok(st) if st.success() => {}
+        _ => {
+            eprintln!("ffmpeg недоступен — пропуск видео-теста");
+            return;
+        }
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    let tower = load_from_bundle(&path, Device::Cpu, DType::F32).expect("load tower");
+    let limits = VideoLimits { target_fps: 2.0, max_frames: 8, max_total_tokens: 512, min_group_tokens: 16 };
+    let prepared = prepare_video(&video, &tower.config, limits, Device::Cpu).expect("prepare video");
+    // 3 с × 2 fps = 6 кадров → 3 группы.
+    assert_eq!(prepared.grid.t, 3, "групп кадров: {:?}", prepared.group_timestamps);
+    assert_eq!(prepared.group_timestamps.len(), 3);
+    assert!(prepared.group_timestamps.windows(2).all(|p| p[0] < p[1]));
+    let per_group = (prepared.grid.h * prepared.grid.w) / tower.config.merge_unit();
+    assert!(per_group >= 16 && per_group * 3 <= 512, "токенов на группу: {per_group}");
+
+    let emb = tower.forward(&prepared.patches, prepared.grid).expect("forward");
+    assert_eq!(emb.dims(), &[3 * per_group, tower.config.out_hidden_size]);
+    let rows = emb.to_vec2::<f32>().expect("to_vec2");
+    assert!(rows.iter().flatten().all(|v| v.is_finite()), "NaN/inf в видео-эмбеддингах");
+    // Группы независимы: первая группа отдельно даёт те же строки, что в
+    // общем прогоне (внимание не перетекает между кадрами).
+    let per_patches = prepared.grid.h * prepared.grid.w;
+    let first = prepared.patches.narrow(0, 0, per_patches).and_then(|t| t.contiguous()).unwrap();
+    let g0 = tower
+        .forward(&first, synaptix_vlm_qwen3::ImageGrid { t: 1, h: prepared.grid.h, w: prepared.grid.w })
+        .expect("forward group 0");
+    let g0 = g0.to_vec2::<f32>().unwrap();
+    for (a, b) in g0.iter().zip(rows.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+    }
+    eprintln!("ok: видео {} групп × {per_group} токенов, ts={:?}", prepared.grid.t, prepared.group_timestamps);
 }
