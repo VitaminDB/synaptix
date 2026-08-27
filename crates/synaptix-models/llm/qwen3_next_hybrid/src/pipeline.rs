@@ -8,10 +8,18 @@ use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 
 use crate::config::HybridConfig;
+use crate::mrope;
+use synaptix_llm_common::model::RopePositions;
 use crate::loader::HybridWeights;
 use crate::model::{DecoderModel, ModelError};
 
 pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink};
+
+/// M-RoPE на медиа-промпте включён по умолчанию; `SYN_HYBRID_MROPE=0` —
+/// выключатель для A/B-сравнения с 1D-позициями.
+fn mrope_enabled() -> bool {
+    std::env::var("SYN_HYBRID_MROPE").map(|v| v != "0").unwrap_or(true)
+}
 
 /// Дефолтный chunk префилла гибрида. Ограничивает пик VRAM активаций
 /// (single-shot M>=512 не влезает в 24 ГБ поверх ~18 ГБ весов) при скорости
@@ -57,6 +65,18 @@ pub struct VideoPromptInfo {
     pub groups: usize,
     pub tokens_per_group: usize,
     pub timestamps: Vec<f32>,
+    /// Merged-сетка `(h, w)` одной группы кадров — для M-RoPE.
+    pub grid_hw: (usize, usize),
+}
+
+/// Вложения одной модальности для [`HybridPipeline::generate_with_media`]:
+/// id токена-заполнителя, эмбеддинги всех блоков подряд (в порядке
+/// появления в промпте) и merged-сетка каждого блока. Пустой `grids` —
+/// сетки неизвестны, промпт идёт по 1D-позициям без M-RoPE.
+pub struct MediaInput {
+    pub pad: u32,
+    pub embeds: synaptix_core::tensor::Tensor,
+    pub grids: Vec<(usize, usize)>,
 }
 
 impl VideoPromptInfo {
@@ -370,6 +390,16 @@ impl HybridPipeline {
         path: impl AsRef<Path>,
         limits: synaptix_vlm_qwen3::PreprocessLimits,
     ) -> Result<synaptix_core::tensor::Tensor, PipelineError> {
+        self.encode_image_with_grid(path, limits).map(|(t, _)| t)
+    }
+
+    /// Как [`Self::encode_image`], плюс merged-сетка `(h, w)` картинки —
+    /// нужна M-RoPE, чтобы разложить токены блока по строкам и столбцам.
+    pub fn encode_image_with_grid(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::PreprocessLimits,
+    ) -> Result<(synaptix_core::tensor::Tensor, (usize, usize)), PipelineError> {
         use synaptix_core::grad::no_grad;
         let tower = self
             .vision
@@ -382,8 +412,21 @@ impl HybridPipeline {
             self.model.device,
         )
         .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
-        no_grad(|| tower.forward(&prepared.patches, prepared.grid))
-            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))
+        let m = tower.config.spatial_merge_size.max(1);
+        let grid_hw = (prepared.grid.h / m, prepared.grid.w / m);
+        let feats = no_grad(|| tower.forward(&prepared.patches, prepared.grid))
+            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        Ok((feats, grid_hw))
+    }
+
+    /// Как [`Self::encode_image_limited`], плюс merged-сетка картинки.
+    pub fn encode_image_limited_with_grid(
+        &self,
+        path: impl AsRef<Path>,
+        max_tokens: Option<usize>,
+    ) -> Result<(synaptix_core::tensor::Tensor, (usize, usize)), PipelineError> {
+        let limits = self.image_limits(max_tokens)?;
+        self.encode_image_with_grid(path, limits)
     }
 
     pub fn image_token_count(
@@ -430,10 +473,12 @@ impl HybridPipeline {
             .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
         let feats = no_grad(|| tower.forward(&patches, grid))
             .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        let m = tower.config.spatial_merge_size.max(1);
         let info = VideoPromptInfo {
             groups: grid.t,
             tokens_per_group: (grid.h * grid.w) / tower.config.merge_unit(),
             timestamps: group_timestamps,
+            grid_hw: (grid.h / m, grid.w / m),
         };
         Ok((feats, info))
     }
@@ -510,7 +555,8 @@ impl HybridPipeline {
     }
 
     /// Генерация по промпту с картинками: `image_embeds` — по тензору на
-    /// картинку в порядке появления в промпте.
+    /// картинку в порядке появления в промпте. Сетки неизвестны, поэтому
+    /// без M-RoPE (см. [`Self::generate_with_media`]).
     pub fn generate_with_images(
         &self,
         prompt_ids: &[u32],
@@ -521,18 +567,25 @@ impl HybridPipeline {
         use synaptix_core::tensor::Tensor;
         let refs: Vec<&Tensor> = image_embeds.iter().collect();
         let feats = Tensor::cat(&refs, 0).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        self.generate_with_media(prompt_ids, Some(&feats), None, gen_cfg, sink)
+        let pad = self
+            .config
+            .image_token_id
+            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+        let input = MediaInput { pad, embeds: feats, grids: Vec::new() };
+        self.generate_with_media(prompt_ids, std::slice::from_ref(&input), gen_cfg, sink)
     }
 
     /// Генерация по промпту с картинками и/или видео. Эмбеддинги каждой
     /// модальности — конкатенация по порядку появления в промпте (см.
-    /// [`Self::embed_with_media`]). Спекулятивные пути (MTP / CUDA-graph)
-    /// здесь не применяются — префилл идёт по готовым эмбеддингам.
+    /// [`Self::embed_with_media`]). Если конфиг несёт `mrope_section`, а у
+    /// всех вложений известны сетки, позиции RoPE — мультимодальные
+    /// (`crate::mrope`): префилл по таблицам на весь промпт, декод — по
+    /// 1D со сдвигом. Спекулятивные пути (MTP / CUDA-graph) здесь не
+    /// применяются — префилл идёт по готовым эмбеддингам.
     pub fn generate_with_media(
         &self,
         prompt_ids: &[u32],
-        image_embeds: Option<&synaptix_core::tensor::Tensor>,
-        video_embeds: Option<&synaptix_core::tensor::Tensor>,
+        inputs: &[MediaInput],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
@@ -542,24 +595,40 @@ impl HybridPipeline {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("empty prompt".into()));
         }
-        let mut media: Vec<(u32, &Tensor)> = Vec::new();
-        if let Some(t) = image_embeds {
-            let pad = self
-                .config
-                .image_token_id
-                .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
-            media.push((pad, t));
-        }
-        if let Some(t) = video_embeds {
-            let pad = self
-                .config
-                .video_token_id
-                .ok_or_else(|| PipelineError::Model("config.json без video_token_id".into()))?;
-            media.push((pad, t));
-        }
-        if media.is_empty() {
+        if inputs.is_empty() {
             return Err(PipelineError::Model("generate_with_media без медиа".into()));
         }
+        let media: Vec<(u32, &Tensor)> = inputs.iter().map(|m| (m.pad, &m.embeds)).collect();
+
+        // M-RoPE: таблицы cos/sin на весь промпт + сдвиг позиций декода.
+        let mrope_on = mrope_enabled() && inputs.iter().all(|m| !m.grids.is_empty());
+        let mrope_tables = match (&self.config.mrope, mrope_on) {
+            (Some(spec), true) => {
+                let runs: Vec<mrope::MediaRuns> = inputs
+                    .iter()
+                    .map(|m| mrope::MediaRuns { pad: m.pad, grids: &m.grids })
+                    .collect();
+                let positions = mrope::positions_3d(prompt_ids, &runs).map_err(PipelineError::Forward)?;
+                let inv = self.config.rope_inv_freqs();
+                let (cos, sin) = mrope::rope_tables(&positions.pos, &inv, &spec.section, spec.interleaved);
+                let half = inv.len();
+                let l = prompt_ids.len();
+                let cos = Tensor::from_vec(cos, vec![l, half], self.model.device)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                let sin = Tensor::from_vec(sin, vec![l, half], self.model.device)
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                Some((cos, sin, positions.decode_delta()))
+            }
+            _ => None,
+        };
+        let prefill_pos = match &mrope_tables {
+            Some((cos, sin, _)) => RopePositions::Tables { cos, sin },
+            None => RopePositions::Sequential,
+        };
+        let decode_pos = match &mrope_tables {
+            Some((_, _, delta)) => RopePositions::Shifted(*delta),
+            None => RopePositions::Sequential,
+        };
         let cfg = self.prepare_cfg(gen_cfg);
         let device = self.model.device;
         let l = prompt_ids.len();
@@ -589,7 +658,7 @@ impl HybridPipeline {
                 .narrow(1, off, step)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let h = no_grad(|| self.model.forward_from_hidden(&part, &mut kv))
+            let h = no_grad(|| self.model.forward_from_hidden_pos(&part, &mut kv, prefill_pos))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             last_hidden = Some(h);
             off += step;
@@ -615,7 +684,7 @@ impl HybridPipeline {
             }
             let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            logits = no_grad(|| self.model.forward(&step, &mut kv))
+            logits = no_grad(|| self.model.forward_pos(&step, &mut kv, decode_pos))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
         }
         let decode_ms = dec_t0.elapsed().as_millis();

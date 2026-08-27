@@ -11,7 +11,24 @@ use synaptix_ops::attention::softmax::scaled_dot_attention;
 use synaptix_ops::conv::causal_conv1d::causal_conv1d_stateful;
 use synaptix_ops::embed::token_embedding;
 use synaptix_ops::norm::rms_norm::rms_norm;
-use synaptix_ops::pos::rope::{apply_rope_range, RopeLayout};
+use synaptix_ops::pos::rope::{apply_rope_range, apply_rope_with_cossin, RopeLayout};
+
+/// Откуда брать позиции RoPE для прогона блоков.
+///
+/// Обычный текст — [`Self::Sequential`]: позиция токена равна его индексу в
+/// последовательности (`past + i`). Мультимодальный промпт Qwen-VL /
+/// Qwen3.5 живёт на M-RoPE: у патчей картинки три оси позиций (время,
+/// строка, столбец), а текст после блока продолжается не с `h·w`, а с
+/// `max(h, w)`. Такие таблицы cos/sin строятся снаружи на весь промпт
+/// ([`Self::Tables`]), а декод после него идёт по 1D-позициям со сдвигом
+/// ([`Self::Shifted`]: `past + i + delta`, где `delta = max_pos + 1 − L`).
+#[derive(Clone, Copy)]
+pub enum RopePositions<'a> {
+    Sequential,
+    Shifted(i64),
+    /// `[L, rotary_dim/2]` F32 на весь промпт; берутся строки `[past, past+s)`.
+    Tables { cos: &'a Tensor, sin: &'a Tensor },
+}
 use synaptix_ops::pos::rope_cache::RopeCache;
 
 use crate::config::{Activation, DecoderConfig, LayerKind, NormGain};
@@ -1171,16 +1188,46 @@ impl DecoderModel {
         let past = kv_cache.seq_len;
         let hidden = self.embed_ids(input_ids)?;
         if dump_layers_on() { record_layer_norm(999, "embed", &hidden, s, past); }
-        self.run_blocks(hidden, kv_cache, batch, s)
+        self.run_blocks(hidden, kv_cache, batch, s, RopePositions::Sequential)
     }
 
     pub fn forward_from_hidden(&self, hidden: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {
+        self.forward_from_hidden_pos(hidden, kv_cache, RopePositions::Sequential)
+    }
+
+    /// Как [`Self::forward_from_hidden`], но с явными позициями RoPE
+    /// (M-RoPE-таблицы мультимодального промпта).
+    pub fn forward_from_hidden_pos(
+        &self,
+        hidden: &Tensor,
+        kv_cache: &mut KvCache,
+        rope_pos: RopePositions,
+    ) -> Result<Tensor, ModelError> {
         if hidden.rank() != 3 {
             return Err(ModelError::Shape(format!("hidden must be [B, S, H], got {:?}", hidden.dims())));
         }
         let batch = hidden.dims()[0];
         let s = hidden.dims()[1];
-        self.run_blocks(hidden.clone(), kv_cache, batch, s)
+        self.run_blocks(hidden.clone(), kv_cache, batch, s, rope_pos)
+    }
+
+    /// Как [`Self::forward`], но с явными позициями RoPE — декод после
+    /// M-RoPE-промпта идёт по 1D-позициям со сдвигом
+    /// ([`RopePositions::Shifted`]).
+    pub fn forward_pos(
+        &self,
+        input_ids: &Tensor,
+        kv_cache: &mut KvCache,
+        rope_pos: RopePositions,
+    ) -> Result<Tensor, ModelError> {
+        if input_ids.rank() != 2 {
+            return Err(ModelError::Shape(format!("input_ids must be [B, S], got {:?}", input_ids.dims())));
+        }
+        let batch = input_ids.dims()[0];
+        let s = input_ids.dims()[1];
+        let hidden = self.embed_ids(input_ids)?;
+        let hidden = self.run_blocks(hidden, kv_cache, batch, s, rope_pos)?;
+        self.head_at(&hidden, hidden.dims()[1] - 1)
     }
 
     /// Как [`Self::forward_trunk`], но дополнительно возвращает выходы блоков
@@ -1200,7 +1247,7 @@ impl DecoderModel {
         let s = input_ids.dims()[1];
         let hidden = self.embed_ids(input_ids)?;
         let mut tapped = Vec::with_capacity(taps.len());
-        let out = self.run_blocks_tapped(hidden, kv_cache, batch, s, taps, &mut tapped)?;
+        let out = self.run_blocks_tapped(hidden, kv_cache, batch, s, taps, &mut tapped, RopePositions::Sequential)?;
         Ok((out, tapped))
     }
 
@@ -1210,9 +1257,10 @@ impl DecoderModel {
         kv_cache: &mut KvCache,
         batch: usize,
         s: usize,
+        rope_pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
         let mut sink = Vec::new();
-        self.run_blocks_tapped(hidden, kv_cache, batch, s, &[], &mut sink)
+        self.run_blocks_tapped(hidden, kv_cache, batch, s, &[], &mut sink, rope_pos)
     }
 
     fn run_blocks_tapped(
@@ -1223,6 +1271,7 @@ impl DecoderModel {
         s: usize,
         taps: &[usize],
         tapped: &mut Vec<Tensor>,
+        rope_pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
         let past = kv_cache.seq_len;
         if past + s > kv_cache.max_seq {
@@ -1240,7 +1289,7 @@ impl DecoderModel {
             let h = prof(dev, "norm", || rms_norm(hidden, &blk.pre_attn_norm, blk.rms_eps).coerr())?;
             let is_lin = matches!(&blk.mixer, Mixer::Linear(_));
             let mixed = match &blk.mixer {
-                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None))?,
+                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos))?,
                 Mixer::Linear(la) => prof(dev, "attn_linear", || la.forward(&h, &mut kv_cache.layers[idx], s, self.device, self.dtype))?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
@@ -1368,7 +1417,7 @@ impl DecoderModel {
             let mixed = match &blk.mixer {
                 Mixer::Full(fa) => fa.forward(
                     &h, &mut kv.layers[idx], 0, s, batch, self.rope_at(idx),
-                    self.kv_dtype, dev, self.dtype, pad_ref,
+                    self.kv_dtype, dev, self.dtype, pad_ref, RopePositions::Sequential,
                 )?,
                 Mixer::Linear(_) => {
                     return Err(ModelError::Forward(
@@ -1765,6 +1814,7 @@ impl FullAttn {
         device: Device,
         compute: DType,
         pad_bias: Option<&Tensor>,
+        rope_pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
         let kv = match cache {
             LayerCache::Full(k) => k,
@@ -1790,8 +1840,8 @@ impl FullAttn {
         let q = prof(device, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let k = prof(device, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
 
-        let q = prof(device, "attn_rope", || partial_rope(&q, rope, past, s, self.rotary_dim, hd).coerr())?;
-        let k = prof(device, "attn_rope", || partial_rope(&k, rope, past, s, self.rotary_dim, hd).coerr())?;
+        let q = prof(device, "attn_rope", || partial_rope(&q, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
+        let k = prof(device, "attn_rope", || partial_rope(&k, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
 
         let new_len = past + s;
         let group = nh / nkv;
@@ -2626,17 +2676,44 @@ pub fn layer_dump_take() -> Vec<(usize, String, Vec<f32>)> {
     LAYER_DUMP.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
-fn partial_rope(x: &Tensor, rope: &RopeCache, start: usize, len: usize, rotary_dim: usize, head_dim: usize) -> CoreResult<Tensor> {
+fn partial_rope(
+    x: &Tensor,
+    rope: &RopeCache,
+    start: usize,
+    len: usize,
+    rotary_dim: usize,
+    head_dim: usize,
+    pos: RopePositions,
+) -> CoreResult<Tensor> {
     if rotary_dim == 0 {
         return Ok(x.clone());
     }
+    let rotate = |x_rot: &Tensor| -> CoreResult<Tensor> {
+        match pos {
+            RopePositions::Sequential => apply_rope_range(x_rot, rope, start, len, RopeLayout::Split),
+            RopePositions::Shifted(delta) => {
+                let shifted = start as i64 + delta;
+                if shifted < 0 {
+                    return Err(synaptix_core::error::SynaptixError::Other(format!(
+                        "rope: позиция {start} со сдвигом {delta} отрицательна"
+                    )));
+                }
+                apply_rope_range(x_rot, rope, shifted as usize, len, RopeLayout::Split)
+            }
+            RopePositions::Tables { cos, sin } => {
+                let cos = cos.narrow(0, start, len)?.contiguous()?;
+                let sin = sin.narrow(0, start, len)?.contiguous()?;
+                apply_rope_with_cossin(x_rot, &cos, &sin, RopeLayout::Split)
+            }
+        }
+    };
     if rotary_dim == head_dim {
-        return apply_rope_range(x, rope, start, len, RopeLayout::Split);
+        return rotate(x);
     }
     let dev = x.device();
     let x_rot = prof(dev, "rope_split_in", || x.narrow(3, 0, rotary_dim)?.contiguous())?;
     let x_pass = x.narrow(3, rotary_dim, head_dim - rotary_dim)?.contiguous()?;
-    let rotated = prof(dev, "rope_kernel", || apply_rope_range(&x_rot, rope, start, len, RopeLayout::Split))?;
+    let rotated = prof(dev, "rope_kernel", || rotate(&x_rot))?;
     prof(dev, "rope_cat", || Tensor::cat(&[&rotated, &x_pass], 3))
 }
 

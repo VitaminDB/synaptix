@@ -21,7 +21,7 @@ use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
-use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
+use synaptix_llm_qwen3_next_hybrid::pipeline::{HybridPipeline, MediaInput};
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
 use synaptix_tokenizer::{
     ChatTemplate, HfTokenizer, Message as TokMessage, MessageRole, SpecialTokenKind, SpecialTokens,
@@ -419,9 +419,25 @@ impl LlmPipeline {
                     .map_err(|e| LlmError(e.to_string()))
             }
             LlmPipeline::Hybrid(p) => {
-                let images = concat_media(media, MediaKind::Image)?;
-                let video = concat_media(media, MediaKind::Video)?;
-                p.generate_with_media(prompt_ids, images.as_ref(), video.as_ref(), cfg, sink)
+                // По модальности: склейка эмбеддингов + сетка каждого блока
+                // (у видео — одна сетка на каждую группу кадров) для M-RoPE.
+                let mut inputs: Vec<MediaInput> = Vec::new();
+                for (kind, pad) in [
+                    (MediaKind::Image, p.config.image_token_id),
+                    (MediaKind::Video, p.config.video_token_id),
+                ] {
+                    let Some(embeds) = concat_media(media, kind)? else { continue };
+                    let pad = pad.ok_or_else(|| {
+                        LlmError(format!("config.json без id заполнителя для {kind:?}"))
+                    })?;
+                    let grids: Vec<(usize, usize)> = media
+                        .iter()
+                        .filter(|m| m.kind == kind)
+                        .flat_map(|m| std::iter::repeat_n(m.grid_hw, m.blocks))
+                        .collect();
+                    inputs.push(MediaInput { pad, embeds, grids });
+                }
+                p.generate_with_media(prompt_ids, &inputs, cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
@@ -793,6 +809,12 @@ pub struct MediaEmbedding {
     pub embeds: Tensor,
     pub tokens: usize,
     pub prompt_block: String,
+    /// Merged-сетка `(h, w)` одного блока (картинки / группы кадров) — для
+    /// M-RoPE у Qwen-гибрида; `(0, 0)`, если архитектура её не использует.
+    pub grid_hw: (usize, usize),
+    /// Сколько блоков заполнителей в промпте: 1 у картинки, число групп
+    /// кадров у видео.
+    pub blocks: usize,
 }
 
 impl MediaEmbedding {
@@ -886,18 +908,20 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let embeds = match &*guard {
-            LlmPipeline::MuseGlimmer(m) => m
-                .encode_image_limited(path, max_tokens)
-                .map_err(|e| LlmError(format!("image encode: {e}")))?,
+        let (embeds, grid_hw) = match &*guard {
+            LlmPipeline::MuseGlimmer(m) => (
+                m.encode_image_limited(path, max_tokens)
+                    .map_err(|e| LlmError(format!("image encode: {e}")))?,
+                (0, 0),
+            ),
             LlmPipeline::Hybrid(h) => h
-                .encode_image_limited(path, max_tokens)
+                .encode_image_limited_with_grid(path, max_tokens)
                 .map_err(|e| LlmError(format!("image encode: {e}")))?,
             _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
         let tokens = embeds.dims()[0];
         let prompt_block = guard.image_block(tokens);
-        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block })
+        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1 })
     }
 
     /// Кодирует видео: сэмплинг кадров (ffmpeg) → vision-башня. Блок промпта
@@ -907,18 +931,18 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let (embeds, prompt_block) = match &*guard {
+        let (embeds, prompt_block, grid_hw, blocks) = match &*guard {
             LlmPipeline::MuseGlimmer(m) => {
                 let (embeds, info) = m
                     .encode_video(path)
                     .map_err(|e| LlmError(format!("video encode: {e}")))?;
-                (embeds, info.prompt_block())
+                (embeds, info.prompt_block(), (0, 0), info.groups)
             }
             LlmPipeline::Hybrid(h) => {
                 let (embeds, info) = h
                     .encode_video(path)
                     .map_err(|e| LlmError(format!("video encode: {e}")))?;
-                (embeds, info.prompt_block())
+                (embeds, info.prompt_block(), info.grid_hw, info.groups)
             }
             _ => return Err(LlmError("архитектура не принимает видео".into())),
         };
@@ -928,6 +952,8 @@ impl Llm {
             embeds,
             tokens,
             prompt_block,
+            grid_hw,
+            blocks,
         })
     }
 }

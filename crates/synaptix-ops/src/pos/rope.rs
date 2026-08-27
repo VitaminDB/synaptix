@@ -62,7 +62,10 @@ pub fn apply_rope_range(
     apply_rope_with_cossin(x, &cos, &sin, layout)
 }
 
-fn apply_rope_with_cossin(
+/// RoPE по готовым таблицам `cos`/`sin` формы `[S, head_dim/2]` (F32) —
+/// строка на позицию токена. Нужен там, где позиции не последовательны
+/// (M-RoPE: у каждой частоты своя ось позиции — таблицы строятся снаружи).
+pub fn apply_rope_with_cossin(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,

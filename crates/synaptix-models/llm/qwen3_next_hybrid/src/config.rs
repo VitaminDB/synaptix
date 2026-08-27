@@ -11,6 +11,20 @@ pub enum LayerKind {
 struct RopeParameters {
     #[serde(default = "default_rope_theta")]
     rope_theta: f32,
+    /// M-RoPE: сколько частот rotary-части отдано осям (время, строка,
+    /// столбец) — у Qwen3.5 `[11, 11, 10]` на 32 частоты.
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
+    /// Интерливинг осей по частотам (`T H W T H W …`), а не подряд блоками.
+    #[serde(default)]
+    mrope_interleaved: bool,
+}
+
+/// Раскладка M-RoPE (см. `crate::mrope`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MropeSpec {
+    pub section: Vec<usize>,
+    pub interleaved: bool,
 }
 
 fn default_rope_theta() -> f32 {
@@ -94,7 +108,11 @@ impl Default for TextConfigRaw {
             bos_token_id: Some(248044),
             eos_token_id: EosField::One(248044),
             mtp_num_hidden_layers: 0,
-            rope_parameters: RopeParameters { rope_theta: default_rope_theta() },
+            rope_parameters: RopeParameters {
+                rope_theta: default_rope_theta(),
+                mrope_section: None,
+                mrope_interleaved: false,
+            },
         }
     }
 }
@@ -130,9 +148,22 @@ pub struct HybridConfig {
     pub video_token_id: Option<u32>,
     pub vision_start_token_id: Option<u32>,
     pub vision_end_token_id: Option<u32>,
+    /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
+    /// (у text-only сборок и старых конфигов).
+    pub mrope: Option<MropeSpec>,
 }
 
 impl HybridConfig {
+    /// Обратные частоты rotary-части — ровно те, что кладёт в таблицы
+    /// `RopeCache::new` (та же f32-арифметика), чтобы M-RoPE-таблицы,
+    /// собранные на host, для текста совпадали с обычным путём.
+    pub fn rope_inv_freqs(&self) -> Vec<f32> {
+        let rd = self.rotary_dim();
+        (0..rd / 2)
+            .map(|i| self.rope_theta.powf(-(2.0 * i as f32) / (rd as f32)))
+            .collect()
+    }
+
     pub fn from_hf_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
         let root: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|e| ConfigError::Parse(format!("config json: {e}")))?;
@@ -142,12 +173,17 @@ impl HybridConfig {
             .unwrap_or_else(|| root.clone());
         let raw: TextConfigRaw = serde_json::from_value(tc)
             .map_err(|e| ConfigError::Parse(format!("text_config: {e}")))?;
+        let mrope = raw.rope_parameters.mrope_section.clone().map(|section| MropeSpec {
+            section,
+            interleaved: raw.rope_parameters.mrope_interleaved,
+        });
         let mut cfg = Self::from_raw(raw)?;
         let id = |k: &str| root.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
         cfg.image_token_id = id("image_token_id");
         cfg.video_token_id = id("video_token_id");
         cfg.vision_start_token_id = id("vision_start_token_id");
         cfg.vision_end_token_id = id("vision_end_token_id");
+        cfg.mrope = mrope;
         Ok(cfg)
     }
 
@@ -209,6 +245,7 @@ impl HybridConfig {
             video_token_id: None,
             vision_start_token_id: None,
             vision_end_token_id: None,
+            mrope: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -400,6 +437,19 @@ mod tests {
         assert_eq!(cfg.layer_kind(3), LayerKind::Full);
         assert!(!cfg.tie_word_embeddings);
         assert!(cfg.attn_output_gate);
+    }
+
+    #[test]
+    fn reads_mrope_spec() {
+        let json = r#"{"model_type": "qwen3_5", "rope_parameters": {"mrope_interleaved": true,
+            "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25}, "head_dim": 256, "partial_rotary_factor": 0.25}"#;
+        let cfg = HybridConfig::from_hf_bytes(json.as_bytes()).unwrap();
+        assert_eq!(cfg.mrope, Some(MropeSpec { section: vec![11, 11, 10], interleaved: true }));
+        assert_eq!(cfg.rotary_dim(), 64);
+        assert_eq!(cfg.rope_inv_freqs().len(), 32);
+        let plain = HybridConfig::from_hf_bytes(br#"{"model_type": "qwen3_5"}"#).unwrap();
+        assert_eq!(plain.mrope, None);
     }
 
     #[test]
