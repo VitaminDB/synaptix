@@ -398,20 +398,54 @@ impl LlmPipeline {
         }
     }
 
+    /// Генерация по промпту с медиа-вложениями (см. `LlmRunner::generate_streaming_media`).
+    ///
+    /// Muse Glimmer принимает картинки и видео (склейка эмбеддингов по
+    /// модальности), Qwen-гибрид — только картинки, каждая своим тензором
+    /// (по одному на прогон `image_pad`).
     fn generate_streaming_media(
         &self,
         prompt_ids: &[u32],
-        images: Option<&Tensor>,
-        video: Option<&Tensor>,
+        media: &[&MediaEmbedding],
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(), LlmError> {
         match self {
-            LlmPipeline::MuseGlimmer(p) => p
-                .generate_with_mixed_media(prompt_ids, images, video, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::MuseGlimmer(p) => {
+                let images = concat_media(media, MediaKind::Image)?;
+                let video = concat_media(media, MediaKind::Video)?;
+                p.generate_with_mixed_media(prompt_ids, images.as_ref(), video.as_ref(), cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
+            LlmPipeline::Hybrid(p) => {
+                if media.iter().any(|m| m.kind == MediaKind::Video) {
+                    return Err(LlmError(
+                        "Qwen-гибрид принимает только картинки, видео — нет".into(),
+                    ));
+                }
+                let images: Vec<Tensor> = media.iter().map(|m| m.embeds.clone()).collect();
+                p.generate_with_images(prompt_ids, &images, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             _ => Err(LlmError("архитектура не принимает медиа-вход".into())),
+        }
+    }
+
+    /// Блок-заполнитель картинки в тексте промпта. Спецтокены у архитектур
+    /// свои: Muse Glimmer — `<|image_start|><|patch|>…<|image_end|>`,
+    /// Qwen-гибрид — `<|vision_start|><|image_pad|>…<|vision_end|>`.
+    fn image_block(&self, tokens: usize) -> String {
+        match self {
+            LlmPipeline::Hybrid(_) => format!(
+                "{QWEN_VISION_START_TOKEN}{}{QWEN_VISION_END_TOKEN}",
+                QWEN_IMAGE_PAD_TOKEN.repeat(tokens)
+            ),
+            _ => format!(
+                "{IMAGE_START_TOKEN}{}{IMAGE_END_TOKEN}",
+                IMAGE_PAD_TOKEN.repeat(tokens)
+            ),
         }
     }
 
@@ -773,12 +807,18 @@ impl MediaEmbedding {
 }
 
 impl Llm {
-    /// Умеет ли архитектура принимать медиа-вход и есть ли в конфиге
-    /// `vision_config` (т.е. это multimodal-сборка, а не text-only).
+    /// Умеет ли архитектура принимать медиа-вход и есть ли это в сборке:
+    /// у Muse Glimmer — `vision_config` в конфиге, у Qwen-гибрида
+    /// (Qwen3.5/3.6/3.8) — `image_token_id` в конфиге и компонент башни
+    /// в бандле (`model.visual.*`). Иначе это text-only.
     pub fn supports_media(&self) -> bool {
         match self.pipeline.lock() {
             Ok(p) => match &*p {
                 LlmPipeline::MuseGlimmer(m) => m.config.vision.is_some(),
+                LlmPipeline::Hybrid(h) => {
+                    h.config.image_token_id.is_some()
+                        && HybridPipeline::bundle_has_vision(&self.model_path)
+                }
                 _ => false,
             },
             Err(_) => false,
@@ -790,6 +830,7 @@ impl Llm {
         match self.pipeline.lock() {
             Ok(p) => match &*p {
                 LlmPipeline::MuseGlimmer(m) => m.has_vision(),
+                LlmPipeline::Hybrid(h) => h.has_vision(),
                 _ => false,
             },
             Err(_) => false,
@@ -814,6 +855,13 @@ impl Llm {
                 m.load_vision(&self.model_path, self.compute_dtype)
                     .map_err(|e| LlmError(format!("vision load: {e}")))
             }
+            LlmPipeline::Hybrid(h) => {
+                if h.has_vision() {
+                    return Ok(true);
+                }
+                h.load_vision(&self.model_path, self.compute_dtype)
+                    .map_err(|e| LlmError(format!("vision load: {e}")))
+            }
             _ => Ok(false),
         }
     }
@@ -821,8 +869,10 @@ impl Llm {
     /// Выгружает vision-башню и возвращает её память пулу устройства.
     pub fn release_media_tower(&self) {
         if let Ok(mut guard) = self.pipeline.lock() {
-            if let LlmPipeline::MuseGlimmer(m) = &mut *guard {
-                m.release_vision();
+            match &mut *guard {
+                LlmPipeline::MuseGlimmer(m) => m.release_vision(),
+                LlmPipeline::Hybrid(h) => h.release_vision(),
+                _ => {}
             }
         }
     }
@@ -840,17 +890,17 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let LlmPipeline::MuseGlimmer(m) = &*guard else {
-            return Err(LlmError("архитектура не принимает картинки".into()));
+        let embeds = match &*guard {
+            LlmPipeline::MuseGlimmer(m) => m
+                .encode_image_limited(path, max_tokens)
+                .map_err(|e| LlmError(format!("image encode: {e}")))?,
+            LlmPipeline::Hybrid(h) => h
+                .encode_image_limited(path, max_tokens)
+                .map_err(|e| LlmError(format!("image encode: {e}")))?,
+            _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
-        let embeds = m
-            .encode_image_limited(path, max_tokens)
-            .map_err(|e| LlmError(format!("image encode: {e}")))?;
         let tokens = embeds.dims()[0];
-        let prompt_block = format!(
-            "{IMAGE_START_TOKEN}{}{IMAGE_END_TOKEN}",
-            IMAGE_PAD_TOKEN.repeat(tokens)
-        );
+        let prompt_block = guard.image_block(tokens);
         Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block })
     }
 
@@ -861,8 +911,14 @@ impl Llm {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let LlmPipeline::MuseGlimmer(m) = &*guard else {
-            return Err(LlmError("архитектура не принимает видео".into()));
+        let m = match &*guard {
+            LlmPipeline::MuseGlimmer(m) => m,
+            LlmPipeline::Hybrid(_) => {
+                return Err(LlmError(
+                    "Qwen-гибрид принимает только картинки, видео — нет".into(),
+                ))
+            }
+            _ => return Err(LlmError("архитектура не принимает видео".into())),
         };
         let (embeds, info) = m
             .encode_video(path)
@@ -877,11 +933,15 @@ impl Llm {
     }
 }
 
-/// Обёртки блока картинки в промпте (см. `MediaEmbedding::prompt_block`).
+/// Обёртки блока картинки в промпте Muse Glimmer (см. `MediaEmbedding::prompt_block`).
 const IMAGE_START_TOKEN: &str = "<|image_start|>";
 const IMAGE_END_TOKEN: &str = "<|image_end|>";
 /// Заполнитель одного vision-токена картинки — `config.image_token_id`.
 const IMAGE_PAD_TOKEN: &str = "<|patch|>";
+/// То же для Qwen-гибрида (Qwen3.5/3.6/3.8 — токены семейства Qwen-VL).
+const QWEN_VISION_START_TOKEN: &str = "<|vision_start|>";
+const QWEN_VISION_END_TOKEN: &str = "<|vision_end|>";
+const QWEN_IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
 
 pub struct LlmTokenizer {
     tokenizer: HfTokenizer,
@@ -1207,9 +1267,7 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
-        let images = concat_media(media, MediaKind::Image)?;
-        let video = concat_media(media, MediaKind::Video)?;
-        if images.is_none() && video.is_none() {
+        if media.is_empty() {
             return Err(LlmError("generate_streaming_media без вложений".into()));
         }
 
@@ -1243,13 +1301,7 @@ impl<'a> LlmGeneration<'a> {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        pipeline.generate_streaming_media(
-            prompt_ids,
-            images.as_ref(),
-            video.as_ref(),
-            cfg,
-            &mut sink,
-        )
+        pipeline.generate_streaming_media(prompt_ids, media, cfg, &mut sink)
     }
 }
 

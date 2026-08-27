@@ -289,6 +289,51 @@ impl HybridPipeline {
         self.vision.is_some()
     }
 
+    /// Есть ли в бандле компонент vision-башни — без её загрузки.
+    pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
+        synaptix_vlm_qwen3::bundle_has_vision(path)
+    }
+
+    /// Выгружает башню и возвращает её память пулу устройства.
+    pub fn release_vision(&mut self) {
+        if self.vision.take().is_some() {
+            if let Device::Cuda(o) = self.model.device {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+            }
+        }
+    }
+
+    /// Лимиты препроцессинга под потолок vision-токенов: один токен после
+    /// merge накрывает `size_factor²` пикселей, так что `max_tokens`
+    /// пересчитывается в `max_pixels` для `smart_resize`. `None`/0 — дефолт.
+    pub fn image_limits(
+        &self,
+        max_tokens: Option<usize>,
+    ) -> Result<synaptix_vlm_qwen3::PreprocessLimits, PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let mut limits = synaptix_vlm_qwen3::PreprocessLimits::default();
+        if let Some(n) = max_tokens.filter(|n| *n > 0) {
+            let f = tower.config.size_factor();
+            limits.max_pixels = limits.max_pixels.min(n * f * f);
+            limits.min_pixels = limits.min_pixels.min(limits.max_pixels);
+        }
+        Ok(limits)
+    }
+
+    /// Как [`Self::encode_image`], но с потолком на число vision-токенов
+    /// (см. [`Self::image_limits`]).
+    pub fn encode_image_limited(
+        &self,
+        path: impl AsRef<Path>,
+        max_tokens: Option<usize>,
+    ) -> Result<synaptix_core::tensor::Tensor, PipelineError> {
+        let limits = self.image_limits(max_tokens)?;
+        self.encode_image(path, limits)
+    }
+
     pub fn encode_image(
         &self,
         path: impl AsRef<Path>,
@@ -415,11 +460,32 @@ impl HybridPipeline {
 
         let t0 = std::time::Instant::now();
         let emb = self.embed_with_images(prompt_ids, image_embeds)?;
-        let hidden = no_grad(|| self.model.forward_from_hidden(&emb, &mut kv))
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        // Префилл чанками, как в текстовом пути: пик активаций гибрида
+        // растёт с длиной чанка, и single-shot по длинной истории с
+        // картинкой упирался в OOM. `prepare_cfg` уже выровнял чанк по
+        // границе GDN-скана (кратные 64 bit-exact к single-shot).
+        let chunk = match cfg.prefill_batch {
+            0 => l,
+            n => n.max(1),
+        };
+        let mut off = 0usize;
+        let mut last_hidden = None;
+        while off < l {
+            let step = chunk.min(l - off);
+            let part = emb
+                .narrow(1, off, step)
+                .and_then(|t| t.contiguous())
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let h = no_grad(|| self.model.forward_from_hidden(&part, &mut kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            last_hidden = Some(h);
+            off += step;
+        }
+        let hidden =
+            last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
         let mut logits = self
             .model
-            .head_at(&hidden, l - 1)
+            .head_at(&hidden, hidden.dims()[1] - 1)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
         let prefill_ms = t0.elapsed().as_millis();
 

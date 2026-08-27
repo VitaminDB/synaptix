@@ -10,17 +10,33 @@ use synaptix_io::weights::WeightLoader;
 use crate::config::VisionConfig;
 use crate::model::{VisionError, VisionTower, VisionWeights};
 
+/// Отдельный компонент башни — так её кладёт GGUF-репак (`--mmproj`).
 pub const VISION_COMPONENT: &str = "vision";
+
+/// Тензор, по которому узнаём башню среди весов основного компонента:
+/// HF-упаковка (`syn-pack` по safetensors) кладёт `model.visual.*` в
+/// `tensors:main` вместе с языковой моделью.
+fn probe_key() -> String {
+    format!("{}.patch_embed.proj.weight", crate::model::VIS)
+}
 
 pub struct BundleVisionWeights {
     loader: SynBundleLoader,
 }
 
 impl BundleVisionWeights {
+    /// Открывает веса башни: из компонента `vision`, если он есть в бандле,
+    /// иначе — из основного компонента (HF-имена `model.visual.*`).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VisionError> {
-        let loader = SynBundleLoader::open(path)
-            .map_err(|e| VisionError::Load(e.to_string()))?
-            .with_component(VISION_COMPONENT);
+        let path = path.as_ref();
+        let has_component = Bundle::open(path)
+            .map(|b| b.meta().components.contains_key(VISION_COMPONENT))
+            .map_err(|e| VisionError::Load(e.to_string()))?;
+        let mut loader =
+            SynBundleLoader::open(path).map_err(|e| VisionError::Load(e.to_string()))?;
+        if has_component {
+            loader = loader.with_component(VISION_COMPONENT);
+        }
         Ok(Self { loader })
     }
 
@@ -37,11 +53,21 @@ impl VisionWeights for BundleVisionWeights {
     }
 }
 
+/// Есть ли в бандле vision-башня: отдельным компонентом `vision` или
+/// тензорами `model.visual.*` в основном компоненте. Без загрузки весов —
+/// читается только заголовок safetensors (mmap).
 pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
     let Ok(b) = Bundle::open(path) else {
         return false;
     };
-    b.meta().components.contains_key(VISION_COMPONENT)
+    if b.meta().components.contains_key(VISION_COMPONENT) {
+        return true;
+    }
+    drop(b);
+    BundleVisionWeights::open(path)
+        .map(|w| w.has(&probe_key()))
+        .unwrap_or(false)
 }
 
 pub fn load_from_bundle(
