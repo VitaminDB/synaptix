@@ -21,6 +21,7 @@ use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
+use synaptix_llm_qwen4_exp::pipeline::Qwen4ExpPipeline;
 use synaptix_llm_qwen3_next_hybrid::pipeline::{HybridPipeline, MediaInput};
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
 use synaptix_tokenizer::{
@@ -361,6 +362,7 @@ pub struct LlmConfig {
 
 enum LlmPipeline {
     Qwen3(Qwen3Pipeline),
+    Qwen4Exp(Qwen4ExpPipeline),
     Hybrid(HybridPipeline),
     Llama(LlamaPipeline),
     Gemma3(GemmaPipeline),
@@ -371,6 +373,7 @@ impl LlmPipeline {
     fn rope_capacity(&self) -> usize {
         match self {
             Self::Qwen3(p) => p.model.rope_capacity(),
+            Self::Qwen4Exp(p) => p.rope_capacity(),
             Self::Hybrid(p) => p.model.rope_capacity(),
             Self::Llama(p) => p.model.rope_capacity(),
             Self::Gemma3(p) => p.model.rope_capacity(),
@@ -381,6 +384,7 @@ impl LlmPipeline {
     fn kv_bytes_per_token(&self) -> usize {
         match self {
             Self::Qwen3(p) => p.model.kv_bytes_per_token(),
+            Self::Qwen4Exp(p) => p.kv_bytes_per_token(),
             Self::Hybrid(p) => p.model.kv_bytes_per_token(),
             Self::Llama(p) => p.model.kv_bytes_per_token(),
             Self::Gemma3(p) => p.model.kv_bytes_per_token(),
@@ -391,6 +395,7 @@ impl LlmPipeline {
     fn kv_fixed_bytes(&self, batch: usize, max_seq: usize) -> usize {
         match self {
             Self::Qwen3(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Qwen4Exp(p) => p.kv_fixed_bytes(batch, max_seq),
             Self::Hybrid(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Llama(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Gemma3(p) => p.model.kv_fixed_bytes(batch, max_seq),
@@ -469,6 +474,10 @@ impl LlmPipeline {
     ) -> Result<(), LlmError> {
         match self {
             LlmPipeline::Qwen3(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Qwen4Exp(p) => p
                 .generate_streaming(prompt_ids, cfg, sink)
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
@@ -1542,6 +1551,11 @@ pub fn load_llm(
         LlmArch::Qwen3 => Qwen3Pipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Qwen3)
             .map_err(|e| LlmError(format!("load qwen3: {e}")))?,
+        LlmArch::Qwen4Exp => {
+            Qwen4ExpPipeline::load_with_precision(path, device, precision, max_seq)
+                .map(LlmPipeline::Qwen4Exp)
+                .map_err(|e| LlmError(format!("load qwen4_exp: {e}")))?
+        }
         LlmArch::Hybrid => HybridPipeline::load_with_precision_mtp(
             path,
             device,

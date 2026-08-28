@@ -178,6 +178,9 @@ pub fn run(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             HybridPipeline::load_with_precision(&args.model, device, precision, Some(args.context))
                 .map_err(|e| format!("load: {e}"))?,
         ),
+        Arch::Qwen4Exp => {
+            return Err("chat пока без qwen4_exp: используйте `synaptix run`".into())
+        }
         Arch::MuseGlimmer => ChatPipeline::MuseGlimmer(
             MusePipeline::load_with_precision(&args.model, device, precision, Some(args.context))
                 .map_err(|e| format!("load: {e}"))?,
@@ -234,6 +237,7 @@ fn arch_label(arch: Arch) -> &'static str {
         Arch::Qwen3 => "qwen3",
         Arch::Hybrid => "qwen3-next-hybrid",
         Arch::MuseGlimmer => "muse-glimmer",
+        Arch::Qwen4Exp => "qwen4-exp",
     }
 }
 

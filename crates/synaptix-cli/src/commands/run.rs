@@ -85,6 +85,7 @@ pub enum Arch {
     Qwen3,
     Hybrid,
     MuseGlimmer,
+    Qwen4Exp,
 }
 
 /// Детекция архитектуры через единый `synaptix::facade::arch`. Llama/Gemma3 в
@@ -95,6 +96,7 @@ pub fn detect_arch(path: &Path) -> Result<Arch, String> {
         LlmArch::Qwen3 => Ok(Arch::Qwen3),
         LlmArch::Hybrid => Ok(Arch::Hybrid),
         LlmArch::MuseGlimmer => Ok(Arch::MuseGlimmer),
+        LlmArch::Qwen4Exp => Ok(Arch::Qwen4Exp),
         other => Err(format!(
             "CLI run/chat поддерживает qwen3/hybrid/muse_glimmer; детектирован {other:?} — используйте synthos"
         )),
@@ -130,6 +132,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         Arch::Qwen3 => run_qwen3(&args, device, precision),
         Arch::Hybrid => run_hybrid(&args, device, precision),
         Arch::MuseGlimmer => run_muse(&args, device, precision),
+        Arch::Qwen4Exp => run_qwen4_exp(&args, device, precision),
     }
 }
 
@@ -279,6 +282,40 @@ fn run_muse(
             .generate(&prompt_ids, gen_cfg)
             .map_err(|e| format!("generate: {e}"))?
     };
+    let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
+    print_run_result(
+        &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
+    );
+    Ok(())
+}
+
+fn run_qwen4_exp(
+    args: &RunArgs,
+    device: Device,
+    precision: PrecisionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_llm_common::GenerationConfig;
+    use synaptix_llm_qwen4_exp::Qwen4ExpPipeline;
+
+    let t0 = std::time::Instant::now();
+    let pipeline =
+        Qwen4ExpPipeline::load_with_precision(&args.model, device, precision, args.max_seq)
+            .map_err(|e| format!("load: {e}"))?;
+    eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+
+    let prompt_ids = pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?;
+    eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
+
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_tokens,
+        temperature: args.temperature,
+        seed: args.seed,
+        max_seq: args.max_seq,
+        ..Default::default()
+    };
+    let (new_ids, stats) = pipeline
+        .generate(&prompt_ids, gen_cfg)
+        .map_err(|e| format!("generate: {e}"))?;
     let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
     print_run_result(
         &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,

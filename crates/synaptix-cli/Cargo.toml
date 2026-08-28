@@ -18,6 +18,7 @@ synaptix-tokenizer    = { workspace = true }
 synaptix-debug        = { workspace = true }
 synaptix-llm-common   = { workspace = true }
 synaptix-llm-qwen3    = { workspace = true }
+synaptix-llm-qwen4-exp = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
 synaptix-llm-muse-glimmer = { workspace = true }
 synaptix-vlm-qwen3    = { workspace = true }

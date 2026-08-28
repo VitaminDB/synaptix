@@ -66,10 +66,12 @@ pub enum LlmArch {
     Llama,
     Gemma3,
     MuseGlimmer,
+    Qwen4Exp,
 }
 
 /// `qwen3_next`/`qwen3_5`/`qwen3_6` → гибрид (GatedDeltaNet + full-attn);
-/// `llama` → Llama; `gemma`/`gemma3` → Gemma3; остальное → Qwen3 (dense/MoE).
+/// `qwen4_exp` → Qwen4Exp (GatedDeltaNet + QSA + MoE + PLE); `llama` → Llama;
+/// `gemma`/`gemma3` → Gemma3; остальное → Qwen3 (dense/MoE).
 pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
     let key = arch_key(path)
         .ok_or_else(|| format!("config.json/arch не найдены в {}", path.display()))?;
@@ -78,6 +80,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         "llama" => LlmArch::Llama,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,
         "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,
+        "qwen4_exp" | "qwen4_exp_text" => LlmArch::Qwen4Exp,
         _ => LlmArch::Qwen3,
     })
 }
