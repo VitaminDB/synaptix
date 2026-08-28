@@ -381,6 +381,14 @@ impl LlmPipeline {
         }
     }
 
+    /// Отдать память карты, которую держат кэши модели (у Qwen4Exp это
+    /// резидентные эксперты). Вызывается перед выгрузкой.
+    fn release_device_caches(&self) {
+        if let Self::Qwen4Exp(p) = self {
+            p.release_device_caches();
+        }
+    }
+
     fn kv_bytes_per_token(&self) -> usize {
         match self {
             Self::Qwen3(p) => p.model.kv_bytes_per_token(),
@@ -765,6 +773,13 @@ impl Llm {
             .lock()
             .map(|p| p.kv_bytes_per_token())
             .unwrap_or(0)
+    }
+
+    /// Отдать память карты, занятую кэшами модели, не дожидаясь её `Drop`.
+    pub fn release_device_caches(&self) {
+        if let Ok(p) = self.pipeline.lock() {
+            p.release_device_caches();
+        }
     }
 
     /// VRAM под KV-слои постоянного размера (ring-окно sliding-слоёв) — их нет

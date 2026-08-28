@@ -52,7 +52,7 @@ impl Qwen4ExpPipeline {
             Qwen4ExpWeights::open(path, device, precision.compute)
                 .map_err(|e| PipelineError::Load(e.to_string()))?,
         );
-        let config = weights.config.clone();
+        let mut config = weights.config.clone();
         let tokenizer = if weights.tokenizer_json.is_empty() {
             None
         } else {
@@ -62,6 +62,10 @@ impl Qwen4ExpPipeline {
             )
         };
         let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
+        // MoE считает вход своими под-чанками; если они мельче чанка префилла,
+        // каждый под-чанк заново поднимает почти всех экспертов слоя — на
+        // длинном промпте это кратный перечит всей стопки.
+        config.moe.chunk = config.moe.chunk.max(prefill_chunk());
         let expert_cache = expert_cache_for(&config, device);
         let lazy = expert_cache.is_some() && weights.has_lazy_experts(0);
         let expert_source: Option<Arc<dyn ExpertSource>> = lazy
@@ -114,6 +118,15 @@ impl Qwen4ExpPipeline {
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
+    /// Отдать память карты, которую держат резидентные эксперты. Нужно при
+    /// выгрузке модели: кэш живёт в самой модели, но её `Drop` может
+    /// задержаться, пока кто-то держит ссылку, а память освободить надо сразу.
+    pub fn release_device_caches(&self) {
+        if let Some(cache) = self.model.expert_cache() {
+            cache.clear();
+        }
+    }
+
     pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
         self.model.expert_cache_stats()
     }
@@ -162,12 +175,21 @@ impl Qwen4ExpPipeline {
         if cfg.eos_token_id.is_none() && cfg.eos_token_ids.is_empty() {
             cfg.eos_token_ids = self.config.eos_token_ids.clone();
         }
-        if cfg.prefill_batch == 0 {
-            cfg.prefill_batch = std::env::var("SYN_QWEN4EXP_PREFILL_CHUNK")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_PREFILL_CHUNK);
+        // Цена префилла здесь — число чанков, умноженное на объём экспертов:
+        // любой чанк длиннее сотни токенов задевает почти все 512 экспертов
+        // слоя, поэтому мелкий чанк означает лишний полный прогон весов через
+        // шину. Внешнюю настройку (её ставят ради пика VRAM у плотных
+        // моделей) поднимаем до своего минимума, но не опускаем ниже неё.
+        let want = prefill_chunk();
+        if cfg.prefill_batch < want {
+            if cfg.prefill_batch > 0 {
+                eprintln!(
+                    "[qwen4_exp] чанк префилла поднят с {} до {want}: на мелких чанках \
+                     эксперты перечитываются целиком на каждый",
+                    cfg.prefill_batch
+                );
+            }
+            cfg.prefill_batch = want;
         }
         cfg
     }
@@ -264,6 +286,14 @@ impl Qwen4ExpPipeline {
     }
 }
 
+fn prefill_chunk() -> usize {
+    std::env::var("SYN_QWEN4EXP_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK)
+}
+
 /// Сколько VRAM уйдёт под KV и ключи индексатора при полном окне.
 fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize) -> usize {
     let qsa = cfg
@@ -289,15 +319,22 @@ fn warn_if_cache_too_big(cache: &Arc<ExpertCache>, device: Device, kv_reserve: u
         return;
     };
     let need = cache.capacity_bytes() + kv_reserve;
-    if need > free {
-        eprintln!(
-            "[qwen4_exp] кэш экспертов {:.1} ГБ плюс KV {:.1} ГБ против {:.1} ГБ свободных — \
-             при нехватке уменьшите SYN_QWEN4EXP_EXPERT_CACHE_GB",
-            cache.capacity_bytes() as f64 / (1u64 << 30) as f64,
-            kv_reserve as f64 / (1u64 << 30) as f64,
-            free as f64 / (1u64 << 30) as f64,
-        );
+    if need <= free {
+        return;
     }
+    // Свободного меньше, чем просят: карту делят с другими моделями. Ужимаем,
+    // но не в ноль — без кэша каждый токен перечитывает всех своих экспертов.
+    // `cuMemGetInfo` не знает про уже зарезервированное пулами, поэтому
+    // нижнюю границу держим щедрой.
+    let room = free.saturating_sub(kv_reserve + (1 << 30));
+    let capacity = cache.capacity_bytes().min(room).max(2 << 30);
+    eprintln!(
+        "[qwen4_exp] кэш экспертов ужат до {:.1} ГБ: свободно {:.1} ГБ, под KV нужно {:.1} ГБ",
+        capacity as f64 / (1u64 << 30) as f64,
+        free as f64 / (1u64 << 30) as f64,
+        kv_reserve as f64 / (1u64 << 30) as f64,
+    );
+    cache.set_capacity(capacity);
 }
 
 /// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
