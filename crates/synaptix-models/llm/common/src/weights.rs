@@ -141,16 +141,11 @@ impl QLinear {
                     + l.bias().map_or(0, |b| b.dtype().bytes_for_numel(b.numel()))
             }
             QLinear::Quant(w) => {
-                // NVFP4-ядро GEMM держит вторую, перемешанную копию весов —
-                // она появляется на первом же префилле, и не учитывать её в
-                // бюджете кэша значит промахнуться вдвое.
+                // У NVFP4 первое умножение строит перемешанную копию и тут же
+                // освобождает исходную, так что постоянный размер — один
+                // packed плюс масштабы; двойной вес держится лишь мгновение.
                 let numel = w.n() * w.k();
-                let packed = w.dtype().bytes_for_numel(numel) + numel / 16;
-                if w.dtype() == DType::NVFP4 {
-                    packed * 2
-                } else {
-                    packed
-                }
+                w.dtype().bytes_for_numel(numel) + numel / 16
             }
         }
     }

@@ -13,6 +13,16 @@ use crate::norm::coerr;
 
 const CHUNK: usize = 64;
 
+/// Длина скана для чанка `s`. Ядро дополняет длину до кратной чанку, поэтому
+/// на декоде (`s = 1`) чанк в 64 шага означал бы 64 шага скана вместо одного.
+fn scan_chunk(s: usize) -> usize {
+    if s < CHUNK {
+        s.max(1)
+    } else {
+        CHUNK
+    }
+}
+
 pub struct LinearAttn {
     in_proj_qkv: QLinear,
     in_proj_a: QLinear,
@@ -298,7 +308,7 @@ impl LinearAttn {
                 dk,
                 dv,
                 self.conv_k,
-                CHUNK,
+                scan_chunk(s),
                 self.q_scale,
                 true,
             ))?
