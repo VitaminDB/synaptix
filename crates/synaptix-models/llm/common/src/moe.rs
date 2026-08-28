@@ -399,6 +399,19 @@ struct SharedExpert {
 /// Откуда брать эксперта, которого нет на устройстве. Реализация читает его
 /// из хранилища модели (квантованный `.syn` отдаёт срез стопки прямо из
 /// mmap), так что в оперативной памяти эксперты не лежат вовсе.
+/// Сбор строк по индексам. `index_select` на карте копирует строку за строкой
+/// и на перестановке шестидесяти тысяч строк стоит дороже, чем все умножения
+/// экспертов вместе взятые; embed-ядро читает индексы прямо с карты.
+fn take_rows(src: &Tensor, ids: &Tensor) -> Result<Tensor, ModelError> {
+    match src.embed_gather(ids) {
+        Ok(t) => Ok(t),
+        Err(synaptix_core::error::SynaptixError::Unsupported(_)) => src
+            .index_select(0, ids)
+            .map_err(|e| ModelError::Forward(format!("MoE: сбор строк: {e}"))),
+        Err(e) => Err(ModelError::Forward(format!("MoE: сбор строк: {e}"))),
+    }
+}
+
 /// До скольких токенов разом MoE считает батчем GEMV. Спекулятивный шаг
 /// приносит пару, а батч — единственный путь, где вес уже лежит перемешанным:
 /// GEMM пришлось бы читать освобождённую packed-копию и тянуть эксперта заново.
@@ -788,15 +801,16 @@ impl MoeFfn {
     }
 
     fn forward_chunk(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+        use crate::profile::stage;
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
-        let (experts, weights) = self.route(x)?;
+        let (experts, weights) = stage("moe:route", || self.route(x))?;
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
         // страницам бандла стоит дороже самого умножения.
         let batchable = t <= batch_tokens();
-        self.prefetch(&experts, &weights, batchable);
+        stage("moe:prefetch", || self.prefetch(&experts, &weights, batchable));
         if batchable {
             if let Some(out) = self.forward_pairs_batched(x, &experts, &weights)? {
                 return Ok(out);
@@ -808,12 +822,12 @@ impl MoeFfn {
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
 
-        let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
-        let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
-            .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
-        let gathered = x
-            .index_select(0, &row_idx)
-            .map_err(|e| ModelError::Forward(format!("MoE: сбор токенов: {e}")))?;
+        let gathered = stage("moe:gather", || -> Result<Tensor, ModelError> {
+            let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
+            let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
+                .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
+            take_rows(x, &row_idx)
+        })?;
 
         let mut outs: Vec<Tensor> = Vec::new();
         let mut pos = 0usize;
@@ -835,11 +849,13 @@ impl MoeFfn {
                 pos = end;
                 continue;
             }
-            let slice = gathered
-                .narrow(0, pos, end - pos)
-                .and_then(|t| t.contiguous())
-                .map_err(|e| ModelError::Forward(format!("MoE: срез эксперта {expert}: {e}")))?;
-            let out = self.expert_forward(expert as usize, &slice)?;
+            let slice = stage("moe:slice", || {
+                gathered
+                    .narrow(0, pos, end - pos)
+                    .and_then(|t| t.contiguous())
+                    .map_err(|e| ModelError::Forward(format!("MoE: срез эксперта {expert}: {e}")))
+            })?;
+            let out = stage("moe:expert", || self.expert_forward(expert as usize, &slice))?;
             let out = if out.dtype() == self.compute {
                 out
             } else {
@@ -854,13 +870,14 @@ impl MoeFfn {
             }
         }
 
-        let refs: Vec<&Tensor> = outs.iter().collect();
-        let stacked = if refs.len() == 1 {
-            outs[0].clone()
-        } else {
+        let stacked = stage("moe:stack", || -> Result<Tensor, ModelError> {
+            let refs: Vec<&Tensor> = outs.iter().collect();
+            if refs.len() == 1 {
+                return Ok(outs[0].clone());
+            }
             Tensor::cat(&refs, 0)
-                .map_err(|e| ModelError::Forward(format!("MoE: сборка экспертов: {e}")))?
-        };
+                .map_err(|e| ModelError::Forward(format!("MoE: сборка экспертов: {e}")))
+        })?;
 
         // Вес пары применяется до возврата строк на места.
         let scale: Vec<f32> = order.iter().map(|p| weights[*p as usize]).collect();
@@ -879,16 +896,18 @@ impl MoeFfn {
         }
         let inverse = Tensor::from_vec::<_, u32>(inverse, vec![t * k], self.device)
             .map_err(|e| ModelError::Forward(format!("MoE: обратные индексы: {e}")))?;
-        let mixed = scaled
-            .index_select(0, &inverse)
-            .and_then(|m| m.reshape((t, k, self.cfg.hidden_size)))
-            .and_then(|m| m.sum([1usize]))
-            .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?;
+        let mixed = stage("moe:scatter", || -> Result<Tensor, ModelError> {
+            let restored = take_rows(&scaled, &inverse)?;
+            restored
+                .reshape((t, k, self.cfg.hidden_size))
+                .and_then(|m| m.sum([1usize]))
+                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))
+        })?;
         let mixed = self.to_compute(mixed)?;
 
         match &self.shared {
             Some(shared) => {
-                let s = self.shared_forward(shared, x)?;
+                let s = stage("moe:shared", || self.shared_forward(shared, x))?;
                 mixed
                     .add(&s)
                     .map_err(|e| ModelError::Forward(format!("MoE: shared expert: {e}")))

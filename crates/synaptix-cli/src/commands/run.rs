@@ -324,6 +324,10 @@ fn run_qwen4_exp(
     if !report.is_empty() {
         eprintln!("synaptix run: этапы forward:\n{report}");
     }
+    let moe = synaptix_llm_common::profile::report();
+    if !moe.is_empty() {
+        eprintln!("synaptix run: этапы MoE:\n{moe}");
+    }
     if let Some(c) = pipeline.expert_cache_stats() {
         let total = c.hits + c.misses;
         eprintln!(
