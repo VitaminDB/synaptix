@@ -156,6 +156,64 @@ fn matches_hf_reference() {
 }
 
 #[test]
+fn bundle_matches_directory() {
+    let Some(dir) = ref_dir() else {
+        return;
+    };
+    let Ok(bundle) = std::env::var("SYN_QWEN4EXP_REF_BUNDLE") else {
+        eprintln!("SYN_QWEN4EXP_REF_BUNDLE не задан — пропуск");
+        return;
+    };
+    let bundle = PathBuf::from(bundle);
+    if !bundle.exists() {
+        eprintln!("бандл {} не найден — пропуск", bundle.display());
+        return;
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    let tokens = tokens_of(&dir);
+
+    let weights = Qwen4ExpWeights::open(&bundle, Device::Cpu, DType::F32).expect("open bundle");
+    let cfg = weights.config.clone();
+    let model = Qwen4ExpModel::build(
+        &cfg,
+        &weights,
+        Device::Cpu,
+        DType::F32,
+        DType::F32,
+        cfg.max_position_embeddings.min(4096),
+        &|layer| weights.ngram_rows(layer),
+    )
+    .expect("build from bundle");
+
+    let mut cache = model.make_cache(tokens.len() + 8).expect("cache");
+    let got = model
+        .forward(&tokens, &mut cache)
+        .expect("forward")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    let refs = SafetensorsLoader::open(dir.join("reference.safetensors")).expect("reference");
+    let (want, _) = read_vec(&refs, "logits");
+    let (max_abs, _) = diff(&got, &want);
+    eprintln!("бандл против каталога: max_abs={max_abs:.3e}");
+    let mut mismatched = 0usize;
+    let vocab = cfg.vocab_size;
+    for row in 0..tokens.len() {
+        let (m, _) = diff(&got[row * vocab..(row + 1) * vocab], &want[row * vocab..(row + 1) * vocab]);
+        if m >= 2e-3 {
+            mismatched += 1;
+        }
+    }
+    assert!(
+        mismatched * 10 <= tokens.len(),
+        "бандл разошёлся на {mismatched} строках из {}",
+        tokens.len()
+    );
+}
+
+#[test]
 fn decode_matches_prefill() {
     let Some(dir) = ref_dir() else {
         return;

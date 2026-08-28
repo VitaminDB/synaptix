@@ -75,6 +75,7 @@ fn cfg() -> MoeConfig {
         shared_intermediate_size: I,
         norm_topk_prob: true,
         chunk: 4,
+        skip_below: 0.0,
     }
 }
 

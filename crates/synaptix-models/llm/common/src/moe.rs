@@ -50,6 +50,11 @@ pub struct MoeConfig {
     /// Сколько токенов обрабатывать за один проход. Пик памяти — примерно
     /// `chunk · k · H`, поэтому длинный prefill режется на части.
     pub chunk: usize,
+    /// Аварийный клапан оффлоада: пара «токен—эксперт» с весом ниже порога
+    /// пропускается, если эксперта нет в кэше на устройстве. Экономит перенос
+    /// весов ценой небольшой потери массы у последних слотов top-k. `0` —
+    /// выключено, и это значение по умолчанию.
+    pub skip_below: f32,
 }
 
 impl MoeConfig {
@@ -63,6 +68,7 @@ impl MoeConfig {
             shared_intermediate_size: 640,
             norm_topk_prob: true,
             chunk: 512,
+            skip_below: 0.0,
         }
     }
 }
@@ -116,12 +122,16 @@ struct CacheInner {
     bytes: usize,
     hits: u64,
     misses: u64,
+    skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertCacheStats {
     pub hits: u64,
     pub misses: u64,
+    /// Сколько пар «токен—эксперт» отброшено аварийным клапаном
+    /// ([`MoeConfig::skip_below`]).
+    pub skipped: u64,
     pub resident: usize,
     pub bytes: usize,
 }
@@ -137,6 +147,7 @@ impl ExpertCache {
                 bytes: 0,
                 hits: 0,
                 misses: 0,
+                skipped: 0,
             }),
         })
     }
@@ -154,6 +165,7 @@ impl ExpertCache {
         ExpertCacheStats {
             hits: inner.hits,
             misses: inner.misses,
+            skipped: inner.skipped,
             resident: inner.map.len(),
             bytes: inner.bytes,
         }
@@ -164,6 +176,12 @@ impl ExpertCache {
         inner.map.clear();
         inner.order.clear();
         inner.bytes = 0;
+    }
+
+    fn note_skipped(&self, count: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.skipped += count;
+        }
     }
 
     fn get(&self, key: (usize, usize)) -> Option<Arc<Expert>> {
@@ -179,6 +197,13 @@ impl ExpertCache {
                 None
             }
         }
+    }
+
+    fn contains(&self, key: (usize, usize)) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.map.contains_key(&key))
+            .unwrap_or(false)
     }
 
     fn insert(&self, key: (usize, usize), expert: Arc<Expert>) {
@@ -521,18 +546,41 @@ impl MoeFfn {
 
         let mut outs: Vec<Tensor> = Vec::new();
         let mut pos = 0usize;
+        let mut skipped = 0u64;
         while pos < order.len() {
             let expert = experts[order[pos] as usize];
             let mut end = pos + 1;
             while end < order.len() && experts[order[end] as usize] == expert {
                 end += 1;
             }
+            // Аварийный клапан: эксперт, которого нет на устройстве, а все его
+            // пары в этом чанке весят меньше порога, не стоит переноса.
+            if self.skip_expert(expert as usize, &order[pos..end], &weights) {
+                skipped += (end - pos) as u64;
+                outs.push(
+                    Tensor::zeros(vec![end - pos, self.cfg.hidden_size], self.compute, self.device)
+                        .map_err(|e| ModelError::Forward(format!("MoE: пропуск эксперта: {e}")))?,
+                );
+                pos = end;
+                continue;
+            }
             let slice = gathered
                 .narrow(0, pos, end - pos)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| ModelError::Forward(format!("MoE: срез эксперта {expert}: {e}")))?;
-            outs.push(self.expert_forward(expert as usize, &slice)?);
+            let out = self.expert_forward(expert as usize, &slice)?;
+            let out = if out.dtype() == self.compute {
+                out
+            } else {
+                self.to_compute(out)?
+            };
+            outs.push(out);
             pos = end;
+        }
+        if skipped > 0 {
+            if let Some(cache) = &self.cache {
+                cache.note_skipped(skipped);
+            }
         }
 
         let refs: Vec<&Tensor> = outs.iter().collect();
@@ -576,6 +624,19 @@ impl MoeFfn {
             }
             None => Ok(mixed),
         }
+    }
+
+    /// Стоит ли пропустить эксперта: только при включённом оффлоаде, когда его
+    /// нет на устройстве и все его пары в чанке весят меньше порога.
+    fn skip_expert(&self, expert: usize, pairs: &[u32], weights: &[f32]) -> bool {
+        if self.cfg.skip_below <= 0.0 {
+            return false;
+        }
+        let Some(cache) = &self.cache else { return false };
+        if pairs.iter().any(|p| weights[*p as usize] >= self.cfg.skip_below) {
+            return false;
+        }
+        !cache.contains((self.layer_id, expert))
     }
 
     fn expert_forward(&self, expert: usize, x: &Tensor) -> Result<Tensor, ModelError> {

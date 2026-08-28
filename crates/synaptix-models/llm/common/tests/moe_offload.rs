@@ -84,6 +84,7 @@ fn cfg() -> MoeConfig {
         shared_intermediate_size: I,
         norm_topk_prob: true,
         chunk: 5,
+        skip_below: 0.0,
     }
 }
 
@@ -138,6 +139,60 @@ fn offloaded_matches_resident() {
         one_expert * 4
     );
     assert!(stats.resident <= 4, "резидентов больше ёмкости: {}", stats.resident);
+}
+
+#[test]
+fn skip_below_drops_only_weak_pairs() {
+    synaptix_kernels_cpu::ensure_registered();
+    let x = Tensor::from_vec::<_, f32>(noise(11, T * H), vec![T, H], Device::Cpu).unwrap();
+    let one_expert = (2 * I * H + H * I) * std::mem::size_of::<f32>();
+    let cache = ExpertCache::new(Device::Cpu, one_expert * 2);
+
+    let w = weights(0);
+    let exact = MoeFfn::load_offloaded(
+        &w,
+        "mlp",
+        cfg(),
+        Device::Cpu,
+        DType::F32,
+        DType::F32,
+        cache.clone(),
+        0,
+    )
+    .unwrap();
+    let want = host_vec(&exact.forward(&x).unwrap());
+
+    cache.clear();
+    let mut approx_cfg = cfg();
+    // Порог выше веса последнего слота top-k, но ниже первого: отбрасывается
+    // хвост роутинга, основной вклад остаётся.
+    approx_cfg.skip_below = 0.34;
+    let approx = MoeFfn::load_offloaded(
+        &w,
+        "mlp",
+        approx_cfg,
+        Device::Cpu,
+        DType::F32,
+        DType::F32,
+        cache.clone(),
+        1,
+    )
+    .unwrap();
+    let got = host_vec(&approx.forward(&x).unwrap());
+
+    let stats = cache.stats();
+    assert!(stats.skipped > 0, "клапан не сработал");
+    let max_diff = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    assert!(max_diff > 0.0, "выход не изменился — клапан ничего не отбросил");
+    assert!(
+        max_diff < scale,
+        "клапан снёс больше, чем весит сам выход: {max_diff} против {scale}"
+    );
 }
 
 #[test]

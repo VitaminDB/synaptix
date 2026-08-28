@@ -99,6 +99,7 @@ fn cfg(with_shared: bool, norm_topk_prob: bool) -> MoeConfig {
         shared_intermediate_size: if with_shared { I } else { 0 },
         norm_topk_prob,
         chunk: 3, // меньше T — заодно проверяется склейка чанков
+        skip_below: 0.0,
     }
 }
 

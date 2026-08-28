@@ -203,6 +203,10 @@ impl Qwen4ExpConfig {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
             chunk: 512,
+            skip_below: std::env::var("SYN_MOE_SKIP_BELOW")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.0),
         };
 
         let ple_layer_ids: Vec<usize> = text
