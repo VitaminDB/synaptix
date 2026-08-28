@@ -320,6 +320,19 @@ fn run_qwen4_exp(
     print_run_result(
         &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
     );
+    if let Some(c) = pipeline.expert_cache_stats() {
+        let total = c.hits + c.misses;
+        eprintln!(
+            "synaptix run: эксперты — {} резидентов ({:.1} ГБ), обращений {}, подкачано {} ({:.1} ГБ) за {:.1} с, пропущено {}",
+            c.resident,
+            c.bytes as f64 / (1u64 << 30) as f64,
+            total,
+            c.fetched + c.misses,
+            (c.fetched + c.misses) as f64 * 2.9 / 1024.0,
+            c.fetch_millis as f64 / 1000.0,
+            c.skipped,
+        );
+    }
     Ok(())
 }
 

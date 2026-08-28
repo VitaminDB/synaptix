@@ -9,11 +9,12 @@ use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader};
 use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
-use synaptix_llm_common::{ModelError, WeightSource};
+use synaptix_llm_common::moe::ExpertSource;
+use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 
 use crate::config::Qwen4ExpConfig;
 use crate::model::LM_PREFIX;
-use crate::ngram::{CachedRows, NGramRows, TensorRows};
+use crate::ngram::{decode_mxfp8_row, CachedRows, NGramRows, TensorRows};
 
 pub enum Source {
     Files(Arc<SafetensorsLoader>),
@@ -22,6 +23,9 @@ pub enum Source {
 
 pub struct Qwen4ExpWeights {
     source: Source,
+    /// Второй взгляд на тот же mmap бандла — нужен, чтобы читать блобы
+    /// `.qpacked`/`.qscales` построчно, без подъёма всего тензора.
+    raw: Option<Arc<SafetensorsLoader>>,
     text_prefix: bool,
     pub config: Qwen4ExpConfig,
     pub tokenizer_json: Vec<u8>,
@@ -58,6 +62,7 @@ impl Qwen4ExpWeights {
         let text_prefix = !raw_contains(&source, &format!("{LM_PREFIX}.embed_tokens.weight"));
         Ok(Self {
             source,
+            raw: None,
             text_prefix,
             config,
             tokenizer_json,
@@ -88,8 +93,10 @@ impl Qwen4ExpWeights {
             .with_device(device);
         let source = Source::Bundle(loader);
         let text_prefix = !raw_contains(&source, &format!("{LM_PREFIX}.embed_tokens.weight"));
+        let raw = SafetensorsLoader::open_bundle(path, None).ok().map(Arc::new);
         Ok(Self {
             source,
+            raw,
             text_prefix,
             config,
             tokenizer_json,
@@ -115,6 +122,9 @@ impl Qwen4ExpWeights {
             .map(|i| format!("{prefix}.shard_{i}.weight"))
             .collect();
         let names: Vec<String> = names.iter().map(|n| self.resolve(n)).collect();
+        if let Some(table) = self.quant_ngram_rows(&names)? {
+            return Ok(table);
+        }
         match &self.source {
             Source::Files(loader) => {
                 let (_, dtype, shape) = loader
@@ -154,6 +164,137 @@ fn ngram_cache_bytes() -> usize {
     match std::env::var("SYN_QWEN4EXP_NGRAM_CACHE_MB") {
         Ok(v) => v.trim().parse::<usize>().unwrap_or(0) * 1024 * 1024,
         Err(_) => 512 * 1024 * 1024,
+    }
+}
+
+impl Qwen4ExpWeights {
+    /// Один эксперт из квантованной стопки `[E, N, K]` — прямо из mmap,
+    /// без подъёма всей стопки. `None` — стопка в источнике не квантована.
+    pub fn quant_expert(
+        &self,
+        key: &str,
+        expert: usize,
+        device: Device,
+    ) -> Option<Result<QuantWeight, ModelError>> {
+        match &self.source {
+            Source::Bundle(l) => Some(
+                l.load_quant_expert(&self.resolve(key), expert, device)?
+                    .map_err(|e| ModelError::Load(e.to_string())),
+            ),
+            Source::Files(_) => None,
+        }
+    }
+
+    /// Готов ли источник отдавать экспертов по одному (квантованный бандл).
+    pub fn has_lazy_experts(&self, layer: usize) -> bool {
+        let key = format!("{LM_PREFIX}.layers.{layer}.mlp.experts.gate_up_proj");
+        match &self.source {
+            Source::Bundle(l) => l.quant_dims(&self.resolve(&key)).is_some(),
+            Source::Files(_) => false,
+        }
+    }
+
+    /// Квантованная таблица n-грамм: строки читаются прямо из блобов
+    /// `.qpacked`/`.qscales` и декодируются на лету, без подъёма шарда
+    /// целиком (один шард — 380 МБ, вся таблица — полсотни гигабайт).
+    fn quant_ngram_rows(&self, names: &[String]) -> Result<Option<Box<dyn NGramRows>>, ModelError> {
+        let (Source::Bundle(bundle), Some(raw)) = (&self.source, &self.raw) else {
+            return Ok(None);
+        };
+        let Some(dims) = bundle.quant_dims(&names[0]) else {
+            return Ok(None);
+        };
+        let (slices, rows, dim) = dims;
+        if slices != 1 {
+            return Err(ModelError::Load(format!(
+                "{}: таблица n-грамм оказалась стопкой из {slices} матриц",
+                names[0]
+            )));
+        }
+        let mut packed = Vec::with_capacity(names.len());
+        let mut scales = Vec::with_capacity(names.len());
+        for name in names {
+            let (p, s) = resolve_quant_blobs(raw, name).ok_or_else(|| {
+                ModelError::Load(format!("{name}: в бандле нет пары .qpacked/.qscales"))
+            })?;
+            raw.advise_random(&p);
+            raw.advise_random(&s);
+            packed.push(p);
+            scales.push(s);
+        }
+        let table = Box::new(MxfpRows {
+            loader: raw.clone(),
+            packed,
+            scales,
+            rows_per_shard: rows,
+            dim,
+        });
+        Ok(Some(match ngram_cache_bytes() {
+            0 => table,
+            bytes => Box::new(CachedRows::new(table, bytes)),
+        }))
+    }
+}
+
+fn resolve_quant_blobs(loader: &SafetensorsLoader, name: &str) -> Option<(String, String)> {
+    for prefix in ["", "model."] {
+        let base = format!("{prefix}{name}");
+        let packed = format!("{base}.qpacked");
+        let scales = format!("{base}.qscales");
+        if loader.raw_bytes(&packed).is_some() && loader.raw_bytes(&scales).is_some() {
+            return Some((packed, scales));
+        }
+    }
+    None
+}
+
+/// Строки MXFP8-таблицы: `packed` — E4M3 по байту на элемент, `scales` —
+/// E8M0 по байту на блок из 32.
+struct MxfpRows {
+    loader: Arc<SafetensorsLoader>,
+    packed: Vec<String>,
+    scales: Vec<String>,
+    rows_per_shard: usize,
+    dim: usize,
+}
+
+impl NGramRows for MxfpRows {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn rows(&self) -> usize {
+        self.rows_per_shard * self.packed.len()
+    }
+
+    fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<(), ModelError> {
+        let blocks = self.dim.div_ceil(32);
+        for (i, id) in ids.iter().enumerate() {
+            let id = *id as usize;
+            let shard = id / self.rows_per_shard;
+            let row = id % self.rows_per_shard;
+            let packed_name = self
+                .packed
+                .get(shard)
+                .ok_or_else(|| ModelError::Forward(format!("n-gram: шард {shard} вне таблицы")))?;
+            let scales_name = &self.scales[shard];
+            let (packed, _, _) = self
+                .loader
+                .raw_bytes(packed_name)
+                .ok_or_else(|| ModelError::Forward(format!("n-gram: нет {packed_name}")))?;
+            let (scales, _, _) = self
+                .loader
+                .raw_bytes(scales_name)
+                .ok_or_else(|| ModelError::Forward(format!("n-gram: нет {scales_name}")))?;
+            let p = packed
+                .get(row * self.dim..(row + 1) * self.dim)
+                .ok_or_else(|| ModelError::Forward(format!("n-gram: строка {id} вне шарда")))?;
+            let s = scales
+                .get(row * blocks..(row + 1) * blocks)
+                .ok_or_else(|| ModelError::Forward(format!("n-gram: масштабы строки {id} вне шарда")))?;
+            decode_mxfp8_row(p, s, &mut out[i * self.dim..(i + 1) * self.dim]);
+        }
+        Ok(())
     }
 }
 
@@ -201,7 +342,9 @@ impl NGramRows for MmapRows {
 fn raw_contains(source: &Source, key: &str) -> bool {
     match source {
         Source::Files(l) => l.contains(key),
-        Source::Bundle(l) => l.names().iter().any(|n| *n == key),
+        Source::Bundle(l) => {
+            l.names().iter().any(|n| *n == key) || l.quant_dims(key).is_some()
+        }
     }
 }
 
@@ -228,6 +371,8 @@ impl WeightSource for Qwen4ExpWeights {
     }
 
     fn contains(&self, key: &str) -> bool {
+        // В квантованном бандле исходного тензора нет — вместо него лежит
+        // пара `.qpacked`/`.qscales`, и знает о ней только манифест.
         raw_contains(&self.source, &self.resolve(key))
     }
 
@@ -258,4 +403,37 @@ pub enum LoadError {
     Io(String),
     #[error("config: {0}")]
     Config(String),
+}
+
+
+/// Источник экспертов поверх квантованного бандла: каждая пара
+/// `gate_up`/`down` читается срезом стопки в момент промаха кэша.
+pub struct BundleExperts {
+    weights: Arc<Qwen4ExpWeights>,
+}
+
+impl BundleExperts {
+    pub fn new(weights: Arc<Qwen4ExpWeights>) -> Self {
+        Self { weights }
+    }
+}
+
+impl ExpertSource for BundleExperts {
+    fn fetch(
+        &self,
+        layer: usize,
+        expert: usize,
+        device: Device,
+    ) -> Result<(QLinear, QLinear), ModelError> {
+        let prefix = format!("{LM_PREFIX}.layers.{layer}.mlp.experts");
+        let one = |name: &str| -> Result<QLinear, ModelError> {
+            let key = format!("{prefix}.{name}");
+            let w = self
+                .weights
+                .quant_expert(&key, expert, device)
+                .ok_or_else(|| ModelError::Load(format!("{key}: стопка не квантована")))??;
+            Ok(QLinear::Quant(w))
+        };
+        Ok((one("gate_up_proj")?, one("down_proj")?))
+    }
 }

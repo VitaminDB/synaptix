@@ -1,9 +1,10 @@
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
+use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 use std::sync::Arc;
 
-use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, MoeFfn};
+use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, ExpertSource, MoeFfn};
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::attention::linear::GatedDeltaNetState;
 use synaptix_ops::embed::token_embedding;
@@ -64,11 +65,18 @@ impl ModelCache {
 
 pub type NGramTableFactory<'a> = dyn Fn(usize) -> Result<Box<dyn NGramRows>, ModelError> + 'a;
 
+/// Таблица токен-эмбеддингов: в квантованном бандле она лежит MXFP8 и
+/// читается gather-ядром, в плотном — обычным `index_select`.
+pub enum EmbedTable {
+    Dense(Tensor),
+    Quant(QuantWeight),
+}
+
 pub struct Qwen4ExpModel {
     pub config: Qwen4ExpConfig,
     pub device: Device,
     pub compute: DType,
-    embed: Tensor,
+    embed: EmbedTable,
     blocks: Vec<Block>,
     mixer_hc: GatedResidual,
     lm_head: QLinear,
@@ -87,7 +95,17 @@ impl Qwen4ExpModel {
         rope_capacity: usize,
         ngram_table: &NGramTableFactory<'_>,
     ) -> Result<Self, ModelError> {
-        Self::build_with_cache(cfg, weights, device, compute, quant, rope_capacity, ngram_table, None)
+        Self::build_with_cache(
+            cfg,
+            weights,
+            device,
+            compute,
+            quant,
+            rope_capacity,
+            ngram_table,
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -100,10 +118,22 @@ impl Qwen4ExpModel {
         rope_capacity: usize,
         ngram_table: &NGramTableFactory<'_>,
         expert_cache: Option<Arc<ExpertCache>>,
+        expert_source: Option<Arc<dyn ExpertSource>>,
     ) -> Result<Self, ModelError> {
-        let embed = weights.tensor(&format!("{LM_PREFIX}.embed_tokens.weight"), device, compute)?;
+        let embed_key = format!("{LM_PREFIX}.embed_tokens.weight");
+        let embed = match weights.quant(&embed_key, device) {
+            Some(q) => EmbedTable::Quant(q?),
+            None => EmbedTable::Dense(weights.tensor(&embed_key, device, compute)?),
+        };
         let lm_head = if cfg.tie_word_embeddings {
-            QLinear::build(embed.clone(), compute, compute)?
+            match &embed {
+                EmbedTable::Dense(t) => QLinear::build(t.clone(), compute, compute)?,
+                EmbedTable::Quant(_) => {
+                    return Err(ModelError::Build(
+                        "tie_word_embeddings с квантованными эмбеддингами не поддержан".into(),
+                    ))
+                }
+            }
         } else if let Some(prequant) = weights.quant("lm_head.weight", device) {
             QLinear::Quant(prequant?)
         } else {
@@ -137,8 +167,19 @@ impl Qwen4ExpModel {
                     quant,
                 )?),
             };
-            let moe = match &expert_cache {
-                Some(cache) => MoeFfn::load_offloaded(
+            let moe = match (&expert_cache, &expert_source) {
+                (Some(cache), Some(source)) => MoeFfn::load_lazy(
+                    weights,
+                    &format!("{prefix}.mlp"),
+                    cfg.moe.clone(),
+                    device,
+                    compute,
+                    quant,
+                    cache.clone(),
+                    l,
+                    source.clone(),
+                )?,
+                (Some(cache), None) => MoeFfn::load_offloaded(
                     weights,
                     &format!("{prefix}.mlp"),
                     cfg.moe.clone(),
@@ -148,7 +189,7 @@ impl Qwen4ExpModel {
                     cache.clone(),
                     l,
                 )?,
-                None => MoeFfn::load(
+                (None, _) => MoeFfn::load(
                     weights,
                     &format!("{prefix}.mlp"),
                     cfg.moe.clone(),
@@ -274,7 +315,13 @@ impl Qwen4ExpModel {
     pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor, ModelError> {
         let ids = Tensor::from_vec(tokens.to_vec(), vec![tokens.len()], self.device)
             .map_err(|e| ModelError::Forward(e.to_string()))?;
-        coerr(token_embedding(&ids, &self.embed))
+        match &self.embed {
+            EmbedTable::Dense(t) => coerr(token_embedding(&ids, t)),
+            EmbedTable::Quant(q) => {
+                let rows = coerr(q.embed_gather(&ids))?;
+                coerr(rows.to_dtype(self.compute))
+            }
+        }
     }
 
     pub fn forward_hidden(

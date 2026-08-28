@@ -107,6 +107,42 @@ pub fn decode_rows(bytes: &[u8], dtype: DType, out: &mut [f32]) {
     }
 }
 
+/// Одна строка MXFP8: `packed` — E4M3 по байту на элемент, `scales` — E8M0,
+/// по байту на блок из 32 элементов. Значение = e4m3 · 2^(scale − 127).
+pub fn decode_mxfp8_row(packed: &[u8], scales: &[u8], out: &mut [f32]) {
+    for (i, o) in out.iter_mut().enumerate() {
+        let scale = scales[i / 32];
+        let mult = if scale == 0 {
+            0.0
+        } else {
+            f32::from_bits((scale as u32) << 23)
+        };
+        *o = e4m3_to_f32(packed[i]) * mult;
+    }
+}
+
+pub fn e4m3_to_f32(raw: u8) -> f32 {
+    let sign = ((raw >> 7) as u32) << 31;
+    let exp = ((raw >> 3) & 0x0f) as u32;
+    let mant = (raw & 0x07) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut e = -1i32;
+        let mut m = mant;
+        while m & 0x08 == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        return f32::from_bits(sign | (((127 - 7 + e + 1) as u32) << 23) | ((m & 0x07) << 20));
+    }
+    if exp == 0x0f && mant == 0x07 {
+        return f32::NAN;
+    }
+    f32::from_bits(sign | ((exp + 127 - 7) << 23) | (mant << 20))
+}
+
 fn f16_to_f32(raw: u16) -> f32 {
     let sign = ((raw >> 15) as u32) << 31;
     let exp = ((raw >> 10) & 0x1f) as u32;

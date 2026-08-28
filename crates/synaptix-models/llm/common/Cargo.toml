@@ -14,6 +14,7 @@ synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-infer     = { workspace = true }
+rayon              = { workspace = true }
 thiserror          = { workspace = true }
 
 [dev-dependencies]

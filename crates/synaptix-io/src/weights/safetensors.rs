@@ -215,19 +215,7 @@ impl SafetensorsLoader {
         let Some(entry) = self.entries.get(&self.resolve_name(name)) else {
             return false;
         };
-        let (ptr, len) = (entry.data.as_ptr() as usize, entry.data.len());
-        for shard in &self._shards {
-            let base = shard.data.as_ptr() as usize;
-            if ptr < base || ptr + len > base + shard.data.len() {
-                continue;
-            }
-            if let ShardOwner::Mmap(mmap) = &shard._owner {
-                return mmap
-                    .advise_range(memmap2::Advice::Random, ptr - base, len)
-                    .is_ok();
-            }
-        }
-        false
+        advise_random_range(entry.data)
     }
 
     fn resolve_name(&self, name: &str) -> String {
@@ -251,6 +239,27 @@ impl SafetensorsLoader {
             _ => Ok(tensor),
         }
     }
+}
+
+/// `MADV_RANDOM` на диапазон mmap: без него чтение одной строки тянет за
+/// собой окно упреждающего чтения. Работает и для тензоров внутри `.syn` —
+/// адрес берётся у самого слайса, чей это mmap, знать не нужно.
+#[cfg(target_os = "linux")]
+pub fn advise_random_range(data: &[u8]) -> bool {
+    extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    const MADV_RANDOM: i32 = 1;
+    let page = 4096usize;
+    let start = data.as_ptr() as usize;
+    let aligned = start & !(page - 1);
+    let len = data.len() + (start - aligned);
+    unsafe { madvise(aligned as *mut std::ffi::c_void, len, MADV_RANDOM) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn advise_random_range(_data: &[u8]) -> bool {
+    false
 }
 
 fn index_shard(

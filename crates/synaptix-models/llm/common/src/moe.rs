@@ -25,6 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -130,6 +131,8 @@ struct CacheInner {
     hits: u64,
     misses: u64,
     skipped: u64,
+    fetched: u64,
+    fetch_nanos: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +142,10 @@ pub struct ExpertCacheStats {
     /// Сколько пар «токен—эксперт» отброшено аварийным клапаном
     /// ([`MoeConfig::skip_below`]).
     pub skipped: u64,
+    /// Сколько экспертов поднято предзагрузкой чанка.
+    pub fetched: u64,
+    /// Суммарное время предзагрузки.
+    pub fetch_millis: u64,
     pub resident: usize,
     pub bytes: usize,
 }
@@ -158,6 +165,8 @@ impl ExpertCache {
                 hits: 0,
                 misses: 0,
                 skipped: 0,
+                fetched: 0,
+                fetch_nanos: 0,
             }),
         })
     }
@@ -176,6 +185,8 @@ impl ExpertCache {
             hits: inner.hits,
             misses: inner.misses,
             skipped: inner.skipped,
+            fetched: inner.fetched,
+            fetch_millis: inner.fetch_nanos / 1_000_000,
             resident: inner.map.len(),
             bytes: inner.bytes,
         }
@@ -186,6 +197,18 @@ impl ExpertCache {
         inner.map.clear();
         inner.order.clear();
         inner.bytes = 0;
+    }
+
+    fn note_fetch_time(&self, elapsed: std::time::Duration) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fetch_nanos += elapsed.as_nanos() as u64;
+        }
+    }
+
+    fn note_fetched(&self, count: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fetched += count;
+        }
     }
 
     fn note_skipped(&self, count: u64) {
@@ -242,6 +265,28 @@ struct SharedExpert {
     router: Tensor,
 }
 
+/// Откуда брать эксперта, которого нет на устройстве. Реализация читает его
+/// из хранилища модели (квантованный `.syn` отдаёт срез стопки прямо из
+/// mmap), так что в оперативной памяти эксперты не лежат вовсе.
+pub trait ExpertSource: Send + Sync {
+    fn fetch(&self, layer: usize, expert: usize, device: Device)
+        -> Result<(QLinear, QLinear), ModelError>;
+}
+
+enum ExpertStore {
+    Resident(Vec<Expert>),
+    Lazy { source: Arc<dyn ExpertSource>, count: usize },
+}
+
+impl ExpertStore {
+    fn count(&self) -> usize {
+        match self {
+            ExpertStore::Resident(v) => v.len(),
+            ExpertStore::Lazy { count, .. } => *count,
+        }
+    }
+}
+
 pub struct MoeFfn {
     cfg: MoeConfig,
     cache: Option<Arc<ExpertCache>>,
@@ -249,7 +294,7 @@ pub struct MoeFfn {
     /// `[E, H]` в F32: софтмакс роутера считается в полной точности, иначе
     /// на 512 экспертах порядок top-k пляшет от округления.
     router: Tensor,
-    experts: Vec<Expert>,
+    experts: ExpertStore,
     shared: Option<SharedExpert>,
     device: Device,
     compute: DType,
@@ -282,17 +327,6 @@ impl MoeFfn {
         quant: DType,
         expert_storage: Device,
     ) -> Result<Self, ModelError> {
-        let router = weights
-            .tensor(&format!("{prefix}.gate.weight"), device, DType::F32)?;
-        if router.dims() != [cfg.num_experts, cfg.hidden_size] {
-            return Err(ModelError::Load(format!(
-                "{prefix}.gate.weight: форма {:?}, ожидалась [{}, {}]",
-                router.dims(),
-                cfg.num_experts,
-                cfg.hidden_size
-            )));
-        }
-
         let gate_up = Self::load_stack(
             weights,
             &format!("{prefix}.experts.gate_up_proj"),
@@ -313,11 +347,35 @@ impl MoeFfn {
             quant,
             expert_storage,
         )?;
-        let experts = gate_up
-            .into_iter()
-            .zip(down)
-            .map(|(gate_up, down)| Expert { gate_up, down })
-            .collect();
+        let mut me = Self::load_parts(weights, prefix, cfg, device, compute, quant)?;
+        me.experts = ExpertStore::Resident(
+            gate_up
+                .into_iter()
+                .zip(down)
+                .map(|(gate_up, down)| Expert { gate_up, down })
+                .collect(),
+        );
+        Ok(me)
+    }
+
+    fn load_parts(
+        weights: &dyn WeightSource,
+        prefix: &str,
+        cfg: MoeConfig,
+        device: Device,
+        compute: DType,
+        quant: DType,
+    ) -> Result<Self, ModelError> {
+        let router = weights
+            .tensor(&format!("{prefix}.gate.weight"), device, DType::F32)?;
+        if router.dims() != [cfg.num_experts, cfg.hidden_size] {
+            return Err(ModelError::Load(format!(
+                "{prefix}.gate.weight: форма {:?}, ожидалась [{}, {}]",
+                router.dims(),
+                cfg.num_experts,
+                cfg.hidden_size
+            )));
+        }
 
         let shared = if cfg.shared_intermediate_size > 0 {
             let lin = |name: &str| -> Result<QLinear, ModelError> {
@@ -343,7 +401,40 @@ impl MoeFfn {
             None
         };
 
-        Ok(Self { cfg, cache: None, layer_id: 0, router, experts, shared, device, compute })
+        Ok(Self {
+            cfg,
+            cache: None,
+            layer_id: 0,
+            router,
+            experts: ExpertStore::Resident(Vec::new()),
+            shared,
+            device,
+            compute,
+        })
+    }
+
+    /// Эксперты не материализуются вовсе: роутер и shared expert грузятся как
+    /// обычно, а выбранный эксперт читается из [`ExpertSource`] при промахе
+    /// кэша. Так модель со 120 миллиардами весов в экспертах не занимает ни
+    /// системной памяти, ни памяти карты сверх кэша.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_lazy(
+        weights: &dyn WeightSource,
+        prefix: &str,
+        cfg: MoeConfig,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        cache: Arc<ExpertCache>,
+        layer_id: usize,
+        source: Arc<dyn ExpertSource>,
+    ) -> Result<Self, ModelError> {
+        let count = cfg.num_experts;
+        let mut me = Self::load_parts(weights, prefix, cfg, device, compute, quant)?;
+        me.experts = ExpertStore::Lazy { source, count };
+        me.cache = Some(cache);
+        me.layer_id = layer_id;
+        Ok(me)
     }
 
     /// Веса экспертов остаются в системной памяти, а на устройство едет
@@ -547,6 +638,8 @@ impl MoeFfn {
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
 
+        self.prefetch(&experts, &weights);
+
         let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
         let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
             .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
@@ -636,6 +729,52 @@ impl MoeFfn {
         }
     }
 
+    /// Поднять на устройство всех экспертов чанка, которых там ещё нет.
+    /// Промахи читаются параллельно: у ленивого источника это страничные
+    /// промахи mmap, и одна очередь к NVMe заметно медленнее нескольких.
+    fn prefetch(&self, experts: &[u32], weights: &[f32]) {
+        let Some(cache) = &self.cache else { return };
+        if !matches!(self.experts, ExpertStore::Lazy { .. }) {
+            return;
+        }
+        // Клапан отсекает экспертов ещё до подкачки: тянуть с диска того, чьи
+        // пары всё равно будут отброшены, незачем.
+        let mut wanted: Vec<u32> = experts
+            .iter()
+            .zip(weights)
+            .filter(|(_, w)| **w >= self.cfg.skip_below)
+            .map(|(e, _)| *e)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let missing: Vec<u32> = wanted
+            .into_iter()
+            .filter(|e| !cache.contains((self.layer_id, *e as usize)))
+            .collect();
+        if missing.len() < 2 {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let fetched: Vec<(u32, Expert)> = missing
+            .par_iter()
+            .filter_map(|e| {
+                let ExpertStore::Lazy { source, .. } = &self.experts else {
+                    return None;
+                };
+                source
+                    .fetch(self.layer_id, *e as usize, cache.device())
+                    .ok()
+                    .map(|(gate_up, down)| (*e, Expert { gate_up, down }))
+            })
+            .collect();
+        cache.note_fetch_time(started.elapsed());
+        let loaded = fetched.len() as u64;
+        for (expert, weights) in fetched {
+            cache.insert((self.layer_id, expert as usize), Arc::new(weights));
+        }
+        cache.note_fetched(loaded);
+    }
+
     /// Стоит ли пропустить эксперта: только при включённом оффлоаде, когда его
     /// нет на устройстве и все его пары в чанке весят меньше порога.
     fn skip_expert(&self, expert: usize, pairs: &[u32], weights: &[f32]) -> bool {
@@ -650,39 +789,62 @@ impl MoeFfn {
     }
 
     fn expert_forward(&self, expert: usize, x: &Tensor) -> Result<Tensor, ModelError> {
-        let host = self
-            .experts
-            .get(expert)
-            .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
-        match &self.cache {
-            None => {
+        match (&self.experts, &self.cache) {
+            (ExpertStore::Resident(all), None) => {
+                let host = all
+                    .get(expert)
+                    .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
                 let gu = host.gate_up.forward(x)?;
                 let h = self.swiglu(&gu)?;
                 host.down.forward(&h)
             }
-            Some(cache) => {
-                let key = (self.layer_id, expert);
-                let resident = match cache.get(key) {
-                    Some(e) => e,
-                    None => {
-                        let pinned = cache._mirror.is_some();
-                        if pinned {
-                            synaptix_core::device::cuda::set_pin_mirror(true);
-                        }
-                        let moved = host.to_device(cache.device());
-                        if pinned {
-                            synaptix_core::device::cuda::set_pin_mirror(false);
-                        }
-                        let e = Arc::new(moved?);
-                        cache.insert(key, e.clone());
-                        e
-                    }
-                };
+            (_, Some(cache)) => {
+                let resident = self.resident_expert(expert, cache)?;
                 let gu = resident.gate_up.forward(x)?;
                 let h = self.swiglu(&gu)?;
                 resident.down.forward(&h)
             }
+            (ExpertStore::Lazy { .. }, None) => Err(ModelError::Forward(
+                "MoE: ленивые эксперты без кэша — некуда их класть".into(),
+            )),
         }
+    }
+
+    fn resident_expert(
+        &self,
+        expert: usize,
+        cache: &Arc<ExpertCache>,
+    ) -> Result<Arc<Expert>, ModelError> {
+        let key = (self.layer_id, expert);
+        if let Some(e) = cache.get(key) {
+            return Ok(e);
+        }
+        let fetched = match &self.experts {
+            ExpertStore::Resident(all) => {
+                let host = all
+                    .get(expert)
+                    .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
+                let pinned = cache._mirror.is_some();
+                if pinned {
+                    synaptix_core::device::cuda::set_pin_mirror(true);
+                }
+                let moved = host.to_device(cache.device());
+                if pinned {
+                    synaptix_core::device::cuda::set_pin_mirror(false);
+                }
+                moved?
+            }
+            ExpertStore::Lazy { source, count } => {
+                if expert >= *count {
+                    return Err(ModelError::Forward(format!("MoE: нет эксперта {expert}")));
+                }
+                let (gate_up, down) = source.fetch(self.layer_id, expert, cache.device())?;
+                Expert { gate_up, down }
+            }
+        };
+        let e = Arc::new(fetched);
+        cache.insert(key, e.clone());
+        Ok(e)
     }
 
     /// Статистика попаданий в кэш резидентных экспертов (`None` — оффлоад выключен).

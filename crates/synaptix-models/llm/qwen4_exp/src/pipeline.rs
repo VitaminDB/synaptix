@@ -8,13 +8,13 @@ use synaptix_core::precision::PrecisionConfig;
 use std::sync::Arc;
 
 use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink, TokenSampler};
-use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats};
+use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, ExpertSource};
 use synaptix_llm_common::ModelError;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::tokenizer::Tokenizer;
 
 use crate::config::Qwen4ExpConfig;
-use crate::loader::Qwen4ExpWeights;
+use crate::loader::{BundleExperts, Qwen4ExpWeights};
 use crate::model::{ModelCache, Qwen4ExpModel};
 
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
@@ -39,8 +39,10 @@ impl Qwen4ExpPipeline {
         max_seq: Option<usize>,
     ) -> Result<Self, PipelineError> {
         let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
-        let weights = Qwen4ExpWeights::open(path, device, precision.compute)
-            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        let weights = Arc::new(
+            Qwen4ExpWeights::open(path, device, precision.compute)
+                .map_err(|e| PipelineError::Load(e.to_string()))?,
+        );
         let config = weights.config.clone();
         let tokenizer = if weights.tokenizer_json.is_empty() {
             None
@@ -52,21 +54,26 @@ impl Qwen4ExpPipeline {
         };
         let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
         let expert_cache = expert_cache_for(&config, device);
+        let lazy = expert_cache.is_some() && weights.has_lazy_experts(0);
+        let expert_source: Option<Arc<dyn ExpertSource>> = lazy
+            .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
         if let Some(cache) = &expert_cache {
             eprintln!(
-                "[qwen4_exp] эксперты в системной памяти, на карте кэш {:.1} ГБ",
+                "[qwen4_exp] эксперты {}, на карте кэш {:.1} ГБ",
+                if lazy { "читаются из бандла по одному" } else { "в системной памяти" },
                 cache.capacity_bytes() as f64 / (1 << 30) as f64
             );
         }
         let model = Qwen4ExpModel::build_with_cache(
             &config,
-            &weights,
+            &*weights,
             device,
             precision.compute,
             precision.mlp_w,
             cap,
             &|layer| weights.ngram_rows(layer),
             expert_cache,
+            expert_source,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?;
         let chat_template = weights.chat_template.clone();
