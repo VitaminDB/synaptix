@@ -22,8 +22,10 @@ use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 /// Чанк префилла. Чем он крупнее, тем меньше проходов по всей стопке
 /// экспертов: любой чанк длиннее сотни токенов задевает почти все 512
 /// экспертов слоя, так что стоимость префилла — это число чанков, умноженное
-/// на объём экспертов. Меняется `SYN_QWEN4EXP_PREFILL_CHUNK`.
-pub const DEFAULT_PREFILL_CHUNK: usize = 4096;
+/// на объём экспертов. На промпте в 6k токенов чанк 8192 вместо 4096 срезает
+/// подкачку со 126 до 78 ГБ, а префилл с 161 до 215 tok/s.
+/// Меняется `SYN_QWEN4EXP_PREFILL_CHUNK`.
+pub const DEFAULT_PREFILL_CHUNK: usize = 8192;
 
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
