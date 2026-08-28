@@ -437,6 +437,8 @@ pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Stor
         r?
     } else if let Some(r) = crate::device::cuda::pin_mirror_htod(&stream, bytes) {
         r?
+    } else if crate::device::cuda::pinned_tls_enabled() && !bytes.is_empty() {
+        crate::device::cuda::pinned_htod_tls(&stream, bytes)?
     } else if crate::device::cuda::offload_pinned_enabled() && !bytes.is_empty() {
         crate::device::cuda::pinned_htod(&stream, bytes)?
     } else {

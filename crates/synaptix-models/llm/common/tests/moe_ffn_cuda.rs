@@ -195,6 +195,67 @@ fn single_token_batched_matches_expert_by_expert() {
     assert!(rel < 1e-6, "батч разошёлся с поэкспертным путём: {rel:.3e}");
 }
 
+/// Спекулятивный шаг приносит в MoE пару токенов: они обязаны считаться тем же
+/// батчем, что и одиночный, иначе путь уходит на GEMM с уже освобождённой
+/// packed-копией веса и эксперт перечитывается заново.
+#[test]
+fn token_pair_batched_matches_expert_by_expert() {
+    if !setup() {
+        eprintln!("CUDA-устройств нет — пропуск");
+        return;
+    }
+    use std::sync::Arc;
+    use synaptix_llm_common::moe::ExpertCache;
+
+    let device = Device::Cuda(0);
+    let mut rows = noise(11, H);
+    rows.extend(noise(12, H));
+    let xt = Tensor::from_vec::<_, f32>(rows, vec![2, H], device)
+        .and_then(|t| t.to_dtype(DType::F16))
+        .unwrap();
+    let w = weights();
+
+    let plain = MoeFfn::load(&w, "mlp", cfg(), device, DType::F16, DType::NVFP4)
+        .expect("сборка MoE");
+    let want = plain
+        .forward(&xt)
+        .expect("поэкспертно")
+        .to_device(Device::Cpu)
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .unwrap();
+
+    let cache: Arc<ExpertCache> = ExpertCache::new(device, 1 << 30);
+    let batched_moe = MoeFfn::load_offloaded(
+        &w,
+        "mlp",
+        cfg(),
+        device,
+        DType::F16,
+        DType::NVFP4,
+        cache.clone(),
+        0,
+    )
+    .expect("сборка MoE с кэшем");
+    let got = batched_moe
+        .forward(&xt)
+        .expect("батчем")
+        .to_device(Device::Cpu)
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .unwrap();
+
+    let stats = cache.stats();
+    assert!(stats.batched > 0, "батчевый путь не сработал на паре токенов");
+    assert_eq!(stats.unbatched, 0, "пара ушла на поэкспертный путь");
+    assert_eq!(got.len(), want.len());
+    let rel = l2_rel(&got, &want);
+    eprintln!("батч пары против поэкспертного: rel_l2={rel:.3e}");
+    assert!(rel < 1e-6, "батч пары разошёлся: {rel:.3e}");
+}
+
 #[test]
 fn chunking_keeps_the_answer_within_quant_noise() {
     if !setup() {

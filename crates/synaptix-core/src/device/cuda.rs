@@ -951,6 +951,110 @@ mod inner {
     /// `stream`, потребитель обязан синкать его перед использованием на другом
     /// stream'е (loader-путь это уже делает: `lsc.synchronize()` после fetch).
     /// Байты не меняются → bit-identical прежнему синхронному пути.
+    thread_local! {
+        /// Идёт подкачка мелких весов (эксперты MoE) → H2D через собственный
+        /// pinned-буфер потока.
+        static PINNED_TLS_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PINNED_TLS_BUF: std::cell::RefCell<PinnedTls> = std::cell::RefCell::new(PinnedTls {
+            bufs: [
+                crate::memory::pinned::PinnedBuf::new(0),
+                crate::memory::pinned::PinnedBuf::new(0),
+            ],
+            pending: [None, None],
+            next: 0,
+        });
+    }
+
+    /// До какого размера тело едет через буфер потока: крупное отдаём общему
+    /// конвейеру, чтобы не держать десятки мегабайт pinned на каждом потоке.
+    const PINNED_TLS_MAX: usize = 16 << 20;
+
+    /// Пара буферов на поток: пока DMA читает один, копия следующего тела идёт
+    /// во второй.
+    struct PinnedTls {
+        bufs: [crate::memory::pinned::PinnedBuf; 2],
+        pending: [Option<cudarc::driver::CudaEvent>; 2],
+        next: usize,
+    }
+
+    pub fn pinned_tls_enabled() -> bool {
+        PINNED_TLS_ON.with(|c| c.get())
+    }
+
+    /// RAII-гард pinned-staging на потоке. Ставится вокруг подкачки экспертов:
+    /// pageable-копия идёт через staging драйвера (~6 ГБ/с и общая очередь на
+    /// процесс), а свой pinned-буфер даёт DMA без промежуточного копирования, и
+    /// потоки предзагрузки перестают мешать друг другу.
+    pub struct PinnedStageGuard {
+        prev: bool,
+    }
+
+    impl PinnedStageGuard {
+        pub fn new() -> Self {
+            Self { prev: PINNED_TLS_ON.with(|c| c.replace(true)) }
+        }
+    }
+
+    impl Default for PinnedStageGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for PinnedStageGuard {
+        fn drop(&mut self) {
+            PINNED_TLS_ON.with(|c| c.set(self.prev));
+        }
+    }
+
+    pub fn pinned_htod_tls(
+        stream: &Arc<CudaStream>,
+        bytes: &[u8],
+    ) -> Result<cudarc::driver::CudaSlice<u8>> {
+        if bytes.len() > PINNED_TLS_MAX {
+            return pinned_htod(stream, bytes);
+        }
+        let mut dst = match unsafe { alloc_bytes_uninit(stream, bytes.len()) } {
+            Ok(b) => b,
+            Err(_) => {
+                let ord = stream.context().ordinal();
+                let _ = stream.synchronize();
+                let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                unsafe { alloc_bytes_uninit(stream, bytes.len()) }.map_err(|e| {
+                    SynaptixError::Cuda(format!(
+                        "pinned_htod_tls alloc({}) after trim: {e:?}",
+                        bytes.len()
+                    ))
+                })?
+            }
+        };
+        PINNED_TLS_BUF.with(|cell| -> Result<()> {
+            let mut slot = cell.borrow_mut();
+            let b = slot.next;
+            slot.next ^= 1;
+            if let Some(ev) = slot.pending[b].take() {
+                ev.synchronize()
+                    .map_err(|e| SynaptixError::Cuda(format!("pinned_htod_tls event: {e:?}")))?;
+            }
+            if slot.bufs[b].len() < bytes.len() {
+                slot.bufs[b] = crate::memory::pinned::PinnedBuf::new_uninit(
+                    bytes.len().next_power_of_two().max(1 << 22),
+                );
+            }
+            slot.bufs[b].as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            stream
+                .memcpy_htod(&slot.bufs[b].as_slice()[..bytes.len()], &mut dst)
+                .map_err(|e| SynaptixError::Cuda(format!("pinned_htod_tls memcpy: {e:?}")))?;
+            slot.pending[b] = Some(
+                stream
+                    .record_event(None)
+                    .map_err(|e| SynaptixError::Cuda(format!("pinned_htod_tls record: {e:?}")))?,
+            );
+            Ok(())
+        })?;
+        Ok(dst)
+    }
+
     pub fn pinned_htod(
         stream: &Arc<CudaStream>,
         bytes: &[u8],

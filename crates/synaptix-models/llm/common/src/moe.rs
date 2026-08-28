@@ -139,8 +139,15 @@ pub struct ExpertCache {
     _mirror: Option<synaptix_core::device::cuda::PinMirrorGuard>,
 }
 
+/// Резидент кэша с битом обращения: по нему идёт вытеснение «часами» —
+/// приближение LRU, которому не нужен ни список, ни полный обход.
+struct Resident {
+    expert: Arc<Expert>,
+    used: bool,
+}
+
 struct CacheInner {
-    map: HashMap<(usize, usize), Arc<Expert>>,
+    map: HashMap<(usize, usize), Resident>,
     order: VecDeque<(usize, usize)>,
     bytes: usize,
     /// Эксперты, поднятые под префилл: он обходит почти всю стопку, и класть
@@ -225,9 +232,8 @@ impl ExpertCache {
     pub fn trim_to(&self, bytes: usize) {
         let Ok(mut inner) = self.inner.lock() else { return };
         while inner.bytes > bytes {
-            let Some(victim) = inner.order.pop_front() else { break };
-            if let Some(old) = inner.map.remove(&victim) {
-                inner.bytes = inner.bytes.saturating_sub(old.bytes());
+            if !inner.evict_one() {
+                break;
             }
         }
     }
@@ -287,11 +293,13 @@ impl ExpertCache {
 
     fn get(&self, key: (usize, usize)) -> Option<Arc<Expert>> {
         let mut inner = self.inner.lock().ok()?;
-        let found = inner
-            .map
-            .get(&key)
-            .or_else(|| inner.scratch.get(&key))
-            .cloned();
+        let found = match inner.map.get_mut(&key) {
+            Some(r) => {
+                r.used = true;
+                Some(r.expert.clone())
+            }
+            None => inner.scratch.get(&key).cloned(),
+        };
         match found {
             Some(e) => {
                 inner.hits += 1;
@@ -345,14 +353,38 @@ impl ExpertCache {
         }
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         while inner.bytes + bytes > capacity {
-            let Some(victim) = inner.order.pop_front() else { break };
-            if let Some(old) = inner.map.remove(&victim) {
-                inner.bytes = inner.bytes.saturating_sub(old.bytes());
+            if !inner.evict_one() {
+                break;
             }
         }
         inner.bytes += bytes;
         inner.order.push_back(key);
-        inner.map.insert(key, expert);
+        inner.map.insert(key, Resident { expert, used: false });
+    }
+}
+
+impl CacheInner {
+    /// Шаг «часов»: эксперт, к которому обращались с прошлого круга, получает
+    /// второй шанс, остальные уходят. Выбор экспертов сильно неравномерен, и
+    /// простая очередь по возрасту вымывала как раз горячих.
+    fn evict_one(&mut self) -> bool {
+        for _ in 0..self.order.len().max(1) {
+            let Some(key) = self.order.pop_front() else { return false };
+            match self.map.get_mut(&key) {
+                Some(r) if r.used => {
+                    r.used = false;
+                    self.order.push_back(key);
+                }
+                Some(_) => {
+                    if let Some(old) = self.map.remove(&key) {
+                        self.bytes = self.bytes.saturating_sub(old.expert.bytes());
+                    }
+                    return true;
+                }
+                None => {}
+            }
+        }
+        false
     }
 }
 
@@ -367,6 +399,20 @@ struct SharedExpert {
 /// Откуда брать эксперта, которого нет на устройстве. Реализация читает его
 /// из хранилища модели (квантованный `.syn` отдаёт срез стопки прямо из
 /// mmap), так что в оперативной памяти эксперты не лежат вовсе.
+/// До скольких токенов разом MoE считает батчем GEMV. Спекулятивный шаг
+/// приносит пару, а батч — единственный путь, где вес уже лежит перемешанным:
+/// GEMM пришлось бы читать освобождённую packed-копию и тянуть эксперта заново.
+fn batch_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SYN_MOE_BATCH_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1)
+    })
+}
+
 pub trait ExpertSource: Send + Sync {
     fn fetch(&self, layer: usize, expert: usize, device: Device)
         -> Result<(QLinear, QLinear), ModelError>;
@@ -746,8 +792,13 @@ impl MoeFfn {
         let k = self.cfg.num_experts_per_tok;
         let (experts, weights) = self.route(x)?;
 
-        if t == 1 {
-            if let Some(out) = self.forward_single_batched(x, &experts, &weights)? {
+        // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
+        // путь берёт экспертов из кэша по одному, и очередь в один поток к
+        // страницам бандла стоит дороже самого умножения.
+        let batchable = t <= batch_tokens();
+        self.prefetch(&experts, &weights, batchable);
+        if batchable {
+            if let Some(out) = self.forward_pairs_batched(x, &experts, &weights)? {
                 return Ok(out);
             }
         }
@@ -756,8 +807,6 @@ impl MoeFfn {
         // получает один GEMM вместо GEMV на токен.
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
-
-        self.prefetch(&experts, &weights, t == 1);
 
         let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
         let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
@@ -848,18 +897,24 @@ impl MoeFfn {
         }
     }
 
-    /// Декод одного токена: все выбранные эксперты считаются двумя батчевыми
-    /// GEMV вместо пары умножений на каждого. На слой это четыре запуска ядер
-    /// вместо трёх десятков, а именно они, а не арифметика, и определяют
-    /// время шага. `None` — путь неприменим (не NVFP4, нет перемешанной копии
-    /// весов, неподходящие формы), вызывающий считает как раньше.
-    fn forward_single_batched(
+    /// Декод горстки токенов: все пары «токен × выбранный эксперт» считаются
+    /// двумя батчевыми GEMV вместо пары умножений на каждого. На слой это
+    /// четыре запуска ядер вместо трёх десятков, а именно они, а не
+    /// арифметика, и определяют время шага. `None` — путь неприменим (не
+    /// NVFP4, нет перемешанной копии весов, неподходящие формы), вызывающий
+    /// считает как раньше.
+    fn forward_pairs_batched(
         &self,
         x: &Tensor,
         experts: &[u32],
         weights: &[f32],
     ) -> Result<Option<Tensor>, ModelError> {
         if self.cache.is_none() && matches!(self.experts, ExpertStore::Lazy { .. }) {
+            return Ok(None);
+        }
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        if experts.len() != t * k {
             return Ok(None);
         }
         let picked: Vec<Arc<Expert>> = {
@@ -902,7 +957,9 @@ impl MoeFfn {
         let gate_up: Vec<&QuantWeight> =
             picked.iter().map(|e| e.gate_up.quant_weight().unwrap()).collect();
         let acts: Vec<(&Tensor, &Tensor)> = (0..picked.len()).map(|_| (&packed_x, &scales_x)).collect();
-        let rows = vec![0usize; picked.len()];
+        // Пары идут в порядке `токен * k + слот`, поэтому строка активации у
+        // пары — её номер, делённый на число экспертов на токен.
+        let rows: Vec<usize> = (0..picked.len()).map(|p| p / k).collect();
         let Ok(gu) = QuantWeight::gemv_batched(&gate_up, &acts, &rows) else {
             return Ok(None);
         };
@@ -923,8 +980,9 @@ impl MoeFfn {
             .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
         let mixed = parts
             .broadcast_mul(&scale)
-            .and_then(|m| m.sum([0usize]))
-            .and_then(|m| m.reshape((1, self.cfg.hidden_size)))
+            .and_then(|m| m.reshape((t, k, self.cfg.hidden_size)))
+            .and_then(|m| m.sum([1usize]))
+            .and_then(|m| m.reshape((t, self.cfg.hidden_size)))
             .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?;
         let mixed = self.to_compute(mixed)?;
 
@@ -975,6 +1033,7 @@ impl MoeFfn {
                     return None;
                 };
                 let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
+                let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
                 let (gate_up, down) = source.fetch(self.layer_id, *e as usize, cache.device()).ok()?;
                 if prepare_batch {
                     // Только на декоде: репак держит обе копии веса разом, а на
@@ -1042,6 +1101,7 @@ impl MoeFfn {
         // мелкие веса и крупные буферы префилла дробят free-list, и уже через
         // несколько слоёв не находится непрерывного куска.
         let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
+        let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
         let fetched = match &self.experts {
             ExpertStore::Resident(all) => {
                 let host = all
