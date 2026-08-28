@@ -13,6 +13,7 @@ synaptix-nn        = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-bundle    = { workspace = true }
 synaptix-llm-common = { workspace = true }
+synaptix-vlm-qwen3  = { workspace = true }
 synaptix-tokenizer = { workspace = true }
 rayon              = { workspace = true }
 serde_json         = { workspace = true }

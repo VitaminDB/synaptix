@@ -316,6 +316,65 @@ impl Qwen4ExpModel {
         Ok(ModelCache { layers, ple, seq_len: 0, max_seq })
     }
 
+    /// Эмбеддинги промпта с подставленными строками медиа: `media` — пары
+    /// «id заполнителя → матрица `[n, H]`», строки расходуются по порядку
+    /// появления заполнителя в промпте.
+    pub fn embed_with_media(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+    ) -> Result<Tensor, ModelError> {
+        let embeds = self.embed_tokens(tokens)?;
+        if media.is_empty() {
+            return Ok(embeds);
+        }
+        let hidden = self.config.hidden_size;
+        let mut rows = embeds
+            .to_device(Device::Cpu)
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+
+        for (pad, feats) in media {
+            let dims = feats.dims().to_vec();
+            if dims.len() != 2 || dims[1] != hidden {
+                return Err(ModelError::Shape(format!(
+                    "медиа-эмбеддинги: форма {dims:?}, ожидалось [n, {hidden}]"
+                )));
+            }
+            let src = feats
+                .to_device(Device::Cpu)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| ModelError::Forward(e.to_string()))?;
+            let slots: Vec<usize> = tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| *t == pad)
+                .map(|(i, _)| i)
+                .collect();
+            if slots.len() != dims[0] {
+                return Err(ModelError::Shape(format!(
+                    "медиа: заполнителей {} против {} строк эмбеддингов",
+                    slots.len(),
+                    dims[0]
+                )));
+            }
+            for (row, slot) in slots.into_iter().enumerate() {
+                let from = row * hidden;
+                rows[slot * hidden..(slot + 1) * hidden]
+                    .copy_from_slice(&src[from..from + hidden]);
+            }
+        }
+
+        coerr(
+            Tensor::from_vec(rows, vec![tokens.len(), hidden], self.device)
+                .and_then(|t| t.to_dtype(self.compute)),
+        )
+    }
+
     pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor, ModelError> {
         let ids = Tensor::from_vec(tokens.to_vec(), vec![tokens.len()], self.device)
             .map_err(|e| ModelError::Forward(e.to_string()))?;
@@ -342,12 +401,22 @@ impl Qwen4ExpModel {
         cache: &mut ModelCache,
         trace: bool,
     ) -> Result<(Tensor, Vec<(String, Tensor)>), ModelError> {
+        self.forward_traced_media(tokens, &[], cache, trace)
+    }
+
+    pub fn forward_traced_media(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+        trace: bool,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>), ModelError> {
         let s = tokens.len();
         if s == 0 {
             return Err(ModelError::Forward("пустой вход".into()));
         }
         let past = cache.seq_len;
-        let embeds = self.embed_tokens(tokens)?;
+        let embeds = self.embed_with_media(tokens, media)?;
         let hc = self.config.hc_count;
         let hidden = coerr(embeds.reshape(vec![s, 1, self.config.hidden_size]))?;
         let ones = coerr(Tensor::zeros(
@@ -451,6 +520,18 @@ impl Qwen4ExpModel {
             traced.push(("final".to_string(), out.clone()));
         }
         Ok((out, traced))
+    }
+
+    pub fn forward_media_last(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+    ) -> Result<Tensor, ModelError> {
+        let (hidden, _) = self.forward_traced_media(tokens, media, cache, false)?;
+        let s = hidden.dims()[0];
+        let last = coerr(coerr(hidden.narrow(0, s - 1, 1))?.contiguous())?;
+        self.lm_head.forward(&last)
     }
 
     pub fn forward(&self, tokens: &[u32], cache: &mut ModelCache) -> Result<Tensor, ModelError> {

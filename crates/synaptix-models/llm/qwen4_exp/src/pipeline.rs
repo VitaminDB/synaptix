@@ -5,6 +5,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::grad::no_grad;
 use synaptix_core::precision::PrecisionConfig;
+use synaptix_core::tensor::Tensor;
 use std::sync::Arc;
 
 use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink, TokenSampler};
@@ -25,6 +26,7 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 4096;
 
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
+    pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
     pub config: Qwen4ExpConfig,
     pub chat_template: Option<String>,
     tokenizer: Option<HfTokenizer>,
@@ -89,7 +91,67 @@ impl Qwen4ExpPipeline {
             warn_if_cache_too_big(cache, device, kv_reserve);
         }
         let chat_template = weights.chat_template.clone();
-        Ok(Self { model, config, chat_template, tokenizer, max_seq: cap })
+        Ok(Self { model, vision: None, config, chat_template, tokenizer, max_seq: cap })
+    }
+
+    /// Поднять vision-башню из того же бандла. `false` — компонента нет.
+    pub fn load_vision(
+        &mut self,
+        path: impl AsRef<Path>,
+        dtype: DType,
+    ) -> Result<bool, PipelineError> {
+        let path = path.as_ref();
+        if !synaptix_vlm_qwen3::bundle_has_vision(path) {
+            return Ok(false);
+        }
+        let tower = synaptix_vlm_qwen3::load_from_bundle(path, self.model.device, dtype)
+            .map_err(|e| PipelineError::Load(format!("vision: {e}")))?;
+        self.vision = Some(tower);
+        Ok(true)
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Картинка → строки эмбеддингов `[n, hidden]` и merged-сетка `(h, w)`.
+    pub fn encode_image(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::PreprocessLimits,
+    ) -> Result<(Tensor, (usize, usize)), PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let prepared =
+            synaptix_vlm_qwen3::prepare_image(path, &tower.config, limits, self.model.device)
+                .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+        let merge = tower.config.spatial_merge_size.max(1);
+        let grid = (prepared.grid.h / merge, prepared.grid.w / merge);
+        let feats = no_grad(|| tower.forward(&prepared.patches, prepared.grid))
+            .map_err(|e| PipelineError::Model(format!("vision forward: {e}")))?;
+        let feats = feats
+            .to_dtype(self.model.compute)
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        Ok((feats, grid))
+    }
+
+    /// Сколько токенов-заполнителей займёт картинка в промпте.
+    pub fn image_token_count(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::PreprocessLimits,
+    ) -> Result<usize, PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let prepared =
+            synaptix_vlm_qwen3::prepare_image(path, &tower.config, limits, Device::Cpu)
+                .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+        let merge = tower.config.spatial_merge_size.max(1);
+        Ok((prepared.grid.h / merge) * (prepared.grid.w / merge))
     }
 
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>, PipelineError> {
@@ -209,6 +271,18 @@ impl Qwen4ExpPipeline {
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        self.generate_media_streaming(prompt_ids, &[], cfg, sink)
+    }
+
+    /// Генерация с медиа-вложениями: `media` — пары «id заполнителя → строки
+    /// эмбеддингов», строки расходуются по порядку появления заполнителя.
+    pub fn generate_media_streaming(
+        &self,
+        prompt_ids: &[u32],
+        media: &[(u32, Tensor)],
+        cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("пустой промпт".into()));
         }
@@ -243,7 +317,8 @@ impl Qwen4ExpPipeline {
             while offset < prompt_ids.len() {
                 let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
                 let chunk = &prompt_ids[offset..offset + take];
-                last = Some(self.model.forward_last(chunk, &mut cache)?);
+                let slice = media_for_chunk(prompt_ids, media, offset, take)?;
+                last = Some(self.model.forward_media_last(chunk, &slice, &mut cache)?);
                 offset += take;
             }
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
@@ -282,6 +357,34 @@ impl Qwen4ExpPipeline {
             },
         ))
     }
+}
+
+/// Строки медиа-эмбеддингов, попадающие в чанк префилла `[offset, offset+len)`.
+/// Заполнители нумеруются по всему промпту, поэтому при нарезке нужно взять
+/// ровно те строки, чьи слоты попали в чанк.
+fn media_for_chunk(
+    prompt: &[u32],
+    media: &[(u32, Tensor)],
+    offset: usize,
+    len: usize,
+) -> Result<Vec<(u32, Tensor)>, ModelError> {
+    if media.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(media.len());
+    for (pad, feats) in media {
+        let before = prompt[..offset].iter().filter(|t| *t == pad).count();
+        let inside = prompt[offset..offset + len].iter().filter(|t| *t == pad).count();
+        if inside == 0 {
+            continue;
+        }
+        let rows = feats
+            .narrow(0, before, inside)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| ModelError::Forward(format!("медиа: срез строк: {e}")))?;
+        out.push((*pad, rows));
+    }
+    Ok(out)
 }
 
 fn prefill_chunk() -> usize {
