@@ -13,7 +13,7 @@ use synaptix_llm_common::{ModelError, WeightSource};
 
 use crate::config::Qwen4ExpConfig;
 use crate::model::LM_PREFIX;
-use crate::ngram::{NGramRows, TensorRows};
+use crate::ngram::{CachedRows, NGramRows, TensorRows};
 
 pub enum Source {
     Files(Arc<SafetensorsLoader>),
@@ -122,13 +122,20 @@ impl Qwen4ExpWeights {
                     .ok_or_else(|| ModelError::Load(format!("нет тензора {}", names[0])))?;
                 let rows = shape[0];
                 let dim = shape[1];
-                Ok(Box::new(MmapRows {
+                for name in &names {
+                    loader.advise_random(name);
+                }
+                let table = Box::new(MmapRows {
                     loader: loader.clone(),
                     names,
                     rows_per_shard: rows,
                     dim,
                     dtype,
-                }))
+                });
+                Ok(match ngram_cache_bytes() {
+                    0 => table,
+                    bytes => Box::new(CachedRows::new(table, bytes)),
+                })
             }
             Source::Bundle(_) => {
                 let mut parts = Vec::with_capacity(names.len());
@@ -140,6 +147,13 @@ impl Qwen4ExpWeights {
                 Ok(Box::new(TensorRows::from_tensor(&all)?))
             }
         }
+    }
+}
+
+fn ngram_cache_bytes() -> usize {
+    match std::env::var("SYN_QWEN4EXP_NGRAM_CACHE_MB") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(0) * 1024 * 1024,
+        Err(_) => 512 * 1024 * 1024,
     }
 }
 

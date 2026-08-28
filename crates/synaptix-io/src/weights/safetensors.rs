@@ -207,6 +207,29 @@ impl SafetensorsLoader {
             .map(|e| (e.data, e.dtype, e.shape.as_slice()))
     }
 
+    /// Отключить readahead для диапазона тензора (`MADV_RANDOM`): у таблиц с
+    /// произвольным доступом (n-gram-эмбеддинги PLE) чтение одной строки в
+    /// 320 байт иначе тянет за собой всё окно упреждающего чтения. `false` —
+    /// тензор не найден или шард лежит не в собственном mmap (бандл).
+    pub fn advise_random(&self, name: &str) -> bool {
+        let Some(entry) = self.entries.get(&self.resolve_name(name)) else {
+            return false;
+        };
+        let (ptr, len) = (entry.data.as_ptr() as usize, entry.data.len());
+        for shard in &self._shards {
+            let base = shard.data.as_ptr() as usize;
+            if ptr < base || ptr + len > base + shard.data.len() {
+                continue;
+            }
+            if let ShardOwner::Mmap(mmap) = &shard._owner {
+                return mmap
+                    .advise_range(memmap2::Advice::Random, ptr - base, len)
+                    .is_ok();
+            }
+        }
+        false
+    }
+
     fn resolve_name(&self, name: &str) -> String {
         match &self.prefix {
             Some(p) if !name.starts_with(p.as_str()) => format!("{p}.{name}"),

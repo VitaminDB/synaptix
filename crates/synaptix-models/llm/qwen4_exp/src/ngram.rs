@@ -1,5 +1,7 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -207,6 +209,121 @@ impl NGramRows for TensorRows {
                 .get(start..start + self.dim)
                 .ok_or_else(|| ModelError::Forward(format!("n-gram: строка {id} вне таблицы")))?;
             out[i * self.dim..(i + 1) * self.dim].copy_from_slice(row);
+        }
+        Ok(())
+    }
+}
+
+pub struct CachedRows {
+    inner: Box<dyn NGramRows>,
+    cache: Mutex<RowCache>,
+}
+
+struct RowCache {
+    slot_of: HashMap<i64, usize>,
+    key_of: Vec<i64>,
+    data: Vec<f32>,
+    next: usize,
+    dim: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl RowCache {
+    fn new(rows: usize, dim: usize) -> Self {
+        Self {
+            slot_of: HashMap::with_capacity(rows),
+            key_of: vec![-1; rows],
+            data: vec![0.0; rows * dim],
+            next: 0,
+            dim,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, id: i64, out: &mut [f32]) -> bool {
+        match self.slot_of.get(&id) {
+            Some(slot) => {
+                let start = slot * self.dim;
+                out.copy_from_slice(&self.data[start..start + self.dim]);
+                self.hits += 1;
+                true
+            }
+            None => {
+                self.misses += 1;
+                false
+            }
+        }
+    }
+
+    fn put(&mut self, id: i64, row: &[f32]) {
+        if self.key_of.is_empty() {
+            return;
+        }
+        let slot = self.next;
+        self.next = (self.next + 1) % self.key_of.len();
+        let old = self.key_of[slot];
+        if old >= 0 {
+            self.slot_of.remove(&old);
+        }
+        self.key_of[slot] = id;
+        self.slot_of.insert(id, slot);
+        let start = slot * self.dim;
+        self.data[start..start + self.dim].copy_from_slice(row);
+    }
+}
+
+impl CachedRows {
+    pub fn new(inner: Box<dyn NGramRows>, cache_bytes: usize) -> Self {
+        let dim = inner.dim();
+        let rows = cache_bytes / (dim * std::mem::size_of::<f32>()).max(1);
+        Self { inner, cache: Mutex::new(RowCache::new(rows, dim)) }
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        let c = self.cache.lock().unwrap();
+        (c.hits, c.misses)
+    }
+}
+
+impl NGramRows for CachedRows {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn rows(&self) -> usize {
+        self.inner.rows()
+    }
+
+    fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<(), ModelError> {
+        let dim = self.inner.dim();
+        let mut missing: Vec<usize> = Vec::new();
+        {
+            let mut cache = self.cache.lock().map_err(|_| ModelError::Forward("кэш n-gram отравлен".into()))?;
+            for (i, id) in ids.iter().enumerate() {
+                if !cache.get(*id, &mut out[i * dim..(i + 1) * dim]) {
+                    missing.push(i);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let fetched: Result<Vec<Vec<f32>>, ModelError> = missing
+            .par_iter()
+            .map(|i| {
+                let mut row = vec![0.0f32; dim];
+                self.inner.gather_into(&ids[*i..*i + 1], &mut row)?;
+                Ok(row)
+            })
+            .collect();
+        let fetched = fetched?;
+        let mut cache = self.cache.lock().map_err(|_| ModelError::Forward("кэш n-gram отравлен".into()))?;
+        for (slot, i) in missing.iter().enumerate() {
+            let row = &fetched[slot];
+            out[i * dim..(i + 1) * dim].copy_from_slice(row);
+            cache.put(ids[*i], row);
         }
         Ok(())
     }

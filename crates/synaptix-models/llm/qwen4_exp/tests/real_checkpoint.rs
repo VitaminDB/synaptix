@@ -127,7 +127,13 @@ fn ngram_gather_streams_from_disk() {
     )
     .expect("n-gram");
 
-    let tokens: Vec<u32> = (0..32).map(|i| (i * 7919 + 13) as u32 % 248_320).collect();
+    let salt: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tokens: Vec<u32> = (0..256u32)
+        .map(|i| (i.wrapping_mul(7919).wrapping_add(salt)) % 248_320)
+        .collect();
     let mut history = vec![embedding.eos(); embedding.context_len()];
     history.extend_from_slice(&tokens);
 
@@ -137,14 +143,23 @@ fn ngram_gather_streams_from_disk() {
 
     let t0 = Instant::now();
     let out = embedding.forward(&history, tokens.len()).expect("gather");
-    let elapsed = t0.elapsed();
+    let cold = t0.elapsed();
     assert_eq!(out.dims(), &[tokens.len(), 2560]);
     let v = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert!(v.iter().any(|x| *x != 0.0), "все строки нулевые");
     assert!(v.iter().all(|x| x.is_finite()));
+
+    let t1 = Instant::now();
+    let again = embedding.forward(&history, tokens.len()).expect("gather");
+    let warm = t1.elapsed();
+    let v2 = again.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(v, v2, "повторный гатер вернул другие строки");
+
+    let rows = tokens.len() * 16;
     eprintln!(
-        "n-gram: {} токенов × 16 голов за {:.1} мс",
-        tokens.len(),
-        elapsed.as_secs_f32() * 1000.0
+        "n-gram: {rows} строк — первый проход {:.1} мс ({:.1} мкс/строка), повтор {:.1} мс",
+        cold.as_secs_f32() * 1000.0,
+        cold.as_secs_f32() * 1e6 / rows as f32,
+        warm.as_secs_f32() * 1000.0
     );
 }
