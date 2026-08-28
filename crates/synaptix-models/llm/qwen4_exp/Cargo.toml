@@ -1,0 +1,22 @@
+[package]
+name = "synaptix-llm-qwen4-exp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen4Exp (Qwen3.8-Flash-Next): Gated DeltaNet + Qwen Sparse Attention, MoE 512/10+1, gated-residual потоки, PLE с n-gram-эмбеддингами, MTP"
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
