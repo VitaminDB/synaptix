@@ -433,6 +433,7 @@ fn apply_unary<T: Copy, OPS: FloatOps<T>>(op: UnaryOp, x: T) -> T {
         UnaryOp::Tanh => OPS::tanh(x),
         UnaryOp::Clamp(lo, hi) => OPS::clamp(x, lo, hi),
         UnaryOp::Powf(e) => OPS::powf(x, e),
+        UnaryOp::Identity => x,
         UnaryOp::Affine(mul, add) => OPS::affine(x, mul, add),
         UnaryOp::Erf => OPS::erf(x),
         UnaryOp::Sigmoid => OPS::sigmoid(x),

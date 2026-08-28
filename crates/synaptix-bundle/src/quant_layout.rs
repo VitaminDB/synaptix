@@ -94,6 +94,29 @@ impl QuantEntry {
         let total = crate::inspect::quantized_bytes(&self.shape, self.kind()?)?;
         Some(total - self.packed_bytes()?)
     }
+
+    /// Число матриц в стопке: 1 для обычного двумерного веса, `E` для
+    /// экспертов MoE.
+    pub fn slices(&self) -> Option<usize> {
+        Some(self.dims()?.0)
+    }
+
+    /// Байты одной матрицы стопки в блобе `.qpacked`.
+    ///
+    /// Писатель кладёт срезы подряд — сперва все упакованные веса
+    /// (`эксперт 0`, `эксперт 1`, …), затем тем же порядком все масштабы.
+    /// Поэтому эксперт `i` читается срезом `[i * шаг, (i + 1) * шаг)` в
+    /// каждом из двух блобов.
+    pub fn packed_bytes_per_slice(&self) -> Option<u64> {
+        let slices = self.slices()? as u64;
+        Some(self.packed_bytes()? / slices)
+    }
+
+    /// Байты масштабов одной матрицы стопки в блобе `.qscales`.
+    pub fn scales_bytes_per_slice(&self) -> Option<u64> {
+        let slices = self.slices()? as u64;
+        Some(self.scales_bytes()? / slices)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

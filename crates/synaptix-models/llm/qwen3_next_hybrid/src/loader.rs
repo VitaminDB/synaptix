@@ -99,6 +99,18 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
         let r = self.loader.load_quant(&Self::bundle_key(key), device)?;
         Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
+
+    /// Стопка экспертов MoE, упакованная одним блобом.
+    fn quant_stack(
+        &self,
+        key: &str,
+        device: Device,
+    ) -> Option<
+        Result<Vec<synaptix_core::tensor::quant::QuantWeight>, synaptix_llm_common::ModelError>,
+    > {
+        let r = self.loader.load_quant_stack(&Self::bundle_key(key), device)?;
+        Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

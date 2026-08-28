@@ -200,8 +200,13 @@ impl Backend for CudaBackend {
         }
         // Общий путь (используется `Tensor::contiguous()` на permuted/narrowed
         // тензорах): strided gather из src → contiguous write в dst. dst обязан
-        // быть contiguous. Реализован через identity-affine unary kernel
-        // (x*1+0), который читает по strides и пишет линейно.
+        // быть contiguous. Реализован через identity-unary kernel, который
+        // читает по strides и пишет линейно.
+        //
+        // Именно identity, а не affine `x*1+0`: по IEEE `-0.0 * 1 + 0 = +0.0`,
+        // и копия молча теряла знак нуля. Веса от этого меняются на один
+        // бит — но и `contiguous()` перестаёт быть копией, и упакованный при
+        // сборке бандла квант расходится с квантом, посчитанным на лету.
         if !dst_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
         }
@@ -212,7 +217,7 @@ impl Backend for CudaBackend {
             .device()
             .clone();
         let kernels = crate::kernels::elementwise::ElementwiseKernels::for_context(&ctx)?;
-        crate::kernels::elementwise::run_unary(&kernels, UnaryOp::Affine(1.0, 0.0), src, dst)
+        crate::kernels::elementwise::run_unary(&kernels, UnaryOp::Identity, src, dst)
     }
 
     fn cast(

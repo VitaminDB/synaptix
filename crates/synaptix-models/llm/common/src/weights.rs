@@ -23,6 +23,21 @@ pub trait WeightSource {
     fn quant(&self, _key: &str, _device: Device) -> Option<Result<QuantWeight, ModelError>> {
         None
     }
+
+    /// Стопка квантованных матриц `[E, N, K]` — так лежат веса экспертов
+    /// MoE: один блоб на все `E` матриц, в бандле он не разбит по экспертам.
+    /// Возвращается по одному [`QuantWeight`] на эксперта в порядке ведущей
+    /// оси; обычная матрица `[N, K]` — стопка из одного элемента.
+    ///
+    /// `None` — вес не квантован (обычный путь: прочитать плотную стопку и
+    /// нарезать её самому).
+    fn quant_stack(
+        &self,
+        _key: &str,
+        _device: Device,
+    ) -> Option<Result<Vec<QuantWeight>, ModelError>> {
+        None
+    }
 }
 
 pub enum QLinear {

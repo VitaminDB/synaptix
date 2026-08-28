@@ -47,6 +47,8 @@ fn kv_layout_passthrough_ok(lo: &Layout) -> bool {
 fn attach_unary_grad(op: UnaryOp, input: &Tensor, output: &mut Tensor) -> Result<()> {
     use UnaryGradKind::*;
     let grad_op = match op {
+        // Копия — тождество и по значению, и по градиенту.
+        UnaryOp::Identity => GradOp::Identity { input },
         UnaryOp::Neg => GradOp::Neg { input },
         UnaryOp::Abs => GradOp::Unary { input, kind: Abs, alpha: None },
         UnaryOp::Sqrt => GradOp::Unary { input, kind: Sqrt, alpha: None },

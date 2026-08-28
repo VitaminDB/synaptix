@@ -1009,6 +1009,7 @@ pub fn run_cast(
 
 fn unary_code(op: UnaryOp) -> (i32, f32, f32) {
     match op {
+        UnaryOp::Identity => (26, 0.0, 0.0),
         UnaryOp::Neg => (0, 0.0, 0.0),
         UnaryOp::Abs => (1, 0.0, 0.0),
         UnaryOp::Sqrt => (2, 0.0, 0.0),

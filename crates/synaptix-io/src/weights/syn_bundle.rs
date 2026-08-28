@@ -160,43 +160,108 @@ impl SynBundleLoader {
     /// `Some(Err(_))` — квантован, но прочитать не вышло: молча свалиться на
     /// плотный путь нельзя, плотной копии в бандле уже нет.
     pub fn load_quant(&self, name: &str, device: Device) -> Option<Result<QuantWeight>> {
+        let (key, entry) = self.quant_entry(name)?;
+        let slices = match entry.dims() {
+            Some((s, _, _)) => s,
+            None => {
+                return Some(Err(IoError::Bundle(format!(
+                    "`{key}`: форма {:?} не матрица",
+                    entry.shape
+                ))))
+            }
+        };
+        if slices != 1 {
+            // Стопка экспертов — это `slices` независимых матриц, а
+            // `QuantWeight` описывает одну. Отдать первую молча значило бы
+            // подсунуть модели чужие веса, поэтому — явная ошибка с
+            // указанием на stack-API.
+            return Some(Err(IoError::Bundle(format!(
+                "`{key}`: стопка из {slices} матриц — читайте её через load_quant_stack"
+            ))));
+        }
+        Some(self.build_quant_slice(&key, 0, device))
+    }
+
+    /// Вся стопка `[E, N, K]` экспертов MoE: по одному [`QuantWeight`] на
+    /// эксперта, в порядке ведущей оси. Обычная матрица `[N, K]` — стопка из
+    /// одного элемента, поэтому вызывающему не нужно различать эти случаи.
+    ///
+    /// Каждый эксперт получает собственные буферы: писатель кладёт срезы
+    /// подряд, а ядрам нужен непрерывный `packed`, начинающийся с нуля.
+    pub fn load_quant_stack(&self, name: &str, device: Device) -> Option<Result<Vec<QuantWeight>>> {
+        let (key, entry) = self.quant_entry(name)?;
+        let slices = match entry.slices() {
+            Some(s) => s,
+            None => {
+                return Some(Err(IoError::Bundle(format!(
+                    "`{key}`: форма {:?} не матрица и не стопка матриц",
+                    entry.shape
+                ))))
+            }
+        };
+        let mut out = Vec::with_capacity(slices);
+        for i in 0..slices {
+            match self.build_quant_slice(&key, i, device) {
+                Ok(w) => out.push(w),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(out))
+    }
+
+    /// Один эксперт стопки — когда вся стопка в память не нужна
+    /// (expert-parallel, host-stream по требованию).
+    pub fn load_quant_expert(
+        &self,
+        name: &str,
+        expert: usize,
+        device: Device,
+    ) -> Option<Result<QuantWeight>> {
+        let (key, _) = self.quant_entry(name)?;
+        Some(self.build_quant_slice(&key, expert, device))
+    }
+
+    /// Форма квантованного веса: `(число матриц, N, K)`. `None` — вес в
+    /// бандле не квантован.
+    pub fn quant_dims(&self, name: &str) -> Option<(usize, usize, usize)> {
+        let (_, entry) = self.quant_entry(name)?;
+        entry.dims()
+    }
+
+    /// Запись манифеста для `name` с учётом префикса компонента. Возвращает
+    /// имя, под которым тензор лежит в бандле, — по нему же строятся имена
+    /// блобов.
+    fn quant_entry(&self, name: &str) -> Option<(String, synaptix_bundle::QuantEntry)> {
         let manifest = self.quant_manifest()?;
         if manifest.is_empty() {
             return None;
         }
-        let idx = match self.index() {
-            Ok(i) => i,
-            Err(e) => return Some(Err(e)),
-        };
+        let idx = self.index().ok()?;
         let key = Self::resolve_key(name, &idx.prefix);
-        let entry = manifest
-            .entry(&key)
-            .or_else(|| manifest.entry(name))?;
-        let name_in_bundle = if manifest.entry(&key).is_some() { key } else { name.to_string() };
-
-        Some(self.build_quant(manifest, &name_in_bundle, entry, device))
+        if let Some(e) = manifest.entry(&key) {
+            return Some((key, e.clone()));
+        }
+        manifest.entry(name).map(|e| (name.to_string(), e.clone()))
     }
 
-    fn build_quant(
-        &self,
-        manifest: &QuantManifest,
-        key: &str,
-        entry: &synaptix_bundle::QuantEntry,
-        device: Device,
-    ) -> Result<QuantWeight> {
+    /// Собрать [`QuantWeight`] для среза `slice` стопки (для обычной матрицы
+    /// — единственного среза 0).
+    fn build_quant_slice(&self, key: &str, slice: usize, device: Device) -> Result<QuantWeight> {
+        let manifest = self
+            .quant_manifest()
+            .ok_or_else(|| IoError::Bundle(format!("`{key}`: манифест кванта пропал")))?;
+        let entry = manifest
+            .entry(key)
+            .ok_or_else(|| IoError::Bundle(format!("`{key}`: нет записи в манифесте кванта")))?;
         let kind = entry.kind().ok_or_else(|| {
             IoError::Bundle(format!("`{key}`: неизвестный квант-формат `{}`", entry.format))
         })?;
         let (slices, n, k) = entry
             .dims()
             .ok_or_else(|| IoError::Bundle(format!("`{key}`: форма {:?} не матрица", entry.shape)))?;
-        if slices != 1 {
-            // Стопка экспертов — это `slices` независимых матриц, а
-            // `QuantWeight` описывает одну. Пока такие веса читать некому:
-            // MoE-путь в движке не реализован. Ошибка честнее тихого
-            // возврата плотного тензора, которого в бандле нет.
+        if slice >= slices {
             return Err(IoError::Bundle(format!(
-                "`{key}`: стопка из {slices} матриц — чтение квантованных MoE-весов пока не поддержано"
+                "`{key}`: срез {slice} за границей стопки из {slices}"
             )));
         }
 
@@ -209,20 +274,25 @@ impl SynBundleLoader {
                 .ok_or_else(|| IoError::Bundle(format!("`{blob}`: блоб не найден в бандле")))?;
             Ok(&bytes[meta.off..meta.off + meta.len])
         };
-        let packed_bytes = take(&manifest.packed_name(key))?;
-        let scales_bytes = take(&manifest.scales_name(key))?;
+        let packed_all = take(&manifest.packed_name(key))?;
+        let scales_all = take(&manifest.scales_name(key))?;
 
         // Размеры сверяем с манифестом: расхождение означает, что бандл
         // собран другой версией раскладки, и молча считать по нему нельзя.
         let want_packed = entry.packed_bytes().unwrap_or(0) as usize;
         let want_scales = entry.scales_bytes().unwrap_or(0) as usize;
-        if packed_bytes.len() != want_packed || scales_bytes.len() != want_scales {
+        if packed_all.len() != want_packed || scales_all.len() != want_scales {
             return Err(IoError::Bundle(format!(
                 "`{key}`: блобы {}/{} байт, а раскладка требует {want_packed}/{want_scales}",
-                packed_bytes.len(),
-                scales_bytes.len()
+                packed_all.len(),
+                scales_all.len()
             )));
         }
+
+        let packed_step = entry.packed_bytes_per_slice().unwrap_or(0) as usize;
+        let scales_step = entry.scales_bytes_per_slice().unwrap_or(0) as usize;
+        let packed_bytes = &packed_all[slice * packed_step..(slice + 1) * packed_step];
+        let scales_bytes = &scales_all[slice * scales_step..(slice + 1) * scales_step];
 
         let dtype = match kind {
             synaptix_bundle::inspect::QuantKind::Nvfp4 => DType::NVFP4,

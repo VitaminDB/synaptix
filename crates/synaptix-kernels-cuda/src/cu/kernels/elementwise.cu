@@ -67,6 +67,8 @@ __device__ __forceinline__ float apply_unary(int op_code, float x, float a, floa
         case 23: return rintf(x);
         case 24: return floorf(x);
         case 25: return ceilf(x);
+        // Копия «как есть»: ни умножения, ни сложения — иначе теряется знак нуля.
+        case 26: return x;
         default: return x;
     }
 }

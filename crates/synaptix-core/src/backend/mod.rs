@@ -10,6 +10,10 @@ use crate::tensor::storage::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnaryOp {
+    /// Копия значения без арифметики. Нужна там, где важны сами байты:
+    /// `x * 1 + 0` превращает `-0.0` в `+0.0`, поэтому strided-копия через
+    /// affine молча меняла веса.
+    Identity,
     Neg,
     Abs,
     Sqrt,
