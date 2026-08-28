@@ -131,6 +131,22 @@ impl QLinear {
         }
     }
 
+    /// Сколько байт весов занимает — для учёта в кэше резидентных экспертов
+    /// MoE (квант считается по упакованной раскладке, плотный — по dtype).
+    pub fn bytes(&self) -> usize {
+        match self {
+            QLinear::Dense(l) => {
+                let w = l.weight();
+                w.dtype().bytes_for_numel(w.numel())
+                    + l.bias().map_or(0, |b| b.dtype().bytes_for_numel(b.numel()))
+            }
+            QLinear::Quant(w) => {
+                let numel = w.n() * w.k();
+                w.dtype().bytes_for_numel(numel) + numel / 16
+            }
+        }
+    }
+
     /// Перенос весов на устройство (host-stream блоков: CPU-резидент → GPU по
     /// требованию в forward, как DiT-блоки LTX).
     pub fn to_device(&self, dev: Device) -> Result<Self, ModelError> {

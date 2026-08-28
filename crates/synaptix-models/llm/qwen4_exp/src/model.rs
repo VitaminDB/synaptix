@@ -1,7 +1,9 @@
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
-use synaptix_llm_common::moe::MoeFfn;
+use std::sync::Arc;
+
+use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, MoeFfn};
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::attention::linear::GatedDeltaNetState;
 use synaptix_ops::embed::token_embedding;
@@ -72,6 +74,7 @@ pub struct Qwen4ExpModel {
     lm_head: QLinear,
     rope: RopeCache,
     ple_layers: Vec<usize>,
+    expert_cache: Option<Arc<ExpertCache>>,
 }
 
 impl Qwen4ExpModel {
@@ -83,6 +86,20 @@ impl Qwen4ExpModel {
         quant: DType,
         rope_capacity: usize,
         ngram_table: &NGramTableFactory<'_>,
+    ) -> Result<Self, ModelError> {
+        Self::build_with_cache(cfg, weights, device, compute, quant, rope_capacity, ngram_table, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_cache(
+        cfg: &Qwen4ExpConfig,
+        weights: &dyn WeightSource,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        rope_capacity: usize,
+        ngram_table: &NGramTableFactory<'_>,
+        expert_cache: Option<Arc<ExpertCache>>,
     ) -> Result<Self, ModelError> {
         let embed = weights.tensor(&format!("{LM_PREFIX}.embed_tokens.weight"), device, compute)?;
         let lm_head = if cfg.tie_word_embeddings {
@@ -120,14 +137,26 @@ impl Qwen4ExpModel {
                     quant,
                 )?),
             };
-            let moe = MoeFfn::load(
-                weights,
-                &format!("{prefix}.mlp"),
-                cfg.moe.clone(),
-                device,
-                compute,
-                quant,
-            )?;
+            let moe = match &expert_cache {
+                Some(cache) => MoeFfn::load_offloaded(
+                    weights,
+                    &format!("{prefix}.mlp"),
+                    cfg.moe.clone(),
+                    device,
+                    compute,
+                    quant,
+                    cache.clone(),
+                    l,
+                )?,
+                None => MoeFfn::load(
+                    weights,
+                    &format!("{prefix}.mlp"),
+                    cfg.moe.clone(),
+                    device,
+                    compute,
+                    quant,
+                )?,
+            };
             let ple = match cfg.ple_at(l) {
                 Some(index) => {
                     let ple_cfg = cfg.ple.as_ref().unwrap();
@@ -209,7 +238,12 @@ impl Qwen4ExpModel {
             lm_head,
             rope,
             ple_layers,
+            expert_cache,
         })
+    }
+
+    pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
+        self.expert_cache.as_ref().map(|c| c.stats())
     }
 
     pub fn make_cache(&self, max_seq: usize) -> Result<ModelCache, ModelError> {

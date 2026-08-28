@@ -22,6 +22,9 @@
 //! вклады k экспертов. Всё это — операции на устройстве; на хост уходят
 //! только логиты роутера (см. [`MoeFfn::route`]).
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -75,11 +78,125 @@ fn weight_dtype(quant: DType, compute: DType) -> DType {
     }
 }
 
-struct Expert {
+pub struct Expert {
     /// `[2I, H]` — первая половина строк gate, вторая up.
     gate_up: QLinear,
     /// `[H, I]`.
     down: QLinear,
+}
+
+impl Expert {
+    fn bytes(&self) -> usize {
+        self.gate_up.bytes() + self.down.bytes()
+    }
+
+    fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
+        Ok(Self {
+            gate_up: self.gate_up.to_device(dev)?,
+            down: self.down.to_device(dev)?,
+        })
+    }
+}
+
+/// Кэш резидентных экспертов, общий для всех MoE-слоёв модели.
+///
+/// Веса экспертов лежат в системной памяти (их суммарный объём в разы больше
+/// VRAM), а на устройство едет только то, что выбрал роутер. Вытеснение —
+/// FIFO: MoE обучается с балансировкой нагрузки, поэтому «горячих» экспертов,
+/// ради которых стоило бы держать возраст обращения, там нет.
+pub struct ExpertCache {
+    device: Device,
+    capacity_bytes: usize,
+    inner: Mutex<CacheInner>,
+}
+
+struct CacheInner {
+    map: HashMap<(usize, usize), Arc<Expert>>,
+    order: VecDeque<(usize, usize)>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub resident: usize,
+    pub bytes: usize,
+}
+
+impl ExpertCache {
+    pub fn new(device: Device, capacity_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            device,
+            capacity_bytes,
+            inner: Mutex::new(CacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+                misses: 0,
+            }),
+        })
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    pub fn stats(&self) -> ExpertCacheStats {
+        let inner = self.inner.lock().expect("кэш экспертов отравлен");
+        ExpertCacheStats {
+            hits: inner.hits,
+            misses: inner.misses,
+            resident: inner.map.len(),
+            bytes: inner.bytes,
+        }
+    }
+
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().expect("кэш экспертов отравлен");
+        inner.map.clear();
+        inner.order.clear();
+        inner.bytes = 0;
+    }
+
+    fn get(&self, key: (usize, usize)) -> Option<Arc<Expert>> {
+        let mut inner = self.inner.lock().ok()?;
+        match inner.map.get(&key) {
+            Some(e) => {
+                let e = e.clone();
+                inner.hits += 1;
+                Some(e)
+            }
+            None => {
+                inner.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(&self, key: (usize, usize), expert: Arc<Expert>) {
+        let bytes = expert.bytes();
+        let Ok(mut inner) = self.inner.lock() else { return };
+        if inner.map.contains_key(&key) {
+            return;
+        }
+        while inner.bytes + bytes > self.capacity_bytes {
+            let Some(victim) = inner.order.pop_front() else { break };
+            if let Some(old) = inner.map.remove(&victim) {
+                inner.bytes = inner.bytes.saturating_sub(old.bytes());
+            }
+        }
+        inner.bytes += bytes;
+        inner.order.push_back(key);
+        inner.map.insert(key, expert);
+    }
 }
 
 struct SharedExpert {
@@ -92,6 +209,8 @@ struct SharedExpert {
 
 pub struct MoeFfn {
     cfg: MoeConfig,
+    cache: Option<Arc<ExpertCache>>,
+    layer_id: usize,
     /// `[E, H]` в F32: софтмакс роутера считается в полной точности, иначе
     /// на 512 экспертах порядок top-k пляшет от округления.
     router: Tensor,
@@ -115,6 +234,19 @@ impl MoeFfn {
         compute: DType,
         quant: DType,
     ) -> Result<Self, ModelError> {
+        Self::load_inner(weights, prefix, cfg, device, compute, quant, device)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_inner(
+        weights: &dyn WeightSource,
+        prefix: &str,
+        cfg: MoeConfig,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        expert_storage: Device,
+    ) -> Result<Self, ModelError> {
         let router = weights
             .tensor(&format!("{prefix}.gate.weight"), device, DType::F32)?;
         if router.dims() != [cfg.num_experts, cfg.hidden_size] {
@@ -134,6 +266,7 @@ impl MoeFfn {
             device,
             compute,
             quant,
+            expert_storage,
         )?;
         let down = Self::load_stack(
             weights,
@@ -143,6 +276,7 @@ impl MoeFfn {
             device,
             compute,
             quant,
+            expert_storage,
         )?;
         let experts = gate_up
             .into_iter()
@@ -174,10 +308,31 @@ impl MoeFfn {
             None
         };
 
-        Ok(Self { cfg, router, experts, shared, device, compute })
+        Ok(Self { cfg, cache: None, layer_id: 0, router, experts, shared, device, compute })
+    }
+
+    /// Веса экспертов остаются в системной памяти, а на устройство едет
+    /// только выбранное роутером — через общий [`ExpertCache`]. Всё остальное
+    /// (роутер, shared expert) резидентно на `device`, как обычно.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_offloaded(
+        weights: &dyn WeightSource,
+        prefix: &str,
+        cfg: MoeConfig,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        cache: Arc<ExpertCache>,
+        layer_id: usize,
+    ) -> Result<Self, ModelError> {
+        let mut me = Self::load_inner(weights, prefix, cfg, device, compute, quant, Device::Cpu)?;
+        me.cache = Some(cache);
+        me.layer_id = layer_id;
+        Ok(me)
     }
 
     /// Стопка `[E, N, K]` → по одной матрице на эксперта.
+    #[allow(clippy::too_many_arguments)]
     fn load_stack(
         weights: &dyn WeightSource,
         key: &str,
@@ -186,6 +341,7 @@ impl MoeFfn {
         device: Device,
         compute: DType,
         quant: DType,
+        storage: Device,
     ) -> Result<Vec<QLinear>, ModelError> {
         // Квантованный бандл: плотной копии там нет, режем готовые пары.
         if let Some(stack) = weights.quant_stack(key, device) {
@@ -207,10 +363,23 @@ impl MoeFfn {
                     )));
                 }
             }
-            return Ok(stack.into_iter().map(QLinear::Quant).collect());
+            return stack
+                .into_iter()
+                .map(|w| {
+                    let q = QLinear::Quant(w);
+                    if storage == device {
+                        Ok(q)
+                    } else {
+                        q.to_device(storage)
+                    }
+                })
+                .collect();
         }
 
-        let dense = weights.tensor(key, device, weight_dtype(quant, compute))?;
+        // При оффлоаде плотная стопка читается в системную память, а на
+        // устройство едет по одной матрице — только чтобы посчитать квант.
+        let read_device = if storage == device { device } else { Device::Cpu };
+        let dense = weights.tensor(key, read_device, weight_dtype(quant, compute))?;
         if dense.dims() != [num_experts, want[0], want[1]] {
             return Err(ModelError::Load(format!(
                 "{key}: форма {:?}, ожидалась [{num_experts}, {}, {}]",
@@ -228,7 +397,17 @@ impl MoeFfn {
                     .and_then(|t| t.contiguous())
                     .and_then(|t| t.reshape((want[0], want[1])))
                     .map_err(|e| ModelError::Load(format!("{key}: эксперт {i}: {e}")))?;
-                QLinear::build(w, quant, compute)
+                let w = if quant.is_quantized() && w.device() != device {
+                    w.to_device(device).map_err(|e| ModelError::Load(e.to_string()))?
+                } else {
+                    w
+                };
+                let q = QLinear::build(w, quant, compute)?;
+                if storage == device {
+                    Ok(q)
+                } else {
+                    q.to_device(storage)
+                }
             })
             .collect()
     }
@@ -400,13 +579,36 @@ impl MoeFfn {
     }
 
     fn expert_forward(&self, expert: usize, x: &Tensor) -> Result<Tensor, ModelError> {
-        let e = self
+        let host = self
             .experts
             .get(expert)
             .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
-        let gu = e.gate_up.forward(x)?;
-        let h = self.swiglu(&gu)?;
-        e.down.forward(&h)
+        match &self.cache {
+            None => {
+                let gu = host.gate_up.forward(x)?;
+                let h = self.swiglu(&gu)?;
+                host.down.forward(&h)
+            }
+            Some(cache) => {
+                let key = (self.layer_id, expert);
+                let resident = match cache.get(key) {
+                    Some(e) => e,
+                    None => {
+                        let e = Arc::new(host.to_device(cache.device())?);
+                        cache.insert(key, e.clone());
+                        e
+                    }
+                };
+                let gu = resident.gate_up.forward(x)?;
+                let h = self.swiglu(&gu)?;
+                resident.down.forward(&h)
+            }
+        }
+    }
+
+    /// Статистика попаданий в кэш резидентных экспертов (`None` — оффлоад выключен).
+    pub fn cache_stats(&self) -> Option<ExpertCacheStats> {
+        self.cache.as_ref().map(|c| c.stats())
     }
 
     /// `gate_up: [m, 2I]` → `silu(gate) * up`.

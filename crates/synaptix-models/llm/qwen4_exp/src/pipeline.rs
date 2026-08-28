@@ -5,7 +5,10 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::grad::no_grad;
 use synaptix_core::precision::PrecisionConfig;
+use std::sync::Arc;
+
 use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink, TokenSampler};
+use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats};
 use synaptix_llm_common::ModelError;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::tokenizer::Tokenizer;
@@ -48,7 +51,14 @@ impl Qwen4ExpPipeline {
             )
         };
         let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
-        let model = Qwen4ExpModel::build(
+        let expert_cache = expert_cache_for(&config, device);
+        if let Some(cache) = &expert_cache {
+            eprintln!(
+                "[qwen4_exp] эксперты в системной памяти, на карте кэш {:.1} ГБ",
+                cache.capacity_bytes() as f64 / (1 << 30) as f64
+            );
+        }
+        let model = Qwen4ExpModel::build_with_cache(
             &config,
             &weights,
             device,
@@ -56,6 +66,7 @@ impl Qwen4ExpPipeline {
             precision.mlp_w,
             cap,
             &|layer| weights.ngram_rows(layer),
+            expert_cache,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?;
         let chat_template = weights.chat_template.clone();
@@ -81,6 +92,10 @@ impl Qwen4ExpPipeline {
         tokenizer
             .decode(ids, true)
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
+    }
+
+    pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
+        self.model.expert_cache_stats()
     }
 
     pub fn rope_capacity(&self) -> usize {
@@ -216,6 +231,28 @@ impl Qwen4ExpPipeline {
             },
         ))
     }
+}
+
+/// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
+/// остальное — в системной памяти. Размер задаётся
+/// `SYN_QWEN4EXP_EXPERT_CACHE_GB` (0 — грузить эксперты целиком на
+/// устройство, как раньше); по умолчанию 12 ГБ, и только для моделей, чьи
+/// эксперты заведомо не влезают в память карты.
+fn expert_cache_for(cfg: &Qwen4ExpConfig, device: Device) -> Option<Arc<ExpertCache>> {
+    if !matches!(device, Device::Cuda(_)) {
+        return None;
+    }
+    let requested = std::env::var("SYN_QWEN4EXP_EXPERT_CACHE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok());
+    let big = cfg.moe.num_experts * cfg.num_hidden_layers >= 1024;
+    let gb = match requested {
+        Some(v) if v <= 0.0 => return None,
+        Some(v) => v,
+        None if big => 12.0,
+        None => return None,
+    };
+    Some(ExpertCache::new(device, (gb * (1u64 << 30) as f64) as usize))
 }
 
 #[derive(Debug, thiserror::Error)]
