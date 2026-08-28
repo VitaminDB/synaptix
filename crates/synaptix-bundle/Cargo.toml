@@ -65,3 +65,7 @@ path = "src/bin/syn_compact.rs"
 [[bin]]
 name = "syn-verify"
 path = "src/bin/syn_verify.rs"
+
+[[bin]]
+name = "syn-scan"
+path = "src/bin/syn_scan.rs"

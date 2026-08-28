@@ -3,7 +3,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use safetensors::SafeTensors;
+use synaptix_bundle::quant_layout::QuantManifest;
 use synaptix_bundle::Bundle;
+use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 
 use crate::error::{IoError, Result};
@@ -40,6 +42,9 @@ pub struct SynBundleLoader {
     component: Option<String>,
     default_device: Device,
     index: OnceLock<TensorIndex>,
+    /// Манифест квантованных весов. `None` внутри — бандл собран обычным
+    /// образом; читается лениво, один раз.
+    quant: OnceLock<Option<QuantManifest>>,
 }
 
 impl SynBundleLoader {
@@ -50,6 +55,7 @@ impl SynBundleLoader {
             component: None,
             default_device: Device::Cpu,
             index: OnceLock::new(),
+            quant: OnceLock::new(),
         })
     }
 
@@ -134,6 +140,100 @@ impl SynBundleLoader {
             Some(d) if d != src_dtype => tensor.to_dtype(d).map_err(IoError::Core),
             _ => Ok(tensor),
         }
+    }
+}
+
+/// Квантованные веса из бандла, собранного с `syn-quant-v1`.
+impl SynBundleLoader {
+    /// Манифест квантования; `None` — бандл обычный.
+    pub fn quant_manifest(&self) -> Option<&QuantManifest> {
+        self.quant
+            .get_or_init(|| QuantManifest::read_from(&self.bundle))
+            .as_ref()
+    }
+
+    /// Готовый квант-вес прямо из mmap: пара блобов `.qpacked`/`.qscales`
+    /// поднимается на устройство как есть, без разжатия в F16 и повторного
+    /// квантования.
+    ///
+    /// `None` — этот тензор в бандле не квантован (обычный путь загрузки).
+    /// `Some(Err(_))` — квантован, но прочитать не вышло: молча свалиться на
+    /// плотный путь нельзя, плотной копии в бандле уже нет.
+    pub fn load_quant(&self, name: &str, device: Device) -> Option<Result<QuantWeight>> {
+        let manifest = self.quant_manifest()?;
+        if manifest.is_empty() {
+            return None;
+        }
+        let idx = match self.index() {
+            Ok(i) => i,
+            Err(e) => return Some(Err(e)),
+        };
+        let key = Self::resolve_key(name, &idx.prefix);
+        let entry = manifest
+            .entry(&key)
+            .or_else(|| manifest.entry(name))?;
+        let name_in_bundle = if manifest.entry(&key).is_some() { key } else { name.to_string() };
+
+        Some(self.build_quant(manifest, &name_in_bundle, entry, device))
+    }
+
+    fn build_quant(
+        &self,
+        manifest: &QuantManifest,
+        key: &str,
+        entry: &synaptix_bundle::QuantEntry,
+        device: Device,
+    ) -> Result<QuantWeight> {
+        let kind = entry.kind().ok_or_else(|| {
+            IoError::Bundle(format!("`{key}`: неизвестный квант-формат `{}`", entry.format))
+        })?;
+        let (slices, n, k) = entry
+            .dims()
+            .ok_or_else(|| IoError::Bundle(format!("`{key}`: форма {:?} не матрица", entry.shape)))?;
+        if slices != 1 {
+            // Стопка экспертов — это `slices` независимых матриц, а
+            // `QuantWeight` описывает одну. Пока такие веса читать некому:
+            // MoE-путь в движке не реализован. Ошибка честнее тихого
+            // возврата плотного тензора, которого в бандле нет.
+            return Err(IoError::Bundle(format!(
+                "`{key}`: стопка из {slices} матриц — чтение квантованных MoE-весов пока не поддержано"
+            )));
+        }
+
+        let (bytes, _) = self.st_bytes()?;
+        let idx = self.index()?;
+        let take = |blob: &str| -> Result<&[u8]> {
+            let meta = idx
+                .by_name
+                .get(blob)
+                .ok_or_else(|| IoError::Bundle(format!("`{blob}`: блоб не найден в бандле")))?;
+            Ok(&bytes[meta.off..meta.off + meta.len])
+        };
+        let packed_bytes = take(&manifest.packed_name(key))?;
+        let scales_bytes = take(&manifest.scales_name(key))?;
+
+        // Размеры сверяем с манифестом: расхождение означает, что бандл
+        // собран другой версией раскладки, и молча считать по нему нельзя.
+        let want_packed = entry.packed_bytes().unwrap_or(0) as usize;
+        let want_scales = entry.scales_bytes().unwrap_or(0) as usize;
+        if packed_bytes.len() != want_packed || scales_bytes.len() != want_scales {
+            return Err(IoError::Bundle(format!(
+                "`{key}`: блобы {}/{} байт, а раскладка требует {want_packed}/{want_scales}",
+                packed_bytes.len(),
+                scales_bytes.len()
+            )));
+        }
+
+        let dtype = match kind {
+            synaptix_bundle::inspect::QuantKind::Nvfp4 => DType::NVFP4,
+            synaptix_bundle::inspect::QuantKind::Mxfp8 => DType::MXFP8,
+        };
+        let packed = Tensor::from_raw_slice(packed_bytes, vec![packed_bytes.len()], DType::U8, device)
+            .map_err(IoError::Core)?;
+        let scales = Tensor::from_raw_slice(scales_bytes, vec![scales_bytes.len()], DType::U8, device)
+            .map_err(IoError::Core)?;
+        QuantWeight::new(packed.storage_arc(), scales.storage_arc(), dtype, n, k)
+            .map_err(IoError::Core)
     }
 }
 

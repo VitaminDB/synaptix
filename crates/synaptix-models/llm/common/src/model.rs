@@ -710,6 +710,12 @@ impl DecoderModel {
         //    скромной VRAM;
         //  • device==Cpu (чистый CPU-инференс): квант недоступен → плотный путь.
         let qlin = |key: &str, wq: DType| -> Result<QLinear, ModelError> {
+            // Веса, уже упакованные в бандле, берём как есть: ни чтения F16,
+            // ни повторного квантования на загрузке.
+            if let Some(prequant) = weights.quant(key, if b_dev == device { device } else { b_dev }) {
+                let qw = prequant?;
+                return Ok(QLinear::Quant(qw));
+            }
             if wq.is_quantized() && matches!(device, Device::Cuda(_)) {
                 let w = weights.tensor(key, device, DType::F16)?;
                 let q = QLinear::build(w, wq, compute)?;
@@ -737,8 +743,18 @@ impl DecoderModel {
                 .map_err(|e| ModelError::Load(e.to_string()))
         };
 
-        let mut embed_dense = Some(weights.tensor("model.embed_tokens.weight", device, compute)?);
-        let embed_quant = if embed_dtype == DType::MXFP8
+        // Эмбеддинги, уже упакованные в бандле: плотной копии там нет,
+        // поэтому и читать её не пробуем, и квантовать заново незачем.
+        let prequant_embed = weights
+            .quant("model.embed_tokens.weight", device)
+            .transpose()?;
+        let mut embed_dense = match prequant_embed {
+            Some(_) => None,
+            None => Some(weights.tensor("model.embed_tokens.weight", device, compute)?),
+        };
+        let embed_quant = if let Some(q) = prequant_embed {
+            Some(q)
+        } else if embed_dtype == DType::MXFP8
             && !cfg.tie_word_embeddings
             && matches!(device, Device::Cuda(_))
             && cfg.hidden_size % 32 == 0
@@ -779,6 +795,9 @@ impl DecoderModel {
                 compute,
                 compute,
             )?
+        } else if let Some(prequant) = weights.quant("lm_head.weight", device) {
+            // Голова уже упакована в бандле — берём как есть.
+            QLinear::Quant(prequant?)
         } else {
             // lm_head всегда резидентен на `device` (даже при offload); квант
             // считается на GPU. На CPU-устройстве квант недоступен → плотный.

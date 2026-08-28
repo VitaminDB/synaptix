@@ -54,6 +54,18 @@ impl HybridWeights {
     pub fn contains(&self, key: &str) -> bool {
         self.loader.names().iter().any(|n| *n == key)
     }
+
+    /// Имя тензора внутри бандла: у гибрида языковая часть лежит под
+    /// `model.language_model.`, а снаружи адресуется как `model.`.
+    fn bundle_key(key: &str) -> String {
+        if key == "lm_head.weight" {
+            return key.to_string();
+        }
+        match key.strip_prefix("model.") {
+            Some(rest) => format!("{LM_PREFIX}{rest}"),
+            None => key.to_string(),
+        }
+    }
 }
 
 impl synaptix_llm_common::WeightSource for HybridWeights {
@@ -74,14 +86,18 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
     }
 
     fn contains(&self, key: &str) -> bool {
-        let mapped = if key == "lm_head.weight" {
-            key.to_string()
-        } else if let Some(rest) = key.strip_prefix("model.") {
-            format!("{LM_PREFIX}{rest}")
-        } else {
-            key.to_string()
-        };
-        HybridWeights::contains(self, &mapped)
+        HybridWeights::contains(self, &Self::bundle_key(key))
+    }
+
+    /// Готовый квант-вес из бандла, собранного с `syn-quant-v1`.
+    fn quant(
+        &self,
+        key: &str,
+        device: Device,
+    ) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, synaptix_llm_common::ModelError>>
+    {
+        let r = self.loader.load_quant(&Self::bundle_key(key), device)?;
+        Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
 }
 

@@ -14,7 +14,10 @@ pub mod cdir;
 pub mod chunk;
 pub mod error;
 pub mod header;
+pub mod inspect;
+pub mod pack_plan;
 pub mod path;
+pub mod quant_layout;
 pub mod quantized;
 pub mod stream;
 
@@ -25,6 +28,7 @@ mod resolver;
 
 
 pub use bundle::{Bundle, DirEntry};
+pub use pack_plan::{scan_collection, scan_source, FoundItem, PackPlan, SourceCandidate};
 pub use builder::{
     resolve_safetensors_in_dir, BundleBuilder, ProgressCallback, ProgressEvent,
 };
@@ -35,6 +39,7 @@ pub fn available_space(path: impl AsRef<std::path::Path>) -> Result<u64> {
 pub use cdir::{BundleMeta, CdirFormat, ChunkEntry, ChunkStatus, ChunkType, FileTag, LoraOverlay, RefSpec};
 pub use editor::{compact, BundleEditor};
 pub use error::{Error, Result};
+pub use quant_layout::{QuantEntry, QuantManifest};
 pub use quantized::{QuantizedChunkHeader, QUANT_FORMAT_FP8E4M3, QUANTIZED_CHUNK_NAME};
 pub use stream::{safetensors_header, StDtype, StreamTensor, TensorStream};
 pub use resolver::{FsResolver, RefResolver};
@@ -42,8 +47,13 @@ pub use resolver::{FsResolver, RefResolver};
 pub const SUPPORTED_MAJOR: u16 = 1;
 pub const CURRENT_MINOR: u16 = 0;
 
-pub const SUPPORTED_REQUIRED_CAPS: &[&str] = &[CAP_TENSOR_DELTA];
+pub const SUPPORTED_REQUIRED_CAPS: &[&str] = &[CAP_TENSOR_DELTA, CAP_QUANT_WEIGHTS];
 
 pub const CAP_SHA256_MANIFEST: &str = "sha256-manifest";
 pub const CAP_BLAKE3_MANIFEST: &str = "blake3-chunks";
 pub const CAP_TENSOR_DELTA: &str = "tensor-delta-overlays";
+/// Веса упакованы квантованными (NVFP4/MXFP8): вместо `<имя>` в
+/// tensors-чанке лежат `<имя>.qpacked` и `<имя>.qscales`, а раскладку
+/// описывает файл `quant_manifest.json`. Читатель без поддержки обязан
+/// отказаться открывать бандл, а не искать тензоры под прежними именами.
+pub const CAP_QUANT_WEIGHTS: &str = "syn-quant-v1";

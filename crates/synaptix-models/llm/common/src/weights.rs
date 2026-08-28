@@ -9,6 +9,20 @@ use crate::model::ModelError;
 pub trait WeightSource {
     fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, ModelError>;
     fn contains(&self, key: &str) -> bool;
+
+    /// Готовый квант-вес, если он лежит в источнике уже упакованным
+    /// (бандл собран с `syn-quant-v1`).
+    ///
+    /// `None` — источник хранит плотные веса, работает обычный путь:
+    /// прочитать F16 и посчитать квант на GPU. `Some(Err(_))` — вес
+    /// квантован, но прочитать его не удалось; свалиться на плотный путь
+    /// нельзя, плотной копии в таком бандле нет.
+    ///
+    /// Реализация по умолчанию отвечает `None`, поэтому источники, которые
+    /// про квант ничего не знают, продолжают работать как раньше.
+    fn quant(&self, _key: &str, _device: Device) -> Option<Result<QuantWeight, ModelError>> {
+        None
+    }
 }
 
 pub enum QLinear {

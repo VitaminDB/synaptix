@@ -130,6 +130,35 @@ impl synaptix_llm_common::WeightSource for MuseWeights {
         }
         MuseWeights::contains(self, &format!("{LM_PREFIX}{rest}"))
     }
+
+    /// Готовый квант-вес из бандла, собранного с `syn-quant-v1`.
+    ///
+    /// Синтетические и склеиваемые на лету веса сюда не попадают: `q_proj`
+    /// собирается из двух тензоров ([`MuseWeights::fused_q_gate`]), а
+    /// `q_norm`/`k_norm` в бандле вообще нет — для них квант-блоба быть не
+    /// может, и спрашивать его бессмысленно.
+    fn quant(
+        &self,
+        key: &str,
+        device: Device,
+    ) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, synaptix_llm_common::ModelError>>
+    {
+        let bundle_key = if key == "lm_head.weight" {
+            key.to_string()
+        } else {
+            let rest = key.strip_prefix("model.")?;
+            if layer_suffix(rest, "self_attn.q_proj.weight").is_some()
+                || layer_suffix(rest, "self_attn.q_norm.weight").is_some()
+                || layer_suffix(rest, "self_attn.k_norm.weight").is_some()
+                || rest == "norm.weight"
+            {
+                return None;
+            }
+            format!("{LM_PREFIX}{rest}")
+        };
+        let r = self.loader.load_quant(&bundle_key, device)?;
+        Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
