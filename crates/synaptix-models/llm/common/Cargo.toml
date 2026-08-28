@@ -17,4 +17,5 @@ synaptix-infer     = { workspace = true }
 thiserror          = { workspace = true }
 
 [dev-dependencies]
-synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

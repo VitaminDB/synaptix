@@ -56,6 +56,11 @@ pub enum LayerRole {
     Conditioning,
     /// Выходная голова не-языковой модели (`final_layer.*`, `proj_out`).
     Head,
+    /// Роутер MoE: матрица `[эксперты, hidden]`, по логитам которой выбираются
+    /// эксперты, и её гейты. Весит крохи, а решает всё — квантовать нельзя:
+    /// сдвиг логита на пол-процента меняет состав top-k, то есть модель
+    /// начинает считать другими весами.
+    Router,
     Vision,
     Audio,
     Vae,
@@ -68,6 +73,7 @@ impl LayerRole {
     /// CLI печатает как есть.
     pub fn key(self) -> &'static str {
         match self {
+            LayerRole::Router => "router",
             LayerRole::Embedding => "embedding",
             LayerRole::LmHead => "lm_head",
             LayerRole::Attention => "attention",
@@ -381,6 +387,17 @@ pub fn classify(name: &str) -> LayerRole {
     {
         return LayerRole::Attention;
     }
+    // Роутер MoE — до общего правила MLP: `mlp.gate.weight` лежит внутри
+    // `.mlp.`, но это не проекция FFN. `gate_proj` сюда не попадает — у него
+    // другое имя.
+    if n.ends_with(".gate.weight")
+        || n.ends_with(".gate.bias")
+        || n.contains("shared_expert_gate")
+        || n.contains("router.")
+        || n.contains("e_score_correction_bias")
+    {
+        return LayerRole::Router;
+    }
     if n.contains(".mlp.")
         || n.contains(".ffn.")
         || n.contains(".ff.")
@@ -620,6 +637,38 @@ mod tests {
             LayerRole::Lora
         );
         assert_eq!(classify("decoder.up_blocks.0.conv.weight"), LayerRole::Vae);
+    }
+
+    /// Роутер MoE решает, какими весами считать токен, и весит крохи —
+    /// квантовать его нельзя. Проекции FFN с похожими именами (`gate_proj`,
+    /// `gate_up_proj`) при этом обязаны остаться MLP.
+    #[test]
+    fn moe_router_is_not_an_mlp_projection() {
+        assert_eq!(classify("model.layers.0.mlp.gate.weight"), LayerRole::Router);
+        assert_eq!(
+            classify("model.language_model.layers.0.mlp.shared_expert_gate.weight"),
+            LayerRole::Router
+        );
+        assert_eq!(
+            classify("model.layers.0.block_sparse_moe.gate.weight"),
+            LayerRole::Router
+        );
+        assert_eq!(
+            classify("model.layers.0.mlp.gate.e_score_correction_bias"),
+            LayerRole::Router
+        );
+        assert_eq!(
+            classify("model.language_model.layers.0.mlp.experts.gate_up_proj"),
+            LayerRole::Mlp
+        );
+        assert_eq!(
+            classify("model.language_model.layers.0.mlp.experts.down_proj"),
+            LayerRole::Mlp
+        );
+        assert_eq!(
+            classify("model.layers.0.mlp.shared_expert.gate_proj.weight"),
+            LayerRole::Mlp
+        );
     }
 
     /// Раскладка диффузионного трансформера (MiniMax-H3 / LTX): модуляция

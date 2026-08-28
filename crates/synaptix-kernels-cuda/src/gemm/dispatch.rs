@@ -571,6 +571,18 @@ pub fn mxfp8_linear_tiled(
 /// же). `out_u8` при этом плотный `[m, n]`. Нужен для N вне 128-кратности:
 /// голова идёт быстрым ядром, хвост — фолбэком.
 #[allow(clippy::too_many_arguments)]
+/// Берёт ли tiled-ядро эту форму.
+///
+/// `K = 128` не берёт: ядро читает K-тайлы парами (double-buffer), и на
+/// единственном тайле подхватывает следующий, которого нет, — это не
+/// «неточный ответ», а `CUDA_ERROR_ILLEGAL_ADDRESS`, роняющий весь контекст.
+/// Такие формы уходят в деквант-фолбэк. `K = 128` встречается у узких
+/// проекций (например, MoE-эксперты в тестовых конфигурациях), у боевых
+/// весов `K` заметно больше.
+fn tiled_shape_ok(n: u32, k: u32) -> bool {
+    n % 128 == 0 && k % 128 == 0 && k >= 256
+}
+
 pub fn mxfp8_linear_tiled_n(
     qk: &Mxfp8QuantKernels,
     ctx: &Arc<CudaContext>,
@@ -583,7 +595,7 @@ pub fn mxfp8_linear_tiled_n(
 ) -> Result<bool> {
     let k = w.k() as u32;
     let m_pad = (m + 127) & !127;
-    if n % 128 != 0 || k % 128 != 0 {
+    if !tiled_shape_ok(n, k) {
         return Ok(false);
     }
     let k_us = k as usize;
@@ -825,7 +837,7 @@ pub fn mxfp8_linear_dequant_fallback(
     }
 
     // Голова доступна, только если tiled-ядро вообще применимо по K.
-    let n_head = if k % 128 == 0 { n - n % 128 } else { 0 };
+    let n_head = if tiled_shape_ok(128, k) { n - n % 128 } else { 0 };
     let rest = n - n_head;
     let chunk = if rest == 0 {
         0
