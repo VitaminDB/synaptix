@@ -137,10 +137,10 @@ impl LinearAttn {
         state: &mut GatedDeltaNetState,
         s: usize,
     ) -> Result<Tensor, ModelError> {
-        let core = if matches!(self.device, Device::Cuda(_)) && self.conv_w_dev.is_some() {
-            self.core_device(h, state, s)?
-        } else {
-            self.core_host(h, state, s)?
+        let core = match self.core_on_device(h, state, s) {
+            Some(Ok(core)) => core,
+            Some(Err(e)) => return Err(e),
+            None => self.core_host(h, state, s)?,
         };
         let z = coerr(self
             .in_proj_z
@@ -149,6 +149,29 @@ impl LinearAttn {
         let normed = self.gate(&core, &z)?;
         let normed = coerr(normed.reshape(vec![s, self.value_dim]))?;
         self.out_proj.forward(&normed)
+    }
+
+    /// CUDA-путь, если он применим к этой длине чанка: фьюз
+    /// `conv1d + prep + chunk_gated_delta_rule` требует кратности чанку скана,
+    /// иначе считаем host-цепочкой.
+    fn core_on_device(
+        &self,
+        h: &Tensor,
+        state: &mut GatedDeltaNetState,
+        s: usize,
+    ) -> Option<Result<Tensor, ModelError>> {
+        if !matches!(self.device, Device::Cuda(_)) || self.conv_w_dev.is_none() {
+            return None;
+        }
+        match self.core_device(h, state, s) {
+            Ok(core) => Some(Ok(core)),
+            Err(ModelError::Forward(msg)) if unsupported(&msg) => {
+                state.conv_state_dev = None;
+                state.ssm_state_dev = None;
+                None
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn core_host(
@@ -284,6 +307,11 @@ impl LinearAttn {
             .reshape(vec![1, s, h_v, dv]))?
             .to_dtype(self.compute))
     }
+}
+
+fn unsupported(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("unsupported") || m.contains("не поддерж") || m.contains("chunk")
 }
 
 fn host_vec(t: &Tensor) -> Result<Vec<f32>, ModelError> {
