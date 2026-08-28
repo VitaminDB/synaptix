@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -214,35 +215,42 @@ impl QsaIndexer {
                 .and_then(|t| t.flatten_all())
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(|e| ModelError::Forward(e.to_string()))?;
-            for i in 0..take {
-                let pos = past + row + i;
-                let visible = pos + 1;
-                let nb = visible / cr;
-                let scores_row = &host[i * total_blocks..i * total_blocks + nb.min(total_blocks)];
-                let mut tokens = Vec::with_capacity(topk * cr + cr);
-                if nb > 0 {
-                    let mut order: Vec<u32> = (0..scores_row.len() as u32).collect();
-                    let take_blocks = topk.min(order.len());
-                    if take_blocks < order.len() {
-                        order.select_nth_unstable_by(take_blocks - 1, |a, b| {
-                            scores_row[*b as usize]
-                                .partial_cmp(&scores_row[*a as usize])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        order.truncate(take_blocks);
-                    }
-                    for b in order {
-                        let start = b as usize * cr;
-                        for t in start..start + cr {
-                            tokens.push(t as u32);
+            // Выбор блоков независим по запросам, а на длинном контексте это
+            // десятки тысяч кандидатов на каждый — один поток тут становится
+            // дороже самого внимания.
+            let picked: Vec<Vec<u32>> = (0..take)
+                .into_par_iter()
+                .map(|i| {
+                    let pos = past + row + i;
+                    let visible = pos + 1;
+                    let nb = (visible / cr).min(total_blocks);
+                    let scores_row = &host[i * total_blocks..i * total_blocks + nb];
+                    let mut tokens = Vec::with_capacity(topk * cr + cr);
+                    if nb > 0 {
+                        let mut order: Vec<u32> = (0..scores_row.len() as u32).collect();
+                        let take_blocks = topk.min(order.len());
+                        if take_blocks < order.len() {
+                            order.select_nth_unstable_by(take_blocks - 1, |a, b| {
+                                scores_row[*b as usize]
+                                    .partial_cmp(&scores_row[*a as usize])
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            order.truncate(take_blocks);
+                        }
+                        for b in order {
+                            let start = b as usize * cr;
+                            for t in start..start + cr {
+                                tokens.push(t as u32);
+                            }
                         }
                     }
-                }
-                for t in nb * cr..visible {
-                    tokens.push(t as u32);
-                }
-                selected.push(tokens);
-            }
+                    for t in nb * cr..visible {
+                        tokens.push(t as u32);
+                    }
+                    tokens
+                })
+                .collect();
+            selected.extend(picked);
             row += take;
         }
         Ok(Some(selected))

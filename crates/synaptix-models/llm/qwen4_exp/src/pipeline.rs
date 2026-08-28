@@ -17,7 +17,16 @@ use crate::config::Qwen4ExpConfig;
 use crate::loader::{BundleExperts, Qwen4ExpWeights};
 use crate::model::{ModelCache, Qwen4ExpModel};
 
-pub const DEFAULT_PREFILL_CHUNK: usize = 512;
+/// Чанк префилла. Чем он крупнее, тем меньше проходов по всей стопке
+/// экспертов: любой чанк длиннее сотни токенов задевает почти все 512
+/// экспертов слоя, так что стоимость префилла — это число чанков, умноженное
+/// на объём экспертов. Меняется `SYN_QWEN4EXP_PREFILL_CHUNK`.
+pub const DEFAULT_PREFILL_CHUNK: usize = 4096;
+
+/// Ёмкость кэша экспертов на время префилла. Чанк задевает почти всех
+/// экспертов слоя — кэш всё равно вытеснится целиком, а память нужна
+/// активациям; на декоде ёмкость возвращается.
+const PREFILL_CACHE_BYTES: usize = 4 << 30;
 
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
@@ -64,6 +73,7 @@ impl Qwen4ExpPipeline {
                 cache.capacity_bytes() as f64 / (1 << 30) as f64
             );
         }
+        let kv_reserve = model_kv_reserve(&config, cap);
         let model = Qwen4ExpModel::build_with_cache(
             &config,
             &*weights,
@@ -76,6 +86,9 @@ impl Qwen4ExpPipeline {
             expert_source,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?;
+        if let Some(cache) = model.expert_cache() {
+            warn_if_cache_too_big(cache, device, kv_reserve);
+        }
         let chat_template = weights.chat_template.clone();
         Ok(Self { model, config, chat_template, tokenizer, max_seq: cap })
     }
@@ -150,7 +163,11 @@ impl Qwen4ExpPipeline {
             cfg.eos_token_ids = self.config.eos_token_ids.clone();
         }
         if cfg.prefill_batch == 0 {
-            cfg.prefill_batch = DEFAULT_PREFILL_CHUNK;
+            cfg.prefill_batch = std::env::var("SYN_QWEN4EXP_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_PREFILL_CHUNK);
         }
         cfg
     }
@@ -196,6 +213,10 @@ impl Qwen4ExpPipeline {
             cfg.eos_token_ids.clone()
         };
 
+        let cache_capacity = self.model.expert_cache().map(|c| c.capacity_bytes());
+        if let (Some(cache), Some(full)) = (self.model.expert_cache(), cache_capacity) {
+            cache.set_capacity(PREFILL_CACHE_BYTES.min(full));
+        }
         let prefill_start = Instant::now();
         let mut logits = no_grad(|| -> Result<_, ModelError> {
             let mut last = None;
@@ -209,6 +230,9 @@ impl Qwen4ExpPipeline {
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
         })?;
         let prefill_ms = prefill_start.elapsed().as_millis();
+        if let (Some(cache), Some(full)) = (self.model.expert_cache(), cache_capacity) {
+            cache.set_capacity(full);
+        }
 
         let decode_start = Instant::now();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
@@ -237,6 +261,42 @@ impl Qwen4ExpPipeline {
                 decode_ms,
             },
         ))
+    }
+}
+
+/// Сколько VRAM уйдёт под KV и ключи индексатора при полном окне.
+fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize) -> usize {
+    let qsa = cfg
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, crate::config::LayerType::Qsa))
+        .count();
+    let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * 2
+        + if cfg.indexer.compress_ratio > 0 {
+            cfg.indexer.head_dim * 2 / cfg.indexer.compress_ratio
+        } else {
+            0
+        };
+    qsa * max_seq * per_token
+}
+
+/// Предупредить, если под кэш просят больше, чем видно свободного. Сам размер
+/// не трогаем: `cuMemGetInfo` не знает про уже зарезервированное пулами, и
+/// автоподгонка по нему обнуляла кэш там, где он прекрасно помещался.
+fn warn_if_cache_too_big(cache: &Arc<ExpertCache>, device: Device, kv_reserve: usize) {
+    let Device::Cuda(ordinal) = device else { return };
+    let Ok((free, _total)) = synaptix_core::device::cuda::mem_info(ordinal) else {
+        return;
+    };
+    let need = cache.capacity_bytes() + kv_reserve;
+    if need > free {
+        eprintln!(
+            "[qwen4_exp] кэш экспертов {:.1} ГБ плюс KV {:.1} ГБ против {:.1} ГБ свободных — \
+             при нехватке уменьшите SYN_QWEN4EXP_EXPERT_CACHE_GB",
+            cache.capacity_bytes() as f64 / (1u64 << 30) as f64,
+            kv_reserve as f64 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64,
+        );
     }
 }
 

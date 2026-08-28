@@ -8,10 +8,23 @@ use synaptix_ops::pos::rope::{apply_rope_range, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
 
 use crate::config::Qwen4ExpConfig;
-use crate::norm::{coerr, load_one_plus, rms};
+use crate::norm::{coerr, load_one_plus, rms, stage};
 use crate::qsa::{IndexerCache, QsaIndexer};
 
 const MASK_NEG: f32 = -1.0e4;
+
+/// Потолок памяти на собранные K/V одной группы запросов.
+const SPARSE_KV_BUDGET: usize = 512 << 20;
+
+/// Считать ли выбранные позиции гатером — работа тогда растёт с бюджетом
+/// индексатора, а не с длиной контекста. `SYN_QWEN4EXP_QSA_GATHER=0`
+/// возвращает прежний путь с маской поверх полного внимания.
+fn gather_selected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_QSA_GATHER").map(|v| v.trim() != "0").unwrap_or(true)
+    })
+}
 
 pub struct KvLayer {
     pub k: Tensor,
@@ -113,7 +126,7 @@ impl QsaAttention {
         rope: &RopeCache,
     ) -> Result<(Tensor, Option<Vec<Vec<u32>>>), ModelError> {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
-        let selected = self.indexer.forward(h, idx, past, s, rope)?;
+        let selected = stage("qsa:indexer", || self.indexer.forward(h, idx, past, s, rope))?;
 
         let qg = self.q_proj.forward(h)?;
         let qg = coerr(qg.reshape(vec![1, s, nh, 2 * hd]))?;
@@ -168,12 +181,15 @@ impl QsaAttention {
                     }
                 }
             }
-            Some(sel) => {
+            Some(sel) if gather_selected() => {
+                stage("qsa:sparse", || self.sparse_attention(&q, kv, sel))?
+            }
+            Some(sel) => stage("qsa:masked", || {
                 let k_rep = repeat_kv(&k_all, nh / nkv)?;
                 let v_rep = repeat_kv(&v_all, nh / nkv)?;
                 let mask = self.selection_mask(sel, s, kv_len)?;
-                coerr(scaled_dot_attention(&q, &k_rep, &v_rep, self.scale, Some(&mask)))?
-            }
+                coerr(scaled_dot_attention(&q, &k_rep, &v_rep, self.scale, Some(&mask)))
+            })?,
         };
 
         let attn = coerr(coerr(attn.permute(vec![0, 2, 1, 3]))?.contiguous())?;
@@ -207,6 +223,103 @@ impl QsaAttention {
             }
         }
         coerr(coerr(Tensor::from_vec(data, vec![s, kv_len], self.device))?.to_dtype(self.compute))
+    }
+
+    /// Attention по выбранным индексатором позициям, без построения маски на
+    /// всю длину контекста: KV собираются гатером, и каждый запрос считает
+    /// свой бюджет (≤ `budget + compress_ratio − 1` позиций) независимо от
+    /// того, сколько токенов уже в кэше.
+    ///
+    /// Запросы группируются по числу выбранных позиций — внутри группы формы
+    /// совпадают, поэтому ни паддинга, ни маски не нужно. Группы режутся по
+    /// памяти собранного KV.
+    fn sparse_attention(
+        &self,
+        q: &Tensor,
+        kv: &KvLayer,
+        selected: &[Vec<u32>],
+    ) -> Result<Tensor, ModelError> {
+        let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let cap = kv.k.dims()[2];
+        let s = selected.len();
+        let elem = (self.compute.size_in_bits() / 8).max(1);
+
+        let mut by_len: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for (i, row) in selected.iter().enumerate() {
+            by_len.entry(row.len()).or_default().push(i);
+        }
+
+        let mut order: Vec<usize> = Vec::with_capacity(s);
+        let mut parts: Vec<Tensor> = Vec::new();
+        for (m, rows) in by_len {
+            if m == 0 {
+                return Err(ModelError::Forward("QSA: пустой набор позиций".into()));
+            }
+            let per_query = 2 * nkv * m * hd * elem;
+            let group = (SPARSE_KV_BUDGET / per_query.max(1)).clamp(1, rows.len());
+            for slice in rows.chunks(group) {
+                let g = slice.len();
+                // Гатер идёт по KV-буферу как по таблице `[nkv · cap, hd]`:
+                // строка головы `h` и позиции `p` лежит по индексу `h·cap + p`.
+                // Так подходит быстрое embed-ядро, читающее индексы с карты, —
+                // `index_select` копирует строку за строкой и на бюджете в две
+                // тысячи позиций стоит дороже самого внимания.
+                // Индексы сразу в порядке `[запрос, голова, позиция]` — тогда
+                // результат гатера уже нужной формы и транспонировать
+                // четверть гигабайта не приходится.
+                let mut idx = Vec::with_capacity(g * nkv * m);
+                for row in slice {
+                    for head in 0..nkv {
+                        let base = (head * cap) as u32;
+                        idx.extend(selected[*row].iter().map(|p| base + *p));
+                    }
+                }
+                let idx = coerr(Tensor::from_vec(idx, vec![g * nkv * m], self.device))?;
+                let gather = |src: &Tensor| -> Result<Tensor, ModelError> {
+                    let table = coerr(src.reshape(vec![nkv * cap, hd]))?;
+                    let picked = match table.embed_gather(&idx) {
+                        Ok(p) => p,
+                        Err(SynaptixError::Unsupported(_)) => coerr(table.index_select(0, &idx))?,
+                        Err(e) => return Err(ModelError::Forward(e.to_string())),
+                    };
+                    coerr(picked.reshape(vec![g, nkv, m, hd]))
+                };
+                let k_sel = gather(&kv.k)?;
+                let v_sel = gather(&kv.v)?;
+
+                let rows_idx: Vec<u32> = slice.iter().map(|r| *r as u32).collect();
+                let rows_idx = coerr(Tensor::from_vec(rows_idx, vec![g], self.device))?;
+                let q_sel = coerr(q.index_select(2, &rows_idx))?;
+                let q_sel = coerr(coerr(q_sel.permute(vec![2, 1, 0, 3]))?.contiguous())?;
+
+                let out = match q_sel.flash_attention(&k_sel, &v_sel, self.scale, false) {
+                    Ok(a) => a,
+                    Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
+                        let k_rep = repeat_kv(&k_sel, nh / nkv)?;
+                        let v_rep = repeat_kv(&v_sel, nh / nkv)?;
+                        coerr(scaled_dot_attention(&q_sel, &k_rep, &v_rep, self.scale, None))?
+                    }
+                    Err(e) => return Err(ModelError::Forward(e.to_string())),
+                };
+                order.extend_from_slice(slice);
+                parts.push(coerr(out.reshape(vec![g, nh, hd]))?);
+            }
+        }
+
+        let stacked = if parts.len() == 1 {
+            parts.pop().expect("одна часть")
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            coerr(Tensor::cat(&refs, 0))?
+        };
+        let mut inverse = vec![0u32; s];
+        for (place, row) in order.iter().enumerate() {
+            inverse[*row] = place as u32;
+        }
+        let inverse = coerr(Tensor::from_vec(inverse, vec![s], self.device))?;
+        let restored = coerr(stacked.index_select(0, &inverse))?;
+        coerr(coerr(coerr(restored.permute(vec![1, 0, 2]))?.contiguous())?
+            .reshape(vec![1, nh, s, hd]))
     }
 }
 

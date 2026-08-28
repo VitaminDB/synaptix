@@ -15,7 +15,7 @@ use crate::config::{LayerType, Qwen4ExpConfig};
 use crate::gated_residual::GatedResidual;
 use crate::linear_attn::LinearAttn;
 use crate::ngram::{NGramEmbedding, NGramRows};
-use crate::norm::{coerr, ctx};
+use crate::norm::{coerr, ctx, stage};
 use crate::ple::{PleLayer, PleState};
 use crate::qsa::IndexerCache;
 
@@ -287,6 +287,10 @@ impl Qwen4ExpModel {
         self.expert_cache.as_ref().map(|c| c.stats())
     }
 
+    pub fn expert_cache(&self) -> Option<&Arc<ExpertCache>> {
+        self.expert_cache.as_ref()
+    }
+
     pub fn make_cache(&self, max_seq: usize) -> Result<ModelCache, ModelError> {
         let mut layers = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -363,21 +367,27 @@ impl Qwen4ExpModel {
             if let Some(ple) = &block.ple {
                 let state = &mut cache.ple[ple_slot];
                 ple_slot += 1;
-                let delta = ctx(ple.forward(&hidden, tokens, state), &format!("слой {l} ple"))?;
+                let delta = stage("ple", || {
+                    ctx(ple.forward(&hidden, tokens, state), &format!("слой {l} ple"))
+                })?;
                 hidden = coerr(hidden.add(&delta))?;
             }
 
-            let mixed = ctx(block.attn_hc.forward(&hidden), &format!("слой {l} attn_hc"))?;
+            let mixed = stage("hc", || {
+                ctx(block.attn_hc.forward(&hidden), &format!("слой {l} attn_hc"))
+            })?;
             let out = match (&block.mixer, &mut cache.layers[l]) {
-                (Mixer::Linear(la), LayerState::Linear(state)) => {
-                    ctx(la.forward(&mixed.mixed, state, s), &format!("слой {l} linear_attn"))?
-                }
+                (Mixer::Linear(la), LayerState::Linear(state)) => stage("linear_attn", || {
+                    ctx(la.forward(&mixed.mixed, state, s), &format!("слой {l} linear_attn"))
+                })?,
                 (Mixer::Qsa(qa), LayerState::Qsa(state)) => {
                     let (kv, idx) = state.as_mut();
-                    let (out, selected) = ctx(
-                        qa.forward(&mixed.mixed, kv, idx, past, s, &self.rope),
-                        &format!("слой {l} qsa"),
-                    )?;
+                    let (out, selected) = stage("qsa", || {
+                        ctx(
+                            qa.forward(&mixed.mixed, kv, idx, past, s, &self.rope),
+                            &format!("слой {l} qsa"),
+                        )
+                    })?;
                     if trace {
                         let kv_len = past + s;
                         let mut mask = vec![0f32; s * kv_len];
@@ -419,7 +429,9 @@ impl Qwen4ExpModel {
             ), &format!("слой {l} attn_inject"))?;
 
             let mixed = ctx(block.mlp_hc.forward(&hidden), &format!("слой {l} mlp_hc"))?;
-            let out = ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))?;
+            let out = stage("moe", || {
+                ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
+            })?;
             hidden = ctx(block.mlp_hc.inject(
                 &mixed.hyper,
                 &out,

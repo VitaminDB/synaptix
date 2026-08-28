@@ -7,6 +7,54 @@ pub fn coerr<T>(r: synaptix_core::error::Result<T>) -> Result<T, ModelError> {
     r.map_err(|e| ModelError::Forward(e.to_string()))
 }
 
+static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static STAGES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn profiling() -> bool {
+    *PROFILE.get_or_init(|| std::env::var("SYN_QWEN4EXP_PROFILE").is_ok())
+}
+
+/// Замер этапа forward'а: включается `SYN_QWEN4EXP_PROFILE`. Замеры грубые —
+/// очередь CUDA синхронизируется не здесь, а на ближайшей выгрузке на хост
+/// (роутер MoE, top-k индексатора), так что доли стоит читать как порядок
+/// величины.
+pub fn stage<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    if !profiling() {
+        return f();
+    }
+    let started = std::time::Instant::now();
+    let out = f();
+    let nanos = started.elapsed().as_nanos() as u64;
+    if let Ok(mut stages) = STAGES.lock() {
+        match stages.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(entry) => {
+                entry.1 += nanos;
+                entry.2 += 1;
+            }
+            None => stages.push((name, nanos, 1)),
+        }
+    }
+    out
+}
+
+pub fn profile_report() -> String {
+    let Ok(mut stages) = STAGES.lock() else {
+        return String::new();
+    };
+    stages.sort_by_key(|(_, nanos, _)| std::cmp::Reverse(*nanos));
+    let total: u64 = stages.iter().map(|(_, n, _)| *n).sum();
+    let mut out = String::new();
+    for (name, nanos, calls) in stages.iter() {
+        out.push_str(&format!(
+            "  {name}: {:.2} с ({:.1}%), вызовов {calls}\n",
+            *nanos as f64 / 1e9,
+            100.0 * *nanos as f64 / total.max(1) as f64,
+        ));
+    }
+    stages.clear();
+    out
+}
+
 pub fn ctx<T>(r: Result<T, ModelError>, what: &str) -> Result<T, ModelError> {
     r.map_err(|e| match e {
         ModelError::Forward(m) => ModelError::Forward(format!("{what}: {m}")),

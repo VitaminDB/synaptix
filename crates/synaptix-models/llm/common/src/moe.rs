@@ -23,6 +23,7 @@
 //! только логиты роутера (см. [`MoeFfn::route`]).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
@@ -113,7 +114,7 @@ impl Expert {
 /// ради которых стоило бы держать возраст обращения, там нет.
 pub struct ExpertCache {
     device: Device,
-    capacity_bytes: usize,
+    capacity_bytes: AtomicUsize,
     inner: Mutex<CacheInner>,
     /// Pinned-зеркало host-весов (`SYN_MOE_PINNED=1`, по умолчанию выключено).
     /// Первая отправка эксперта копирует его в закреплённую память — на слое
@@ -156,7 +157,7 @@ impl ExpertCache {
             && std::env::var("SYN_MOE_PINNED").map(|v| v.trim() == "1").unwrap_or(false);
         Arc::new(Self {
             device,
-            capacity_bytes,
+            capacity_bytes: AtomicUsize::new(capacity_bytes),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
@@ -176,7 +177,27 @@ impl ExpertCache {
     }
 
     pub fn capacity_bytes(&self) -> usize {
-        self.capacity_bytes
+        self.capacity_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Сменить ёмкость и сразу освободить лишнее. Префилл трогает почти всех
+    /// экспертов слоя, так что держать под них большой кэш бессмысленно — он
+    /// всё равно вытеснится, зато отнимет память у активаций; на декоде,
+    /// наоборот, кэш и есть источник скорости.
+    pub fn set_capacity(&self, bytes: usize) {
+        self.capacity_bytes.store(bytes, Ordering::Relaxed);
+        self.trim_to(bytes);
+    }
+
+    /// Освободить резидентов, пока занято больше `bytes`.
+    pub fn trim_to(&self, bytes: usize) {
+        let Ok(mut inner) = self.inner.lock() else { return };
+        while inner.bytes > bytes {
+            let Some(victim) = inner.order.pop_front() else { break };
+            if let Some(old) = inner.map.remove(&victim) {
+                inner.bytes = inner.bytes.saturating_sub(old.bytes());
+            }
+        }
     }
 
     pub fn stats(&self) -> ExpertCacheStats {
@@ -245,7 +266,8 @@ impl ExpertCache {
         if inner.map.contains_key(&key) {
             return;
         }
-        while inner.bytes + bytes > self.capacity_bytes {
+        let capacity = self.capacity_bytes.load(Ordering::Relaxed);
+        while inner.bytes + bytes > capacity {
             let Some(victim) = inner.order.pop_front() else { break };
             if let Some(old) = inner.map.remove(&victim) {
                 inner.bytes = inner.bytes.saturating_sub(old.bytes());
@@ -761,6 +783,7 @@ impl MoeFfn {
                 let ExpertStore::Lazy { source, .. } = &self.experts else {
                     return None;
                 };
+                let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
                 source
                     .fetch(self.layer_id, *e as usize, cache.device())
                     .ok()
@@ -819,6 +842,10 @@ impl MoeFfn {
         if let Some(e) = cache.get(key) {
             return Ok(e);
         }
+        // Веса эксперта живут отдельно от активаций: смешанные в одном пуле
+        // мелкие веса и крупные буферы префилла дробят free-list, и уже через
+        // несколько слоёв не находится непрерывного куска.
+        let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
         let fetched = match &self.experts {
             ExpertStore::Resident(all) => {
                 let host = all

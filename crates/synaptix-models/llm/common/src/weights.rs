@@ -141,8 +141,16 @@ impl QLinear {
                     + l.bias().map_or(0, |b| b.dtype().bytes_for_numel(b.numel()))
             }
             QLinear::Quant(w) => {
+                // NVFP4-ядро GEMM держит вторую, перемешанную копию весов —
+                // она появляется на первом же префилле, и не учитывать её в
+                // бюджете кэша значит промахнуться вдвое.
                 let numel = w.n() * w.k();
-                w.dtype().bytes_for_numel(numel) + numel / 16
+                let packed = w.dtype().bytes_for_numel(numel) + numel / 16;
+                if w.dtype() == DType::NVFP4 {
+                    packed * 2
+                } else {
+                    packed
+                }
             }
         }
     }

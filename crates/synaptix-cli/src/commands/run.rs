@@ -320,6 +320,10 @@ fn run_qwen4_exp(
     print_run_result(
         &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
     );
+    let report = synaptix_llm_qwen4_exp::norm::profile_report();
+    if !report.is_empty() {
+        eprintln!("synaptix run: этапы forward:\n{report}");
+    }
     if let Some(c) = pipeline.expert_cache_stats() {
         let total = c.hits + c.misses;
         eprintln!(
