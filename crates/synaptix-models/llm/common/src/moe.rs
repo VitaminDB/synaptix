@@ -114,6 +114,13 @@ pub struct ExpertCache {
     device: Device,
     capacity_bytes: usize,
     inner: Mutex<CacheInner>,
+    /// Pinned-зеркало host-весов (`SYN_MOE_PINNED=1`, по умолчанию выключено).
+    /// Первая отправка эксперта копирует его в закреплённую память — на слое
+    /// 512 экспертов это втрое дороже обычной pageable-копии, — зато повторные
+    /// отправки того же эксперта идут DMA без staging. Окупается только при
+    /// тесном кэше с частым вытеснением, и ценой второй копии каждого
+    /// отправленного эксперта в RAM.
+    _mirror: Option<synaptix_core::device::cuda::PinMirrorGuard>,
 }
 
 struct CacheInner {
@@ -138,9 +145,12 @@ pub struct ExpertCacheStats {
 
 impl ExpertCache {
     pub fn new(device: Device, capacity_bytes: usize) -> Arc<Self> {
+        let pinned = matches!(device, Device::Cuda(_))
+            && std::env::var("SYN_MOE_PINNED").map(|v| v.trim() == "1").unwrap_or(false);
         Arc::new(Self {
             device,
             capacity_bytes,
+            _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
                 order: VecDeque::new(),
@@ -655,7 +665,15 @@ impl MoeFfn {
                 let resident = match cache.get(key) {
                     Some(e) => e,
                     None => {
-                        let e = Arc::new(host.to_device(cache.device())?);
+                        let pinned = cache._mirror.is_some();
+                        if pinned {
+                            synaptix_core::device::cuda::set_pin_mirror(true);
+                        }
+                        let moved = host.to_device(cache.device());
+                        if pinned {
+                            synaptix_core::device::cuda::set_pin_mirror(false);
+                        }
+                        let e = Arc::new(moved?);
                         cache.insert(key, e.clone());
                         e
                     }
