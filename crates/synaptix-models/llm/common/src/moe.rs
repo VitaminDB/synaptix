@@ -818,14 +818,12 @@ impl MoeFfn {
                     .get(expert)
                     .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
                 let gu = host.gate_up.forward(x)?;
-                let h = self.swiglu(&gu)?;
-                host.down.forward(&h)
+                self.down_from_gate_up(&host.down, &gu, x.dims()[0])
             }
             (_, Some(cache)) => {
                 let resident = self.resident_expert(expert, cache)?;
                 let gu = resident.gate_up.forward(x)?;
-                let h = self.swiglu(&gu)?;
-                resident.down.forward(&h)
+                self.down_from_gate_up(&resident.down, &gu, x.dims()[0])
             }
             (ExpertStore::Lazy { .. }, None) => Err(ModelError::Forward(
                 "MoE: ленивые эксперты без кэша — некуда их класть".into(),
@@ -877,6 +875,24 @@ impl MoeFfn {
     /// Статистика попаданий в кэш резидентных экспертов (`None` — оффлоад выключен).
     pub fn cache_stats(&self) -> Option<ExpertCacheStats> {
         self.cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Вторая половина эксперта: `silu(gate) · up`, затем проекция вниз. У
+    /// NVFP4-веса это один фьюз вместо пяти ядер — активация сразу выходит
+    /// квантованной, ровно в том виде, какой нужен GEMM'у.
+    fn down_from_gate_up(
+        &self,
+        down: &QLinear,
+        gate_up: &Tensor,
+        m: usize,
+    ) -> Result<Tensor, ModelError> {
+        if down.quant_dtype() == Some(DType::NVFP4) {
+            if let Ok((packed, scales)) = gate_up.silu_mul_quant_nvfp4(1.0) {
+                return down.forward_prequant(&packed, &scales, m);
+            }
+        }
+        let h = self.swiglu(gate_up)?;
+        down.forward(&h)
     }
 
     /// `gate_up: [m, 2I]` → `silu(gate) * up`.
