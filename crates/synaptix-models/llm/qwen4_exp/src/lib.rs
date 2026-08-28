@@ -4,6 +4,7 @@ pub mod gated_residual;
 pub mod linear_attn;
 pub mod loader;
 pub mod model;
+pub mod mtp;
 pub mod ngram;
 pub mod norm;
 pub mod pipeline;

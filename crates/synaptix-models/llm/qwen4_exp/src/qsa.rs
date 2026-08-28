@@ -14,17 +14,55 @@ pub struct IndexerCache {
     block_keys: Tensor,
     blocks: usize,
     capacity: usize,
+    head_dim: usize,
+    ratio: usize,
 }
 
 impl IndexerCache {
-    pub fn new(capacity_blocks: usize, head_dim: usize, device: Device, dtype: DType) -> Result<Self, ModelError> {
+    pub fn new(
+        capacity_blocks: usize,
+        head_dim: usize,
+        ratio: usize,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, ModelError> {
         let block_keys = Tensor::zeros(vec![1, 1, capacity_blocks.max(1), head_dim], dtype, device)
             .map_err(|e| ModelError::Build(e.to_string()))?;
-        Ok(Self { pending: Vec::new(), block_keys, blocks: 0, capacity: capacity_blocks.max(1) })
+        Ok(Self {
+            pending: Vec::new(),
+            block_keys,
+            blocks: 0,
+            capacity: capacity_blocks.max(1),
+            head_dim,
+            ratio: ratio.max(1),
+        })
     }
 
     pub fn blocks(&self) -> usize {
         self.blocks
+    }
+
+    /// Метка состояния: сколько блоков собрано и сколько сырых ключей ждёт
+    /// в хвосте. По ней спекулятивный шаг откатывается.
+    pub fn mark(&self) -> (usize, usize) {
+        (self.blocks, self.pending.len())
+    }
+
+    /// Какой будет метка через `n` токенов: ключи копятся в хвосте и каждые
+    /// `ratio` штук сворачиваются в блок, так что считать её можно наперёд —
+    /// прогону пары это избавляет от лишнего прохода индексатора.
+    pub fn mark_after(&self, n: usize) -> (usize, usize) {
+        let waiting = self.pending.len() / self.head_dim + n;
+        let new_blocks = waiting / self.ratio;
+        (self.blocks + new_blocks, (waiting % self.ratio) * self.head_dim)
+    }
+
+    pub fn rewind(&mut self, mark: (usize, usize)) {
+        let (blocks, pending) = mark;
+        self.blocks = self.blocks.min(blocks);
+        if self.pending.len() > pending {
+            self.pending.truncate(pending);
+        }
     }
 
     pub fn reset(&mut self) {
@@ -78,7 +116,13 @@ impl QsaIndexer {
 
     pub fn make_cache(&self, max_seq: usize) -> Result<IndexerCache, ModelError> {
         let blocks = max_seq.div_ceil(self.cfg.compress_ratio) + 1;
-        IndexerCache::new(blocks, self.cfg.head_dim, self.device, self.compute)
+        IndexerCache::new(
+            blocks,
+            self.cfg.head_dim,
+            self.cfg.compress_ratio,
+            self.device,
+            self.compute,
+        )
     }
 
     fn rope(&self, x: &Tensor, rope: &RopeCache, positions: &[u32]) -> Result<Tensor, ModelError> {

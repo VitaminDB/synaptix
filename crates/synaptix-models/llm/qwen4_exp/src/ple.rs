@@ -7,6 +7,7 @@ use crate::config::Qwen4ExpConfig;
 use crate::ngram::NGramEmbedding;
 use crate::norm::{coerr, group_rms, load_one_plus};
 
+#[derive(Clone)]
 pub struct PleState {
     pub tokens: Vec<u32>,
     pub conv: Vec<f32>,

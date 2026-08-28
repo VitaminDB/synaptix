@@ -17,6 +17,7 @@ use synaptix_tokenizer::tokenizer::Tokenizer;
 use crate::config::Qwen4ExpConfig;
 use crate::loader::{BundleExperts, Qwen4ExpWeights};
 use crate::model::{ModelCache, Qwen4ExpModel};
+use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 
 /// Чанк префилла. Чем он крупнее, тем меньше проходов по всей стопке
 /// экспертов: любой чанк длиннее сотни токенов задевает почти все 512
@@ -29,8 +30,20 @@ pub struct Qwen4ExpPipeline {
     pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
     pub config: Qwen4ExpConfig,
     pub chat_template: Option<String>,
+    pub mtp: Option<MtpHead>,
     tokenizer: Option<HfTokenizer>,
     max_seq: usize,
+}
+
+/// Состояние спекулятивного декода: голова со своим кэшем и хвост потока
+/// последних впитанных позиций вместе с токенами, которые голова ещё не
+/// видела. Голова обязана пройти по каждой позиции ровно один раз, иначе её
+/// собственные позиции разъезжаются с позициями модели.
+struct Speculation<'a> {
+    head: &'a MtpHead,
+    cache: MtpCache,
+    stream: Tensor,
+    tokens: Vec<u32>,
 }
 
 impl Qwen4ExpPipeline {
@@ -91,7 +104,28 @@ impl Qwen4ExpPipeline {
             warn_if_cache_too_big(cache, device, kv_reserve);
         }
         let chat_template = weights.chat_template.clone();
-        Ok(Self { model, vision: None, config, chat_template, tokenizer, max_seq: cap })
+        let mtp = if speculation_on() && mtp_present(&*weights) {
+            let cache = model.expert_cache().cloned();
+            let source: Option<Arc<dyn ExpertSource>> = (cache.is_some()
+                && weights.has_lazy_mtp_experts())
+            .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
+            let head = MtpHead::load(
+                &*weights,
+                &config,
+                device,
+                precision.compute,
+                precision.mlp_w,
+                cache,
+                source,
+                config.num_hidden_layers,
+            )
+            .map_err(|e| PipelineError::Load(format!("mtp: {e}")))?;
+            eprintln!("[qwen4_exp] спекулятивный декод: голова многотокенного предсказания поднята");
+            Some(head)
+        } else {
+            None
+        };
+        Ok(Self { model, vision: None, config, chat_template, mtp, tokenizer, max_seq: cap })
     }
 
     /// Поднять vision-башню из того же бандла. `false` — компонента нет.
@@ -182,6 +216,25 @@ impl Qwen4ExpPipeline {
         if let Some(cache) = self.model.expert_cache() {
             cache.clear();
         }
+    }
+
+    fn draft(&self, spec: &mut Speculation<'_>) -> Result<u32, ModelError> {
+        let embeds = self.model.embed_tokens(&spec.tokens)?;
+        let hidden = spec
+            .head
+            .forward(&spec.stream, &embeds, &mut spec.cache, self.model.rope())?;
+        let logits = self.model.lm_head_forward(&last_row(&hidden)?)?;
+        let best = logits
+            .flatten_all()
+            .and_then(|t| t.argmax(0))
+            .and_then(|t| t.to_device(Device::Cpu))
+            .and_then(|t| t.to_dtype(DType::U32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<u32>())
+            .map_err(|e| ModelError::Forward(format!("драфт: {e}")))?;
+        best.first()
+            .copied()
+            .ok_or_else(|| ModelError::Forward("драфт: пустой argmax".into()))
     }
 
     pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
@@ -311,6 +364,8 @@ impl Qwen4ExpPipeline {
             cache.set_scratch_mode(true);
         }
         let prefill_start = Instant::now();
+        let want_stream = self.mtp.is_some();
+        let mut tail_stream: Option<Tensor> = None;
         let mut logits = no_grad(|| -> Result<_, ModelError> {
             let mut last = None;
             let mut offset = 0usize;
@@ -318,7 +373,15 @@ impl Qwen4ExpPipeline {
                 let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
                 let chunk = &prompt_ids[offset..offset + take];
                 let slice = media_for_chunk(prompt_ids, media, offset, take)?;
-                last = Some(self.model.forward_media_last(chunk, &slice, &mut cache)?);
+                let done = offset + take >= prompt_ids.len();
+                if want_stream && done {
+                    let (hidden, stream) =
+                        self.model.forward_media_with_stream(chunk, &slice, &mut cache)?;
+                    tail_stream = Some(last_row(&stream)?);
+                    last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
+                } else {
+                    last = Some(self.model.forward_media_last(chunk, &slice, &mut cache)?);
+                }
                 offset += take;
             }
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
@@ -331,21 +394,82 @@ impl Qwen4ExpPipeline {
 
         let decode_start = Instant::now();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
-        for _ in 0..cfg.max_new_tokens {
-            let token = sampler.sample(&logits)?;
+        let mut spec = match (&self.mtp, tail_stream) {
+            (Some(head), Some(stream)) => Some(Speculation {
+                head,
+                cache: head
+                    .make_cache(&self.config, budget + 8, self.model.device, self.model.compute)
+                    .map_err(PipelineError::from)?,
+                stream,
+                tokens: Vec::new(),
+            }),
+            _ => None,
+        };
+        let mut drafted = 0usize;
+        let mut accepted = 0usize;
+        let mut runs = 0usize;
+
+        let mut token = sampler.sample(&logits)?;
+        loop {
             out.push(token);
-            if !sink.on_token(token) {
-                break;
-            }
-            if eos.contains(&token) {
+            if !sink.on_token(token) || eos.contains(&token) || out.len() >= cfg.max_new_tokens {
                 break;
             }
             if cache.seq_len >= self.max_seq {
                 break;
             }
-            logits = no_grad(|| self.model.forward_last(&[token], &mut cache))?;
+            if cache.seq_len + 2 > self.max_seq {
+                spec = None;
+            }
+            let draft = match spec.as_mut() {
+                Some(spec) => {
+                    if spec.tokens.len() < spec.stream.dims()[0] {
+                        spec.tokens.push(token);
+                    }
+                    Some(no_grad(|| self.draft(spec))?)
+                }
+                None => None,
+            };
+            let Some(draft) = draft else {
+                runs += 1;
+                logits = no_grad(|| self.model.forward_last(&[token], &mut cache))?;
+                token = sampler.sample(&logits)?;
+                continue;
+            };
+
+            drafted += 1;
+            runs += 1;
+            let (hidden, stream, snap) =
+                no_grad(|| self.model.forward_pair(&[token, draft], &mut cache))?;
+            let first = no_grad(|| self.model.lm_head_forward(&row(&hidden, 0)?))?;
+            let next = sampler.sample(&first)?;
+            let spec = spec.as_mut().expect("драфт без спекуляции");
+            if next != draft {
+                cache.restore(&snap).map_err(PipelineError::from)?;
+                spec.stream = row(&stream, 0)?;
+                spec.tokens = vec![next];
+                token = next;
+                continue;
+            }
+
+            accepted += 1;
+            out.push(next);
+            if !sink.on_token(next) || eos.contains(&next) || out.len() >= cfg.max_new_tokens {
+                break;
+            }
+            let second = no_grad(|| self.model.lm_head_forward(&row(&hidden, 1)?))?;
+            token = sampler.sample(&second)?;
+            spec.stream = stream;
+            spec.tokens = vec![next, token];
         }
         let decode_ms = decode_start.elapsed().as_millis();
+        if drafted > 0 {
+            eprintln!(
+                "[qwen4_exp] спекуляция: принято {accepted} из {drafted} ({:.0}%), токенов за прогон {:.2}",
+                100.0 * accepted as f32 / drafted as f32,
+                out.len() as f32 / runs.max(1) as f32
+            );
+        }
 
         Ok((
             out.clone(),
@@ -357,6 +481,20 @@ impl Qwen4ExpPipeline {
             },
         ))
     }
+}
+
+fn row(t: &Tensor, i: usize) -> Result<Tensor, ModelError> {
+    t.narrow(0, i, 1)
+        .and_then(|x| x.contiguous())
+        .map_err(|e| ModelError::Forward(format!("строка {i}: {e}")))
+}
+
+fn last_row(t: &Tensor) -> Result<Tensor, ModelError> {
+    row(t, t.dims()[0] - 1)
+}
+
+fn speculation_on() -> bool {
+    std::env::var("SYN_QWEN4EXP_SPEC").map(|v| v.trim() != "0").unwrap_or(false)
 }
 
 /// Строки медиа-эмбеддингов, попадающие в чанк префилла `[offset, offset+len)`.

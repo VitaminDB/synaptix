@@ -23,6 +23,56 @@ fn scan_chunk(s: usize) -> usize {
     }
 }
 
+/// Снимок рекуррентного состояния слоя. Копия живёт там же, где истина:
+/// на карте — device-копией (её снятие и возврат стоят одну memcpy внутри
+/// VRAM), на хосте — векторами.
+pub struct GdnSnap {
+    conv_dev: Option<Tensor>,
+    ssm_dev: Option<Tensor>,
+    conv_host: Vec<f32>,
+    ssm_host: Vec<f32>,
+}
+
+impl GdnSnap {
+    pub fn take(state: &GatedDeltaNetState) -> Result<Self, ModelError> {
+        Ok(Self {
+            conv_dev: clone_dev(state.conv_state_dev.as_ref())?,
+            ssm_dev: clone_dev(state.ssm_state_dev.as_ref())?,
+            conv_host: state.conv_state.clone(),
+            ssm_host: state.ssm_state.clone(),
+        })
+    }
+
+    pub fn restore(&self, state: &mut GatedDeltaNetState) -> Result<(), ModelError> {
+        state.conv_state.clone_from(&self.conv_host);
+        state.ssm_state.clone_from(&self.ssm_host);
+        put_dev(&mut state.conv_state_dev, self.conv_dev.as_ref())?;
+        put_dev(&mut state.ssm_state_dev, self.ssm_dev.as_ref())?;
+        Ok(())
+    }
+}
+
+fn clone_dev(src: Option<&Tensor>) -> Result<Option<Tensor>, ModelError> {
+    let Some(src) = src else { return Ok(None) };
+    let mut dst = coerr(Tensor::zeros(src.dims().to_vec(), src.dtype(), src.device()))?;
+    coerr(dst.copy_from(src))?;
+    Ok(Some(dst))
+}
+
+fn put_dev(slot: &mut Option<Tensor>, src: Option<&Tensor>) -> Result<(), ModelError> {
+    match (slot.as_mut(), src) {
+        (Some(dst), Some(src)) => coerr(dst.copy_from(src)),
+        (_, None) => {
+            *slot = None;
+            Ok(())
+        }
+        (None, Some(src)) => {
+            *slot = clone_dev(Some(src))?;
+            Ok(())
+        }
+    }
+}
+
 pub struct LinearAttn {
     in_proj_qkv: QLinear,
     in_proj_a: QLinear,
@@ -152,11 +202,42 @@ impl LinearAttn {
             Some(Err(e)) => return Err(e),
             None => self.core_host(h, state, s)?,
         };
+        self.finish(h, &core, s)
+    }
+
+    /// Тот же прогон, но скан рвётся после `split` токенов и состояние на этой
+    /// границе снимается. Спекулятивный шаг считает пару «токен + драфт» одним
+    /// проходом, а откатывать должен только вторую позицию.
+    pub fn forward_split(
+        &self,
+        h: &Tensor,
+        state: &mut GatedDeltaNetState,
+        s: usize,
+        split: usize,
+    ) -> Result<(Tensor, GdnSnap), ModelError> {
+        let head = coerr(coerr(h.narrow(0, 0, split))?.contiguous())?;
+        let tail = coerr(coerr(h.narrow(0, split, s - split))?.contiguous())?;
+        let first = match self.core_on_device(&head, state, split) {
+            Some(Ok(core)) => core,
+            Some(Err(e)) => return Err(e),
+            None => self.core_host(&head, state, split)?,
+        };
+        let snap = GdnSnap::take(state)?;
+        let second = match self.core_on_device(&tail, state, s - split) {
+            Some(Ok(core)) => core,
+            Some(Err(e)) => return Err(e),
+            None => self.core_host(&tail, state, s - split)?,
+        };
+        let core = coerr(Tensor::cat(&[&first, &second], 1))?;
+        Ok((self.finish(h, &core, s)?, snap))
+    }
+
+    fn finish(&self, h: &Tensor, core: &Tensor, s: usize) -> Result<Tensor, ModelError> {
         let z = coerr(self
             .in_proj_z
             .forward(h)?
             .reshape(vec![1, s, self.num_v_heads, self.dv]))?;
-        let normed = self.gate(&core, &z)?;
+        let normed = self.gate(core, &z)?;
         let normed = coerr(normed.reshape(vec![s, self.value_dim]))?;
         self.out_proj.forward(&normed)
     }

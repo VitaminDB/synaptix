@@ -13,7 +13,7 @@ use synaptix_ops::pos::rope_cache::RopeCache;
 use crate::attention::{KvLayer, QsaAttention};
 use crate::config::{LayerType, Qwen4ExpConfig};
 use crate::gated_residual::GatedResidual;
-use crate::linear_attn::LinearAttn;
+use crate::linear_attn::{GdnSnap, LinearAttn};
 use crate::ngram::{NGramEmbedding, NGramRows};
 use crate::norm::{coerr, ctx, stage};
 use crate::ple::{PleLayer, PleState};
@@ -47,6 +47,48 @@ pub struct ModelCache {
 }
 
 impl ModelCache {
+    /// Снять состояние целиком: рекуррентное — копией, KV и ключи индексатора —
+    /// меткой позиции, дальше их просто перепишут.
+    pub fn snapshot(&mut self) -> Result<CacheSnapshot, ModelError> {
+        let mut linear = Vec::new();
+        let mut qsa = Vec::new();
+        for layer in self.layers.iter_mut() {
+            match layer {
+                LayerState::Linear(s) => linear.push(GdnSnap::take(s)?),
+                LayerState::Qsa(b) => qsa.push(b.1.mark()),
+            }
+        }
+        Ok(CacheSnapshot {
+            seq_len: self.seq_len,
+            linear,
+            qsa,
+            ple: self.ple.clone(),
+        })
+    }
+
+    /// Вернуть состояние: драфт не подтвердился.
+    pub fn restore(&mut self, snap: &CacheSnapshot) -> Result<(), ModelError> {
+        let mut linear = snap.linear.iter();
+        let mut qsa = snap.qsa.iter();
+        for layer in self.layers.iter_mut() {
+            match layer {
+                LayerState::Linear(s) => {
+                    if let Some(saved) = linear.next() {
+                        saved.restore(s)?;
+                    }
+                }
+                LayerState::Qsa(b) => {
+                    if let Some(mark) = qsa.next() {
+                        b.1.rewind(*mark);
+                    }
+                }
+            }
+        }
+        self.ple.clone_from(&snap.ple);
+        self.seq_len = snap.seq_len;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in self.layers.iter_mut() {
@@ -61,6 +103,36 @@ impl ModelCache {
             }
         }
     }
+}
+
+/// Снимок состояний, которые нельзя переписать задним числом. KV и ключи
+/// индексатора достаточно усечь по позиции, а рекуррентное состояние линейного
+/// внимания, свёртка PLE и его история токенов копируются: спекулятивный шаг
+/// впитывает драфт, и при отказе всё это надо вернуть.
+pub struct CacheSnapshot {
+    seq_len: usize,
+    linear: Vec<GdnSnap>,
+    qsa: Vec<(usize, usize)>,
+    ple: Vec<PleState>,
+}
+
+impl CacheSnapshot {
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trace {
+    Off,
+    Stream,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+struct RunOpts {
+    trace: Trace,
+    split: Option<usize>,
 }
 
 pub type NGramTableFactory<'a> = dyn Fn(usize) -> Result<Box<dyn NGramRows>, ModelError> + 'a;
@@ -411,10 +483,50 @@ impl Qwen4ExpModel {
         cache: &mut ModelCache,
         trace: bool,
     ) -> Result<(Tensor, Vec<(String, Tensor)>), ModelError> {
+        let opts = RunOpts {
+            trace: if trace { Trace::Full } else { Trace::Off },
+            split: None,
+        };
+        let (out, traced, _) = self.run(tokens, media, cache, opts)?;
+        Ok((out, traced))
+    }
+
+    /// Прогон пары «токен + драфт» одним проходом. Кроме скрытых состояний
+    /// обеих позиций отдаёт снимок кэша на границе между ними: если драфт не
+    /// подтвердился, откатывать надо только его.
+    pub fn forward_pair(
+        &self,
+        tokens: &[u32],
+        cache: &mut ModelCache,
+    ) -> Result<(Tensor, Tensor, CacheSnapshot), ModelError> {
+        if tokens.len() < 2 {
+            return Err(ModelError::Forward("пара короче двух токенов".into()));
+        }
+        let opts = RunOpts { trace: Trace::Stream, split: Some(1) };
+        let (out, traced, snap) = self.run(tokens, &[], cache, opts)?;
+        let stream = pick_stream(traced)?;
+        let snap = snap.ok_or_else(|| ModelError::Forward("снимок пары не снят".into()))?;
+        Ok((out, stream, snap))
+    }
+
+    fn run(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+        opts: RunOpts,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>, Option<CacheSnapshot>), ModelError> {
         let s = tokens.len();
         if s == 0 {
             return Err(ModelError::Forward("пустой вход".into()));
         }
+        let split = match opts.split {
+            Some(k) if k == 0 || k >= s => {
+                return Err(ModelError::Forward(format!("разрыв {k} вне длины {s}")))
+            }
+            other => other,
+        };
+        let trace = opts.trace == Trace::Full;
         let past = cache.seq_len;
         let embeds = self.embed_with_media(tokens, media)?;
         let hc = self.config.hc_count;
@@ -429,6 +541,9 @@ impl Qwen4ExpModel {
 
         let mut traced = Vec::new();
         let mut ple_slot = 0usize;
+        let mut snap_linear = Vec::new();
+        let mut snap_qsa = Vec::new();
+        let mut snap_ple = Vec::new();
         for (l, block) in self.blocks.iter().enumerate() {
             if trace {
                 traced.push((format!("in_{l}"), hidden.clone()));
@@ -436,8 +551,22 @@ impl Qwen4ExpModel {
             if let Some(ple) = &block.ple {
                 let state = &mut cache.ple[ple_slot];
                 ple_slot += 1;
-                let delta = stage("ple", || {
-                    ctx(ple.forward(&hidden, tokens, state), &format!("слой {l} ple"))
+                let delta = stage("ple", || match split {
+                    None => ctx(ple.forward(&hidden, tokens, state), &format!("слой {l} ple")),
+                    Some(k) => {
+                        let head = coerr(coerr(hidden.narrow(0, 0, k))?.contiguous())?;
+                        let first = ctx(
+                            ple.forward(&head, &tokens[..k], state),
+                            &format!("слой {l} ple"),
+                        )?;
+                        snap_ple.push(state.clone());
+                        let tail = coerr(coerr(hidden.narrow(0, k, s - k))?.contiguous())?;
+                        let second = ctx(
+                            ple.forward(&tail, &tokens[k..], state),
+                            &format!("слой {l} ple"),
+                        )?;
+                        coerr(Tensor::cat(&[&first, &second], 0))
+                    }
                 })?;
                 hidden = coerr(hidden.add(&delta))?;
             }
@@ -447,10 +576,23 @@ impl Qwen4ExpModel {
             })?;
             let out = match (&block.mixer, &mut cache.layers[l]) {
                 (Mixer::Linear(la), LayerState::Linear(state)) => stage("linear_attn", || {
-                    ctx(la.forward(&mixed.mixed, state, s), &format!("слой {l} linear_attn"))
+                    match split {
+                        None => ctx(la.forward(&mixed.mixed, state, s), &format!("слой {l} linear_attn")),
+                        Some(k) => {
+                            let (out, snap) = ctx(
+                                la.forward_split(&mixed.mixed, state, s, k),
+                                &format!("слой {l} linear_attn"),
+                            )?;
+                            snap_linear.push(snap);
+                            Ok(out)
+                        }
+                    }
                 })?,
                 (Mixer::Qsa(qa), LayerState::Qsa(state)) => {
                     let (kv, idx) = state.as_mut();
+                    if let Some(k) = split {
+                        snap_qsa.push(idx.mark_after(k));
+                    }
                     let (out, selected) = stage("qsa", || {
                         ctx(
                             qa.forward(&mixed.mixed, kv, idx, past, s, &self.rope),
@@ -515,11 +657,43 @@ impl Qwen4ExpModel {
         }
 
         cache.seq_len = past + s;
+        if opts.trace != Trace::Off {
+            traced.push(("stream".to_string(), hidden.clone()));
+        }
         let out = self.mixer_hc.forward(&hidden)?.mixed;
         if trace {
             traced.push(("final".to_string(), out.clone()));
         }
-        Ok((out, traced))
+        let snap = split.map(|k| CacheSnapshot {
+            seq_len: past + k,
+            linear: snap_linear,
+            qsa: snap_qsa,
+            ple: snap_ple,
+        });
+        Ok((out, traced, snap))
+    }
+
+    /// Скрытое состояние под голову словаря и поток последнего слоя `[T, hc·H]`
+    /// до сводящего миксера — второй нужен голове многотокенного предсказания.
+    pub fn forward_with_stream(
+        &self,
+        tokens: &[u32],
+        cache: &mut ModelCache,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        let opts = RunOpts { trace: Trace::Stream, split: None };
+        let (out, traced, _) = self.run(tokens, &[], cache, opts)?;
+        Ok((out, pick_stream(traced)?))
+    }
+
+    pub fn forward_media_with_stream(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        let opts = RunOpts { trace: Trace::Stream, split: None };
+        let (out, traced, _) = self.run(tokens, media, cache, opts)?;
+        Ok((out, pick_stream(traced)?))
     }
 
     pub fn forward_media_last(
@@ -550,9 +724,21 @@ impl Qwen4ExpModel {
         self.lm_head.forward(hidden)
     }
 
+    pub fn rope(&self) -> &RopeCache {
+        &self.rope
+    }
+
     pub fn ple_layers(&self) -> &[usize] {
         &self.ple_layers
     }
+}
+
+fn pick_stream(traced: Vec<(String, Tensor)>) -> Result<Tensor, ModelError> {
+    traced
+        .into_iter()
+        .find(|(name, _)| name == "stream")
+        .map(|(_, t)| t)
+        .ok_or_else(|| ModelError::Forward("поток последнего слоя не снят".into()))
 }
 
 fn read_ngram_buffers(

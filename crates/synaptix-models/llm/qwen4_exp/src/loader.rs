@@ -14,6 +14,7 @@ use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 
 use crate::config::Qwen4ExpConfig;
 use crate::model::LM_PREFIX;
+use crate::mtp::MTP_PREFIX;
 use crate::ngram::{decode_mxfp8_row, CachedRows, NGramRows, TensorRows};
 
 pub enum Source {
@@ -188,8 +189,17 @@ impl Qwen4ExpWeights {
     /// Готов ли источник отдавать экспертов по одному (квантованный бандл).
     pub fn has_lazy_experts(&self, layer: usize) -> bool {
         let key = format!("{LM_PREFIX}.layers.{layer}.mlp.experts.gate_up_proj");
+        self.lazy_stack(&key)
+    }
+
+    /// То же про экспертов головы многотокенного предсказания.
+    pub fn has_lazy_mtp_experts(&self) -> bool {
+        self.lazy_stack(&format!("{MTP_PREFIX}.layers.0.mlp.experts.gate_up_proj"))
+    }
+
+    fn lazy_stack(&self, key: &str) -> bool {
         match &self.source {
-            Source::Bundle(l) => l.quant_dims(&self.resolve(&key)).is_some(),
+            Source::Bundle(l) => l.quant_dims(&self.resolve(key)).is_some(),
             Source::Files(_) => false,
         }
     }
@@ -410,11 +420,19 @@ pub enum LoadError {
 /// `gate_up`/`down` читается срезом стопки в момент промаха кэша.
 pub struct BundleExperts {
     weights: Arc<Qwen4ExpWeights>,
+    mtp_layer: usize,
 }
 
 impl BundleExperts {
     pub fn new(weights: Arc<Qwen4ExpWeights>) -> Self {
-        Self { weights }
+        let mtp_layer = weights.config.num_hidden_layers;
+        Self { weights, mtp_layer }
+    }
+
+    /// Номер, под которым эксперты головы многотокенного предсказания живут в
+    /// общем кэше: сразу за слоями модели.
+    pub fn mtp_layer(&self) -> usize {
+        self.mtp_layer
     }
 }
 
@@ -425,7 +443,11 @@ impl ExpertSource for BundleExperts {
         expert: usize,
         device: Device,
     ) -> Result<(QLinear, QLinear), ModelError> {
-        let prefix = format!("{LM_PREFIX}.layers.{layer}.mlp.experts");
+        let prefix = if layer == self.mtp_layer {
+            format!("{MTP_PREFIX}.layers.0.mlp.experts")
+        } else {
+            format!("{LM_PREFIX}.layers.{layer}.mlp.experts")
+        };
         let one = |name: &str| -> Result<QLinear, ModelError> {
             let key = format!("{prefix}.{name}");
             let w = self
