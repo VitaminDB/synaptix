@@ -131,6 +131,15 @@ impl QLinear {
         }
     }
 
+    /// Квант-вес, если он квантованный: нужен батчевому GEMV, который считает
+    /// несколько экспертов одним запуском.
+    pub fn quant_weight(&self) -> Option<&QuantWeight> {
+        match self {
+            QLinear::Quant(w) => Some(w),
+            QLinear::Dense(_) => None,
+        }
+    }
+
     /// Сколько байт весов занимает — для учёта в кэше резидентных экспертов
     /// MoE (квант считается по упакованной раскладке, плотный — по dtype).
     pub fn bytes(&self) -> usize {

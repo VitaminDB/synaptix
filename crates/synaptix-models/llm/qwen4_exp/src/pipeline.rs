@@ -26,7 +26,7 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 4096;
 /// Ёмкость кэша экспертов на время префилла. Чанк задевает почти всех
 /// экспертов слоя — кэш всё равно вытеснится целиком, а память нужна
 /// активациям; на декоде ёмкость возвращается.
-const PREFILL_CACHE_BYTES: usize = 4 << 30;
+const PREFILL_CACHE_BYTES: usize = 3 << 30;
 
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,

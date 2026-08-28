@@ -135,6 +135,66 @@ fn quantized_experts_match_dense_within_quant_noise() {
 /// проверяется главное: и целиком, и по кускам ответ остаётся тем же с
 /// точностью до квант-шума. Перепутанные при перестановке токены дали бы
 /// расхождение в разы, а не в проценты.
+/// Декод одного токена идёт батчевым GEMV по всем выбранным экспертам; ответ
+/// обязан совпасть с поэкспертным путём (тот же квант, та же арифметика,
+/// отличается только число запусков ядер).
+#[test]
+fn single_token_batched_matches_expert_by_expert() {
+    if !setup() {
+        eprintln!("CUDA-устройств нет — пропуск");
+        return;
+    }
+    use std::sync::Arc;
+    use synaptix_llm_common::moe::ExpertCache;
+
+    let device = Device::Cuda(0);
+    let x = noise(99, H);
+    let xt = Tensor::from_vec::<_, f32>(x.clone(), vec![1, H], device)
+        .and_then(|t| t.to_dtype(DType::F16))
+        .unwrap();
+    let w = weights();
+
+    // Резидентный путь без кэша — эксперты считаются по одному.
+    let plain = MoeFfn::load(&w, "mlp", cfg(), device, DType::F16, DType::NVFP4)
+        .expect("сборка MoE");
+    let want = plain
+        .forward(&xt)
+        .expect("поэкспертно")
+        .to_device(Device::Cpu)
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .unwrap();
+
+    let cache: Arc<ExpertCache> = ExpertCache::new(device, 1 << 30);
+    let batched_moe = MoeFfn::load_offloaded(
+        &w,
+        "mlp",
+        cfg(),
+        device,
+        DType::F16,
+        DType::NVFP4,
+        cache.clone(),
+        0,
+    )
+    .expect("сборка MoE с кэшем");
+    let got = batched_moe
+        .forward(&xt)
+        .expect("батчем")
+        .to_device(Device::Cpu)
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .unwrap();
+
+    let stats = cache.stats();
+    assert!(stats.batched > 0, "батчевый путь не сработал");
+    assert_eq!(stats.unbatched, 0, "часть шагов ушла на поэкспертный путь");
+    let rel = l2_rel(&got, &want);
+    eprintln!("батч против поэкспертного: rel_l2={rel:.3e}");
+    assert!(rel < 1e-6, "батч разошёлся с поэкспертным путём: {rel:.3e}");
+}
+
 #[test]
 fn chunking_keeps_the_answer_within_quant_noise() {
     if !setup() {

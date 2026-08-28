@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
+use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 
 use crate::model::ModelError;
@@ -78,6 +79,16 @@ impl MoeConfig {
 /// В каком виде читать плотные веса: под квантование — F16 (его требуют
 /// квант-ядра), иначе сразу в рабочем dtype, чтобы не терять точность на
 /// лишнем проходе через половинную.
+fn is_oom(e: &ModelError) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("out of memory") || s.contains("oom")
+}
+
+fn to_f16(x: &Tensor) -> Result<Tensor, ModelError> {
+    x.to_dtype(DType::F16)
+        .map_err(|e| ModelError::Forward(format!("MoE: приведение к F16: {e}")))
+}
+
 fn weight_dtype(quant: DType, compute: DType) -> DType {
     if quant.is_quantized() {
         DType::F16
@@ -134,6 +145,8 @@ struct CacheInner {
     skipped: u64,
     fetched: u64,
     fetch_nanos: u64,
+    batched: u64,
+    unbatched: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +160,9 @@ pub struct ExpertCacheStats {
     pub fetched: u64,
     /// Суммарное время предзагрузки.
     pub fetch_millis: u64,
+    /// Сколько шагов декода посчитано батчем и сколько — поэкспертно.
+    pub batched: u64,
+    pub unbatched: u64,
     pub resident: usize,
     pub bytes: usize,
 }
@@ -168,6 +184,8 @@ impl ExpertCache {
                 skipped: 0,
                 fetched: 0,
                 fetch_nanos: 0,
+                batched: 0,
+                unbatched: 0,
             }),
         })
     }
@@ -208,6 +226,8 @@ impl ExpertCache {
             skipped: inner.skipped,
             fetched: inner.fetched,
             fetch_millis: inner.fetch_nanos / 1_000_000,
+            batched: inner.batched,
+            unbatched: inner.unbatched,
             resident: inner.map.len(),
             bytes: inner.bytes,
         }
@@ -218,6 +238,16 @@ impl ExpertCache {
         inner.map.clear();
         inner.order.clear();
         inner.bytes = 0;
+    }
+
+    fn note_batch(&self, ok: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if ok {
+                inner.batched += 1;
+            } else {
+                inner.unbatched += 1;
+            }
+        }
     }
 
     fn note_fetch_time(&self, elapsed: std::time::Duration) {
@@ -639,7 +669,21 @@ impl MoeFfn {
                 .narrow(0, start, len)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| ModelError::Forward(format!("MoE: срез токенов: {e}")))?;
-            parts.push(self.forward_chunk(&chunk)?);
+            let out = match self.forward_chunk(&chunk) {
+                Ok(out) => out,
+                Err(e) if is_oom(&e) => {
+                    // Кэш экспертов держит память, которой не хватило активациям:
+                    // отдаём половину и пробуем ещё раз, прежде чем падать.
+                    if let Some(cache) = &self.cache {
+                        cache.trim_to(cache.capacity_bytes() / 2);
+                    } else {
+                        return Err(e);
+                    }
+                    self.forward_chunk(&chunk)?
+                }
+                Err(e) => return Err(e),
+            };
+            parts.push(out);
         }
         let out = if parts.len() == 1 {
             parts.pop().expect("одна часть")
@@ -655,12 +699,18 @@ impl MoeFfn {
         let k = self.cfg.num_experts_per_tok;
         let (experts, weights) = self.route(x)?;
 
+        if t == 1 {
+            if let Some(out) = self.forward_single_batched(x, &experts, &weights)? {
+                return Ok(out);
+            }
+        }
+
         // Пары (токен, слот), сгруппированные по эксперту: каждый эксперт
         // получает один GEMM вместо GEMV на токен.
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
 
-        self.prefetch(&experts, &weights);
+        self.prefetch(&experts, &weights, t == 1);
 
         let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
         let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
@@ -751,10 +801,104 @@ impl MoeFfn {
         }
     }
 
+    /// Декод одного токена: все выбранные эксперты считаются двумя батчевыми
+    /// GEMV вместо пары умножений на каждого. На слой это четыре запуска ядер
+    /// вместо трёх десятков, а именно они, а не арифметика, и определяют
+    /// время шага. `None` — путь неприменим (не NVFP4, нет перемешанной копии
+    /// весов, неподходящие формы), вызывающий считает как раньше.
+    fn forward_single_batched(
+        &self,
+        x: &Tensor,
+        experts: &[u32],
+        weights: &[f32],
+    ) -> Result<Option<Tensor>, ModelError> {
+        if self.cache.is_none() && matches!(self.experts, ExpertStore::Lazy { .. }) {
+            return Ok(None);
+        }
+        let picked: Vec<Arc<Expert>> = {
+            let mut out = Vec::with_capacity(experts.len());
+            for e in experts {
+                match &self.cache {
+                    Some(cache) => out.push(self.resident_expert(*e as usize, cache)?),
+                    None => return Ok(None),
+                }
+            }
+            out
+        };
+        // Перемешанная копия нужна батчу; обычно её строит первое умножение,
+        // но эксперт мог попасть в кэш и без него — тогда строим здесь, это
+        // однократная работа на эксперта.
+        let mut ready = true;
+        for e in &picked {
+            for w in [e.gate_up.quant_weight(), e.down.quant_weight()] {
+                match w {
+                    Some(w) if w.dtype() == DType::NVFP4 => {
+                        if w.shuffled().is_none() && w.ensure_shuffled().is_err() {
+                            ready = false;
+                        }
+                    }
+                    _ => ready = false,
+                }
+            }
+        }
+        if !ready {
+            if let Some(cache) = &self.cache {
+                cache.note_batch(false);
+            }
+            return Ok(None);
+        }
+
+        let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
+        let Ok((packed_x, scales_x)) = xf.nvfp4_quantize_act() else {
+            return Ok(None);
+        };
+        let gate_up: Vec<&QuantWeight> =
+            picked.iter().map(|e| e.gate_up.quant_weight().unwrap()).collect();
+        let acts: Vec<(&Tensor, &Tensor)> = (0..picked.len()).map(|_| (&packed_x, &scales_x)).collect();
+        let rows = vec![0usize; picked.len()];
+        let Ok(gu) = QuantWeight::gemv_batched(&gate_up, &acts, &rows) else {
+            return Ok(None);
+        };
+
+        let Ok((packed_h, scales_h)) = gu.silu_mul_quant_nvfp4(1.0) else {
+            return Ok(None);
+        };
+        let down: Vec<&QuantWeight> = picked.iter().map(|e| e.down.quant_weight().unwrap()).collect();
+        let acts: Vec<(&Tensor, &Tensor)> =
+            (0..picked.len()).map(|_| (&packed_h, &scales_h)).collect();
+        let rows: Vec<usize> = (0..picked.len()).collect();
+        let Ok(parts) = QuantWeight::gemv_batched(&down, &acts, &rows) else {
+            return Ok(None);
+        };
+
+        let scale = Tensor::from_vec::<_, f32>(weights.to_vec(), vec![weights.len(), 1], self.device)
+            .and_then(|s| s.to_dtype(parts.dtype()))
+            .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
+        let mixed = parts
+            .broadcast_mul(&scale)
+            .and_then(|m| m.sum([0usize]))
+            .and_then(|m| m.reshape((1, self.cfg.hidden_size)))
+            .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?;
+        let mixed = self.to_compute(mixed)?;
+
+        if let Some(cache) = &self.cache {
+            cache.note_batch(true);
+        }
+        Ok(Some(match &self.shared {
+            Some(shared) => {
+                let s = self.shared_forward(shared, x)?;
+                mixed
+                    .add(&s)
+                    .map_err(|e| ModelError::Forward(format!("MoE: shared expert: {e}")))?
+            }
+            None => mixed,
+        }))
+    }
+
     /// Поднять на устройство всех экспертов чанка, которых там ещё нет.
     /// Промахи читаются параллельно: у ленивого источника это страничные
     /// промахи mmap, и одна очередь к NVMe заметно медленнее нескольких.
-    fn prefetch(&self, experts: &[u32], weights: &[f32]) {
+    fn prefetch(&self, experts: &[u32], weights: &[f32], prepare_batch: bool) {
         let Some(cache) = &self.cache else { return };
         if !matches!(self.experts, ExpertStore::Lazy { .. }) {
             return;
@@ -773,7 +917,7 @@ impl MoeFfn {
             .into_iter()
             .filter(|e| !cache.contains((self.layer_id, *e as usize)))
             .collect();
-        if missing.len() < 2 {
+        if missing.is_empty() {
             return;
         }
         let started = std::time::Instant::now();
@@ -784,10 +928,17 @@ impl MoeFfn {
                     return None;
                 };
                 let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
-                source
-                    .fetch(self.layer_id, *e as usize, cache.device())
-                    .ok()
-                    .map(|(gate_up, down)| (*e, Expert { gate_up, down }))
+                let (gate_up, down) = source.fetch(self.layer_id, *e as usize, cache.device()).ok()?;
+                if prepare_batch {
+                    // Только на декоде: репак держит обе копии веса разом, а на
+                    // префилле экспертов поднимается сотнями и пик не влезает.
+                    for w in [gate_up.quant_weight(), down.quant_weight()] {
+                        if let Some(w) = w {
+                            let _ = w.ensure_shuffled();
+                        }
+                    }
+                }
+                Some((*e, Expert { gate_up, down }))
             })
             .collect();
         cache.note_fetch_time(started.elapsed());

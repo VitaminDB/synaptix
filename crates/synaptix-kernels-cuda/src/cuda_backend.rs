@@ -3177,6 +3177,137 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn nvfp4_repack(
+        &self,
+        packed: &Storage,
+        out: &mut Storage,
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let src = packed
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_repack: вес не на карте"))?;
+        let ctx = src.device().clone();
+        let ord = src.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?;
+        let src_slice = src.slice();
+        let dst = out
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("nvfp4_repack: приёмник не на карте"))?;
+        let mut dst_slice = dst.slice_mut();
+        crate::best_cu::gemv::gemv_nvfp4::nvfp4_w_repack(
+            &kernels,
+            &stream,
+            &src_slice,
+            &mut dst_slice,
+            n as u32,
+            k as u32,
+        )
+    }
+
+    fn nvfp4_gemv_batched(
+        &self,
+        w_shuf: &[&Storage],
+        w_scales: &[&Storage],
+        x_packed: &[&Storage],
+        x_scales: &[&Storage],
+        x_rows: &[usize],
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (out_st, out_lo) = out;
+        let experts = w_shuf.len();
+        if experts == 0 {
+            return Ok(());
+        }
+        if out_lo.dtype() != DType::F16 {
+            return Err(SynaptixError::Unsupported("nvfp4_gemv_batched: out должен быть F16"));
+        }
+        let first = w_shuf[0]
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_batched: вес не на карте"))?;
+        let ctx = first.device().clone();
+        let ord = first.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?;
+
+        // Адреса буферов собираем на хосте и разом отправляем на карту: ядро
+        // выбирает эксперта по blockIdx.z и читает свой указатель.
+        use cudarc::driver::DevicePtr;
+        let addr = |st: &Storage, what: &'static str| -> Result<u64> {
+            let buf = st.as_cuda().ok_or(SynaptixError::Unsupported(what))?;
+            let (ptr, _guard) = buf.slice().device_ptr(&stream);
+            Ok(ptr)
+        };
+        let mut ptrs: Vec<Vec<u64>> = Vec::with_capacity(4);
+        for (group, what) in [
+            (w_shuf, "nvfp4_gemv_batched: вес не на карте"),
+            (w_scales, "nvfp4_gemv_batched: масштабы веса не на карте"),
+            (x_packed, "nvfp4_gemv_batched: активация не на карте"),
+            (x_scales, "nvfp4_gemv_batched: масштабы активации не на карте"),
+        ] {
+            if group.len() != experts {
+                return Err(SynaptixError::Unsupported("nvfp4_gemv_batched: неровный батч"));
+            }
+            ptrs.push(
+                group
+                    .iter()
+                    .map(|st| addr(st, what))
+                    .collect::<Result<Vec<u64>>>()?,
+            );
+        }
+        if x_rows.len() != experts {
+            return Err(SynaptixError::Unsupported("nvfp4_gemv_batched: неровный батч строк"));
+        }
+        // Упакованная активация лежит построчно: строка `row` начинается с
+        // `row · k/2` байт. Масштабы живут в tile-раскладке, для них смещение
+        // считается отдельно и уезжает в ядро.
+        for (ptr, row) in ptrs[2].iter_mut().zip(x_rows) {
+            *ptr += (row * (k / 2)) as u64;
+        }
+        let dev_ptrs: Vec<cudarc::driver::CudaSlice<u64>> = ptrs
+            .iter()
+            .map(|v| {
+                stream
+                    .memcpy_stod(v)
+                    .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_batched: адреса: {e:?}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Смещение строки внутри tile масштабов — та же раскладка, что пишет
+        // квантователь: `(outer % 32) * 16 + (outer / 32) * 4`.
+        let offs: Vec<u32> = x_rows
+            .iter()
+            .map(|row| ((row % 32) * 16 + (row / 32) * 4) as u32)
+            .collect();
+        let offs_dev = stream
+            .memcpy_stod(&offs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_batched: смещения: {e:?}")))?;
+
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_batched: out не на карте"))?;
+        let mut out_view = unsafe { out_buf.slice_mut().transmute_mut::<half::f16>(experts * n) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemv_batched: transmute out→f16".into()))?;
+        crate::best_cu::gemv::gemv_nvfp4::nvfp4_mma_gemv_shuf_f16_batched(
+            &kernels,
+            &stream,
+            &dev_ptrs[0],
+            &dev_ptrs[1],
+            &dev_ptrs[2],
+            &dev_ptrs[3],
+            &offs_dev,
+            &mut out_view,
+            n as u32,
+            k as u32,
+            experts as u32,
+        )
+    }
+
     fn embed_gather_mxfp8(
         &self,
         table: &Storage,

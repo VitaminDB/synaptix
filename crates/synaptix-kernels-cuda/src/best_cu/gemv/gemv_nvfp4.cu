@@ -51,6 +51,7 @@ __device__ __forceinline__ void nvfp4_gemv_mma_chunk(
     unsigned int k_lo_off,
     unsigned int k_hi_off,
     unsigned int sfa_row_base,
+    unsigned int x_sf_off,
     float& d0, float& d1, float& d2, float& d3)
 {
     unsigned int chunk_base = block_base + chunk * 512u;
@@ -62,7 +63,7 @@ __device__ __forceinline__ void nvfp4_gemv_mma_chunk(
     unsigned int b0 = *(const unsigned int*)(smem_x + k_chunk_b + k_lo_off);
     unsigned int b1 = *(const unsigned int*)(smem_x + k_chunk_b + k_hi_off);
     unsigned int sfa0 = *(const unsigned int*)(scales_w + sfa_row_base + chunk * 512u);
-    unsigned int sfb0 = *(const unsigned int*)(scales_x + chunk * 512u);
+    unsigned int sfb0 = *(const unsigned int*)(scales_x + chunk * 512u + x_sf_off);
     constexpr unsigned short tidA = 0, bidA = 0, tidB = 0, bidB = 0;
     float n0, n1, n2, n3;
     asm volatile(
@@ -84,6 +85,10 @@ __device__ __forceinline__ void nvfp4_gemv_mma_chunk(
     d0 = n0; d1 = n1; d2 = n2; d3 = n3;
 }
 
+// `x_sf_off` — смещение строки активации внутри tile масштабов
+// (`(outer%32)*16 + (outer/32)*4`). Для одиночного GEMV активация всегда одна
+// строка и смещение нулевое; батчу оно нужно, чтобы читать свою строку из
+// общего кванта, посчитанного разом для всех экспертов.
 template <unsigned int WARPS>
 __device__ __forceinline__ void mma_gemv_shuf_impl(
     const unsigned char* __restrict__ packed_w,
@@ -93,7 +98,8 @@ __device__ __forceinline__ void mma_gemv_shuf_impl(
     syn_out_t*           __restrict__ out,
     unsigned int N,
     unsigned int K,
-    unsigned int sf_inner_dim_w)
+    unsigned int sf_inner_dim_w,
+    unsigned int x_sf_off)
 {
     constexpr unsigned int M_TILE = WARPS * 16;
     constexpr unsigned int THREADS = WARPS * 32;
@@ -140,7 +146,7 @@ __device__ __forceinline__ void mma_gemv_shuf_impl(
     unsigned int num_chunks = K >> 6;
     for (unsigned int chunk = 0; chunk < num_chunks; chunk++) {
         nvfp4_gemv_mma_chunk(packed_w, scales_w, smem_x, scales_x, block_base, chunk,
-                             top_off, bot_off, k_lo_off, k_hi_off, sfa_row_base,
+                             top_off, bot_off, k_lo_off, k_hi_off, sfa_row_base, x_sf_off,
                              d0, d1, d2, d3);
     }
 
@@ -161,7 +167,7 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w4(
     syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K, unsigned int sf_inner_dim_w)
 {
-    mma_gemv_shuf_impl<4>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w);
+    mma_gemv_shuf_impl<4>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w, 0u);
 }
 
 extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8(
@@ -172,7 +178,30 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8(
     syn_out_t*           __restrict__ out,
     unsigned int N, unsigned int K, unsigned int sf_inner_dim_w)
 {
-    mma_gemv_shuf_impl<8>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w);
+    mma_gemv_shuf_impl<8>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w, 0u);
+}
+
+// Батч GEMV по списку весов: blockIdx.z выбирает эксперта, указатели на его
+// packed/scales и на его активацию берутся из массивов. Нужен MoE-декоду, где
+// на слой приходится десяток матриц по одной строке каждая: отдельными
+// запусками они упираются в launch overhead, а не в вычисления.
+extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8_batched(
+    const unsigned long long* __restrict__ w_ptrs,
+    const unsigned long long* __restrict__ sw_ptrs,
+    const unsigned long long* __restrict__ xp_ptrs,
+    const unsigned long long* __restrict__ xs_ptrs,
+    const unsigned int*       __restrict__ x_sf_offs,
+    syn_out_t*           __restrict__ out,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w)
+{
+    unsigned int e = blockIdx.z;
+    const unsigned char* pw = (const unsigned char*)(size_t)w_ptrs[e];
+    const unsigned char* sw = (const unsigned char*)(size_t)sw_ptrs[e];
+    const unsigned char* px = (const unsigned char*)(size_t)xp_ptrs[e];
+    const unsigned char* sx = (const unsigned char*)(size_t)xs_ptrs[e];
+    unsigned int x_sf_off = x_sf_offs == nullptr ? 0u : x_sf_offs[e];
+    mma_gemv_shuf_impl<8>(pw, sw, px, sx, out + (size_t)e * (size_t)N, N, K, sf_inner_dim_w,
+                          x_sf_off);
 }
 
 extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8_persistent(

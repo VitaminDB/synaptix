@@ -327,7 +327,7 @@ fn run_qwen4_exp(
     if let Some(c) = pipeline.expert_cache_stats() {
         let total = c.hits + c.misses;
         eprintln!(
-            "synaptix run: эксперты — {} резидентов ({:.1} ГБ), обращений {}, подкачано {} ({:.1} ГБ) за {:.1} с, пропущено {}",
+            "synaptix run: эксперты — {} резидентов ({:.1} ГБ), обращений {}, подкачано {} ({:.1} ГБ) за {:.1} с, пропущено {}, батчем {} из {}",
             c.resident,
             c.bytes as f64 / (1u64 << 30) as f64,
             total,
@@ -335,6 +335,8 @@ fn run_qwen4_exp(
             (c.fetched + c.misses) as f64 * 2.9 / 1024.0,
             c.fetch_millis as f64 / 1000.0,
             c.skipped,
+            c.batched,
+            c.batched + c.unbatched,
         );
     }
     Ok(())

@@ -17,6 +17,7 @@ pub struct Nvfp4MmaGemvShufKernels {
     w4: CudaFunction,
     w8: CudaFunction,
     w8_persistent: CudaFunction,
+    w8_batched: CudaFunction,
     num_sms: u32,
 }
 
@@ -79,7 +80,8 @@ impl Nvfp4MmaGemvShufKernels {
         let w4 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8")?;
         let w8p = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_persistent")?;
-        for f in [&w4, &w8, &w8p] {
+        let w8b = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_batched")?;
+        for f in [&w4, &w8, &w8p, &w8b] {
             f.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 SMEM_OPT_IN_BYTES,
@@ -94,6 +96,7 @@ impl Nvfp4MmaGemvShufKernels {
             w4,
             w8,
             w8_persistent: w8p,
+            w8_batched: w8b,
             _module: module,
             num_sms,
         });
@@ -104,6 +107,56 @@ impl Nvfp4MmaGemvShufKernels {
 
 fn sf_inner_dim(k: u32) -> u32 {
     k.div_ceil(64) * 4
+}
+
+/// Батч GEMV: `out[e]` = `W_e · x_e`, по одному блоку grid.z на эксперта.
+/// Все веса обязаны быть одной формы `[n, k]`; `out` — плотный `[e, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_mma_gemv_shuf_f16_batched(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    w_ptrs: &CudaSlice<u64>,
+    sw_ptrs: &CudaSlice<u64>,
+    xp_ptrs: &CudaSlice<u64>,
+    xs_ptrs: &CudaSlice<u64>,
+    x_sf_offs: &CudaSlice<u32>,
+    out: &mut CudaViewMut<f16>,
+    n: u32,
+    k: u32,
+    experts: u32,
+) -> Result<()> {
+    if k % 64 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "nvfp4_mma_gemv_shuf_f16_batched: K={k} must be multiple of 64"
+        )));
+    }
+    if n % W8_M_TILE != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "nvfp4_mma_gemv_shuf_f16_batched: N={n} must be multiple of {W8_M_TILE}"
+        )));
+    }
+    if experts == 0 {
+        return Ok(());
+    }
+    let sf_inner_w = sf_inner_dim(k);
+    let cfg = LaunchConfig {
+        grid_dim: (n / W8_M_TILE, 1, experts),
+        block_dim: (W8_THREADS, 1, 1),
+        shared_mem_bytes: (k / 2) as u32,
+    };
+    let mut b = stream.launch_builder(&kernels.w8_batched);
+    b.arg(w_ptrs)
+        .arg(sw_ptrs)
+        .arg(xp_ptrs)
+        .arg(xs_ptrs)
+        .arg(x_sf_offs)
+        .arg(&mut *out)
+        .arg(&n)
+        .arg(&k)
+        .arg(&sf_inner_w);
+    unsafe { b.launch(cfg) }
+        .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemv_shuf_f16_batched: {e:?}")))?;
+    Ok(())
 }
 
 pub fn nvfp4_w_repack(

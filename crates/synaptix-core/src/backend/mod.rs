@@ -627,6 +627,42 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("embed_gather не поддержан этим backend"))
     }
 
+    /// Перемешать NVFP4-вес в раскладку, которую читают GEMV/GEMM-ядра.
+    /// `packed` `[n, k]` → `out` того же размера. Обычно это делает первое
+    /// умножение; отдельный вызов нужен, чтобы подготовить веса заранее.
+    fn nvfp4_repack(
+        &self,
+        _packed: &Storage,
+        _out: &mut Storage,
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_repack не поддержан этим backend"))
+    }
+
+    /// Батч NVFP4-GEMV: `out[e, :] = W_e · x_e`, все веса формы `[n, k]` в
+    /// перемешанной раскладке. `x_rows` — номер строки активации в её кванте:
+    /// батч умеет читать разные строки одного общего буфера, как выходит после
+    /// фьюза swiglu, посчитанного на всех экспертах разом. Нужен MoE-декоду: десяток матриц по одной
+    /// строке каждая отдельными запусками упирается в launch overhead.
+    /// Default `Unsupported` → вызывающий считает эксперты по одному.
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemv_batched(
+        &self,
+        _w_shuf: &[&Storage],
+        _w_scales: &[&Storage],
+        _x_packed: &[&Storage],
+        _x_scales: &[&Storage],
+        _x_rows: &[usize],
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_gemv_batched не поддержан этим backend"))
+    }
+
     fn embed_gather_mxfp8(
         &self,
         _table: &Storage,
