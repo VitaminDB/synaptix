@@ -412,19 +412,12 @@ struct FetchJob {
 impl FetchJob {
     fn run(self) {
         let started = std::time::Instant::now();
-        // Копии идут своим стримом: в общем они встали бы в очередь за
-        // вычислениями слоя, и подкачку нечем было бы перекрыть.
-        let loader = match self.cache.device() {
-            Device::Cuda(ord) => synaptix_core::device::cuda::loader_stream(ord).ok(),
-            _ => None,
-        };
         let fetched: Vec<(u32, Expert)> = self
             .missing
             .par_iter()
             .filter_map(|e| {
                 let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
                 let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
-                let _stream = loader.clone().map(LoaderStreamGuard::new);
                 let (gate_up, down) =
                     self.source.fetch(self.layer_id, *e as usize, self.cache.device()).ok()?;
                 if self.prepare_batch {
@@ -439,33 +432,12 @@ impl FetchJob {
                 Some((*e, Expert { gate_up, down }))
             })
             .collect();
-        // Отданный вызывающему сигнал должен означать, что тела уже на карте.
-        if let Some(ls) = &loader {
-            let _ = ls.synchronize();
-        }
         self.cache.note_fetch_time(started.elapsed());
         let loaded = fetched.len() as u64;
         for (expert, weights) in fetched {
             self.cache.insert((self.layer_id, expert as usize), Arc::new(weights));
         }
         self.cache.note_fetched(loaded);
-    }
-}
-
-/// Ставит alloc-стрим потока на время подкачки и возвращает прежний на выходе:
-/// rayon переиспользует свои потоки под чужие задачи.
-struct LoaderStreamGuard;
-
-impl LoaderStreamGuard {
-    fn new(stream: std::sync::Arc<synaptix_core::device::cuda::Stream>) -> Self {
-        synaptix_core::device::cuda::set_alloc_stream(Some(stream));
-        Self
-    }
-}
-
-impl Drop for LoaderStreamGuard {
-    fn drop(&mut self) {
-        synaptix_core::device::cuda::set_alloc_stream(None);
     }
 }
 
@@ -886,34 +858,17 @@ impl MoeFfn {
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
         // страницам бандла стоит дороже самого умножения.
         let batchable = t <= batch_tokens();
+        stage("moe:prefetch", || self.prefetch(&experts, &weights, batchable));
         if batchable {
-            stage("moe:prefetch", || self.prefetch(&experts, &weights, true));
             if let Some(out) = self.forward_pairs_batched(x, &experts, &weights)? {
                 return Ok(out);
             }
         }
 
         // Пары (токен, слот), сгруппированные по эксперту: каждый эксперт
-        // получает один GEMM вместо GEMV на токен. Резиденты идут первыми:
-        // пока считаются они, промахи едут на карту своим стримом.
+        // получает один GEMM вместо GEMV на токен.
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
-        let pending = if batchable {
-            None
-        } else {
-            let resident = |e: u32| match &self.cache {
-                Some(cache) => cache.contains((self.layer_id, e as usize)),
-                None => true,
-            };
-            let rx = self.prefetch_async(&experts, &weights, false);
-            if rx.is_some() {
-                order.sort_unstable_by_key(|p| {
-                    (!resident(experts[*p as usize]), experts[*p as usize], *p)
-                });
-            }
-            rx
-        };
-        let mut waited = pending.is_none();
 
         let gathered = stage("moe:gather", || -> Result<Tensor, ModelError> {
             let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
@@ -942,14 +897,6 @@ impl MoeFfn {
                 pos = end;
                 continue;
             }
-            if !waited && !self.resident_now(expert) {
-                stage("moe:prefetch", || {
-                    if let Some(rx) = &pending {
-                        let _ = rx.recv();
-                    }
-                });
-                waited = true;
-            }
             let slice = stage("moe:slice", || {
                 gathered
                     .narrow(0, pos, end - pos)
@@ -964,11 +911,6 @@ impl MoeFfn {
             };
             outs.push(out);
             pos = end;
-        }
-        if !waited {
-            if let Some(rx) = &pending {
-                let _ = rx.recv();
-            }
         }
         if skipped > 0 {
             if let Some(cache) = &self.cache {
@@ -1042,11 +984,45 @@ impl MoeFfn {
         if experts.len() != t * k {
             return Ok(None);
         }
+
+        let pairs: Vec<usize> = (0..experts.len()).collect();
+        let Some(mixed) = self.batched_pairs(x, experts, weights, &pairs, t, k)? else {
+            return Ok(None);
+        };
+        let mixed = self.to_compute(mixed)?;
+
+        if let Some(cache) = &self.cache {
+            cache.note_batch(true);
+        }
+        Ok(Some(match &self.shared {
+            Some(shared) => {
+                let s = self.shared_forward(shared, x)?;
+                mixed
+                    .add(&s)
+                    .map_err(|e| ModelError::Forward(format!("MoE: shared expert: {e}")))?
+            }
+            None => mixed,
+        }))
+    }
+
+    /// Сумма по указанным парам «токен × эксперт»: два батчевых GEMV и фьюз
+    /// swiglu между ними. `None` — путь неприменим (не NVFP4, нет перемешанной
+    /// копии весов, неподходящие формы).
+    #[allow(clippy::too_many_arguments)]
+    fn batched_pairs(
+        &self,
+        x: &Tensor,
+        experts: &[u32],
+        weights: &[f32],
+        pairs: &[usize],
+        t: usize,
+        k: usize,
+    ) -> Result<Option<Tensor>, ModelError> {
         let picked: Vec<Arc<Expert>> = {
-            let mut out = Vec::with_capacity(experts.len());
-            for e in experts {
+            let mut out = Vec::with_capacity(pairs.len());
+            for p in pairs {
                 match &self.cache {
-                    Some(cache) => out.push(self.resident_expert(*e as usize, cache)?),
+                    Some(cache) => out.push(self.resident_expert(experts[*p] as usize, cache)?),
                     None => return Ok(None),
                 }
             }
@@ -1084,7 +1060,7 @@ impl MoeFfn {
         let acts: Vec<(&Tensor, &Tensor)> = (0..picked.len()).map(|_| (&packed_x, &scales_x)).collect();
         // Пары идут в порядке `токен * k + слот`, поэтому строка активации у
         // пары — её номер, делённый на число экспертов на токен.
-        let rows: Vec<usize> = (0..picked.len()).map(|p| p / k).collect();
+        let rows: Vec<usize> = pairs.iter().map(|p| p / k).collect();
         let Ok(gu) = QuantWeight::gemv_batched(&gate_up, &acts, &rows) else {
             return Ok(None);
         };
@@ -1100,29 +1076,28 @@ impl MoeFfn {
             return Ok(None);
         };
 
-        let scale = Tensor::from_vec::<_, f32>(weights.to_vec(), vec![weights.len(), 1], self.device)
+        let scale: Vec<f32> = pairs.iter().map(|p| weights[*p]).collect();
+        let scale = Tensor::from_vec::<_, f32>(scale, vec![pairs.len(), 1], self.device)
             .and_then(|s| s.to_dtype(parts.dtype()))
             .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
-        let mixed = parts
+        let scaled = parts
             .broadcast_mul(&scale)
-            .and_then(|m| m.reshape((t, k, self.cfg.hidden_size)))
-            .and_then(|m| m.sum([1usize]))
-            .and_then(|m| m.reshape((t, self.cfg.hidden_size)))
-            .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?;
-        let mixed = self.to_compute(mixed)?;
-
-        if let Some(cache) = &self.cache {
-            cache.note_batch(true);
-        }
-        Ok(Some(match &self.shared {
-            Some(shared) => {
-                let s = self.shared_forward(shared, x)?;
-                mixed
-                    .add(&s)
-                    .map_err(|e| ModelError::Forward(format!("MoE: shared expert: {e}")))?
-            }
-            None => mixed,
-        }))
+            .map_err(|e| ModelError::Forward(format!("MoE: взвешивание: {e}")))?;
+        // Слагаемые пары ложатся на свой токен: при одном токене это просто
+        // сумма всех строк, иначе пары идут полными группами по k.
+        let summed = if t == 1 {
+            scaled
+                .sum([0usize])
+                .and_then(|m| m.reshape((1, self.cfg.hidden_size)))
+                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+        } else {
+            scaled
+                .reshape((t, k, self.cfg.hidden_size))
+                .and_then(|m| m.sum([1usize]))
+                .and_then(|m| m.reshape((t, self.cfg.hidden_size)))
+                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+        };
+        Ok(Some(summed))
     }
 
     /// Поднять на устройство всех экспертов чанка, которых там ещё нет.
@@ -1131,30 +1106,6 @@ impl MoeFfn {
     fn prefetch(&self, experts: &[u32], weights: &[f32], prepare_batch: bool) {
         if let Some(job) = self.fetch_job(experts, weights, prepare_batch) {
             job.run();
-        }
-    }
-
-    /// Та же подкачка, но фоном: пока промахи едут на карту, вызывающий
-    /// успевает посчитать экспертов, которые там уже лежат.
-    fn prefetch_async(
-        &self,
-        experts: &[u32],
-        weights: &[f32],
-        prepare_batch: bool,
-    ) -> Option<std::sync::mpsc::Receiver<()>> {
-        let job = self.fetch_job(experts, weights, prepare_batch)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        rayon::spawn(move || {
-            job.run();
-            let _ = tx.send(());
-        });
-        Some(rx)
-    }
-
-    fn resident_now(&self, expert: u32) -> bool {
-        match &self.cache {
-            Some(cache) => cache.contains((self.layer_id, expert as usize)),
-            None => true,
         }
     }
 
