@@ -604,9 +604,9 @@ impl Qwen4ExpModel {
                         let mut mask = vec![0f32; s * kv_len];
                         match &selected {
                             Some(sel) => {
-                                for (i, row) in sel.iter().enumerate() {
-                                    for t in row {
-                                        mask[i * kv_len + *t as usize] = 1.0;
+                                for i in 0..sel.len() {
+                                    for t in sel.positions(i) {
+                                        mask[i * kv_len + t as usize] = 1.0;
                                     }
                                 }
                             }

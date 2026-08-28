@@ -27,8 +27,15 @@ pub struct IndexerConfig {
 }
 
 impl IndexerConfig {
+    /// Сколько блоков оставляет индексатор. `SYN_QWEN4EXP_QSA_TOPK` урезает
+    /// бюджет — так разреженный путь включается на коротком контексте, где его
+    /// можно сверить с полным вниманием.
     pub fn block_topk(&self) -> usize {
-        self.budget / self.compress_ratio
+        let full = self.budget / self.compress_ratio;
+        match std::env::var("SYN_QWEN4EXP_QSA_TOPK").ok().and_then(|v| v.trim().parse().ok()) {
+            Some(n) if n > 0 && n < full => n,
+            _ => full,
+        }
     }
     pub fn qk_dim(&self) -> usize {
         (self.n_heads + self.kv_heads) * self.head_dim

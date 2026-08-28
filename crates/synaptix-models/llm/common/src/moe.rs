@@ -399,6 +399,76 @@ struct SharedExpert {
 /// Откуда брать эксперта, которого нет на устройстве. Реализация читает его
 /// из хранилища модели (квантованный `.syn` отдаёт срез стопки прямо из
 /// mmap), так что в оперативной памяти эксперты не лежат вовсе.
+/// Подкачка промахов одного слоя: живёт отдельно от `MoeFfn`, чтобы её можно
+/// было отдать фоновому потоку.
+struct FetchJob {
+    source: Arc<dyn ExpertSource>,
+    cache: Arc<ExpertCache>,
+    layer_id: usize,
+    prepare_batch: bool,
+    missing: Vec<u32>,
+}
+
+impl FetchJob {
+    fn run(self) {
+        let started = std::time::Instant::now();
+        // Копии идут своим стримом: в общем они встали бы в очередь за
+        // вычислениями слоя, и подкачку нечем было бы перекрыть.
+        let loader = match self.cache.device() {
+            Device::Cuda(ord) => synaptix_core::device::cuda::loader_stream(ord).ok(),
+            _ => None,
+        };
+        let fetched: Vec<(u32, Expert)> = self
+            .missing
+            .par_iter()
+            .filter_map(|e| {
+                let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
+                let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
+                let _stream = loader.clone().map(LoaderStreamGuard::new);
+                let (gate_up, down) =
+                    self.source.fetch(self.layer_id, *e as usize, self.cache.device()).ok()?;
+                if self.prepare_batch {
+                    // Только на декоде: репак держит обе копии веса разом, а на
+                    // префилле экспертов поднимается сотнями и пик не влезает.
+                    for w in [gate_up.quant_weight(), down.quant_weight()] {
+                        if let Some(w) = w {
+                            let _ = w.ensure_shuffled();
+                        }
+                    }
+                }
+                Some((*e, Expert { gate_up, down }))
+            })
+            .collect();
+        // Отданный вызывающему сигнал должен означать, что тела уже на карте.
+        if let Some(ls) = &loader {
+            let _ = ls.synchronize();
+        }
+        self.cache.note_fetch_time(started.elapsed());
+        let loaded = fetched.len() as u64;
+        for (expert, weights) in fetched {
+            self.cache.insert((self.layer_id, expert as usize), Arc::new(weights));
+        }
+        self.cache.note_fetched(loaded);
+    }
+}
+
+/// Ставит alloc-стрим потока на время подкачки и возвращает прежний на выходе:
+/// rayon переиспользует свои потоки под чужие задачи.
+struct LoaderStreamGuard;
+
+impl LoaderStreamGuard {
+    fn new(stream: std::sync::Arc<synaptix_core::device::cuda::Stream>) -> Self {
+        synaptix_core::device::cuda::set_alloc_stream(Some(stream));
+        Self
+    }
+}
+
+impl Drop for LoaderStreamGuard {
+    fn drop(&mut self) {
+        synaptix_core::device::cuda::set_alloc_stream(None);
+    }
+}
+
 /// Сбор строк по индексам. `index_select` на карте копирует строку за строкой
 /// и на перестановке шестидесяти тысяч строк стоит дороже, чем все умножения
 /// экспертов вместе взятые; embed-ядро читает индексы прямо с карты.
@@ -722,39 +792,45 @@ impl MoeFfn {
 
         let mut experts = vec![0u32; t * k];
         let mut weights = vec![0f32; t * k];
-        let mut order: Vec<u32> = Vec::with_capacity(e);
-        for i in 0..t {
-            let row = &logits[i * e..(i + 1) * e];
-            order.clear();
-            order.extend(0..e as u32);
-            // Полной сортировки не нужно — важны только k первых.
-            order.select_nth_unstable_by(k - 1, |a, b| {
-                row[*b as usize]
-                    .partial_cmp(&row[*a as usize])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top = &mut order[..k];
-            top.sort_unstable_by(|a, b| {
-                row[*b as usize]
-                    .partial_cmp(&row[*a as usize])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+        // Выбор top-k по строкам независим, а строк на префилле тысячи:
+        // последовательный проход по 512 логитам на токен стоил четверть
+        // времени всей MoE.
+        let norm_topk = self.cfg.norm_topk_prob;
+        experts
+            .par_chunks_mut(k)
+            .zip(weights.par_chunks_mut(k))
+            .enumerate()
+            .for_each(|(i, (experts, weights))| {
+                let row = &logits[i * e..(i + 1) * e];
+                let mut order: Vec<u32> = (0..e as u32).collect();
+                // Полной сортировки не нужно — важны только k первых.
+                order.select_nth_unstable_by(k - 1, |a, b| {
+                    row[*b as usize]
+                        .partial_cmp(&row[*a as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top = &mut order[..k];
+                top.sort_unstable_by(|a, b| {
+                    row[*b as usize]
+                        .partial_cmp(&row[*a as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-            // softmax по k выбранным логитам — это и есть общая softmax,
-            // поделённая на сумму top-k. Без нормировки делим на сумму по
-            // всем экспертам.
-            let max = top.iter().map(|j| row[*j as usize]).fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = top.iter().map(|j| (row[*j as usize] - max).exp()).collect();
-            let denom: f32 = if self.cfg.norm_topk_prob {
-                exps.iter().sum()
-            } else {
-                row.iter().map(|v| (v - max).exp()).sum()
-            };
-            for (s, (idx, ex)) in top.iter().zip(exps.iter()).enumerate() {
-                experts[i * k + s] = *idx;
-                weights[i * k + s] = ex / denom;
-            }
-        }
+                // softmax по k выбранным логитам — это и есть общая softmax,
+                // поделённая на сумму top-k. Без нормировки делим на сумму по
+                // всем экспертам.
+                let max = top.iter().map(|j| row[*j as usize]).fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = top.iter().map(|j| (row[*j as usize] - max).exp()).collect();
+                let denom: f32 = if norm_topk {
+                    exps.iter().sum()
+                } else {
+                    row.iter().map(|v| (v - max).exp()).sum()
+                };
+                for (s, (idx, ex)) in top.iter().zip(exps.iter()).enumerate() {
+                    experts[s] = *idx;
+                    weights[s] = ex / denom;
+                }
+            });
         Ok((experts, weights))
     }
 
@@ -810,17 +886,34 @@ impl MoeFfn {
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
         // страницам бандла стоит дороже самого умножения.
         let batchable = t <= batch_tokens();
-        stage("moe:prefetch", || self.prefetch(&experts, &weights, batchable));
         if batchable {
+            stage("moe:prefetch", || self.prefetch(&experts, &weights, true));
             if let Some(out) = self.forward_pairs_batched(x, &experts, &weights)? {
                 return Ok(out);
             }
         }
 
         // Пары (токен, слот), сгруппированные по эксперту: каждый эксперт
-        // получает один GEMM вместо GEMV на токен.
+        // получает один GEMM вместо GEMV на токен. Резиденты идут первыми:
+        // пока считаются они, промахи едут на карту своим стримом.
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
+        let pending = if batchable {
+            None
+        } else {
+            let resident = |e: u32| match &self.cache {
+                Some(cache) => cache.contains((self.layer_id, e as usize)),
+                None => true,
+            };
+            let rx = self.prefetch_async(&experts, &weights, false);
+            if rx.is_some() {
+                order.sort_unstable_by_key(|p| {
+                    (!resident(experts[*p as usize]), experts[*p as usize], *p)
+                });
+            }
+            rx
+        };
+        let mut waited = pending.is_none();
 
         let gathered = stage("moe:gather", || -> Result<Tensor, ModelError> {
             let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
@@ -849,6 +942,14 @@ impl MoeFfn {
                 pos = end;
                 continue;
             }
+            if !waited && !self.resident_now(expert) {
+                stage("moe:prefetch", || {
+                    if let Some(rx) = &pending {
+                        let _ = rx.recv();
+                    }
+                });
+                waited = true;
+            }
             let slice = stage("moe:slice", || {
                 gathered
                     .narrow(0, pos, end - pos)
@@ -863,6 +964,11 @@ impl MoeFfn {
             };
             outs.push(out);
             pos = end;
+        }
+        if !waited {
+            if let Some(rx) = &pending {
+                let _ = rx.recv();
+            }
         }
         if skipped > 0 {
             if let Some(cache) = &self.cache {
@@ -1023,10 +1129,40 @@ impl MoeFfn {
     /// Промахи читаются параллельно: у ленивого источника это страничные
     /// промахи mmap, и одна очередь к NVMe заметно медленнее нескольких.
     fn prefetch(&self, experts: &[u32], weights: &[f32], prepare_batch: bool) {
-        let Some(cache) = &self.cache else { return };
-        if !matches!(self.experts, ExpertStore::Lazy { .. }) {
-            return;
+        if let Some(job) = self.fetch_job(experts, weights, prepare_batch) {
+            job.run();
         }
+    }
+
+    /// Та же подкачка, но фоном: пока промахи едут на карту, вызывающий
+    /// успевает посчитать экспертов, которые там уже лежат.
+    fn prefetch_async(
+        &self,
+        experts: &[u32],
+        weights: &[f32],
+        prepare_batch: bool,
+    ) -> Option<std::sync::mpsc::Receiver<()>> {
+        let job = self.fetch_job(experts, weights, prepare_batch)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        rayon::spawn(move || {
+            job.run();
+            let _ = tx.send(());
+        });
+        Some(rx)
+    }
+
+    fn resident_now(&self, expert: u32) -> bool {
+        match &self.cache {
+            Some(cache) => cache.contains((self.layer_id, expert as usize)),
+            None => true,
+        }
+    }
+
+    fn fetch_job(&self, experts: &[u32], weights: &[f32], prepare_batch: bool) -> Option<FetchJob> {
+        let cache = self.cache.as_ref()?;
+        let ExpertStore::Lazy { source, .. } = &self.experts else {
+            return None;
+        };
         // Клапан отсекает экспертов ещё до подкачки: тянуть с диска того, чьи
         // пары всё равно будут отброшены, незачем.
         let mut wanted: Vec<u32> = experts
@@ -1042,36 +1178,15 @@ impl MoeFfn {
             .filter(|e| !cache.contains((self.layer_id, *e as usize)))
             .collect();
         if missing.is_empty() {
-            return;
+            return None;
         }
-        let started = std::time::Instant::now();
-        let fetched: Vec<(u32, Expert)> = missing
-            .par_iter()
-            .filter_map(|e| {
-                let ExpertStore::Lazy { source, .. } = &self.experts else {
-                    return None;
-                };
-                let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
-                let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
-                let (gate_up, down) = source.fetch(self.layer_id, *e as usize, cache.device()).ok()?;
-                if prepare_batch {
-                    // Только на декоде: репак держит обе копии веса разом, а на
-                    // префилле экспертов поднимается сотнями и пик не влезает.
-                    for w in [gate_up.quant_weight(), down.quant_weight()] {
-                        if let Some(w) = w {
-                            let _ = w.ensure_shuffled();
-                        }
-                    }
-                }
-                Some((*e, Expert { gate_up, down }))
-            })
-            .collect();
-        cache.note_fetch_time(started.elapsed());
-        let loaded = fetched.len() as u64;
-        for (expert, weights) in fetched {
-            cache.insert((self.layer_id, expert as usize), Arc::new(weights));
-        }
-        cache.note_fetched(loaded);
+        Some(FetchJob {
+            source: source.clone(),
+            cache: cache.clone(),
+            layer_id: self.layer_id,
+            prepare_batch,
+            missing,
+        })
     }
 
     /// Стоит ли пропустить эксперта: только при включённом оффлоаде, когда его

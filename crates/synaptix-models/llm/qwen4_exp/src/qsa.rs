@@ -9,6 +9,42 @@ use synaptix_ops::pos::rope_cache::RopeCache;
 use crate::config::{IndexerConfig, Qwen4ExpConfig};
 use crate::norm::{coerr, load_one_plus, rms};
 
+/// Выбор индексатора: блоки, а не позиции. Блок — `compress_ratio` подряд
+/// идущих токенов, и в KV они лежат сплошняком, поэтому и собирать их надо
+/// блоками: строка в четыре раза шире — гатер во столько же раз быстрее.
+/// Хвост — токены после последнего полного блока, они видны всегда.
+pub struct Selection {
+    pub ratio: usize,
+    pub blocks: Vec<Vec<u32>>,
+    pub tails: Vec<(u32, u32)>,
+}
+
+impl Selection {
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    pub fn row_len(&self, i: usize) -> usize {
+        self.blocks[i].len() * self.ratio + self.tails[i].1 as usize
+    }
+
+    /// Позиции строки по порядку: сперва выбранные блоки, потом хвост.
+    pub fn positions(&self, i: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.row_len(i));
+        for b in &self.blocks[i] {
+            let start = b * self.ratio as u32;
+            out.extend(start..start + self.ratio as u32);
+        }
+        let (from, len) = self.tails[i];
+        out.extend(from..from + len);
+        out
+    }
+}
+
 pub struct IndexerCache {
     pending: Vec<f32>,
     block_keys: Tensor,
@@ -206,7 +242,7 @@ impl QsaIndexer {
         past: usize,
         s: usize,
         rope: &RopeCache,
-    ) -> Result<Option<Vec<Vec<u32>>>, ModelError> {
+    ) -> Result<Option<Selection>, ModelError> {
         let d = self.cfg.head_dim;
         let nh = self.cfg.n_heads;
         let qk = self.qk_proj.forward(h)?;
@@ -242,7 +278,8 @@ impl QsaIndexer {
 
         let cr = self.cfg.compress_ratio;
         let topk = self.cfg.block_topk();
-        let mut selected = Vec::with_capacity(s);
+        let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(s);
+        let mut tails: Vec<(u32, u32)> = Vec::with_capacity(s);
         let chunk = (1 << 22) / total_blocks.max(1);
         let chunk = chunk.clamp(1, 256).min(s);
         let mut row = 0usize;
@@ -262,14 +299,14 @@ impl QsaIndexer {
             // Выбор блоков независим по запросам, а на длинном контексте это
             // десятки тысяч кандидатов на каждый — один поток тут становится
             // дороже самого внимания.
-            let picked: Vec<Vec<u32>> = (0..take)
+            let picked: Vec<(Vec<u32>, (u32, u32))> = (0..take)
                 .into_par_iter()
                 .map(|i| {
                     let pos = past + row + i;
                     let visible = pos + 1;
                     let nb = (visible / cr).min(total_blocks);
                     let scores_row = &host[i * total_blocks..i * total_blocks + nb];
-                    let mut tokens = Vec::with_capacity(topk * cr + cr);
+                    let mut blocks = Vec::with_capacity(topk);
                     if nb > 0 {
                         let mut order: Vec<u32> = (0..scores_row.len() as u32).collect();
                         let take_blocks = topk.min(order.len());
@@ -281,22 +318,16 @@ impl QsaIndexer {
                             });
                             order.truncate(take_blocks);
                         }
-                        for b in order {
-                            let start = b as usize * cr;
-                            for t in start..start + cr {
-                                tokens.push(t as u32);
-                            }
-                        }
+                        blocks = order;
                     }
-                    for t in nb * cr..visible {
-                        tokens.push(t as u32);
-                    }
-                    tokens
+                    (blocks, ((nb * cr) as u32, (visible - nb * cr) as u32))
                 })
-                .collect();
-            selected.extend(picked);
+                .collect();            for (b, t) in picked {
+                blocks.push(b);
+                tails.push(t);
+            }
             row += take;
         }
-        Ok(Some(selected))
+        Ok(Some(Selection { ratio: cr, blocks, tails }))
     }
 }

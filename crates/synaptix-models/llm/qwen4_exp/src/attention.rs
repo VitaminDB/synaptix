@@ -9,7 +9,7 @@ use synaptix_ops::pos::rope_cache::RopeCache;
 
 use crate::config::Qwen4ExpConfig;
 use crate::norm::{coerr, load_one_plus, rms, stage};
-use crate::qsa::{IndexerCache, QsaIndexer};
+use crate::qsa::{IndexerCache, QsaIndexer, Selection};
 
 const MASK_NEG: f32 = -1.0e4;
 
@@ -20,10 +20,7 @@ const SPARSE_KV_BUDGET: usize = 512 << 20;
 /// индексатора, а не с длиной контекста. `SYN_QWEN4EXP_QSA_GATHER=0`
 /// возвращает прежний путь с маской поверх полного внимания.
 fn gather_selected() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("SYN_QWEN4EXP_QSA_GATHER").map(|v| v.trim() != "0").unwrap_or(true)
-    })
+    std::env::var("SYN_QWEN4EXP_QSA_GATHER").map(|v| v.trim() != "0").unwrap_or(true)
 }
 
 pub struct KvLayer {
@@ -39,6 +36,9 @@ impl KvLayer {
         device: Device,
         dtype: DType,
     ) -> Result<Self, ModelError> {
+        // Ёмкость округляется вверх: блоки индексатора собираются из KV
+        // строками по `compress_ratio` позиций, и хвост должен быть целым.
+        let capacity = capacity.next_multiple_of(8);
         let dims = vec![1, num_kv_heads, capacity, head_dim];
         Ok(Self {
             k: Tensor::zeros(dims.clone(), dtype, device).map_err(|e| ModelError::Build(e.to_string()))?,
@@ -124,7 +124,7 @@ impl QsaAttention {
         past: usize,
         s: usize,
         rope: &RopeCache,
-    ) -> Result<(Tensor, Option<Vec<Vec<u32>>>), ModelError> {
+    ) -> Result<(Tensor, Option<Selection>), ModelError> {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let selected = stage("qsa:indexer", || self.indexer.forward(h, idx, past, s, rope))?;
 
@@ -211,12 +211,12 @@ impl QsaAttention {
         coerr(coerr(Tensor::from_vec(data, vec![s, kv_len], self.device))?.to_dtype(self.compute))
     }
 
-    fn selection_mask(&self, selected: &[Vec<u32>], s: usize, kv_len: usize) -> Result<Tensor, ModelError> {
+    fn selection_mask(&self, selected: &Selection, s: usize, kv_len: usize) -> Result<Tensor, ModelError> {
         let mut data = vec![MASK_NEG; s * kv_len];
-        for (i, row) in selected.iter().enumerate() {
+        for i in 0..s {
             let base = i * kv_len;
-            for t in row {
-                let t = *t as usize;
+            for t in selected.positions(i) {
+                let t = t as usize;
                 if t < kv_len {
                     data[base + t] = 0.0;
                 }
@@ -233,81 +233,184 @@ impl QsaAttention {
     /// же блоки, поэтому на тайл собирается объединение их наборов, а кто
     /// какие позиции видит, задаёт маска. На префилле это убирает почти весь
     /// трафик гатера — каждый запрос тянул свои две тысячи позиций отдельно.
+    /// Прежний путь: запросы группируются по числу выбранных позиций, внутри
+    /// группы формы совпадают, так что ни паддинга, ни маски не нужно, и
+    /// работает flash. Каждому запросу собирается свой KV — на длинном
+    /// контексте это дешевле, чем общее на всех объединение.
+    fn attention_per_query(
+        &self,
+        q: &Tensor,
+        kv: &KvLayer,
+        selected: &Selection,
+        offset: usize,
+        len: usize,
+    ) -> Result<Tensor, ModelError> {
+        let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let cap = kv.k.dims()[2];
+        let cr = selected.ratio.max(1);
+        let elem = (self.compute.size_in_bits() / 8).max(1);
+        if cap % cr != 0 {
+            return Err(ModelError::Shape(format!(
+                "QSA: ёмкость KV {cap} не кратна блоку {cr}"
+            )));
+        }
+        let block_rows = cap / cr;
+
+        // Строки одной длины считаются вместе: формы совпадают, так что ни
+        // паддинга, ни маски не нужно и работает flash.
+        let mut by_len: std::collections::BTreeMap<(usize, usize), Vec<usize>> = Default::default();
+        for i in offset..offset + len {
+            by_len
+                .entry((selected.blocks[i].len(), selected.tails[i].1 as usize))
+                .or_default()
+                .push(i);
+        }
+
+        let q_flat = coerr(coerr(coerr(q.reshape(vec![nh, q.dims()[2], hd]))?.permute(vec![1, 0, 2]))?
+            .contiguous())?;
+        let q_flat = coerr(q_flat.reshape(vec![q.dims()[2], nh * hd]))?;
+
+        let mut order: Vec<usize> = Vec::with_capacity(len);
+        let mut parts: Vec<Tensor> = Vec::new();
+        for ((nb, tail), rows) in by_len {
+            let m = nb * cr + tail;
+            if m == 0 {
+                return Err(ModelError::Forward("QSA: пустой набор позиций".into()));
+            }
+            let per_query = 2 * nkv * m * hd * elem;
+            let group = (SPARSE_KV_BUDGET / per_query.max(1)).clamp(1, rows.len());
+            for slice in rows.chunks(group) {
+                let g = slice.len();
+                let mut block_idx = Vec::with_capacity(g * nkv * nb);
+                let mut tail_idx = Vec::with_capacity(g * nkv * tail);
+                for row in slice {
+                    for head in 0..nkv {
+                        let base = (head * block_rows) as u32;
+                        block_idx.extend(selected.blocks[*row].iter().map(|b| base + *b));
+                        let (from, count) = selected.tails[*row];
+                        let base = (head * cap) as u32;
+                        tail_idx.extend((0..count).map(|j| base + from + j));
+                    }
+                }
+                let block_idx = coerr(Tensor::from_vec(block_idx, vec![g * nkv * nb], self.device))?;
+                let tail_idx = coerr(Tensor::from_vec(tail_idx, vec![g * nkv * tail], self.device))?;
+                let gather = |src: &Tensor| -> Result<Tensor, ModelError> {
+                    // Блоки лежат в KV сплошняком, поэтому собираются строками
+                    // по `cr` позиций разом — вчетверо меньше обращений.
+                    let blocks = coerr(src.reshape(vec![nkv * block_rows, cr * hd]))?;
+                    let picked = take_rows(&blocks, &block_idx)?;
+                    let picked = coerr(picked.reshape(vec![g, nkv, nb * cr, hd]))?;
+                    if tail == 0 {
+                        return Ok(picked);
+                    }
+                    let table = coerr(src.reshape(vec![nkv * cap, hd]))?;
+                    let rest = take_rows(&table, &tail_idx)?;
+                    let rest = coerr(rest.reshape(vec![g, nkv, tail, hd]))?;
+                    coerr(Tensor::cat(&[&picked, &rest], 2))
+                };
+                let k_sel = gather(&kv.k)?;
+                let v_sel = gather(&kv.v)?;
+
+                let rows_idx: Vec<u32> = slice.iter().map(|r| *r as u32).collect();
+                let rows_idx = coerr(Tensor::from_vec(rows_idx, vec![g], self.device))?;
+                let q_sel = take_rows(&q_flat, &rows_idx)?;
+                let q_sel = coerr(q_sel.reshape(vec![g, nh, 1, hd]))?;
+
+                let out = match q_sel.flash_attention(&k_sel, &v_sel, self.scale, false) {
+                    Ok(a) => a,
+                    Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
+                        let k_rep = repeat_kv(&k_sel, nh / nkv)?;
+                        let v_rep = repeat_kv(&v_sel, nh / nkv)?;
+                        coerr(scaled_dot_attention(&q_sel, &k_rep, &v_rep, self.scale, None))?
+                    }
+                    Err(e) => return Err(ModelError::Forward(e.to_string())),
+                };
+                order.extend_from_slice(slice);
+                parts.push(coerr(out.reshape(vec![g, nh, hd]))?);
+            }
+        }
+
+        let stacked = if parts.len() == 1 {
+            parts.pop().expect("одна часть")
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            coerr(Tensor::cat(&refs, 0))?
+        };
+        let mut inverse = vec![0u32; len];
+        for (place, row) in order.iter().enumerate() {
+            inverse[*row - offset] = place as u32;
+        }
+        let inverse = coerr(Tensor::from_vec(inverse, vec![len], self.device))?;
+        let stacked = coerr(stacked.reshape(vec![len, nh * hd]))?;
+        let restored = coerr(take_rows(&stacked, &inverse)?.reshape(vec![len, nh, hd]))?;
+        coerr(coerr(coerr(restored.permute(vec![1, 0, 2]))?.contiguous())?
+            .reshape(vec![1, nh, len, hd]))
+    }
+
     fn sparse_attention(
         &self,
         q: &Tensor,
         kv: &KvLayer,
-        selected: &[Vec<u32>],
+        selected: &Selection,
     ) -> Result<Tensor, ModelError> {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let cap = kv.k.dims()[2];
+        let cr = selected.ratio.max(1);
         let s = selected.len();
         let elem = (self.compute.size_in_bits() / 8).max(1);
+        if cap % cr != 0 {
+            return Err(ModelError::Shape(format!(
+                "QSA: ёмкость KV {cap} не кратна блоку {cr}"
+            )));
+        }
+        let block_rows = cap / cr;
         let limit = TileLimit {
-            kv_row: 2 * nkv * hd * elem,
-            score_row: nh * 4,
+            kv_row: 2 * nkv * cr * hd * elem,
+            score_row: nh * cr * 4,
             max_len: qsa_tile(),
             kv_budget: SPARSE_KV_BUDGET,
             score_budget: SPARSE_SCORE_BUDGET,
-            spread: qsa_spread(),
         };
 
         let mut parts: Vec<Tensor> = Vec::new();
         let mut start = 0usize;
-        let mut union = Union::new(cap);
+        let mut union = Union::new(block_rows);
         while start < s {
-            let len = union.take_tile(&selected[start..], &limit);
-            let positions = union.positions();
-            let u = positions.len();
-            if u == 0 {
-                return Err(ModelError::Forward("QSA: пустой набор позиций".into()));
+            let len = union.take_tile(selected, start, &limit);
+            // Общее объединение окупается не всегда: на длинном контексте
+            // соседние запросы смотрят в разные места, и внимание по их
+            // объединению считает почти весь контекст. Тогда дешевле собрать
+            // каждому запросу свой KV — блоками, одним вызовом на группу.
+            if !union.worth_tiling(len, &limit) {
+                let end = (start + PER_QUERY_SPAN).min(s);
+                parts.push(self.attention_per_query(q, kv, selected, start, end - start)?);
+                start = end;
+                continue;
             }
+            let blocks = union.blocks();
+            let u = blocks.len();
 
-            // Гатер идёт по KV-буферу как по таблице `[nkv · cap, hd]`: строка
-            // головы `h` и позиции `p` лежит по индексу `h·cap + p`. Так
-            // подходит быстрое embed-ядро, читающее индексы с карты, —
-            // `index_select` копирует строку за строкой и стоит дороже самого
-            // внимания.
             let mut idx = Vec::with_capacity(nkv * u);
             for head in 0..nkv {
-                let base = (head * cap) as u32;
-                idx.extend(positions.iter().map(|p| base + *p));
+                let base = (head * block_rows) as u32;
+                idx.extend(blocks.iter().map(|b| base + *b));
             }
             let idx = coerr(Tensor::from_vec(idx, vec![nkv * u], self.device))?;
             let gather = |src: &Tensor| -> Result<Tensor, ModelError> {
-                let table = coerr(src.reshape(vec![nkv * cap, hd]))?;
-                let picked = match table.embed_gather(&idx) {
-                    Ok(p) => p,
-                    Err(SynaptixError::Unsupported(_)) => coerr(table.index_select(0, &idx))?,
-                    Err(e) => return Err(ModelError::Forward(e.to_string())),
-                };
-                coerr(picked.reshape(vec![1, nkv, u, hd]))
+                let table = coerr(src.reshape(vec![nkv * block_rows, cr * hd]))?;
+                coerr(take_rows(&table, &idx)?.reshape(vec![1, nkv, u * cr, hd]))
             };
             let k_sel = gather(&kv.k)?;
             let v_sel = gather(&kv.v)?;
 
             let q_tile = coerr(coerr(q.narrow(2, start, len))?.contiguous())?;
-            // Все запросы тайла смотрят на всё объединение — маска не нужна,
-            // и тогда работает flash-путь (так идёт декод: тайл из одного).
-            let full = selected[start..start + len].iter().all(|row| row.len() == u);
-            let out = if full {
-                match q_tile.flash_attention(&k_sel, &v_sel, self.scale, false) {
-                    Ok(a) => a,
-                    Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
-                        let k_rep = repeat_kv(&k_sel, nh / nkv)?;
-                        let v_rep = repeat_kv(&v_sel, nh / nkv)?;
-                        coerr(scaled_dot_attention(&q_tile, &k_rep, &v_rep, self.scale, None))?
-                    }
-                    Err(e) => return Err(ModelError::Forward(e.to_string())),
-                }
-            } else {
-                let mask = union.mask(&selected[start..start + len]);
-                let mask = coerr(coerr(Tensor::from_vec(mask, vec![len, u], self.device))?
-                    .to_dtype(self.compute))?;
-                let k_rep = repeat_kv(&k_sel, nh / nkv)?;
-                let v_rep = repeat_kv(&v_sel, nh / nkv)?;
-                coerr(scaled_dot_attention(&q_tile, &k_rep, &v_rep, self.scale, Some(&mask)))?
-            };
+            let mask = union.mask(selected, start, len);
+            let mask = coerr(coerr(Tensor::from_vec(mask, vec![len, u * cr], self.device))?
+                .to_dtype(self.compute))?;
+            let k_rep = repeat_kv(&k_sel, nh / nkv)?;
+            let v_rep = repeat_kv(&v_sel, nh / nkv)?;
+            let out =
+                coerr(scaled_dot_attention(&q_tile, &k_rep, &v_rep, self.scale, Some(&mask)))?;
             parts.push(coerr(out.reshape(vec![1, nh, len, hd]))?);
             start += len;
         }
@@ -320,22 +423,13 @@ impl QsaAttention {
     }
 }
 
-/// Во сколько раз объединение тайла может быть шире одного набора.
-fn qsa_spread() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("SYN_QWEN4EXP_QSA_SPREAD")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(4)
-            .max(1)
-    })
-}
+/// Потолок матрицы скоров одного тайла.
+const SPARSE_SCORE_BUDGET: usize = 192 << 20;
 
-/// Сколько подряд идущих запросов делят один собранный KV. На промпте в 6k
-/// токенов сборка выбранных позиций стоила 9.3 с поштучно, 4.9 с тайлами по
-/// 128 и 2.1 с тайлами по 512; дальше объединение разрастается и внимание
-/// начинает считать лишнее.
+/// Сколько запросов уходит в поштучный путь за раз, когда тайлы не набираются.
+const PER_QUERY_SPAN: usize = 512;
+
+/// Верхний предел длины тайла.
 fn qsa_tile() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -347,81 +441,87 @@ fn qsa_tile() -> usize {
     })
 }
 
-/// Потолок матрицы скоров одного тайла.
-const SPARSE_SCORE_BUDGET: usize = 192 << 20;
-
 struct TileLimit {
     kv_row: usize,
     score_row: usize,
     max_len: usize,
     kv_budget: usize,
     score_budget: usize,
-    spread: usize,
 }
 
-/// Объединение наборов позиций по тайлу запросов: биты по позициям контекста
-/// плюс номер позиции внутри объединения. Тайл набирается по одному запросу и
-/// закрывается, как только объединение перестаёт окупаться — считать по нему
-/// внимание дороже, чем собрать KV каждому запросу отдельно.
+/// Объединение выбранных блоков по тайлу запросов: биты по блокам контекста
+/// плюс номер блока внутри объединения. Тайл набирается по одному запросу и
+/// закрывается, как только объединение упирается в бюджет памяти.
 struct Union {
     bits: Vec<u64>,
     rank: Vec<u32>,
-    positions: Vec<u32>,
+    blocks: Vec<u32>,
+    widest: usize,
 }
 
 impl Union {
-    fn new(cap: usize) -> Self {
+    fn new(total_blocks: usize) -> Self {
         Self {
-            bits: vec![0; cap.div_ceil(64)],
-            rank: vec![u32::MAX; cap],
-            positions: Vec::new(),
+            bits: vec![0; total_blocks.div_ceil(64)],
+            rank: vec![u32::MAX; total_blocks],
+            blocks: Vec::new(),
+            widest: 0,
         }
     }
 
-    fn set(&mut self, p: u32) -> bool {
-        let (w, b) = ((p as usize) / 64, (p as usize) % 64);
-        let was = self.bits[w] & (1 << b) != 0;
-        self.bits[w] |= 1 << b;
+    fn set(&mut self, b: u32) -> bool {
+        let (w, i) = ((b as usize) / 64, (b as usize) % 64);
+        let was = self.bits[w] & (1 << i) != 0;
+        self.bits[w] |= 1 << i;
         !was
     }
 
-    fn clear(&mut self, p: u32) {
-        let (w, b) = ((p as usize) / 64, (p as usize) % 64);
-        self.bits[w] &= !(1u64 << b);
+    fn clear(&mut self, b: u32) {
+        let (w, i) = ((b as usize) / 64, (b as usize) % 64);
+        self.bits[w] &= !(1u64 << i);
+    }
+
+    /// Блоки строки: выбранные индексатором плюс тот, в котором сидит хвост.
+    fn row_blocks(sel: &Selection, i: usize) -> impl Iterator<Item = u32> + '_ {
+        let ratio = sel.ratio.max(1) as u32;
+        let (from, len) = sel.tails[i];
+        sel.blocks[i]
+            .iter()
+            .copied()
+            .chain((len > 0).then_some(from / ratio))
     }
 
     /// Сколько запросов подряд разделят один собранный KV. Запросы
     /// добавляются по одному, пока собранный KV и матрица скоров влезают в
     /// бюджет: чем длиннее контекст, тем шире объединение и тем короче выходит
-    /// тайл — на 6k это около пятисот запросов, на 35k несколько десятков.
-    fn take_tile(&mut self, rows: &[Vec<u32>], limit: &TileLimit) -> usize {
-        let stale = std::mem::take(&mut self.positions);
-        for p in stale {
-            self.clear(p);
+    /// тайл.
+    fn take_tile(&mut self, sel: &Selection, offset: usize, limit: &TileLimit) -> usize {
+        let stale = std::mem::take(&mut self.blocks);
+        for b in stale {
+            self.clear(b);
         }
+        let rows = sel.len() - offset;
         let mut size = 0usize;
         let mut widest = 0usize;
         let mut len = 0usize;
         let mut added: Vec<u32> = Vec::new();
-        while len < rows.len() && len < limit.max_len {
-            let row = &rows[len];
+        while len < rows && len < limit.max_len {
+            let i = offset + len;
             added.clear();
-            for p in row {
-                if self.set(*p) {
-                    added.push(*p);
+            let mut row_size = 0usize;
+            for b in Self::row_blocks(sel, i) {
+                row_size += 1;
+                if self.set(b) {
+                    added.push(b);
                 }
             }
             let size_next = size + added.len();
-            let widest_next = widest.max(row.len());
-            // Объединение шире учетверённого набора значит, что запросы тайла
-            // смотрят в разные места: маска отбросит больше, чем оставит, а
-            // внимание посчитает почти весь контекст — тайл тогда не нужен.
+            let widest_next = widest.max(row_size);
             let fits = size_next * limit.kv_row <= limit.kv_budget
-                && (len + 1) * size_next * limit.score_row <= limit.score_budget
-                && size_next <= limit.spread * widest_next.max(1);
+                && (len + 1) * size_next * limit.score_row <= limit.score_budget;
             if len > 0 && !fits {
-                for p in added.drain(..) {
-                    self.clear(p);
+                for b in added.drain(..) {
+                    self.clear(b);
                 }
                 break;
             }
@@ -429,37 +529,75 @@ impl Union {
             widest = widest_next;
             len += 1;
         }
+        self.widest = widest;
         for (w, word) in self.bits.iter().enumerate() {
             let mut bits = *word;
             while bits != 0 {
-                let b = bits.trailing_zeros() as usize;
+                let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let p = (w * 64 + b) as u32;
-                self.rank[p as usize] = self.positions.len() as u32;
-                self.positions.push(p);
+                let b = (w * 64 + i) as u32;
+                self.rank[b as usize] = self.blocks.len() as u32;
+                self.blocks.push(b);
             }
         }
         len.max(1)
     }
 
-    fn positions(&self) -> &[u32] {
-        &self.positions
+    fn blocks(&self) -> &[u32] {
+        &self.blocks
     }
 
-    /// Аддитивная маска `[len, |union|]`: запрос видит только свои позиции.
-    fn mask(&self, rows: &[Vec<u32>]) -> Vec<f32> {
-        let u = self.positions.len();
-        let mut mask = vec![MASK_NEG; rows.len() * u];
-        for (i, row) in rows.iter().enumerate() {
-            let base = i * u;
-            for p in row {
-                let j = self.rank[*p as usize];
-                if j != u32::MAX {
-                    mask[base + j as usize] = 0.0;
+    /// Стоит ли считать тайл общим объединением. Слева — что придётся прочитать
+    /// на запрос при общем KV (собранные блоки, поделённые на длину тайла, плюс
+    /// матрица скоров, которая пишется, читается и нормируется), справа —
+    /// сколько стоит собрать каждому запросу свой KV.
+    fn worth_tiling(&self, len: usize, limit: &TileLimit) -> bool {
+        if len <= 1 {
+            return false;
+        }
+        let u = self.blocks.len();
+        let tiled = u * limit.kv_row / len + u * limit.score_row * 3;
+        let per_query = self.widest * limit.kv_row;
+        tiled < per_query
+    }
+
+    /// Аддитивная маска `[len, |union| · ratio]`: запрос видит только свои
+    /// блоки, а в блоке с хвостом — только те позиции, что уже есть.
+    fn mask(&self, sel: &Selection, offset: usize, len: usize) -> Vec<f32> {
+        let ratio = sel.ratio.max(1);
+        let width = self.blocks.len() * ratio;
+        let mut mask = vec![MASK_NEG; len * width];
+        for i in 0..len {
+            let row = offset + i;
+            let base = i * width;
+            for b in &sel.blocks[row] {
+                let j = self.rank[*b as usize];
+                if j == u32::MAX {
+                    continue;
                 }
+                let from = base + j as usize * ratio;
+                mask[from..from + ratio].iter_mut().for_each(|c| *c = 0.0);
             }
+            let (from, count) = sel.tails[row];
+            if count == 0 {
+                continue;
+            }
+            let j = self.rank[(from / ratio as u32) as usize];
+            if j == u32::MAX {
+                continue;
+            }
+            let start = base + j as usize * ratio;
+            mask[start..start + count as usize].iter_mut().for_each(|c| *c = 0.0);
         }
         mask
+    }
+}
+
+fn take_rows(src: &Tensor, ids: &Tensor) -> Result<Tensor, ModelError> {
+    match src.embed_gather(ids) {
+        Ok(t) => Ok(t),
+        Err(SynaptixError::Unsupported(_)) => coerr(src.index_select(0, ids)),
+        Err(e) => Err(ModelError::Forward(e.to_string())),
     }
 }
 
@@ -479,64 +617,85 @@ fn repeat_kv(x: &Tensor, group: usize) -> Result<Tensor, ModelError> {
 mod tests {
     use super::*;
 
-    fn limit(max_len: usize, score_row: usize) -> TileLimit {
+    fn sel(rows: Vec<(Vec<u32>, (u32, u32))>) -> Selection {
+        let (blocks, tails) = rows.into_iter().unzip();
+        Selection { ratio: 4, blocks, tails }
+    }
+
+    fn limit(max_len: usize, score_budget: usize) -> TileLimit {
         TileLimit {
             kv_row: 1,
-            score_row,
+            score_row: 1,
             max_len,
             kv_budget: SPARSE_KV_BUDGET,
-            score_budget: SPARSE_SCORE_BUDGET,
-            spread: 64,
+            score_budget,
         }
     }
 
     #[test]
-    fn tile_covers_every_selected_position() {
-        let rows = vec![
-            vec![0u32, 4, 8],
-            vec![4u32, 12],
-            vec![100u32],
-        ];
-        let mut union = Union::new(128);
-        let len = union.take_tile(&rows, &limit(8, 1));
+    fn tile_covers_every_selected_block() {
+        let selection = sel(vec![
+            (vec![0, 2], (12, 2)),
+            (vec![2, 5], (24, 0)),
+            (vec![9], (40, 1)),
+        ]);
+        let mut union = Union::new(64);
+        let len = union.take_tile(&selection, 0, &limit(8, 1 << 20));
         assert_eq!(len, 3);
-        assert_eq!(union.positions(), &[0, 4, 8, 12, 100]);
+        assert_eq!(union.blocks(), &[0, 2, 3, 5, 9, 10]);
 
-        let mask = union.mask(&rows);
-        let u = union.positions().len();
-        for (i, row) in rows.iter().enumerate() {
-            for (j, p) in union.positions().iter().enumerate() {
-                let open = mask[i * u + j] == 0.0;
-                assert_eq!(open, row.contains(p), "строка {i}, позиция {p}");
+        let mask = union.mask(&selection, 0, len);
+        let width = union.blocks().len() * 4;
+        for i in 0..len {
+            let allowed: Vec<u32> = selection.positions(i);
+            for (j, b) in union.blocks().iter().enumerate() {
+                for t in 0..4u32 {
+                    let open = mask[i * width + j * 4 + t as usize] == 0.0;
+                    assert_eq!(open, allowed.contains(&(b * 4 + t)), "строка {i}, блок {b}");
+                }
             }
         }
     }
 
     #[test]
     fn tile_stops_on_budget_and_resumes() {
-        let rows: Vec<Vec<u32>> = (0..8).map(|i| vec![i as u32 * 10, i as u32 * 10 + 1]).collect();
-        let mut union = Union::new(128);
-        // Бюджет скоров пускает только пару запросов: 2 * 4 позиции * 1 = 8.
-        let lim = TileLimit {
-            kv_row: 1,
-            score_row: 1,
-            max_len: 8,
-            kv_budget: SPARSE_KV_BUDGET,
-            score_budget: 8,
-            spread: 64,
-        };
-        let first = union.take_tile(&rows, &lim);
-        assert!(first >= 1 && first < rows.len(), "тайл {first} не ограничен бюджетом");
-        let rest = union.take_tile(&rows[first..], &lim);
+        let rows: Vec<(Vec<u32>, (u32, u32))> =
+            (0..8).map(|i| (vec![i as u32 * 3, i as u32 * 3 + 1], (100, 0))).collect();
+        let selection = sel(rows);
+        let mut union = Union::new(64);
+        // Бюджет скоров пускает лишь пару запросов.
+        let first = union.take_tile(&selection, 0, &limit(8, 8));
+        assert!(first >= 1 && first < selection.len(), "тайл {first} не ограничен бюджетом");
+        let rest = union.take_tile(&selection, first, &limit(8, 8));
         assert!(rest >= 1);
-        assert!(union.positions().iter().all(|p| *p >= rows[first][0]));
     }
 
     #[test]
-    fn single_query_tile_keeps_its_own_positions() {
-        let rows = vec![vec![3u32, 9, 27]];
+    fn single_query_tile_is_not_worth_tiling() {
+        let selection = sel(vec![(vec![1, 3], (16, 2))]);
         let mut union = Union::new(64);
-        assert_eq!(union.take_tile(&rows, &limit(512, 4)), 1);
-        assert_eq!(union.positions(), &[3, 9, 27]);
+        let lim = limit(512, 1 << 20);
+        assert_eq!(union.take_tile(&selection, 0, &lim), 1);
+        assert!(!union.worth_tiling(1, &lim), "тайл из одного запроса не нужен");
+    }
+
+    #[test]
+    fn wide_union_is_not_worth_tiling() {
+        // Наборы не пересекаются: объединение растёт как сумма, и общий KV
+        // читается почти целиком каждым запросом.
+        let rows: Vec<(Vec<u32>, (u32, u32))> =
+            (0..8).map(|i| (vec![i as u32 * 2, i as u32 * 2 + 1], (200, 0))).collect();
+        let selection = sel(rows);
+        let mut union = Union::new(64);
+        let lim = TileLimit {
+            kv_row: 1024,
+            score_row: 64,
+            max_len: 512,
+            kv_budget: SPARSE_KV_BUDGET,
+            score_budget: SPARSE_SCORE_BUDGET,
+        };
+        let len = union.take_tile(&selection, 0, &lim);
+        assert_eq!(len, 8);
+        assert!(!union.worth_tiling(len, &lim));
     }
 }
