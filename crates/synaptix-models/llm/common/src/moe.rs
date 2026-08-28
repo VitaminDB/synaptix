@@ -126,6 +126,9 @@ impl Expert {
 pub struct ExpertCache {
     device: Device,
     capacity_bytes: AtomicUsize,
+    /// Лимит временного набора префилла.
+    scratch_bytes: usize,
+    scratch_mode: std::sync::atomic::AtomicBool,
     inner: Mutex<CacheInner>,
     /// Pinned-зеркало host-весов (`SYN_MOE_PINNED=1`, по умолчанию выключено).
     /// Первая отправка эксперта копирует его в закреплённую память — на слое
@@ -140,6 +143,12 @@ struct CacheInner {
     map: HashMap<(usize, usize), Arc<Expert>>,
     order: VecDeque<(usize, usize)>,
     bytes: usize,
+    /// Эксперты, поднятые под префилл: он обходит почти всю стопку, и класть
+    /// их в основной кэш значит вытеснить всё, что прогрел предыдущий диалог.
+    /// Живут до конца префилла, лимит свой.
+    scratch: HashMap<(usize, usize), Arc<Expert>>,
+    scratch_order: VecDeque<(usize, usize)>,
+    scratch_bytes: usize,
     hits: u64,
     misses: u64,
     skipped: u64,
@@ -174,11 +183,16 @@ impl ExpertCache {
         Arc::new(Self {
             device,
             capacity_bytes: AtomicUsize::new(capacity_bytes),
+            scratch_bytes: (capacity_bytes / 4).clamp(1 << 30, 4 << 30),
+            scratch_mode: std::sync::atomic::AtomicBool::new(false),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
                 order: VecDeque::new(),
                 bytes: 0,
+                scratch: HashMap::new(),
+                scratch_order: VecDeque::new(),
+                scratch_bytes: 0,
                 hits: 0,
                 misses: 0,
                 skipped: 0,
@@ -228,8 +242,8 @@ impl ExpertCache {
             fetch_millis: inner.fetch_nanos / 1_000_000,
             batched: inner.batched,
             unbatched: inner.unbatched,
-            resident: inner.map.len(),
-            bytes: inner.bytes,
+            resident: inner.map.len() + inner.scratch.len(),
+            bytes: inner.bytes + inner.scratch_bytes,
         }
     }
 
@@ -238,6 +252,9 @@ impl ExpertCache {
         inner.map.clear();
         inner.order.clear();
         inner.bytes = 0;
+        inner.scratch.clear();
+        inner.scratch_order.clear();
+        inner.scratch_bytes = 0;
     }
 
     fn note_batch(&self, ok: bool) {
@@ -270,9 +287,13 @@ impl ExpertCache {
 
     fn get(&self, key: (usize, usize)) -> Option<Arc<Expert>> {
         let mut inner = self.inner.lock().ok()?;
-        match inner.map.get(&key) {
+        let found = inner
+            .map
+            .get(&key)
+            .or_else(|| inner.scratch.get(&key))
+            .cloned();
+        match found {
             Some(e) => {
-                let e = e.clone();
                 inner.hits += 1;
                 Some(e)
             }
@@ -283,17 +304,43 @@ impl ExpertCache {
         }
     }
 
+    /// Освободить экспертов, поднятых под префилл. Прогретые остаются.
+    pub fn clear_scratch(&self) {
+        let Ok(mut inner) = self.inner.lock() else { return };
+        inner.scratch.clear();
+        inner.scratch_order.clear();
+        inner.scratch_bytes = 0;
+    }
+
+    /// Куда класть поднятых экспертов: `true` — во временный набор префилла.
+    pub fn set_scratch_mode(&self, on: bool) {
+        self.scratch_mode.store(on, Ordering::Relaxed);
+    }
+
     fn contains(&self, key: (usize, usize)) -> bool {
         self.inner
             .lock()
-            .map(|inner| inner.map.contains_key(&key))
+            .map(|inner| inner.map.contains_key(&key) || inner.scratch.contains_key(&key))
             .unwrap_or(false)
     }
 
     fn insert(&self, key: (usize, usize), expert: Arc<Expert>) {
         let bytes = expert.bytes();
+        let scratch = self.scratch_mode.load(Ordering::Relaxed);
         let Ok(mut inner) = self.inner.lock() else { return };
-        if inner.map.contains_key(&key) {
+        if inner.map.contains_key(&key) || inner.scratch.contains_key(&key) {
+            return;
+        }
+        if scratch {
+            while inner.scratch_bytes + bytes > self.scratch_bytes {
+                let Some(victim) = inner.scratch_order.pop_front() else { break };
+                if let Some(old) = inner.scratch.remove(&victim) {
+                    inner.scratch_bytes = inner.scratch_bytes.saturating_sub(old.bytes());
+                }
+            }
+            inner.scratch_bytes += bytes;
+            inner.scratch_order.push_back(key);
+            inner.scratch.insert(key, expert);
             return;
         }
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);

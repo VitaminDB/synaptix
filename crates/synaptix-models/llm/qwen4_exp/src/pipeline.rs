@@ -23,11 +23,6 @@ use crate::model::{ModelCache, Qwen4ExpModel};
 /// на объём экспертов. Меняется `SYN_QWEN4EXP_PREFILL_CHUNK`.
 pub const DEFAULT_PREFILL_CHUNK: usize = 4096;
 
-/// Ёмкость кэша экспертов на время префилла. Чанк задевает почти всех
-/// экспертов слоя — кэш всё равно вытеснится целиком, а память нужна
-/// активациям; на декоде ёмкость возвращается.
-const PREFILL_CACHE_BYTES: usize = 3 << 30;
-
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
     pub config: Qwen4ExpConfig,
@@ -235,9 +230,11 @@ impl Qwen4ExpPipeline {
             cfg.eos_token_ids.clone()
         };
 
-        let cache_capacity = self.model.expert_cache().map(|c| c.capacity_bytes());
-        if let (Some(cache), Some(full)) = (self.model.expert_cache(), cache_capacity) {
-            cache.set_capacity(PREFILL_CACHE_BYTES.min(full));
+        // Префилл обходит почти всю стопку экспертов: пусть поднятое им живёт
+        // отдельно и уходит по окончании, а прогретое прошлым ходом остаётся —
+        // декоду оно и пригодится.
+        if let Some(cache) = self.model.expert_cache() {
+            cache.set_scratch_mode(true);
         }
         let prefill_start = Instant::now();
         let mut logits = no_grad(|| -> Result<_, ModelError> {
@@ -252,8 +249,9 @@ impl Qwen4ExpPipeline {
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
         })?;
         let prefill_ms = prefill_start.elapsed().as_millis();
-        if let (Some(cache), Some(full)) = (self.model.expert_cache(), cache_capacity) {
-            cache.set_capacity(full);
+        if let Some(cache) = self.model.expert_cache() {
+            cache.set_scratch_mode(false);
+            cache.clear_scratch();
         }
 
         let decode_start = Instant::now();
