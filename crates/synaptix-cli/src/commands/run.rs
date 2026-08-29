@@ -298,12 +298,62 @@ fn run_qwen4_exp(
     use synaptix_llm_qwen4_exp::Qwen4ExpPipeline;
 
     let t0 = std::time::Instant::now();
-    let pipeline =
+    let mut pipeline =
         Qwen4ExpPipeline::load_with_precision(&args.model, device, precision, args.max_seq)
             .map_err(|e| format!("load: {e}"))?;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
-    let prompt_ids = pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?;
+    // Картинка занимает в промпте столько заполнителей, сколько строк отдала
+    // башня; собираем промпт из id напрямую — decode выбрасывает спецтокены.
+    let image = match &args.image {
+        Some(path) => {
+            if !pipeline
+                .load_vision(&args.model, precision.compute)
+                .map_err(|e| format!("vision load: {e}"))?
+            {
+                return Err("в бандле нет компонента vision".into());
+            }
+            let limits = synaptix_vlm_qwen3::PreprocessLimits::default();
+            let n = pipeline.image_token_count(path, limits).map_err(|e| format!("image: {e}"))?;
+            let (feats, grid) = pipeline.encode_image(path, limits).map_err(|e| format!("image: {e}"))?;
+            eprintln!(
+                "synaptix run: image {} → {n} vision-токенов, сетка {}×{}",
+                path.display(),
+                grid.0,
+                grid.1
+            );
+            Some((n, feats))
+        }
+        None => None,
+    };
+    let pipeline = pipeline;
+
+    let prompt_ids = match &image {
+        None => pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?,
+        Some((n, _)) => {
+            let pad = pipeline
+                .config
+                .image_token_id
+                .ok_or("в конфиге нет id заполнителя картинки")?;
+            let mut ids = pipeline
+                .encode("<|im_start|>user\n")
+                .map_err(|e| format!("tokenize: {e}"))?;
+            if let Some(t) = pipeline.config.vision_start_token_id {
+                ids.push(t);
+            }
+            ids.extend(std::iter::repeat_n(pad, *n));
+            if let Some(t) = pipeline.config.vision_end_token_id {
+                ids.push(t);
+            }
+            ids.extend(pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?);
+            ids.extend(
+                pipeline
+                    .encode("<|im_end|>\n<|im_start|>assistant\n")
+                    .map_err(|e| format!("tokenize: {e}"))?,
+            );
+            ids
+        }
+    };
     eprintln!("synaptix run: prompt {} tokens", prompt_ids.len());
 
     let gen_cfg = GenerationConfig {
@@ -313,9 +363,16 @@ fn run_qwen4_exp(
         max_seq: args.max_seq,
         ..Default::default()
     };
-    let (new_ids, stats) = pipeline
-        .generate(&prompt_ids, gen_cfg)
-        .map_err(|e| format!("generate: {e}"))?;
+    let (new_ids, stats) = match &image {
+        None => pipeline.generate(&prompt_ids, gen_cfg).map_err(|e| format!("generate: {e}"))?,
+        Some((_, feats)) => {
+            let pad = pipeline.config.image_token_id.expect("id заполнителя");
+            let media = [(pad, feats.clone())];
+            pipeline
+                .generate_media_streaming(&prompt_ids, &media, gen_cfg, &mut |_: u32| true)
+                .map_err(|e| format!("generate: {e}"))?
+        }
+    };
     let text = pipeline.decode(&new_ids).map_err(|e| format!("decode: {e}"))?;
     print_run_result(
         &args.prompt, &text, stats.prompt_tokens, stats.new_tokens, stats.prefill_ms, stats.decode_ms,
