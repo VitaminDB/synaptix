@@ -88,9 +88,13 @@ __device__ __forceinline__ void fb_load_vec(float* dst, const __nv_bfloat16* p, 
   for (int i = 0; i < vec; ++i) dst[i] = __bfloat162float(p[i]);
 }
 
+// Сумма по варпу, разложенная обменом «бабочкой»: результат оказывается сразу
+// во всех лейнах, и рассылать его отдельной инструкцией не нужно. На каждую
+// пару «позиция × голова» это одна сэкономленная инструкция из шести, а их тут
+// больше, чем самих умножений.
 __device__ __forceinline__ float fb_warp_sum(float v) {
   #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off, 32);
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off, 32);
   return v;
 }
 
@@ -179,7 +183,6 @@ __device__ __forceinline__ void flash_blocks_impl(
       #pragma unroll
       for (int i = 0; i < vec; i++) part += q_reg[r][i] * kv_reg[i];
       float s = fb_warp_sum(part) * scale;
-      s = __shfl_sync(0xFFFFFFFFu, s, 0, 32);
       if (!live) s = FB_NEG_INF;
 
       float m_new = fmaxf(run_m[r], s);
@@ -357,7 +360,6 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
       #pragma unroll
       for (int i = 0; i < vec; i++) part += q_reg[r][i] * kv_reg[i];
       float s = fb_warp_sum(part * ksc) * scale;
-      s = __shfl_sync(0xFFFFFFFFu, s, 0, 32);
       if (!live) s = FB_NEG_INF;
 
       float m_new = fmaxf(run_m[r], s);
