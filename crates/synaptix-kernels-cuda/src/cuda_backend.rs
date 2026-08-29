@@ -2036,6 +2036,81 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn flash_attention_blocks(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        table: (&Storage, &Layout),
+        tail_from: (&Storage, &Layout),
+        tail_len: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        ratio: usize,
+        scale: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (q_st, q_lo) = q;
+        let (k_st, k_lo) = k;
+        let (v_st, v_lo) = v;
+        let (tb_st, tb_lo) = table;
+        let (tf_st, _tf_lo) = tail_from;
+        let (tl_st, _tl_lo) = tail_len;
+        let (out_st, _out_lo) = out;
+        let dtype = q_lo.dtype();
+        if k_lo.dtype() != dtype || v_lo.dtype() != dtype {
+            return Err(SynaptixError::Unsupported("flash_blocks: dtype mismatch q/k/v"));
+        }
+        if q_lo.dims().len() != 3 || k_lo.dims().len() != 3 || v_lo.dims() != k_lo.dims() {
+            return Err(SynaptixError::Unsupported("flash_blocks: ждём q [B,NH,D], k/v [NKV,CAP,D]"));
+        }
+        if tb_lo.dims().len() != 2 {
+            return Err(SynaptixError::Unsupported("flash_blocks: таблица блоков не [B,NB]"));
+        }
+        if !q_lo.is_contiguous() || !k_lo.is_contiguous() || !v_lo.is_contiguous() || !tb_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        if q_lo.offset() != 0 || k_lo.offset() != 0 || v_lo.offset() != 0 || tb_lo.offset() != 0 {
+            return Err(SynaptixError::Unsupported("flash_blocks: ненулевое смещение"));
+        }
+        let (b, nh, d) = (q_lo.dims()[0], q_lo.dims()[1], q_lo.dims()[2]);
+        let (nkv, cap) = (k_lo.dims()[0], k_lo.dims()[1]);
+        if k_lo.dims()[2] != d || tb_lo.dims()[0] != b {
+            return Err(SynaptixError::Unsupported("flash_blocks: несогласованные формы"));
+        }
+        let nb = tb_lo.dims()[1];
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: q non-cuda"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: k non-cuda"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: v non-cuda"))?;
+        let tb_buf = tb_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: table non-cuda"))?;
+        let tf_buf = tf_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: tail_from non-cuda"))?;
+        let tl_buf = tl_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks: tail_len non-cuda"))?;
+        let ctx = q_buf.device().clone();
+        let ord = q_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let out_buf = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("flash_blocks: out non-cuda"))?;
+        let kernels = crate::attention::flash_blocks::FlashBlocksKernels::for_context(&ctx)?;
+        crate::attention::flash_blocks::flash_blocks_u8(
+            &kernels,
+            &stream,
+            q_buf.slice(),
+            k_buf.slice(),
+            v_buf.slice(),
+            tb_buf.slice(),
+            tf_buf.slice(),
+            tl_buf.slice(),
+            out_buf.slice_mut(),
+            b as u32,
+            nh as u32,
+            nkv as u32,
+            cap as u32,
+            d as u32,
+            nb as u32,
+            ratio as u32,
+            scale,
+            dtype,
+        )
+    }
+
     fn flash_attention_window(
         &self,
         q: (&Storage, &Layout),

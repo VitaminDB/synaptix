@@ -435,6 +435,27 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("flash_attention не поддержан этим backend"))
     }
 
+    /// Attention по таблице блоков KV: каждый запрос смотрит на свой набор
+    /// блоков по `ratio` подряд идущих позиций плюс хвост `tail`. Нужен
+    /// разреженному вниманию — иначе выбранные позиции пришлось бы собирать
+    /// гатером в отдельный буфер. Default Unsupported → caller fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_blocks(
+        &self,
+        _q: (&Storage, &Layout),
+        _k: (&Storage, &Layout),
+        _v: (&Storage, &Layout),
+        _table: (&Storage, &Layout),
+        _tail_from: (&Storage, &Layout),
+        _tail_len: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _ratio: usize,
+        _scale: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("flash_attention_blocks не поддержан этим backend"))
+    }
+
     /// Двунаправленный sliding-window flash (band ±window). Default Unsupported
     /// → caller fallback (наивная маска).
     #[allow(clippy::too_many_arguments)]

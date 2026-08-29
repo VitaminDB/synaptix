@@ -281,6 +281,36 @@ impl QsaAttention {
             let group = (SPARSE_KV_BUDGET / per_query.max(1)).clamp(1, rows.len());
             for slice in rows.chunks(group) {
                 let g = slice.len();
+                let rows_idx: Vec<u32> = slice.iter().map(|r| *r as u32).collect();
+                let rows_idx = coerr(Tensor::from_vec(rows_idx, vec![g], self.device))?;
+                let q_sel = take_rows(&q_flat, &rows_idx)?;
+
+                // Ядро читает KV прямо по таблице блоков — собранного буфера не
+                // нужно вовсе. На горстке запросов оно проигрывает: сетка из
+                // `g · nkv` блоков не загружает карту, и выгоднее собрать
+                // позиции гатером и отдать их обычному flash.
+                if nb > 0 && g >= BLOCK_KERNEL_MIN {
+                    let table: Vec<u32> =
+                        slice.iter().flat_map(|r| selected.blocks[*r].iter().copied()).collect();
+                    let from: Vec<u32> = slice.iter().map(|r| selected.tails[*r].0).collect();
+                    let len: Vec<u32> = slice.iter().map(|r| selected.tails[*r].1).collect();
+                    let table = coerr(Tensor::from_vec(table, vec![g, nb], self.device))?;
+                    let from = coerr(Tensor::from_vec(from, vec![g], self.device))?;
+                    let len = coerr(Tensor::from_vec(len, vec![g], self.device))?;
+                    let q3 = coerr(q_sel.reshape(vec![g, nh, hd]))?;
+                    let k3 = coerr(kv.k.reshape(vec![nkv, cap, hd]))?;
+                    let v3 = coerr(kv.v.reshape(vec![nkv, cap, hd]))?;
+                    match q3.flash_attention_blocks(&k3, &v3, &table, &from, &len, cr, self.scale) {
+                        Ok(out) => {
+                            order.extend_from_slice(slice);
+                            parts.push(out);
+                            continue;
+                        }
+                        Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
+                        Err(e) => return Err(ModelError::Forward(e.to_string())),
+                    }
+                }
+
                 let mut block_idx = Vec::with_capacity(g * nkv * nb);
                 let mut tail_idx = Vec::with_capacity(g * nkv * tail);
                 for row in slice {
@@ -295,8 +325,6 @@ impl QsaAttention {
                 let block_idx = coerr(Tensor::from_vec(block_idx, vec![g * nkv * nb], self.device))?;
                 let tail_idx = coerr(Tensor::from_vec(tail_idx, vec![g * nkv * tail], self.device))?;
                 let gather = |src: &Tensor| -> Result<Tensor, ModelError> {
-                    // Блоки лежат в KV сплошняком, поэтому собираются строками
-                    // по `cr` позиций разом — вчетверо меньше обращений.
                     let blocks = coerr(src.reshape(vec![nkv * block_rows, cr * hd]))?;
                     let picked = take_rows(&blocks, &block_idx)?;
                     let picked = coerr(picked.reshape(vec![g, nkv, nb * cr, hd]))?;
@@ -310,10 +338,6 @@ impl QsaAttention {
                 };
                 let k_sel = gather(&kv.k)?;
                 let v_sel = gather(&kv.v)?;
-
-                let rows_idx: Vec<u32> = slice.iter().map(|r| *r as u32).collect();
-                let rows_idx = coerr(Tensor::from_vec(rows_idx, vec![g], self.device))?;
-                let q_sel = take_rows(&q_flat, &rows_idx)?;
                 let q_sel = coerr(q_sel.reshape(vec![g, nh, 1, hd]))?;
 
                 let out = match q_sel.flash_attention(&k_sel, &v_sel, self.scale, false) {
@@ -428,6 +452,9 @@ const SPARSE_SCORE_BUDGET: usize = 192 << 20;
 
 /// Сколько запросов уходит в поштучный путь за раз, когда тайлы не набираются.
 const PER_QUERY_SPAN: usize = 512;
+
+/// От скольких запросов в группе включается ядро по таблице блоков.
+const BLOCK_KERNEL_MIN: usize = 8;
 
 /// Верхний предел длины тайла.
 fn qsa_tile() -> usize {
@@ -550,14 +577,15 @@ impl Union {
     /// Стоит ли считать тайл общим объединением. Слева — что придётся прочитать
     /// на запрос при общем KV (собранные блоки, поделённые на длину тайла, плюс
     /// матрица скоров, которая пишется, читается и нормируется), справа —
-    /// сколько стоит собрать каждому запросу свой KV.
+    /// сколько стоит поштучный путь. Он вдвое дешевле своего трафика: там KV
+    /// не собирается вовсе, ядро читает его прямо по таблице блоков.
     fn worth_tiling(&self, len: usize, limit: &TileLimit) -> bool {
         if len <= 1 {
             return false;
         }
         let u = self.blocks.len();
         let tiled = u * limit.kv_row / len + u * limit.score_row * 3;
-        let per_query = self.widest * limit.kv_row;
+        let per_query = self.widest * limit.kv_row / 2;
         tiled < per_query
     }
 

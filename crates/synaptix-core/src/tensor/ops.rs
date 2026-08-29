@@ -2501,6 +2501,48 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    /// Attention по таблице блоков KV: `self` — запросы `[B, NH, D]`, `k`/`v` —
+    /// общий буфер слоя `[NKV, CAP, D]`, `table` — индексы блоков `[B, NB]`,
+    /// `tail_from`/`tail_len` — хвост каждого запроса `[B]`. Позиция блока `b`
+    /// это `b · ratio`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_blocks(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        table: &Tensor,
+        tail_from: &Tensor,
+        tail_len: &Tensor,
+        ratio: usize,
+        scale: f32,
+    ) -> Result<Self> {
+        if self.rank() != 3 {
+            return Err(SynaptixError::Unsupported("flash_blocks: q rank != 3"));
+        }
+        let q = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let k_c = if k.is_contiguous() { k.clone() } else { k.contiguous()? };
+        let v_c = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+        let tb = if table.is_contiguous() { table.clone() } else { table.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(q.dims().to_vec()), self.dtype());
+        let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
+        let backend = registry::backend_for(self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.flash_attention_blocks(
+            (&q.storage, &q.layout),
+            (&k_c.storage, &k_c.layout),
+            (&v_c.storage, &v_c.layout),
+            (&tb.storage, &tb.layout),
+            (&tail_from.storage, &tail_from.layout),
+            (&tail_len.storage, &tail_len.layout),
+            (&mut storage, &out_layout),
+            ratio,
+            scale,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     pub fn flash_attention(
         &self,
         k: &Tensor,
