@@ -441,6 +441,14 @@ impl FetchJob {
     }
 }
 
+fn to_host_f32(t: &Tensor) -> Result<Vec<f32>, ModelError> {
+    t.to_device(Device::Cpu)
+        .and_then(|x| x.to_dtype(DType::F32))
+        .and_then(|x| x.flatten_all())
+        .and_then(|x| x.to_vec1::<f32>())
+        .map_err(|e| ModelError::Forward(format!("роутер MoE: выгрузка: {e}")))
+}
+
 /// Сбор строк по индексам. `index_select` на карте копирует строку за строкой
 /// и на перестановке шестидесяти тысяч строк стоит дороже, чем все умножения
 /// экспертов вместе взятые; embed-ядро читает индексы прямо с карты.
@@ -756,16 +764,41 @@ impl MoeFfn {
             .to_dtype(DType::F32)
             .and_then(|xf| xf.linear(&self.router))
             .map_err(|err| ModelError::Forward(format!("роутер MoE: {err}")))?;
-        let logits = logits
-            .to_device(Device::Cpu)
-            .and_then(|l| l.flatten_all())
-            .and_then(|l| l.to_vec1::<f32>())
-            .map_err(|err| ModelError::Forward(format!("роутер MoE: выгрузка: {err}")))?;
+
+        // Выбор top-k считает карта: на хост тогда уезжают k пар «эксперт,
+        // логит» вместо всей строки из сотен логитов. Нормировка без
+        // `norm_topk_prob` требует суммы по всем экспертам, поэтому там
+        // остаётся прежний путь.
+        if self.cfg.norm_topk_prob {
+            if let Ok((vals, idx)) = logits.topk_rows(k) {
+                let host_vals = to_host_f32(&vals)?;
+                let host_idx = idx
+                    .to_device(Device::Cpu)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<u32>())
+                    .map_err(|err| ModelError::Forward(format!("роутер MoE: индексы: {err}")))?;
+                let mut experts = vec![0u32; t * k];
+                let mut weights = vec![0f32; t * k];
+                for i in 0..t {
+                    let row = &host_vals[i * k..(i + 1) * k];
+                    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
+                    let denom: f32 = exps.iter().sum();
+                    for s in 0..k {
+                        experts[i * k + s] = host_idx[i * k + s];
+                        weights[i * k + s] = exps[s] / denom;
+                    }
+                }
+                return Ok((experts, weights));
+            }
+        }
+
+        let logits = to_host_f32(&logits)?;
 
         let mut experts = vec![0u32; t * k];
         let mut weights = vec![0f32; t * k];
         // Выбор top-k по строкам независим, а строк на префилле тысячи:
-        // последовательный проход по 512 логитам на токен стоил четверть
+        // последовательный проход по сотням логитов на токен стоил четверть
         // времени всей MoE.
         let norm_topk = self.cfg.norm_topk_prob;
         experts

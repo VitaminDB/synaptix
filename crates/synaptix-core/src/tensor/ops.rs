@@ -2501,6 +2501,36 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    /// Top-k по строкам `[rows, cols]`: возвращает `(значения, индексы)` формы
+    /// `[rows, k]`, отсортированные по убыванию.
+    pub fn topk_rows(&self, k: usize) -> Result<(Self, Self)> {
+        if self.rank() != 2 {
+            return Err(SynaptixError::Unsupported("topk_rows: ждём [rows, cols]"));
+        }
+        let (rows, cols) = (self.dims()[0], self.dims()[1]);
+        if k == 0 || k > cols {
+            return Err(SynaptixError::Unsupported("topk_rows: k вне ширины строки"));
+        }
+        let src = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let idx_layout = Layout::contiguous(Shape::new(vec![rows, k]), DType::U32);
+        let val_layout = Layout::contiguous(Shape::new(vec![rows, k]), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut idx = backend.alloc_uninit(DType::U32.bytes_for_numel(rows * k), self.device())?;
+        let mut val = backend.alloc_uninit(self.dtype().bytes_for_numel(rows * k), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.topk_rows(
+            (&src.storage, &src.layout),
+            (&mut idx, &idx_layout),
+            (&mut val, &val_layout),
+            k,
+            &stream,
+        )?;
+        Ok((
+            Tensor::from_parts(Arc::new(val), val_layout),
+            Tensor::from_parts(Arc::new(idx), idx_layout),
+        ))
+    }
+
     /// Attention по таблице блоков KV: `self` — запросы `[B, NH, D]`, `k`/`v` —
     /// общий буфер слоя `[NKV, CAP, D]`, `table` — индексы блоков `[B, NB]`,
     /// `tail_from`/`tail_len` — хвост каждого запроса `[B]`. Позиция блока `b`

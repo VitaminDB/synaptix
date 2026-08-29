@@ -2036,6 +2036,49 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn topk_rows(
+        &self,
+        scores: (&Storage, &Layout),
+        indices: (&mut Storage, &Layout),
+        values: (&mut Storage, &Layout),
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (src_st, src_lo) = scores;
+        let (idx_st, _idx_lo) = indices;
+        let (val_st, _val_lo) = values;
+        if src_lo.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported("topk_rows: только F32"));
+        }
+        if src_lo.dims().len() != 2 || !src_lo.is_contiguous() || src_lo.offset() != 0 {
+            return Err(SynaptixError::Unsupported("topk_rows: ждём contiguous [rows, cols]"));
+        }
+        let (rows, cols) = (src_lo.dims()[0], src_lo.dims()[1]);
+        if cols > crate::kernels::topk_rows::MAX_COLS {
+            return Err(SynaptixError::Unsupported("topk_rows: строка шире потолка"));
+        }
+        let src_buf = src_st.as_cuda().ok_or(SynaptixError::Unsupported("topk_rows: non-cuda"))?;
+        let ctx = src_buf.device().clone();
+        let ord = src_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::kernels::topk_rows::TopkRowsKernels::for_context(&ctx)?;
+        // Срез клонировать нельзя — cudarc копирует данные, и ядро писало бы
+        // в копию, оставив выход неинициализированным.
+        let idx_buf = idx_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("topk_rows: idx non-cuda"))?;
+        let idx_slice = idx_buf.slice_mut();
+        let val_buf = val_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("topk_rows: val non-cuda"))?;
+        crate::kernels::topk_rows::topk_rows_f32(
+            &kernels,
+            &stream,
+            src_buf.slice(),
+            idx_slice,
+            val_buf.slice_mut(),
+            rows as u32,
+            cols as u32,
+            k as u32,
+        )
+    }
+
     fn flash_attention_blocks(
         &self,
         q: (&Storage, &Layout),

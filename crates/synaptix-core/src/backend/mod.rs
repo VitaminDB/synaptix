@@ -435,6 +435,20 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("flash_attention не поддержан этим backend"))
     }
 
+    /// Top-k по строкам матрицы: `values`/`indices` формы `[rows, k]`. Нужен
+    /// роутеру MoE — иначе на хост уезжает вся матрица логитов. Default
+    /// Unsupported → caller считает на процессоре.
+    fn topk_rows(
+        &self,
+        _scores: (&Storage, &Layout),
+        _indices: (&mut Storage, &Layout),
+        _values: (&mut Storage, &Layout),
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("topk_rows не поддержан этим backend"))
+    }
+
     /// Attention по таблице блоков KV: каждый запрос смотрит на свой набор
     /// блоков по `ratio` подряд идущих позиций плюс хвост `tail`. Нужен
     /// разреженному вниманию — иначе выбранные позиции пришлось бы собирать
