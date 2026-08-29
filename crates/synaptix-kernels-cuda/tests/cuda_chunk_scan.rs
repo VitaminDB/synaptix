@@ -38,17 +38,22 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn chunked_vs_per_step_multichunk() {
+    check(2, 16, 16, 8, 3);
+}
+
+/// Форма настоящей модели: на ней главный цикл идёт слитым ядром — блок
+/// на голову и полосу каналов, состояние в shared.
+#[test]
+fn chunked_vs_per_step_model_shape() {
+    check(2, 128, 128, 64, 3);
+}
+
+fn check(bh: usize, hk: usize, hv: usize, cs: usize, nc: usize) {
     let Some((ctx, stream)) = setup() else { return };
     let cfk = ChunkFlaKernels::for_context(&ctx).expect("chunk_fla");
     let csk = ChunkScanKernels::for_context(&ctx).expect("chunk_scan");
     let gdr = GatedDeltaRuleKernels::for_context(&ctx).expect("gated_delta_rule");
-
-    let bh = 2usize;
-    let hk = 16usize;
-    let hv = 16usize;
-    let cs = 8usize;
-    let nc = 3usize;
-    let t = nc * cs; // 24 — nc>1
+    let t = nc * cs;
     let q_scale = (hk as f32).powf(-0.5);
 
     // Полные входы (BH, T, *) и (BH, T).

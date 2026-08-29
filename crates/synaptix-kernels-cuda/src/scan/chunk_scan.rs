@@ -473,7 +473,27 @@ pub fn chunk_gated_delta_rule(
         hk,
     )?;
 
-    // ── Главный цикл по чанкам (state-зависимость).
+    // ── Главный цикл по чанкам (state-зависимость). На ходовых формах он
+    // идёт одним ядром: шесть запусков на чанк с сеткой в BH блоков карту не
+    // загружали, а состояние между ними уезжало в глобальную память.
+    if ChunkFlaKernels::chunk_scan_fits(cs, hk, hv) {
+        cfk.gdn_chunk_scan(
+            stream,
+            &*q_scaled,
+            &*k_cumdecay,
+            &*k_cumdecay_input,
+            &*value_proc,
+            &*attn,
+            &*g_cumsum,
+            state,
+            out,
+            bh,
+            nc,
+            hv,
+        )?;
+        return Ok(());
+    }
+
     for ci in 0..nc {
         let off_hk = ci * cs * hk;
         let off_hv = ci * cs * hv;

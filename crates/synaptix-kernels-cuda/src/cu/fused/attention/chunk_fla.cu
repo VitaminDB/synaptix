@@ -329,3 +329,172 @@ __global__ void state_decay_from_gcumsum_chunk_f32(
 }
 
 } // extern "C"
+
+// Весь главный цикл чанк-скана одним ядром.
+//
+// Шесть отдельных запусков на чанк (два умножения на состояние, внутричанковое
+// внимание, затухание состояния и его пополнение) шли цепочкой с сеткой в BH
+// блоков, а состояние между ними уезжало в глобальную память. Здесь блок берёт
+// одну голову и полосу выходных каналов, держит состояние в shared и проходит
+// по всем чанкам сам: полосы независимы, потому что и выход, и пополнение
+// состояния касаются только своих каналов.
+//
+//   q_scaled/k_cumdecay/k_decayed (BH, NC, CS, HK)
+//   value_proc                    (BH, NC, CS, HV)
+//   attn (внутричанковое, с маской) (BH, NC, CS, CS)
+//   g_cumsum                      (BH, NC, CS)
+//   state                         (BH, HK, HV)   in/out
+//   out                           (BH, NC·CS, HV)
+//
+// Формы жёсткие: CS=64, HK=128, полоса HV=64. Каждый поток считает не один
+// выход, а тайл 4×4 (у пополнения состояния 8×4): иначе на каждое умножение
+// приходится своё чтение, и ядро выходит вдвое медленнее цепочки из bmm.
+
+#define GCS_CS 64
+#define GCS_HK 128
+#define GCS_TILE 64
+#define GCS_BLOCK 256
+
+extern "C" __global__ __launch_bounds__(GCS_BLOCK) void gdn_chunk_scan_f32(
+    const float* __restrict__ q_scaled,
+    const float* __restrict__ k_cumdecay,
+    const float* __restrict__ k_decayed,
+    const float* __restrict__ value_proc,
+    const float* __restrict__ attn,
+    const float* __restrict__ g_cumsum,
+    float* __restrict__ state,
+    float* __restrict__ out,
+    unsigned int nc,
+    unsigned int hv
+) {
+    __shared__ float st[GCS_HK][GCS_TILE];
+    __shared__ float vp[GCS_CS][GCS_TILE];
+
+    const unsigned int b = blockIdx.x;
+    const unsigned int j0 = blockIdx.y * GCS_TILE;
+    // Сетка потоков 16×16: строки по четыре, столбцы по четыре.
+    const unsigned int rj = (threadIdx.x & 15u) * 4u;
+    const unsigned int ri = (threadIdx.x >> 4) * 4u;
+    // Для загрузок и пополнения состояния — раскладка «строка × 64 канала».
+    const unsigned int lx = threadIdx.x & (GCS_TILE - 1);
+    const unsigned int ly = threadIdx.x >> 6;
+
+    const unsigned long long st_base = (unsigned long long)b * GCS_HK * hv + j0 + lx;
+    for (unsigned int d = ly; d < GCS_HK; d += GCS_BLOCK / GCS_TILE) {
+        st[d][lx] = state[st_base + (unsigned long long)d * hv];
+    }
+    __syncthreads();
+
+    const unsigned long long qk_head = (unsigned long long)b * nc * GCS_CS * GCS_HK;
+    const unsigned long long v_head = (unsigned long long)b * nc * GCS_CS * hv;
+    const unsigned long long a_head = (unsigned long long)b * nc * GCS_CS * GCS_CS;
+    const unsigned long long g_head = (unsigned long long)b * nc * GCS_CS;
+
+    for (unsigned int ci = 0; ci < nc; ++ci) {
+        const float* kcd = k_cumdecay + qk_head + (unsigned long long)ci * GCS_CS * GCS_HK;
+        const float* qsc = q_scaled + qk_head + (unsigned long long)ci * GCS_CS * GCS_HK;
+        const float* kdec = k_decayed + qk_head + (unsigned long long)ci * GCS_CS * GCS_HK;
+        const float* vsrc = value_proc + v_head + (unsigned long long)ci * GCS_CS * hv;
+        const float* am = attn + a_head + (unsigned long long)ci * GCS_CS * GCS_CS;
+        const float* gc = g_cumsum + g_head + (unsigned long long)ci * GCS_CS;
+
+        // vp = value_proc − k_cumdecay @ state.
+        {
+            float acc[4][4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+            for (int d = 0; d < GCS_HK; ++d) {
+                float kv[4], sv[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) kv[i] = kcd[(unsigned long long)(ri + i) * GCS_HK + d];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) sv[j] = st[d][rj + j];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += kv[i] * sv[j];
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    vp[ri + i][rj + j] =
+                        vsrc[(unsigned long long)(ri + i) * hv + j0 + rj + j] - acc[i][j];
+                }
+        }
+        __syncthreads();
+
+        // out = q_scaled @ state + attn @ vp.
+        {
+            float acc[4][4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+            for (int d = 0; d < GCS_HK; ++d) {
+                float qv[4], sv[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) qv[i] = qsc[(unsigned long long)(ri + i) * GCS_HK + d];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) sv[j] = st[d][rj + j];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += qv[i] * sv[j];
+            }
+            for (int u = 0; u < GCS_CS; ++u) {
+                float av[4], vv[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) av[i] = am[(unsigned long long)(ri + i) * GCS_CS + u];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) vv[j] = vp[u][rj + j];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += av[i] * vv[j];
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    out[v_head + (unsigned long long)(ci * GCS_CS + ri + i) * hv + j0 + rj + j] =
+                        acc[i][j];
+                }
+        }
+        __syncthreads();
+
+        // state = state·exp(g_last) + k_decayed^T @ vp.
+        {
+            const float decay = __expf(gc[GCS_CS - 1]);
+            const unsigned int d0 = (threadIdx.x >> 4) * 8u;
+            float acc[8][4];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = st[d0 + i][rj + j] * decay;
+            for (int t = 0; t < GCS_CS; ++t) {
+                float kv[8], vv[4];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) kv[i] = kdec[(unsigned long long)t * GCS_HK + d0 + i];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) vv[j] = vp[t][rj + j];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += kv[i] * vv[j];
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) st[d0 + i][rj + j] = acc[i][j];
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int d = ly; d < GCS_HK; d += GCS_BLOCK / GCS_TILE) {
+        state[st_base + (unsigned long long)d * hv] = st[d][lx];
+    }
+}

@@ -29,6 +29,7 @@ pub struct ChunkFlaKernels {
     mul_decay_mask_chunk: CudaFunction,
     scale_k_decayed_chunk: CudaFunction,
     scale_k_decayed_all: CudaFunction,
+    gdn_chunk_scan: CudaFunction,
     mul_inplace: CudaFunction,
     state_decay_from_gcumsum_chunk: CudaFunction,
 }
@@ -60,6 +61,7 @@ impl ChunkFlaKernels {
             mul_decay_mask_chunk: load_fn(&module, "mul_decay_mask_chunk_f32")?,
             scale_k_decayed_chunk: load_fn(&module, "scale_k_decayed_chunk_f32")?,
             scale_k_decayed_all: load_fn(&module, "scale_k_decayed_all_f32")?,
+            gdn_chunk_scan: load_fn(&module, "gdn_chunk_scan_f32")?,
             mul_inplace: load_fn(&module, "mul_inplace_f32")?,
             state_decay_from_gcumsum_chunk: load_fn(&module, "state_decay_from_gcumsum_chunk_f32")?,
             _module: module,
@@ -317,6 +319,53 @@ impl ChunkFlaKernels {
     /// `k_decayed = k[:, ci, :, :] * exp(g_last - g_cumsum[:, ci, :])`.
     /// k `(BH,NC,CS,HK)`, g_cumsum `(BH,NC,CS)`, k_decayed_out `(BH,CS,HK)`.
     #[allow(clippy::too_many_arguments)]
+    /// Формы, на которые рассчитан слитый цикл чанк-скана.
+    pub fn chunk_scan_fits(cs: u32, hk: u32, hv: u32) -> bool {
+        cs == 64 && hk == 128 && hv % 64 == 0
+    }
+
+    /// Весь главный цикл чанк-скана одним запуском: блок берёт голову и
+    /// полосу выходных каналов, держит состояние в shared и проходит по всем
+    /// чанкам сам.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan(
+        &self,
+        stream: &Arc<CudaStream>,
+        q_scaled: &CudaSlice<f32>,
+        k_cumdecay: &CudaSlice<f32>,
+        k_decayed: &CudaSlice<f32>,
+        value_proc: &CudaSlice<f32>,
+        attn: &CudaSlice<f32>,
+        g_cumsum: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        bh: u32,
+        nc: u32,
+        hv: u32,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (bh, hv / 64, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&self.gdn_chunk_scan);
+        b.arg(q_scaled)
+            .arg(k_cumdecay)
+            .arg(k_decayed)
+            .arg(value_proc)
+            .arg(attn)
+            .arg(g_cumsum)
+            .arg(state)
+            .arg(out)
+            .arg(&nc)
+            .arg(&hv);
+        unsafe {
+            b.launch(cfg)
+                .map_err(|e| SynaptixError::Cuda(format!("launch gdn_chunk_scan: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     /// `k_decayed` сразу по всем чанкам: шаг от состояния не зависит, а
     /// поштучно это был запуск на чанк с сеткой в `BH` блоков.
     pub fn scale_k_decayed_all(
