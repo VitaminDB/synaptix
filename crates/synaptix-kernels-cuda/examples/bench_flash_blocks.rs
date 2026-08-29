@@ -78,7 +78,7 @@ fn bench(cap: usize, g: usize, nb: usize, iters: usize) {
         q4.flash_attention(&k_sel, &v_sel, scale, false).expect("flash")
     };
     let by_blocks = || {
-        q.flash_attention_blocks(&k, &v, &table, &tail_from, &tail_len, RATIO, scale)
+        q.flash_attention_blocks(&k, &v, &table, &tail_from, &tail_len, RATIO, scale, 0)
             .expect("ядро по блокам")
     };
 

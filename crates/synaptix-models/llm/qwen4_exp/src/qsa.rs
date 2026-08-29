@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
+use synaptix_core::error::SynaptixError;
 use synaptix_core::tensor::Tensor;
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::pos::rope::{apply_rope_with_cossin, RopeLayout};
@@ -11,37 +12,70 @@ use crate::norm::{coerr, load_one_plus, rms};
 
 /// Выбор индексатора: блоки, а не позиции. Блок — `compress_ratio` подряд
 /// идущих токенов, и в KV они лежат сплошняком, поэтому и собирать их надо
-/// блоками: строка в четыре раза шире — гатер во столько же раз быстрее.
-/// Хвост — токены после последнего полного блока, они видны всегда.
+/// блоками. Таблица живёт на карте — там же, где её посчитали, и туда же её
+/// читает ядро внимания; на хост она выгружается только по требованию
+/// (тайловый путь и трассировка).
 pub struct Selection {
     pub ratio: usize,
-    pub blocks: Vec<Vec<u32>>,
-    pub tails: Vec<(u32, u32)>,
+    pub topk: usize,
+    pub rows: usize,
+    /// Сколько всего блоков в контексте на момент выбора.
+    pub blocks_total: usize,
+    /// `[rows, topk]` u32; пустой слот помечен `u32::MAX`.
+    pub blocks: Tensor,
+    /// `[rows]` u32 — начало и длина хвоста (токены после последнего блока).
+    pub tail_from: Tensor,
+    pub tail_len: Tensor,
+    tails_host: Vec<(u32, u32)>,
+    host: std::sync::OnceLock<Vec<Vec<u32>>>,
 }
 
 impl Selection {
     pub fn len(&self) -> usize {
-        self.blocks.len()
+        self.rows
     }
 
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.rows == 0
     }
 
-    pub fn row_len(&self, i: usize) -> usize {
-        self.blocks[i].len() * self.ratio + self.tails[i].1 as usize
+    pub fn tails(&self) -> &[(u32, u32)] {
+        &self.tails_host
+    }
+
+    /// Таблица блоков на хосте. Считается один раз по требованию.
+    pub fn host_blocks(&self) -> Result<&Vec<Vec<u32>>, ModelError> {
+        if let Some(v) = self.host.get() {
+            return Ok(v);
+        }
+        let flat = self
+            .blocks
+            .to_device(Device::Cpu)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<u32>())
+            .map_err(|e| ModelError::Forward(format!("QSA: выгрузка таблицы: {e}")))?;
+        let rows: Vec<Vec<u32>> = flat
+            .chunks(self.topk)
+            .map(|r| r.iter().copied().filter(|b| *b != u32::MAX).collect())
+            .collect();
+        Ok(self.host.get_or_init(|| rows))
+    }
+
+    pub fn row_len(&self, i: usize) -> Result<usize, ModelError> {
+        Ok(self.host_blocks()?[i].len() * self.ratio + self.tails_host[i].1 as usize)
     }
 
     /// Позиции строки по порядку: сперва выбранные блоки, потом хвост.
-    pub fn positions(&self, i: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(self.row_len(i));
-        for b in &self.blocks[i] {
+    pub fn positions(&self, i: usize) -> Result<Vec<u32>, ModelError> {
+        let blocks = &self.host_blocks()?[i];
+        let mut out = Vec::with_capacity(blocks.len() * self.ratio);
+        for b in blocks {
             let start = b * self.ratio as u32;
             out.extend(start..start + self.ratio as u32);
         }
-        let (from, len) = self.tails[i];
+        let (from, len) = self.tails_host[i];
         out.extend(from..from + len);
-        out
+        Ok(out)
     }
 }
 
@@ -230,6 +264,47 @@ impl QsaIndexer {
         Ok(())
     }
 
+    /// Тот же отбор на процессоре: нужен там, где ядра нет (CPU-устройство и
+    /// проверки паритета).
+    fn topk_on_host(
+        &self,
+        scores: &Tensor,
+        valid: &[u32],
+        take: usize,
+        total_blocks: usize,
+        topk: usize,
+    ) -> Result<Tensor, ModelError> {
+        let host = scores
+            .to_device(Device::Cpu)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let mut table = vec![u32::MAX; take * topk];
+        table
+            .par_chunks_mut(topk)
+            .enumerate()
+            .for_each(|(i, slot)| {
+                let nb = (valid[i] as usize).min(total_blocks);
+                if nb == 0 {
+                    return;
+                }
+                let row = &host[i * total_blocks..i * total_blocks + nb];
+                let mut order: Vec<u32> = (0..nb as u32).collect();
+                if topk < order.len() {
+                    order.select_nth_unstable_by(topk - 1, |a, b| {
+                        row[*b as usize]
+                            .partial_cmp(&row[*a as usize])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    order.truncate(topk);
+                }
+                for (s, b) in order.iter().enumerate() {
+                    slot[s] = *b;
+                }
+            });
+        coerr(Tensor::from_vec(table, vec![take, topk], self.device))
+    }
+
     pub fn needs_selection(&self, kv_len: usize) -> bool {
         kv_len / self.cfg.compress_ratio > self.cfg.block_topk()
     }
@@ -277,9 +352,21 @@ impl QsaIndexer {
         let keys_t = coerr(coerr(keys.t())?.contiguous())?;
 
         let cr = self.cfg.compress_ratio;
-        let topk = self.cfg.block_topk();
-        let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(s);
+        let topk = self.cfg.block_topk().min(total_blocks);
         let mut tails: Vec<(u32, u32)> = Vec::with_capacity(s);
+        let mut valid: Vec<u32> = Vec::with_capacity(s);
+        for i in 0..s {
+            let visible = past + i + 1;
+            let nb = (visible / cr).min(total_blocks);
+            valid.push(nb as u32);
+            tails.push(((nb * cr) as u32, (visible - nb * cr) as u32));
+        }
+
+        // Скоры считаются чанками (матрица `[take, блоков]` на длинном
+        // контексте занимает сотни мегабайт), а выбор блоков делает карта:
+        // выгрузка строк логитов на хост и отбор на процессоре стоили дороже
+        // всего остального в индексаторе.
+        let mut parts: Vec<Tensor> = Vec::new();
         let chunk = (1 << 22) / total_blocks.max(1);
         let chunk = chunk.clamp(1, 256).min(s);
         let mut row = 0usize;
@@ -291,43 +378,47 @@ impl QsaIndexer {
             let scores = coerr(coerr(scores.reshape(vec![take, nh, total_blocks]))?.sum_keepdim(1))?;
             let scores = coerr(coerr(scores.reshape(vec![take, total_blocks]))?
                 .mul_scalar(1.0 / (d as f32).sqrt()))?;
-            let host = scores
-                .to_device(Device::Cpu)
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>())
-                .map_err(|e| ModelError::Forward(e.to_string()))?;
-            // Выбор блоков независим по запросам, а на длинном контексте это
-            // десятки тысяч кандидатов на каждый — один поток тут становится
-            // дороже самого внимания.
-            let picked: Vec<(Vec<u32>, (u32, u32))> = (0..take)
-                .into_par_iter()
-                .map(|i| {
-                    let pos = past + row + i;
-                    let visible = pos + 1;
-                    let nb = (visible / cr).min(total_blocks);
-                    let scores_row = &host[i * total_blocks..i * total_blocks + nb];
-                    let mut blocks = Vec::with_capacity(topk);
-                    if nb > 0 {
-                        let mut order: Vec<u32> = (0..scores_row.len() as u32).collect();
-                        let take_blocks = topk.min(order.len());
-                        if take_blocks < order.len() {
-                            order.select_nth_unstable_by(take_blocks - 1, |a, b| {
-                                scores_row[*b as usize]
-                                    .partial_cmp(&scores_row[*a as usize])
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            order.truncate(take_blocks);
-                        }
-                        blocks = order;
-                    }
-                    (blocks, ((nb * cr) as u32, (visible - nb * cr) as u32))
-                })
-                .collect();            for (b, t) in picked {
-                blocks.push(b);
-                tails.push(t);
-            }
+            let valid_t = coerr(Tensor::from_vec(
+                valid[row..row + take].to_vec(),
+                vec![take],
+                self.device,
+            ))?;
+            let picked = match scores.topk_wide(&valid_t, topk) {
+                Ok(t) => t,
+                Err(SynaptixError::Unsupported(_)) => {
+                    self.topk_on_host(&scores, &valid[row..row + take], take, total_blocks, topk)?
+                }
+                Err(e) => return Err(ModelError::Forward(e.to_string())),
+            };
+            parts.push(picked);
             row += take;
         }
-        Ok(Some(Selection { ratio: cr, blocks, tails }))
+        let blocks = if parts.len() == 1 {
+            parts.pop().expect("одна часть")
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            coerr(Tensor::cat(&refs, 0))?
+        };
+        let tail_from = coerr(Tensor::from_vec(
+            tails.iter().map(|(f, _)| *f).collect::<Vec<u32>>(),
+            vec![s],
+            self.device,
+        ))?;
+        let tail_len = coerr(Tensor::from_vec(
+            tails.iter().map(|(_, l)| *l).collect::<Vec<u32>>(),
+            vec![s],
+            self.device,
+        ))?;
+        Ok(Some(Selection {
+            ratio: cr,
+            topk,
+            rows: s,
+            blocks_total: total_blocks,
+            blocks,
+            tail_from,
+            tail_len,
+            tails_host: tails,
+            host: std::sync::OnceLock::new(),
+        }))
     }
 }

@@ -93,6 +93,7 @@ pub fn flash_blocks_u8(
     nb: u32,
     ratio: u32,
     scale: f32,
+    row_offset: u32,
     dtype: DType,
 ) -> Result<()> {
     if b == 0 || nh == 0 || d == 0 {
@@ -151,7 +152,7 @@ pub fn flash_blocks_u8(
         block_dim: (BLOCK, 1, 1),
         shared_mem_bytes: smem,
     };
-    let (b_i, nh_i, nkv_i, cap_i, d_i, nb_i, ratio_i) = (
+    let (b_i, nh_i, nkv_i, cap_i, d_i, nb_i, ratio_i, off_i) = (
         b as i32,
         nh as i32,
         nkv as i32,
@@ -159,6 +160,7 @@ pub fn flash_blocks_u8(
         d as i32,
         nb as i32,
         ratio as i32,
+        row_offset as i32,
     );
     let mut bld = stream.launch_builder(func);
     bld.arg(q)
@@ -175,7 +177,8 @@ pub fn flash_blocks_u8(
         .arg(&d_i)
         .arg(&nb_i)
         .arg(&ratio_i)
-        .arg(&scale);
+        .arg(&scale)
+        .arg(&off_i);
     unsafe {
         bld.launch(cfg).map_err(|e| {
             SynaptixError::Cuda(format!(

@@ -45,11 +45,15 @@ __device__ __forceinline__ float fb_warp_sum(float v) {
 }
 
 // Позиция `t`-го элемента набора запроса: сперва выбранные блоки, потом хвост.
+// Пустой слот таблицы (`0xFFFFFFFF`) даёт -1 — такой позиции нет, и её вклад
+// в софтмакс нулевой.
 __device__ __forceinline__ int fb_pos(
     const unsigned int* __restrict__ table, int nb, int ratio, int tail_from, int t) {
   int in_blocks = nb * ratio;
   if (t < in_blocks) {
-    return (int)table[t / ratio] * ratio + (t % ratio);
+    unsigned int b = table[t / ratio];
+    if (b == 0xFFFFFFFFu) return -1;
+    return (int)b * ratio + (t % ratio);
   }
   return tail_from + (t - in_blocks);
 }
@@ -63,7 +67,7 @@ __device__ __forceinline__ void flash_blocks_impl(
     const unsigned int* __restrict__ table,
     const unsigned int* __restrict__ tail_from, const unsigned int* __restrict__ tail_len,
     T* __restrict__ out,
-    int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale) {
+    int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale, int row_offset) {
   int row = blockIdx.x;
   int bi = row / NKV;
   int h_kv = row % NKV;
@@ -81,10 +85,13 @@ __device__ __forceinline__ void flash_blocks_impl(
   int vec = (VEC > 0) ? VEC : D / 32;   // сколько элементов строки держит лейн
   int tid = threadIdx.x;
   int warp = tid >> 5, lane = tid & 31;
-  int from = (int)tail_from[bi];
-  int total = NB * ratio + (int)tail_len[bi];
+  // Таблица и хвосты приходят целиком: срез по строкам пришлось бы
+  // материализовать, а копия u32-вида на карте не поддержана.
+  int src_row = bi + row_offset;
+  int from = (int)tail_from[src_row];
+  int total = NB * ratio + (int)tail_len[src_row];
 
-  const unsigned int* row_table = table + (long)bi * NB;
+  const unsigned int* row_table = table + (long)src_row * NB;
 
   // Регистровое состояние варпа: q и аккумулятор распределены по лейнам,
   // максимум и нормировка — общие на варп.
@@ -106,6 +113,8 @@ __device__ __forceinline__ void flash_blocks_impl(
 
   for (int t = warp; t < total; t += FB_WARPS) {
     int pos = fb_pos(row_table, NB, ratio, from, t);
+    bool live = pos >= 0;
+    if (!live) pos = 0;
     const T* k_row = k + ((long)h_kv * CAP + pos) * D;
     float kv_reg[FB_MAX_VEC];
     #pragma unroll
@@ -123,6 +132,7 @@ __device__ __forceinline__ void flash_blocks_impl(
       for (int i = 0; i < vec; i++) part += q_reg[r][i] * kv_reg[i];
       float s = fb_warp_sum(part) * scale;
       s = __shfl_sync(0xFFFFFFFFu, s, 0, 32);
+      if (!live) s = FB_NEG_INF;
 
       float m_new = fmaxf(run_m[r], s);
       float alpha = fb_is_finite(run_m[r]) ? __expf(run_m[r] - m_new) : 0.0f;
@@ -182,9 +192,10 @@ __device__ __forceinline__ void flash_blocks_impl(
       const T* q, const T* k, const T* v,                                                  \
       const unsigned int* table, const unsigned int* tail_from,                            \
       const unsigned int* tail_len, T* out,                                                \
-      int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale) {             \
+      int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale,               \
+      int row_offset) {                                                                    \
     flash_blocks_impl<T, VEC, REP>(q, k, v, table, tail_from, tail_len, out,               \
-                                   B, NH, NKV, CAP, D, NB, ratio, scale);                  \
+                                   B, NH, NKV, CAP, D, NB, ratio, scale, row_offset);      \
   }
 
 FB_ENTRY(flash_blocks_f32, float, 0, 0)

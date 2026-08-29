@@ -135,7 +135,7 @@ fn check_shape(dtype: DType, tol: f32, nh: usize, nkv: usize, d: usize) {
     let tail_len = Tensor::from_vec(tail_len, vec![b], device).expect("длина хвоста");
 
     let got = q
-        .flash_attention_blocks(&k, &v, &table, &tail_from, &tail_len, RATIO, 1.0 / (d as f32).sqrt())
+        .flash_attention_blocks(&k, &v, &table, &tail_from, &tail_len, RATIO, 1.0 / (d as f32).sqrt(), 0)
         .expect("ядро по блокам");
     let got = host(&got);
 

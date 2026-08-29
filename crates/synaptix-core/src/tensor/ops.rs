@@ -2531,10 +2531,37 @@ impl Tensor {
         ))
     }
 
+    /// Top-k по широким строкам: `valid` — сколько первых столбцов строки
+    /// действительны. Возвращает индексы `[rows, k]`, где незанятые слоты
+    /// помечены `u32::MAX`.
+    pub fn topk_wide(&self, valid: &Tensor, k: usize) -> Result<Self> {
+        if self.rank() != 2 {
+            return Err(SynaptixError::Unsupported("topk_wide: ждём [rows, cols]"));
+        }
+        let (rows, cols) = (self.dims()[0], self.dims()[1]);
+        if k == 0 || k > cols {
+            return Err(SynaptixError::Unsupported("topk_wide: k вне ширины строки"));
+        }
+        let src = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![rows, k]), DType::U32);
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(DType::U32.bytes_for_numel(rows * k), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.topk_wide(
+            (&src.storage, &src.layout),
+            (&valid.storage, &valid.layout),
+            (&mut out, &out_layout),
+            k,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
     /// Attention по таблице блоков KV: `self` — запросы `[B, NH, D]`, `k`/`v` —
     /// общий буфер слоя `[NKV, CAP, D]`, `table` — индексы блоков `[B, NB]`,
-    /// `tail_from`/`tail_len` — хвост каждого запроса `[B]`. Позиция блока `b`
-    /// это `b · ratio`.
+    /// `tail_from`/`tail_len` — хвост каждого запроса `[rows]`. Позиция блока
+    /// `b` это `b · ratio`, а `row_offset` говорит, с какой строки таблицы
+    /// начинается этот запрос: срез по строкам пришлось бы материализовать.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_blocks(
         &self,
@@ -2545,6 +2572,7 @@ impl Tensor {
         tail_len: &Tensor,
         ratio: usize,
         scale: f32,
+        row_offset: usize,
     ) -> Result<Self> {
         if self.rank() != 3 {
             return Err(SynaptixError::Unsupported("flash_blocks: q rank != 3"));
@@ -2568,6 +2596,7 @@ impl Tensor {
             (&mut storage, &out_layout),
             ratio,
             scale,
+            row_offset,
             &stream,
         )?;
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))

@@ -2079,6 +2079,43 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn topk_wide(
+        &self,
+        scores: (&Storage, &Layout),
+        valid: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (src_st, src_lo) = scores;
+        let (val_st, _val_lo) = valid;
+        let (out_st, _out_lo) = out;
+        if src_lo.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported("topk_wide: только F32"));
+        }
+        if src_lo.dims().len() != 2 || !src_lo.is_contiguous() || src_lo.offset() != 0 {
+            return Err(SynaptixError::Unsupported("topk_wide: ждём contiguous [rows, cols]"));
+        }
+        let (rows, cols) = (src_lo.dims()[0], src_lo.dims()[1]);
+        let src_buf = src_st.as_cuda().ok_or(SynaptixError::Unsupported("topk_wide: non-cuda"))?;
+        let val_buf = val_st.as_cuda().ok_or(SynaptixError::Unsupported("topk_wide: valid non-cuda"))?;
+        let ctx = src_buf.device().clone();
+        let ord = src_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::kernels::topk_wide::TopkWideKernels::for_context(&ctx)?;
+        let out_buf = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("topk_wide: out non-cuda"))?;
+        crate::kernels::topk_wide::topk_wide_f32(
+            &kernels,
+            &stream,
+            src_buf.slice(),
+            val_buf.slice(),
+            out_buf.slice_mut(),
+            rows as u32,
+            cols as u32,
+            k as u32,
+        )
+    }
+
     fn flash_attention_blocks(
         &self,
         q: (&Storage, &Layout),
@@ -2090,6 +2127,7 @@ impl Backend for CudaBackend {
         out: (&mut Storage, &Layout),
         ratio: usize,
         scale: f32,
+        row_offset: usize,
         _stream: &Stream,
     ) -> Result<()> {
         let (q_st, q_lo) = q;
@@ -2117,7 +2155,7 @@ impl Backend for CudaBackend {
         }
         let (b, nh, d) = (q_lo.dims()[0], q_lo.dims()[1], q_lo.dims()[2]);
         let (nkv, cap) = (k_lo.dims()[0], k_lo.dims()[1]);
-        if k_lo.dims()[2] != d || tb_lo.dims()[0] != b {
+        if k_lo.dims()[2] != d || tb_lo.dims()[0] < row_offset + b {
             return Err(SynaptixError::Unsupported("flash_blocks: несогласованные формы"));
         }
         let nb = tb_lo.dims()[1];
@@ -2150,6 +2188,7 @@ impl Backend for CudaBackend {
             nb as u32,
             ratio as u32,
             scale,
+            row_offset as u32,
             dtype,
         )
     }

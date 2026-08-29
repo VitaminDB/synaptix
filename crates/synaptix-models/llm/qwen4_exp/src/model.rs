@@ -605,7 +605,7 @@ impl Qwen4ExpModel {
                         match &selected {
                             Some(sel) => {
                                 for i in 0..sel.len() {
-                                    for t in sel.positions(i) {
+                                    for t in sel.positions(i)? {
                                         mask[i * kv_len + t as usize] = 1.0;
                                     }
                                 }

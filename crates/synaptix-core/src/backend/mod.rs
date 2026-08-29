@@ -449,6 +449,20 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("topk_rows не поддержан этим backend"))
     }
 
+    /// Top-k по широким строкам: индексы `[rows, k]`, незанятые слоты
+    /// помечены `u32::MAX`. `valid` задаёт, сколько первых столбцов строки
+    /// действительно (у запроса виден лишь его префикс контекста).
+    fn topk_wide(
+        &self,
+        _scores: (&Storage, &Layout),
+        _valid: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("topk_wide не поддержан этим backend"))
+    }
+
     /// Attention по таблице блоков KV: каждый запрос смотрит на свой набор
     /// блоков по `ratio` подряд идущих позиций плюс хвост `tail`. Нужен
     /// разреженному вниманию — иначе выбранные позиции пришлось бы собирать
@@ -465,6 +479,7 @@ pub trait Backend: Send + Sync + 'static {
         _out: (&mut Storage, &Layout),
         _ratio: usize,
         _scale: f32,
+        _row_offset: usize,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("flash_attention_blocks не поддержан этим backend"))
