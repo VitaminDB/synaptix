@@ -9,7 +9,7 @@ use synaptix_ops::pos::rope::{apply_rope_with_cossin, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
 
 use crate::config::{IndexerConfig, Qwen4ExpConfig};
-use crate::norm::{coerr, load_one_plus, rms};
+use crate::norm::{coerr, load_one_plus, rms, stage};
 
 /// Выбор индексатора: блоки, а не позиции. Блок — `compress_ratio` подряд
 /// идущих токенов, и в KV они лежат сплошняком, поэтому и собирать их надо
@@ -81,7 +81,10 @@ impl Selection {
 }
 
 pub struct IndexerCache {
-    pending: Vec<f32>,
+    /// Ключи, не набравшие полный блок. Живут на карте: раньше они уезжали
+    /// на хост целиком, сворачивались там циклом и возвращались обратно.
+    pending: Tensor,
+    pending_rows: usize,
     block_keys: Tensor,
     blocks: usize,
     capacity: usize,
@@ -99,13 +102,17 @@ impl IndexerCache {
     ) -> Result<Self, ModelError> {
         let block_keys = Tensor::zeros(vec![1, 1, capacity_blocks.max(1), head_dim], dtype, device)
             .map_err(|e| ModelError::Build(e.to_string()))?;
+        let ratio = ratio.max(1);
+        let pending = Tensor::zeros(vec![1, ratio.max(2) - 1, head_dim], DType::F32, device)
+            .map_err(|e| ModelError::Build(e.to_string()))?;
         Ok(Self {
-            pending: Vec::new(),
+            pending,
+            pending_rows: 0,
             block_keys,
             blocks: 0,
             capacity: capacity_blocks.max(1),
             head_dim,
-            ratio: ratio.max(1),
+            ratio,
         })
     }
 
@@ -116,28 +123,26 @@ impl IndexerCache {
     /// Метка состояния: сколько блоков собрано и сколько сырых ключей ждёт
     /// в хвосте. По ней спекулятивный шаг откатывается.
     pub fn mark(&self) -> (usize, usize) {
-        (self.blocks, self.pending.len())
+        (self.blocks, self.pending_rows)
     }
 
     /// Какой будет метка через `n` токенов: ключи копятся в хвосте и каждые
     /// `ratio` штук сворачиваются в блок, так что считать её можно наперёд —
     /// прогону пары это избавляет от лишнего прохода индексатора.
     pub fn mark_after(&self, n: usize) -> (usize, usize) {
-        let waiting = self.pending.len() / self.head_dim + n;
+        let waiting = self.pending_rows + n;
         let new_blocks = waiting / self.ratio;
-        (self.blocks + new_blocks, (waiting % self.ratio) * self.head_dim)
+        (self.blocks + new_blocks, waiting % self.ratio)
     }
 
     pub fn rewind(&mut self, mark: (usize, usize)) {
-        let (blocks, pending) = mark;
+        let (blocks, rows) = mark;
         self.blocks = self.blocks.min(blocks);
-        if self.pending.len() > pending {
-            self.pending.truncate(pending);
-        }
+        self.pending_rows = self.pending_rows.min(rows);
     }
 
     pub fn reset(&mut self) {
-        self.pending.clear();
+        self.pending_rows = 0;
         self.blocks = 0;
     }
 }
@@ -237,19 +242,33 @@ impl QsaIndexer {
         coerr(Tensor::cat(&[&rotated, &tail], 3))
     }
 
+    /// Свернуть новые ключи в блоки. Ключи, не набравшие полный блок, ждут
+    /// следующего вызова прямо на карте: раньше они уезжали на хост целиком,
+    /// сворачивались там тройным циклом и возвращались обратно — на длинном
+    /// промпте это и трафик, и синхронизация посреди слоя.
     fn push_keys(
         &self,
         cache: &mut IndexerCache,
-        raw: &[f32],
+        keys: &Tensor,
         rope: &RopeCache,
         sel: RopePositions,
     ) -> Result<(), ModelError> {
         let d = self.cfg.head_dim;
         let cr = self.cfg.compress_ratio;
-        cache.pending.extend_from_slice(raw);
-        let available = cache.pending.len() / d;
-        let new_blocks = available / cr;
+        let fresh = keys.dims()[1];
+        let waiting = cache.pending_rows + fresh;
+        let new_blocks = waiting / cr;
+        let keys = coerr(keys.to_dtype(DType::F32))?;
+        let all = if cache.pending_rows == 0 {
+            keys
+        } else {
+            let head =
+                coerr(coerr(cache.pending.narrow(1, 0, cache.pending_rows))?.contiguous())?;
+            coerr(Tensor::cat(&[&head, &keys], 1))?
+        };
         if new_blocks == 0 {
+            coerr(cache.pending.copy_rows_from(0, &all))?;
+            cache.pending_rows = waiting;
             return Ok(());
         }
         if cache.blocks + new_blocks > cache.capacity {
@@ -259,23 +278,19 @@ impl QsaIndexer {
                 cache.capacity
             )));
         }
-        let mut pooled = vec![0f32; new_blocks * d];
-        for b in 0..new_blocks {
-            for j in 0..cr {
-                let src = (b * cr + j) * d;
-                for c in 0..d {
-                    pooled[b * d + c] += cache.pending[src + c];
-                }
-            }
-            for c in 0..d {
-                pooled[b * d + c] /= cr as f32;
-            }
+        let taken = new_blocks * cr;
+        let full = coerr(coerr(all.narrow(1, 0, taken))?.contiguous())?;
+        let pooled = coerr(coerr(coerr(full.reshape(vec![new_blocks, cr, d]))?.sum_keepdim(1))?
+            .reshape(vec![new_blocks, d]))?;
+        let pooled = coerr(pooled.mul_scalar(1.0 / cr as f32))?;
+        let rest = waiting - taken;
+        if rest > 0 {
+            let tail = coerr(coerr(all.narrow(1, taken, rest))?.contiguous())?;
+            coerr(cache.pending.copy_rows_from(0, &tail))?;
         }
-        cache.pending.drain(..new_blocks * cr * d);
+        cache.pending_rows = rest;
 
-        let pooled = Tensor::from_vec(pooled, vec![new_blocks, d], self.device)
-            .and_then(|t| t.to_dtype(self.compute))
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let pooled = coerr(pooled.to_dtype(self.compute))?;
         let normed = rms(&pooled, &self.k_norm, self.eps)?;
         let normed = coerr(normed.reshape(vec![1, 1, new_blocks, d]))?;
         let positions: Vec<u32> = (0..new_blocks)
@@ -352,13 +367,8 @@ impl QsaIndexer {
         let q = coerr(coerr(qk.narrow(1, 0, nh * d))?.contiguous())?;
         let k = coerr(coerr(qk.narrow(1, nh * d, self.cfg.kv_heads * d))?.contiguous())?;
 
-        let raw = k
-            .to_device(Device::Cpu)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
-        self.push_keys(cache, &raw, rope, sel)?;
+        let k_rows = coerr(k.reshape(vec![1, s * self.cfg.kv_heads, d]))?;
+        stage("idx:pool", || self.push_keys(cache, &k_rows, rope, sel))?;
 
         let kv_len = past + s;
         if !self.needs_selection(kv_len) {
