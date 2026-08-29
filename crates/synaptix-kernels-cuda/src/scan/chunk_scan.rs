@@ -247,8 +247,6 @@ struct ChunkWs {
     k_cumdecay_input: WsBuf<f32>,
     q_scaled: WsBuf<f32>,
     v_prime: WsBuf<f32>,
-    attn_intra: WsBuf<f32>,
-    k_decayed: WsBuf<f32>,
 }
 
 impl ChunkWs {
@@ -266,8 +264,6 @@ impl ChunkWs {
             + self.k_cumdecay_input.bytes()
             + self.q_scaled.bytes()
             + self.v_prime.bytes()
-            + self.attn_intra.bytes()
-            + self.k_decayed.bytes()
     }
 }
 
@@ -368,14 +364,6 @@ pub fn chunk_gated_delta_rule(
         .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
         .map_err(|e| werr("q_scaled", e))?;
     let v_prime = ws.v_prime.fit_zeros(stream, bh_u * cs_u * hv_u).map_err(|e| werr("v_prime", e))?;
-    let attn_intra = ws
-        .attn_intra
-        .fit_zeros(stream, bh_u * cs_u * cs_u)
-        .map_err(|e| werr("attn_intra", e))?;
-    let k_decayed = ws
-        .k_decayed
-        .fit_zeros(stream, bh_u * cs_u * hk_u)
-        .map_err(|e| werr("k_decayed", e))?;
 
     // ── intra-chunk attn + decay_mask.
     cfk.compute_chunk_attn(
@@ -449,6 +437,42 @@ pub fn chunk_gated_delta_rule(
         0.0,
     )?;
 
+    // ── Шаги, не зависящие от состояния, считаются сразу по всем чанкам:
+    // поштучно каждый был запуском с сеткой в BH блоков, а её карте мало.
+    // Оба буфера к этому месту отработали: `attn` нужен был только двум
+    // умножениям выше, `k_cumdecay_input` — одному.
+    csk.bmm(
+        stream,
+        &*q_n,
+        0,
+        &*k_n,
+        0,
+        &mut *attn,
+        0,
+        false,
+        true,
+        cs,
+        cs,
+        hk,
+        (cs * hk) as i64,
+        (cs * hk) as i64,
+        (cs * cs) as i64,
+        bnc,
+        1.0,
+        0.0,
+    )?;
+    cfk.mul_inplace(stream, &mut *attn, &*dm, (bh_u * nc_u * cs_u * cs_u) as u64)?;
+    cfk.scale_k_decayed_all(
+        stream,
+        &mut *k_cumdecay_input,
+        &*k_n,
+        &*g_cumsum,
+        bh,
+        nc,
+        cs,
+        hk,
+    )?;
+
     // ── Главный цикл по чанкам (state-зависимость).
     for ci in 0..nc {
         let off_hk = ci * cs * hk;
@@ -501,36 +525,11 @@ pub fn chunk_gated_delta_rule(
             0.0,
         )?;
 
-        // 9.4 attn_intra = q_n[:, ci] @ k_n[:, ci]^T.
+        // 9.6 out[:, ci] += attn_intra[:, ci] @ v_new (v_new = value_proc[:, ci]).
         csk.bmm(
             stream,
-            &*q_n,
-            off_hk,
-            &*k_n,
-            off_hk,
-            &mut *attn_intra,
-            0,
-            false,
-            true,
-            cs,
-            cs,
-            hk,
-            (nc * cs * hk) as i64,
-            (nc * cs * hk) as i64,
-            (cs * cs) as i64,
-            bh,
-            1.0,
-            0.0,
-        )?;
-
-        // 9.5 attn_intra *= decay_mask[:, ci].
-        cfk.mul_decay_mask_chunk(stream, &mut *attn_intra, &*dm, bh, nc, cs, ci)?;
-
-        // 9.6 out[:, ci] += attn_intra @ v_new (v_new = value_proc[:, ci]).
-        csk.bmm(
-            stream,
-            &*attn_intra,
-            0,
+            &*attn,
+            (ci * cs * cs) as u32,
             &*value_proc,
             off_hv,
             out,
@@ -540,7 +539,7 @@ pub fn chunk_gated_delta_rule(
             cs,
             hv,
             cs,
-            (cs * cs) as i64,
+            (nc * cs * cs) as i64,
             (nc * cs * hv) as i64,
             (nc * cs * hv) as i64,
             bh,
@@ -551,14 +550,11 @@ pub fn chunk_gated_delta_rule(
         // 9.7 state *= exp(g_cumsum[:, ci, CS-1]).
         cfk.state_decay_from_gcumsum_chunk(stream, state, &*g_cumsum, bh, nc, cs, hk, hv, ci)?;
 
-        // 9.8 k_decayed = k_n[:, ci] * exp(g_last - g_cumsum[:, ci]).
-        cfk.scale_k_decayed_chunk(stream, &mut *k_decayed, &*k_n, &*g_cumsum, bh, nc, cs, hk, ci)?;
-
-        // 9.9 state += k_decayed^T @ v_new.
+        // 9.9 state += k_decayed[:, ci]^T @ v_new.
         csk.bmm(
             stream,
-            &*k_decayed,
-            0,
+            &*k_cumdecay_input,
+            off_hk as u32,
             &*value_proc,
             off_hv,
             state,
@@ -568,7 +564,7 @@ pub fn chunk_gated_delta_rule(
             hk,
             hv,
             cs,
-            (cs * hk) as i64,
+            (nc * cs * hk) as i64,
             (nc * cs * hv) as i64,
             (hk * hv) as i64,
             bh,

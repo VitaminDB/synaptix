@@ -28,6 +28,8 @@ pub struct ChunkFlaKernels {
     sub_chunk: CudaFunction,
     mul_decay_mask_chunk: CudaFunction,
     scale_k_decayed_chunk: CudaFunction,
+    scale_k_decayed_all: CudaFunction,
+    mul_inplace: CudaFunction,
     state_decay_from_gcumsum_chunk: CudaFunction,
 }
 
@@ -57,6 +59,8 @@ impl ChunkFlaKernels {
             sub_chunk: load_fn(&module, "sub_chunk_f32")?,
             mul_decay_mask_chunk: load_fn(&module, "mul_decay_mask_chunk_f32")?,
             scale_k_decayed_chunk: load_fn(&module, "scale_k_decayed_chunk_f32")?,
+            scale_k_decayed_all: load_fn(&module, "scale_k_decayed_all_f32")?,
+            mul_inplace: load_fn(&module, "mul_inplace_f32")?,
             state_decay_from_gcumsum_chunk: load_fn(&module, "state_decay_from_gcumsum_chunk_f32")?,
             _module: module,
         });
@@ -313,6 +317,58 @@ impl ChunkFlaKernels {
     /// `k_decayed = k[:, ci, :, :] * exp(g_last - g_cumsum[:, ci, :])`.
     /// k `(BH,NC,CS,HK)`, g_cumsum `(BH,NC,CS)`, k_decayed_out `(BH,CS,HK)`.
     #[allow(clippy::too_many_arguments)]
+    /// `k_decayed` сразу по всем чанкам: шаг от состояния не зависит, а
+    /// поштучно это был запуск на чанк с сеткой в `BH` блоков.
+    pub fn scale_k_decayed_all(
+        &self,
+        stream: &Arc<CudaStream>,
+        k_decayed_out: &mut CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        g_cumsum: &CudaSlice<f32>,
+        bh: u32,
+        nc: u32,
+        cs: u32,
+        hk: u32,
+    ) -> Result<()> {
+        let block: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: (bh * nc * cs, hk.div_ceil(block), 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&self.scale_k_decayed_all);
+        b.arg(k_decayed_out).arg(k).arg(g_cumsum).arg(&bh).arg(&nc).arg(&cs).arg(&hk);
+        unsafe {
+            b.launch(cfg)
+                .map_err(|e| SynaptixError::Cuda(format!("launch scale_k_decayed_all: {e:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// Поэлементное `a *= b` по всему буферу.
+    pub fn mul_inplace(
+        &self,
+        stream: &Arc<CudaStream>,
+        a: &mut CudaSlice<f32>,
+        b_in: &CudaSlice<f32>,
+        n: u64,
+    ) -> Result<()> {
+        let block: u32 = 256;
+        let grid = (n.div_ceil(block as u64)) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bld = stream.launch_builder(&self.mul_inplace);
+        bld.arg(a).arg(b_in).arg(&n);
+        unsafe {
+            bld.launch(cfg)
+                .map_err(|e| SynaptixError::Cuda(format!("launch mul_inplace: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     pub fn scale_k_decayed_chunk(
         &self,
         stream: &Arc<CudaStream>,

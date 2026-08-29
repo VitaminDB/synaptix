@@ -244,6 +244,40 @@ __global__ void mul_decay_mask_chunk_f32(
 }
 
 // k_decayed[bh,:,:] = k[bh, ci, :, :] * exp(g_last[bh] - g_cumsum[bh, ci, :]).
+// k_decayed[bh, c, :, :] = k[bh, c, :, :] * exp(g_last[bh,c] - g_cumsum[bh,c,:])
+// сразу по всем чанкам: от состояния этот шаг не зависит, а поштучно он стоил
+// запуска на чанк при сетке в BH блоков.
+__global__ void scale_k_decayed_all_f32(
+    float* __restrict__ k_decayed_out,        // (BH, NC, CS, HK)
+    const float* __restrict__ k,              // (BH, NC, CS, HK)
+    const float* __restrict__ g_cumsum,       // (BH, NC, CS)
+    unsigned int bh,
+    unsigned int nc,
+    unsigned int cs,
+    unsigned int hk
+) {
+    unsigned int row = blockIdx.x;
+    unsigned int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= bh * nc * cs || d >= hk) return;
+    unsigned int t = row % cs;
+    unsigned int rest = row / cs;
+    unsigned long long off_g = (unsigned long long)rest * cs;
+    float factor = __expf(g_cumsum[off_g + cs - 1] - g_cumsum[off_g + t]);
+    unsigned long long off = (unsigned long long)row * hk + d;
+    k_decayed_out[off] = k[off] * factor;
+}
+
+// Поэлементное a *= b по всему буферу.
+__global__ void mul_inplace_f32(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    unsigned long long n
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] = a[i] * b[i];
+}
+
 __global__ void scale_k_decayed_chunk_f32(
     float* __restrict__ k_decayed_out,        // (BH, CS, HK)
     const float* __restrict__ k,              // (BH, NC, CS, HK)
