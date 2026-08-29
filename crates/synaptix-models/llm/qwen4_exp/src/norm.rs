@@ -8,22 +8,44 @@ pub fn coerr<T>(r: synaptix_core::error::Result<T>) -> Result<T, ModelError> {
 }
 
 static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static PROFILE_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static STAGES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 pub fn profiling() -> bool {
     *PROFILE.get_or_init(|| std::env::var("SYN_QWEN4EXP_PROFILE").is_ok())
 }
 
-/// Замер этапа forward'а: включается `SYN_QWEN4EXP_PROFILE`. Замеры грубые —
-/// очередь CUDA синхронизируется не здесь, а на ближайшей выгрузке на хост
-/// (роутер MoE, top-k индексатора), так что доли стоит читать как порядок
-/// величины.
+/// Ждать ли карту на границе этапа. Без ожидания очередь синхронизируется
+/// не здесь, а на ближайшей выгрузке на хост (роутер MoE, top-k
+/// индексатора), и время утекает в соседний этап: доли тогда — порядок
+/// величины, не более. `SYN_QWEN4EXP_PROFILE=sync` даёт честные цифры ценой
+/// сериализации.
+fn profiling_sync() -> bool {
+    *PROFILE_SYNC.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_PROFILE").map(|v| v.trim() == "sync").unwrap_or(false)
+    })
+}
+
+fn wait_device() {
+    if let Ok(stream) = synaptix_core::device::cuda::default_stream(0) {
+        let _ = stream.synchronize();
+    }
+}
+
+/// Замер этапа forward'а: включается `SYN_QWEN4EXP_PROFILE`.
 pub fn stage<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     if !profiling() {
         return f();
     }
+    let sync = profiling_sync();
+    if sync {
+        wait_device();
+    }
     let started = std::time::Instant::now();
     let out = f();
+    if sync {
+        wait_device();
+    }
     let nanos = started.elapsed().as_nanos() as u64;
     if let Ok(mut stages) = STAGES.lock() {
         match stages.iter_mut().find(|(n, _, _)| *n == name) {

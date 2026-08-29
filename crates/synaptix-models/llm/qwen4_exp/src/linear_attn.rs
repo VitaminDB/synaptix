@@ -9,7 +9,7 @@ use synaptix_ops::conv::causal_conv1d::causal_conv1d_stateful;
 use synaptix_ops::norm::rms_norm::rms_norm;
 
 use crate::config::Qwen4ExpConfig;
-use crate::norm::coerr;
+use crate::norm::{coerr, stage};
 
 const CHUNK: usize = 64;
 
@@ -235,6 +235,10 @@ impl LinearAttn {
     }
 
     fn finish(&self, h: &Tensor, core: &Tensor, s: usize) -> Result<Tensor, ModelError> {
+        stage("la:finish", || self.finish_inner(h, core, s))
+    }
+
+    fn finish_inner(&self, h: &Tensor, core: &Tensor, s: usize) -> Result<Tensor, ModelError> {
         let z = coerr(self
             .in_proj_z
             .forward(h)?
@@ -341,12 +345,13 @@ impl LinearAttn {
         s: usize,
     ) -> Result<Tensor, ModelError> {
         let (dk, dv, h_v) = (self.dk, self.dv, self.num_v_heads);
-        let qkv = self.in_proj_qkv.forward(h)?;
-        let qkv = coerr(qkv.reshape(vec![1, s, self.conv_dim]))?;
-        let a = self.in_proj_a.forward(h)?;
-        let b = self.in_proj_b.forward(h)?;
-        let a = coerr(a.to_dtype(DType::F16))?;
-        let b = coerr(b.to_dtype(DType::F16))?;
+        let (qkv, a, b) = stage("la:proj", || -> Result<_, ModelError> {
+            let qkv = self.in_proj_qkv.forward(h)?;
+            let qkv = coerr(qkv.reshape(vec![1, s, self.conv_dim]))?;
+            let a = coerr(self.in_proj_a.forward(h)?.to_dtype(DType::F16))?;
+            let b = coerr(self.in_proj_b.forward(h)?.to_dtype(DType::F16))?;
+            Ok((qkv, a, b))
+        })?;
         let conv_w = self.conv_w_dev.as_ref().unwrap();
         let a_log = self.a_log_dev.as_ref().unwrap();
         let dt_bias = self.dt_bias_dev.as_ref().unwrap();
@@ -375,7 +380,7 @@ impl LinearAttn {
             conv_w_c = coerr(conv_w.to_dtype(self.compute))?;
             &conv_w_c
         };
-        let out = {
+        let out = stage("la:scan", || -> Result<_, ModelError> {
             let cs = state.conv_state_dev.as_mut().unwrap();
             let ss = state.ssm_state_dev.as_mut().unwrap();
             coerr(qkv.linear_attn_chunk_prefill(
@@ -394,11 +399,13 @@ impl LinearAttn {
                 scan_chunk(s),
                 self.q_scale,
                 true,
-            ))?
-        };
-        coerr(coerr(coerr(coerr(out.transpose(0, 1))?.contiguous())?
-            .reshape(vec![1, s, h_v, dv]))?
-            .to_dtype(self.compute))
+            ))
+        })?;
+        stage("la:post", || {
+            coerr(coerr(coerr(coerr(out.transpose(0, 1))?.contiguous())?
+                .reshape(vec![1, s, h_v, dv]))?
+                .to_dtype(self.compute))
+        })
     }
 }
 

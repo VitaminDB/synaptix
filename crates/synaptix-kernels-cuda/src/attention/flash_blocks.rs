@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::kernels::compile::{compile_module, load_fn};
+use crate::kernels::compile::{compile_module, compile_module_with_opts, load_fn};
 
 const BLOCK: u32 = 128;
 const WARPS: u32 = 4;
@@ -30,6 +30,7 @@ const MAX_VEC: u32 = 8;
 
 pub struct FlashBlocksKernels {
     _module: Arc<CudaModule>,
+    _fast: Option<Arc<CudaModule>>,
     f32: CudaFunction,
     f16: CudaFunction,
     bf16: CudaFunction,
@@ -66,6 +67,12 @@ impl FlashBlocksKernels {
         }
         let src = include_str!("../cu/fused/attention/flash_blocks.cu");
         let module = compile_module(ctx, src, "flash_blocks.cu")?;
+        // Тот же исходник, но под sm_120a: там деквант E4M3 — одна
+        // инструкция, а на sm_80 он разворачивается программно и ядро по
+        // квантованному KV выходит вдвое медленнее плотного. На картах, где
+        // модуль не поднимается, остаются функции из основного.
+        let fast = compile_module_with_opts(ctx, src, "flash_blocks.cu", &[], Some("sm_120a")).ok();
+        let q8 = fast.as_ref().unwrap_or(&module);
         let new = Arc::new(Self {
             f32: load_fn(&module, "flash_blocks_f32")?,
             f16: load_fn(&module, "flash_blocks_f16")?,
@@ -76,15 +83,16 @@ impl FlashBlocksKernels {
             f32_h256_r6: load_fn(&module, "flash_blocks_f32_h256_r6")?,
             f16_h256_r6: load_fn(&module, "flash_blocks_f16_h256_r6")?,
             bf16_h256_r6: load_fn(&module, "flash_blocks_bf16_h256_r6")?,
-            q8_f32: load_fn(&module, "flash_blocks_mxfp8_f32")?,
-            q8_f16: load_fn(&module, "flash_blocks_mxfp8_f16")?,
-            q8_bf16: load_fn(&module, "flash_blocks_mxfp8_bf16")?,
-            q8_f32_h128_r8: load_fn(&module, "flash_blocks_mxfp8_f32_h128_r8")?,
-            q8_f16_h128_r8: load_fn(&module, "flash_blocks_mxfp8_f16_h128_r8")?,
-            q8_bf16_h128_r8: load_fn(&module, "flash_blocks_mxfp8_bf16_h128_r8")?,
-            q8_f32_h256_r6: load_fn(&module, "flash_blocks_mxfp8_f32_h256_r6")?,
-            q8_f16_h256_r6: load_fn(&module, "flash_blocks_mxfp8_f16_h256_r6")?,
-            q8_bf16_h256_r6: load_fn(&module, "flash_blocks_mxfp8_bf16_h256_r6")?,
+            q8_f32: load_fn(q8, "flash_blocks_mxfp8_f32")?,
+            q8_f16: load_fn(q8, "flash_blocks_mxfp8_f16")?,
+            q8_bf16: load_fn(q8, "flash_blocks_mxfp8_bf16")?,
+            q8_f32_h128_r8: load_fn(q8, "flash_blocks_mxfp8_f32_h128_r8")?,
+            q8_f16_h128_r8: load_fn(q8, "flash_blocks_mxfp8_f16_h128_r8")?,
+            q8_bf16_h128_r8: load_fn(q8, "flash_blocks_mxfp8_bf16_h128_r8")?,
+            q8_f32_h256_r6: load_fn(q8, "flash_blocks_mxfp8_f32_h256_r6")?,
+            q8_f16_h256_r6: load_fn(q8, "flash_blocks_mxfp8_f16_h256_r6")?,
+            q8_bf16_h256_r6: load_fn(q8, "flash_blocks_mxfp8_bf16_h256_r6")?,
+            _fast: fast,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
