@@ -145,6 +145,53 @@ impl IndexerCache {
         self.pending_rows = 0;
         self.blocks = 0;
     }
+
+    /// Переселить буферы индексатора в host-RAM (см.
+    /// `ModelCache::park_to_host`). Позиции (`blocks`, `pending_rows`) не
+    /// трогаются — переезжают только данные.
+    pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        Ok(park_tensor(&mut self.pending)? + park_tensor(&mut self.block_keys)?)
+    }
+
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        Ok(unpark_tensor(&mut self.pending, device)?
+            + unpark_tensor(&mut self.block_keys, device)?)
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.block_keys.device() == Device::Cpu
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        [&self.pending, &self.block_keys]
+            .into_iter()
+            .filter(|t| t.device() != Device::Cpu)
+            .map(|t| t.dtype().bytes_for_numel(t.numel()))
+            .sum()
+    }
+}
+
+/// Общие помощники переезда тензора между картой и host-RAM.
+pub(crate) fn park_tensor(t: &mut Tensor) -> Result<usize, ModelError> {
+    if t.device() == Device::Cpu {
+        return Ok(0);
+    }
+    let bytes = t.dtype().bytes_for_numel(t.numel());
+    *t = t
+        .to_device(Device::Cpu)
+        .map_err(|e| ModelError::Forward(e.to_string()))?;
+    Ok(bytes)
+}
+
+pub(crate) fn unpark_tensor(t: &mut Tensor, device: Device) -> Result<usize, ModelError> {
+    if t.device() == device {
+        return Ok(0);
+    }
+    let bytes = t.dtype().bytes_for_numel(t.numel());
+    *t = t
+        .to_device(device)
+        .map_err(|e| ModelError::Forward(e.to_string()))?;
+    Ok(bytes)
 }
 
 pub struct QsaIndexer {

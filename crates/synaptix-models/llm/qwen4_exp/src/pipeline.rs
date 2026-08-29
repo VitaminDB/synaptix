@@ -18,7 +18,7 @@ use synaptix_tokenizer::tokenizer::Tokenizer;
 
 use crate::config::Qwen4ExpConfig;
 use crate::loader::{BundleExperts, Qwen4ExpWeights};
-use crate::model::{ModelCache, Qwen4ExpModel};
+use crate::model::{CacheSnapshot, ModelCache, Qwen4ExpModel};
 use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 
 /// Чанк префилла. Чем он крупнее, тем меньше проходов по всей стопке
@@ -38,6 +38,39 @@ pub struct MediaInput {
     pub grids: Vec<mrope::Grid3>,
 }
 
+/// Разметка видео в промпте: сколько групп кадров, сколько токенов на
+/// группу и таймкод каждой.
+#[derive(Debug, Clone)]
+pub struct VideoPromptInfo {
+    pub groups: usize,
+    pub tokens_per_group: usize,
+    pub timestamps: Vec<f32>,
+    /// Merged-сетка `(h, w)` одной группы кадров — для M-RoPE.
+    pub grid_hw: (usize, usize),
+}
+
+impl VideoPromptInfo {
+    /// Всего vision-токенов видео.
+    pub fn tokens(&self) -> usize {
+        self.groups * self.tokens_per_group
+    }
+
+    /// Блок промпта как у HF-процессора Qwen3-VL: на каждую группу кадров
+    /// `<{t:.1} seconds><|vision_start|><|video_pad|>…<|vision_end|>`.
+    /// Таймкод — обычный текст, так модель видит временну́ю шкалу и без
+    /// M-RoPE по оси времени.
+    pub fn prompt_block(&self) -> String {
+        let mut s = String::new();
+        for g in 0..self.groups {
+            let ts = self.timestamps.get(g).copied().unwrap_or(0.0);
+            s.push_str(&format!("<{ts:.1} seconds><|vision_start|>"));
+            s.push_str(&"<|video_pad|>".repeat(self.tokens_per_group));
+            s.push_str("<|vision_end|>");
+        }
+        s
+    }
+}
+
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
     pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
@@ -46,6 +79,82 @@ pub struct Qwen4ExpPipeline {
     pub mtp: Option<MtpHead>,
     tokenizer: Option<HfTokenizer>,
     max_seq: usize,
+}
+
+/// Сессия префикс-KV: посчитанный контекст диалога живёт между ходами, и ход
+/// дописывает в него только новый хвост промпта.
+///
+/// Точка возврата стоит на КОНЦЕ ПРОМПТА, а не хода: chat-шаблон
+/// перерисовывает реплику ассистента, поэтому сгенерированные токены новому
+/// промпту префиксом не являются, а весь промпт прошлого хода — является.
+/// Снимок в этой точке снимается тем же механизмом, что откатывает
+/// непринятый спекулятивный драфт (`ModelCache::snapshot`/`restore`):
+/// рекуррентное состояние GDN и PLE копируются, KV и ключи индексатора
+/// откатываются по позиции.
+pub struct Qwen4ExpSession {
+    cache: ModelCache,
+    /// Токены промпта, на конце которого стоит точка возврата.
+    ids: Vec<u32>,
+    /// Состояние в этой точке. `None` — сессия пустая.
+    snap: Option<CacheSnapshot>,
+}
+
+impl Qwen4ExpSession {
+    /// Сколько токенов нового промпта уже посчитано. Ноль — префикс не
+    /// совпал (сжали историю, поправили сообщение, сменили системный
+    /// prompt): частичное совпадение бесполезно, GDN-состояние на середину
+    /// не откатить.
+    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+        let n = self.ids.len();
+        if n == 0 || self.snap.is_none() || prompt_ids.len() <= n {
+            return 0;
+        }
+        if prompt_ids[..n] != self.ids[..] {
+            return 0;
+        }
+        n
+    }
+
+    pub fn ctx_tokens(&self) -> usize {
+        self.cache.max_seq
+    }
+
+    pub fn cached_tokens(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Забыть префикс (смена чата/модели, сжатие истории).
+    pub fn invalidate(&mut self) {
+        self.ids.clear();
+        self.snap = None;
+        self.cache.reset();
+    }
+
+    /// Переселить кэш сессии в host-RAM и освободить VRAM — на время
+    /// вложенной генерации (см. `ModelCache::park_to_host`).
+    pub fn park_to_host(&mut self) -> Result<usize, PipelineError> {
+        let mut moved = self.cache.park_to_host()?;
+        if let Some(snap) = self.snap.as_mut() {
+            moved += snap.park_to_host();
+        }
+        Ok(moved)
+    }
+
+    /// Обратный переезд. Снимок GDN device-копий не восстанавливает: их
+    /// пересеет из host-векторов первый же `restore`.
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, PipelineError> {
+        Ok(self.cache.unpark_to(device)?)
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.cache.is_parked()
+    }
+
+    /// Сколько VRAM держит сессия прямо сейчас.
+    pub fn device_bytes(&self) -> usize {
+        self.cache.device_bytes()
+            + self.snap.as_ref().map(|s| s.device_bytes()).unwrap_or(0)
+    }
 }
 
 /// Состояние спекулятивного декода: голова со своим кэшем и хвост потока
@@ -118,7 +227,7 @@ impl Qwen4ExpPipeline {
             eprintln!("[qwen4_exp] KV-кэш квантованный: mxfp8 с масштабом на 32 элемента");
         }
         if let Some(cache) = model.expert_cache() {
-            warn_if_cache_too_big(cache, device, kv_reserve);
+            fit_cache_to_vram(cache, &config, device, kv_reserve);
         }
         let chat_template = weights.chat_template.clone();
         let mtp = if speculation_on() && mtp_present(&*weights) {
@@ -165,6 +274,40 @@ impl Qwen4ExpPipeline {
         self.vision.is_some()
     }
 
+    /// Есть ли в бандле башня — без подъёма весов (читается только заголовок).
+    pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
+        synaptix_vlm_qwen3::bundle_has_vision(path)
+    }
+
+    /// Выгружает башню и возвращает её память пулу устройства.
+    pub fn release_vision(&mut self) {
+        if self.vision.take().is_some() {
+            if let Device::Cuda(o) = self.model.device {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+            }
+        }
+    }
+
+    /// Лимиты препроцессинга под потолок vision-токенов: один токен после
+    /// merge накрывает `size_factor²` пикселей, так что `max_tokens`
+    /// пересчитывается в `max_pixels` для `smart_resize`. `None`/0 — дефолт.
+    pub fn image_limits(
+        &self,
+        max_tokens: Option<usize>,
+    ) -> Result<synaptix_vlm_qwen3::PreprocessLimits, PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let mut limits = synaptix_vlm_qwen3::PreprocessLimits::default();
+        if let Some(n) = max_tokens.filter(|n| *n > 0) {
+            let f = tower.config.size_factor();
+            limits.max_pixels = limits.max_pixels.min(n * f * f);
+            limits.min_pixels = limits.min_pixels.min(limits.max_pixels);
+        }
+        Ok(limits)
+    }
+
     /// Картинка → строки эмбеддингов `[n, hidden]` и merged-сетка `(h, w)`.
     pub fn encode_image(
         &self,
@@ -188,33 +331,56 @@ impl Qwen4ExpPipeline {
         Ok((feats, grid))
     }
 
-    /// Видео → строки эмбеддингов `[n, hidden]` и merged-сетка `(t, h, w)`.
-    /// Кадры группируются по `temporal_patch_size`: группа кадров даёт один
-    /// набор патчей, и в промпте всё видео — один блок заполнителей.
+    /// Видео → строки эмбеддингов `[n, hidden]` и merged-сетка `(t, h, w)`
+    /// всего видео одним блоком заполнителей (путь CLI: промпт без таймкодов).
     pub fn encode_video(
         &self,
         path: impl AsRef<Path>,
         limits: synaptix_vlm_qwen3::VideoLimits,
     ) -> Result<(Tensor, mrope::Grid3), PipelineError> {
+        let (feats, info) = self.encode_video_limited(path, limits)?;
+        let grid =
+            mrope::Grid3 { t: info.groups, h: info.grid_hw.0, w: info.grid_hw.1 };
+        Ok((feats, grid))
+    }
+
+    /// Видео → эмбеддинги и разметка промпта по группам кадров: каждая группа
+    /// идёт своим блоком заполнителей с таймкодом, как у HF-процессора
+    /// Qwen3-VL (см. [`VideoPromptInfo::prompt_block`]).
+    pub fn encode_video_with_info(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(Tensor, VideoPromptInfo), PipelineError> {
+        self.encode_video_limited(path, synaptix_vlm_qwen3::VideoLimits::default())
+    }
+
+    /// Кадры группируются по `temporal_patch_size`: группа кадров даёт один
+    /// набор патчей и один блок заполнителей в промпте.
+    pub fn encode_video_limited(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::VideoLimits,
+    ) -> Result<(Tensor, VideoPromptInfo), PipelineError> {
         let tower = self
             .vision
             .as_ref()
             .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
-        let prepared =
+        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps } =
             synaptix_vlm_qwen3::prepare_video(path, &tower.config, limits, self.model.device)
                 .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
-        let merge = tower.config.spatial_merge_size.max(1);
-        let grid = mrope::Grid3 {
-            t: prepared.grid.t,
-            h: prepared.grid.h / merge,
-            w: prepared.grid.w / merge,
-        };
-        let feats = no_grad(|| tower.forward(&prepared.patches, prepared.grid))
+        let feats = no_grad(|| tower.forward(&patches, grid))
             .map_err(|e| PipelineError::Model(format!("vision forward: {e}")))?;
         let feats = feats
             .to_dtype(self.model.compute)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
-        Ok((feats, grid))
+        let merge = tower.config.spatial_merge_size.max(1);
+        let info = VideoPromptInfo {
+            groups: grid.t,
+            tokens_per_group: (grid.h * grid.w) / tower.config.merge_unit(),
+            timestamps: group_timestamps,
+            grid_hw: (grid.h / merge, grid.w / merge),
+        };
+        Ok((feats, info))
     }
 
     /// Сколько токенов-заполнителей займёт картинка в промпте.
@@ -422,6 +588,28 @@ impl Qwen4ExpPipeline {
         Ok(Some((make(cos)?, make(sin)?)))
     }
 
+    /// Пустая сессия префикс-KV на `ctx_tokens` токенов контекста.
+    pub fn new_session(&self, ctx_tokens: usize) -> Result<Qwen4ExpSession, PipelineError> {
+        Ok(Qwen4ExpSession {
+            cache: self.make_cache(ctx_tokens)?,
+            ids: Vec::new(),
+            snap: None,
+        })
+    }
+
+    /// Как [`Self::generate_streaming`], но с префикс-KV: всё, что уже лежит
+    /// в `session`, не считается заново. Возвращает, сколько токенов промпта
+    /// удалось переиспользовать.
+    pub fn generate_cached_streaming(
+        &self,
+        session: &mut Qwen4ExpSession,
+        prompt_ids: &[u32],
+        cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        self.run_stream(prompt_ids, &[], cfg, sink, Some(session))
+    }
+
     /// Генерация с медиа-вложениями: `media` — пары «id заполнителя → строки
     /// эмбеддингов», строки расходуются по порядку появления заполнителя.
     pub fn generate_media_streaming(
@@ -431,6 +619,21 @@ impl Qwen4ExpPipeline {
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        self.run_stream(prompt_ids, inputs, cfg, sink, None)
+            .map(|(out, stats, _)| (out, stats))
+    }
+
+    /// Общее тело генерации. `session` задан — ход идёт по префикс-KV:
+    /// префиллится только хвост промпта, а на его конце снимается новая
+    /// точка возврата.
+    fn run_stream(
+        &self,
+        prompt_ids: &[u32],
+        inputs: &[MediaInput],
+        cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+        mut session: Option<&mut Qwen4ExpSession>,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("пустой промпт".into()));
         }
@@ -453,7 +656,42 @@ impl Qwen4ExpPipeline {
             None => RopePositions::Sequential,
         };
         let (prefill_pos, decode_pos) = (pos, pos);
-        let mut cache = self.make_cache(budget)?;
+
+        // Кэш хода: свой одноразовый или тот, что живёт в сессии между
+        // ходами. Медиа-промпт префикс-KV не поддерживает — эмбеддинги
+        // заполнителей в кэш не заносятся, и продолжать с него нельзя.
+        if !inputs.is_empty() {
+            session = None;
+        }
+        if let Some(s) = session.as_deref_mut() {
+            // Ход не влезает в кэш сессии — пересоздаём его под новый
+            // размер, префикс при этом теряется.
+            if budget > s.cache.max_seq {
+                s.cache = self.make_cache(budget)?;
+                s.ids.clear();
+                s.snap = None;
+            }
+        }
+        let reuse = session
+            .as_deref()
+            .map(|s| s.reusable(prompt_ids))
+            .unwrap_or(0);
+        // Флаг снимаем заранее: дальше `session` занята заимствованием кэша.
+        let want_session = session.is_some();
+        let mut owned_cache;
+        let cache: &mut ModelCache = match session.as_deref_mut() {
+            Some(s) => {
+                match (reuse > 0).then(|| s.snap.as_ref()).flatten() {
+                    Some(snap) => s.cache.restore(snap).map_err(PipelineError::from)?,
+                    None => s.cache.reset(),
+                }
+                &mut s.cache
+            }
+            None => {
+                owned_cache = self.make_cache(budget)?;
+                &mut owned_cache
+            }
+        };
         let mut sampler = TokenSampler::new(&cfg, prompt_ids);
         let eos: Vec<u32> = if cfg.eos_token_ids.is_empty() {
             cfg.eos_token_id.into_iter().collect()
@@ -463,8 +701,14 @@ impl Qwen4ExpPipeline {
 
         // Префилл обходит почти всю стопку экспертов: пусть поднятое им живёт
         // отдельно и уходит по окончании, а прогретое прошлым ходом остаётся —
-        // декоду оно и пригодится.
+        // декоду оно и пригодится. И ужимаем кэш ПОД длину промпта: активации
+        // префилла считаются после экспертов, и ловить на них OOM дороже, чем
+        // подкачать пару сотен экспертов заново.
         if let Some(cache) = self.model.expert_cache() {
+            cache.fit_to_vram(activation_reserve(
+                &self.config,
+                prompt_ids.len().min(cfg.prefill_batch),
+            ));
             cache.set_scratch_mode(true);
         }
         let prefill_start = Instant::now();
@@ -474,16 +718,20 @@ impl Qwen4ExpPipeline {
         // тогда поднимаются на карту один раз на весь промпт, а не на каждый
         // чанк. Цена — поток всех токенов в памяти, поэтому короткие промпты
         // идут прежним путём.
-        let by_layers = prompt_ids.len() > cfg.prefill_batch
+        // Хвост промпта: всё до `reuse` уже посчитано прошлым ходом и лежит
+        // в кэше сессии. Позиции при этом абсолютные — `cache.seq_len`
+        // указывает на границу.
+        let fresh = &prompt_ids[reuse..];
+        let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
         let mut logits = no_grad(|| -> Result<_, ModelError> {
             if by_layers {
                 let (hidden, stream) =
                     self.model.prefill_by_layers(
-                        prompt_ids,
+                        fresh,
                         media,
-                        &mut cache,
+                        cache,
                         cfg.prefill_batch,
                         prefill_pos,
                     )?;
@@ -493,7 +741,7 @@ impl Qwen4ExpPipeline {
                 return self.model.lm_head_forward(&hidden);
             }
             let mut last = None;
-            let mut offset = 0usize;
+            let mut offset = reuse;
             while offset < prompt_ids.len() {
                 let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
                 let chunk = &prompt_ids[offset..offset + take];
@@ -501,21 +749,29 @@ impl Qwen4ExpPipeline {
                 let done = offset + take >= prompt_ids.len();
                 if want_stream && done {
                     let (hidden, stream) =
-                        self.model.forward_media_with_stream(chunk, &slice, &mut cache, prefill_pos)?;
+                        self.model.forward_media_with_stream(chunk, &slice, cache, prefill_pos)?;
                     tail_stream = Some(last_row(&stream)?);
                     last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
                 } else {
                     last =
-                        Some(self.model.forward_media_last(chunk, &slice, &mut cache, prefill_pos)?);
+                        Some(self.model.forward_media_last(chunk, &slice, cache, prefill_pos)?);
                 }
                 offset += take;
             }
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
         })?;
+        // Точка возврата для следующего хода — ровно здесь, до декода.
+        let boundary = match want_session {
+            true => Some(cache.snapshot().map_err(PipelineError::from)?),
+            false => None,
+        };
         let prefill_ms = prefill_start.elapsed().as_millis();
         if let Some(cache) = self.model.expert_cache() {
             cache.set_scratch_mode(false);
             cache.clear_scratch();
+            // Пик хода позади: декод считает по горстке токенов, и кэшу можно
+            // вернуться к потолку — на нём и держится скорость генерации.
+            cache.fit_to_vram(activation_reserve(&self.config, DECODE_TOKENS));
         }
 
         let decode_start = Instant::now();
@@ -558,7 +814,7 @@ impl Qwen4ExpPipeline {
             };
             let Some(draft) = draft else {
                 runs += 1;
-                logits = no_grad(|| self.model.forward_last_pos(&[token], &mut cache, decode_pos))?;
+                logits = no_grad(|| self.model.forward_last_pos(&[token], cache, decode_pos))?;
                 token = sampler.sample(&logits)?;
                 continue;
             };
@@ -566,7 +822,7 @@ impl Qwen4ExpPipeline {
             drafted += 1;
             runs += 1;
             let (hidden, stream, snap) =
-                no_grad(|| self.model.forward_pair(&[token, draft], &mut cache, decode_pos))?;
+                no_grad(|| self.model.forward_pair(&[token, draft], cache, decode_pos))?;
             let first = no_grad(|| self.model.lm_head_forward(&row(&hidden, 0)?))?;
             let next = sampler.sample(&first)?;
             let spec = spec.as_mut().expect("драфт без спекуляции");
@@ -589,12 +845,43 @@ impl Qwen4ExpPipeline {
             spec.tokens = vec![next, token];
         }
         let decode_ms = decode_start.elapsed().as_millis();
+        if let (Some(cache), Some(st)) = (self.model.expert_cache(), self.model.expert_cache_stats())
+        {
+            let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
+            let (rsv, used) = match self.model.device {
+                Device::Cuda(o) => {
+                    synaptix_core::device::cuda::experts_pool_stats(o).unwrap_or((0, 0))
+                }
+                _ => (0, 0),
+            };
+            eprintln!(
+                "[qwen4_exp] кэш экспертов: {} шт / {:.2} ГБ при потолке {:.2} ГБ (пул {:.2}/{:.2} ГБ),                  попаданий {}, промахов {}, подкачано {} за {} мс",
+                st.resident,
+                gb(st.bytes),
+                gb(cache.capacity_bytes()),
+                gb(used as usize),
+                gb(rsv as usize),
+                st.hits,
+                st.misses,
+                st.fetched,
+                st.fetch_millis,
+            );
+        }
         if drafted > 0 {
             eprintln!(
                 "[qwen4_exp] спекуляция: принято {accepted} из {drafted} ({:.0}%), токенов за прогон {:.2}",
                 100.0 * accepted as f32 / drafted as f32,
                 out.len() as f32 / runs.max(1) as f32
             );
+        }
+
+        // Кэш больше не нужен как заимствование — записываем точку возврата
+        // в сессию. Порядок важен: `boundary` снят до декода, а декод успел
+        // дописать в кэш свои токены; сравнение префикса на следующем ходу
+        // идёт по `ids`, откат — по снимку.
+        if let (Some(s), Some(snap)) = (session, boundary) {
+            s.ids = prompt_ids.to_vec();
+            s.snap = Some(snap);
         }
 
         Ok((
@@ -605,6 +892,7 @@ impl Qwen4ExpPipeline {
                 prefill_ms,
                 decode_ms,
             },
+            reuse,
         ))
     }
 }
@@ -692,31 +980,59 @@ fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize, kv: DType) -> usize {
     qsa * max_seq * per_token
 }
 
-/// Предупредить, если под кэш просят больше, чем видно свободного. Сам размер
-/// не трогаем: `cuMemGetInfo` не знает про уже зарезервированное пулами, и
-/// автоподгонка по нему обнуляла кэш там, где он прекрасно помещался.
-fn warn_if_cache_too_big(cache: &Arc<ExpertCache>, device: Device, kv_reserve: usize) {
+/// Сколько VRAM обязано остаться свободным под активации хода на `tokens`
+/// токенов разом.
+///
+/// Префилл держит поток скрытых состояний на ВЕСЬ промпт сразу: `[T,
+/// hc_count, hidden]` в f32 — у Qwen3.8-Flash-Next это 40 КБ на токен, и ещё
+/// столько же уходит на копии между слоями. MoE поверх этого собирает и
+/// разбирает `T × top_k` строк. Всё это считается ПОСЛЕ того, как эксперты
+/// уже заняли своё, поэтому кэш обязан ужаться заранее, а не ловить OOM.
+/// Сколько токенов разом считает декод (шаг + спекулятивный черновик).
+const DECODE_TOKENS: usize = 8;
+
+fn activation_reserve(cfg: &Qwen4ExpConfig, tokens: usize) -> usize {
+    let hidden = cfg.hidden_size;
+    // поток hyper-connections (f32) с копиями + перестановки MoE: сбор строк,
+    // выходы экспертов, их сборка, взвешивание и обратная перестановка —
+    // пять живых копий `T × top_k × hidden` разом.
+    let per_token = cfg.hc_count.max(1) * hidden * 4 * 3
+        + cfg.moe.num_experts_per_tok * hidden * 2 * 5;
+    const FLOOR: usize = 2 << 30;
+    FLOOR + tokens.saturating_mul(per_token)
+}
+
+/// Подогнать ёмкость кэша экспертов под то, что реально осталось на карте
+/// после подъёма весов.
+///
+/// Ужимается именно ЁМКОСТЬ, а не потолок: расклад «свободно минус KV на всё
+/// окно минус активации самого длинного чанка префилла» — это худший случай
+/// префилла, а на декоде свободно втрое больше, и кэш там и есть источник
+/// скорости. Пока это опускало потолок навсегда, кэш оставался ужатым на всю
+/// жизнь модели: в чате он замирал на 7 ГБ при девяти свободных, эксперты
+/// перечитывались с хоста каждый шаг, и декод шёл вдвое медленнее замеров
+/// CLI на том же бандле. Потолок остаётся тем, что заказан настройкой, а
+/// пофазный `fit_to_vram` в `generate_media_streaming` двигает ёмкость в обе
+/// стороны; на OOM аллокатор всё равно заберёт своё через `Reclaimable`.
+fn fit_cache_to_vram(cache: &Arc<ExpertCache>, cfg: &Qwen4ExpConfig, device: Device, kv_reserve: usize) {
     let Device::Cuda(ordinal) = device else { return };
     let Ok((free, _total)) = synaptix_core::device::cuda::mem_info(ordinal) else {
         return;
     };
-    let need = cache.capacity_bytes() + kv_reserve;
-    if need <= free {
+    let reserve = kv_reserve + activation_reserve(cfg, prefill_chunk());
+    let capacity = cache.fit_to_vram(reserve);
+    if capacity >= cache.ceiling_bytes() {
         return;
     }
-    // Свободного меньше, чем просят: карту делят с другими моделями. Ужимаем,
-    // но не в ноль — без кэша каждый токен перечитывает всех своих экспертов.
-    // `cuMemGetInfo` не знает про уже зарезервированное пулами, поэтому
-    // нижнюю границу держим щедрой.
-    let room = free.saturating_sub(kv_reserve + (1 << 30));
-    let capacity = cache.capacity_bytes().min(room).max(2 << 30);
+    let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
     eprintln!(
-        "[qwen4_exp] кэш экспертов ужат до {:.1} ГБ: свободно {:.1} ГБ, под KV нужно {:.1} ГБ",
-        capacity as f64 / (1u64 << 30) as f64,
-        free as f64 / (1u64 << 30) as f64,
-        kv_reserve as f64 / (1u64 << 30) as f64,
+        "[qwen4_exp] кэш экспертов на старте {:.1} ГБ из потолка {:.1} ГБ: свободно {:.1} ГБ, \
+         под KV всего окна и активации префилла нужно {:.1} ГБ (на декоде ёмкость вернётся)",
+        gb(capacity),
+        gb(cache.ceiling_bytes()),
+        gb(free),
+        gb(reserve),
     );
-    cache.set_capacity(capacity);
 }
 
 /// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
@@ -732,10 +1048,15 @@ fn expert_cache_for(cfg: &Qwen4ExpConfig, device: Device) -> Option<Arc<ExpertCa
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok());
     let big = cfg.moe.num_experts * cfg.num_hidden_layers >= 1024;
+    // Потолок — верхняя граница, а не бронь: каждая фаза хода зовёт
+    // `fit_to_vram` и опускает ёмкость под реально свободную VRAM, а на OOM
+    // аллокатор забирает своё через `Reclaimable`. Замеры на 125B (RTX 5090
+    // Laptop 24 ГБ) дают плато скорости декода как раз на 16–18 ГБ кэша, и
+    // прежние 12 ГБ отсекали его без всякой пользы.
     let gb = match requested {
         Some(v) if v <= 0.0 => return None,
         Some(v) => v,
-        None if big => 12.0,
+        None if big => 16.0,
         None => return None,
     };
     Some(ExpertCache::new(device, (gb * (1u64 << 30) as f64) as usize))

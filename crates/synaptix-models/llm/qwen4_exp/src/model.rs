@@ -18,7 +18,7 @@ use crate::linear_attn::{GdnSnap, LinearAttn};
 use crate::ngram::{NGramEmbedding, NGramRows};
 use crate::norm::{coerr, ctx, stage};
 use crate::ple::{PleLayer, PleState};
-use crate::qsa::IndexerCache;
+use crate::qsa::{park_tensor, unpark_tensor, IndexerCache};
 
 pub const LM_PREFIX: &str = "model.language_model";
 
@@ -104,6 +104,98 @@ impl ModelCache {
             }
         }
     }
+
+    /// Переселить содержимое кэша в host-RAM, освободив VRAM. Позиции
+    /// (`seq_len`, метки индексатора) не трогаются — переезжают только
+    /// данные, так что после [`Self::unpark_to`] ход продолжается с той же
+    /// точки.
+    ///
+    /// Зачем: пока идёт вложенная генерация (субагент чата), посчитанный
+    /// контекст диалога держит гигабайты, а вложенному прогону их не хватает.
+    /// Перевоз через PCIe дешевле, чем потерять префикс и префиллить историю
+    /// заново.
+    pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for l in self.layers.iter_mut() {
+            match l {
+                LayerState::Linear(s) => {
+                    // Истина GDN — host-векторы, зеркала пересеет
+                    // `sync_to_device`; но сперва считываем то, что дописал
+                    // graph-декод.
+                    s.sync_to_host().map_err(|e| ModelError::Forward(e.to_string()))?;
+                    moved += dev_bytes(s.conv_state_dev.as_ref())
+                        + dev_bytes(s.ssm_state_dev.as_ref());
+                    s.conv_state_dev = None;
+                    s.ssm_state_dev = None;
+                }
+                LayerState::Qsa(b) => {
+                    let (kv, idx) = b.as_mut();
+                    moved += park_tensor(&mut kv.k)?;
+                    moved += park_tensor(&mut kv.v)?;
+                    if let Some(t) = kv.k_scale.as_mut() {
+                        moved += park_tensor(t)?;
+                    }
+                    if let Some(t) = kv.v_scale.as_mut() {
+                        moved += park_tensor(t)?;
+                    }
+                    moved += idx.park_to_host()?;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for l in self.layers.iter_mut() {
+            let LayerState::Qsa(b) = l else { continue };
+            let (kv, idx) = b.as_mut();
+            moved += unpark_tensor(&mut kv.k, device)?;
+            moved += unpark_tensor(&mut kv.v, device)?;
+            if let Some(t) = kv.k_scale.as_mut() {
+                moved += unpark_tensor(t, device)?;
+            }
+            if let Some(t) = kv.v_scale.as_mut() {
+                moved += unpark_tensor(t, device)?;
+            }
+            moved += idx.unpark_to(device)?;
+        }
+        Ok(moved)
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.layers.iter().any(|l| match l {
+            LayerState::Qsa(b) => b.0.k.device() == Device::Cpu,
+            LayerState::Linear(_) => false,
+        })
+    }
+
+    /// Сколько VRAM держит кэш прямо сейчас.
+    pub fn device_bytes(&self) -> usize {
+        let mut total = 0;
+        for l in &self.layers {
+            match l {
+                LayerState::Qsa(b) => {
+                    let (kv, idx) = (&b.0, &b.1);
+                    for t in [Some(&kv.k), Some(&kv.v), kv.k_scale.as_ref(), kv.v_scale.as_ref()] {
+                        if let Some(t) = t.filter(|t| t.device() != Device::Cpu) {
+                            total += dev_bytes(Some(t));
+                        }
+                    }
+                    total += idx.device_bytes();
+                }
+                LayerState::Linear(s) => {
+                    total += dev_bytes(s.conv_state_dev.as_ref())
+                        + dev_bytes(s.ssm_state_dev.as_ref());
+                }
+            }
+        }
+        total
+    }
+}
+
+fn dev_bytes(t: Option<&Tensor>) -> usize {
+    t.map(|t| t.dtype().bytes_for_numel(t.numel())).unwrap_or(0)
 }
 
 /// Снимок состояний, которые нельзя переписать задним числом. KV и ключи
@@ -120,6 +212,17 @@ pub struct CacheSnapshot {
 impl CacheSnapshot {
     pub fn seq_len(&self) -> usize {
         self.seq_len
+    }
+
+    /// Отпустить device-копии снимка (см. [`ModelCache::park_to_host`]):
+    /// `GdnSnap` дублирует состояние в host-векторах, поэтому переезд для
+    /// него — это просто освобождение зеркал.
+    pub fn park_to_host(&mut self) -> usize {
+        self.linear.iter_mut().map(|s| s.park_to_host()).sum()
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.linear.iter().map(|s| s.device_bytes()).sum()
     }
 }
 

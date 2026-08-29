@@ -368,6 +368,10 @@ pub fn nvfp4_linear_f16(
         None
     };
 
+    // Эксперт MoE: перемешанная копия должна лечь в пул экспертов. Гард —
+    // потоко-локальный флаг, поэтому держим его РОВНО на построение: дальше по
+    // функции ядра берут свои workspace'ы, и им место в пуле активаций.
+    let _expert_pool = w.alloc_guard();
     let shuf_storage = w.shuffled_or_try_init(|| {
         let packed_arc = w.packed_arc().ok_or_else(|| {
             SynaptixError::Cuda("nvfp4_linear: raw W освобождён, shuffled не построить".into())
@@ -394,6 +398,7 @@ pub fn nvfp4_linear_f16(
         }
         Ok(Arc::new(storage))
     })?;
+    drop(_expert_pool);
     // Безусловно освобождаем сырой packed-NVFP4 сразу после построения shuf: shuf —
     // ЕДИНСТВЕННЫЙ формат, который читают все GEMV/GEMM-планы (CUTLASS/TmaWs2,
     // которым нужен был packed, вырезаны в decutlass). Держать обе копии = 2×

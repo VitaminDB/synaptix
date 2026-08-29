@@ -173,6 +173,47 @@ impl DFlashCache {
     pub fn context_start(&self) -> usize {
         self.start
     }
+
+    /// Переселить буфер драфтера в host-RAM (см.
+    /// `KvCache::park_to_host`): на время вложенной генерации кэш
+    /// префикс-KV не должен держать VRAM.
+    pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for t in self.k.iter_mut().chain(self.v.iter_mut()) {
+            if t.device() == Device::Cpu {
+                continue;
+            }
+            moved += t.dtype().bytes_for_numel(t.numel());
+            *t = t
+                .to_device(Device::Cpu)
+                .map_err(|e| ModelError::Forward(e.to_string()))?;
+        }
+        Ok(moved)
+    }
+
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for t in self.k.iter_mut().chain(self.v.iter_mut()) {
+            if t.device() == device {
+                continue;
+            }
+            moved += t.dtype().bytes_for_numel(t.numel());
+            *t = t
+                .to_device(device)
+                .map_err(|e| ModelError::Forward(e.to_string()))?;
+        }
+        Ok(moved)
+    }
+
+    /// Сколько VRAM держит буфер драфтера прямо сейчас.
+    pub fn device_bytes(&self) -> usize {
+        self.k
+            .iter()
+            .chain(self.v.iter())
+            .filter(|t| t.device() != Device::Cpu)
+            .map(|t| t.dtype().bytes_for_numel(t.numel()))
+            .sum()
+    }
 }
 
 pub struct DFlashModule {

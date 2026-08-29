@@ -37,15 +37,26 @@ fn trace(bytes: usize) {
     }
 }
 
-/// Sync всех стримов + возврат пулом освобождённых блоков драйверу.
+/// Sync всех стримов + возврат пулом освобождённых блоков драйверу, а со
+/// второй попытки — ещё и просьба к отдаваемым кэшам подвинуться
+/// (`memory::reclaim`: кэш экспертов MoE перечитается из бандла).
 /// `attempt` — номер попытки, задаёт паузу перед sync'ом.
-fn reclaim(ordinal: usize, attempt: u32) {
+fn reclaim(ordinal: usize, attempt: u32, want: usize) {
     if attempt > 0 {
         std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+        let ask = want.max(MIN_RECLAIM).saturating_mul(attempt as usize);
+        synaptix_core::memory::reclaim::reclaim(
+            synaptix_core::device::Device::Cuda(ordinal),
+            ask,
+        );
     }
     let _ = synaptix_core::device::cuda::synchronize_all(ordinal);
     let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ordinal);
 }
+
+/// Меньше этого просить у кэшей бессмысленно: пул отдаёт драйверу целыми
+/// сегментами, и на просьбу в мегабайт вернётся ноль.
+const MIN_RECLAIM: usize = 512 * 1024 * 1024;
 
 /// Диагностика провалившегося скретча: кто держит VRAM в момент OOM'а.
 /// Печатается один раз на исчерпание — ровно как `[OOM_TOP]`/`[OOM_SUM]` в
@@ -122,7 +133,7 @@ impl WsAlloc for Arc<CudaStream> {
         };
         let ord = self.context().ordinal();
         for attempt in 0..RETRIES {
-            reclaim(ord, attempt);
+            reclaim(ord, attempt, len * std::mem::size_of::<T>());
             if let Ok(b) = synaptix_core::device::cuda::alloc_act_zeros::<T>(self, len) {
                 return Ok(b);
             }
@@ -136,15 +147,15 @@ impl WsAlloc for Arc<CudaStream> {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         trace(len * std::mem::size_of::<T>());
-        let first = match self.alloc_zeros::<T>(len) {
+        let first = match synaptix_core::device::cuda::alloc_cache_zeros::<T>(self, len) {
             Ok(b) => return Ok(b),
             Err(e) if is_oom(&e) => e,
             Err(e) => return Err(e),
         };
         let ord = self.context().ordinal();
         for attempt in 0..RETRIES {
-            reclaim(ord, attempt);
-            if let Ok(b) = self.alloc_zeros::<T>(len) {
+            reclaim(ord, attempt, len * std::mem::size_of::<T>());
+            if let Ok(b) = synaptix_core::device::cuda::alloc_cache_zeros::<T>(self, len) {
                 return Ok(b);
             }
         }
@@ -157,15 +168,17 @@ impl WsAlloc for Arc<CudaStream> {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         trace(len * std::mem::size_of::<T>());
-        let first = match self.alloc::<T>(len) {
+        let first = match unsafe { synaptix_core::device::cuda::alloc_cache_uninit::<T>(self, len) }
+        {
             Ok(b) => return Ok(b),
             Err(e) if is_oom(&e) => e,
             Err(e) => return Err(e),
         };
         let ord = self.context().ordinal();
         for attempt in 0..RETRIES {
-            reclaim(ord, attempt);
-            if let Ok(b) = self.alloc::<T>(len) {
+            reclaim(ord, attempt, len * std::mem::size_of::<T>());
+            if let Ok(b) = unsafe { synaptix_core::device::cuda::alloc_cache_uninit::<T>(self, len) }
+            {
                 return Ok(b);
             }
         }
@@ -182,7 +195,7 @@ impl WsAlloc for Arc<CudaStream> {
         };
         let ord = self.context().ordinal();
         for attempt in 0..RETRIES {
-            reclaim(ord, attempt);
+            reclaim(ord, attempt, len * std::mem::size_of::<T>());
             if let Ok(b) = unsafe { synaptix_core::device::cuda::alloc_act_uninit::<T>(self, len) } {
                 return Ok(b);
             }

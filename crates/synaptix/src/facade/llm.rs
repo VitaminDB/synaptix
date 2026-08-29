@@ -14,14 +14,16 @@ use synaptix_core::dtype::DType;
 use synaptix_core::precision::{parse_dtype, PrecisionConfig};
 use synaptix_core::tensor::Tensor;
 use synaptix_llm_common::{
-    GenerationConfig, KvCache as LlmKvCache, LinearSnapshot, StreamSink,
+    mrope, GenerationConfig, KvCache as LlmKvCache, LinearSnapshot, StreamSink,
 };
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
-use synaptix_llm_qwen4_exp::pipeline::Qwen4ExpPipeline;
+use synaptix_llm_qwen4_exp::pipeline::{
+    MediaInput as Qwen4MediaInput, Qwen4ExpPipeline, Qwen4ExpSession,
+};
 use synaptix_llm_qwen3_next_hybrid::pipeline::{HybridPipeline, MediaInput};
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
 use synaptix_tokenizer::{
@@ -503,16 +505,45 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
+            // Та же разметка, что у гибрида, только сетка блока трёхмерна:
+            // блок картинки и блок группы кадров — это `t = 1`, ось времени
+            // ведёт таймкод в тексте (см. `VideoPromptInfo::prompt_block`).
+            LlmPipeline::Qwen4Exp(p) => {
+                let mut inputs: Vec<Qwen4MediaInput> = Vec::new();
+                for (kind, pad) in [
+                    (MediaKind::Image, p.config.image_token_id),
+                    (MediaKind::Video, p.config.video_token_id),
+                ] {
+                    let Some(embeds) = concat_media(media, kind)? else { continue };
+                    let pad = pad.ok_or_else(|| {
+                        LlmError(format!("config.json без id заполнителя для {kind:?}"))
+                    })?;
+                    let grids: Vec<mrope::Grid3> = media
+                        .iter()
+                        .filter(|m| m.kind == kind)
+                        .flat_map(|m| {
+                            std::iter::repeat_n(
+                                mrope::Grid3::image(m.grid_hw.0, m.grid_hw.1),
+                                m.blocks,
+                            )
+                        })
+                        .collect();
+                    inputs.push(Qwen4MediaInput { pad, embeds, grids });
+                }
+                p.generate_media_streaming(prompt_ids, &inputs, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             _ => Err(LlmError("архитектура не принимает медиа-вход".into())),
         }
     }
 
     /// Блок-заполнитель картинки в тексте промпта. Спецтокены у архитектур
     /// свои: Muse Glimmer — `<|image_start|><|patch|>…<|image_end|>`,
-    /// Qwen-гибрид — `<|vision_start|><|image_pad|>…<|vision_end|>`.
+    /// Qwen-гибрид и Qwen4Exp — `<|vision_start|><|image_pad|>…<|vision_end|>`.
     fn image_block(&self, tokens: usize) -> String {
         match self {
-            LlmPipeline::Hybrid(_) => format!(
+            LlmPipeline::Hybrid(_) | LlmPipeline::Qwen4Exp(_) => format!(
                 "{QWEN_VISION_START_TOKEN}{}{QWEN_VISION_END_TOKEN}",
                 QWEN_IMAGE_PAD_TOKEN.repeat(tokens)
             ),
@@ -654,6 +685,11 @@ enum SessionKind {
     /// поэтому снимок не нужен; зато у sliding-слоёв кэш держит лишь последние
     /// W токенов — граница должна попадать в окно.
     Muse { dcache: Option<DFlashCache> },
+    /// Qwen4Exp: весь кэш хода (KV+индексатор QSA, рекуррентное состояние GDN,
+    /// свёртка PLE) живёт своим типом внутри пайплайна, поэтому общий
+    /// `LlmKvCache` для такой сессии пустой — вся работа идёт через
+    /// [`Qwen4ExpSession`].
+    Qwen4Exp(Box<Qwen4ExpSession>),
 }
 
 impl LlmKvSession {
@@ -695,6 +731,9 @@ impl LlmKvSession {
                     0
                 }
             }
+            // У Qwen4Exp свой кэш и свой счёт токенов — `self.ids` для него
+            // не ведётся.
+            SessionKind::Qwen4Exp(s) => s.reusable(prompt_ids),
         }
     }
 
@@ -713,7 +752,103 @@ impl LlmKvSession {
                     d.reset();
                 }
             }
+            SessionKind::Qwen4Exp(s) => s.invalidate(),
         }
+    }
+
+    /// Переселить весь кэш сессии в host-RAM и вернуть VRAM.
+    ///
+    /// Нужно на время вложенной генерации: субагент крутит свой цикл на той
+    /// же модели и просит собственный KV-ринг, а посчитанный контекст
+    /// родителя в это время бесполезно держит гигабайты — ровно тот OOM,
+    /// который вложенный прогон отдаёт вместо ответа. Перевоз через PCIe
+    /// (десятки мс на сотни МБ) дешевле, чем потерять префикс и префиллить
+    /// историю заново (секунды).
+    ///
+    /// Возвращает, сколько байт уехало в RAM. Сама VRAM возвращается
+    /// драйверу не здесь, а тримом пула — зовите его следом.
+    pub fn park_to_host(&mut self) -> Result<usize, LlmError> {
+        let mut moved = self.kv.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+        match &mut self.kind {
+            SessionKind::Hybrid { mtp_kv, snap, .. } => {
+                moved += mtp_kv.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+                if let Some(sn) = snap.as_mut() {
+                    for s in sn.iter_mut() {
+                        moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+                    }
+                }
+            }
+            SessionKind::Muse { dcache } => {
+                if let Some(d) = dcache.as_mut() {
+                    moved += d.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+                }
+            }
+            SessionKind::Qwen4Exp(s) => {
+                moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Обратный переезд. Если VRAM не нашлось — ошибка, и вызывающему стоит
+    /// выбросить сессию: полный префилл всегда возможен, а половина кэша на
+    /// устройстве — нет.
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, LlmError> {
+        let mut moved = self
+            .kv
+            .unpark_to(device)
+            .map_err(|e| LlmError(e.to_string()))?;
+        match &mut self.kind {
+            SessionKind::Hybrid { mtp_kv, snap, .. } => {
+                moved += mtp_kv
+                    .unpark_to(device)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                if let Some(sn) = snap.as_mut() {
+                    for s in sn.iter_mut() {
+                        moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
+                    }
+                }
+            }
+            SessionKind::Muse { dcache } => {
+                if let Some(d) = dcache.as_mut() {
+                    moved += d.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
+                }
+            }
+            SessionKind::Qwen4Exp(s) => {
+                moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Кэш сейчас в host-RAM.
+    pub fn is_parked(&self) -> bool {
+        match &self.kind {
+            SessionKind::Qwen4Exp(s) => s.is_parked(),
+            _ => self.kv.is_parked(),
+        }
+    }
+
+    /// Сколько VRAM держит сессия прямо сейчас (0 — она припаркована).
+    pub fn device_bytes(&self) -> usize {
+        let mut total = self.kv.device_bytes();
+        match &self.kind {
+            SessionKind::Hybrid { mtp_kv, snap, .. } => {
+                total += mtp_kv.device_bytes();
+                // Снимок GDN-состояния — тоже VRAM, и заметная: у гибрида
+                // 27B это сотни мегабайт рядом с самим кэшем.
+                if let Some(sn) = snap.as_ref() {
+                    total += sn.iter().map(|s| s.device_bytes()).sum::<usize>();
+                }
+            }
+            SessionKind::Muse { dcache } => {
+                if let Some(d) = dcache.as_ref() {
+                    total += d.device_bytes();
+                }
+            }
+            SessionKind::Qwen4Exp(s) => total += s.device_bytes(),
+        }
+        total
     }
 
     /// Сбросить кэш к пустому состоянию перед полным префиллом.
@@ -730,6 +865,8 @@ impl LlmKvSession {
                     d.reset();
                 }
             }
+            // Qwen4Exp сбрасывает свой кэш сам, внутри хода.
+            SessionKind::Qwen4Exp(_) => {}
         }
     }
 }
@@ -811,6 +948,19 @@ impl Llm {
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Muse { dcache },
+                }))
+            }
+            LlmPipeline::Qwen4Exp(p) => {
+                // Весь кэш этой модели (KV+индексатор QSA, рекуррентное
+                // состояние GDN, свёртка PLE) — свой тип пайплайна, поэтому
+                // общий `kv` тут пустой каркас: он нужен только чтобы не
+                // делать поле опциональным ради одной архитектуры.
+                let session = p.new_session(ctx).map_err(|e| LlmError(e.to_string()))?;
+                Ok(Some(LlmKvSession {
+                    kv: LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx },
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Qwen4Exp(Box::new(session)),
                 }))
             }
             _ => Ok(None),
@@ -900,8 +1050,8 @@ impl MediaEmbedding {
 impl Llm {
     /// Умеет ли архитектура принимать медиа-вход и есть ли это в сборке:
     /// у Muse Glimmer — `vision_config` в конфиге, у Qwen-гибрида
-    /// (Qwen3.5/3.6/3.8) — `image_token_id` в конфиге и компонент башни
-    /// в бандле (`model.visual.*`). Иначе это text-only.
+    /// (Qwen3.5/3.6/3.8) и Qwen4Exp — `image_token_id` в конфиге и компонент
+    /// башни в бандле (`model.visual.*`). Иначе это text-only.
     pub fn supports_media(&self) -> bool {
         match self.pipeline.lock() {
             Ok(p) => match &*p {
@@ -909,6 +1059,10 @@ impl Llm {
                 LlmPipeline::Hybrid(h) => {
                     h.config.image_token_id.is_some()
                         && HybridPipeline::bundle_has_vision(&self.model_path)
+                }
+                LlmPipeline::Qwen4Exp(q) => {
+                    q.config.image_token_id.is_some()
+                        && Qwen4ExpPipeline::bundle_has_vision(&self.model_path)
                 }
                 _ => false,
             },
@@ -922,6 +1076,7 @@ impl Llm {
             Ok(p) => match &*p {
                 LlmPipeline::MuseGlimmer(m) => m.has_vision(),
                 LlmPipeline::Hybrid(h) => h.has_vision(),
+                LlmPipeline::Qwen4Exp(q) => q.has_vision(),
                 _ => false,
             },
             Err(_) => false,
@@ -953,6 +1108,13 @@ impl Llm {
                 h.load_vision(&self.model_path, self.compute_dtype)
                     .map_err(|e| LlmError(format!("vision load: {e}")))
             }
+            LlmPipeline::Qwen4Exp(q) => {
+                if q.has_vision() {
+                    return Ok(true);
+                }
+                q.load_vision(&self.model_path, self.compute_dtype)
+                    .map_err(|e| LlmError(format!("vision load: {e}")))
+            }
             _ => Ok(false),
         }
     }
@@ -963,6 +1125,7 @@ impl Llm {
             match &mut *guard {
                 LlmPipeline::MuseGlimmer(m) => m.release_vision(),
                 LlmPipeline::Hybrid(h) => h.release_vision(),
+                LlmPipeline::Qwen4Exp(q) => q.release_vision(),
                 _ => {}
             }
         }
@@ -990,6 +1153,13 @@ impl Llm {
             LlmPipeline::Hybrid(h) => h
                 .encode_image_limited_with_grid(path, max_tokens)
                 .map_err(|e| LlmError(format!("image encode: {e}")))?,
+            LlmPipeline::Qwen4Exp(q) => {
+                let limits = q
+                    .image_limits(max_tokens)
+                    .map_err(|e| LlmError(format!("image encode: {e}")))?;
+                q.encode_image(path, limits)
+                    .map_err(|e| LlmError(format!("image encode: {e}")))?
+            }
             _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
         let tokens = embeds.dims()[0];
@@ -1014,6 +1184,12 @@ impl Llm {
             LlmPipeline::Hybrid(h) => {
                 let (embeds, info) = h
                     .encode_video(path)
+                    .map_err(|e| LlmError(format!("video encode: {e}")))?;
+                (embeds, info.prompt_block(), info.grid_hw, info.groups)
+            }
+            LlmPipeline::Qwen4Exp(q) => {
+                let (embeds, info) = q
+                    .encode_video_with_info(path)
                     .map_err(|e| LlmError(format!("video encode: {e}")))?;
                 (embeds, info.prompt_block(), info.grid_hw, info.groups)
             }
@@ -1194,6 +1370,13 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        // Сессию могли припарковать в host-RAM на время вложенной генерации
+        // (см. [`LlmKvSession::park_to_host`]). Забирать её обратно —
+        // обязанность вызывающего, но забыть это дешевле, чем поймать
+        // device mismatch посреди forward'а.
+        if session.is_parked() {
+            session.unpark_to(self.model.device)?;
+        }
         let pipeline = self
             .model
             .pipeline
@@ -1343,6 +1526,15 @@ impl<'a> LlmGeneration<'a> {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
                 }
+            }
+            LlmPipeline::Qwen4Exp(p) => {
+                let SessionKind::Qwen4Exp(s) = &mut session.kind else {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                };
+                let (_, _, reuse) = p
+                    .generate_cached_streaming(s, prompt_ids, cfg, &mut sink)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(reuse)
             }
             _ => Err(LlmError("префикс-KV: архитектура не поддержана".into())),
         }

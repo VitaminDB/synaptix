@@ -395,6 +395,16 @@ pub(crate) fn cuda_alloc_zeros(device: Device, n_bytes: usize) -> Result<Storage
                 let mut got = None;
                 for attempt in 0..5u32 {
                     std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+                    if attempt > 0 {
+                        // Живую память трим не вернёт — просим отдаваемые кэши
+                        // (эксперты MoE) подвинуться. Полгигабайта — минимум,
+                        // которым пул реально шевелит сегменты.
+                        const MIN_RECLAIM: usize = 512 * 1024 * 1024;
+                        crate::memory::reclaim::reclaim(
+                            device,
+                            n_bytes.max(MIN_RECLAIM).saturating_mul(attempt as usize),
+                        );
+                    }
                     let _ = crate::device::cuda::synchronize_all(ord);
                     let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
                     if let Ok(b) = crate::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {

@@ -531,6 +531,158 @@ impl KvCache {
             }
         }
     }
+
+    /// Переселяет содержимое кэша в host-RAM: буферы слоёв заменяются
+    /// CPU-копиями, VRAM возвращается пулу. Возвращает, сколько байт VRAM
+    /// освободилось (не всё из этого едет через шину: device-зеркала GDN
+    /// просто сбрасываются — их источник истины и так в RAM).
+    ///
+    /// Зачем: пока идёт вложенная генерация (субагент, сводка), посчитанный
+    /// контекст диалога держит гигабайты VRAM, а вложенному прогону их не
+    /// хватает. Перевезти префикс через PCIe и привезти обратно дешевле, чем
+    /// потерять его и префиллить историю заново: 220 МБ идут ~40 мс в обе
+    /// стороны против единиц секунд на префилл тех же токенов.
+    ///
+    /// Состояние кэша (`seq_len`, `start` слоёв) не меняется — переезжают
+    /// только данные. Forward по «припаркованному» кэшу упадёт на
+    /// несовпадении устройств, это осознанно: молча считать по пустому
+    /// буферу хуже, чем громко отказать.
+    pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for l in self.layers.iter_mut() {
+            match l {
+                LayerCache::Full(f) => {
+                    moved += park_tensor(&mut f.k)?;
+                    moved += park_tensor(&mut f.v)?;
+                    if let Some(t) = f.k_scale.as_mut() {
+                        moved += park_tensor(t)?;
+                    }
+                    if let Some(t) = f.v_scale.as_mut() {
+                        moved += park_tensor(t)?;
+                    }
+                }
+                LayerCache::Linear(st) => {
+                    // У GDN источник истины — host-векторы, а device-зеркала
+                    // пересеиваются из них (`sync_to_device`). Поэтому их не
+                    // возим, а сбрасываем — предварительно считав то, что
+                    // дописал graph-декод.
+                    st.sync_to_host().coerr()?;
+                    moved += tensor_bytes(st.conv_state_dev.as_ref());
+                    moved += tensor_bytes(st.ssm_state_dev.as_ref());
+                    st.conv_state_dev = None;
+                    st.ssm_state_dev = None;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Обратный переезд: [`Self::park_to_host`] наоборот.
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        for l in self.layers.iter_mut() {
+            let LayerCache::Full(f) = l else { continue };
+            moved += unpark_tensor(&mut f.k, device)?;
+            moved += unpark_tensor(&mut f.v, device)?;
+            if let Some(t) = f.k_scale.as_mut() {
+                moved += unpark_tensor(t, device)?;
+            }
+            if let Some(t) = f.v_scale.as_mut() {
+                moved += unpark_tensor(t, device)?;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Содержимое лежит в host-RAM — до forward'а нужен [`Self::unpark_to`].
+    pub fn is_parked(&self) -> bool {
+        self.layers.iter().any(|l| match l {
+            LayerCache::Full(f) => f.k.device() == Device::Cpu,
+            LayerCache::Linear(_) => false,
+        })
+    }
+
+    /// Сколько VRAM держат буферы слоёв прямо сейчас.
+    pub fn device_bytes(&self) -> usize {
+        let mut total = 0;
+        for l in &self.layers {
+            match l {
+                LayerCache::Full(f) => {
+                    for t in [Some(&f.k), Some(&f.v), f.k_scale.as_ref(), f.v_scale.as_ref()] {
+                        if let Some(t) = t {
+                            if t.device() != Device::Cpu {
+                                total += tensor_bytes(Some(t));
+                            }
+                        }
+                    }
+                }
+                LayerCache::Linear(st) => {
+                    total += tensor_bytes(st.conv_state_dev.as_ref());
+                    total += tensor_bytes(st.ssm_state_dev.as_ref());
+                }
+            }
+        }
+        total
+    }
+}
+
+fn tensor_bytes(t: Option<&Tensor>) -> usize {
+    t.map(|t| t.dtype().bytes_for_numel(t.numel())).unwrap_or(0)
+}
+
+fn park_tensor(t: &mut Tensor) -> Result<usize, ModelError> {
+    if t.device() == Device::Cpu {
+        return Ok(0);
+    }
+    let bytes = tensor_bytes(Some(t));
+    *t = t.to_device(Device::Cpu).coerr()?;
+    Ok(bytes)
+}
+
+fn unpark_tensor(t: &mut Tensor, device: Device) -> Result<usize, ModelError> {
+    if t.device() == device {
+        return Ok(0);
+    }
+    let bytes = tensor_bytes(Some(t));
+    *t = t.to_device(device).coerr()?;
+    Ok(bytes)
+}
+
+impl LinearSnapshot {
+    /// Переселить снимок linear-состояния в host-RAM — см.
+    /// [`KvCache::park_to_host`]. Device-половина снимка переезжает как есть:
+    /// host-половина (`*_host`) и так лежит в RAM.
+    pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        if let Some(t) = self.conv_dev.as_mut() {
+            moved += park_tensor(t)?;
+        }
+        if let Some(t) = self.ssm_dev.as_mut() {
+            moved += park_tensor(t)?;
+        }
+        Ok(moved)
+    }
+
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        let mut moved = 0;
+        if let Some(t) = self.conv_dev.as_mut() {
+            moved += unpark_tensor(t, device)?;
+        }
+        if let Some(t) = self.ssm_dev.as_mut() {
+            moved += unpark_tensor(t, device)?;
+        }
+        Ok(moved)
+    }
+
+    /// Сколько VRAM держит device-половина снимка прямо сейчас.
+    pub fn device_bytes(&self) -> usize {
+        [self.conv_dev.as_ref(), self.ssm_dev.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|t| t.device() != Device::Cpu)
+            .map(|t| tensor_bytes(Some(t)))
+            .sum()
+    }
 }
 
 pub struct DecodeState {

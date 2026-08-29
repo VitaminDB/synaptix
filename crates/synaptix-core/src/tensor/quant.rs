@@ -16,6 +16,11 @@ pub struct QuantWeight {
     k: usize,
     device: Device,
     shuffled: OnceCell<Arc<Storage>>,
+    /// Вес живёт в кэше экспертов MoE: его перемешанная копия должна лечь в
+    /// пул экспертов, а не в default'ный рядом с резидентными весами — иначе
+    /// вытеснение эксперта не возвращает драйверу ничего (см.
+    /// `synaptix_core::device::cuda::experts_pool`).
+    expert_pool: std::sync::atomic::AtomicBool,
 }
 
 impl QuantWeight {
@@ -46,7 +51,25 @@ impl QuantWeight {
             k,
             device,
             shuffled: OnceCell::new(),
+            expert_pool: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Пометить вес как эксперта MoE — см. поле `expert_pool`.
+    pub fn mark_expert_pool(&self) {
+        self.expert_pool.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_expert_pool(&self) -> bool {
+        self.expert_pool.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Гард пула под аллокации, которые принадлежат этому весу (перемешанная
+    /// копия). `None` — вес не из кэша экспертов, пул выбирается как раньше.
+    pub fn alloc_guard(&self) -> Option<crate::device::cuda::ExpertsAllocGuard> {
+        self.is_expert_pool()
+            .then(|| crate::device::cuda::ExpertsAllocGuard::for_device(self.device))
+            .flatten()
     }
 
     pub fn from_tensors(packed: &Tensor, scales: &Tensor, n: usize, k: usize) -> Result<Self> {
@@ -129,14 +152,22 @@ impl QuantWeight {
             let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
                 "QuantWeight::to_device: packed released",
             ))?;
-            return Self::new(packed, self.scales.clone(), self.dtype, self.n, self.k);
+            let out = Self::new(packed, self.scales.clone(), self.dtype, self.n, self.k)?;
+            if self.is_expert_pool() {
+                out.mark_expert_pool();
+            }
+            return Ok(out);
         }
         let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
             "QuantWeight::to_device: packed released",
         ))?;
         let packed = Arc::new(crate::tensor::conversion::storage_to_device(&packed, dev)?);
         let scales = Arc::new(crate::tensor::conversion::storage_to_device(&self.scales, dev)?);
-        Self::new(packed, scales, self.dtype, self.n, self.k)
+        let out = Self::new(packed, scales, self.dtype, self.n, self.k)?;
+        if self.is_expert_pool() {
+            out.mark_expert_pool();
+        }
+        Ok(out)
     }
 
     /// Посчитать сразу несколько NVFP4-GEMV одним запуском: `out[e]` = `W_e ·
@@ -162,7 +193,9 @@ impl QuantWeight {
         let stream = Stream::default_for(self.device)?;
         let bytes = DType::NVFP4.bytes_for_numel(self.n * self.k);
         // Перемешанная копия — это вес, а не активация: в общем пуле она дробит
-        // free-list, из которого потом нечем выделить крупный буфер.
+        // free-list, из которого потом нечем выделить крупный буфер. У эксперта
+        // MoE пул свой — он вытесняется вместе с ним.
+        let _expert_pool = self.alloc_guard();
         let _weights_pool = crate::device::cuda::WeightsAllocGuard::new();
         let mut out = backend.alloc_zeros(bytes, self.device)?;
         backend.nvfp4_repack(&packed, &mut out, self.n, self.k, &stream)?;

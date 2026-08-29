@@ -126,7 +126,14 @@ impl Expert {
 pub struct ExpertCache {
     device: Device,
     capacity_bytes: AtomicUsize,
-    /// Лимит временного набора префилла.
+    /// Потолок ёмкости: то, что задано настройкой. `capacity_bytes` ходит под
+    /// ним туда-сюда — вниз на нехватке VRAM, обратно вверх, когда пик хода
+    /// пройден.
+    ceiling_bytes: AtomicUsize,
+    /// Лимит временного набора префилла — ЧАСТЬ общего бюджета
+    /// `capacity_bytes`, а не добавка к нему: раньше на карте оказывалось
+    /// `capacity + scratch` байт экспертов (12 + 3 ГБ при 24 ГБ VRAM), и
+    /// активациям префилла не оставалось ничего.
     scratch_bytes: usize,
     scratch_mode: std::sync::atomic::AtomicBool,
     inner: Mutex<CacheInner>,
@@ -185,12 +192,22 @@ pub struct ExpertCacheStats {
 
 impl ExpertCache {
     pub fn new(device: Device, capacity_bytes: usize) -> Arc<Self> {
+        let me = Self::build(device, capacity_bytes);
+        // Кэш перечитывается из бандла, поэтому на чужом OOM он обязан
+        // подвинуться — регистрируем как отдаваемую память устройства.
+        let dynamic: Arc<dyn synaptix_core::memory::reclaim::Reclaimable> = me.clone();
+        synaptix_core::memory::reclaim::register(&dynamic);
+        me
+    }
+
+    fn build(device: Device, capacity_bytes: usize) -> Arc<Self> {
         let pinned = matches!(device, Device::Cuda(_))
             && std::env::var("SYN_MOE_PINNED").map(|v| v.trim() == "1").unwrap_or(false);
         Arc::new(Self {
             device,
             capacity_bytes: AtomicUsize::new(capacity_bytes),
-            scratch_bytes: (capacity_bytes / 4).clamp(1 << 30, 4 << 30),
+            ceiling_bytes: AtomicUsize::new(capacity_bytes),
+            scratch_bytes: (capacity_bytes / 4).min(2 << 30),
             scratch_mode: std::sync::atomic::AtomicBool::new(false),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
             inner: Mutex::new(CacheInner {
@@ -228,14 +245,62 @@ impl ExpertCache {
         self.trim_to(bytes);
     }
 
-    /// Освободить резидентов, пока занято больше `bytes`.
+    /// Освободить резидентов, пока занято больше `bytes` (считая набор
+    /// префилла — бюджет общий). Освобождённое сразу возвращаем драйверу:
+    /// в своём пуле трим отдаёт целые сегменты, ради этого пул и заведён.
     pub fn trim_to(&self, bytes: usize) {
-        let Ok(mut inner) = self.inner.lock() else { return };
-        while inner.bytes > bytes {
-            if !inner.evict_one() {
-                break;
+        {
+            let Ok(mut inner) = self.inner.lock() else { return };
+            if inner.bytes + inner.scratch_bytes <= bytes {
+                return;
+            }
+            while inner.bytes + inner.scratch_bytes > bytes {
+                if !inner.evict_one() {
+                    break;
+                }
             }
         }
+        if let Device::Cuda(ord) = self.device {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+            let _ = synaptix_core::device::cuda::trim_experts_pool(ord);
+        }
+    }
+
+    /// Потолок ёмкости (то, что задано настройкой).
+    pub fn ceiling_bytes(&self) -> usize {
+        self.ceiling_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Опустить потолок — например, когда при загрузке видно, что заказанный
+    /// кэш не оставляет места ни KV, ни активациям.
+    pub fn set_ceiling(&self, bytes: usize) {
+        self.ceiling_bytes.store(bytes, Ordering::Relaxed);
+        if self.capacity_bytes.load(Ordering::Relaxed) > bytes {
+            self.set_capacity(bytes);
+        }
+    }
+
+    /// Подогнать ёмкость под текущую VRAM, оставив `reserve` байт свободными
+    /// под активации и KV предстоящей фазы. Кэш и растёт (после пика хода
+    /// потолок возвращается), и ужимается — а `reclaim` на OOM только режет,
+    /// иначе первая же нехватка навсегда оставила бы модель без кэша.
+    pub fn fit_to_vram(&self, reserve: usize) -> usize {
+        let ceiling = self.ceiling_bytes();
+        let Device::Cuda(ord) = self.device else {
+            return ceiling;
+        };
+        let Ok((free, _total)) = synaptix_core::device::cuda::mem_info(ord) else {
+            return self.capacity_bytes();
+        };
+        // Слабина своего пула — тоже наша: она уйдёт под следующего эксперта,
+        // не занимая у драйвера.
+        let slack = synaptix_core::device::cuda::experts_pool_stats(ord)
+            .map(|(rsv, used)| rsv.saturating_sub(used) as usize)
+            .unwrap_or(0);
+        let room = self.used_bytes() + free + slack;
+        let want = room.saturating_sub(reserve).clamp(MIN_CACHE_BYTES, ceiling);
+        self.set_capacity(want);
+        want
     }
 
     pub fn stats(&self) -> ExpertCacheStats {
@@ -339,6 +404,7 @@ impl ExpertCache {
         if inner.map.contains_key(&key) || inner.scratch.contains_key(&key) {
             return;
         }
+        let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         if scratch {
             while inner.scratch_bytes + bytes > self.scratch_bytes {
                 let Some(victim) = inner.scratch_order.pop_front() else { break };
@@ -346,13 +412,19 @@ impl ExpertCache {
                     inner.scratch_bytes = inner.scratch_bytes.saturating_sub(old.bytes());
                 }
             }
+            // Набор префилла — часть общего бюджета: под него уступает
+            // прогретый кэш, а не свободная VRAM (её ждут активации).
+            while inner.bytes + inner.scratch_bytes + bytes > capacity {
+                if !inner.evict_one() {
+                    break;
+                }
+            }
             inner.scratch_bytes += bytes;
             inner.scratch_order.push_back(key);
             inner.scratch.insert(key, expert);
             return;
         }
-        let capacity = self.capacity_bytes.load(Ordering::Relaxed);
-        while inner.bytes + bytes > capacity {
+        while inner.bytes + inner.scratch_bytes + bytes > capacity {
             if !inner.evict_one() {
                 break;
             }
@@ -361,14 +433,66 @@ impl ExpertCache {
         inner.order.push_back(key);
         inner.map.insert(key, Resident { expert, used: false });
     }
+
+    /// Занято экспертами всего (прогретые + набор префилла).
+    pub fn used_bytes(&self) -> usize {
+        self.inner.lock().map(|i| i.bytes + i.scratch_bytes).unwrap_or(0)
+    }
 }
+
+impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
+    /// Отдать не меньше `want` байт: сперва набор префилла (он перечитается
+    /// на следующем чанке), потом прогретые эксперты. Ёмкость опускаем до
+    /// того, что осталось, — иначе кэш тут же наберёт обратно ровно те же
+    /// гигабайты, и ретрай аллокации снова упрётся в OOM.
+    fn reclaim(&self, device: Device, want: usize) -> usize {
+        if device != self.device || want == 0 {
+            return 0;
+        }
+        // Нас зовут из аллокатора — возможно, из-под этого же мьютекса.
+        let Ok(mut inner) = self.inner.try_lock() else { return 0 };
+        let before = inner.bytes + inner.scratch_bytes;
+        if !inner.scratch.is_empty() {
+            inner.scratch.clear();
+            inner.scratch_order.clear();
+            inner.scratch_bytes = 0;
+        }
+        while before.saturating_sub(inner.bytes + inner.scratch_bytes) < want {
+            if !inner.evict_one() {
+                break;
+            }
+        }
+        let freed = before.saturating_sub(inner.bytes + inner.scratch_bytes);
+        let left = inner.bytes + inner.scratch_bytes;
+        drop(inner);
+        if freed == 0 {
+            return 0;
+        }
+        self.capacity_bytes.fetch_min(left.max(MIN_CACHE_BYTES), Ordering::Relaxed);
+        // Пул отдаёт драйверу только по триму, а звавший нас аллокатор
+        // синкает стримы сам — здесь достаточно вернуть сегменты.
+        if let Device::Cuda(ord) = device {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+            let _ = synaptix_core::device::cuda::trim_experts_pool(ord);
+        }
+        freed
+    }
+}
+
+/// Ниже этого кэш не ужимаем: без резидентных экспертов каждый токен
+/// перечитывает с диска все свои десять — генерация встаёт.
+const MIN_CACHE_BYTES: usize = 1 << 30;
 
 impl CacheInner {
     /// Шаг «часов»: эксперт, к которому обращались с прошлого круга, получает
     /// второй шанс, остальные уходят. Выбор экспертов сильно неравномерен, и
     /// простая очередь по возрасту вымывала как раз горячих.
     fn evict_one(&mut self) -> bool {
-        for _ in 0..self.order.len().max(1) {
+        // Два круга, а не один: если на первом у ВСЕХ резидентов взведён бит
+        // обращения (так бывает сразу после плотного чанка), круг только
+        // гасит биты и не вытесняет ничего — а вызывающий по `false` решает,
+        // что кэш пуст, и бросает трим на полном кэше.
+        for _ in 0..(2 * self.order.len()).max(1) {
             let Some(key) = self.order.pop_front() else { return false };
             match self.map.get_mut(&key) {
                 Some(r) if r.used => {
@@ -416,10 +540,21 @@ impl FetchJob {
             .missing
             .par_iter()
             .filter_map(|e| {
-                let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
+                // Пул экспертов, а не общий пул весов: набор кэша живёт и
+                // умирает целиком, и только в своём пуле трим после вытеснения
+                // реально возвращает память драйверу (см. `experts_pool`).
+                let _experts_pool =
+                    synaptix_core::device::cuda::ExpertsAllocGuard::for_device(self.cache.device());
                 let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
                 let (gate_up, down) =
                     self.source.fetch(self.layer_id, *e as usize, self.cache.device()).ok()?;
+                for w in [gate_up.quant_weight(), down.quant_weight()] {
+                    if let Some(w) = w {
+                        // Метка живёт с весом: перемешанную копию может строить
+                        // и первое умножение — она обязана лечь в тот же пул.
+                        w.mark_expert_pool();
+                    }
+                }
                 if self.prepare_batch {
                     // Только на декоде: репак держит обе копии веса разом, а на
                     // префилле экспертов поднимается сотнями и пик не влезает.
@@ -860,12 +995,13 @@ impl MoeFfn {
                 Ok(out) => out,
                 Err(e) if is_oom(&e) => {
                     // Кэш экспертов держит память, которой не хватило активациям:
-                    // отдаём половину и пробуем ещё раз, прежде чем падать.
-                    if let Some(cache) = &self.cache {
-                        cache.trim_to(cache.capacity_bytes() / 2);
-                    } else {
-                        return Err(e);
-                    }
+                    // отдаём половину ЗАНЯТОГО (не ёмкости — она константа, и
+                    // делить её пополам на полупустом кэше значит не отдать
+                    // ничего) и опускаем ёмкость, иначе кэш наберёт обратно
+                    // ровно те же гигабайты ещё до конца чанка.
+                    let Some(cache) = &self.cache else { return Err(e) };
+                    let want = (cache.used_bytes() / 2).max(MIN_CACHE_BYTES);
+                    cache.set_capacity(want);
                     self.forward_chunk(&chunk)?
                 }
                 Err(e) => return Err(e),
@@ -1217,8 +1353,10 @@ impl MoeFfn {
         }
         // Веса эксперта живут отдельно от активаций: смешанные в одном пуле
         // мелкие веса и крупные буферы префилла дробят free-list, и уже через
-        // несколько слоёв не находится непрерывного куска.
-        let _weights_pool = synaptix_core::device::cuda::WeightsAllocGuard::new();
+        // несколько слоёв не находится непрерывного куска. И отдельно от
+        // резидентных весов модели: вытеснение обязано возвращать память.
+        let _experts_pool =
+            synaptix_core::device::cuda::ExpertsAllocGuard::for_device(cache.device());
         let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
         let fetched = match &self.experts {
             ExpertStore::Resident(all) => {
@@ -1243,6 +1381,11 @@ impl MoeFfn {
                 Expert { gate_up, down }
             }
         };
+        for w in [fetched.gate_up.quant_weight(), fetched.down.quant_weight()] {
+            if let Some(w) = w {
+                w.mark_expert_pool();
+            }
+        }
         let e = Arc::new(fetched);
         cache.insert(key, e.clone());
         Ok(e)

@@ -52,6 +52,24 @@ impl GdnSnap {
         put_dev(&mut state.ssm_state_dev, self.ssm_dev.as_ref())?;
         Ok(())
     }
+
+    /// Отпустить device-половину снимка: истина продублирована в
+    /// host-векторах, и `restore` соберёт зеркала из них заново. Возвращает
+    /// освобождённые байты. См. `ModelCache::park_to_host`.
+    pub fn park_to_host(&mut self) -> usize {
+        let bytes = dev_bytes(self.conv_dev.as_ref()) + dev_bytes(self.ssm_dev.as_ref());
+        self.conv_dev = None;
+        self.ssm_dev = None;
+        bytes
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        dev_bytes(self.conv_dev.as_ref()) + dev_bytes(self.ssm_dev.as_ref())
+    }
+}
+
+fn dev_bytes(t: Option<&Tensor>) -> usize {
+    t.map(|t| t.dtype().bytes_for_numel(t.numel())).unwrap_or(0)
 }
 
 fn clone_dev(src: Option<&Tensor>) -> Result<Option<Tensor>, ModelError> {

@@ -356,3 +356,110 @@ fn prefix_kv_muse_dflash_matches_full_prefill() {
         .expect("cached turn 3");
     assert_eq!(reused, 0, "при расхождении префикса переиспользовать нельзя");
 }
+
+/// Кэш переживает переезд в host-RAM: `park_to_host` + `unpark_to` дают ровно
+/// тот же ход, что и без переезда.
+///
+/// Зачем такой переезд: пока идёт вложенная генерация (субагент чата), кэш
+/// диалога держит гигабайты VRAM, а вложенному прогону их не хватает.
+/// Альтернатива — выбросить кэш и префиллить историю заново, поэтому цена
+/// ошибки здесь — не «медленно», а «тихо другой ответ».
+#[test]
+fn prefix_kv_survives_host_park() {
+    let Ok(path) = std::env::var("SYN_QWEN38_BUNDLE") else {
+        eprintln!("SYN_QWEN38_BUNDLE не задан — пропускаем");
+        return;
+    };
+    reclaim_vram();
+    let (model, tok) = load_llm_with_policy(
+        Path::new(&path),
+        QuantPolicy::balance(),
+        &Device::Cuda(0),
+    )
+    .expect("load");
+
+    let head = "Сформулируй кратко: чем отличается TCP от UDP? Отвечай по-русски. ".repeat(8);
+    let tail = "Дополнение: ещё расскажи про QUIC и его отличие от TCP, тоже кратко. ".repeat(8);
+    let ids1 = tok.encode(&head).expect("encode 1");
+    let mut ids2 = ids1.clone();
+    ids2.extend_from_slice(&tok.encode(&tail).expect("encode 2"));
+    let max_new = 24usize;
+    let ctx = 4096usize;
+
+    // A. Кэш без переезда — эталон.
+    let mut resident2 = Vec::new();
+    let resident_reused;
+    {
+        let mut session = model
+            .new_kv_session(ctx, max_new)
+            .expect("session")
+            .expect("гибрид с MTP умеет префикс-KV");
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.generate_streaming_cached(&mut session, &ids1, &tok, |_, _| true)
+            .expect("resident turn 1");
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        resident_reused = r
+            .generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+                resident2.push(id);
+                true
+            })
+            .expect("resident turn 2");
+    }
+    reclaim_vram();
+
+    // B. Тот же кэш, но между ходами он съездил в RAM и обратно.
+    let mut session = model
+        .new_kv_session(ctx, max_new)
+        .expect("session")
+        .expect("гибрид с MTP умеет префикс-KV");
+    let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+    r.generate_streaming_cached(&mut session, &ids1, &tok, |_, _| true)
+        .expect("parked turn 1");
+
+    let held = session.device_bytes();
+    assert!(held > 0, "после хода кэш обязан держать VRAM");
+    let t = std::time::Instant::now();
+    let moved = session.park_to_host().expect("park");
+    let park_ms = t.elapsed().as_millis();
+    assert!(session.is_parked(), "сессия должна считаться припаркованной");
+    assert_eq!(session.device_bytes(), 0, "припаркованный кэш не держит VRAM");
+    reclaim_vram();
+
+    let t = std::time::Instant::now();
+    let back = session.unpark_to(Device::Cuda(0)).expect("unpark");
+    let unpark_ms = t.elapsed().as_millis();
+    assert!(!session.is_parked());
+    // Возвращается меньше, чем освободилось: device-зеркала GDN-состояния не
+    // возят через шину, их пересеет из host-векторов первый же forward
+    // (`sync_to_device`). Всё остальное — K/V слоёв — обязано вернуться.
+    assert!(back > 0, "K/V слоёв не вернулись");
+    assert_eq!(session.device_bytes(), back, "на устройстве не то, что привезли");
+    assert!(back <= held);
+    println!(
+        "префикс-KV: освобождено {} MB за {park_ms} мс, вернулось {} MB за {unpark_ms} мс \
+         (держал {} MB)",
+        moved / (1024 * 1024),
+        back / (1024 * 1024),
+        held / (1024 * 1024)
+    );
+
+    let mut parked2 = Vec::new();
+    let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+    let parked_reused = r
+        .generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+            parked2.push(id);
+            true
+        })
+        .expect("parked turn 2");
+
+    assert_eq!(
+        parked_reused, resident_reused,
+        "переезд не должен менять размер переиспользуемого префикса"
+    );
+    assert_eq!(
+        tok.decode(&parked2).unwrap_or_default(),
+        tok.decode(&resident2).unwrap_or_default(),
+        "ход после переезда кэша разошёлся с ходом без переезда"
+    );
+    assert_eq!(parked2, resident2, "токены расходятся");
+}

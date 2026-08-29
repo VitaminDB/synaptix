@@ -33,6 +33,21 @@ fn stream_is_capturing(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> b
     )
 }
 
+/// Попросить отдаваемые кэши (кэш экспертов MoE) освободить место под
+/// аллокацию, которой не хватило памяти. Со второй попытки: первая — это
+/// обычный sync+trim, он лечит фрагментацию, а тут уже живая память.
+///
+/// Меньше полугигабайта просить бессмысленно: пул возвращает драйверу целыми
+/// сегментами.
+fn ask_caches(device: Device, attempt: u32, n_bytes: usize) {
+    const MIN_RECLAIM: usize = 512 * 1024 * 1024;
+    if attempt == 0 {
+        return;
+    }
+    let ask = n_bytes.max(MIN_RECLAIM).saturating_mul(attempt as usize);
+    synaptix_core::memory::reclaim::reclaim(device, ask);
+}
+
 impl Backend for CudaBackend {
     fn device_kind(&self) -> Device {
         Device::Cuda(0)
@@ -74,6 +89,7 @@ impl Backend for CudaBackend {
                     let mut got = None;
                     for attempt in 0..5u32 {
                         std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+                        ask_caches(device, attempt, n_bytes);
                         let _ = synaptix_core::device::cuda::synchronize_all(ord);
                         let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
                         if let Ok(b) = synaptix_core::device::cuda::alloc_act_zeros::<u8>(&stream, n_bytes) {
@@ -125,6 +141,7 @@ impl Backend for CudaBackend {
                     let mut got = None;
                     for attempt in 0..5u32 {
                         std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+                        ask_caches(device, attempt, n_bytes);
                         let _ = synaptix_core::device::cuda::synchronize_all(ord);
                         let _ = synaptix_core::memory::cuda_pool::trim_pools_on_oom(ord);
                         if let Ok(b) = unsafe { synaptix_core::device::cuda::alloc_act_uninit::<u8>(&stream, n_bytes) } {

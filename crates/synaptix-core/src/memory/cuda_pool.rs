@@ -155,6 +155,7 @@ pub fn hard_trim_all_pools_device(ordinal: usize) -> crate::error::Result<()> {
     let r = hard_trim_cuda_mempool_device(ordinal);
     let _ = crate::device::cuda::trim_weights_pool(ordinal);
     let _ = crate::device::cuda::trim_activations_pool(ordinal);
+    let _ = crate::device::cuda::trim_experts_pool(ordinal);
     r
 }
 
@@ -165,6 +166,7 @@ pub fn trim_pools_on_oom(ordinal: usize) -> crate::error::Result<()> {
     let r = trim_cuda_mempool_device(ordinal);
     let _ = crate::device::cuda::trim_activations_pool(ordinal);
     let _ = crate::device::cuda::trim_weights_pool(ordinal);
+    let _ = crate::device::cuda::trim_experts_pool(ordinal);
     r
 }
 

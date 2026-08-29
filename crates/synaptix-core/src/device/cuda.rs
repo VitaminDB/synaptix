@@ -312,6 +312,126 @@ mod inner {
             .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolTrimTo(activations): {e:?}")))
     }
 
+    /// Пул ЭКСПЕРТОВ MoE — третий, отдельно и от весов, и от активаций.
+    ///
+    /// Зачем: эксперты кэша (см. `synaptix_llm_common::moe::ExpertCache`) —
+    /// единственные веса, которые приходят и уходят пачками по ходу
+    /// генерации. Пока их packed/scales и перемешанные копии лежали в
+    /// default-пуле рядом с резидентными весами модели, вытеснение эксперта
+    /// НИЧЕГО не возвращало драйверу: `cuMemPoolTrimTo` не отдаёт страницу, в
+    /// которой остался хоть один живой блок, а страницы были перемешаны с
+    /// весами. Наблюдали ровно это: default-пул reserved 17.3 ГБ / used 10.9,
+    /// кэш ужат вдвое — и всё равно `alloc_uninit(219 МБ)` падал в OOM при
+    /// 6.4 ГБ «свободного» внутри пула.
+    ///
+    /// В своём пуле у экспертов ровно два-три size-класса, набор живёт и
+    /// умирает целиком, поэтому `trim_experts_pool` реально возвращает
+    /// освобождённое драйверу — и активациям префилла есть куда расти.
+    fn experts_pool(ord: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
+        use cudarc::driver::sys;
+        static POOLS: Lazy<RwLock<std::collections::HashMap<usize, usize>>> =
+            Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
+        if let Some(&p) = POOLS.read().get(&ord) {
+            return Ok(p as sys::CUmemoryPool);
+        }
+        let mut wr = POOLS.write();
+        if let Some(&p) = wr.get(&ord) {
+            return Ok(p as sys::CUmemoryPool);
+        }
+        let ctx = get(ord)?;
+        ctx.bind_to_thread()
+            .map_err(|e| SynaptixError::Cuda(format!("bind_to_thread: {e:?}")))?;
+        let mut props: sys::CUmemPoolProps = unsafe { std::mem::zeroed() };
+        props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        props.location.__bindgen_anon_1.id = ord as i32;
+        let pool = unsafe { cudarc::driver::result::mem_pool::create(&props) }
+            .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolCreate(experts): {e:?}")))?;
+        let thr: u64 = u64::MAX;
+        unsafe {
+            let _ = cudarc::driver::result::mem_pool::set_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &thr as *const u64 as *mut std::ffi::c_void,
+            );
+        }
+        wr.insert(ord, pool as usize);
+        Ok(pool)
+    }
+
+    /// (reserved, used) байт пула экспертов.
+    pub fn experts_pool_stats(ordinal: usize) -> Result<(u64, u64)> {
+        use cudarc::driver::sys;
+        let pool = experts_pool(ordinal)?;
+        let mut rsv: u64 = 0;
+        let mut used: u64 = 0;
+        unsafe {
+            let _ = cudarc::driver::result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                &mut rsv as *mut u64 as *mut std::ffi::c_void,
+            );
+            let _ = cudarc::driver::result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                &mut used as *mut u64 as *mut std::ffi::c_void,
+            );
+        }
+        Ok((rsv, used))
+    }
+
+    /// Вернуть драйверу всё, что пул экспертов не держит живым.
+    pub fn trim_experts_pool(ordinal: usize) -> Result<()> {
+        let pool = experts_pool(ordinal)?;
+        unsafe { cudarc::driver::result::mem_pool::trim_to(pool, 0) }
+            .map_err(|e| SynaptixError::Cuda(format!("cuMemPoolTrimTo(experts): {e:?}")))
+    }
+
+    thread_local! {
+        /// Идёт подкачка/репак эксперта MoE на этом потоке → аллокации в
+        /// пул экспертов (приоритетнее флага загрузки весов).
+        static EXPERTS_ALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Пометить поток как поднимающий эксперта; возвращает прежнее значение.
+    pub fn set_experts_alloc(on: bool) -> bool {
+        EXPERTS_ALLOC.with(|c| c.replace(on))
+    }
+
+    pub fn experts_alloc() -> bool {
+        EXPERTS_ALLOC.with(|c| c.get())
+    }
+
+    /// RAII вокруг [`set_experts_alloc`]: всё, что аллоцируется внутри, ложится
+    /// в пул экспертов. Ставится на подкачку эксперта из бандла и на построение
+    /// его перемешанной копии — на всё, что вытесняется вместе с экспертом.
+    pub struct ExpertsAllocGuard {
+        prev: bool,
+    }
+
+    impl ExpertsAllocGuard {
+        pub fn new() -> Self {
+            Self { prev: set_experts_alloc(true) }
+        }
+
+        /// Только для CUDA-устройства; на CPU — пустышка (флаг не трогаем).
+        pub fn for_device(device: crate::device::Device) -> Option<Self> {
+            matches!(device, crate::device::Device::Cuda(_)).then(Self::new)
+        }
+    }
+
+    impl Default for ExpertsAllocGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for ExpertsAllocGuard {
+        fn drop(&mut self) {
+            set_experts_alloc(self.prev);
+        }
+    }
+
     thread_local! {
         /// Идёт загрузка весов на этом потоке → аллокации в default-пул.
         static WEIGHTS_ALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -403,10 +523,21 @@ mod inner {
         stream: &Arc<CudaStream>,
         len: usize,
     ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
+        let ord = stream.context().ordinal();
+        // Эксперт MoE — в свой пул: он вытесняется пачками, и только отдельный
+        // пул отдаёт освобождённое драйверу (см. `experts_pool`).
+        if experts_alloc() && act_pool_enabled() && !graph_capturing() {
+            if let Ok(pool) = experts_pool(ord) {
+                let bytes = len.max(1) * std::mem::size_of::<T>();
+                let ptr = unsafe {
+                    cudarc::driver::result::mem_pool::alloc_async(pool, bytes, stream.cu_stream())
+                }?;
+                return Ok(unsafe { stream.upgrade_device_ptr::<T>(ptr, len) });
+            }
+        }
         if !alloc_in_activations_pool() {
             return stream.alloc::<T>(len);
         }
-        let ord = stream.context().ordinal();
         let Ok(pool) = activations_pool(ord) else {
             return stream.alloc::<T>(len);
         };
@@ -440,6 +571,19 @@ mod inner {
             return stream.alloc::<u8>(len);
         }
         let ord = stream.context().ordinal();
+        // H2D эксперта (packed/scales из бандла) — в пул экспертов.
+        if experts_alloc() {
+            if let Ok(pool) = experts_pool(ord) {
+                let ptr = unsafe {
+                    cudarc::driver::result::mem_pool::alloc_async(
+                        pool,
+                        len.max(1),
+                        stream.cu_stream(),
+                    )
+                }?;
+                return Ok(unsafe { stream.upgrade_device_ptr::<u8>(ptr, len) });
+            }
+        }
         let loading = WEIGHTS_ALLOC.with(|c| c.get());
         if loading {
             // Staging-буферы разных размеров оставляют в пуле по блоку на
@@ -473,6 +617,43 @@ mod inner {
             cudarc::driver::result::mem_pool::alloc_async(pool, len.max(1), stream.cu_stream())
         }?;
         Ok(unsafe { stream.upgrade_device_ptr::<u8>(ptr, len) })
+    }
+
+    /// Долгоживущий кэш ЯДРА (перемешанные веса, MXFP8-скретчи): default-пул,
+    /// как раньше, — но под [`ExpertsAllocGuard`] уходит в пул экспертов, иначе
+    /// перемешанная копия эксперта осела бы среди резидентных весов и держала
+    /// бы их страницы от трима.
+    ///
+    /// # Safety
+    /// Как `CudaStream::alloc`.
+    pub unsafe fn alloc_cache_uninit<T: cudarc::driver::DeviceRepr>(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
+        if experts_alloc() && act_pool_enabled() && !graph_capturing() {
+            let ord = stream.context().ordinal();
+            if let Ok(pool) = experts_pool(ord) {
+                let bytes = len.max(1) * std::mem::size_of::<T>();
+                let ptr = unsafe {
+                    cudarc::driver::result::mem_pool::alloc_async(pool, bytes, stream.cu_stream())
+                }?;
+                return Ok(unsafe { stream.upgrade_device_ptr::<T>(ptr, len) });
+            }
+        }
+        stream.alloc::<T>(len)
+    }
+
+    /// [`alloc_cache_uninit`] + memset в нули.
+    pub fn alloc_cache_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
+        if !experts_alloc() {
+            return stream.alloc_zeros::<T>(len);
+        }
+        let mut buf = unsafe { alloc_cache_uninit::<T>(stream, len) }?;
+        stream.memset_zeros(&mut buf)?;
+        Ok(buf)
     }
 
     /// [`alloc_act_uninit`] + memset в нули (эквивалент `alloc_zeros`).
@@ -545,7 +726,10 @@ mod inner {
         bytes: &[u8],
     ) -> Result<cudarc::driver::CudaSlice<u8>> {
         let ord = stream.context().ordinal();
-        let pool = weights_pool(ord)?;
+        // Под [`ExpertsAllocGuard`] — в пул экспертов: pinned-зеркало MoE
+        // ходит именно сюда, а вытесняться эксперт должен вместе со своим
+        // пулом, иначе трим опять ничего не вернёт.
+        let pool = if experts_alloc() { experts_pool(ord)? } else { weights_pool(ord)? };
         let ptr = unsafe {
             cudarc::driver::result::mem_pool::alloc_async(pool, bytes.len(), stream.cu_stream())
         }
