@@ -242,6 +242,55 @@ impl QuantPolicy {
     }
 }
 
+/// Настройки, при которых модель работает лучше всего. Считает их движок:
+/// это он знает, какие пути у какой архитектуры выверены замерами, а
+/// приложению остаётся их применить.
+#[derive(Debug, Clone)]
+pub struct OptimalProfile {
+    pub policy: QuantPolicy,
+    /// CUDA-graph на декоде.
+    pub graph_decode: bool,
+    /// Спекулятивный декод: MTP-голова у гибрида и Qwen4Exp, DFlash у
+    /// Muse-Glimmer.
+    pub speculation: bool,
+    pub layer_sync: LayerSyncMode,
+}
+
+/// Выверенные настройки под архитектуру бандла.
+///
+/// Qwen4Exp держит KV квантованным: ядро по таблице блоков читает его
+/// напрямую, отчего QSA на длинном промпте почти на треть быстрее, а памяти
+/// под кэш нужно вдвое меньше. Спекуляция там же выключена — шаг упирается в
+/// подкачку экспертов, и у второго токена почти свой их набор, так что
+/// драфт только добавляет работы. У Muse-Glimmer наоборот: DFlash на
+/// greedy-пути ничего не меняет в ответе и заметно ускоряет.
+pub fn optimal_profile(path: &Path) -> OptimalProfile {
+    let arch = crate::facade::arch::detect_llm_arch(path).ok();
+    let mut policy = QuantPolicy::balance();
+    let mut speculation = false;
+    match arch {
+        Some(crate::facade::arch::LlmArch::Qwen4Exp) => {
+            policy.kv_dtype = KvDtypePolicy::MXFP8;
+            policy.preset_name = "optimal".to_string();
+        }
+        Some(crate::facade::arch::LlmArch::MuseGlimmer) => {
+            speculation = true;
+            policy.preset_name = "optimal".to_string();
+        }
+        Some(crate::facade::arch::LlmArch::Hybrid) => {
+            speculation = true;
+            policy.preset_name = "optimal".to_string();
+        }
+        _ => policy.preset_name = "optimal".to_string(),
+    }
+    OptimalProfile {
+        policy,
+        graph_decode: false,
+        speculation,
+        layer_sync: LayerSyncMode::Auto,
+    }
+}
+
 /// `--kv-dtype` → DType KV-кеша. `fp8`/`mxfp8` → MXFP8 (Blackwell block-scale);
 /// иначе compute dtype.
 pub fn parse_kv_dtype(s: Option<&str>, compute: DType) -> DType {
