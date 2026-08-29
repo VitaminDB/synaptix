@@ -3,6 +3,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::SynaptixError;
 use synaptix_core::tensor::Tensor;
+use synaptix_llm_common::model::RopePositions;
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::pos::rope::{apply_rope_with_cossin, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
@@ -195,13 +196,37 @@ impl QsaIndexer {
         )
     }
 
-    fn rope(&self, x: &Tensor, rope: &RopeCache, positions: &[u32]) -> Result<Tensor, ModelError> {
+    fn rope(
+        &self,
+        x: &Tensor,
+        rope: &RopeCache,
+        positions: &[u32],
+        sel: RopePositions,
+    ) -> Result<Tensor, ModelError> {
         if self.rotary_dim == 0 {
             return Ok(x.clone());
         }
-        let pos = Tensor::from_vec(positions.to_vec(), vec![positions.len()], self.device)
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
-        let (cos, sin) = coerr(rope.select_positions(&pos))?;
+        let ids = |v: Vec<u32>| -> Result<Tensor, ModelError> {
+            let n = v.len();
+            coerr(Tensor::from_vec(v, vec![n], self.device))
+        };
+        let (cos, sin) = match sel {
+            RopePositions::Tables { cos, sin } => {
+                let idx = ids(positions.to_vec())?;
+                (crate::attention::take_rows(cos, &idx)?, crate::attention::take_rows(sin, &idx)?)
+            }
+            RopePositions::Shifted(delta) => {
+                let pos = ids(positions
+                    .iter()
+                    .map(|p| (*p as i64 + delta).max(0) as u32)
+                    .collect())?;
+                coerr(rope.select_positions(&pos))?
+            }
+            RopePositions::Sequential => {
+                let pos = ids(positions.to_vec())?;
+                coerr(rope.select_positions(&pos))?
+            }
+        };
         let d = x.dims()[3];
         if self.rotary_dim == d {
             return coerr(apply_rope_with_cossin(x, &cos, &sin, RopeLayout::Split));
@@ -217,6 +242,7 @@ impl QsaIndexer {
         cache: &mut IndexerCache,
         raw: &[f32],
         rope: &RopeCache,
+        sel: RopePositions,
     ) -> Result<(), ModelError> {
         let d = self.cfg.head_dim;
         let cr = self.cfg.compress_ratio;
@@ -255,7 +281,7 @@ impl QsaIndexer {
         let positions: Vec<u32> = (0..new_blocks)
             .map(|b| ((cache.blocks + b) * cr) as u32)
             .collect();
-        let roped = self.rope(&normed, rope, &positions)?;
+        let roped = self.rope(&normed, rope, &positions, sel)?;
         cache
             .block_keys
             .kv_append_inplace(&roped, cache.blocks)
@@ -317,6 +343,7 @@ impl QsaIndexer {
         past: usize,
         s: usize,
         rope: &RopeCache,
+        sel: RopePositions,
     ) -> Result<Option<Selection>, ModelError> {
         let d = self.cfg.head_dim;
         let nh = self.cfg.n_heads;
@@ -331,7 +358,7 @@ impl QsaIndexer {
             .and_then(|t| t.flatten_all())
             .and_then(|t| t.to_vec1::<f32>())
             .map_err(|e| ModelError::Forward(e.to_string()))?;
-        self.push_keys(cache, &raw, rope)?;
+        self.push_keys(cache, &raw, rope, sel)?;
 
         let kv_len = past + s;
         if !self.needs_selection(kv_len) {
@@ -342,7 +369,7 @@ impl QsaIndexer {
         let q = rms(&q, &self.q_norm, self.eps)?;
         let q = coerr(coerr(q.permute(vec![0, 2, 1, 3]))?.contiguous())?;
         let positions: Vec<u32> = (past..past + s).map(|p| p as u32).collect();
-        let q = self.rope(&q, rope, &positions)?;
+        let q = self.rope(&q, rope, &positions, sel)?;
         let q = coerr(coerr(coerr(q.permute(vec![0, 2, 1, 3]))?.contiguous())?
             .reshape(vec![s * nh, d]))?;
 

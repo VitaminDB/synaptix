@@ -1,5 +1,5 @@
 pub mod config;
 pub mod loader;
 pub mod model;
-pub mod mrope;
+pub use synaptix_llm_common::mrope;
 pub mod pipeline;

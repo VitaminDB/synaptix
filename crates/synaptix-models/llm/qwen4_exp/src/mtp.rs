@@ -200,7 +200,15 @@ impl MtpHead {
         let mixed = self.attn_hc.forward(&stream)?;
         let (out, _) = self
             .attn
-            .forward(&mixed.mixed, &mut cache.kv, &mut cache.indexer, past, t, rope)?;
+            .forward(
+                &mixed.mixed,
+                &mut cache.kv,
+                &mut cache.indexer,
+                past,
+                t,
+                rope,
+                synaptix_llm_common::model::RopePositions::Sequential,
+            )?;
         stream = self.attn_hc.inject(
             &mixed.hyper,
             &out,

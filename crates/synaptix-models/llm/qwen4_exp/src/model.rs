@@ -4,6 +4,7 @@ use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 use std::sync::Arc;
 
+use synaptix_llm_common::model::RopePositions;
 use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, ExpertSource, MoeFfn};
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::attention::linear::GatedDeltaNetState;
@@ -130,9 +131,10 @@ enum Trace {
 }
 
 #[derive(Clone, Copy)]
-struct RunOpts {
+struct RunOpts<'a> {
     trace: Trace,
     split: Option<usize>,
+    rope: RopePositions<'a>,
 }
 
 pub type NGramTableFactory<'a> = dyn Fn(usize) -> Result<Box<dyn NGramRows>, ModelError> + 'a;
@@ -507,6 +509,7 @@ impl Qwen4ExpModel {
         let opts = RunOpts {
             trace: if trace { Trace::Full } else { Trace::Off },
             split: None,
+            rope: RopePositions::Sequential,
         };
         let (out, traced, _) = self.run(tokens, media, cache, opts)?;
         Ok((out, traced))
@@ -519,11 +522,12 @@ impl Qwen4ExpModel {
         &self,
         tokens: &[u32],
         cache: &mut ModelCache,
+        pos: RopePositions,
     ) -> Result<(Tensor, Tensor, CacheSnapshot), ModelError> {
         if tokens.len() < 2 {
             return Err(ModelError::Forward("пара короче двух токенов".into()));
         }
-        let opts = RunOpts { trace: Trace::Stream, split: Some(1) };
+        let opts = RunOpts { trace: Trace::Stream, split: Some(1), rope: pos };
         let (out, traced, snap) = self.run(tokens, &[], cache, opts)?;
         let stream = pick_stream(traced)?;
         let snap = snap.ok_or_else(|| ModelError::Forward("снимок пары не снят".into()))?;
@@ -543,6 +547,7 @@ impl Qwen4ExpModel {
         media: &[(u32, Tensor)],
         cache: &mut ModelCache,
         chunk: usize,
+        pos: RopePositions,
     ) -> Result<(Tensor, Tensor), ModelError> {
         let s = tokens.len();
         if s == 0 {
@@ -606,7 +611,15 @@ impl Qwen4ExpModel {
                         let (kv, idx) = state.as_mut();
                         let (out, _) = stage("qsa", || {
                             ctx(
-                                qa.forward(&mixed.mixed, kv, idx, past + start, len, &self.rope),
+                                qa.forward(
+                                    &mixed.mixed,
+                                    kv,
+                                    idx,
+                                    past + start,
+                                    len,
+                                    &self.rope,
+                                    pos,
+                                ),
                                 &format!("слой {l} qsa"),
                             )
                         })?;
@@ -735,7 +748,7 @@ impl Qwen4ExpModel {
                     }
                     let (out, selected) = stage("qsa", || {
                         ctx(
-                            qa.forward(&mixed.mixed, kv, idx, past, s, &self.rope),
+                            qa.forward(&mixed.mixed, kv, idx, past, s, &self.rope, opts.rope),
                             &format!("слой {l} qsa"),
                         )
                     })?;
@@ -820,7 +833,7 @@ impl Qwen4ExpModel {
         tokens: &[u32],
         cache: &mut ModelCache,
     ) -> Result<(Tensor, Tensor), ModelError> {
-        let opts = RunOpts { trace: Trace::Stream, split: None };
+        let opts = RunOpts { trace: Trace::Stream, split: None, rope: RopePositions::Sequential };
         let (out, traced, _) = self.run(tokens, &[], cache, opts)?;
         Ok((out, pick_stream(traced)?))
     }
@@ -830,8 +843,9 @@ impl Qwen4ExpModel {
         tokens: &[u32],
         media: &[(u32, Tensor)],
         cache: &mut ModelCache,
+        pos: RopePositions,
     ) -> Result<(Tensor, Tensor), ModelError> {
-        let opts = RunOpts { trace: Trace::Stream, split: None };
+        let opts = RunOpts { trace: Trace::Stream, split: None, rope: pos };
         let (out, traced, _) = self.run(tokens, media, cache, opts)?;
         Ok((out, pick_stream(traced)?))
     }
@@ -841,8 +855,10 @@ impl Qwen4ExpModel {
         tokens: &[u32],
         media: &[(u32, Tensor)],
         cache: &mut ModelCache,
+        pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
-        let (hidden, _) = self.forward_traced_media(tokens, media, cache, false)?;
+        let opts = RunOpts { trace: Trace::Off, split: None, rope: pos };
+        let (hidden, _, _) = self.run(tokens, media, cache, opts)?;
         let s = hidden.dims()[0];
         let last = coerr(coerr(hidden.narrow(0, s - 1, 1))?.contiguous())?;
         self.lm_head.forward(&last)
@@ -854,7 +870,17 @@ impl Qwen4ExpModel {
     }
 
     pub fn forward_last(&self, tokens: &[u32], cache: &mut ModelCache) -> Result<Tensor, ModelError> {
-        let hidden = self.forward_hidden(tokens, cache)?;
+        self.forward_last_pos(tokens, cache, RopePositions::Sequential)
+    }
+
+    pub fn forward_last_pos(
+        &self,
+        tokens: &[u32],
+        cache: &mut ModelCache,
+        pos: RopePositions,
+    ) -> Result<Tensor, ModelError> {
+        let opts = RunOpts { trace: Trace::Off, split: None, rope: pos };
+        let (hidden, _, _) = self.run(tokens, &[], cache, opts)?;
         let s = hidden.dims()[0];
         let last = coerr(coerr(hidden.narrow(0, s - 1, 1))?.contiguous())?;
         self.lm_head.forward(&last)

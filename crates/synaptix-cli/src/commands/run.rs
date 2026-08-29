@@ -322,7 +322,7 @@ fn run_qwen4_exp(
                 grid.0,
                 grid.1
             );
-            Some((n, feats))
+            Some((n, feats, grid))
         }
         None => None,
     };
@@ -330,7 +330,7 @@ fn run_qwen4_exp(
 
     let prompt_ids = match &image {
         None => pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?,
-        Some((n, _)) => {
+        Some((n, _, _)) => {
             let pad = pipeline
                 .config
                 .image_token_id
@@ -365,9 +365,13 @@ fn run_qwen4_exp(
     };
     let (new_ids, stats) = match &image {
         None => pipeline.generate(&prompt_ids, gen_cfg).map_err(|e| format!("generate: {e}"))?,
-        Some((_, feats)) => {
+        Some((_, feats, grid)) => {
             let pad = pipeline.config.image_token_id.expect("id заполнителя");
-            let media = [(pad, feats.clone())];
+            let media = [synaptix_llm_qwen4_exp::pipeline::MediaInput {
+                pad,
+                embeds: feats.clone(),
+                grids: vec![*grid],
+            }];
             pipeline
                 .generate_media_streaming(&prompt_ids, &media, gen_cfg, &mut |_: u32| true)
                 .map_err(|e| format!("generate: {e}"))?

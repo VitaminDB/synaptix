@@ -83,7 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let (out, stats) = pipeline.generate_media_streaming(
         &ids,
-        &[(pad_id, feats)],
+        &[synaptix_llm_qwen4_exp::pipeline::MediaInput {
+            pad: pad_id,
+            embeds: feats,
+            grids: vec![grid],
+        }],
         cfg,
         &mut |_: u32| true,
     )?;

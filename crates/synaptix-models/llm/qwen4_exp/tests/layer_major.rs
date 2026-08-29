@@ -55,7 +55,13 @@ fn check(device: Device, dtype: DType, chunk: usize, tol: f32) {
 
     let mut layered = model.make_cache(tokens.len() + 8).expect("кэш");
     let (got, _) = model
-        .prefill_by_layers(&tokens, &[], &mut layered, chunk)
+        .prefill_by_layers(
+            &tokens,
+            &[],
+            &mut layered,
+            chunk,
+            synaptix_llm_common::model::RopePositions::Sequential,
+        )
         .expect("послойный префилл");
     let got = host(&got);
 

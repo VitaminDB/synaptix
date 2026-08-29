@@ -9,7 +9,9 @@ use synaptix_core::tensor::Tensor;
 use std::sync::Arc;
 
 use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, StreamSink, TokenSampler};
+use synaptix_llm_common::model::RopePositions;
 use synaptix_llm_common::moe::{ExpertCache, ExpertCacheStats, ExpertSource};
+use synaptix_llm_common::mrope;
 use synaptix_llm_common::ModelError;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::tokenizer::Tokenizer;
@@ -26,6 +28,15 @@ use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 /// подкачку с 290 до 186 ГБ, а префилл с 560 до 718 tok/s.
 /// Меняется `SYN_QWEN4EXP_PREFILL_CHUNK`.
 pub const DEFAULT_PREFILL_CHUNK: usize = 16384;
+
+/// Вложение одной модальности: id заполнителя, строки эмбеддингов и
+/// merged-сетки блоков в порядке появления в промпте. Сетки нужны M-RoPE:
+/// без них позиции картинки одномерны.
+pub struct MediaInput {
+    pub pad: u32,
+    pub embeds: Tensor,
+    pub grids: Vec<(usize, usize)>,
+}
 
 pub struct Qwen4ExpPipeline {
     pub model: Qwen4ExpModel,
@@ -337,18 +348,66 @@ impl Qwen4ExpPipeline {
         self.generate_media_streaming(prompt_ids, &[], cfg, sink)
     }
 
+    /// Таблицы cos/sin M-RoPE на промпт и на `tail` позиций после него.
+    /// Хвост нужен декоду: у токенов картинки позиции трёхмерны, поэтому
+    /// после блока счётчик позиций отстаёт от индекса токена, и брать их
+    /// приходится по той же таблице — в том числе индексатору, который
+    /// поворачивает ключи блоков по индексу их первого токена.
+    ///
+    /// `None` — позиции одномерные: конфиг без `mrope_section`, промпт без
+    /// медиа, у вложения нет сеток либо `SYN_QWEN4EXP_MROPE=0`.
+    fn mrope_tables(
+        &self,
+        prompt_ids: &[u32],
+        inputs: &[MediaInput],
+        tail: usize,
+    ) -> Result<Option<(Tensor, Tensor)>, PipelineError> {
+        let Some(section) = self.config.rope.mrope_section else {
+            return Ok(None);
+        };
+        if inputs.is_empty() || !mrope_on() || inputs.iter().any(|m| m.grids.is_empty()) {
+            return Ok(None);
+        }
+        let runs: Vec<mrope::MediaRuns> = inputs
+            .iter()
+            .map(|m| mrope::MediaRuns { pad: m.pad, grids: &m.grids })
+            .collect();
+        let mut positions = mrope::positions_3d(prompt_ids, &runs)
+            .map_err(|e| PipelineError::Model(format!("mrope: {e}")))?;
+        let next = positions.max_pos + 1;
+        positions.pos.extend((0..tail as u32).map(|k| [next + k, next + k, next + k]));
+        let inv = self.config.rope.inv_freqs();
+        let (cos, sin) = mrope::rope_tables(
+            &positions.pos,
+            &inv,
+            &section,
+            self.config.rope.mrope_interleaved,
+        );
+        let rows = positions.pos.len();
+        let half = inv.len();
+        let device = self.model.device;
+        let make = |v: Vec<f32>| {
+            Tensor::from_vec(v, vec![rows, half], device)
+                .map_err(|e| PipelineError::Model(e.to_string()))
+        };
+        Ok(Some((make(cos)?, make(sin)?)))
+    }
+
     /// Генерация с медиа-вложениями: `media` — пары «id заполнителя → строки
     /// эмбеддингов», строки расходуются по порядку появления заполнителя.
     pub fn generate_media_streaming(
         &self,
         prompt_ids: &[u32],
-        media: &[(u32, Tensor)],
+        inputs: &[MediaInput],
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("пустой промпт".into()));
         }
+        let media: Vec<(u32, Tensor)> =
+            inputs.iter().map(|m| (m.pad, m.embeds.clone())).collect();
+        let media = media.as_slice();
         let cfg = self.prepare(cfg);
         let budget = prompt_ids.len() + cfg.max_new_tokens;
         if budget > self.max_seq {
@@ -359,6 +418,12 @@ impl Qwen4ExpPipeline {
                 self.max_seq
             )));
         }
+        let tables = self.mrope_tables(prompt_ids, inputs, cfg.max_new_tokens + 8)?;
+        let pos = match &tables {
+            Some((cos, sin)) => RopePositions::Tables { cos, sin },
+            None => RopePositions::Sequential,
+        };
+        let (prefill_pos, decode_pos) = (pos, pos);
         let mut cache = self.make_cache(budget)?;
         let mut sampler = TokenSampler::new(&cfg, prompt_ids);
         let eos: Vec<u32> = if cfg.eos_token_ids.is_empty() {
@@ -386,7 +451,13 @@ impl Qwen4ExpPipeline {
         let mut logits = no_grad(|| -> Result<_, ModelError> {
             if by_layers {
                 let (hidden, stream) =
-                    self.model.prefill_by_layers(prompt_ids, media, &mut cache, cfg.prefill_batch)?;
+                    self.model.prefill_by_layers(
+                        prompt_ids,
+                        media,
+                        &mut cache,
+                        cfg.prefill_batch,
+                        prefill_pos,
+                    )?;
                 if want_stream {
                     tail_stream = Some(stream);
                 }
@@ -401,11 +472,12 @@ impl Qwen4ExpPipeline {
                 let done = offset + take >= prompt_ids.len();
                 if want_stream && done {
                     let (hidden, stream) =
-                        self.model.forward_media_with_stream(chunk, &slice, &mut cache)?;
+                        self.model.forward_media_with_stream(chunk, &slice, &mut cache, prefill_pos)?;
                     tail_stream = Some(last_row(&stream)?);
                     last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
                 } else {
-                    last = Some(self.model.forward_media_last(chunk, &slice, &mut cache)?);
+                    last =
+                        Some(self.model.forward_media_last(chunk, &slice, &mut cache, prefill_pos)?);
                 }
                 offset += take;
             }
@@ -457,7 +529,7 @@ impl Qwen4ExpPipeline {
             };
             let Some(draft) = draft else {
                 runs += 1;
-                logits = no_grad(|| self.model.forward_last(&[token], &mut cache))?;
+                logits = no_grad(|| self.model.forward_last_pos(&[token], &mut cache, decode_pos))?;
                 token = sampler.sample(&logits)?;
                 continue;
             };
@@ -465,7 +537,7 @@ impl Qwen4ExpPipeline {
             drafted += 1;
             runs += 1;
             let (hidden, stream, snap) =
-                no_grad(|| self.model.forward_pair(&[token, draft], &mut cache))?;
+                no_grad(|| self.model.forward_pair(&[token, draft], &mut cache, decode_pos))?;
             let first = no_grad(|| self.model.lm_head_forward(&row(&hidden, 0)?))?;
             let next = sampler.sample(&first)?;
             let spec = spec.as_mut().expect("драфт без спекуляции");
@@ -554,6 +626,15 @@ fn media_for_chunk(
         out.push((*pad, rows));
     }
     Ok(out)
+}
+
+/// Мультимодальные позиции RoPE. `SYN_QWEN4EXP_MROPE=0` возвращает
+/// одномерные — для сверки с прежним поведением.
+fn mrope_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_MROPE").map(|v| v.trim() != "0").unwrap_or(true)
+    })
 }
 
 fn prefill_chunk() -> usize {

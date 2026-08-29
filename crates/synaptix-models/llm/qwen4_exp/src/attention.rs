@@ -2,9 +2,9 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::SynaptixError;
 use synaptix_core::tensor::Tensor;
+use synaptix_llm_common::model::{partial_rope, RopePositions};
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 use synaptix_ops::attention::softmax::scaled_dot_attention;
-use synaptix_ops::pos::rope::{apply_rope_range, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
 
 use crate::config::Qwen4ExpConfig;
@@ -173,18 +173,15 @@ impl QsaAttention {
         })
     }
 
-    fn partial_rope(&self, x: &Tensor, rope: &RopeCache, past: usize, s: usize) -> Result<Tensor, ModelError> {
-        if self.rotary_dim == 0 {
-            return Ok(x.clone());
-        }
-        if self.rotary_dim == self.head_dim {
-            return coerr(apply_rope_range(x, rope, past, s, RopeLayout::Split));
-        }
-        let head = coerr(coerr(x.narrow(3, 0, self.rotary_dim))?.contiguous())?;
-        let tail = coerr(coerr(x.narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim))?
-            .contiguous())?;
-        let rotated = coerr(apply_rope_range(&head, rope, past, s, RopeLayout::Split))?;
-        coerr(Tensor::cat(&[&rotated, &tail], 3))
+    fn rope(
+        &self,
+        x: &Tensor,
+        rope: &RopeCache,
+        past: usize,
+        s: usize,
+        pos: RopePositions,
+    ) -> Result<Tensor, ModelError> {
+        coerr(partial_rope(x, rope, past, s, self.rotary_dim, self.head_dim, pos))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -196,9 +193,11 @@ impl QsaAttention {
         past: usize,
         s: usize,
         rope: &RopeCache,
+        pos: RopePositions,
     ) -> Result<(Tensor, Option<Selection>), ModelError> {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
-        let selected = stage("qsa:indexer", || self.indexer.forward(h, idx, past, s, rope))?;
+        let selected =
+            stage("qsa:indexer", || self.indexer.forward(h, idx, past, s, rope, pos))?;
 
         let qg = self.q_proj.forward(h)?;
         let qg = coerr(qg.reshape(vec![1, s, nh, 2 * hd]))?;
@@ -214,8 +213,8 @@ impl QsaAttention {
             .permute(vec![0, 2, 1, 3]))?
             .contiguous())?;
 
-        let q = self.partial_rope(&q, rope, past, s)?;
-        let k = self.partial_rope(&k, rope, past, s)?;
+        let q = self.rope(&q, rope, past, s, pos)?;
+        let k = self.rope(&k, rope, past, s, pos)?;
 
         let cap = kv.k.dims()[2];
         if past + s > cap {
@@ -823,7 +822,7 @@ impl Union {
     }
 }
 
-fn take_rows(src: &Tensor, ids: &Tensor) -> Result<Tensor, ModelError> {
+pub(crate) fn take_rows(src: &Tensor, ids: &Tensor) -> Result<Tensor, ModelError> {
     match src.embed_gather(ids) {
         Ok(t) => Ok(t),
         Err(SynaptixError::Unsupported(_)) => coerr(src.index_select(0, ids)),

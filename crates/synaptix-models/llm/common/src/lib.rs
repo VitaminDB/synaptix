@@ -1,6 +1,7 @@
 pub mod config;
 pub mod generate;
 pub mod model;
+pub mod mrope;
 pub mod moe;
 pub mod profile;
 pub mod mtp;

@@ -71,7 +71,11 @@ fn check(device: Device, dtype: DType, tol: f32) {
     // Драфт заведомо неверный: интересен именно откат.
     let wrong = tokens[head].wrapping_add(1) % cfg.vocab_size as u32;
     let (hidden, _, snap) = model
-        .forward_pair(&[tokens[head], wrong], &mut spec)
+        .forward_pair(
+            &[tokens[head], wrong],
+            &mut spec,
+            synaptix_llm_common::model::RopePositions::Sequential,
+        )
         .expect("пара");
     let first = host(&model.lm_head_forward(&hidden.narrow(0, 0, 1).unwrap().contiguous().unwrap()).unwrap());
     let d0 = diff(&first, &expected[0]);
@@ -89,7 +93,11 @@ fn check(device: Device, dtype: DType, tol: f32) {
     let mut kept = model.make_cache(tokens.len() + 8).expect("кэш");
     model.forward(&tokens[..head], &mut kept).expect("префилл");
     let (hidden, _, _) = model
-        .forward_pair(&[tokens[head], tokens[head + 1]], &mut kept)
+        .forward_pair(
+            &[tokens[head], tokens[head + 1]],
+            &mut kept,
+            synaptix_llm_common::model::RopePositions::Sequential,
+        )
         .expect("пара");
     let second = host(&model.lm_head_forward(&hidden.narrow(0, 1, 1).unwrap().contiguous().unwrap()).unwrap());
     let d1 = diff(&second, &expected[1]);

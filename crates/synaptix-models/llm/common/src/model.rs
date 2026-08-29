@@ -2695,7 +2695,7 @@ pub fn layer_dump_take() -> Vec<(usize, String, Vec<f32>)> {
     LAYER_DUMP.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
-fn partial_rope(
+pub fn partial_rope(
     x: &Tensor,
     rope: &RopeCache,
     start: usize,

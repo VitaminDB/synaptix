@@ -17,6 +17,13 @@ pub struct RopeConfig {
     pub mrope_interleaved: bool,
 }
 
+impl RopeConfig {
+    pub fn inv_freqs(&self) -> Vec<f32> {
+        let rd = self.rotary_dim.max(2);
+        (0..rd / 2).map(|i| self.theta.powf(-(2.0 * i as f32) / rd as f32)).collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IndexerConfig {
     pub n_heads: usize,
