@@ -99,4 +99,54 @@ __global__ void bmm_f32(
     Cb[cidx] = alpha * acc + beta * prev;
 }
 
+// Тайловый вариант того же GEMM: тайл 16×16 через shared, по одному элементу
+// C на поток. Наивная версия читала A и B из глобальной памяти на каждый шаг
+// K — на формах чанк-скана (64×64×128, сотни матриц в батче) это и было
+// главной статьёй расхода линейного внимания.
+#define BMM_TILE 16
+
+__global__ void bmm_tiled_f32(
+    const float* __restrict__ A, unsigned int offA,
+    const float* __restrict__ B, unsigned int offB,
+    float* __restrict__ C, unsigned int offC,
+    int transA, int transB,
+    unsigned int M, unsigned int N, unsigned int K,
+    long long strideA, long long strideB, long long strideC,
+    unsigned int batch,
+    float alpha, float beta
+) {
+    __shared__ float As[BMM_TILE][BMM_TILE + 1];
+    __shared__ float Bs[BMM_TILE][BMM_TILE + 1];
+
+    unsigned int bi = blockIdx.z;
+    if (bi >= batch) return;
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int m = blockIdx.y * BMM_TILE + ty;
+    unsigned int n = blockIdx.x * BMM_TILE + tx;
+
+    const float* Ab = A + offA + (long long)bi * strideA;
+    const float* Bb = B + offB + (long long)bi * strideB;
+    float* Cb = C + offC + (long long)bi * strideC;
+
+    float acc = 0.0f;
+    for (unsigned int k0 = 0; k0 < K; k0 += BMM_TILE) {
+        unsigned int ka = k0 + tx;
+        As[ty][tx] = (m < M && ka < K)
+            ? (transA ? Ab[(unsigned long long)ka * M + m] : Ab[(unsigned long long)m * K + ka])
+            : 0.0f;
+        unsigned int kb = k0 + ty;
+        Bs[ty][tx] = (n < N && kb < K)
+            ? (transB ? Bb[(unsigned long long)n * K + kb] : Bb[(unsigned long long)kb * N + n])
+            : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < BMM_TILE; ++kk) acc += As[ty][kk] * Bs[kk][tx];
+        __syncthreads();
+    }
+    if (m >= M || n >= N) return;
+    unsigned long long cidx = (unsigned long long)m * N + n;
+    float prev = (beta != 0.0f) ? Cb[cidx] : 0.0f;
+    Cb[cidx] = alpha * acc + beta * prev;
+}
+
 } // extern "C"

@@ -27,6 +27,7 @@ use crate::wsalloc::WsBuf;
 pub struct ChunkScanKernels {
     _module: Arc<CudaModule>,
     cumsum: CudaFunction,
+    bmm_tiled: CudaFunction,
     l2norm_scale: CudaFunction,
     mul_rowwise: CudaFunction,
     bmm: CudaFunction,
@@ -53,6 +54,7 @@ impl ChunkScanKernels {
             l2norm_scale: load_fn(&module, "l2norm_scale_lastdim_f32")?,
             mul_rowwise: load_fn(&module, "mul_rowwise_f32")?,
             bmm: load_fn(&module, "bmm_f32")?,
+            bmm_tiled: load_fn(&module, "bmm_tiled_f32")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -163,17 +165,29 @@ impl ChunkScanKernels {
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        let block = 256u32;
-        let total = (batch as u64) * (m as u64) * (n as u64);
-        let grid = ((total + block as u64 - 1) / block as u64) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
+        // Тайловый вариант выигрывает везде, кроме совсем узких матриц, где
+        // тайл 16×16 почти пустой.
+        let tiled = m >= 8 && n >= 8 && k >= 8;
+        let cfg = if tiled {
+            LaunchConfig {
+                grid_dim: (n.div_ceil(16), m.div_ceil(16), batch),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            let block = 256u32;
+            let total = (batch as u64) * (m as u64) * (n as u64);
+            let grid = ((total + block as u64 - 1) / block as u64) as u32;
+            LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            }
         };
         let ta: i32 = trans_a as i32;
         let tb: i32 = trans_b as i32;
-        let mut bld = stream.launch_builder(&self.bmm);
+        let func = if tiled { &self.bmm_tiled } else { &self.bmm };
+        let mut bld = stream.launch_builder(func);
         bld.arg(a)
             .arg(&off_a)
             .arg(b_mat)
