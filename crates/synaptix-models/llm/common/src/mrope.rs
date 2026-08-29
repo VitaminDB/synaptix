@@ -18,11 +18,29 @@
 //! Порт `get_rope_index` и `apply_interleaved_mrope` из HF
 //! `modeling_qwen3_vl.py`.
 
+/// Merged-сетка одного блока: кадров, строк, столбцов. У картинки `t = 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grid3 {
+    pub t: usize,
+    pub h: usize,
+    pub w: usize,
+}
+
+impl Grid3 {
+    pub fn image(h: usize, w: usize) -> Self {
+        Self { t: 1, h, w }
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.t * self.h * self.w
+    }
+}
+
 /// Прогоны токенов-заполнителей одной модальности: id заполнителя и
-/// merged-сетка `(h, w)` каждого блока в порядке появления в промпте.
+/// merged-сетка каждого блока в порядке появления в промпте.
 pub struct MediaRuns<'a> {
     pub pad: u32,
-    pub grids: &'a [(usize, usize)],
+    pub grids: &'a [Grid3],
 }
 
 /// 3D-позиции токенов промпта и максимальная позиция (для сдвига декода).
@@ -55,20 +73,23 @@ pub fn positions_3d(ids: &[u32], runs: &[MediaRuns]) -> Result<Positions, String
                 i += 1;
             }
             let run = i - start;
-            let (gh, gw) = *runs[ri].grids.get(cursors[ri]).ok_or_else(|| {
+            let g = *runs[ri].grids.get(cursors[ri]).ok_or_else(|| {
                 format!("mrope: блоков заполнителя {pad} в промпте больше, чем сеток ({})", runs[ri].grids.len())
             })?;
             cursors[ri] += 1;
-            if gh == 0 || gw == 0 || gh * gw != run {
+            if g.t == 0 || g.h == 0 || g.w == 0 || g.tokens() != run {
                 return Err(format!(
-                    "mrope: блок заполнителя {pad} из {run} токенов не совпадает с сеткой {gh}×{gw}"
+                    "mrope: блок заполнителя {pad} из {run} токенов не совпадает с сеткой {}×{}×{}",
+                    g.t, g.h, g.w
                 ));
             }
+            let plane = g.h * g.w;
             for j in 0..run {
-                let (r, c) = ((j / gw) as u32, (j % gw) as u32);
-                pos.push([cur, cur + r, cur + c]);
+                let ti = (j / plane) as u32;
+                let (r, c) = (((j % plane) / g.w) as u32, (j % g.w) as u32);
+                pos.push([cur + ti, cur + r, cur + c]);
             }
-            cur += gh.max(gw) as u32;
+            cur += g.t.max(g.h).max(g.w) as u32;
         } else {
             pos.push([cur, cur, cur]);
             cur += 1;
@@ -150,7 +171,7 @@ mod tests {
     fn image_block_gets_grid_positions_and_compresses_tail() {
         const PAD: u32 = 99;
         let ids = [1u32, 2, PAD, PAD, PAD, PAD, PAD, PAD, 3, 4];
-        let grids = [(2usize, 3usize)];
+        let grids = [Grid3::image(2, 3)];
         let p = positions_3d(&ids, &[MediaRuns { pad: PAD, grids: &grids }]).unwrap();
         let expect = vec![
             [0, 0, 0], [1, 1, 1],
@@ -169,7 +190,7 @@ mod tests {
         const VID: u32 = 7;
         // <t><start> pad pad <end> <t><start> pad pad <end>
         let ids = [10u32, 11, VID, VID, 12, 10, 11, VID, VID, 12];
-        let grids = [(1usize, 2usize), (1, 2)];
+        let grids = [Grid3::image(1, 2), Grid3::image(1, 2)];
         let p = positions_3d(&ids, &[MediaRuns { pad: VID, grids: &grids }]).unwrap();
         assert_eq!(p.pos[2], [2, 2, 2]);
         assert_eq!(p.pos[3], [2, 2, 3]);
@@ -179,11 +200,26 @@ mod tests {
         assert_eq!(p.pos[9], [9, 9, 9]);
     }
 
+    /// Видео одним блоком: t·h·w токенов, ось времени растёт по группам
+    /// кадров, а текст после блока продолжается с max(t, h, w).
+    #[test]
+    fn video_block_uses_temporal_axis() {
+        const VID: u32 = 7;
+        let ids = [1u32, VID, VID, VID, VID, VID, VID, VID, VID, 2];
+        let grids = [Grid3 { t: 2, h: 2, w: 2 }];
+        let p = positions_3d(&ids, &[MediaRuns { pad: VID, grids: &grids }]).unwrap();
+        assert_eq!(&p.pos[1..9], &[
+            [1, 1, 1], [1, 1, 2], [1, 2, 1], [1, 2, 2],
+            [2, 1, 1], [2, 1, 2], [2, 2, 1], [2, 2, 2],
+        ]);
+        assert_eq!(p.pos[9], [3, 3, 3]);
+    }
+
     #[test]
     fn grid_mismatch_is_an_error() {
         const PAD: u32 = 99;
         let ids = [PAD, PAD, PAD];
-        let grids = [(2usize, 2usize)];
+        let grids = [Grid3::image(2, 2)];
         assert!(positions_3d(&ids, &[MediaRuns { pad: PAD, grids: &grids }]).is_err());
         let ids = [PAD, PAD, PAD, PAD, 1, PAD, PAD, PAD, PAD];
         assert!(positions_3d(&ids, &[MediaRuns { pad: PAD, grids: &grids }]).is_err());

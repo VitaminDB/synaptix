@@ -35,7 +35,7 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 16384;
 pub struct MediaInput {
     pub pad: u32,
     pub embeds: Tensor,
-    pub grids: Vec<(usize, usize)>,
+    pub grids: Vec<mrope::Grid3>,
 }
 
 pub struct Qwen4ExpPipeline {
@@ -180,6 +180,35 @@ impl Qwen4ExpPipeline {
                 .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
         let merge = tower.config.spatial_merge_size.max(1);
         let grid = (prepared.grid.h / merge, prepared.grid.w / merge);
+        let feats = no_grad(|| tower.forward(&prepared.patches, prepared.grid))
+            .map_err(|e| PipelineError::Model(format!("vision forward: {e}")))?;
+        let feats = feats
+            .to_dtype(self.model.compute)
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        Ok((feats, grid))
+    }
+
+    /// Видео → строки эмбеддингов `[n, hidden]` и merged-сетка `(t, h, w)`.
+    /// Кадры группируются по `temporal_patch_size`: группа кадров даёт один
+    /// набор патчей, и в промпте всё видео — один блок заполнителей.
+    pub fn encode_video(
+        &self,
+        path: impl AsRef<Path>,
+        limits: synaptix_vlm_qwen3::VideoLimits,
+    ) -> Result<(Tensor, mrope::Grid3), PipelineError> {
+        let tower = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
+        let prepared =
+            synaptix_vlm_qwen3::prepare_video(path, &tower.config, limits, self.model.device)
+                .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
+        let merge = tower.config.spatial_merge_size.max(1);
+        let grid = mrope::Grid3 {
+            t: prepared.grid.t,
+            h: prepared.grid.h / merge,
+            w: prepared.grid.w / merge,
+        };
         let feats = no_grad(|| tower.forward(&prepared.patches, prepared.grid))
             .map_err(|e| PipelineError::Model(format!("vision forward: {e}")))?;
         let feats = feats

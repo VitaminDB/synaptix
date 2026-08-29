@@ -119,8 +119,8 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.kv_dtype.as_deref(),
     )?;
     let arch = detect_arch(&args.model)?;
-    if args.video.is_some() && arch != Arch::MuseGlimmer {
-        return Err("--video поддержан только для muse_glimmer".into());
+    if args.video.is_some() && !matches!(arch, Arch::MuseGlimmer | Arch::Qwen4Exp) {
+        return Err("--video поддержан для muse_glimmer и qwen4_exp".into());
     }
     eprintln!(
         "synaptix run: loading model from {} (arch={arch:?}, compute={:?}, attn_w={:?}, mlp_w={:?}, lm_head={:?}, embed={:?}, kv={:?}, {:?})",
@@ -303,16 +303,19 @@ fn run_qwen4_exp(
             .map_err(|e| format!("load: {e}"))?;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
-    // Картинка занимает в промпте столько заполнителей, сколько строк отдала
-    // башня; собираем промпт из id напрямую — decode выбрасывает спецтокены.
-    let image = match &args.image {
-        Some(path) => {
-            if !pipeline
-                .load_vision(&args.model, precision.compute)
-                .map_err(|e| format!("vision load: {e}"))?
-            {
-                return Err("в бандле нет компонента vision".into());
-            }
+    // Картинка и видео занимают в промпте столько заполнителей, сколько строк
+    // отдала башня; собираем промпт из id напрямую — decode выбрасывает
+    // спецтокены.
+    if args.image.is_some() || args.video.is_some() {
+        if !pipeline
+            .load_vision(&args.model, precision.compute)
+            .map_err(|e| format!("vision load: {e}"))?
+        {
+            return Err("в бандле нет компонента vision".into());
+        }
+    }
+    let media = match (&args.image, &args.video) {
+        (Some(path), _) => {
             let limits = synaptix_vlm_qwen3::PreprocessLimits::default();
             let n = pipeline.image_token_count(path, limits).map_err(|e| format!("image: {e}"))?;
             let (feats, grid) = pipeline.encode_image(path, limits).map_err(|e| format!("image: {e}"))?;
@@ -322,26 +325,43 @@ fn run_qwen4_exp(
                 grid.0,
                 grid.1
             );
-            Some((n, feats, grid))
-        }
-        None => None,
-    };
-    let pipeline = pipeline;
-
-    let prompt_ids = match &image {
-        None => pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?,
-        Some((n, _, _)) => {
             let pad = pipeline
                 .config
                 .image_token_id
                 .ok_or("в конфиге нет id заполнителя картинки")?;
+            Some((pad, n, feats, synaptix_llm_common::mrope::Grid3::image(grid.0, grid.1)))
+        }
+        (None, Some(path)) => {
+            let limits = synaptix_vlm_qwen3::VideoLimits::default();
+            let (feats, grid) = pipeline.encode_video(path, limits).map_err(|e| format!("video: {e}"))?;
+            let n = grid.tokens();
+            eprintln!(
+                "synaptix run: video {} → {n} vision-токенов, сетка {}×{}×{}",
+                path.display(),
+                grid.t,
+                grid.h,
+                grid.w
+            );
+            let pad = pipeline
+                .config
+                .video_token_id
+                .ok_or("в конфиге нет id заполнителя видео")?;
+            Some((pad, n, feats, grid))
+        }
+        (None, None) => None,
+    };
+    let pipeline = pipeline;
+
+    let prompt_ids = match &media {
+        None => pipeline.encode(&args.prompt).map_err(|e| format!("tokenize: {e}"))?,
+        Some((pad, n, _, _)) => {
             let mut ids = pipeline
                 .encode("<|im_start|>user\n")
                 .map_err(|e| format!("tokenize: {e}"))?;
             if let Some(t) = pipeline.config.vision_start_token_id {
                 ids.push(t);
             }
-            ids.extend(std::iter::repeat_n(pad, *n));
+            ids.extend(std::iter::repeat_n(*pad, *n));
             if let Some(t) = pipeline.config.vision_end_token_id {
                 ids.push(t);
             }
@@ -363,17 +383,16 @@ fn run_qwen4_exp(
         max_seq: args.max_seq,
         ..Default::default()
     };
-    let (new_ids, stats) = match &image {
+    let (new_ids, stats) = match &media {
         None => pipeline.generate(&prompt_ids, gen_cfg).map_err(|e| format!("generate: {e}"))?,
-        Some((_, feats, grid)) => {
-            let pad = pipeline.config.image_token_id.expect("id заполнителя");
-            let media = [synaptix_llm_qwen4_exp::pipeline::MediaInput {
-                pad,
+        Some((pad, _, feats, grid)) => {
+            let inputs = [synaptix_llm_qwen4_exp::pipeline::MediaInput {
+                pad: *pad,
                 embeds: feats.clone(),
                 grids: vec![*grid],
             }];
             pipeline
-                .generate_media_streaming(&prompt_ids, &media, gen_cfg, &mut |_: u32| true)
+                .generate_media_streaming(&prompt_ids, &inputs, gen_cfg, &mut |_: u32| true)
                 .map_err(|e| format!("generate: {e}"))?
         }
     };

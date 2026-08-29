@@ -604,9 +604,14 @@ impl HybridPipeline {
         let mrope_on = mrope_enabled() && inputs.iter().all(|m| !m.grids.is_empty());
         let mrope_tables = match (&self.config.mrope, mrope_on) {
             (Some(spec), true) => {
+                let grids: Vec<Vec<mrope::Grid3>> = inputs
+                    .iter()
+                    .map(|m| m.grids.iter().map(|(h, w)| mrope::Grid3::image(*h, *w)).collect())
+                    .collect();
                 let runs: Vec<mrope::MediaRuns> = inputs
                     .iter()
-                    .map(|m| mrope::MediaRuns { pad: m.pad, grids: &m.grids })
+                    .zip(&grids)
+                    .map(|(m, g)| mrope::MediaRuns { pad: m.pad, grids: g })
                     .collect();
                 let positions = mrope::positions_3d(prompt_ids, &runs).map_err(PipelineError::Forward)?;
                 let inv = self.config.rope_inv_freqs();

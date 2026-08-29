@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[synaptix_llm_qwen4_exp::pipeline::MediaInput {
             pad: pad_id,
             embeds: feats,
-            grids: vec![grid],
+            grids: vec![synaptix_llm_common::mrope::Grid3::image(grid.0, grid.1)],
         }],
         cfg,
         &mut |_: u32| true,
