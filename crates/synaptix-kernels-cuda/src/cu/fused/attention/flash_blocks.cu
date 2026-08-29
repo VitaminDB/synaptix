@@ -38,6 +38,55 @@ __device__ __forceinline__ void fb_st(float* p, float v) { *p = v; }
 __device__ __forceinline__ void fb_st(__half* p, float v) { *p = __float2half(v); }
 __device__ __forceinline__ void fb_st(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
+// Загрузка куска строки в регистры. Восемь подряд идущих half — это ровно
+// один 16-байтный доступ, и на разрозненных блоках KV он заметно дешевле
+// восьми отдельных.
+__device__ __forceinline__ void fb_load_vec(float* dst, const __half* p, int vec) {
+  if (vec == 8) {
+    float4 raw = *reinterpret_cast<const float4*>(p);
+    const __half2* h = reinterpret_cast<const __half2*>(&raw);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float2 f = __half22float2(h[i]);
+      dst[2 * i] = f.x;
+      dst[2 * i + 1] = f.y;
+    }
+    return;
+  }
+  if (vec == 4) {
+    float2 raw = *reinterpret_cast<const float2*>(p);
+    const __half2* h = reinterpret_cast<const __half2*>(&raw);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      float2 f = __half22float2(h[i]);
+      dst[2 * i] = f.x;
+      dst[2 * i + 1] = f.y;
+    }
+    return;
+  }
+  for (int i = 0; i < vec; ++i) dst[i] = __half2float(p[i]);
+}
+
+__device__ __forceinline__ void fb_load_vec(float* dst, const float* p, int vec) {
+  if (vec == 8) {
+    float4 a = *reinterpret_cast<const float4*>(p);
+    float4 b = *reinterpret_cast<const float4*>(p + 4);
+    dst[0] = a.x; dst[1] = a.y; dst[2] = a.z; dst[3] = a.w;
+    dst[4] = b.x; dst[5] = b.y; dst[6] = b.z; dst[7] = b.w;
+    return;
+  }
+  if (vec == 4) {
+    float4 a = *reinterpret_cast<const float4*>(p);
+    dst[0] = a.x; dst[1] = a.y; dst[2] = a.z; dst[3] = a.w;
+    return;
+  }
+  for (int i = 0; i < vec; ++i) dst[i] = p[i];
+}
+
+__device__ __forceinline__ void fb_load_vec(float* dst, const __nv_bfloat16* p, int vec) {
+  for (int i = 0; i < vec; ++i) dst[i] = __bfloat162float(p[i]);
+}
+
 __device__ __forceinline__ float fb_warp_sum(float v) {
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off, 32);
@@ -117,13 +166,11 @@ __device__ __forceinline__ void flash_blocks_impl(
     if (!live) pos = 0;
     const T* k_row = k + ((long)h_kv * CAP + pos) * D;
     float kv_reg[FB_MAX_VEC];
-    #pragma unroll
-    for (int i = 0; i < vec; i++) kv_reg[i] = fb_ld(k_row + lane * vec + i);
+    fb_load_vec(kv_reg, k_row + lane * vec, vec);
 
     const T* v_row = v + ((long)h_kv * CAP + pos) * D;
     float vv_reg[FB_MAX_VEC];
-    #pragma unroll
-    for (int i = 0; i < vec; i++) vv_reg[i] = fb_ld(v_row + lane * vec + i);
+    fb_load_vec(vv_reg, v_row + lane * vec, vec);
 
     #pragma unroll
     for (int r = 0; r < n_rep; r++) {
