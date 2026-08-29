@@ -28,6 +28,7 @@ pub struct ChunkScanKernels {
     _module: Arc<CudaModule>,
     cumsum: CudaFunction,
     bmm_tiled: CudaFunction,
+    bmm_reg: CudaFunction,
     l2norm_scale: CudaFunction,
     mul_rowwise: CudaFunction,
     bmm: CudaFunction,
@@ -55,6 +56,7 @@ impl ChunkScanKernels {
             mul_rowwise: load_fn(&module, "mul_rowwise_f32")?,
             bmm: load_fn(&module, "bmm_f32")?,
             bmm_tiled: load_fn(&module, "bmm_tiled_f32")?,
+            bmm_reg: load_fn(&module, "bmm_reg_f32")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -165,10 +167,17 @@ impl ChunkScanKernels {
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        // Тайловый вариант выигрывает везде, кроме совсем узких матриц, где
-        // тайл 16×16 почти пустой.
-        let tiled = m >= 8 && n >= 8 && k >= 8;
-        let cfg = if tiled {
+        // Регистровый тайл берётся, когда матрица хотя бы в один блок 64×64;
+        // на узких формах он вырождается, и там работает тайл 16×16.
+        let reg = m >= 32 && n >= 64 && k >= 16;
+        let tiled = !reg && m >= 8 && n >= 8 && k >= 8;
+        let cfg = if reg {
+            LaunchConfig {
+                grid_dim: (n.div_ceil(64), m.div_ceil(64), batch),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            }
+        } else if tiled {
             LaunchConfig {
                 grid_dim: (n.div_ceil(16), m.div_ceil(16), batch),
                 block_dim: (16, 16, 1),
@@ -186,7 +195,13 @@ impl ChunkScanKernels {
         };
         let ta: i32 = trans_a as i32;
         let tb: i32 = trans_b as i32;
-        let func = if tiled { &self.bmm_tiled } else { &self.bmm };
+        let func = if reg {
+            &self.bmm_reg
+        } else if tiled {
+            &self.bmm_tiled
+        } else {
+            &self.bmm
+        };
         let mut bld = stream.launch_builder(func);
         bld.arg(a)
             .arg(&off_a)
