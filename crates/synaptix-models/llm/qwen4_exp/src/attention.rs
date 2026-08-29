@@ -82,11 +82,21 @@ impl KvLayer {
     pub fn append(&mut self, k: &Tensor, v: &Tensor, past: usize) -> Result<(), ModelError> {
         match (&mut self.k_scale, &mut self.v_scale) {
             (Some(ks), Some(vs)) => {
+                // Квант принимает только половинную точность; на f32-профиле
+                // (проверки паритета) вход приводится.
+                let half = |t: &Tensor| -> Result<Tensor, ModelError> {
+                    if matches!(t.dtype(), DType::F16 | DType::BF16) {
+                        Ok(t.clone())
+                    } else {
+                        coerr(t.to_dtype(DType::F16))
+                    }
+                };
+                let (k, v) = (half(k)?, half(v)?);
                 self.k
-                    .kv_append_quant_mxfp8_inplace(ks, k, past)
+                    .kv_append_quant_mxfp8_inplace(ks, &k, past)
                     .map_err(|e| ModelError::Forward(e.to_string()))?;
                 self.v
-                    .kv_append_quant_mxfp8_inplace(vs, v, past)
+                    .kv_append_quant_mxfp8_inplace(vs, &v, past)
                     .map_err(|e| ModelError::Forward(e.to_string()))
             }
             _ => {
