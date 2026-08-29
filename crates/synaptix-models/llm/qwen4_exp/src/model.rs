@@ -509,6 +509,125 @@ impl Qwen4ExpModel {
         Ok((out, stream, snap))
     }
 
+    /// Префилл слой за слоем: внешний цикл идёт по слоям, внутренний — по
+    /// чанкам промпта. Эксперты слоя тогда поднимаются на карту один раз на
+    /// весь промпт, а не на каждый чанк, — при чтении их из бандла это главная
+    /// статья расхода. Цена — держать поток всех токенов целиком.
+    ///
+    /// Возвращает скрытое состояние последней позиции и её поток (последний
+    /// нужен голове многотокенного предсказания).
+    pub fn prefill_by_layers(
+        &self,
+        tokens: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+        chunk: usize,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        let s = tokens.len();
+        if s == 0 {
+            return Err(ModelError::Forward("пустой вход".into()));
+        }
+        let chunk = chunk.clamp(1, s);
+        let past = cache.seq_len;
+        let hc = self.config.hc_count;
+        let width = hc * self.config.hidden_size;
+
+        let embeds = self.embed_with_media(tokens, media)?;
+        let hidden = coerr(embeds.reshape(vec![s, 1, self.config.hidden_size]))?;
+        let ones = coerr(Tensor::zeros(
+            vec![s, hc, self.config.hidden_size],
+            self.compute,
+            self.device,
+        ))?;
+        let mut stream = coerr(coerr(hidden.broadcast_add(&ones))?.reshape(vec![1, s, width]))?;
+
+        let mut ple_slot = 0usize;
+        for (l, block) in self.blocks.iter().enumerate() {
+            let ple_here = block.ple.as_ref().map(|ple| (ple, ple_slot));
+            if ple_here.is_some() {
+                ple_slot += 1;
+            }
+            let mut start = 0usize;
+            while start < s {
+                let len = chunk.min(s - start);
+                // Копия обязана быть настоящей: срез потока делит storage с
+                // ним самим, а запись результата обратно требует уникального
+                // владения.
+                let view = coerr(stream.narrow(1, start, len))?;
+                let mut piece = coerr(Tensor::empty_uninit(
+                    vec![1, len, width],
+                    self.compute,
+                    self.device,
+                ))?;
+                coerr(piece.copy_from(&view))?;
+                drop(view);
+                let mut piece = coerr(piece.reshape(vec![len, width]))?;
+
+                if let Some((ple, slot)) = ple_here {
+                    let state = &mut cache.ple[slot];
+                    let delta = stage("ple", || {
+                        ctx(
+                            ple.forward(&piece, &tokens[start..start + len], state),
+                            &format!("слой {l} ple"),
+                        )
+                    })?;
+                    piece = coerr(piece.add(&delta))?;
+                }
+
+                let mixed = stage("hc", || {
+                    ctx(block.attn_hc.forward(&piece), &format!("слой {l} attn_hc"))
+                })?;
+                let out = match (&block.mixer, &mut cache.layers[l]) {
+                    (Mixer::Linear(la), LayerState::Linear(state)) => stage("linear_attn", || {
+                        ctx(la.forward(&mixed.mixed, state, len), &format!("слой {l} linear_attn"))
+                    })?,
+                    (Mixer::Qsa(qa), LayerState::Qsa(state)) => {
+                        let (kv, idx) = state.as_mut();
+                        let (out, _) = stage("qsa", || {
+                            ctx(
+                                qa.forward(&mixed.mixed, kv, idx, past + start, len, &self.rope),
+                                &format!("слой {l} qsa"),
+                            )
+                        })?;
+                        out
+                    }
+                    _ => return Err(ModelError::Shape(format!("слой {l}: кэш не того типа"))),
+                };
+                let injected = ctx(block.attn_hc.inject(
+                    &mixed.hyper,
+                    &out,
+                    mixed
+                        .inject_weights
+                        .as_ref()
+                        .ok_or_else(|| ModelError::Forward("attn hc без inject".into()))?,
+                ), &format!("слой {l} attn_inject"))?;
+
+                let mixed = ctx(block.mlp_hc.forward(&injected), &format!("слой {l} mlp_hc"))?;
+                let out = stage("moe", || {
+                    ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
+                })?;
+                let done = ctx(block.mlp_hc.inject(
+                    &mixed.hyper,
+                    &out,
+                    mixed
+                        .inject_weights
+                        .as_ref()
+                        .ok_or_else(|| ModelError::Forward("mlp hc без inject".into()))?,
+                ), &format!("слой {l} mlp_inject"))?;
+
+                let row = coerr(done.reshape(vec![1, len, width]))?;
+                coerr(stream.copy_rows_from(start, &row))?;
+                start += len;
+            }
+        }
+
+        cache.seq_len = past + s;
+        let stream = coerr(stream.reshape(vec![s, width]))?;
+        let last_stream = coerr(coerr(stream.narrow(0, s - 1, 1))?.contiguous())?;
+        let out = self.mixer_hc.forward(&last_stream)?.mixed;
+        Ok((out, last_stream))
+    }
+
     fn run(
         &self,
         tokens: &[u32],

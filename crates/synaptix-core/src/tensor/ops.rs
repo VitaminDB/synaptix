@@ -3084,8 +3084,21 @@ impl Tensor {
                 .map_err(|e| SynaptixError::Cuda(format!("copy_rows_from dtod: {e:?}")))?;
             return Ok(());
         }
-        let _ = (dst_off, n_bytes);
-        Err(SynaptixError::Unsupported("copy_rows_from: CPU не поддержан"))
+        let src_bytes = {
+            let cpu = src_c
+                .storage
+                .as_cpu()
+                .ok_or(SynaptixError::Unsupported("copy_rows_from: src не CPU"))?;
+            let off = src_c.layout.byte_offset();
+            cpu.as_bytes()[off..off + n_bytes].to_vec()
+        };
+        let storage = Arc::get_mut(&mut self.storage)
+            .ok_or_else(|| SynaptixError::Other("copy_rows_from: storage aliased".into()))?;
+        let dst = storage
+            .as_cpu_mut()
+            .ok_or(SynaptixError::Unsupported("copy_rows_from: dst не CPU"))?;
+        dst.as_bytes_mut()[dst_off..dst_off + n_bytes].copy_from_slice(&src_bytes);
+        Ok(())
     }
 
     /// Сырой device-указатель и длина (байт) региона плотного CUDA-тензора

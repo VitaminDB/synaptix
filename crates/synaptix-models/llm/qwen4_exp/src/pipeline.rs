@@ -368,7 +368,22 @@ impl Qwen4ExpPipeline {
         let prefill_start = Instant::now();
         let want_stream = self.mtp.is_some();
         let mut tail_stream: Option<Tensor> = None;
+        // Промпт длиннее чанка выгоднее считать слой за слоем: эксперты слоя
+        // тогда поднимаются на карту один раз на весь промпт, а не на каждый
+        // чанк. Цена — поток всех токенов в памяти, поэтому короткие промпты
+        // идут прежним путём.
+        let by_layers = prompt_ids.len() > cfg.prefill_batch
+            && self.model.expert_cache().is_some()
+            && layer_major();
         let mut logits = no_grad(|| -> Result<_, ModelError> {
+            if by_layers {
+                let (hidden, stream) =
+                    self.model.prefill_by_layers(prompt_ids, media, &mut cache, cfg.prefill_batch)?;
+                if want_stream {
+                    tail_stream = Some(stream);
+                }
+                return self.model.lm_head_forward(&hidden);
+            }
             let mut last = None;
             let mut offset = 0usize;
             while offset < prompt_ids.len() {
@@ -493,6 +508,12 @@ fn row(t: &Tensor, i: usize) -> Result<Tensor, ModelError> {
 
 fn last_row(t: &Tensor) -> Result<Tensor, ModelError> {
     row(t, t.dims()[0] - 1)
+}
+
+/// Считать ли длинный префилл слой за слоем. `SYN_QWEN4EXP_LAYER_MAJOR=0`
+/// возвращает прежний порядок (чанк целиком через все слои).
+fn layer_major() -> bool {
+    std::env::var("SYN_QWEN4EXP_LAYER_MAJOR").map(|v| v.trim() != "0").unwrap_or(true)
 }
 
 fn speculation_on() -> bool {
