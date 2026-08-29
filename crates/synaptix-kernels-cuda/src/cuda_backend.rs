@@ -2193,6 +2193,178 @@ impl Backend for CudaBackend {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_blocks_mxfp8(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        k_scale: (&Storage, &Layout),
+        v_scale: (&Storage, &Layout),
+        table: (&Storage, &Layout),
+        tail_from: (&Storage, &Layout),
+        tail_len: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        ratio: usize,
+        scale: f32,
+        row_offset: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (q_st, q_lo) = q;
+        let (k_st, k_lo) = k;
+        let (v_st, v_lo) = v;
+        let (ks_st, ks_lo) = k_scale;
+        let (vs_st, vs_lo) = v_scale;
+        let (tb_st, tb_lo) = table;
+        let (tf_st, _tf_lo) = tail_from;
+        let (tl_st, _tl_lo) = tail_len;
+        let (out_st, _out_lo) = out;
+        let dtype = q_lo.dtype();
+        if k_lo.dtype() != DType::MXFP8 || v_lo.dtype() != DType::MXFP8 {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: k/v не MXFP8"));
+        }
+        if q_lo.dims().len() != 3 || k_lo.dims().len() != 3 || v_lo.dims() != k_lo.dims() {
+            return Err(SynaptixError::Unsupported(
+                "flash_blocks mxfp8: ждём q [B,NH,D], k/v [NKV,CAP,D]",
+            ));
+        }
+        if tb_lo.dims().len() != 2 {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: таблица блоков не [B,NB]"));
+        }
+        if !q_lo.is_contiguous()
+            || !k_lo.is_contiguous()
+            || !v_lo.is_contiguous()
+            || !ks_lo.is_contiguous()
+            || !vs_lo.is_contiguous()
+            || !tb_lo.is_contiguous()
+        {
+            return Err(SynaptixError::NonContiguous);
+        }
+        if q_lo.offset() != 0
+            || k_lo.offset() != 0
+            || v_lo.offset() != 0
+            || ks_lo.offset() != 0
+            || vs_lo.offset() != 0
+            || tb_lo.offset() != 0
+        {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: ненулевое смещение"));
+        }
+        let (b, nh, d) = (q_lo.dims()[0], q_lo.dims()[1], q_lo.dims()[2]);
+        let (nkv, cap) = (k_lo.dims()[0], k_lo.dims()[1]);
+        if k_lo.dims()[2] != d || tb_lo.dims()[0] < row_offset + b {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: несогласованные формы"));
+        }
+        if d % 32 != 0 {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: голова не кратна 32"));
+        }
+        if ks_lo.dims() != [nkv, cap, d / 32] || vs_lo.dims() != ks_lo.dims() {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: форма масштабов"));
+        }
+        let nb = tb_lo.dims()[1];
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: q non-cuda"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: k non-cuda"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: v non-cuda"))?;
+        let ks_buf = ks_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: k_scale non-cuda"))?;
+        let vs_buf = vs_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: v_scale non-cuda"))?;
+        let tb_buf = tb_st.as_cuda().ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: table non-cuda"))?;
+        let tf_buf = tf_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: tail_from non-cuda"))?;
+        let tl_buf = tl_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: tail_len non-cuda"))?;
+        let ctx = q_buf.device().clone();
+        let ord = q_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("flash_blocks mxfp8: out non-cuda"))?;
+        let kernels = crate::attention::flash_blocks::FlashBlocksKernels::for_context(&ctx)?;
+        crate::attention::flash_blocks::flash_blocks_mxfp8_u8(
+            &kernels,
+            &stream,
+            q_buf.slice(),
+            k_buf.slice(),
+            v_buf.slice(),
+            ks_buf.slice(),
+            vs_buf.slice(),
+            tb_buf.slice(),
+            tf_buf.slice(),
+            tl_buf.slice(),
+            out_buf.slice_mut(),
+            b as u32,
+            nh as u32,
+            nkv as u32,
+            cap as u32,
+            d as u32,
+            nb as u32,
+            ratio as u32,
+            scale,
+            row_offset as u32,
+            dtype,
+        )
+    }
+
+    fn mxfp8_dequant(
+        &self,
+        packed: (&Storage, &Layout),
+        scales: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (p_st, p_lo) = packed;
+        let (s_st, s_lo) = scales;
+        let (o_st, o_lo) = out;
+        if p_lo.dtype() != DType::MXFP8 {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: packed не MXFP8"));
+        }
+        if o_lo.dtype() != DType::F16 {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: выход не F16"));
+        }
+        if !p_lo.is_contiguous() || !s_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let dims = p_lo.dims();
+        let k = *dims.last().ok_or(SynaptixError::Unsupported("mxfp8_dequant: пустая форма"))?;
+        if k % 32 != 0 {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: строка не кратна 32"));
+        }
+        let numel = p_lo.numel();
+        let rows = numel / k;
+        if s_lo.numel() != rows * (k / 32) {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: форма масштабов"));
+        }
+        if o_lo.numel() != numel {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: форма выхода"));
+        }
+        let p_buf = p_st.as_cuda().ok_or(SynaptixError::Unsupported("mxfp8_dequant: packed non-cuda"))?;
+        let s_buf = s_st.as_cuda().ok_or(SynaptixError::Unsupported("mxfp8_dequant: scales non-cuda"))?;
+        let ctx = p_buf.device().clone();
+        let ord = p_buf.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?;
+        let p_off = p_lo.byte_offset();
+        let s_off = s_lo.byte_offset();
+        let p_view = p_buf.slice().slice(p_off..p_off + numel);
+        let s_view = s_buf.slice().slice(s_off..s_off + rows * (k / 32));
+        let o_buf = o_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("mxfp8_dequant: out non-cuda"))?;
+        let mut o_view = unsafe { o_buf.slice_mut().transmute_mut::<half::f16>(numel) }
+            .ok_or_else(|| SynaptixError::Cuda("mxfp8_dequant: transmute выхода".into()))?;
+        crate::elementwise::quant::mxfp8_dequant_f16(
+            &kernels,
+            &stream,
+            &p_view,
+            &s_view,
+            &mut o_view,
+            rows as u32,
+            k as u32,
+        )
+    }
+
     fn flash_attention_window(
         &self,
         q: (&Storage, &Layout),

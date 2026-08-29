@@ -89,8 +89,8 @@ impl Qwen4ExpPipeline {
                 cache.capacity_bytes() as f64 / (1 << 30) as f64
             );
         }
-        let kv_reserve = model_kv_reserve(&config, cap);
-        let model = Qwen4ExpModel::build_with_cache(
+        let kv_reserve = model_kv_reserve(&config, cap, precision.kv);
+        let mut model = Qwen4ExpModel::build_with_cache(
             &config,
             &*weights,
             device,
@@ -102,6 +102,10 @@ impl Qwen4ExpPipeline {
             expert_source,
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?;
+        model.set_kv_dtype(precision.kv);
+        if model.kv_quantized() {
+            eprintln!("[qwen4_exp] KV-кэш квантованный: mxfp8 с масштабом на 32 элемента");
+        }
         if let Some(cache) = model.expert_cache() {
             warn_if_cache_too_big(cache, device, kv_reserve);
         }
@@ -255,7 +259,11 @@ impl Qwen4ExpPipeline {
             .iter()
             .filter(|t| matches!(t, crate::config::LayerType::Qsa))
             .count();
-        let kv = 2 * cfg.num_key_value_heads * cfg.head_dim * elem;
+        let kv = if self.model.kv_quantized() {
+            2 * cfg.num_key_value_heads * cfg.head_dim * 33 / 32
+        } else {
+            2 * cfg.num_key_value_heads * cfg.head_dim * elem
+        };
         let indexer = if cfg.indexer.compress_ratio > 0 {
             cfg.indexer.head_dim * elem / cfg.indexer.compress_ratio
         } else {
@@ -557,13 +565,15 @@ fn prefill_chunk() -> usize {
 }
 
 /// Сколько VRAM уйдёт под KV и ключи индексатора при полном окне.
-fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize) -> usize {
+fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize, kv: DType) -> usize {
     let qsa = cfg
         .layer_types
         .iter()
         .filter(|t| matches!(t, crate::config::LayerType::Qsa))
         .count();
-    let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * 2
+    // Квантованный KV — байт на элемент плюс масштаб на каждые 32.
+    let kv_elem = if kv == DType::MXFP8 { 33 } else { 32 * 2 };
+    let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * kv_elem / 32
         + if cfg.indexer.compress_ratio > 0 {
             cfg.indexer.head_dim * 2 / cfg.indexer.compress_ratio
         } else {

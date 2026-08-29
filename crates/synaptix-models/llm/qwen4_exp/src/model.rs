@@ -155,6 +155,7 @@ pub struct Qwen4ExpModel {
     rope: RopeCache,
     ple_layers: Vec<usize>,
     expert_cache: Option<Arc<ExpertCache>>,
+    kv_dtype: DType,
 }
 
 impl Qwen4ExpModel {
@@ -352,7 +353,18 @@ impl Qwen4ExpModel {
             rope,
             ple_layers,
             expert_cache,
+            kv_dtype: compute,
         })
+    }
+
+    /// Чем хранить KV: `MXFP8` кладёт его квантованным — вдвое меньше и
+    /// занятой памяти, и трафика внимания.
+    pub fn set_kv_dtype(&mut self, dtype: DType) {
+        self.kv_dtype = dtype;
+    }
+
+    pub fn kv_quantized(&self) -> bool {
+        (self.kv_dtype == DType::MXFP8 || crate::attention::kv_fp8()) && self.device != Device::Cpu
     }
 
     pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
@@ -369,13 +381,22 @@ impl Qwen4ExpModel {
             layers.push(match &block.mixer {
                 Mixer::Linear(la) => LayerState::Linear(la.make_state()),
                 Mixer::Qsa(qa) => LayerState::Qsa(Box::new((
-                    KvLayer::new(
-                        self.config.num_key_value_heads,
-                        self.config.head_dim,
-                        max_seq,
-                        self.device,
-                        self.compute,
-                    )?,
+                    if self.kv_quantized() {
+                        KvLayer::new_mxfp8(
+                            self.config.num_key_value_heads,
+                            self.config.head_dim,
+                            max_seq,
+                            self.device,
+                        )?
+                    } else {
+                        KvLayer::new(
+                            self.config.num_key_value_heads,
+                            self.config.head_dim,
+                            max_seq,
+                            self.device,
+                            self.compute,
+                        )?
+                    },
                     qa.indexer.make_cache(max_seq)?,
                 ))),
             });

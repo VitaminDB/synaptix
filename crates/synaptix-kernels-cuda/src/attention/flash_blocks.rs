@@ -39,6 +39,15 @@ pub struct FlashBlocksKernels {
     f32_h256_r6: CudaFunction,
     f16_h256_r6: CudaFunction,
     bf16_h256_r6: CudaFunction,
+    q8_f32: CudaFunction,
+    q8_f16: CudaFunction,
+    q8_bf16: CudaFunction,
+    q8_f32_h128_r8: CudaFunction,
+    q8_f16_h128_r8: CudaFunction,
+    q8_bf16_h128_r8: CudaFunction,
+    q8_f32_h256_r6: CudaFunction,
+    q8_f16_h256_r6: CudaFunction,
+    q8_bf16_h256_r6: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashBlocksKernels>)>>> = OnceLock::new();
@@ -67,6 +76,15 @@ impl FlashBlocksKernels {
             f32_h256_r6: load_fn(&module, "flash_blocks_f32_h256_r6")?,
             f16_h256_r6: load_fn(&module, "flash_blocks_f16_h256_r6")?,
             bf16_h256_r6: load_fn(&module, "flash_blocks_bf16_h256_r6")?,
+            q8_f32: load_fn(&module, "flash_blocks_mxfp8_f32")?,
+            q8_f16: load_fn(&module, "flash_blocks_mxfp8_f16")?,
+            q8_bf16: load_fn(&module, "flash_blocks_mxfp8_bf16")?,
+            q8_f32_h128_r8: load_fn(&module, "flash_blocks_mxfp8_f32_h128_r8")?,
+            q8_f16_h128_r8: load_fn(&module, "flash_blocks_mxfp8_f16_h128_r8")?,
+            q8_bf16_h128_r8: load_fn(&module, "flash_blocks_mxfp8_bf16_h128_r8")?,
+            q8_f32_h256_r6: load_fn(&module, "flash_blocks_mxfp8_f32_h256_r6")?,
+            q8_f16_h256_r6: load_fn(&module, "flash_blocks_mxfp8_f16_h256_r6")?,
+            q8_bf16_h256_r6: load_fn(&module, "flash_blocks_mxfp8_bf16_h256_r6")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -183,6 +201,122 @@ pub fn flash_blocks_u8(
         bld.launch(cfg).map_err(|e| {
             SynaptixError::Cuda(format!(
                 "launch flash_blocks: {e:?} (b={b} nh={nh} nkv={nkv} cap={cap} d={d} nb={nb} ratio={ratio} smem={smem} rep_tile={rep_tile})"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_blocks_mxfp8_u8(
+    kernels: &FlashBlocksKernels,
+    stream: &Arc<CudaStream>,
+    q: &CudaSlice<u8>,
+    k: &CudaSlice<u8>,
+    v: &CudaSlice<u8>,
+    k_scale: &CudaSlice<u8>,
+    v_scale: &CudaSlice<u8>,
+    table: &CudaSlice<u8>,
+    tail_from: &CudaSlice<u8>,
+    tail_len: &CudaSlice<u8>,
+    out: &mut CudaSlice<u8>,
+    b: u32,
+    nh: u32,
+    nkv: u32,
+    cap: u32,
+    d: u32,
+    nb: u32,
+    ratio: u32,
+    scale: f32,
+    row_offset: u32,
+    dtype: DType,
+) -> Result<()> {
+    if b == 0 || nh == 0 || d == 0 {
+        return Ok(());
+    }
+    if nkv == 0 || nh % nkv != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "flash_blocks mxfp8: NH={nh} не кратно NKV={nkv}"
+        )));
+    }
+    let n_rep = nh / nkv;
+    if n_rep > MAX_REP {
+        return Err(SynaptixError::Cuda(format!(
+            "flash_blocks mxfp8: {n_rep} голов на kv-голову, потолок {MAX_REP}"
+        )));
+    }
+    if ratio == 0 || cap % ratio != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "flash_blocks mxfp8: ёмкость {cap} не кратна блоку {ratio}"
+        )));
+    }
+    if d % 32 != 0 || d / 32 > MAX_VEC {
+        return Err(SynaptixError::Unsupported("flash_blocks mxfp8: голова не кратна 32"));
+    }
+    let rep_tile = if d == 128 && n_rep % 8 == 0 {
+        8
+    } else if d == 256 && n_rep % 6 == 0 {
+        6
+    } else {
+        4
+    };
+    let func = match (dtype, d, rep_tile) {
+        (DType::F32, 128, 8) => &kernels.q8_f32_h128_r8,
+        (DType::F16, 128, 8) => &kernels.q8_f16_h128_r8,
+        (DType::BF16, 128, 8) => &kernels.q8_bf16_h128_r8,
+        (DType::F32, 256, 6) => &kernels.q8_f32_h256_r6,
+        (DType::F16, 256, 6) => &kernels.q8_f16_h256_r6,
+        (DType::BF16, 256, 6) => &kernels.q8_bf16_h256_r6,
+        (DType::F32, _, _) => &kernels.q8_f32,
+        (DType::F16, _, _) => &kernels.q8_f16,
+        (DType::BF16, _, _) => &kernels.q8_bf16,
+        (other, _, _) => {
+            return Err(SynaptixError::Cuda(format!(
+                "flash_blocks mxfp8: dtype {other:?} не поддержан"
+            )))
+        }
+    };
+
+    let groups = n_rep.div_ceil(rep_tile);
+    let smem = (WARPS * rep_tile.min(n_rep) * (d + 2)) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (b * nkv, groups, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: smem,
+    };
+    let (b_i, nh_i, nkv_i, cap_i, d_i, nb_i, ratio_i, off_i) = (
+        b as i32,
+        nh as i32,
+        nkv as i32,
+        cap as i32,
+        d as i32,
+        nb as i32,
+        ratio as i32,
+        row_offset as i32,
+    );
+    let mut bld = stream.launch_builder(func);
+    bld.arg(q)
+        .arg(k)
+        .arg(v)
+        .arg(k_scale)
+        .arg(v_scale)
+        .arg(table)
+        .arg(tail_from)
+        .arg(tail_len)
+        .arg(out)
+        .arg(&b_i)
+        .arg(&nh_i)
+        .arg(&nkv_i)
+        .arg(&cap_i)
+        .arg(&d_i)
+        .arg(&nb_i)
+        .arg(&ratio_i)
+        .arg(&scale)
+        .arg(&off_i);
+    unsafe {
+        bld.launch(cfg).map_err(|e| {
+            SynaptixError::Cuda(format!(
+                "launch flash_blocks mxfp8: {e:?} (b={b} nh={nh} nkv={nkv} cap={cap} d={d} nb={nb} ratio={ratio} smem={smem} rep_tile={rep_tile})"
             ))
         })?;
     }

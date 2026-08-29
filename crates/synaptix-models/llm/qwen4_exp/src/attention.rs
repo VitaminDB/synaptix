@@ -26,6 +26,8 @@ fn gather_selected() -> bool {
 pub struct KvLayer {
     pub k: Tensor,
     pub v: Tensor,
+    pub k_scale: Option<Tensor>,
+    pub v_scale: Option<Tensor>,
 }
 
 impl KvLayer {
@@ -43,8 +45,78 @@ impl KvLayer {
         Ok(Self {
             k: Tensor::zeros(dims.clone(), dtype, device).map_err(|e| ModelError::Build(e.to_string()))?,
             v: Tensor::zeros(dims, dtype, device).map_err(|e| ModelError::Build(e.to_string()))?,
+            k_scale: None,
+            v_scale: None,
         })
     }
+
+    pub fn new_mxfp8(
+        num_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        device: Device,
+    ) -> Result<Self, ModelError> {
+        if head_dim % 32 != 0 {
+            return Err(ModelError::Build(format!(
+                "KV в fp8: голова {head_dim} не кратна 32"
+            )));
+        }
+        let capacity = capacity.next_multiple_of(8);
+        let dims = vec![1, num_kv_heads, capacity, head_dim];
+        let sdims = vec![1, num_kv_heads, capacity, head_dim / 32];
+        let build = |d: &Vec<usize>, t: DType| {
+            Tensor::zeros(d.clone(), t, device).map_err(|e| ModelError::Build(e.to_string()))
+        };
+        Ok(Self {
+            k: build(&dims, DType::MXFP8)?,
+            v: build(&dims, DType::MXFP8)?,
+            k_scale: Some(build(&sdims, DType::U8)?),
+            v_scale: Some(build(&sdims, DType::U8)?),
+        })
+    }
+
+    pub fn is_quant(&self) -> bool {
+        self.k_scale.is_some()
+    }
+
+    pub fn append(&mut self, k: &Tensor, v: &Tensor, past: usize) -> Result<(), ModelError> {
+        match (&mut self.k_scale, &mut self.v_scale) {
+            (Some(ks), Some(vs)) => {
+                self.k
+                    .kv_append_quant_mxfp8_inplace(ks, k, past)
+                    .map_err(|e| ModelError::Forward(e.to_string()))?;
+                self.v
+                    .kv_append_quant_mxfp8_inplace(vs, v, past)
+                    .map_err(|e| ModelError::Forward(e.to_string()))
+            }
+            _ => {
+                self.k.kv_append_inplace(k, past).map_err(|e| ModelError::Forward(e.to_string()))?;
+                self.v.kv_append_inplace(v, past).map_err(|e| ModelError::Forward(e.to_string()))
+            }
+        }
+    }
+
+    /// Деквантованный KV целиком — запасной путь там, где fp8-ядра нет.
+    fn dense(&self, dtype: DType) -> Result<(Tensor, Tensor), ModelError> {
+        match (&self.k_scale, &self.v_scale) {
+            (Some(ks), Some(vs)) => {
+                let deq = |t: &Tensor, sc: &Tensor| -> Result<Tensor, ModelError> {
+                    coerr(t.mxfp8_dequant(sc)).and_then(|d| coerr(d.to_dtype(dtype)))
+                };
+                Ok((deq(&self.k, ks)?, deq(&self.v, vs)?))
+            }
+            _ => Ok((self.k.clone(), self.v.clone())),
+        }
+    }
+}
+
+/// Хранить ли KV квантованным в fp8: вдвое меньше и трафика внимания, и
+/// занятой памяти. `SYN_QWEN4EXP_KV8=1`.
+pub fn kv_fp8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_KV8").map(|v| v.trim() == "1").unwrap_or(false)
+    })
 }
 
 pub struct QsaAttention {
@@ -152,41 +224,19 @@ impl QsaAttention {
                 past
             )));
         }
-        kv.k.kv_append_inplace(&k, past).map_err(|e| ModelError::Forward(e.to_string()))?;
-        kv.v.kv_append_inplace(&v, past).map_err(|e| ModelError::Forward(e.to_string()))?;
+        kv.append(&k, &v, past)?;
 
         let kv_len = past + s;
-        let k_all = coerr(kv.k.narrow(2, 0, kv_len))?;
-        let v_all = coerr(kv.v.narrow(2, 0, kv_len))?;
 
         let attn = match &selected {
-            None if s == 1 => {
-                let k_rep = repeat_kv(&k_all, nh / nkv)?;
-                let v_rep = repeat_kv(&v_all, nh / nkv)?;
-                coerr(scaled_dot_attention(&q, &k_rep, &v_rep, self.scale, None))?
-            }
-            None => {
-                let flashed = match q.flash_attention(&k_all, &v_all, self.scale, true) {
-                    Ok(a) => Some(a),
-                    Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => None,
-                    Err(e) => return Err(ModelError::Forward(e.to_string())),
-                };
-                match flashed {
-                    Some(a) => a,
-                    None => {
-                        let k_rep = repeat_kv(&k_all, nh / nkv)?;
-                        let v_rep = repeat_kv(&v_all, nh / nkv)?;
-                        let mask = self.causal_mask(s, kv_len, past)?;
-                        coerr(scaled_dot_attention(&q, &k_rep, &v_rep, self.scale, Some(&mask)))?
-                    }
-                }
-            }
+            None => self.dense_attention(&q, kv, past, s, kv_len)?,
             Some(sel) if gather_selected() => {
                 stage("qsa:sparse", || self.sparse_attention(&q, kv, sel))?
             }
             Some(sel) => stage("qsa:masked", || {
-                let k_rep = repeat_kv(&k_all, nh / nkv)?;
-                let v_rep = repeat_kv(&v_all, nh / nkv)?;
+                let (kd, vd) = kv.dense(self.compute)?;
+                let k_rep = repeat_kv(&coerr(kd.narrow(2, 0, kv_len))?, nh / nkv)?;
+                let v_rep = repeat_kv(&coerr(vd.narrow(2, 0, kv_len))?, nh / nkv)?;
                 let mask = self.selection_mask(sel, s, kv_len)?;
                 coerr(scaled_dot_attention(&q, &k_rep, &v_rep, self.scale, Some(&mask)))
             })?,
@@ -196,6 +246,49 @@ impl QsaAttention {
         let attn = coerr(attn.mul(&coerr(gate.sigmoid())?))?;
         let attn = coerr(attn.reshape(vec![s, nh * hd]))?;
         Ok((self.o_proj.forward(&attn)?, selected))
+    }
+
+    /// Внимание по всему контексту — там, где индексатор ещё не выбирает
+    /// блоки. Квантованный KV читается ядром прямо в fp8; если такого пути
+    /// нет, KV деквантуется целиком.
+    fn dense_attention(
+        &self,
+        q: &Tensor,
+        kv: &KvLayer,
+        past: usize,
+        s: usize,
+        kv_len: usize,
+    ) -> Result<Tensor, ModelError> {
+        let (nh, nkv) = (self.num_heads, self.num_kv_heads);
+        if let (Some(ks), Some(vs)) = (&kv.k_scale, &kv.v_scale) {
+            let k_all = coerr(kv.k.narrow(2, 0, kv_len))?;
+            let v_all = coerr(kv.v.narrow(2, 0, kv_len))?;
+            let ks_all = coerr(ks.narrow(2, 0, kv_len))?;
+            let vs_all = coerr(vs.narrow(2, 0, kv_len))?;
+            match q.flash_attention_mxfp8kv(&k_all, &v_all, &ks_all, &vs_all, self.scale, true) {
+                Ok(a) => return Ok(a),
+                Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
+                Err(e) => return Err(ModelError::Forward(e.to_string())),
+            }
+        }
+        let (kd, vd) = kv.dense(self.compute)?;
+        let k_all = coerr(kd.narrow(2, 0, kv_len))?;
+        let v_all = coerr(vd.narrow(2, 0, kv_len))?;
+        if s == 1 {
+            let k_rep = repeat_kv(&k_all, nh / nkv)?;
+            let v_rep = repeat_kv(&v_all, nh / nkv)?;
+            return coerr(scaled_dot_attention(q, &k_rep, &v_rep, self.scale, None));
+        }
+        match q.flash_attention(&k_all, &v_all, self.scale, true) {
+            Ok(a) => Ok(a),
+            Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {
+                let k_rep = repeat_kv(&k_all, nh / nkv)?;
+                let v_rep = repeat_kv(&v_all, nh / nkv)?;
+                let mask = self.causal_mask(s, kv_len, past)?;
+                coerr(scaled_dot_attention(q, &k_rep, &v_rep, self.scale, Some(&mask)))
+            }
+            Err(e) => Err(ModelError::Forward(e.to_string())),
+        }
     }
 
     fn causal_mask(&self, s: usize, kv_len: usize, past: usize) -> Result<Tensor, ModelError> {
@@ -248,7 +341,8 @@ impl QsaAttention {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let cap = kv.k.dims()[2];
         let cr = selected.ratio.max(1);
-        let elem = (self.compute.size_in_bits() / 8).max(1);
+        let quant = kv.is_quant();
+        let elem = if quant { 1 } else { (self.compute.size_in_bits() / 8).max(1) };
         if cap % cr != 0 {
             return Err(ModelError::Shape(format!(
                 "QSA: ёмкость KV {cap} не кратна блоку {cr}"
@@ -257,9 +351,13 @@ impl QsaAttention {
         let block_rows = cap / cr;
         let nb = selected.topk;
 
+        let mut dense_kv: Option<(Tensor, Tensor)> = None;
         let mut parts: Vec<Tensor> = Vec::new();
         let per_query = 2 * nkv * (nb * cr + cr) * hd * elem;
         let group = (SPARSE_KV_BUDGET / per_query.max(1)).clamp(1, len);
+        // Квантованный KV гатером не собрать, поэтому ядро там берётся с
+        // любого числа запросов — сборка потребовала бы декванта всего кэша.
+        let kernel_min = if quant { 1 } else { BLOCK_KERNEL_MIN };
         let mut start = offset;
         while start < offset + len {
             let g = group.min(offset + len - start);
@@ -270,19 +368,38 @@ impl QsaAttention {
             // Ядро читает KV прямо по таблице блоков — она уже на карте, и
             // собранного буфера не нужно вовсе. На горстке запросов сетка из
             // `g · nkv` блоков карту не загружает, и там остаётся сборка.
-            if nb > 0 && g >= BLOCK_KERNEL_MIN {
+            if nb > 0 && g >= kernel_min {
                 let k3 = coerr(kv.k.reshape(vec![nkv, cap, hd]))?;
                 let v3 = coerr(kv.v.reshape(vec![nkv, cap, hd]))?;
-                match q_sel.flash_attention_blocks(
-                    &k3,
-                    &v3,
-                    &selected.blocks,
-                    &selected.tail_from,
-                    &selected.tail_len,
-                    cr,
-                    self.scale,
-                    start,
-                ) {
+                let done = match (&kv.k_scale, &kv.v_scale) {
+                    (Some(ks), Some(vs)) => {
+                        let ks3 = coerr(ks.reshape(vec![nkv, cap, hd / 32]))?;
+                        let vs3 = coerr(vs.reshape(vec![nkv, cap, hd / 32]))?;
+                        q_sel.flash_attention_blocks_mxfp8(
+                            &k3,
+                            &v3,
+                            &ks3,
+                            &vs3,
+                            &selected.blocks,
+                            &selected.tail_from,
+                            &selected.tail_len,
+                            cr,
+                            self.scale,
+                            start,
+                        )
+                    }
+                    _ => q_sel.flash_attention_blocks(
+                        &k3,
+                        &v3,
+                        &selected.blocks,
+                        &selected.tail_from,
+                        &selected.tail_len,
+                        cr,
+                        self.scale,
+                        start,
+                    ),
+                };
+                match done {
                     Ok(out) => {
                         parts.push(out);
                         start += g;
@@ -293,7 +410,11 @@ impl QsaAttention {
                 }
             }
 
-            parts.push(self.gathered_attention(&q_sel, kv, selected, start, g, block_rows)?);
+            if dense_kv.is_none() {
+                dense_kv = Some(kv.dense(self.compute)?);
+            }
+            let (kd, vd) = dense_kv.as_ref().expect("деквантованный KV");
+            parts.push(self.gathered_attention(&q_sel, kd, vd, selected, start, g, block_rows)?);
             start += g;
         }
 
@@ -314,14 +435,15 @@ impl QsaAttention {
     fn gathered_attention(
         &self,
         q_sel: &Tensor,
-        kv: &KvLayer,
+        kv_k: &Tensor,
+        kv_v: &Tensor,
         selected: &Selection,
         offset: usize,
         g: usize,
         block_rows: usize,
     ) -> Result<Tensor, ModelError> {
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
-        let cap = kv.k.dims()[2];
+        let cap = kv_k.dims()[2];
         let cr = selected.ratio.max(1);
         let host = selected.host_blocks()?;
         let tails = selected.tails();
@@ -361,8 +483,8 @@ impl QsaAttention {
                 let rest = coerr(take_rows(&table, &tail_idx)?.reshape(vec![n, nkv, tail, hd]))?;
                 coerr(Tensor::cat(&[&picked, &rest], 2))
             };
-            let k_sel = gather(&kv.k)?;
-            let v_sel = gather(&kv.v)?;
+            let k_sel = gather(kv_k)?;
+            let v_sel = gather(kv_v)?;
 
             let rows_idx: Vec<u32> = rows.iter().map(|r| (*r - offset) as u32).collect();
             let rows_idx = coerr(Tensor::from_vec(rows_idx, vec![n], self.device))?;
@@ -427,7 +549,10 @@ impl QsaAttention {
         // разные места, объединение растёт до всего контекста и маскированное
         // внимание по нему дороже поштучного пути. Проверка идёт до выгрузки
         // таблицы на хост — на длинном контексте она и не понадобится.
-        if selected.blocks_total > TILE_CONTEXT_RATIO * selected.topk {
+        if kv.is_quant()
+            || !tile_union()
+            || selected.blocks_total > TILE_CONTEXT_RATIO * selected.topk
+        {
             let mut parts: Vec<Tensor> = Vec::new();
             let mut start = 0usize;
             while start < s {
@@ -507,6 +632,17 @@ const TILE_CONTEXT_RATIO: usize = 4;
 
 /// От скольких запросов в группе включается ядро по таблице блоков.
 const BLOCK_KERNEL_MIN: usize = 8;
+
+/// Пробовать ли тайл общего объединения наборов. Пока внимание считалось
+/// сборкой позиций, объединение соседних запросов окупалось на коротком
+/// контексте; ядро по таблице блоков быстрее его и там, поэтому путь остаётся
+/// только под `SYN_QWEN4EXP_QSA_TILE_UNION=1`.
+fn tile_union() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_QSA_TILE_UNION").map(|v| v.trim() == "1").unwrap_or(false)
+    })
+}
 
 /// Верхний предел длины тайла.
 fn qsa_tile() -> usize {

@@ -485,6 +485,36 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("flash_attention_blocks не поддержан этим backend"))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_blocks_mxfp8(
+        &self,
+        _q: (&Storage, &Layout),
+        _k: (&Storage, &Layout),
+        _v: (&Storage, &Layout),
+        _k_scale: (&Storage, &Layout),
+        _v_scale: (&Storage, &Layout),
+        _table: (&Storage, &Layout),
+        _tail_from: (&Storage, &Layout),
+        _tail_len: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _ratio: usize,
+        _scale: f32,
+        _row_offset: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("flash_attention_blocks_mxfp8 не поддержан этим backend"))
+    }
+
+    fn mxfp8_dequant(
+        &self,
+        _packed: (&Storage, &Layout),
+        _scales: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("mxfp8_dequant не поддержан этим backend"))
+    }
+
     /// Двунаправленный sliding-window flash (band ±window). Default Unsupported
     /// → caller fallback (наивная маска).
     #[allow(clippy::too_many_arguments)]

@@ -2602,6 +2602,68 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_blocks_mxfp8(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        k_scale: &Tensor,
+        v_scale: &Tensor,
+        table: &Tensor,
+        tail_from: &Tensor,
+        tail_len: &Tensor,
+        ratio: usize,
+        scale: f32,
+        row_offset: usize,
+    ) -> Result<Self> {
+        if self.rank() != 3 {
+            return Err(SynaptixError::Unsupported("flash_blocks mxfp8: q rank != 3"));
+        }
+        let q = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let tb = if table.is_contiguous() { table.clone() } else { table.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(q.dims().to_vec()), self.dtype());
+        let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
+        let backend = registry::backend_for(self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.flash_attention_blocks_mxfp8(
+            (&q.storage, &q.layout),
+            (&k.storage, &k.layout),
+            (&v.storage, &v.layout),
+            (&k_scale.storage, &k_scale.layout),
+            (&v_scale.storage, &v_scale.layout),
+            (&tb.storage, &tb.layout),
+            (&tail_from.storage, &tail_from.layout),
+            (&tail_len.storage, &tail_len.layout),
+            (&mut storage, &out_layout),
+            ratio,
+            scale,
+            row_offset,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
+    pub fn mxfp8_dequant(&self, scales: &Tensor) -> Result<Self> {
+        if self.dtype() != DType::MXFP8 {
+            return Err(SynaptixError::Unsupported("mxfp8_dequant: тензор не MXFP8"));
+        }
+        let packed = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let sc = if scales.is_contiguous() { scales.clone() } else { scales.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(self.dims().to_vec()), DType::F16);
+        let out_bytes = DType::F16.bytes_for_numel(out_layout.numel());
+        let backend = registry::backend_for(self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.mxfp8_dequant(
+            (&packed.storage, &packed.layout),
+            (&sc.storage, &sc.layout),
+            (&mut storage, &out_layout),
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     pub fn flash_attention(
         &self,
         k: &Tensor,
