@@ -24,6 +24,14 @@ pub trait Reclaimable: Send + Sync {
     /// (её же мьютекс может быть занят тем, кто и упёрся в OOM: берите
     /// `try_lock` и возвращайте 0).
     fn reclaim(&self, device: Device, want: usize) -> usize;
+
+    /// Сколько байт кэш готов отдать, если попросят. Нужно планировщику: без
+    /// этого «свободная VRAM» занижена на весь размер кэша, и бюджет KV
+    /// выглядит нулевым рядом с десятью отдаваемыми гигабайтами. По умолчанию
+    /// `0` — кэш, который не умеет отвечать, просто не участвует в оценке.
+    fn reclaimable_bytes(&self, _device: Device) -> usize {
+        0
+    }
 }
 
 type Slot = Weak<dyn Reclaimable>;
@@ -58,6 +66,16 @@ pub fn reclaim(device: Device, want: usize) -> usize {
         freed += r.reclaim(device, want - freed);
     }
     freed
+}
+
+/// Сколько байт зарегистрированные кэши готовы отдать на `device`.
+pub fn reclaimable(device: Device) -> usize {
+    let live: Vec<std::sync::Arc<dyn Reclaimable>> = {
+        let Ok(mut g) = registry().lock() else { return 0 };
+        g.retain(|w| w.strong_count() > 0);
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    live.iter().map(|r| r.reclaimable_bytes(device)).sum()
 }
 
 /// Есть ли кому отдавать (дешёвая проверка перед дорогим ретраем).

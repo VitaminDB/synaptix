@@ -1923,6 +1923,34 @@ pub fn cuda_release_kernel_caches() -> (usize, usize) {
     synaptix_kernels_cuda::release_device_caches()
 }
 
+/// Сколько VRAM держат кэши, готовые подвинуться (кэш экспертов MoE, пустые
+/// slab'ы его арены).
+///
+/// Планировщику контекста без этого числа память видится занятой: `cuMemGetInfo`
+/// показывает 40 МБ свободных рядом с десятью гигабайтами, которые отдадут по
+/// первой же просьбе, и бюджет KV выходит нулевым.
+pub fn cuda_reclaimable_mb(ordinal: i32) -> usize {
+    if ordinal < 0 {
+        return 0;
+    }
+    synaptix_core::memory::reclaim::reclaimable(synaptix_core::device::Device::Cuda(
+        ordinal as usize,
+    )) / (1024 * 1024)
+}
+
+/// Попросить эти кэши освободить `want_mb`. Возвращает отданное, МБ.
+///
+/// Нужно ДО того, как жертвовать чем-то дорогим: пересчитать вытесненного
+/// эксперта стоит миллисекунды, а посчитанный заново префикс-KV — секунды
+/// префилла.
+pub fn cuda_reclaim_mb(ordinal: i32, want_mb: usize) -> usize {
+    if ordinal < 0 {
+        return 0;
+    }
+    let device = synaptix_core::device::Device::Cuda(ordinal as usize);
+    synaptix_core::memory::reclaim::reclaim(device, want_mb * 1024 * 1024) / (1024 * 1024)
+}
+
 /// Trim CUDA-mempool после Drop KV-кэша. На non-CUDA сборках `hard_trim_all_pools_device`
 /// резолвится в no-op fallback, поэтому функция доступна безусловно.
 pub fn cuda_trim_pool(ordinal: i32) -> u64 {

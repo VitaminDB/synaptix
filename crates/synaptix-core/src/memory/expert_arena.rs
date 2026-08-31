@@ -299,6 +299,19 @@ impl crate::memory::reclaim::Reclaimable for EmptySlabs {
         };
         release_empty(ord)
     }
+
+    fn reclaimable_bytes(&self, device: crate::device::Device) -> usize {
+        let crate::device::Device::Cuda(ord) = device else {
+            return 0;
+        };
+        let st = STATE.lock();
+        let current = st.current;
+        st.slabs
+            .iter()
+            .filter(|s| s.ordinal == ord && s.live == 0 && Some(s.id) != current)
+            .map(|s| s.len)
+            .sum()
+    }
 }
 
 /// Зарегистрировать арену как отдаваемую память. Идемпотентно.

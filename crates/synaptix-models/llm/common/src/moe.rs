@@ -512,6 +512,15 @@ impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
     /// на следующем чанке), потом прогретые эксперты. Ёмкость опускаем до
     /// того, что осталось, — иначе кэш тут же наберёт обратно ровно те же
     /// гигабайты, и ретрай аллокации снова упрётся в OOM.
+    /// Отдать можем всё, кроме неприкосновенного минимума: эксперты
+    /// перечитываются из бандла, а KV-кэш и активации — нет.
+    fn reclaimable_bytes(&self, device: Device) -> usize {
+        if device != self.device {
+            return 0;
+        }
+        self.used_bytes().saturating_sub(MIN_CACHE_BYTES)
+    }
+
     fn reclaim(&self, device: Device, want: usize) -> usize {
         if device != self.device || want == 0 {
             return 0;
