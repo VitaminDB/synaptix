@@ -143,9 +143,6 @@ pub struct ExpertCache {
     /// ним туда-сюда — вниз на нехватке VRAM, обратно вверх, когда пик хода
     /// пройден.
     ceiling_bytes: AtomicUsize,
-    /// Размер последнего поднятого эксперта: подсказка арене, чтобы весь
-    /// эксперт лёг в один slab, а не хвостом в соседний.
-    last_expert_bytes: AtomicUsize,
     /// Лимит временного набора префилла — ЧАСТЬ общего бюджета
     /// `capacity_bytes`, а не добавка к нему: раньше на карте оказывалось
     /// `capacity + scratch` байт экспертов (12 + 3 ГБ при 24 ГБ VRAM), и
@@ -226,7 +223,6 @@ impl ExpertCache {
             device,
             capacity_bytes: AtomicUsize::new(capacity_bytes),
             ceiling_bytes: AtomicUsize::new(capacity_bytes),
-            last_expert_bytes: AtomicUsize::new(0),
             scratch_bytes: (capacity_bytes / 4).min(2 << 30),
             scratch_mode: std::sync::atomic::AtomicBool::new(false),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
@@ -250,16 +246,6 @@ impl ExpertCache {
 
     pub fn device(&self) -> Device {
         self.device
-    }
-
-    /// Сказать арене, что сейчас поднимут эксперта: если в текущем slab'е
-    /// столько не осталось, она откроет новый заранее. Иначе хвост эксперта
-    /// уехал бы в соседний slab и держал бы его от освобождения.
-    fn arena_group(&self) {
-        if let Device::Cuda(ord) = self.device {
-            let hint = self.last_expert_bytes.load(Ordering::Relaxed);
-            synaptix_core::memory::expert_arena::begin_group(ord, hint);
-        }
     }
 
     pub fn capacity_bytes(&self) -> usize {
@@ -454,7 +440,6 @@ impl ExpertCache {
         }
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         let slab = expert.slab();
-        self.last_expert_bytes.store(bytes, Ordering::Relaxed);
         if scratch {
             while inner.scratch_bytes + bytes > self.scratch_bytes {
                 let Some(victim) = inner.scratch_order.pop_front() else { break };
@@ -1491,7 +1476,6 @@ impl MoeFfn {
         let _experts_pool =
             synaptix_core::device::cuda::ExpertsAllocGuard::for_device(cache.device());
         let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
-        cache.arena_group();
         let fetched = match &self.experts {
             ExpertStore::Resident(all) => {
                 let host = all
@@ -1604,6 +1588,17 @@ mod tests {
     use super::*;
     use synaptix_core::memory::expert_arena;
 
+    /// Арена одна на процесс, и оба теста ниже меряют её целиком — значит
+    /// идти они обязаны по одному, чем бы ни был занят `cargo test`.
+    static ARENA: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Взять арену под тест и начать с чистого листа.
+    fn arena_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+        expert_arena::release_empty(0);
+        g
+    }
+
     /// Эксперт под MXFP8: `[2I, H]` и `[H, I]` при H=1024, I=512 — около
     /// полутора мегабайт, как у настоящего Qwen4Exp.
     const H: usize = 1024;
@@ -1618,6 +1613,65 @@ mod tests {
         Expert { gate_up: quantized(2 * I, H, device), down: quantized(H, I, device) }
     }
 
+    /// Арена не имеет права расти вслед за ПОТОКОМ экспертов — только вслед
+    /// за тем, сколько их живёт разом.
+    ///
+    /// На живой сессии кэш держал 0.94 ГБ резидентов, а пул экспертов —
+    /// 16.5 ГБ: bump раздавал новые адреса на каждую подкачку (45 тысяч за
+    /// ход), освобождённые слоты не переиспользовались, и slab'ы не пустели
+    /// целиком. VRAM кончалась, аллокатор звал `reclaim`, тот ронял ёмкость
+    /// до минимума — и кэш переставал кэшировать.
+    #[test]
+    fn arena_tracks_residents_not_the_stream_of_fetches() {
+        let _arena = arena_guard();
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+        let device = Device::Cuda(0);
+        if synaptix_core::device::cuda::mem_info(0).is_err() {
+            eprintln!("CUDA недоступна — тест пропущен");
+            return;
+        }
+        if !expert_arena::enabled() {
+            eprintln!("арена выключена через SYN_EXPERT_ARENA — тест пропущен");
+            return;
+        }
+
+        // Ёмкости хватает на ~170 резидентов, а прогоняем 600: вытеснение
+        // идёт всё время, как на префилле.
+        const CAP: usize = 256 << 20;
+        let cache = ExpertCache::new(device, CAP);
+        {
+            let _pool = synaptix_core::device::cuda::ExpertsAllocGuard::for_device(device);
+            for i in 0..600usize {
+                cache.insert((0, i), Arc::new(expert(device)));
+            }
+        }
+        let _ = synaptix_core::device::cuda::synchronize_all(0);
+        let st = expert_arena::stats();
+        eprintln!(
+            "резидентов {} на {} МБ; арена держит {} МБ в {} slab'ах",
+            cache.stats().resident,
+            cache.used_bytes() / (1024 * 1024),
+            st.reserved / (1024 * 1024),
+            st.slabs,
+        );
+        assert!(
+            cache.used_bytes() <= CAP,
+            "кэш перерос ёмкость: {} МБ при потолке {} МБ",
+            cache.used_bytes() / (1024 * 1024),
+            CAP / (1024 * 1024)
+        );
+        assert!(
+            st.reserved <= CAP + 2 * expert_arena::slab_bytes(),
+            "арена раздулась до {} МБ при кэше в {} МБ — освобождённые слоты \
+             не переиспользуются",
+            st.reserved / (1024 * 1024),
+            CAP / (1024 * 1024)
+        );
+        drop(cache);
+        expert_arena::release_empty(0);
+    }
+
     /// Вытеснение обязано возвращать память драйверу, а не только «по учёту».
     ///
     /// Пока кэш вытеснял по одному, освобождённые эксперты оставались
@@ -1627,6 +1681,7 @@ mod tests {
     /// slab арены.
     #[test]
     fn eviction_returns_vram_to_the_driver() {
+        let _arena = arena_guard();
         synaptix_kernels_cpu::ensure_registered();
         synaptix_kernels_cuda::ensure_registered();
         let device = Device::Cuda(0);
@@ -1645,7 +1700,6 @@ mod tests {
         {
             let _pool = synaptix_core::device::cuda::ExpertsAllocGuard::for_device(device);
             for i in 0..384usize {
-                cache.arena_group();
                 let e = expert(device);
                 expected = e.bytes();
                 cache.insert((0, i), Arc::new(e));
@@ -1654,7 +1708,7 @@ mod tests {
         let _ = synaptix_core::device::cuda::synchronize_all(0);
         let before = expert_arena::stats();
         assert!(
-            before.slabs >= 3,
+            before.slabs >= 2,
             "ожидали несколько slab'ов под {} экспертов по {} КБ, получили {}",
             384,
             expected / 1024,

@@ -62,22 +62,48 @@ struct Slab {
     ordinal: usize,
     base: u64,
     len: usize,
-    /// Сколько байт slab'а уже роздано (bump растёт только вперёд).
+    /// Размер слота: у slab'а он один на всех. Эксперты модели одинаковы, так
+    /// что разных размеров всего несколько (упакованные веса двух проекций и
+    /// их масштабы), и слот освободившегося эксперта подходит следующему —
+    /// ради этого slab и привязан к размеру.
+    slot: usize,
+    /// Свободные слоты по индексу. Пустой список и `bump == slots` означают,
+    /// что slab занят целиком.
+    free: Vec<u32>,
+    /// Сколько слотов уже роздано хотя бы раз (граница нетронутого хвоста).
     bump: usize,
-    /// Сколько байт держат живые суб-аллокации.
+    /// Сколько байт держат живые слоты.
     live: usize,
     /// Владение блоком. `None` — блок вынут для освобождения вне мьютекса.
     buf: Option<cudarc::driver::CudaSlice<u8>>,
 }
 
+impl Slab {
+    fn slots(&self) -> usize {
+        self.len / self.slot
+    }
+
+    fn take_slot(&mut self) -> Option<u32> {
+        if let Some(idx) = self.free.pop() {
+            self.live += self.slot;
+            return Some(idx);
+        }
+        if self.bump < self.slots() {
+            let idx = self.bump as u32;
+            self.bump += 1;
+            self.live += self.slot;
+            return Some(idx);
+        }
+        None
+    }
+}
+
 #[derive(Default)]
 struct State {
     slabs: Vec<Slab>,
-    /// ptr суб-аллокации → (slab, байт). Нужна, чтобы освобождение знало,
-    /// у какого slab'а уменьшить счётчик живых.
-    by_ptr: HashMap<u64, (u64, usize)>,
-    /// Slab, в который идёт bump прямо сейчас.
-    current: Option<u64>,
+    /// ptr суб-аллокации → (slab, слот). Нужна освобождению: оно знает только
+    /// адрес.
+    by_ptr: HashMap<u64, (u64, u32)>,
     next_id: u64,
 }
 
@@ -116,14 +142,15 @@ fn widen_bounds(base: u64, len: usize) {
     HI.fetch_max(base + len as u64, Ordering::AcqRel);
 }
 
-/// Открыть slab и сделать его текущим. Вызывается под мьютексом.
-fn open_slab(st: &mut State, ordinal: usize, need: usize) -> Option<u64> {
+/// Открыть slab под слоты размера `slot`. Вызывается под мьютексом.
+fn open_slab(st: &mut State, ordinal: usize, slot: usize) -> Option<usize> {
     // Хук ставим при первом slab'е: до него в арене нет ни одного адреса, и
     // платить лишним вызовом на каждом освобождении в процессе незачем.
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| cudarc::driver::set_free_hook(claim_free));
     register_reclaimable();
-    let len = slab_bytes().max(align_up(need));
+    // Длину режем по слоту: хвост короче слота всё равно никому не достанется.
+    let len = (slab_bytes() / slot).max(1) * slot;
     let stream = crate::device::cuda::default_stream(ordinal).ok()?;
     let pool = crate::device::cuda::experts_pool(ordinal).ok()?;
     let ptr = unsafe {
@@ -135,42 +162,19 @@ fn open_slab(st: &mut State, ordinal: usize, need: usize) -> Option<u64> {
     let buf = unsafe { stream.upgrade_device_ptr::<u8>(ptr, len) };
     let id = st.next_id;
     st.next_id += 1;
-    let base = ptr;
-    st.slabs.push(Slab { id, ordinal, base, len, bump: 0, live: 0, buf: Some(buf) });
-    st.current = Some(id);
-    widen_bounds(base, len);
-    Some(id)
-}
-
-/// Начать группу аллокаций, которая обязана лечь в один slab.
-///
-/// Эксперт — это несколько тензоров (packed + масштабы у каждой из двух
-/// проекций), и вытеснение работает по slab'ам: если хвост эксперта уедет в
-/// соседний slab, тот не опустеет, пока жив этот эксперт. `hint` — ожидаемый
-/// размер эксперта целиком; при нехватке места в текущем slab'е открываем
-/// новый заранее.
-pub fn begin_group(ordinal: usize, hint: usize) {
-    if !enabled() || hint == 0 {
-        return;
-    }
-    let need = align_up(hint);
-    if need > slab_bytes() {
-        return;
-    }
-    let mut st = STATE.lock();
-    let room = st
-        .current
-        .and_then(|id| st.slabs.iter().find(|s| s.id == id))
-        .map(|s| s.len - s.bump)
-        .unwrap_or(0);
-    if room < need {
-        open_slab(&mut st, ordinal, need);
-    }
-}
-
-/// Id slab'а, в который сейчас идут аллокации.
-pub fn current_slab() -> Option<u64> {
-    STATE.lock().current
+    st.slabs.push(Slab {
+        id,
+        ordinal,
+        base: ptr,
+        len,
+        slot,
+        free: Vec::new(),
+        bump: 0,
+        live: 0,
+        buf: Some(buf),
+    });
+    widen_bounds(ptr, len);
+    Some(st.slabs.len() - 1)
 }
 
 /// Выдать `bytes` из арены. `None` — арена выключена, кусок слишком крупный
@@ -179,27 +183,30 @@ pub fn alloc(ordinal: usize, bytes: usize) -> Option<u64> {
     if !enabled() || bytes == 0 {
         return None;
     }
-    let need = align_up(bytes);
+    let slot = align_up(bytes);
     // Крупные буферы — мимо арены: они и так занимают целые сегменты пула,
     // а slab с таким жильцом не опустеет никогда.
-    if need * 2 > slab_bytes() {
+    if slot * 2 > slab_bytes() {
         return None;
     }
     let mut st = STATE.lock();
-    let fits = st
-        .current
-        .and_then(|id| st.slabs.iter().find(|s| s.id == id))
-        .map(|s| s.len - s.bump >= need)
-        .unwrap_or(false);
-    if !fits {
-        open_slab(&mut st, ordinal, need)?;
-    }
-    let id = st.current?;
-    let slab = st.slabs.iter_mut().find(|s| s.id == id)?;
-    let ptr = slab.base + slab.bump as u64;
-    slab.bump += need;
-    slab.live += need;
-    st.by_ptr.insert(ptr, (id, need));
+    // Слот из уже открытого slab'а этого размера — это и есть переиспользование
+    // памяти вытесненных экспертов. Без него bump раздавал бы новый адрес на
+    // каждую подкачку, и арена росла бы вслед за ПОТОКОМ, а не за числом
+    // живых резидентов (наблюдали 16.5 ГБ slab'ов при 0.94 ГБ экспертов).
+    let found = st
+        .slabs
+        .iter()
+        .position(|s| s.ordinal == ordinal && s.slot == slot && (!s.free.is_empty() || s.bump < s.slots()));
+    let idx = match found {
+        Some(i) => i,
+        None => open_slab(&mut st, ordinal, slot)?,
+    };
+    let slab = st.slabs.get_mut(idx)?;
+    let slot_idx = slab.take_slot()?;
+    let ptr = slab.base + slot_idx as u64 * slab.slot as u64;
+    let id = slab.id;
+    st.by_ptr.insert(ptr, (id, slot_idx));
     Some(ptr)
 }
 
@@ -212,11 +219,12 @@ pub fn claim_free(ptr: cudarc::driver::sys::CUdeviceptr) -> bool {
         return false;
     }
     let mut st = STATE.lock();
-    let Some((id, bytes)) = st.by_ptr.remove(&ptr) else {
+    let Some((id, slot_idx)) = st.by_ptr.remove(&ptr) else {
         return false;
     };
     if let Some(slab) = st.slabs.iter_mut().find(|s| s.id == id) {
-        slab.live = slab.live.saturating_sub(bytes);
+        slab.live = slab.live.saturating_sub(slab.slot);
+        slab.free.push(slot_idx);
     }
     true
 }
@@ -229,12 +237,10 @@ pub fn release_empty(ordinal: usize) -> usize {
     }
     let (freed, dead) = {
         let mut st = STATE.lock();
-        let current = st.current;
         let mut dead = Vec::new();
         let mut freed = 0usize;
         st.slabs.retain_mut(|s| {
-            // Текущий slab не трогаем: в него ещё идёт bump.
-            if s.ordinal != ordinal || s.live > 0 || Some(s.id) == current {
+            if s.ordinal != ordinal || s.live > 0 {
                 return true;
             }
             freed += s.len;
@@ -242,7 +248,6 @@ pub fn release_empty(ordinal: usize) -> usize {
             false
         });
         if st.slabs.is_empty() {
-            st.current = None;
             LO.store(u64::MAX, Ordering::Release);
             HI.store(0, Ordering::Release);
         }
@@ -271,17 +276,10 @@ pub fn slab_of(ptr: u64) -> Option<u64> {
 }
 
 /// Slab'ы в порядке появления — кэшу, чтобы выбрать жертву (самый старый
-/// набор экспертов). Текущий slab в список не попадает: вытеснять то, во что
-/// прямо сейчас идёт запись, бессмысленно.
+/// набор экспертов).
 pub fn slabs_by_age() -> Vec<u64> {
     let st = STATE.lock();
-    let current = st.current;
-    let mut ids: Vec<u64> = st
-        .slabs
-        .iter()
-        .filter(|s| Some(s.id) != current && s.live > 0)
-        .map(|s| s.id)
-        .collect();
+    let mut ids: Vec<u64> = st.slabs.iter().filter(|s| s.live > 0).map(|s| s.id).collect();
     ids.sort_unstable();
     ids
 }
@@ -305,10 +303,9 @@ impl crate::memory::reclaim::Reclaimable for EmptySlabs {
             return 0;
         };
         let st = STATE.lock();
-        let current = st.current;
         st.slabs
             .iter()
-            .filter(|s| s.ordinal == ord && s.live == 0 && Some(s.id) != current)
+            .filter(|s| s.ordinal == ord && s.live == 0)
             .map(|s| s.len)
             .sum()
     }
@@ -326,15 +323,10 @@ fn register_reclaimable() {
 
 /// Распустить арену при выгрузке модели: отдаёт всё, что уже никем не занято.
 ///
-/// Slab'ы с живыми резидентами остаются — их адреса розданы тензорам, которые
+/// Slab'ы с живыми резидентами остаются — их слоты розданы тензорам, которые
 /// ещё не дропнуты, и вернуть такой блок драйверу значит подарить кому-то
 /// use-after-free. Они уйдут следующим [`release_empty`], когда модель
 /// действительно умрёт.
 pub fn reset(ordinal: usize) -> usize {
-    let mut st = STATE.lock();
-    if st.current.take().is_some() {
-        // Текущий slab больше не текущий — иначе `release_empty` его не тронет.
-    }
-    drop(st);
     release_empty(ordinal)
 }
