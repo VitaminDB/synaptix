@@ -490,6 +490,23 @@ impl ExpertCache {
     }
 }
 
+impl Drop for ExpertCache {
+    /// Кэш умер — вместе с ним умерли все резиденты, и slab'ы арены пустуют.
+    /// Без этого выгруженная модель оставляла бы на карте до потолка кэша:
+    /// slab держит память до явного освобождения, а трим пула о нём не знает.
+    fn drop(&mut self) {
+        if let Device::Cuda(ord) = self.device {
+            let freed = synaptix_core::memory::expert_arena::release_empty(ord);
+            if freed > 0 {
+                eprintln!(
+                    "[qwen4_exp] арена экспертов распущена: {:.1} ГБ",
+                    freed as f64 / (1u64 << 30) as f64
+                );
+            }
+        }
+    }
+}
+
 impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
     /// Отдать не меньше `want` байт: сперва набор префилла (он перечитается
     /// на следующем чанке), потом прогретые эксперты. Ёмкость опускаем до

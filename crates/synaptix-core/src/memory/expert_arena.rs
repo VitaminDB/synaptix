@@ -122,6 +122,7 @@ fn open_slab(st: &mut State, ordinal: usize, need: usize) -> Option<u64> {
     // платить лишним вызовом на каждом освобождении в процессе незачем.
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| cudarc::driver::set_free_hook(claim_free));
+    register_reclaimable();
     let len = slab_bytes().max(align_up(need));
     let stream = crate::device::cuda::default_stream(ordinal).ok()?;
     let pool = crate::device::cuda::experts_pool(ordinal).ok()?;
@@ -283,6 +284,31 @@ pub fn slabs_by_age() -> Vec<u64> {
         .collect();
     ids.sort_unstable();
     ids
+}
+
+/// Пустые slab'ы — это отдаваемая память: на чужом OOM аллокатор попросит их
+/// через реестр [`crate::memory::reclaim`] раньше, чем сдастся. Сам кэш
+/// экспертов зарегистрирован там же и вытесняет резидентов; арена отдаёт лишь
+/// то, из чего уже все ушли.
+struct EmptySlabs;
+
+impl crate::memory::reclaim::Reclaimable for EmptySlabs {
+    fn reclaim(&self, device: crate::device::Device, _want: usize) -> usize {
+        let crate::device::Device::Cuda(ord) = device else {
+            return 0;
+        };
+        release_empty(ord)
+    }
+}
+
+/// Зарегистрировать арену как отдаваемую память. Идемпотентно.
+fn register_reclaimable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        static KEEP: once_cell::sync::Lazy<std::sync::Arc<dyn crate::memory::reclaim::Reclaimable>> =
+            once_cell::sync::Lazy::new(|| std::sync::Arc::new(EmptySlabs));
+        crate::memory::reclaim::register(&KEEP);
+    });
 }
 
 /// Распустить арену при выгрузке модели: отдаёт всё, что уже никем не занято.
