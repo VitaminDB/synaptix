@@ -801,6 +801,31 @@ pub struct CudaSlice<T> {
 unsafe impl<T> Send for CudaSlice<T> {}
 unsafe impl<T> Sync for CudaSlice<T> {}
 
+/// Hook consulted before an allocation is handed back to the driver; see
+/// [`set_free_hook`].
+static FREE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register a hook that can claim a device allocation instead of freeing it.
+///
+/// A suballocator that hands out pointers into a larger block it owns needs
+/// those pointers *not* to reach `cuMemFree`: the driver knows only the block.
+/// The hook is called with the device pointer on drop and returns `true` when
+/// it owns that address — the drop then leaves the memory to the hook.
+///
+/// The hook must be reentrancy-safe and must not allocate on the device.
+pub fn set_free_hook(hook: fn(sys::CUdeviceptr) -> bool) {
+    FREE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn claimed_by_hook(ptr: sys::CUdeviceptr) -> bool {
+    let raw = FREE_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    let hook: fn(sys::CUdeviceptr) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(ptr)
+}
+
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
@@ -809,6 +834,9 @@ impl<T> Drop for CudaSlice<T> {
         }
         if let Some(write) = self.write.as_ref() {
             ctx.record_err(self.stream.wait(write));
+        }
+        if claimed_by_hook(self.cu_device_ptr) {
+            return;
         }
         if ctx.has_async_alloc {
             ctx.record_err(unsafe {

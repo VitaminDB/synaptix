@@ -327,7 +327,7 @@ mod inner {
     /// В своём пуле у экспертов ровно два-три size-класса, набор живёт и
     /// умирает целиком, поэтому `trim_experts_pool` реально возвращает
     /// освобождённое драйверу — и активациям префилла есть куда расти.
-    fn experts_pool(ord: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
+    pub(crate) fn experts_pool(ord: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
         use cudarc::driver::sys;
         static POOLS: Lazy<RwLock<std::collections::HashMap<usize, usize>>> =
             Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
@@ -513,6 +513,20 @@ mod inner {
         act_pool_enabled() && !WEIGHTS_ALLOC.with(|c| c.get()) && !graph_capturing()
     }
 
+
+    /// Суб-аллокация из арены экспертов: она нарезает крупные slab'ы, и
+    /// вытеснение возвращает драйверу slab целиком. `None` — арена выключена
+    /// или кусок ей не по размеру, зовущий идёт обычным путём в пул.
+    fn arena_alloc<T>(
+        stream: &Arc<CudaStream>,
+        ord: usize,
+        len: usize,
+    ) -> Option<cudarc::driver::CudaSlice<T>> {
+        let bytes = len.max(1) * std::mem::size_of::<T>();
+        let ptr = crate::memory::expert_arena::alloc(ord, bytes)?;
+        Some(unsafe { stream.upgrade_device_ptr::<T>(ptr, len) })
+    }
+
     /// Аллокация под АКТИВАЦИИ: из пула активаций, если он включён и мы не в
     /// загрузке весов / не под graph-capture; иначе — обычный stream-alloc
     /// (default-пул). Память НЕ инициализирована.
@@ -527,6 +541,9 @@ mod inner {
         // Эксперт MoE — в свой пул: он вытесняется пачками, и только отдельный
         // пул отдаёт освобождённое драйверу (см. `experts_pool`).
         if experts_alloc() && act_pool_enabled() && !graph_capturing() {
+            if let Some(b) = arena_alloc::<T>(stream, ord, len) {
+                return Ok(b);
+            }
             if let Ok(pool) = experts_pool(ord) {
                 let bytes = len.max(1) * std::mem::size_of::<T>();
                 let ptr = unsafe {
@@ -573,6 +590,9 @@ mod inner {
         let ord = stream.context().ordinal();
         // H2D эксперта (packed/scales из бандла) — в пул экспертов.
         if experts_alloc() {
+            if let Some(b) = arena_alloc::<u8>(stream, ord, len) {
+                return Ok(b);
+            }
             if let Ok(pool) = experts_pool(ord) {
                 let ptr = unsafe {
                     cudarc::driver::result::mem_pool::alloc_async(
@@ -632,6 +652,9 @@ mod inner {
     ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError> {
         if experts_alloc() && act_pool_enabled() && !graph_capturing() {
             let ord = stream.context().ordinal();
+            if let Some(b) = arena_alloc::<T>(stream, ord, len) {
+                return Ok(b);
+            }
             if let Ok(pool) = experts_pool(ord) {
                 let bytes = len.max(1) * std::mem::size_of::<T>();
                 let ptr = unsafe {

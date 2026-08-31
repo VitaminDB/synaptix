@@ -56,6 +56,12 @@ impl QuantWeight {
     }
 
     /// Пометить вес как эксперта MoE — см. поле `expert_pool`.
+    /// Адрес весов на устройстве — по масштабам: они есть у любой схемы и
+    /// живут рядом с `packed`, в том же slab'е арены экспертов.
+    pub fn device_address(&self) -> Option<u64> {
+        self.scales.device_address()
+    }
+
     pub fn mark_expert_pool(&self) {
         self.expert_pool.store(true, std::sync::atomic::Ordering::Relaxed);
     }

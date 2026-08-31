@@ -46,3 +46,12 @@ manual fitting (0.19.8 added `view_ptr`, which the patch preserves).
 
 Guard test: `cargo test -p synaptix --features cuda --profile fast-release graph_decode`
 with `SYN_GRAPH_DECODE=1` and Qwen3-1.7B present.
+
+3. **Suballocation hook** (`core.rs`) — `set_free_hook` lets an external
+   suballocator claim a device pointer on `CudaSlice::drop`. synaptix keeps MoE
+   experts in slabs of its own (`synaptix-core/src/memory/expert_arena.rs`):
+   the pointers it hands out are interior to a block the driver knows nothing
+   about, so they must never reach `cuMemFreeAsync`. Without the hook the only
+   alternatives were a borrowed-buffer flag threaded through every storage type,
+   or leaking every expert allocation.
+

@@ -109,6 +109,19 @@ impl Expert {
         self.gate_up.bytes() + self.down.bytes()
     }
 
+    /// Slab арены, в котором лежат веса эксперта. `None` — арена выключена
+    /// либо вес не квантован (плотный путь адреса не отдаёт); тогда кэш
+    /// вытесняет по одному, как раньше.
+    fn slab(&self) -> Option<u64> {
+        for l in [&self.gate_up, &self.down] {
+            let addr = l.quant_weight().and_then(|w| w.device_address());
+            if let Some(slab) = addr.and_then(synaptix_core::memory::expert_arena::slab_of) {
+                return Some(slab);
+            }
+        }
+        None
+    }
+
     fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
         Ok(Self {
             gate_up: self.gate_up.to_device(dev)?,
@@ -130,6 +143,9 @@ pub struct ExpertCache {
     /// ним туда-сюда — вниз на нехватке VRAM, обратно вверх, когда пик хода
     /// пройден.
     ceiling_bytes: AtomicUsize,
+    /// Размер последнего поднятого эксперта: подсказка арене, чтобы весь
+    /// эксперт лёг в один slab, а не хвостом в соседний.
+    last_expert_bytes: AtomicUsize,
     /// Лимит временного набора префилла — ЧАСТЬ общего бюджета
     /// `capacity_bytes`, а не добавка к нему: раньше на карте оказывалось
     /// `capacity + scratch` байт экспертов (12 + 3 ГБ при 24 ГБ VRAM), и
@@ -151,6 +167,9 @@ pub struct ExpertCache {
 struct Resident {
     expert: Arc<Expert>,
     used: bool,
+    /// Slab арены — по нему идёт вытеснение: драйверу возвращается только
+    /// slab целиком, поэтому выкидывать резидентов надо группой.
+    slab: Option<u64>,
 }
 
 struct CacheInner {
@@ -160,7 +179,7 @@ struct CacheInner {
     /// Эксперты, поднятые под префилл: он обходит почти всю стопку, и класть
     /// их в основной кэш значит вытеснить всё, что прогрел предыдущий диалог.
     /// Живут до конца префилла, лимит свой.
-    scratch: HashMap<(usize, usize), Arc<Expert>>,
+    scratch: HashMap<(usize, usize), Resident>,
     scratch_order: VecDeque<(usize, usize)>,
     scratch_bytes: usize,
     hits: u64,
@@ -207,6 +226,7 @@ impl ExpertCache {
             device,
             capacity_bytes: AtomicUsize::new(capacity_bytes),
             ceiling_bytes: AtomicUsize::new(capacity_bytes),
+            last_expert_bytes: AtomicUsize::new(0),
             scratch_bytes: (capacity_bytes / 4).min(2 << 30),
             scratch_mode: std::sync::atomic::AtomicBool::new(false),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
@@ -232,6 +252,16 @@ impl ExpertCache {
         self.device
     }
 
+    /// Сказать арене, что сейчас поднимут эксперта: если в текущем slab'е
+    /// столько не осталось, она откроет новый заранее. Иначе хвост эксперта
+    /// уехал бы в соседний slab и держал бы его от освобождения.
+    fn arena_group(&self) {
+        if let Device::Cuda(ord) = self.device {
+            let hint = self.last_expert_bytes.load(Ordering::Relaxed);
+            synaptix_core::memory::expert_arena::begin_group(ord, hint);
+        }
+    }
+
     pub fn capacity_bytes(&self) -> usize {
         self.capacity_bytes.load(Ordering::Relaxed)
     }
@@ -255,12 +285,16 @@ impl ExpertCache {
                 return;
             }
             while inner.bytes + inner.scratch_bytes > bytes {
-                if !inner.evict_one() {
+                if !inner.evict() {
                     break;
                 }
             }
         }
         if let Device::Cuda(ord) = self.device {
+            // Пустые slab'ы арены — сначала: они и есть та память, ради
+            // которой всё это затевалось. Трим пула добирает остальное
+            // (эксперты, не попавшие в арену, и её же отпущенные блоки).
+            synaptix_core::memory::expert_arena::release_empty(ord);
             let _ = synaptix_core::device::cuda::synchronize_all(ord);
             let _ = synaptix_core::device::cuda::trim_experts_pool(ord);
         }
@@ -297,7 +331,13 @@ impl ExpertCache {
         let slack = synaptix_core::device::cuda::experts_pool_stats(ord)
             .map(|(rsv, used)| rsv.saturating_sub(used) as usize)
             .unwrap_or(0);
-        let room = self.used_bytes() + free + slack;
+        // Держим мы не байты экспертов, а slab'ы арены: в них есть и огрызки,
+        // и место под ещё не поднятых. Считать по `used_bytes` значило бы
+        // недосчитать своё же и раздуть ёмкость сверх того, что на карте.
+        let held = self
+            .used_bytes()
+            .max(synaptix_core::memory::expert_arena::reserved_bytes());
+        let room = held + free + slack;
         let want = room.saturating_sub(reserve).clamp(MIN_CACHE_BYTES, ceiling);
         self.set_capacity(want);
         want
@@ -363,7 +403,7 @@ impl ExpertCache {
                 r.used = true;
                 Some(r.expert.clone())
             }
-            None => inner.scratch.get(&key).cloned(),
+            None => inner.scratch.get(&key).map(|r| r.expert.clone()),
         };
         match found {
             Some(e) => {
@@ -379,10 +419,18 @@ impl ExpertCache {
 
     /// Освободить экспертов, поднятых под префилл. Прогретые остаются.
     pub fn clear_scratch(&self) {
-        let Ok(mut inner) = self.inner.lock() else { return };
-        inner.scratch.clear();
-        inner.scratch_order.clear();
-        inner.scratch_bytes = 0;
+        {
+            let Ok(mut inner) = self.inner.lock() else { return };
+            inner.scratch.clear();
+            inner.scratch_order.clear();
+            inner.scratch_bytes = 0;
+        }
+        // Набор префилла — это сотни экспертов разом; его slab'ы освобождаются
+        // целиком, и держать их до следующего трима незачем: как раз сейчас
+        // память нужна активациям декода.
+        if let Device::Cuda(ord) = self.device {
+            synaptix_core::memory::expert_arena::release_empty(ord);
+        }
     }
 
     /// Куда класть поднятых экспертов: `true` — во временный набор префилла.
@@ -405,33 +453,35 @@ impl ExpertCache {
             return;
         }
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);
+        let slab = expert.slab();
+        self.last_expert_bytes.store(bytes, Ordering::Relaxed);
         if scratch {
             while inner.scratch_bytes + bytes > self.scratch_bytes {
                 let Some(victim) = inner.scratch_order.pop_front() else { break };
                 if let Some(old) = inner.scratch.remove(&victim) {
-                    inner.scratch_bytes = inner.scratch_bytes.saturating_sub(old.bytes());
+                    inner.scratch_bytes = inner.scratch_bytes.saturating_sub(old.expert.bytes());
                 }
             }
             // Набор префилла — часть общего бюджета: под него уступает
             // прогретый кэш, а не свободная VRAM (её ждут активации).
             while inner.bytes + inner.scratch_bytes + bytes > capacity {
-                if !inner.evict_one() {
+                if !inner.evict() {
                     break;
                 }
             }
             inner.scratch_bytes += bytes;
             inner.scratch_order.push_back(key);
-            inner.scratch.insert(key, expert);
+            inner.scratch.insert(key, Resident { expert, used: false, slab });
             return;
         }
         while inner.bytes + inner.scratch_bytes + bytes > capacity {
-            if !inner.evict_one() {
+            if !inner.evict() {
                 break;
             }
         }
         inner.bytes += bytes;
         inner.order.push_back(key);
-        inner.map.insert(key, Resident { expert, used: false });
+        inner.map.insert(key, Resident { expert, used: false, slab });
     }
 
     /// Занято экспертами всего (прогретые + набор префилла).
@@ -458,7 +508,7 @@ impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
             inner.scratch_bytes = 0;
         }
         while before.saturating_sub(inner.bytes + inner.scratch_bytes) < want {
-            if !inner.evict_one() {
+            if !inner.evict() {
                 break;
             }
         }
@@ -472,6 +522,7 @@ impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
         // Пул отдаёт драйверу только по триму, а звавший нас аллокатор
         // синкает стримы сам — здесь достаточно вернуть сегменты.
         if let Device::Cuda(ord) = device {
+            synaptix_core::memory::expert_arena::release_empty(ord);
             let _ = synaptix_core::device::cuda::synchronize_all(ord);
             let _ = synaptix_core::device::cuda::trim_experts_pool(ord);
         }
@@ -487,6 +538,62 @@ impl CacheInner {
     /// Шаг «часов»: эксперт, к которому обращались с прошлого круга, получает
     /// второй шанс, остальные уходят. Выбор экспертов сильно неравномерен, и
     /// простая очередь по возрасту вымывала как раз горячих.
+    /// Освободить место под нового резидента.
+    ///
+    /// Когда эксперты живут в арене, вытеснять по одному бессмысленно:
+    /// драйверу возвращается только slab целиком, а поштучное вытеснение
+    /// оставляет в каждом slab'е жильца (кэш «ужимается» по учёту, а
+    /// `cuMemGetInfo` не меняется — см. `expert_arena`). Поэтому с ареной
+    /// уходит самый старый slab со всеми своими резидентами, и лишь без неё
+    /// работает прежний обход часами.
+    fn evict(&mut self) -> bool {
+        if synaptix_core::memory::expert_arena::enabled() {
+            if self.evict_slab() {
+                return true;
+            }
+            // Слоя арены может не быть (плотные веса, слишком крупный
+            // эксперт) — тогда обычный путь всё ещё уместен.
+        }
+        self.evict_one()
+    }
+
+    /// Выкинуть самый старый slab целиком. `false` — вытеснять нечего.
+    fn evict_slab(&mut self) -> bool {
+        for slab in synaptix_core::memory::expert_arena::slabs_by_age() {
+            let mut freed = false;
+            let doomed: Vec<(usize, usize)> = self
+                .scratch
+                .iter()
+                .filter(|(_, r)| r.slab == Some(slab))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in doomed {
+                if let Some(old) = self.scratch.remove(&key) {
+                    self.scratch_bytes = self.scratch_bytes.saturating_sub(old.expert.bytes());
+                    freed = true;
+                }
+            }
+            let doomed: Vec<(usize, usize)> = self
+                .map
+                .iter()
+                .filter(|(_, r)| r.slab == Some(slab))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in doomed {
+                if let Some(old) = self.map.remove(&key) {
+                    self.bytes = self.bytes.saturating_sub(old.expert.bytes());
+                    freed = true;
+                }
+            }
+            if freed {
+                self.scratch_order.retain(|k| self.scratch.contains_key(k));
+                self.order.retain(|k| self.map.contains_key(k));
+                return true;
+            }
+        }
+        false
+    }
+
     fn evict_one(&mut self) -> bool {
         // Два круга, а не один: если на первом у ВСЕХ резидентов взведён бит
         // обращения (так бывает сразу после плотного чанка), круг только
@@ -1358,6 +1465,7 @@ impl MoeFfn {
         let _experts_pool =
             synaptix_core::device::cuda::ExpertsAllocGuard::for_device(cache.device());
         let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
+        cache.arena_group();
         let fetched = match &self.experts {
             ExpertStore::Resident(all) => {
                 let host = all
@@ -1462,5 +1570,98 @@ impl MoeFfn {
         }
         t.to_dtype(self.compute)
             .map_err(|e| ModelError::Forward(format!("MoE: приведение к {:?}: {e}", self.compute)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synaptix_core::memory::expert_arena;
+
+    /// Эксперт под MXFP8: `[2I, H]` и `[H, I]` при H=1024, I=512 — около
+    /// полутора мегабайт, как у настоящего Qwen4Exp.
+    const H: usize = 1024;
+    const I: usize = 512;
+
+    fn quantized(n: usize, k: usize, device: Device) -> QLinear {
+        let w = Tensor::zeros(vec![n, k], DType::F16, device).expect("zeros");
+        QLinear::build(w, DType::MXFP8, DType::F16).expect("quantize")
+    }
+
+    fn expert(device: Device) -> Expert {
+        Expert { gate_up: quantized(2 * I, H, device), down: quantized(H, I, device) }
+    }
+
+    /// Вытеснение обязано возвращать память драйверу, а не только «по учёту».
+    ///
+    /// Пока кэш вытеснял по одному, освобождённые эксперты оставались
+    /// вперемешку с живыми, и `cuMemPoolTrimTo` не отдавал драйверу ничего:
+    /// на живой сессии кэш «ужимался» 13 → 9.4 ГБ, а `cuMemGetInfo` показывал
+    /// 40 МБ свободных, и префилл падал с OOM. Теперь единица вытеснения —
+    /// slab арены.
+    #[test]
+    fn eviction_returns_vram_to_the_driver() {
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+        let device = Device::Cuda(0);
+        if synaptix_core::device::cuda::mem_info(0).is_err() {
+            eprintln!("CUDA недоступна — тест пропущен");
+            return;
+        }
+        if !expert_arena::enabled() {
+            eprintln!("арена выключена через SYN_EXPERT_ARENA — тест пропущен");
+            return;
+        }
+
+        // Ёмкости хватает на всех: вытеснения на вставке быть не должно.
+        let cache = ExpertCache::new(device, 4 << 30);
+        let mut expected = 0usize;
+        {
+            let _pool = synaptix_core::device::cuda::ExpertsAllocGuard::for_device(device);
+            for i in 0..384usize {
+                cache.arena_group();
+                let e = expert(device);
+                expected = e.bytes();
+                cache.insert((0, i), Arc::new(e));
+            }
+        }
+        let _ = synaptix_core::device::cuda::synchronize_all(0);
+        let before = expert_arena::stats();
+        assert!(
+            before.slabs >= 3,
+            "ожидали несколько slab'ов под {} экспертов по {} КБ, получили {}",
+            384,
+            expected / 1024,
+            before.slabs
+        );
+        let (free_before, _) = synaptix_core::device::cuda::mem_info(0).expect("mem_info");
+
+        // Просим кэш ужаться вдвое — ровно то, что делает `fit_to_vram` перед
+        // префиллом следующего хода.
+        cache.trim_to(cache.used_bytes() / 2);
+        let (free_after, _) = synaptix_core::device::cuda::mem_info(0).expect("mem_info");
+        let returned = free_after.saturating_sub(free_before);
+        let after = expert_arena::stats();
+        eprintln!(
+            "slab'ов {} → {}; кэш держит {} МБ; драйверу вернулось {} МБ",
+            before.slabs,
+            after.slabs,
+            cache.used_bytes() / (1024 * 1024),
+            returned / (1024 * 1024),
+        );
+
+        assert!(
+            after.slabs < before.slabs,
+            "вытеснение не освободило ни одного slab'а: {} → {}",
+            before.slabs,
+            after.slabs
+        );
+        assert!(
+            returned >= expert_arena::slab_bytes(),
+            "драйверу вернулось {} МБ — меньше одного slab'а",
+            returned / (1024 * 1024)
+        );
+        drop(cache);
+        expert_arena::release_empty(0);
     }
 }

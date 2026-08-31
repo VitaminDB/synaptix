@@ -49,6 +49,15 @@ impl CudaBuf {
     pub fn device(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> { &self.device }
     pub fn stream(&self) -> &std::sync::Arc<cudarc::driver::CudaStream> { &self.stream }
     pub fn slice(&self) -> &cudarc::driver::CudaSlice<u8> { &self.buf }
+
+    /// Адрес блока на устройстве. Нужен, чтобы спросить арену экспертов, в
+    /// каком slab'е живёт вес: вытеснение там идёт slab'ами целиком.
+    /// Стрим блока и есть его домашний стрим, поэтому событий не пишется.
+    pub fn device_address(&self) -> u64 {
+        use cudarc::driver::DevicePtr;
+        let (ptr, _sync) = self.buf.device_ptr(&self.stream);
+        ptr
+    }
     pub fn slice_mut(&mut self) -> &mut cudarc::driver::CudaSlice<u8> { &mut self.buf }
     pub fn ordinal(&self) -> usize { self.ordinal }
 }
@@ -103,6 +112,14 @@ impl Storage {
         match self {
             Storage::Cpu(b) => Some(b),
             _ => None,
+        }
+    }
+
+    /// Адрес на устройстве (`None` — буфер в системной памяти).
+    pub fn device_address(&self) -> Option<u64> {
+        match self {
+            Storage::Cuda(b) => Some(b.device_address()),
+            Storage::Cpu(_) => None,
         }
     }
 
