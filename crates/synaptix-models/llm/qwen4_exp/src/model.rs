@@ -18,7 +18,7 @@ use crate::linear_attn::{GdnSnap, LinearAttn};
 use crate::ngram::{NGramEmbedding, NGramRows};
 use crate::norm::{coerr, ctx, stage};
 use crate::ple::{PleLayer, PleState};
-use crate::qsa::{park_tensor, unpark_tensor, IndexerCache};
+use crate::qsa::{park_tensor, unpark_tensor, IndexerCache, IndexerTail};
 
 pub const LM_PREFIX: &str = "model.language_model";
 
@@ -48,29 +48,38 @@ pub struct ModelCache {
 }
 
 impl ModelCache {
-    /// Снять состояние целиком: рекуррентное — копией, KV и ключи индексатора —
-    /// меткой позиции, дальше их просто перепишут.
+    /// Снять состояние целиком: рекуррентное — копией, KV — меткой позиции
+    /// (дальше его просто перепишут), индексатор — меткой ПЛЮС содержимым
+    /// хвоста. Метки одной мало: между этим снимком и рестором следующего
+    /// хода декод сворачивает `pending` десятки раз, и ключи хвоста промпта
+    /// затираются — сессия обязана унести их с собой.
     pub fn snapshot(&mut self) -> Result<CacheSnapshot, ModelError> {
         let mut linear = Vec::new();
         let mut qsa = Vec::new();
+        let mut qsa_tails = Vec::new();
         for layer in self.layers.iter_mut() {
             match layer {
                 LayerState::Linear(s) => linear.push(GdnSnap::take(s)?),
-                LayerState::Qsa(b) => qsa.push(b.1.mark()),
+                LayerState::Qsa(b) => {
+                    qsa.push(b.1.mark());
+                    qsa_tails.push(b.1.tail_snapshot()?);
+                }
             }
         }
         Ok(CacheSnapshot {
             seq_len: self.seq_len,
             linear,
             qsa,
+            qsa_tails: Some(qsa_tails),
             ple: self.ple.clone(),
         })
     }
 
-    /// Вернуть состояние: драфт не подтвердился.
+    /// Вернуть состояние: драфт не подтвердился либо ход продолжает сессию.
     pub fn restore(&mut self, snap: &CacheSnapshot) -> Result<(), ModelError> {
         let mut linear = snap.linear.iter();
         let mut qsa = snap.qsa.iter();
+        let mut tails = snap.qsa_tails.as_ref().map(|t| t.iter());
         for layer in self.layers.iter_mut() {
             match layer {
                 LayerState::Linear(s) => {
@@ -79,8 +88,14 @@ impl ModelCache {
                     }
                 }
                 LayerState::Qsa(b) => {
-                    if let Some(mark) = qsa.next() {
-                        b.1.rewind(*mark);
+                    let mark = qsa.next();
+                    match tails.as_mut().and_then(|t| t.next()) {
+                        Some(tail) => b.1.restore_tail(tail)?,
+                        None => {
+                            if let Some(mark) = mark {
+                                b.1.rewind(*mark);
+                            }
+                        }
                     }
                 }
             }
@@ -206,6 +221,11 @@ pub struct CacheSnapshot {
     seq_len: usize,
     linear: Vec<GdnSnap>,
     qsa: Vec<(usize, usize)>,
+    /// Содержимое хвостов индексаторов. Есть у снимка сессии
+    /// ([`ModelCache::snapshot`]); снимок спекулятивной пары живёт без него —
+    /// пара откатывается тут же, пока хвост ниже метки цел, а снимать D2H
+    /// посреди прогона было бы синхронизацией на каждый шаг.
+    qsa_tails: Option<Vec<IndexerTail>>,
     ple: Vec<PleState>,
 }
 
@@ -924,6 +944,7 @@ impl Qwen4ExpModel {
             seq_len: past + k,
             linear: snap_linear,
             qsa: snap_qsa,
+            qsa_tails: None,
             ple: snap_ple,
         });
         Ok((out, traced, snap))

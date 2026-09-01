@@ -80,6 +80,15 @@ impl Selection {
     }
 }
 
+/// Снимок хвоста индексатора для сессии префикс-KV: счётчики и содержимое
+/// `pending` (host-копия — переезд кэша в RAM его не касается).
+#[derive(Clone)]
+pub struct IndexerTail {
+    blocks: usize,
+    rows: usize,
+    data: Vec<f32>,
+}
+
 pub struct IndexerCache {
     /// Ключи, не набравшие полный блок. Живут на карте: раньше они уезжали
     /// на хост целиком, сворачивались там циклом и возвращались обратно.
@@ -135,10 +144,50 @@ impl IndexerCache {
         (self.blocks + new_blocks, waiting % self.ratio)
     }
 
+    /// Откат по метке восстанавливает счётчики ровно — не `min`: после
+    /// свёртки текущий `pending_rows` бывает МЕНЬШЕ откатываемого, и `min`
+    /// оставлял счётчик на свёрнутом значении. Дальше сетка блоков ехала
+    /// относительно позиций токенов, а выбор блоков превращался в шум.
     pub fn rewind(&mut self, mark: (usize, usize)) {
         let (blocks, rows) = mark;
-        self.blocks = self.blocks.min(blocks);
-        self.pending_rows = self.pending_rows.min(rows);
+        self.blocks = blocks;
+        self.pending_rows = rows;
+    }
+
+    /// Полный снимок хвоста: счётчики плюс СОДЕРЖИМОЕ ключей, не набравших
+    /// блок. `mark`/`rewind` спасают только спекулятивную пару — она
+    /// откатывается сразу и содержимое хвоста ниже метки ещё не перезаписано.
+    /// Сессии префикс-KV этого мало: между снимком в конце промпта и
+    /// рестором следующего хода декод многократно сворачивает `pending`,
+    /// и ключи хвоста промпта затираются ключами сгенерированных токенов.
+    pub fn tail_snapshot(&self) -> Result<IndexerTail, ModelError> {
+        let data = if self.pending_rows == 0 {
+            Vec::new()
+        } else {
+            coerr(self.pending.narrow(1, 0, self.pending_rows))?
+                .contiguous()
+                .and_then(|t| t.to_device(Device::Cpu))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| ModelError::Forward(e.to_string()))?
+        };
+        Ok(IndexerTail { blocks: self.blocks, rows: self.pending_rows, data })
+    }
+
+    /// Обратная часть [`Self::tail_snapshot`]: вернуть и счётчики, и ключи.
+    pub fn restore_tail(&mut self, tail: &IndexerTail) -> Result<(), ModelError> {
+        if tail.rows > 0 {
+            let src = Tensor::from_vec(
+                tail.data.clone(),
+                vec![1, tail.rows, self.head_dim],
+                self.pending.device(),
+            )
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+            coerr(self.pending.copy_rows_from(0, &src))?;
+        }
+        self.blocks = tail.blocks;
+        self.pending_rows = tail.rows;
+        Ok(())
     }
 
     pub fn reset(&mut self) {
@@ -504,5 +553,71 @@ impl QsaIndexer {
             tails_host: tails,
             host: std::sync::OnceLock::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tail_rows(cache: &IndexerCache, rows: usize) -> Vec<f32> {
+        cache
+            .pending
+            .narrow(1, 0, rows)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .expect("чтение pending")
+    }
+
+    fn put_rows(cache: &mut IndexerCache, data: Vec<f32>, rows: usize, d: usize) {
+        let src = Tensor::from_vec(data, vec![1, rows, d], Device::Cpu).expect("src");
+        cache.pending.copy_rows_from(0, &src).expect("запись pending");
+    }
+
+    /// Хвост индексатора обязан пережить цикл «снимок в конце промпта →
+    /// свёртки декода → restore следующего хода»: и счётчики, и СОДЕРЖИМОЕ
+    /// `pending`. Ровно здесь ломался префикс-KV чата qwen3.8-flash-next:
+    /// откат по метке возвращал счётчики (да ещё через `min`), содержимое
+    /// было затёрто свёртками декода, сетка блоков уезжала относительно
+    /// позиций токенов — и выбор блоков QSA превращался в шум, модель со
+    /// второго хода отвечала мусором.
+    #[test]
+    fn indexer_tail_roundtrip_survives_folds() {
+        let d = 4usize;
+        let ratio = 4usize;
+        let mut cache = IndexerCache::new(16, d, ratio, Device::Cpu, DType::F32).expect("cache");
+
+        // Состояние на конец промпта: 2 блока свёрнуто, 3 ключа ждут в хвосте.
+        let prompt_tail: Vec<f32> = (0..3 * d).map(|x| x as f32 + 1.0).collect();
+        put_rows(&mut cache, prompt_tail.clone(), 3, d);
+        cache.pending_rows = 3;
+        cache.blocks = 2;
+        let snap = cache.tail_snapshot().expect("снимок");
+
+        // «Декод»: свёртки много раз переписали pending и продвинули счётчики.
+        put_rows(&mut cache, vec![-7.0; 3 * d], 3, d);
+        cache.pending_rows = 1;
+        cache.blocks = 5;
+
+        cache.restore_tail(&snap).expect("restore");
+        assert_eq!(cache.mark(), (2, 3), "счётчики обязаны вернуться ровно");
+        assert_eq!(
+            tail_rows(&cache, 3),
+            prompt_tail,
+            "содержимое хвоста обязано вернуться байт в байт"
+        );
+    }
+
+    /// Откат по метке ставит счётчики ровно, а не через `min`: после свёртки
+    /// текущий `pending_rows` меньше откатываемого, и `min` оставлял его на
+    /// свёрнутом значении — сетка блоков уезжала.
+    #[test]
+    fn rewind_sets_counters_exactly() {
+        let mut cache = IndexerCache::new(16, 4, 4, Device::Cpu, DType::F32).expect("cache");
+        cache.blocks = 5;
+        cache.pending_rows = 1;
+        cache.rewind((2, 3));
+        assert_eq!(cache.mark(), (2, 3));
     }
 }
