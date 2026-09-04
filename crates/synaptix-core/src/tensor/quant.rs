@@ -55,6 +55,42 @@ impl QuantWeight {
         })
     }
 
+    /// Вес, от которого остались только перемешанные байты: так выглядит
+    /// NVFP4 после первого умножения — `shuffled` построен, сырой packed
+    /// освобождён. Устройство берём по scales: packed'а больше нет.
+    pub fn from_shuffled(
+        shuffled: Arc<Storage>,
+        scales: Arc<Storage>,
+        dtype: DType,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        if !dtype.is_quantized() {
+            return Err(SynaptixError::Unsupported(
+                "QuantWeight: dtype должен быть quantized (NVFP4/MXFP8/...)",
+            ));
+        }
+        if shuffled.device() != scales.device() {
+            return Err(SynaptixError::device_mismatch(
+                shuffled.device(),
+                scales.device(),
+            ));
+        }
+        let device = scales.device();
+        let cell = OnceCell::new();
+        let _ = cell.set(shuffled);
+        Ok(Self {
+            packed: Mutex::new(None),
+            scales,
+            dtype,
+            n,
+            k,
+            device,
+            shuffled: cell,
+            expert_pool: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
     /// Пометить вес как эксперта MoE — см. поле `expert_pool`.
     /// Адрес весов на устройстве — по масштабам: они есть у любой схемы и
     /// живут рядом с `packed`, в том же slab'е арены экспертов.
@@ -149,27 +185,38 @@ impl QuantWeight {
         self.device
     }
 
-    /// Перенос packed+scales на `dev` (host-stream квант-весов: квантуем 1× на GPU →
-    /// храним на CPU → стримим обратно по требованию). `shuffled`-кэш не переносится
-    /// (лениво пере-инициализируется на новом устройстве). Байты не меняются →
+    /// Перенос веса на `dev` (host-stream квант-весов: квантуем 1× на GPU →
+    /// храним на CPU → стримим обратно по требованию). Байты не меняются →
     /// bit-identical с резидентным квантом.
+    ///
+    /// Везём ту копию, которая у веса осталась. У NVFP4 первое же умножение
+    /// строит перемешанную копию и освобождает сырой packed
+    /// ([`Self::release_packed`]) — с этого момента вес это и есть `shuffled`,
+    /// и переносить надо его: раскладка перемешивания от устройства не
+    /// зависит, а обратный repack из неё не собрать. Пока packed на месте,
+    /// едет packed, а перемешанная копия пере-строится на новом устройстве
+    /// первым умножением.
     pub fn to_device(&self, dev: Device) -> Result<Self> {
-        if self.device == dev {
-            let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
-                "QuantWeight::to_device: packed released",
-            ))?;
-            let out = Self::new(packed, self.scales.clone(), self.dtype, self.n, self.k)?;
-            if self.is_expert_pool() {
-                out.mark_expert_pool();
+        let same_device = self.device == dev;
+        let moved = |s: &Arc<Storage>| -> Result<Arc<Storage>> {
+            if same_device {
+                Ok(s.clone())
+            } else {
+                Ok(Arc::new(crate::tensor::conversion::storage_to_device(s, dev)?))
             }
-            return Ok(out);
-        }
-        let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
-            "QuantWeight::to_device: packed released",
-        ))?;
-        let packed = Arc::new(crate::tensor::conversion::storage_to_device(&packed, dev)?);
-        let scales = Arc::new(crate::tensor::conversion::storage_to_device(&self.scales, dev)?);
-        let out = Self::new(packed, scales, self.dtype, self.n, self.k)?;
+        };
+        let scales = moved(&self.scales)?;
+        let out = match (self.packed_arc(), self.shuffled.get()) {
+            (Some(packed), _) => Self::new(moved(&packed)?, scales, self.dtype, self.n, self.k)?,
+            (None, Some(shuffled)) => {
+                Self::from_shuffled(moved(shuffled)?, scales, self.dtype, self.n, self.k)?
+            }
+            (None, None) => {
+                return Err(SynaptixError::Unsupported(
+                    "QuantWeight::to_device: у веса нет ни packed, ни shuffled",
+                ));
+            }
+        };
         if self.is_expert_pool() {
             out.mark_expert_pool();
         }

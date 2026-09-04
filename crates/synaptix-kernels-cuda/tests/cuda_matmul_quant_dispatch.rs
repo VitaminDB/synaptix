@@ -342,3 +342,56 @@ fn dispatch_coop_m16_n96() {
     let Some((ctx, stream)) = setup() else { return };
     run_dispatch(&ctx, &stream, 96, 64, 16, Nvfp4Plan::Coop, "coop_m16_n96");
 }
+
+// ───────────────── to_device после release_packed (оффлоад блоков) ─────────────────
+
+/// Регресс: блок с NVFP4-весами уезжает на хост и возвращается ПОСЛЕ первого
+/// умножения. Первое умножение строит перемешанную копию и освобождает сырой
+/// packed, поэтому переносить надо `shuffled` — иначе `to_device` отвечал
+/// «packed released», и частичный оффлоад ронял forward
+/// («forward: model load: op `QuantWeight::to_device: packed released`»).
+/// Байты не меняются → результат после круга обязан совпасть побитово.
+#[test]
+fn quant_weight_roundtrip_after_shuffled() {
+    let Some((ctx, stream)) = setup() else { return };
+    let q = Nvfp4QuantKernels::for_context(&ctx).expect("compile nvfp4_quant");
+    let (n, k, m) = (256_u32, 256_u32, 1_u32);
+
+    let w_host = det_f16(0x51DE_5EED, (n * k) as usize, 1.0);
+    let x_host = det_f16(0x0FF1_0AD0, (m * k) as usize, 0.5);
+    let dev_w: CudaSlice<f16> = stream.clone_htod(&w_host).unwrap();
+    let mut w_packed: CudaSlice<u8> = stream.alloc_zeros((n * k / 2) as usize).unwrap();
+    let mut w_scales: CudaSlice<u8> = stream
+        .alloc_zeros(nvfp4_scale_buffer_size(n as usize, k as usize))
+        .unwrap();
+    quantize_f16_to_nvfp4(&q, &stream, &dev_w, &mut w_packed, &mut w_scales, n, k).unwrap();
+
+    let qw = QuantWeight::new(
+        Arc::new(Storage::Cuda(CudaBuf::new(ctx.clone(), stream.clone(), w_packed, 0))),
+        Arc::new(Storage::Cuda(CudaBuf::new(ctx.clone(), stream.clone(), w_scales, 0))),
+        DType::NVFP4,
+        n as usize,
+        k as usize,
+    )
+    .unwrap();
+
+    let x = Tensor::from_vec(x_host, (m as usize, k as usize), Device::Cuda(0)).unwrap();
+    let out_before = x.linear_quant(&qw).unwrap();
+    assert!(
+        qw.packed_arc().is_none() && qw.shuffled().is_some(),
+        "первое умножение обязано было построить shuffled и освободить packed"
+    );
+
+    // Круг: карта → хост → карта. Оба конца должны отработать без packed.
+    let on_host = qw.to_device(Device::Cpu).expect("вес не уехал на хост");
+    assert_eq!(on_host.device(), Device::Cpu);
+    assert!(on_host.shuffled().is_some(), "перемешанная копия не доехала до хоста");
+    let back = on_host.to_device(Device::Cuda(0)).expect("вес не вернулся на карту");
+    assert_eq!(back.device(), Device::Cuda(0));
+
+    let out_after = x.linear_quant(&back).unwrap();
+    let bytes = |t: &Tensor| -> Vec<u8> {
+        stream.clone_dtoh(t.storage().as_cuda().unwrap().slice()).unwrap()
+    };
+    assert_eq!(bytes(&out_before), bytes(&out_after), "после круга результат разошёлся");
+}

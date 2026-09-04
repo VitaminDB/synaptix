@@ -1190,13 +1190,25 @@ impl DecoderModel {
         let want = resident.min(self.blocks.len());
         let dev = self.device;
         // Сначала выселяем лишние — так освобождается место под въезд.
+        // `host_from` — граница, начиная с которой блоки действительно на
+        // хосте. Не уехавший блок остаётся на карте, и записывать его в
+        // нерезидентные нельзя: forward стримил бы то, что и так лежит на
+        // устройстве, а вызывающий считал бы освободившейся память, которая
+        // не освободилась.
+        let mut host_from = self.blocks.len();
         for idx in (want..self.blocks.len()).rev() {
-            if self.blocks[idx].on_device(dev) {
-                match self.blocks[idx].to_device(Device::Cpu) {
-                    Ok(b) => self.blocks[idx] = b,
-                    Err(e) => {
-                        eprintln!("[llm] блок {idx} не уехал на хост: {e}");
-                    }
+            if !self.blocks[idx].on_device(dev) {
+                host_from = idx;
+                continue;
+            }
+            match self.blocks[idx].to_device(Device::Cpu) {
+                Ok(b) => {
+                    self.blocks[idx] = b;
+                    host_from = idx;
+                }
+                Err(e) => {
+                    eprintln!("[llm] блок {idx} не уехал на хост ({e}) — остаётся на карте");
+                    break;
                 }
             }
         }
@@ -1213,8 +1225,9 @@ impl DecoderModel {
                 }
             }
         }
-        self.resident_blocks = want;
-        want
+        let got = want.max(host_from);
+        self.resident_blocks = got;
+        got
     }
 
     /// Проход по блокам по порядку: резидентные отдаются как есть,
