@@ -258,6 +258,10 @@ impl HybridPipeline {
             && self.model.dtype == DType::F16
             && self.model.kv_dtype != DType::MXFP8
             && !self.model.has_mxfp8_head_or_embed()
+            // При частичном оффлоаде блоки приезжают с хоста каждый ход, и
+            // адреса их весов меняются — захваченный граф ссылался бы на
+            // освобождённую память.
+            && self.model.blocks_all_resident()
     }
 
 
@@ -757,7 +761,7 @@ impl HybridPipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        let use_graph = !self.model.has_mxfp8_head_or_embed();
+        let use_graph = !self.model.has_mxfp8_head_or_embed() && self.model.blocks_all_resident();
         let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
         self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, use_graph, None)
     }
@@ -784,7 +788,7 @@ impl HybridPipeline {
             &synaptix_llm_common::KvCache,
         ) -> Result<(), PipelineError>,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        let use_graph = !self.model.has_mxfp8_head_or_embed();
+        let use_graph = !self.model.has_mxfp8_head_or_embed() && self.model.blocks_all_resident();
         self.generate_mtp_inner(kv, mtp_kv, prompt_ids, gen_cfg, sink, use_graph, Some(on_prefill))
     }
 

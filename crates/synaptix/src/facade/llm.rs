@@ -501,6 +501,43 @@ impl LlmPipeline {
         }
     }
 
+    /// Вес одного блока и их число — единицы планирования частичного
+    /// оффлоада. `None` — архитектура его не поддерживает (MoE со своим
+    /// кэшем экспертов и т.п.).
+    fn block_offload_shape(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Qwen3(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            Self::Hybrid(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            Self::Llama(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            Self::Gemma3(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            Self::MuseGlimmer(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            // У Qwen4Exp свой оффлоад — кэш экспертов.
+            Self::Qwen4Exp(_) => None,
+        }
+    }
+
+    fn resident_blocks(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(p) => Some(p.model.resident_blocks()),
+            Self::Hybrid(p) => Some(p.model.resident_blocks()),
+            Self::Llama(p) => Some(p.model.resident_blocks()),
+            Self::Gemma3(p) => Some(p.model.resident_blocks()),
+            Self::MuseGlimmer(p) => Some(p.model.resident_blocks()),
+            Self::Qwen4Exp(_) => None,
+        }
+    }
+
+    fn set_block_residency(&mut self, resident: usize) -> Option<usize> {
+        match self {
+            Self::Qwen3(p) => Some(p.model.set_block_residency(resident)),
+            Self::Hybrid(p) => Some(p.model.set_block_residency(resident)),
+            Self::Llama(p) => Some(p.model.set_block_residency(resident)),
+            Self::Gemma3(p) => Some(p.model.set_block_residency(resident)),
+            Self::MuseGlimmer(p) => Some(p.model.set_block_residency(resident)),
+            Self::Qwen4Exp(_) => None,
+        }
+    }
+
     fn kv_fixed_bytes(&self, batch: usize, max_seq: usize) -> usize {
         match self {
             Self::Qwen3(p) => p.model.kv_fixed_bytes(batch, max_seq),
@@ -1022,6 +1059,30 @@ impl Llm {
             .lock()
             .map(|p| p.kv_bytes_per_token())
             .unwrap_or(0)
+    }
+
+    /// Вес одного блока в байтах и их количество — по ним хост решает,
+    /// сколько блоков оставить на карте. `None` — архитектура частичный
+    /// оффлоад не поддерживает.
+    pub fn block_offload_shape(&self) -> Option<(usize, usize)> {
+        self.pipeline.lock().ok().and_then(|p| p.block_offload_shape())
+    }
+
+    /// Сколько блоков сейчас на карте.
+    pub fn resident_blocks(&self) -> Option<usize> {
+        self.pipeline.lock().ok().and_then(|p| p.resident_blocks())
+    }
+
+    /// Оставить на карте первые `resident` блоков, остальные — на хосте: во
+    /// время forward'а они приезжают по одному с префетчем следующего.
+    /// Освобождённая память уходит под контекст. Возвращает, сколько блоков
+    /// осталось резидентно (`None` — архитектура не поддерживает).
+    ///
+    /// Плата — скорость: каждый нерезидентный блок едет по PCIe на каждом
+    /// forward'е, и CUDA-графы при этом недоступны. Поэтому звать это стоит
+    /// только когда контекст иначе не помещается.
+    pub fn set_block_residency(&self, resident: usize) -> Option<usize> {
+        self.pipeline.lock().ok().and_then(|mut p| p.set_block_residency(resident))
     }
 
     /// Отдать память карты, занятую кэшами модели, не дожидаясь её `Drop`.

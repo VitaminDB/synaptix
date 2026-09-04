@@ -1161,6 +1161,9 @@ impl MusePipeline {
             && matches!(self.model.dtype, DType::F16 | DType::BF16)
             && self.model.kv_dtype != DType::MXFP8
             && !self.model.has_mxfp8_head_or_embed()
+            // Частичный оффлоад: адреса весов меняются каждый ход, граф их
+            // захватить не может.
+            && self.model.blocks_all_resident()
     }
 
     pub fn generate_with_graph_streaming(

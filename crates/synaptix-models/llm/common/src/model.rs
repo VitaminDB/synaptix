@@ -318,7 +318,61 @@ impl LinearAttn {
     }
 }
 
+impl FullAttn {
+    /// Вес слоя в байтах — для планирования частичного оффлоада.
+    fn bytes(&self) -> usize {
+        self.q_proj.bytes()
+            + self.k_proj.bytes()
+            + self.v_proj.bytes()
+            + self.o_proj.bytes()
+            + tensor_bytes(self.q_norm.as_ref())
+            + tensor_bytes(self.k_norm.as_ref())
+    }
+}
+
+impl LinearAttn {
+    fn bytes(&self) -> usize {
+        self.in_proj_qkv.bytes()
+            + self.in_proj_a.bytes()
+            + self.in_proj_b.bytes()
+            + self.in_proj_z.bytes()
+            + self.out_proj.bytes()
+            + tensor_bytes(Some(&self.norm_weight))
+            + tensor_bytes(self.conv_w_dev.as_ref())
+            + tensor_bytes(self.a_log_dev.as_ref())
+            + tensor_bytes(self.dt_bias_dev.as_ref())
+            + tensor_bytes(self.norm_w_f16.as_ref())
+    }
+}
+
+impl Mlp {
+    fn bytes(&self) -> usize {
+        self.gate_proj.bytes() + self.up_proj.bytes() + self.down_proj.bytes()
+    }
+}
+
 impl Block {
+    /// Сколько памяти занимает блок целиком. По нему планируется частичный
+    /// оффлоад: сколько блоков оставить на карте, чтобы под контекст осталось
+    /// нужное количество памяти.
+    pub fn bytes(&self) -> usize {
+        let mixer = match &self.mixer {
+            Mixer::Full(fa) => fa.bytes(),
+            Mixer::Linear(la) => la.bytes(),
+        };
+        mixer
+            + self.mlp.bytes()
+            + tensor_bytes(Some(&self.pre_attn_norm))
+            + tensor_bytes(self.post_attn_norm.as_ref())
+            + tensor_bytes(Some(&self.pre_mlp_norm))
+            + tensor_bytes(self.post_mlp_norm.as_ref())
+    }
+
+    /// Блок лежит на этом устройстве (по первому весу — они переезжают вместе).
+    fn on_device(&self, dev: Device) -> bool {
+        self.pre_attn_norm.device() == dev
+    }
+
     /// Перенос блока на устройство (host-stream: CPU-резидент → GPU по
     /// требованию). Linear-mixer не поддержан (gemma/llama full-attention only).
     fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
@@ -360,7 +414,10 @@ pub struct DecoderModel {
     embed_scale: Option<f32>,
     /// Блоки CPU-резидентны и стримятся на GPU per-block в forward (pinned-H2D
     /// с префетчем) — bf16-энкодер 24GB на 24GB-карте. Декод-петли не поддержаны.
-    host_stream_blocks: bool,
+    /// Сколько первых блоков живут на устройстве. Остальные — на хосте и
+    /// стримятся по одному во время forward'а с префетчем следующего.
+    /// Равно числу блоков — вся модель резидентна (обычный путь).
+    resident_blocks: usize,
 }
 
 pub struct KvCacheLayer {
@@ -1075,6 +1132,7 @@ impl DecoderModel {
             }
             .map_err(|e| ModelError::Build(e.to_string()))
         };
+        let n_blocks = blocks.len();
         let rope_global = build_rope(&cfg.rope_global)?;
         let rope_local = match &cfg.rope_local {
             Some(s) => Some(build_rope(s)?),
@@ -1096,8 +1154,145 @@ impl DecoderModel {
             rope_local,
             rope_capacity,
             embed_scale: cfg.embed_scale,
-            host_stream_blocks: block_device.is_some_and(|d| d != device),
+            resident_blocks: if block_device.is_some_and(|d| d != device) { 0 } else { n_blocks },
         })
+    }
+
+    /// Сколько блоков у модели.
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Вес одного блока в байтах (по первому — они одинаковы по форме).
+    /// Единица планирования частичного оффлоада.
+    pub fn block_bytes(&self) -> usize {
+        self.blocks.first().map(Block::bytes).unwrap_or(0)
+    }
+
+    /// Сколько блоков сейчас живёт на устройстве.
+    pub fn resident_blocks(&self) -> usize {
+        self.resident_blocks
+    }
+
+    /// Вся модель на устройстве — обычный резидентный путь. При частичном
+    /// оффлоаде CUDA-графы недоступны: адреса весов меняются каждый ход.
+    pub fn blocks_all_resident(&self) -> bool {
+        self.resident_blocks >= self.blocks.len()
+    }
+
+    /// Оставить на устройстве первые `resident` блоков, остальные отправить на
+    /// хост. Блоки переезжают по одному, поэтому пик памяти — один блок сверх
+    /// уже резидентных.
+    ///
+    /// Возвращает, сколько блоков в итоге резидентно: если перевозка упёрлась
+    /// в память, останавливаемся на достигнутом, а не роняем загрузку.
+    pub fn set_block_residency(&mut self, resident: usize) -> usize {
+        let want = resident.min(self.blocks.len());
+        let dev = self.device;
+        // Сначала выселяем лишние — так освобождается место под въезд.
+        for idx in (want..self.blocks.len()).rev() {
+            if self.blocks[idx].on_device(dev) {
+                match self.blocks[idx].to_device(Device::Cpu) {
+                    Ok(b) => self.blocks[idx] = b,
+                    Err(e) => {
+                        eprintln!("[llm] блок {idx} не уехал на хост: {e}");
+                    }
+                }
+            }
+        }
+        for idx in 0..want {
+            if self.blocks[idx].on_device(dev) {
+                continue;
+            }
+            match self.blocks[idx].to_device(dev) {
+                Ok(b) => self.blocks[idx] = b,
+                Err(e) => {
+                    eprintln!("[llm] блок {idx} не въехал на карту ({e}) — остаток стримим");
+                    self.resident_blocks = idx;
+                    return idx;
+                }
+            }
+        }
+        self.resident_blocks = want;
+        want
+    }
+
+    /// Проход по блокам по порядку: резидентные отдаются как есть,
+    /// нерезидентные приезжают с хоста, а следующий за ними префетчится на
+    /// loader-стриме параллельно текущему шагу (pinned-H2D, как DiT-блоки LTX).
+    fn for_each_block<F>(&self, dev: Device, mut body: F) -> Result<(), ModelError>
+    where
+        F: FnMut(usize, &Block) -> Result<(), ModelError>,
+    {
+        let n = self.blocks.len();
+        if self.blocks_all_resident() || !matches!(dev, Device::Cuda(_)) {
+            for (idx, blk) in self.blocks.iter().enumerate() {
+                body(idx, blk)?;
+            }
+            return Ok(());
+        }
+        let ord = if let Device::Cuda(o) = dev { o } else { 0 };
+        synaptix_core::device::cuda::set_offload_pinned(true);
+        let ls = synaptix_core::device::cuda::loader_stream(ord)
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let first_streamed = self.resident_blocks;
+        // Первый нерезидентный блок везём заранее — дальше каждый следующий
+        // едет во время счёта предыдущего.
+        let mut staged: Option<Block> = if first_streamed < n {
+            Some(self.blocks[first_streamed].to_device(dev)?)
+        } else {
+            None
+        };
+        let mut result = Ok(());
+        for idx in 0..n {
+            if idx < first_streamed {
+                if let Err(e) = body(idx, &self.blocks[idx]) {
+                    result = Err(e);
+                    break;
+                }
+                continue;
+            }
+            let cur = match staged.take() {
+                Some(b) => b,
+                None => self.blocks[idx].to_device(dev)?,
+            };
+            let lsc = ls.clone();
+            let next: Result<Option<Block>, ModelError> = std::thread::scope(
+                |sp| -> Result<Option<Block>, ModelError> {
+                    let h = if idx + 1 < n {
+                        Some(sp.spawn(move || -> Result<Block, ModelError> {
+                            synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
+                            synaptix_core::device::cuda::set_offload_pinned(true);
+                            let r = self.blocks[idx + 1].to_device(dev);
+                            let _ = lsc.synchronize();
+                            synaptix_core::device::cuda::set_offload_pinned(false);
+                            synaptix_core::device::cuda::set_alloc_stream(None);
+                            r
+                        }))
+                    } else {
+                        None
+                    };
+                    let step = body(idx, &cur);
+                    let prefetched = match h {
+                        Some(h) => Some(h.join().map_err(|_| {
+                            ModelError::Forward("llm prefetch thread panicked".into())
+                        })??),
+                        None => None,
+                    };
+                    step?;
+                    Ok(prefetched)
+                },
+            );
+            match next {
+                Ok(nb) => staged = nb,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        synaptix_core::device::cuda::set_offload_pinned(false);
+        result
     }
 
     pub fn with_kv_cache_dtype(mut self, kv_dtype: DType) -> Self {
@@ -1476,65 +1671,23 @@ impl DecoderModel {
             Ok(out)
         };
 
-        if self.host_stream_blocks && matches!(dev, Device::Cuda(_)) {
-            // host-stream: блоки CPU-резидентны, текущий стримится на GPU, следующий
-            // префетчится на loader-стриме с pinned-H2D (как DiT-блоки LTX). Работает
-            // при ЛЮБОМ объёме свободной VRAM — на GPU одновременно живёт ~1-2 блока.
-            // KV-кэш резидентен на device, lm_head/embed/rope тоже.
-            let ord = if let Device::Cuda(o) = dev { o } else { 0 };
-            synaptix_core::device::cuda::set_offload_pinned(true);
-            let ls = synaptix_core::device::cuda::loader_stream(ord)
-                .map_err(|e| ModelError::Forward(e.to_string()))?;
-            let mut cur = self.blocks[0].to_device(dev)?;
-            for idx in 0..self.blocks.len() {
-                let lsc = ls.clone();
-                let next: Option<Block> = std::thread::scope(
-                    |sp| -> Result<Option<Block>, ModelError> {
-                        let h = if idx + 1 < self.blocks.len() {
-                            Some(sp.spawn(move || -> Result<Block, ModelError> {
-                                synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
-                                synaptix_core::device::cuda::set_offload_pinned(true);
-                                let r = self.blocks[idx + 1].to_device(dev);
-                                let _ = lsc.synchronize();
-                                synaptix_core::device::cuda::set_offload_pinned(false);
-                                synaptix_core::device::cuda::set_alloc_stream(None);
-                                r
-                            }))
-                        } else {
-                            None
-                        };
-                        hidden = step(idx, &cur, &hidden, kv_cache)?;
-                        if taps.contains(&idx) {
-                            tapped.push(hidden.clone());
-                        }
-                        match h {
-                            Some(h) => Ok(Some(h.join().map_err(|_| {
-                                ModelError::Forward("llm prefetch thread panicked".into())
-                            })??)),
-                            None => Ok(None),
-                        }
-                    },
-                )?;
-                if let Some(nb) = next {
-                    cur = nb;
-                }
+        // Резидентные блоки идут как есть, нерезидентные приезжают с хоста —
+        // решает `for_each_block`, здесь разница только в послойной синхре
+        // (на стриме её делает сам префетч).
+        let sync_ord = match (self.device, self.blocks_all_resident()) {
+            (Device::Cuda(o), true) => Some(o),
+            _ => None,
+        };
+        self.for_each_block(dev, |idx, blk| {
+            hidden = step(idx, blk, &hidden, kv_cache)?;
+            if taps.contains(&idx) {
+                tapped.push(hidden.clone());
             }
-            synaptix_core::device::cuda::set_offload_pinned(false);
-        } else {
-            let sync_ord = match self.device {
-                Device::Cuda(o) => Some(o),
-                _ => None,
-            };
-            for (idx, blk) in self.blocks.iter().enumerate() {
-                hidden = step(idx, blk, &hidden, kv_cache)?;
-                if taps.contains(&idx) {
-                    tapped.push(hidden.clone());
-                }
-                if let Some(o) = sync_ord {
-                    synaptix_core::device::cuda::layer_sync(o, s > 1);
-                }
+            if let Some(o) = sync_ord {
+                synaptix_core::device::cuda::layer_sync(o, s > 1);
             }
-        }
+            Ok(())
+        })?;
         kv_cache.seq_len = past + s;
         Ok(hidden)
     }
@@ -1605,51 +1758,10 @@ impl DecoderModel {
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             residual2.add(&mlp_out).coerr()
         };
-        if self.host_stream_blocks && matches!(dev, Device::Cuda(_)) {
-            // host-stream: CPU-блоки стримятся на GPU per-block, префетч i+1 на
-            // loader-стриме с pinned-H2D (как DiT-блоки LTX). Только прямой
-            // проход — KV-кэш одноразовый.
-            let ord = if let Device::Cuda(o) = dev { o } else { 0 };
-            synaptix_core::device::cuda::set_offload_pinned(true);
-            let ls = synaptix_core::device::cuda::loader_stream(ord)
-                .map_err(|e| ModelError::Forward(e.to_string()))?;
-            let mut cur = self.blocks[0].to_device(dev)?;
-            for idx in 0..self.blocks.len() {
-                let lsc = ls.clone();
-                let next: Option<Block> = std::thread::scope(
-                    |sp| -> Result<Option<Block>, ModelError> {
-                        let h = if idx + 1 < self.blocks.len() {
-                            Some(sp.spawn(move || -> Result<Block, ModelError> {
-                                synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
-                                synaptix_core::device::cuda::set_offload_pinned(true);
-                                let r = self.blocks[idx + 1].to_device(dev);
-                                let _ = lsc.synchronize();
-                                synaptix_core::device::cuda::set_offload_pinned(false);
-                                synaptix_core::device::cuda::set_alloc_stream(None);
-                                r
-                            }))
-                        } else {
-                            None
-                        };
-                        hidden = step(idx, &cur, &hidden, &mut kv)?;
-                        match h {
-                            Some(h) => Ok(Some(h.join().map_err(|_| {
-                                ModelError::Forward("llm prefetch thread panicked".into())
-                            })??)),
-                            None => Ok(None),
-                        }
-                    },
-                )?;
-                if let Some(nb) = next {
-                    cur = nb;
-                }
-            }
-            synaptix_core::device::cuda::set_offload_pinned(false);
-        } else {
-            for (idx, blk) in self.blocks.iter().enumerate() {
-                hidden = step(idx, blk, &hidden, &mut kv)?;
-            }
-        }
+        self.for_each_block(dev, |idx, blk| {
+            hidden = step(idx, blk, &hidden, &mut kv)?;
+            Ok(())
+        })?;
         // HF: последнее состояние = final_norm(выход последнего слоя).
         states.push(rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps).coerr()?);
         Ok(states)
