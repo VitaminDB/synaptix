@@ -26,6 +26,9 @@ use synaptix_llm_qwen4_exp::pipeline::{
 };
 use synaptix_llm_qwen3_next_hybrid::pipeline::{HybridPipeline, MediaInput};
 use synaptix_tokenizer::templates::chat_template::RenderOptions;
+use synaptix_tokenizer::templates::tools::{
+    ToolCall as TokToolCall, ToolCallFunction as TokToolCallFunction,
+};
 use synaptix_tokenizer::{
     ChatTemplate, HfTokenizer, Message as TokMessage, MessageRole, SpecialTokenKind, SpecialTokens,
     Tokenizer as _,
@@ -368,37 +371,84 @@ pub struct Message {
     /// результата (`<tool_output name="...">` у Muse Glimmer, `name` в
     /// ChatML-вариантах), поэтому без него модель не понимает, чей это вывод.
     pub name: Option<String>,
+    /// Размышления реплики ассистента — шаблон рендерит их сам
+    /// (`reasoning_content` у Qwen3.x). `None` — без блока размышлений.
+    pub reasoning: Option<String>,
+    /// Вызовы инструментов реплики ассистента: (имя, JSON аргументов).
+    /// Шаблон рендерит их в своём родном формате (у Qwen3.8 —
+    /// `<function=…><parameter=…>`), поэтому в `content` их класть не надо.
+    pub tool_calls: Vec<(String, String)>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into(), name: None }
+        Self::plain("system", content, None)
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into(), name: None }
+        Self::plain("user", content, None)
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), name: None }
+        Self::plain("assistant", content, None)
     }
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: content.into(), name: None }
+        Self::plain("tool", content, None)
     }
 
     /// Результат инструмента с именем вызванной функции.
     pub fn tool_named(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: content.into(), name: Some(name.into()) }
+        Self::plain("tool", content, Some(name.into()))
+    }
+
+    /// Реплика ассистента целиком: текст, размышления и структурные вызовы.
+    pub fn assistant_turn(
+        content: impl Into<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            name: None,
+            reasoning,
+            tool_calls,
+        }
+    }
+
+    fn plain(role: &str, content: impl Into<String>, name: Option<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            name,
+            reasoning: None,
+            tool_calls: Vec::new(),
+        }
     }
 
     fn to_tok(&self) -> TokMessage {
         match self.role.as_str() {
             "system" => TokMessage::system(self.content.clone()),
-            "assistant" => TokMessage::assistant(self.content.clone()),
+            "assistant" => TokMessage::assistant_with_reasoning(
+                self.content.clone(),
+                self.reasoning.clone(),
+                self.tool_calls
+                    .iter()
+                    .map(|(name, arguments)| TokToolCall {
+                        id: None,
+                        call_type: "function".into(),
+                        function: TokToolCallFunction {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
             "tool" => TokMessage {
                 role: MessageRole::Tool,
                 content: self.content.clone(),
                 name: self.name.clone(),
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             _ => TokMessage::user(self.content.clone()),
         }

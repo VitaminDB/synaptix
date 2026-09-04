@@ -53,6 +53,7 @@ fn messages_from_json(arr: &[JsonValue]) -> Vec<Message> {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             }
         })
         .collect()

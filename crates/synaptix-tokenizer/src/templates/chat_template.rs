@@ -41,19 +41,25 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Размышления реплики ассистента. Шаблоны Qwen3.x берут их из этого
+    /// поля (`message.reasoning_content`), а не из `<think>` в `content`, и
+    /// без него рендерят пустой блок `<think>\n\n</think>` — промпт
+    /// следующего хода тогда расходится с предыдущим на границе `<think>\n`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::System, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new() }
+        Self { role: MessageRole::System, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new(), reasoning_content: None }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::User, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new() }
+        Self { role: MessageRole::User, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new(), reasoning_content: None }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::Assistant, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new() }
+        Self { role: MessageRole::Assistant, content: content.into(), name: None, tool_call_id: None, tool_calls: Vec::new(), reasoning_content: None }
     }
 
     pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
@@ -63,16 +69,28 @@ impl Message {
             name: None,
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 
     pub fn assistant_with_tools(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self::assistant_with_reasoning(content, None, calls)
+    }
+
+    /// Реплика ассистента с размышлениями и структурными вызовами: шаблон
+    /// сам рендерит и `<think>`-блок, и вызовы в своём родном формате.
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        reasoning: Option<String>,
+        calls: Vec<ToolCall>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
             name: None,
             tool_call_id: None,
             tool_calls: calls,
+            reasoning_content: reasoning,
         }
     }
 }
@@ -142,10 +160,11 @@ impl ChatTemplate {
 
     pub fn render(&self, msgs: &[Message], opts: &RenderOptions) -> Result<String> {
         let messages_for_template = self.prepare_messages(msgs, opts);
-        let messages_json: Vec<JsonValue> = messages_for_template
+        let mut messages_json: Vec<JsonValue> = messages_for_template
             .iter()
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?;
+        objectify_tool_call_arguments(&mut messages_json);
         let tools_json: Vec<JsonValue> = opts
             .tools
             .iter()
@@ -201,5 +220,31 @@ impl ChatTemplate {
                 }
             })
             .collect()
+    }
+}
+
+
+/// `ToolCallFunction::arguments` хранит JSON строкой (так их отдаёт API), а
+/// шаблоны перебирают аргументы как объект (`tool_call.arguments|items` у
+/// Qwen3.x — так же Python-шаблон HF получает dict). Перед рендером
+/// разворачиваем строку в объект; не-JSON оставляем как есть.
+fn objectify_tool_call_arguments(messages: &mut [JsonValue]) {
+    for msg in messages.iter_mut() {
+        let Some(calls) = msg.get_mut("tool_calls").and_then(JsonValue::as_array_mut) else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let Some(function) = call.get_mut("function").and_then(JsonValue::as_object_mut) else {
+                continue;
+            };
+            let parsed = function
+                .get("arguments")
+                .and_then(JsonValue::as_str)
+                .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+                .filter(JsonValue::is_object);
+            if let Some(obj) = parsed {
+                function.insert("arguments".into(), obj);
+            }
+        }
     }
 }
