@@ -171,7 +171,7 @@ pub struct BestGemmBf16Kernels {
     f16_tma_b64x128_s3d: Option<CudaFunction>,
     // кэш TMA-дескрипторов: ключ (ptr, rows, cols_b) — дескриптор зависит только
     // от адреса/лейаута (не от данных); веса стабильны между вызовами → хиты.
-    tma_descs: Mutex<std::collections::HashMap<(u64, u32, u32), CudaSlice<u8>>>,
+    tma_descs: Mutex<std::collections::HashMap<(u64, u32, u32), Arc<crate::tma::TmaDesc>>>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<BestGemmBf16Kernels>)>>> = OnceLock::new();
@@ -663,7 +663,7 @@ fn launch_tma_64(
     let (x_ptr, _rx) = x.device_ptr(stream);
     let (w_ptr, _rw) = w.device_ptr(stream);
     let swz = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
-    let desc_for = |ptr: u64, rows: u32, box_r: u32| -> Result<CudaSlice<u8>> {
+    let desc_for = |ptr: u64, rows: u32, box_r: u32| -> Result<Arc<crate::tma::TmaDesc>> {
         let key = (ptr, rows, k * 2 + box_r);
         let mut g = kernels.tma_descs.lock();
         if let Some(d) = g.get(&key) {
@@ -671,7 +671,7 @@ fn launch_tma_64(
         }
         // L2-promotion 256B: стриминговое чтение W — DRAM-эффективность.
         let l2 = CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
-        let d = make_tma_desc_2d_u8_swz_l2(stream, ptr, rows, k * 2, box_r, 128, swz, l2)?;
+        let d = Arc::new(make_tma_desc_2d_u8_swz_l2(stream, ptr, rows, k * 2, box_r, 128, swz, l2)?);
         if g.len() >= 512 {
             g.clear();
         }
@@ -693,8 +693,8 @@ fn launch_tma_64(
     let gr = gr.max(1);
     let smem = stages * (bm + bn) * 128 + 2 * stages * 8;
     let mut bld = stream.launch_builder(kfn);
-    bld.arg(&a_desc)
-        .arg(&b_desc)
+    bld.arg(&*a_desc)
+        .arg(&*b_desc)
         .arg(&mut y_v)
         .arg(&m)
         .arg(&n)

@@ -12,15 +12,16 @@ use synaptix_core::error::{Result, SynaptixError};
 use cudarc::driver::sys::CUtensorMapSwizzle;
 
 use crate::kernels::compile::{compile_module_with_opts, load_fn};
-use crate::tma::{make_tma_desc_2d_u8_swz, make_tma_desc_3d_u8};
+use crate::tma::{make_tma_desc_2d_u8_swz, make_tma_desc_3d_u8, TmaDesc};
 
 // Кэш TMA-дескрипторов (bf16-урок: encode+htod на КАЖДЫЙ вызов = H2D-копия,
 // сериализующаяся со стримом, ~1µs с дескриптора; full-путь их 5 → львиная
 // доля фикс-цены запуска ~10µs vs ~5µs у qutlass). Ключ = адрес + геометрия;
 // переиспользование mempool-адреса с той же геометрией даёт корректный хит
-// (дескриптор кодирует только адрес+layout). Память: 128Б на запись.
+// (дескриптор кодирует только адрес+layout). Память: 128Б на запись — слот
+// арены `tma::TmaDesc`, а не отдельная аллокация (почему — см. там).
 type DescKey = (u64, u32, u32, u32, u32, u32, u64, u64);
-static DESC_CACHE: OnceLock<Mutex<std::collections::HashMap<DescKey, Arc<CudaSlice<u8>>>>> =
+static DESC_CACHE: OnceLock<Mutex<std::collections::HashMap<DescKey, Arc<TmaDesc>>>> =
     OnceLock::new();
 
 /// Сбросить кэш TMA-дескрипторов. Ключ записи — АДРЕС тензора, поэтому после
@@ -49,7 +50,7 @@ pub(crate) fn cached_desc_2d(
     box_rows: u32,
     box_cols_bytes: u32,
     swz: CUtensorMapSwizzle,
-) -> Result<Arc<CudaSlice<u8>>> {
+) -> Result<Arc<TmaDesc>> {
     let key = (ptr, rows, cols_bytes, box_rows, box_cols_bytes, swz as u32, 0u64, 0u64);
     let cache = DESC_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(d) = cache.lock().get(&key) {
@@ -74,7 +75,7 @@ fn cached_desc_3d(
     box0_bytes: u32,
     box1: u32,
     box2: u32,
-) -> Result<Arc<CudaSlice<u8>>> {
+) -> Result<Arc<TmaDesc>> {
     let key = (
         ptr,
         dim0_bytes ^ (box0_bytes << 16),
