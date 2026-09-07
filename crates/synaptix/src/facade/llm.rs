@@ -263,31 +263,29 @@ pub struct OptimalProfile {
 
 /// Выверенные настройки под архитектуру бандла.
 ///
-/// Qwen4Exp держит KV квантованным: ядро по таблице блоков читает его
-/// напрямую, отчего QSA на длинном промпте почти на треть быстрее, а памяти
-/// под кэш нужно вдвое меньше. Спекуляция там же выключена — шаг упирается в
-/// подкачку экспертов, и у второго токена почти свой их набор, так что
-/// драфт только добавляет работы. У Muse-Glimmer наоборот: DFlash на
-/// greedy-пути ничего не меняет в ответе и заметно ускоряет.
+/// KV-кэш у всех LLM держится в MXFP8: байт на элемент плюс E8M0-масштаб на
+/// блок из 32 вместо двух байт — вдвое меньше VRAM на токен контекста. На
+/// 24 ГБ это разница между полной резидентностью блоков и оффлоадом:
+/// 07.09.2026 qwen3.8-27b с F16-кэшем (64 КБ/ток) на контексте 13k выселил
+/// два блока из 64 и потерял 32 → 20 ток/с, хотя при 33 КБ/ток тот же ход
+/// влезал с запасом в семь блоков. Послойно движок сам оставляет плотный
+/// кэш там, где квантованный читать нечем (sliding-слои, head_dim не кратен
+/// 32 — см. `DecoderModel::layer_kv_mxfp8`), а CUDA-графы при квантованном
+/// кэше пайплайны не захватывают (`graph_decode_supported`).
+///
+/// У Qwen4Exp квантованный KV ещё и быстрее: ядро по таблице блоков читает
+/// его напрямую, отчего QSA на длинном промпте почти на треть быстрее.
+/// Спекуляция там выключена — шаг упирается в подкачку экспертов, и у
+/// второго токена почти свой их набор, так что драфт только добавляет
+/// работы. У Muse-Glimmer и гибрида наоборот: DFlash/MTP на greedy-пути
+/// ничего не меняют в ответе и заметно ускоряют.
 pub fn optimal_profile(path: &Path) -> OptimalProfile {
+    use crate::facade::arch::LlmArch;
     let arch = crate::facade::arch::detect_llm_arch(path).ok();
     let mut policy = QuantPolicy::balance();
-    let mut speculation = false;
-    match arch {
-        Some(crate::facade::arch::LlmArch::Qwen4Exp) => {
-            policy.kv_dtype = KvDtypePolicy::MXFP8;
-            policy.preset_name = "optimal".to_string();
-        }
-        Some(crate::facade::arch::LlmArch::MuseGlimmer) => {
-            speculation = true;
-            policy.preset_name = "optimal".to_string();
-        }
-        Some(crate::facade::arch::LlmArch::Hybrid) => {
-            speculation = true;
-            policy.preset_name = "optimal".to_string();
-        }
-        _ => policy.preset_name = "optimal".to_string(),
-    }
+    policy.kv_dtype = KvDtypePolicy::MXFP8;
+    policy.preset_name = "optimal".to_string();
+    let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
     OptimalProfile {
         policy,
         graph_decode: false,
@@ -1784,6 +1782,38 @@ fn stream_delta(full: String, decoded: &mut String) -> String {
 #[cfg(test)]
 mod stream_delta_tests {
     use super::stream_delta;
+
+    /// HF-каталог из одного config.json — `optimal_profile` читает только его.
+    fn model_dir(model_type: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "synaptix-optimal-profile-{model_type}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), format!("{{\"model_type\":\"{model_type}\"}}")).unwrap();
+        dir
+    }
+
+    /// KV в MXFP8 — у всех LLM (07.09.2026), спекуляция — у гибрида и
+    /// Muse-Glimmer, у Qwen4Exp и dense-Qwen3 её нет.
+    #[test]
+    fn optimal_profile_quantizes_kv_for_every_arch() {
+        use super::{optimal_profile, KvDtypePolicy};
+        for (model_type, speculation) in [
+            ("qwen3_5", true),
+            ("qwen3", false),
+            ("qwen4_exp", false),
+            ("muse_glimmer", true),
+            ("llama", false),
+        ] {
+            let dir = model_dir(model_type);
+            let p = optimal_profile(&dir);
+            assert_eq!(p.policy.kv_dtype, KvDtypePolicy::MXFP8, "{model_type}");
+            assert_eq!(p.speculation, speculation, "{model_type}");
+            assert_eq!(p.policy.preset_name, "optimal", "{model_type}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     /// Прогоняет последовательность decode-снапшотов через stream_delta.
     fn run(fulls: &[&str]) -> (Vec<String>, String) {

@@ -264,6 +264,18 @@ impl HybridPipeline {
             && self.model.blocks_all_resident()
     }
 
+    /// Захватывать ли MTP-шаг в CUDA-граф. Та же арифметика, что у
+    /// [`Self::graph_decode_supported`], без требования F16-compute. Граф
+    /// строится на `make_prefill_state`, а тот не умеет квантованный KV —
+    /// с MXFP8-кэшем (политика по умолчанию с 07.09.2026) попытка захвата
+    /// роняла бы ход ошибкой «FP8-KV не поддержан dev-путём» вместо того,
+    /// чтобы тихо идти обычным путём.
+    fn mtp_graph_supported(&self) -> bool {
+        !self.model.has_mxfp8_head_or_embed()
+            && self.model.kv_dtype != DType::MXFP8
+            && self.model.blocks_all_resident()
+    }
+
 
     fn build_mtp_graph(
         &self,
@@ -761,7 +773,7 @@ impl HybridPipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        let use_graph = !self.model.has_mxfp8_head_or_embed() && self.model.blocks_all_resident();
+        let use_graph = self.mtp_graph_supported();
         let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
         self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, use_graph, None)
     }
@@ -788,7 +800,7 @@ impl HybridPipeline {
             &synaptix_llm_common::KvCache,
         ) -> Result<(), PipelineError>,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
-        let use_graph = !self.model.has_mxfp8_head_or_embed() && self.model.blocks_all_resident();
+        let use_graph = self.mtp_graph_supported();
         self.generate_mtp_inner(kv, mtp_kv, prompt_ids, gen_cfg, sink, use_graph, Some(on_prefill))
     }
 

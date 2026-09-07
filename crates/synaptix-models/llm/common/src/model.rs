@@ -1460,9 +1460,16 @@ impl DecoderModel {
         let n_kv = c.num_key_value_heads;
         let hd = c.head_dim;
         if self.kv_dtype == DType::MXFP8 && hd % 32 != 0 {
-            return Err(ModelError::Shape(format!(
-                "make_kv_cache: --kv-dtype mxfp8 требует head_dim % 32 == 0 (hd={hd})"
-            )));
+            // Квантованный кэш живёт блоками по 32 элемента. При head_dim не
+            // кратном 32 `layer_kv_mxfp8` и так отдаёт всем слоям плотный
+            // dtype (ставка «на токен» считается по нему же), так что ронять
+            // загрузку незачем: MXFP8-KV — политика по умолчанию
+            // (`optimal_profile`), и модель с hd=80 просто держит кэш плотным.
+            eprintln!(
+                "[llm] kv-dtype mxfp8 требует head_dim % 32 == 0 (hd={hd}) — \
+                 KV-кэш остаётся в {:?}",
+                self.dtype
+            );
         }
         let ring_ok = self.ring_kv_ok();
         let mut layers = Vec::with_capacity(self.blocks.len());
