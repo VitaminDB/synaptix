@@ -52,6 +52,41 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     return r;
 }
 
+// Две суммы по блоку за одну синхронизацию (результат у всех нитей). `red` — smem [64].
+__device__ __forceinline__ void block_sum2(float& a, float& b, float* red) {
+    unsigned int mask = 0xFFFFFFFFu;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a += __shfl_down_sync(mask, a, off, 32);
+        b += __shfl_down_sync(mask, b, off, 32);
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __syncthreads();
+    if (lane == 0) { red[warp] = a; red[32 + warp] = b; }
+    __syncthreads();
+    int nw = (blockDim.x + 31) >> 5;
+    if (warp == 0) {
+        float ra = (lane < nw) ? red[lane] : 0.f;
+        float rb = (lane < nw) ? red[32 + lane] : 0.f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ra += __shfl_down_sync(mask, ra, off, 32);
+            rb += __shfl_down_sync(mask, rb, off, 32);
+        }
+        if (lane == 0) { red[0] = ra; red[32] = rb; }
+    }
+    __syncthreads();
+    a = red[0];
+    b = red[32];
+    __syncthreads();
+}
+
+// Элементов строки на нить: строка H ≤ DEC_MAXE·blockDim живёт в регистрах,
+// все векторы грузятся разом в начале ядра — латентности перекрываются, а не
+// выстраиваются в цепочку по фазам. 4 на нить: у H=2816 это 704 нити — квант
+// эпилога (четвёрка нитей на группу) укладывается в один проход.
+#define DEC_MAXE 4
+
 // rms по строке из smem (значения уже f32).
 __device__ __forceinline__ float row_rms(const float* s, int h, float eps, float* red) {
     float local = 0.f;
@@ -77,13 +112,17 @@ __device__ __forceinline__ float dq_decode_e4m3(unsigned char byte) {
     return sign ? -val : val;
 }
 
+// Тот же результат, что у nvfp4_quant.cu::encode_e4m3, но без log2f/exp2f:
+// floor(log2|v|) для нормального float — его поле экспоненты, 2^e — сборка
+// битами (в ветку exp_biased < 1 попадают и субнормали: у них поле 0 →
+// e = −127 < −6, как и у log2f).
 __device__ __forceinline__ unsigned char dq_encode_e4m3(float x) {
     if (isnan(x)) return 0x7F;
     float v = fminf(fmaxf(x, -448.0f), 448.0f);
     unsigned int sign = signbit(v) ? 1 : 0;
     float abs_v = fabsf(v);
     if (abs_v == 0.0f) return (unsigned char)(sign << 7);
-    int exp_raw = (int)floorf(log2f(abs_v));
+    int exp_raw = (int)((__float_as_uint(abs_v) >> 23) & 0xFFu) - 127;
     int exp_biased = exp_raw + 7;
     if (exp_biased < 1) {
         int m = (int)nearbyintf(abs_v * 512.0f);
@@ -91,7 +130,7 @@ __device__ __forceinline__ unsigned char dq_encode_e4m3(float x) {
         return (unsigned char)((sign << 7) | (unsigned int)m);
     }
     if (exp_biased > 15) return (unsigned char)((sign << 7) | 0x7E);
-    float pow2 = exp2f((float)exp_raw);
+    float pow2 = __uint_as_float((unsigned int)(exp_raw + 127) << 23);
     int m = (int)nearbyintf(((abs_v / pow2) - 1.0f) * 8.0f);
     if (m == 8) {
         m = 0;
@@ -150,39 +189,89 @@ __device__ __forceinline__ void dq_nvfp4_group(
     *reinterpret_cast<unsigned long long*>(packed8) = out8;
 }
 
-// Строка `s[h]` (значения bf16-точности) → NVFP4-пара строки `row`.
+// Квант 4 значений группы из 16 (четвёрка нитей на группу): amax по группе
+// собирается shfl_xor внутри четвёрки, каждая нить кодирует свои 4 значения в
+// 2 байта. Одна нить на группу с 16 encode подряд держала активными лишь
+// 176 нитей из 1024 и стоила ~4 мкс на строку.
+__device__ __forceinline__ void dq_nvfp4_quad(
+    const float* v4, bool valid, unsigned char* packed2, unsigned char* scale_byte, int sub) {
+    float amax = 0.f;
+    if (valid) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) amax = fmaxf(amax, fabsf(v4[i]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+    if (!valid) return;
+    float scale_raw = (amax > 0.0f) ? (amax / 6.0f) : 1e-9f;
+    unsigned char sb = dq_encode_e4m3(scale_raw);
+    float scale_q = dq_decode_e4m3(sb);
+    if (scale_q == 0.0f) scale_q = 1e-9f;
+    unsigned char b0 = dq_encode_e2m1_rtne(v4[0] / scale_q);
+    unsigned char b1 = dq_encode_e2m1_rtne(v4[1] / scale_q);
+    unsigned char b2 = dq_encode_e2m1_rtne(v4[2] / scale_q);
+    unsigned char b3 = dq_encode_e2m1_rtne(v4[3] / scale_q);
+    unsigned short o = (unsigned short)((b0 & 0x0F) | ((b1 & 0x0F) << 4) | ((b2 & 0x0F) << 8) | ((b3 & 0x0F) << 12));
+    *reinterpret_cast<unsigned short*>(packed2) = o;
+    if (sub == 0) *scale_byte = sb;
+}
+
+// Строка `s[h]` (значения bf16-точности) → NVFP4-пара строки `row`. Все нити
+// блока участвуют в shfl (число итераций одинаково для всех).
 __device__ __forceinline__ void dq_nvfp4_row(
     const float* s, int h, unsigned char* packed, unsigned char* scales, int row, int sf_inner_dim) {
     int groups = h >> 4;
-    for (int g = threadIdx.x; g < groups; g += blockDim.x) {
-        float v[16];
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) v[i] = s[g * 16 + i];
-        unsigned char sb;
-        dq_nvfp4_group(v, packed + ((size_t)row * h + (size_t)g * 16) / 2, &sb);
-        scales[dq_tile_scale_offset((unsigned)row, (unsigned)g, (unsigned)sf_inner_dim)] = sb;
+    int quad = threadIdx.x >> 2;
+    int sub = threadIdx.x & 3;
+    int quads = blockDim.x >> 2;
+    for (int base = 0; base < groups; base += quads) {
+        int g = base + quad;
+        bool valid = g < groups;
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
+        if (valid) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = s[g * 16 + sub * 4 + i];
+        }
+        unsigned char* p2 = packed + ((size_t)row * h + (size_t)g * 16) / 2 + sub * 2;
+        unsigned char* sc = scales + (valid ? dq_tile_scale_offset((unsigned)row, (unsigned)g, (unsigned)sf_inner_dim) : 0u);
+        dq_nvfp4_quad(v, valid, p2, sc, sub);
     }
 }
 
-// Строка `s[h]` → MXFP8 natural (packed [h] e4m3, scales [h/32] E8M0).
+// Строка `s[h]` → MXFP8 natural (packed [h] e4m3, scales [h/32] E8M0):
+// восьмёрка нитей на группу из 32, по 4 значения на нить.
 __device__ __forceinline__ void dq_mxfp8_row(
     const float* s, int h, unsigned char* packed, unsigned char* scales) {
     int groups = h >> 5;
-    for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    int oct = threadIdx.x >> 3;
+    int sub = threadIdx.x & 7;
+    int octs = blockDim.x >> 3;
+    for (int base = 0; base < groups; base += octs) {
+        int g = base + oct;
+        bool valid = g < groups;
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
         float amax = 0.f;
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(s[g * 32 + i]));
+        if (valid) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                v[i] = s[g * 32 + sub * 4 + i];
+                amax = fmaxf(amax, fabsf(v[i]));
+            }
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
+        if (!valid) continue;
         unsigned char sb = (unsigned char)((__float_as_uint(
             __uint_as_float(__float_as_uint(amax) & 0x7F800000u) / 256.0f)) >> 23);
         float sv = fmaxf(__uint_as_float(((unsigned)sb) << 23), 1e-12f);
-        unsigned char ob[32];
+        unsigned char ob[4];
         #pragma unroll
-        for (int i = 0; i < 32; ++i)
-            ob[i] = __nv_fp8_e4m3(fminf(fmaxf(s[g * 32 + i] / sv, -448.0f), 448.0f)).__x;
-        uint4* dst = reinterpret_cast<uint4*>(packed + (size_t)g * 32);
-        dst[0] = *reinterpret_cast<uint4*>(&ob[0]);
-        dst[1] = *reinterpret_cast<uint4*>(&ob[16]);
-        scales[g] = sb;
+        for (int i = 0; i < 4; ++i)
+            ob[i] = __nv_fp8_e4m3(fminf(fmaxf(v[i] / sv, -448.0f), 448.0f)).__x;
+        *reinterpret_cast<unsigned int*>(packed + (size_t)g * 32 + sub * 4) =
+            *reinterpret_cast<unsigned int*>(&ob[0]);
+        if (sub == 0) scales[g] = sb;
     }
 }
 
@@ -217,42 +306,71 @@ extern "C" __global__ void dec_attn_tail_bf16(
     int h, float eps_post, float eps, int sf_inner_dim)
 {
     extern __shared__ float smem[];
-    float* s_h = smem;
-    float* s_y = smem + h;
-    __shared__ float red[32];
+    float* s_y = smem;  // [h]
+    __shared__ float red[64];
+    const int tid = threadIdx.x, bs = blockDim.x;
 
+    float xv[DEC_MAXE], rv[DEC_MAXE], pw[DEC_MAXE], wa[DEC_MAXE], wb[DEC_MAXE], wc[DEC_MAXE];
+    #pragma unroll
+    for (int i = 0; i < DEC_MAXE; ++i) {
+        int t = tid + i * bs;
+        bool ok = t < h;
+        xv[i] = ok ? ldf(attn_out + t) : 0.f;
+        rv[i] = ok ? ldf(hidden_in + t) : 0.f;
+        pw[i] = (ok && post_w) ? ldf(post_w + t) : 1.f;
+        wa[i] = (ok && w_a) ? ldf(w_a + t) : 0.f;
+        wb[i] = (ok && w_b) ? ldf(w_b + t) : 0.f;
+        wc[i] = (ok && w_c) ? ldf(w_c + t) : 0.f;
+    }
     // y = post-norm(attn_out) либо сам attn_out.
-    for (int t = threadIdx.x; t < h; t += blockDim.x) s_y[t] = ldf(attn_out + t);
     if (post_w) {
-        __syncthreads();
-        float rms = row_rms(s_y, h, eps_post, red);
-        for (int t = threadIdx.x; t < h; t += blockDim.x)
-            s_y[t] = rnd_bf16(ldf(post_w + t) * s_y[t] * rms);
+        float sq = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) sq += xv[i] * xv[i];
+        sq = block_sum(sq, red);
+        float rms = rsqrtf(sq / (float)h + eps_post);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) xv[i] = rnd_bf16(pw[i] * xv[i] * rms);
     }
     // hidden = bf16(y + residual).
-    for (int t = threadIdx.x; t < h; t += blockDim.x) {
-        float v = rnd_bf16(s_y[t] + ldf(hidden_in + t));
-        s_h[t] = v;
-        stf(hidden_out + t, v);
+    float sq = 0.f;
+    #pragma unroll
+    for (int i = 0; i < DEC_MAXE; ++i) {
+        int t = tid + i * bs;
+        float v = rnd_bf16(xv[i] + rv[i]);
+        xv[i] = v;
+        if (t < h) stf(hidden_out + t, v);
+        sq += v * v;
     }
-    __syncthreads();
-    float rms = row_rms(s_h, h, eps, red);
+    sq = block_sum(sq, red);
+    float rms = rsqrtf(sq / (float)h + eps);
 
     if (w_a) {
-        norm_into(s_h, rms, w_a, s_y, h);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            int t = tid + i * bs;
+            if (t < h) s_y[t] = rnd_bf16(wa[i] * xv[i] * rms);
+        }
         __syncthreads();
         dq_nvfp4_row(s_y, h, a_packed, a_scales, 0, sf_inner_dim);
         __syncthreads();
     }
     if (w_b) {
-        norm_into(s_h, rms, w_b, s_y, h);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            int t = tid + i * bs;
+            if (t < h) s_y[t] = rnd_bf16(wb[i] * xv[i] * rms);
+        }
         __syncthreads();
         dq_nvfp4_row(s_y, h, b_packed, b_scales, 0, sf_inner_dim);
         __syncthreads();
     }
     if (w_c) {
-        for (int t = threadIdx.x; t < h; t += blockDim.x)
-            stf(c_out + t, ldf(w_c + t) * s_h[t] * rms);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            int t = tid + i * bs;
+            if (t < h) stf(c_out + t, wc[i] * xv[i] * rms);
+        }
     }
 }
 
@@ -281,42 +399,67 @@ extern "C" __global__ void dec_ffn_tail_bf16(
     int h, float eps_post, float eps)
 {
     extern __shared__ float smem[];
-    float* s_m = smem;
-    float* s_t = smem + h;
-    __shared__ float red[32];
+    float* s_t = smem;  // [h]
+    __shared__ float red[64];
+    const int tid = threadIdx.x, bs = blockDim.x;
 
-    for (int t = threadIdx.x; t < h; t += blockDim.x) s_m[t] = ldf(dense_out + t);
+    float mv[DEC_MAXE], av[DEC_MAXE], hv[DEC_MAXE], wd[DEC_MAXE], wm[DEC_MAXE], wp[DEC_MAXE], wn[DEC_MAXE];
+    #pragma unroll
+    for (int i = 0; i < DEC_MAXE; ++i) {
+        int t = tid + i * bs;
+        bool ok = t < h;
+        mv[i] = ok ? ldf(dense_out + t) : 0.f;
+        av[i] = (ok && moe_acc) ? rnd_bf16(moe_acc[t]) : 0.f;
+        hv[i] = ok ? ldf(hidden_in + t) : 0.f;
+        wd[i] = (ok && w_post_dense) ? ldf(w_post_dense + t) : 0.f;
+        wm[i] = (ok && w_post_moe) ? ldf(w_post_moe + t) : 0.f;
+        wp[i] = (ok && w_post_mlp) ? ldf(w_post_mlp + t) : 0.f;
+        wn[i] = (ok && w_next) ? ldf(w_next + t) : 0.f;
+    }
     if (moe_acc) {
-        __syncthreads();
-        float rms_d = row_rms(s_m, h, eps_post, red);
-        for (int t = threadIdx.x; t < h; t += blockDim.x) s_t[t] = rnd_bf16(moe_acc[t]);
-        __syncthreads();
-        float rms_s = row_rms(s_t, h, eps_post, red);
-        for (int t = threadIdx.x; t < h; t += blockDim.x) {
-            float d = rnd_bf16(ldf(w_post_dense + t) * s_m[t] * rms_d);
-            float s = rnd_bf16(ldf(w_post_moe + t) * s_t[t] * rms_s);
-            s_m[t] = rnd_bf16(d + s);
+        float sd = 0.f, ss = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) { sd += mv[i] * mv[i]; ss += av[i] * av[i]; }
+        block_sum2(sd, ss, red);
+        float rms_d = rsqrtf(sd / (float)h + eps_post);
+        float rms_s = rsqrtf(ss / (float)h + eps_post);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            float d = rnd_bf16(wd[i] * mv[i] * rms_d);
+            float sv = rnd_bf16(wm[i] * av[i] * rms_s);
+            mv[i] = rnd_bf16(d + sv);
         }
     }
     if (w_post_mlp) {
-        __syncthreads();
-        float rms_m = row_rms(s_m, h, eps_post, red);
-        for (int t = threadIdx.x; t < h; t += blockDim.x)
-            s_m[t] = rnd_bf16(ldf(w_post_mlp + t) * s_m[t] * rms_m);
+        float sq = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) sq += mv[i] * mv[i];
+        sq = block_sum(sq, red);
+        float rms_m = rsqrtf(sq / (float)h + eps_post);
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) mv[i] = rnd_bf16(wp[i] * mv[i] * rms_m);
     }
-    for (int t = threadIdx.x; t < h; t += blockDim.x) {
-        float v = rnd_bf16(ldf(hidden_in + t) + s_m[t]);
+    float sq = 0.f;
+    #pragma unroll
+    for (int i = 0; i < DEC_MAXE; ++i) {
+        int t = tid + i * bs;
+        float v = rnd_bf16(hv[i] + mv[i]);
         if (layer_scalar != 1.0f) v = rnd_bf16(v * layer_scalar);
-        s_m[t] = v;
-        stf(hidden_out + t, v);
+        mv[i] = v;
+        if (t < h) stf(hidden_out + t, v);
+        sq += v * v;
     }
     if (!w_next) return;
-    __syncthreads();
-    float rms = row_rms(s_m, h, eps, red);
-    for (int t = threadIdx.x; t < h; t += blockDim.x) {
-        float y = rnd_bf16(ldf(w_next + t) * s_m[t] * rms);
-        s_t[t] = y;
-        if (next_bf16) stf(next_bf16 + t, y);
+    sq = block_sum(sq, red);
+    float rms = rsqrtf(sq / (float)h + eps);
+    #pragma unroll
+    for (int i = 0; i < DEC_MAXE; ++i) {
+        int t = tid + i * bs;
+        if (t < h) {
+            float y = rnd_bf16(wn[i] * mv[i] * rms);
+            if (next_bf16) stf(next_bf16 + t, y);
+            s_t[t] = y;
+        }
     }
     if (next_mx_packed) {
         __syncthreads();
@@ -324,117 +467,72 @@ extern "C" __global__ void dec_ffn_tail_bf16(
     }
 }
 
-// ── Роутер MoE: логиты, top-k, софтмакс по k, per-expert scale ──────────
+// ── top-k роутера MoE одним варпом ───────────────────────────────────────
 //
-// Один запуск вместо цепочки cast → gemv_f32 → topk → 5 ядер софтмакса →
-// gather → mul. Логиты считает несколько блоков (варп на эксперта, порядок
-// fmaf — как в mma_gemv_f32, бит-в-бит), последний финиширующий блок (счётчик
-// `atomicInc` с автосбросом) выбирает top-k и попутно обнуляет f32-аккумулятор
-// выхода экспертов `acc_zero[h]`, чтобы индексному GEMV было куда складывать.
-//
-//   x      bf16 [h]; w f32 [e, h]; pes f32 [e] | null
-//   logits f32 [e] (скретч); counter u32 [1] (изначально 0)
-//   out_idx u32 [k]; out_w f32 [k]
-// Грид: ceil(e / 8) блоков по 256 нитей. Dynamic smem = h·4 + e·4 байт.
-extern "C" __global__ void dec_router_topk_bf16(
-    const bf16_t* __restrict__ x,
-    const float* __restrict__ w,
-    const float* __restrict__ pes,
-    float* __restrict__ logits,
-    unsigned int* __restrict__ counter,
-    unsigned int* __restrict__ out_idx,
-    float* __restrict__ out_w,
-    float* __restrict__ acc_zero,
-    int e, int h, int k)
+// Логиты уже посчитаны (хвостовые блоки группового GEMV); здесь top-k,
+// софтмакс по k, `per_expert_scale` и обнуление f32-аккумулятора выхода
+// экспертов. Логиты в регистрах: lane держит PER значений (шаблон, чтобы
+// циклы раскрылись без предикатов), k раз максимум через shfl, при
+// равенстве — меньший индекс (как topk_rows). Софтмакс — по лейнам.
+template <int PER>
+__device__ __forceinline__ void router_topk_warp_t(
+    const float* __restrict__ logits, const float* __restrict__ pes,
+    unsigned int* __restrict__ out_idx, float* __restrict__ out_w,
+    int e, int k, int lane)
 {
-    extern __shared__ float smem[];
-    float* s_x = smem;          // [h]
-    float* s_l = smem + h;      // [e] — только у финишного блока
-    __shared__ float red_v[256];
-    __shared__ unsigned int red_i[256];
-    __shared__ bool s_last;
-    __shared__ float s_top[64];
-
-    for (int t = threadIdx.x; t < h; t += blockDim.x) s_x[t] = ldf(x + t);
-    __syncthreads();
-
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int row = blockIdx.x * 8 + warp;
-    if (row < e) {
-        const float* w_row = w + (size_t)row * h;
-        const float4* w4 = reinterpret_cast<const float4*>(w_row);
-        const float4* x4 = reinterpret_cast<const float4*>(s_x);
-        float acc = 0.f;
-        int k4 = h >> 2;
-        for (int i = lane; i < k4; i += 32) {
-            float4 wv = w4[i];
-            float4 xv = x4[i];
-            acc = fmaf(wv.x, xv.x, acc);
-            acc = fmaf(wv.y, xv.y, acc);
-            acc = fmaf(wv.z, xv.z, acc);
-            acc = fmaf(wv.w, xv.w, acc);
-        }
-        for (int i = (k4 << 2) + lane; i < h; i += 32) acc = fmaf(w_row[i], s_x[i], acc);
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-        if (lane == 0) logits[row] = acc;
+    float lv[PER];
+    #pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        int j = lane + 32 * i;
+        lv[i] = (j < e) ? __ldg(logits + j) : __int_as_float(0xFF800000);
     }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        unsigned int old = atomicInc(counter, gridDim.x - 1);
-        s_last = (old == gridDim.x - 1);
-    }
-    __syncthreads();
-    if (!s_last) return;
-    __threadfence();
-
-    for (int i = threadIdx.x; i < e; i += blockDim.x) s_l[i] = __ldcg(logits + i);
-    __syncthreads();
-
-    // top-k: k раз максимум по блоку, при равенстве — меньший индекс (как topk_rows).
+    float my_v = __int_as_float(0xFF800000);
+    int my_i = 0;
     for (int slot = 0; slot < k; ++slot) {
         float best = __int_as_float(0xFF800000);
-        unsigned int best_i = 0;
-        for (int i = threadIdx.x; i < e; i += blockDim.x) {
-            float v = s_l[i];
-            if (v > best) { best = v; best_i = (unsigned)i; }
+        int best_i = 0x7FFFFFFF;
+        #pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            int j = lane + 32 * i;
+            if (lv[i] > best) { best = lv[i]; best_i = j; }
         }
-        red_v[threadIdx.x] = best;
-        red_i[threadIdx.x] = best_i;
-        __syncthreads();
-        for (unsigned int off = blockDim.x >> 1; off > 0; off >>= 1) {
-            if (threadIdx.x < off) {
-                float o = red_v[threadIdx.x + off];
-                unsigned int oi = red_i[threadIdx.x + off];
-                if (o > red_v[threadIdx.x] || (o == red_v[threadIdx.x] && oi < red_i[threadIdx.x])) {
-                    red_v[threadIdx.x] = o;
-                    red_i[threadIdx.x] = oi;
-                }
-            }
-            __syncthreads();
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+            int oi = __shfl_xor_sync(0xFFFFFFFFu, best_i, off);
+            if (ov > best || (ov == best && oi < best_i)) { best = ov; best_i = oi; }
         }
-        if (threadIdx.x == 0) {
-            out_idx[slot] = red_i[0];
-            s_top[slot] = red_v[0];
-            s_l[red_i[0]] = __int_as_float(0xFF800000);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float m = s_top[0];
-        for (int s = 1; s < k; ++s) m = fmaxf(m, s_top[s]);
-        float sum = 0.f;
-        for (int s = 0; s < k; ++s) { s_top[s] = expf(s_top[s] - m); sum += s_top[s]; }
-        for (int s = 0; s < k; ++s) {
-            float wv = s_top[s] / sum;
-            if (pes) wv *= pes[out_idx[s]];
-            out_w[s] = wv;
+        if (lane == slot) { my_v = best; my_i = best_i; }
+        if ((best_i & 31) == lane) {
+            #pragma unroll
+            for (int i = 0; i < PER; ++i) if (i == (best_i >> 5)) lv[i] = __int_as_float(0xFF800000);
         }
     }
-    if (acc_zero) {
-        for (int t = threadIdx.x; t < h; t += blockDim.x) acc_zero[t] = 0.f;
+    // Софтмакс по k выбранным: lane s < k держит свой логит.
+    float m = my_v;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
+    float ev = (lane < k) ? expf(my_v - m) : 0.f;
+    float sum = ev;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+    if (lane < k) {
+        float wv = ev / sum;
+        if (pes) wv *= pes[my_i];
+        out_idx[lane] = (unsigned)my_i;
+        out_w[lane] = wv;
     }
+}
+
+__device__ __forceinline__ void router_topk_warp(
+    const float* __restrict__ logits, const float* __restrict__ pes,
+    unsigned int* __restrict__ out_idx, float* __restrict__ out_w,
+    int e, int k, int lane)
+{
+    if (e <= 128) router_topk_warp_t<4>(logits, pes, out_idx, out_w, e, k, lane);
+    else if (e <= 256) router_topk_warp_t<8>(logits, pes, out_idx, out_w, e, k, lane);
+    else if (e <= 512) router_topk_warp_t<16>(logits, pes, out_idx, out_w, e, k, lane);
+    else router_topk_warp_t<32>(logits, pes, out_idx, out_w, e, k, lane);
 }
 
 // ── gelu_tanh(gate) · up → NVFP4-пара ────────────────────────────────────
@@ -448,6 +546,7 @@ __device__ __forceinline__ float gelu_tanh_f(float x) {
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
 }
 
+// Четвёрка нитей на группу из 16 (см. dq_nvfp4_quad).
 template <typename T>
 __device__ __forceinline__ void geglu_quant_impl(
     const T* __restrict__ gate, const T* __restrict__ up, long long stride,
@@ -455,34 +554,70 @@ __device__ __forceinline__ void geglu_quant_impl(
     int rows, int inter, int sf_inner_dim)
 {
     int groups = inter >> 4;
-    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= (long long)rows * groups) return;
-    int row = (int)(g / groups);
-    int col = (int)(g % groups);
-    const T* gp = gate + (long long)row * stride + (long long)col * 16;
-    const T* upp = up + (long long)row * stride + (long long)col * 16;
-    float v[16];
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        float gv = ldf(gp + i);
-        float uv = ldf(upp + i);
-        float a = rnd_t(gp, gelu_tanh_f(gv));
-        v[i] = rnd_t(gp, a * uv);
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long g = tid >> 2;
+    int sub = (int)(tid & 3);
+    bool valid = g < (long long)rows * groups;
+    int row = valid ? (int)(g / groups) : 0;
+    int col = valid ? (int)(g % groups) : 0;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (valid) {
+        const T* gp = gate + (long long)row * stride + (long long)col * 16 + sub * 4;
+        const T* upp = up + (long long)row * stride + (long long)col * 16 + sub * 4;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float gv = ldf(gp + i);
+            float uv = ldf(upp + i);
+            float a = rnd_t(gp, gelu_tanh_f(gv));
+            v[i] = rnd_t(gp, a * uv);
+        }
     }
-    unsigned char sb;
-    dq_nvfp4_group(v, packed + ((size_t)row * inter + (size_t)col * 16) / 2, &sb);
-    scales[dq_tile_scale_offset((unsigned)row, (unsigned)col, (unsigned)sf_inner_dim)] = sb;
+    unsigned char* p2 = packed + ((size_t)row * inter + (size_t)col * 16) / 2 + sub * 2;
+    unsigned char* sc = scales + (valid ? dq_tile_scale_offset((unsigned)row, (unsigned)col, (unsigned)sf_inner_dim) : 0u);
+    dq_nvfp4_quad(v, valid, p2, sc, sub);
+}
+
+// Последний блок грида (при r_e > 0) — top-k роутера: варп 0 выбирает
+// экспертов, остальные варпы обнуляют аккумулятор. Так top-k едет в одном
+// запуске с geglu плотного MLP, а не отдельным латентным ядром.
+template <typename T>
+__device__ __forceinline__ void geglu_topk_kernel(
+    const T* gate, const T* up, long long stride,
+    unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    if (r_e > 0 && blockIdx.x == gridDim.x - 1) {
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        if (warp == 0) {
+            router_topk_warp(logits, pes, out_idx, out_w, r_e, r_k, lane);
+        } else if (acc_zero) {
+            for (int t = threadIdx.x - 32; t < r_h; t += blockDim.x - 32) acc_zero[t] = 0.f;
+        }
+        return;
+    }
+    geglu_quant_impl<T>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim);
 }
 
 extern "C" __global__ void dec_geglu_quant_nvfp4_f16(
     const __half* gate, const __half* up, long long stride,
-    unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim)
-{ geglu_quant_impl<__half>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim); }
+    unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    geglu_topk_kernel<__half>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim,
+                              logits, pes, out_idx, out_w, acc_zero, r_e, r_k, r_h);
+}
 
 extern "C" __global__ void dec_geglu_quant_nvfp4_bf16(
     const bf16_t* gate, const bf16_t* up, long long stride,
-    unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim)
-{ geglu_quant_impl<bf16_t>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim); }
+    unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    geglu_topk_kernel<bf16_t>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim,
+                              logits, pes, out_idx, out_w, acc_zero, r_e, r_k, r_h);
+}
 
 // ── Подготовка внимания: нормы голов + RoPE + запись в KV ───────────────
 //

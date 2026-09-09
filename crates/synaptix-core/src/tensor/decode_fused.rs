@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::backend::{registry, DecIndexedOut, DecNormOut, DecNormSpec};
+use crate::backend::{registry, DecIndexedOut, DecNormOut, DecNormSpec, DecTopk};
 use crate::dtype::DType;
 use crate::error::{Result, SynaptixError};
 use crate::stream::Stream;
@@ -225,74 +225,19 @@ impl Tensor {
         Ok((hidden, next_bf16, next_mx))
     }
 
-    /// Роутер MoE. `self` — вход роутера bf16 `[.., H]`, `w` — F32 `[E, H]`,
-    /// `pes` — F32 `[E]` или `[E, 1]`, `counter` — U32[1] (ноль; самосброс).
-    /// Возвращает `(idx U32[k], w F32[k], acc F32[H] обнулённый)`.
-    pub fn dec_router_topk(
-        &self,
-        w: &Tensor,
-        pes: Option<&Tensor>,
-        counter: &mut Tensor,
-        k: usize,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let h = *self.dims().last().ok_or(SynaptixError::Unsupported("dec_router_topk: scalar"))?;
-        if self.layout.numel() != h || self.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_router_topk: вход — одна строка BF16"));
-        }
-        if w.rank() != 2 || w.dims()[1] != h || w.dtype() != DType::F32 || !w.is_contiguous() {
-            return Err(SynaptixError::Unsupported("dec_router_topk: w — F32 [E, H]"));
-        }
-        let e = w.dims()[0];
-        if let Some(p) = pes {
-            if p.layout.numel() != e || p.dtype() != DType::F32 || !p.is_contiguous() {
-                return Err(SynaptixError::Unsupported("dec_router_topk: per_expert_scale — F32[E]"));
-            }
-        }
-        if counter.dtype() != DType::U32 || counter.layout.numel() < 1 {
-            return Err(SynaptixError::Unsupported("dec_router_topk: counter — U32[1]"));
-        }
-        let dev = self.device();
-        let backend = registry::backend_for(dev)?;
-        let x = row_tensor(self, "router_in")?;
-        let mut logits = alloc(backend, dev, e * 4)?;
-        let mut idx = alloc(backend, dev, k * 4)?;
-        let mut wo = alloc(backend, dev, k * 4)?;
-        let mut acc = alloc(backend, dev, h * 4)?;
-        {
-            let stream = Stream::default_for(dev)?;
-            let counter_mut = Arc::get_mut(&mut counter.storage)
-                .ok_or_else(|| SynaptixError::Other("dec_router_topk: счётчик aliased".into()))?;
-            backend.dec_router_topk(
-                &x.storage,
-                &w.storage,
-                pes.map(|t| &*t.storage),
-                &mut logits,
-                counter_mut,
-                &mut idx,
-                &mut wo,
-                Some(&mut acc),
-                e,
-                h,
-                k,
-                &stream,
-            )?;
-        }
-        Ok((
-            Tensor::from_parts(Arc::new(idx), Layout::contiguous(Shape::new(vec![k]), DType::U32)),
-            Tensor::from_parts(Arc::new(wo), Layout::contiguous(Shape::new(vec![k]), DType::F32)),
-            Tensor::from_parts(Arc::new(acc), Layout::contiguous(Shape::new(vec![h]), DType::F32)),
-        ))
-    }
-
     /// `gelu_tanh(gate)·up` → NVFP4-пара `rows × inter`. `gate`/`up` —
     /// (тензор, смещение в элементах), `stride` — шаг строки в элементах.
+    /// `topk = Some((logits F32[e], pes, k, h))` — тем же запуском top-k
+    /// роутера MoE: вернёт `(idx U32[k], w F32[k], acc F32[h] нулевой)`.
+    #[allow(clippy::type_complexity)]
     pub fn dec_geglu_quant_nvfp4(
         gate: (&Tensor, usize),
         up: (&Tensor, usize),
         stride: usize,
         rows: usize,
         inter: usize,
-    ) -> Result<(Tensor, Tensor)> {
+        topk: Option<(&Tensor, Option<&Tensor>, usize, usize)>,
+    ) -> Result<(Tensor, Tensor, Option<(Tensor, Tensor, Tensor)>)> {
         let (g, go) = gate;
         let (u, uo) = up;
         let dt = g.dtype();
@@ -308,21 +253,60 @@ impl Tensor {
         let (pb, sb) = nvfp4_pair_bytes(rows, inter);
         let mut packed = alloc(backend, dev, pb)?;
         let mut scales = alloc(backend, dev, sb)?;
-        let stream = Stream::default_for(dev)?;
-        backend.dec_geglu_quant_nvfp4(
-            (&g.storage, g.layout.byte_offset() + go * esz),
-            (&u.storage, u.layout.byte_offset() + uo * esz),
-            stride,
-            dt,
-            &mut packed,
-            &mut scales,
-            rows,
-            inter,
-            &stream,
-        )?;
+        let mut tk_bufs = match topk {
+            Some((logits, pes, k, h)) => {
+                let e = logits.numel();
+                if logits.dtype() != DType::F32 || !logits.is_contiguous() {
+                    return Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4: логиты F32[e]"));
+                }
+                if let Some(p) = pes {
+                    if p.numel() != e || p.dtype() != DType::F32 || !p.is_contiguous() {
+                        return Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4: per_expert_scale F32[e]"));
+                    }
+                }
+                Some((alloc(backend, dev, k * 4)?, alloc(backend, dev, k * 4)?, alloc(backend, dev, h * 4)?, e, k, h))
+            }
+            None => None,
+        };
+        {
+            let stream = Stream::default_for(dev)?;
+            let tk = match (&topk, &mut tk_bufs) {
+                (Some((logits, pes, _, _)), Some((idx, w, acc, e, k, h))) => Some(DecTopk {
+                    logits: &logits.storage,
+                    pes: pes.map(|t| &*t.storage),
+                    idx,
+                    w,
+                    acc,
+                    e: *e,
+                    k: *k,
+                    h: *h,
+                }),
+                _ => None,
+            };
+            backend.dec_geglu_quant_nvfp4(
+                (&g.storage, g.layout.byte_offset() + go * esz),
+                (&u.storage, u.layout.byte_offset() + uo * esz),
+                stride,
+                dt,
+                &mut packed,
+                &mut scales,
+                rows,
+                inter,
+                tk,
+                &stream,
+            )?;
+        }
+        let tk_out = tk_bufs.map(|(idx, w, acc, _, k, h)| {
+            (
+                Tensor::from_parts(Arc::new(idx), Layout::contiguous(Shape::new(vec![k]), DType::U32)),
+                Tensor::from_parts(Arc::new(w), Layout::contiguous(Shape::new(vec![k]), DType::F32)),
+                Tensor::from_parts(Arc::new(acc), Layout::contiguous(Shape::new(vec![h]), DType::F32)),
+            )
+        });
         Ok((
             Tensor::from_parts(Arc::new(packed), u8_layout(pb)),
             Tensor::from_parts(Arc::new(scales), u8_layout(sb)),
+            tk_out,
         ))
     }
 
@@ -413,13 +397,15 @@ impl Tensor {
     }
 
     /// Групповой GEMV от общей квант-пары: выход `[1, ΣN]` в `out_dtype`,
-    /// блоки групп подряд.
+    /// блоки групп подряд. `router = Some((w F32[e, K], x BF16[K]))` — логиты
+    /// роутера MoE тем же запуском (второй элемент результата, F32[e]).
     pub fn dec_gemv_grouped(
         groups: &[&QuantWeight],
         x_packed: &Tensor,
         x_scales: &Tensor,
         out_dtype: DType,
-    ) -> Result<Tensor> {
+        router: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let first = groups.first().ok_or(SynaptixError::Unsupported("dec_gemv_grouped: пустая группа"))?;
         let dev = first.device();
         let esz = out_dtype.size_in_bits() / 8;
@@ -433,10 +419,32 @@ impl Tensor {
         let mut out = alloc(backend, dev, total * esz)?;
         let specs: Vec<(&QuantWeight, usize)> = groups.iter().copied().zip(offs).collect();
         let stream = Stream::default_for(dev)?;
-        backend.dec_gemv_grouped(&specs, &x_packed.storage, &x_scales.storage, &mut out, out_dtype, &stream)?;
-        Ok(Tensor::from_parts(
-            Arc::new(out),
-            Layout::contiguous(Shape::new(vec![1usize, total]), out_dtype),
+        let mut logits = match router {
+            Some((w, x)) => {
+                if w.rank() != 2 || w.dims()[1] != first.k() || w.dtype() != DType::F32 || !w.is_contiguous() {
+                    return Err(SynaptixError::Unsupported("dec_gemv_grouped: роутер w — F32 [e, K]"));
+                }
+                if x.dtype() != DType::BF16 || x.numel() != first.k() || !x.is_contiguous() || x.layout.byte_offset() != 0 {
+                    return Err(SynaptixError::Unsupported("dec_gemv_grouped: вход роутера — BF16 [K]"));
+                }
+                Some((alloc(backend, dev, w.dims()[0] * 4)?, w.dims()[0]))
+            }
+            None => None,
+        };
+        let router_arg = match (router, &mut logits) {
+            (Some((w, x)), Some((lg, e))) => Some((&*w.storage, &*x.storage, lg, *e)),
+            _ => None,
+        };
+        backend.dec_gemv_grouped(&specs, &x_packed.storage, &x_scales.storage, &mut out, out_dtype, router_arg, &stream)?;
+        let logits = logits.map(|(lg, e)| {
+            Tensor::from_parts(Arc::new(lg), Layout::contiguous(Shape::new(vec![e]), DType::F32))
+        });
+        Ok((
+            Tensor::from_parts(
+                Arc::new(out),
+                Layout::contiguous(Shape::new(vec![1usize, total]), out_dtype),
+            ),
+            logits,
         ))
     }
 }
@@ -515,5 +523,94 @@ impl ExpertTable {
             pairs,
             &stream,
         )
+    }
+}
+
+/// Partials на голову у [`Tensor::dec_flash_gqa`] (как в ядре: внутри блока
+/// ключи делятся на `4 / WPH` частей).
+pub fn dec_flash_gqa_partials(nrep: usize, splits: usize) -> usize {
+    let hpw = nrep.div_ceil(4);
+    let wph = nrep.div_ceil(hpw);
+    splits * (4 / wph)
+}
+
+impl Tensor {
+    /// Годится ли `dec_flash_gqa` для такой геометрии на этом устройстве.
+    pub fn dec_flash_gqa_supported(dev: crate::device::Device, hd: usize, nrep: usize) -> bool {
+        registry::backend_for(dev).map(|b| b.dec_flash_gqa_supported(hd, nrep)).unwrap_or(false)
+    }
+
+    /// Flash-decode одного запроса с GQA. `self` — q `[1, nh, 1, hd]` bf16,
+    /// `k`/`v` — кэши `[1, nkv, cap, hd]`, `tkv` — U32[1], `window` —
+    /// `Some(w)` для sliding-слоя. Возвращает `[1, nh, 1, hd]`.
+    #[allow(clippy::type_complexity)]
+    pub fn dec_flash_gqa(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        tkv: &Tensor,
+        scale: f32,
+        window: Option<usize>,
+        splits: usize,
+        want_bf16: bool,
+        want_mxfp8: bool,
+    ) -> Result<(Option<Tensor>, Option<(Tensor, Tensor)>)> {
+        if self.rank() != 4 || self.dims()[0] != 1 || self.dims()[2] != 1 || self.dtype() != DType::BF16 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: q [1, nh, 1, hd] bf16"));
+        }
+        let (nh, hd) = (self.dims()[1], self.dims()[3]);
+        let kd = k.dims();
+        if kd.len() != 4 || kd[0] != 1 || kd[3] != hd || v.dims() != kd || k.dtype() != DType::BF16 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: кэш [1, nkv, cap, hd] bf16"));
+        }
+        let (nkv, cap) = (kd[1], kd[2]);
+        if nkv == 0 || nh % nkv != 0 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: nh кратно nkv"));
+        }
+        if !self.is_contiguous() || !k.is_contiguous() || !v.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let dev = self.device();
+        let backend = registry::backend_for(dev)?;
+        let s = dec_flash_gqa_partials(nh / nkv, splits);
+        let mut pm = alloc(backend, dev, nh * s * 4)?;
+        let mut pl = alloc(backend, dev, nh * s * 4)?;
+        let mut pa = alloc(backend, dev, nh * s * hd * 4)?;
+        if !want_bf16 && !want_mxfp8 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: нужен хотя бы один выход"));
+        }
+        if (nh * hd) % 32 != 0 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: nh·hd кратно 32"));
+        }
+        let mut out = if want_bf16 { Some(alloc(backend, dev, DType::BF16.bytes_for_numel(nh * hd))?) } else { None };
+        let mut mx = if want_mxfp8 { Some((alloc(backend, dev, nh * hd)?, alloc(backend, dev, nh * hd / 32)?)) } else { None };
+        let stream = Stream::default_for(dev)?;
+        backend.dec_flash_gqa(
+            &self.storage,
+            &k.storage,
+            &v.storage,
+            &tkv.storage,
+            scale,
+            window.unwrap_or(0),
+            cap,
+            nh,
+            nkv,
+            hd,
+            splits,
+            (&mut pm, &mut pl, &mut pa),
+            out.as_mut(),
+            mx.as_mut().map(|(p, sc)| (p, sc)),
+            &stream,
+        )?;
+        let out_t = out.map(|o| {
+            Tensor::from_parts(Arc::new(o), Layout::contiguous(Shape::new(vec![1usize, nh, 1, hd]), DType::BF16))
+        });
+        let mx_t = mx.map(|(p, sc)| {
+            (
+                Tensor::from_parts(Arc::new(p), u8_layout(nh * hd)),
+                Tensor::from_parts(Arc::new(sc), u8_layout(nh * hd / 32)),
+            )
+        });
+        Ok((out_t, mx_t))
     }
 }

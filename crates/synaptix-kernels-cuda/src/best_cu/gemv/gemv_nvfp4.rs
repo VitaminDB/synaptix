@@ -22,6 +22,8 @@ pub struct Nvfp4MmaGemvShufKernels {
     ptr_gather: CudaFunction,
     grouped_splitk: CudaFunction,
     indexed_splitk: CudaFunction,
+    indexed_splitk_mt2: CudaFunction,
+    indexed_splitk_mt4: CudaFunction,
     num_sms: u32,
 }
 
@@ -88,6 +90,8 @@ impl Nvfp4MmaGemvShufKernels {
         let ptr_gather = load_fn(&module, "nvfp4_expert_ptr_gather")?;
         let grouped_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_grouped_splitk")?;
         let indexed_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk")?;
+        let indexed_splitk_mt2 = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk_mt2")?;
+        let indexed_splitk_mt4 = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk_mt4")?;
         for f in [&w4, &w8, &w8p, &w8b] {
             f.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -107,6 +111,8 @@ impl Nvfp4MmaGemvShufKernels {
             ptr_gather,
             grouped_splitk,
             indexed_splitk,
+            indexed_splitk_mt2,
+            indexed_splitk_mt4,
             _module: module,
             num_sms,
         });
@@ -375,8 +381,19 @@ pub struct GemvGroup {
 
 const SPLITK_THREADS: u32 = 256;
 
+/// Строки роутера MoE, считаемые хвостовыми блоками группового GEMV: f32
+/// `w [rows, K]`, bf16 `x [K]`, выход f32 `logits [rows]` (device-адреса).
+#[derive(Clone, Copy, Default)]
+pub struct RouterRows {
+    pub w: u64,
+    pub x: u64,
+    pub logits: u64,
+    pub rows: u32,
+}
+
 /// До трёх весов одной K с общей квант-активацией (строка 0) одним запуском;
 /// каждый блок — 16-строчный тайл со split-K по 8 варпам. N кратны 16.
+/// `router` — необязательный хвост грида со строками роутера.
 pub fn nvfp4_gemv_grouped_splitk(
     kernels: &Nvfp4MmaGemvShufKernels,
     stream: &Arc<CudaStream>,
@@ -384,6 +401,7 @@ pub fn nvfp4_gemv_grouped_splitk(
     packed_x: &CudaView<u8>,
     scales_x: &CudaView<u8>,
     k: u32,
+    router: RouterRows,
 ) -> Result<()> {
     if groups.is_empty() || groups.len() > 3 {
         return Err(SynaptixError::Cuda("nvfp4_gemv_grouped_splitk: 1..3 группы".into()));
@@ -405,12 +423,16 @@ pub fn nvfp4_gemv_grouped_splitk(
         g[i] = *grp;
         tiles += grp.n / 16;
     }
-    if tiles == 0 {
+    let router_blocks = router.rows.div_ceil(8);
+    if tiles + router_blocks == 0 {
         return Ok(());
+    }
+    if router.rows > 0 && k % 4 != 0 {
+        return Err(SynaptixError::Cuda("nvfp4_gemv_grouped_splitk: роутер требует K % 4".into()));
     }
     let sf_inner_w = sf_inner_dim(k);
     let cfg = LaunchConfig {
-        grid_dim: (tiles, 1, 1),
+        grid_dim: (tiles + router_blocks, 1, 1),
         block_dim: (SPLITK_THREADS, 1, 1),
         shared_mem_bytes: k / 2,
     };
@@ -421,7 +443,11 @@ pub fn nvfp4_gemv_grouped_splitk(
         .arg(packed_x)
         .arg(scales_x)
         .arg(&k)
-        .arg(&sf_inner_w);
+        .arg(&sf_inner_w)
+        .arg(&router.w)
+        .arg(&router.x)
+        .arg(&router.logits)
+        .arg(&router.rows);
     unsafe { b.launch(cfg) }
         .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_gemv_grouped_splitk: {e:?}")))?;
     Ok(())
@@ -462,8 +488,17 @@ pub fn nvfp4_gemv_indexed_splitk(
         return Ok(());
     }
     let sf_inner_w = sf_inner_dim(k);
+    // Тайлов на блок: подбирается по K (см. indexed_splitk_mt); SYN_GEMV_MT
+    // перекрывает для замеров.
+    let mt = indexed_tiles_per_block(k, n);
+    let tiles = n / 16;
+    let (func, blocks) = match mt {
+        4 if tiles % 4 == 0 => (&kernels.indexed_splitk_mt4, tiles / 4),
+        2 if tiles % 2 == 0 => (&kernels.indexed_splitk_mt2, tiles / 2),
+        _ => (&kernels.indexed_splitk, tiles),
+    };
     let cfg = LaunchConfig {
-        grid_dim: (n / 16, 1, pairs),
+        grid_dim: (blocks, 1, pairs),
         block_dim: (SPLITK_THREADS, 1, 1),
         shared_mem_bytes: k / 2,
     };
@@ -473,7 +508,7 @@ pub fn nvfp4_gemv_indexed_splitk(
     };
     let row_bytes = k / 2;
     let rpp: i32 = i32::from(rows_per_pair);
-    let mut b = stream.launch_builder(&kernels.indexed_splitk);
+    let mut b = stream.launch_builder(func);
     b.arg(w_table)
         .arg(s_table)
         .arg(idx)
@@ -491,4 +526,15 @@ pub fn nvfp4_gemv_indexed_splitk(
     unsafe { b.launch(cfg) }
         .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_gemv_indexed_splitk: {e:?}")))?;
     Ok(())
+}
+
+/// Сколько 16-строчных тайлов даёт блок индексного GEMV.
+fn indexed_tiles_per_block(k: u32, _n: u32) -> u32 {
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    if let Some(v) = OVERRIDE.get_or_init(|| std::env::var("SYN_GEMV_MT").ok().and_then(|s| s.parse().ok())) {
+        return *v;
+    }
+    // Короткая K: восемь варпов на тайл делят 11 чанков по одному — лучше
+    // меньше варпов на тайл и больше тайлов в блоке.
+    if k <= 1024 { 4 } else { 1 }
 }

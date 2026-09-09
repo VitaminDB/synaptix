@@ -1086,20 +1086,33 @@ impl MoeFfn {
         self.dev_path_ready() && self.cfg.activation == Activation::GeluTanh
     }
 
-    /// Шаг MoE четырьмя ядрами: роутер (логиты + top-k + софтмакс + scale +
-    /// обнуление аккумулятора), индексный GEMV gate/up, geglu с квантом,
-    /// индексный GEMV down со взвешенной f32-суммой в аккумулятор.
-    ///
-    /// `x` — NVFP4-пара входа экспертов (одна строка), `router_in` — bf16
-    /// вход роутера `[1, H]`, `counter` — U32[1] счётчик блоков роутера
-    /// (ноль на старте, самосброс). Возвращает f32 `[H]` — сумму
-    /// `Σ w_p · expert_p(x)`, ещё БЕЗ пост-нормы MoE-ветки.
-    pub fn forward_dev_fused(
+    /// Вес роутера F32 `[E, H]` — для счёта логитов чужим запуском (хвост
+    /// группового GEMV плотного MLP в слитом декоде).
+    pub fn router_weight(&self) -> &Tensor {
+        &self.router
+    }
+
+    /// `per_expert_scale` на карте (F32 `[E, 1]`), если есть.
+    pub fn per_expert_scale_dev(&self) -> Option<&Tensor> {
+        self.per_expert_scale_dev.as_ref()
+    }
+
+    pub fn top_k(&self) -> usize {
+        self.cfg.num_experts_per_tok
+    }
+
+    /// Эксперты слитого декода тремя ядрами: индексный GEMV gate/up, geglu с
+    /// квантом, индексный GEMV down со взвешенной f32-суммой в `acc`.
+    /// `x` — NVFP4-пара входа экспертов (одна строка); `idx`/`w` — выбор
+    /// роутера (U32[k], F32[k]); `acc` — F32 `[H]`, уже обнулён. После вызова
+    /// `acc = Σ w_p · expert_p(x)` — ещё БЕЗ пост-нормы MoE-ветки.
+    pub fn forward_experts_fused(
         &self,
         x: (&Tensor, &Tensor),
-        router_in: &Tensor,
-        counter: &mut Tensor,
-    ) -> Result<Tensor, ModelError> {
+        idx: &Tensor,
+        w: &Tensor,
+        acc: &mut Tensor,
+    ) -> Result<(), ModelError> {
         let Some((gate_up, down)) = &self.dev_tables else {
             return Err(ModelError::Forward("MoE: device-путь не готов".into()));
         };
@@ -1109,15 +1122,13 @@ impl MoeFfn {
         let ferr = |e: SynError| ModelError::Forward(format!("MoE слитый путь: {e}"));
         let k = self.cfg.num_experts_per_tok;
         let i = self.cfg.moe_intermediate_size;
-        let (idx, w, mut acc) = router_in
-            .dec_router_topk(&self.router, self.per_expert_scale_dev.as_ref(), counter, k)
-            .map_err(ferr)?;
         let gu = gate_up
-            .gemv_indexed_rows(&idx, x.0, x.1, false, DType::F16)
+            .gemv_indexed_rows(idx, x.0, x.1, false, DType::F16)
             .map_err(ferr)?;
-        let (hp, hs) = Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, i), 2 * i, k, i).map_err(ferr)?;
-        down.gemv_indexed_accumulate(&idx, &hp, &hs, true, &w, &mut acc).map_err(ferr)?;
-        Ok(acc)
+        let (hp, hs, _) =
+            Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, i), 2 * i, k, i, None).map_err(ferr)?;
+        down.gemv_indexed_accumulate(idx, &hp, &hs, true, w, acc).map_err(ferr)?;
+        Ok(())
     }
 
     /// Шаг MoE ЦЕЛИКОМ на карте: роутер, top-k, выбор экспертов и их счёт — ни

@@ -248,6 +248,9 @@ impl QuantPolicy {
             DType::MXFP8 => PrecisionConfig::mxfp8(),
             _ => PrecisionConfig::dense(self.compute),
         };
+        // Рабочий dtype — из политики: у квант-пресетов он по умолчанию F16,
+        // а профилю Gemma-4 нужен BF16.
+        p.compute = self.compute;
         p.kv = self.kv_dtype.to_dtype();
         p.lm_head = self.lm_head_storage;
         p.embed = self.embed_storage;
@@ -305,6 +308,15 @@ pub fn optimal_profile(path: &Path) -> OptimalProfile {
     // пределах разброса, зато против плотного BF16 это +7 ток/с и −1.6 ГБ).
     if matches!(arch, Some(LlmArch::Gemma4)) {
         policy.attn_storage = Some(DType::MXFP8);
+        // Слитый device-путь декода (09.09: 210 против ~105 ток/с) собран под
+        // BF16-счёт — в нём Gemma и считается в HF; F16 на её тяжёлых
+        // активациях терял младшие разряды. Эмбеддинги BF16: MXFP8-таблица
+        // ходит своим ядром и закрывает захват графа. Голова NVFP4: текст
+        // чист (см. docs/gemma4_2026.md), а MXFP8-голова стоила бы 0.4 мс на
+        // токен из 4.75.
+        policy.compute = DType::BF16;
+        policy.embed_storage = DType::BF16;
+        policy.lm_head_storage = DType::NVFP4;
     }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
     // Графовый декод у Gemma-4: шаг захватывается целиком, включая MoE —

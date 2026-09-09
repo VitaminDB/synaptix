@@ -75,6 +75,20 @@ pub struct DecNormSpec<'a> {
     pub out: DecNormOut<'a>,
 }
 
+/// top-k роутера MoE в хвосте запуска geglu: логиты f32 `[e]` (уже
+/// посчитанные), `pes` f32 `[e]`, выходы `idx` U32 `[k]`, `w` F32 `[k]`,
+/// `acc` F32 `[h]` (обнуляется под сумму экспертов).
+pub struct DecTopk<'a> {
+    pub logits: &'a Storage,
+    pub pes: Option<&'a Storage>,
+    pub idx: &'a mut Storage,
+    pub w: &'a mut Storage,
+    pub acc: &'a mut Storage,
+    pub e: usize,
+    pub k: usize,
+    pub h: usize,
+}
+
 /// Эпилог индексного GEMV экспертов.
 pub enum DecIndexedOut<'a> {
     /// `out[p, N]` в `dtype` (F16|BF16).
@@ -839,30 +853,9 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("dec_ffn_tail не поддержан этим backend"))
     }
 
-    /// Роутер MoE одним запуском: логиты `w[e,h]·x`, top-k, софтмакс по k,
-    /// `per_expert_scale`; попутно обнуляет `acc_zero` (f32 [h]). `counter` —
-    /// U32[1], изначально ноль, ядро возвращает его в ноль само.
-    #[allow(clippy::too_many_arguments)]
-    fn dec_router_topk(
-        &self,
-        _x: &Storage,
-        _w: &Storage,
-        _pes: Option<&Storage>,
-        _logits: &mut Storage,
-        _counter: &mut Storage,
-        _out_idx: &mut Storage,
-        _out_w: &mut Storage,
-        _acc_zero: Option<&mut Storage>,
-        _e: usize,
-        _h: usize,
-        _k: usize,
-        _stream: &Stream,
-    ) -> Result<()> {
-        Err(SynaptixError::Unsupported("dec_router_topk не поддержан этим backend"))
-    }
-
     /// `gelu_tanh(gate)·up` → NVFP4-пара строк. `gate`/`up` — (storage,
     /// байтовое смещение), `stride` — шаг строки в элементах, `dtype` F16|BF16.
+    /// `topk` — top-k роутера MoE тем же запуском (см. [`DecTopk`]).
     #[allow(clippy::too_many_arguments)]
     fn dec_geglu_quant_nvfp4(
         &self,
@@ -874,6 +867,7 @@ pub trait Backend: Send + Sync + 'static {
         _scales: &mut Storage,
         _rows: usize,
         _inter: usize,
+        _topk: Option<DecTopk<'_>>,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4 не поддержан этим backend"))
@@ -912,7 +906,9 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Групповой GEMV декода: до трёх квант-весов одного формата и одной K от
     /// общей квант-пары одним запуском; выходы — строки `out` по байтовым
-    /// смещениям, dtype `out_dtype` (F16|BF16).
+    /// смещениям, dtype `out_dtype` (F16|BF16). `router` — логиты роутера MoE
+    /// (f32 `w [e, K]` · bf16 `x [K]` → f32 `logits [e]`) хвостовыми блоками
+    /// того же запуска (только NVFP4).
     #[allow(clippy::too_many_arguments)]
     fn dec_gemv_grouped(
         &self,
@@ -921,6 +917,7 @@ pub trait Backend: Send + Sync + 'static {
         _x_scales: &Storage,
         _out: &mut Storage,
         _out_dtype: DType,
+        _router: Option<(&Storage, &Storage, &mut Storage, usize)>,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("dec_gemv_grouped не поддержан этим backend"))
@@ -946,6 +943,39 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("dec_gemv_indexed не поддержан этим backend"))
+    }
+
+    /// Flash-decode одного запроса с GQA: `q` `[nh, hd]`, кэши `[nkv, cap, hd]`
+    /// (`tkv` — U32[1] активная длина, `window` > 0 — окно назад от последнего
+    /// ключа), `splits` сегментов ключей; выход `[nh, hd]` bf16 и/или MXFP8-пара
+    /// (`[nh·hd]` e4m3 + `[nh·hd/32]` E8M0) — вход o_proj. Скретчи
+    /// partials выделяет вызывающий: `[nh, S]`, `[nh, S]`, `[nh, S, hd]` f32,
+    /// `S = dec_flash_gqa_partials(nrep, splits)`.
+    #[allow(clippy::too_many_arguments)]
+    fn dec_flash_gqa(
+        &self,
+        _q: &Storage,
+        _k: &Storage,
+        _v: &Storage,
+        _tkv: &Storage,
+        _scale: f32,
+        _window: usize,
+        _cap: usize,
+        _nh: usize,
+        _nkv: usize,
+        _hd: usize,
+        _splits: usize,
+        _parts: (&mut Storage, &mut Storage, &mut Storage),
+        _out: Option<&mut Storage>,
+        _out_mx: Option<(&mut Storage, &mut Storage)>,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_flash_gqa не поддержан этим backend"))
+    }
+
+    /// Поддерживает ли backend [`Self::dec_flash_gqa`] для такой головы и группы.
+    fn dec_flash_gqa_supported(&self, _hd: usize, _nrep: usize) -> bool {
+        false
     }
 
     fn embed_gather_mxfp8(

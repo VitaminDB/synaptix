@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #ifdef SYN_OUT_BF16
 #include <cuda_bf16.h>
@@ -326,10 +327,10 @@ __device__ __forceinline__ void mma_gemv_tile_splitk(
     unsigned int x_sf_off,
     float* red,
     float& top,
-    float& bot)
+    float& bot,
+    unsigned int warp = threadIdx.x >> 5)
 {
     unsigned int tid  = threadIdx.x;
-    unsigned int warp = tid >> 5;
     unsigned int lane = tid & 31u;
 
     unsigned int m_warp_base = tile * 16u;
@@ -352,6 +353,7 @@ __device__ __forceinline__ void mma_gemv_tile_splitk(
 
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
     unsigned int num_chunks = K >> 6;
+    #pragma unroll 4
     for (unsigned int chunk = warp; chunk < num_chunks; chunk += KS) {
         nvfp4_gemv_mma_chunk(packed_w, scales_w, smem_x, scales_x, block_base, chunk,
                              top_off, bot_off, k_lo_off, k_hi_off, sfa_row_base, x_sf_off,
@@ -388,20 +390,60 @@ __device__ __forceinline__ void load_x_smem(
 // Групповой GEMV: до трёх весов одной K с общей квант-активацией одним
 // запуском (q/k/v, gate/up). Блок = один 16-строчный тайл одной из матриц;
 // тайлы идут подряд: [n0/16 | n1/16 | n2/16]. blockDim = 256 (8 варпов split-K).
+// Строки роутера MoE (f32 [E, K] · bf16 x[K]) считаются хвостовыми блоками
+// того же запуска: варп — строка, порядок fmaf как у mma_gemv_f32 (бит-в-бит
+// с host-путём). Отдельным ядром эти 1.4 МБ упирались в латентность (16
+// блоков, 11 мкс); среди GEMV-блоков их латентность спрятана.
+__device__ __forceinline__ void router_row_f32(
+    const float* __restrict__ w, const __nv_bfloat16* __restrict__ x, float* __restrict__ logits,
+    unsigned int row, unsigned int K, unsigned int lane)
+{
+    const float* w_row = w + (size_t)row * K;
+    const float4* w4 = reinterpret_cast<const float4*>(w_row);
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    float acc = 0.f;
+    unsigned int k4 = K >> 2;
+    #pragma unroll 4
+    for (unsigned int i = lane; i < k4; i += 32u) {
+        float4 wv = w4[i];
+        float2 xa = __bfloat1622float2(x2[2 * i]);
+        float2 xb = __bfloat1622float2(x2[2 * i + 1]);
+        acc = fmaf(wv.x, xa.x, acc);
+        acc = fmaf(wv.y, xa.y, acc);
+        acc = fmaf(wv.z, xb.x, acc);
+        acc = fmaf(wv.w, xb.y, acc);
+    }
+    for (unsigned int i = (k4 << 2) + lane; i < K; i += 32u)
+        acc = fmaf(w_row[i], __bfloat162float(x[i]), acc);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) logits[row] = acc;
+}
+
 // Указатели групп приходят числами: у пустых групп они нулевые, а хосту так
-// не нужно держать три изменяемые вьюхи разом.
+// не нужно держать три изменяемые вьюхи разом. Хвост грида (r_rows > 0):
+// строки роутера, по 8 на блок (варп — строка).
 extern "C" __global__ void nvfp4_mma_gemv_shuf_grouped_splitk(
     unsigned long long w0, unsigned long long s0, unsigned long long o0, unsigned int n0,
     unsigned long long w1, unsigned long long s1, unsigned long long o1, unsigned int n1,
     unsigned long long w2, unsigned long long s2, unsigned long long o2, unsigned int n2,
     const unsigned char* __restrict__ packed_x,
     const unsigned char* __restrict__ scales_x,
-    unsigned int K, unsigned int sf_inner_dim_w)
+    unsigned int K, unsigned int sf_inner_dim_w,
+    unsigned long long r_w, unsigned long long r_x, unsigned long long r_logits, unsigned int r_rows)
 {
     extern __shared__ unsigned char smem[];
     __shared__ float red[SYN_SPLITK_WARPS * 8u * 2u];
     unsigned int t = blockIdx.x;
-    unsigned int t0 = n0 >> 4, t1 = n1 >> 4;
+    unsigned int t0 = n0 >> 4, t1 = n1 >> 4, t2 = n2 >> 4;
+    if (t >= t0 + t1 + t2) {
+        unsigned int row = (t - (t0 + t1 + t2)) * 8u + (threadIdx.x >> 5);
+        if (row < r_rows) {
+            router_row_f32((const float*)(size_t)r_w, (const __nv_bfloat16*)(size_t)r_x,
+                           (float*)(size_t)r_logits, row, K, threadIdx.x & 31u);
+        }
+        return;
+    }
     unsigned long long pw_u, sw_u, o_u; unsigned int tile;
     if (t < t0)           { pw_u = w0; sw_u = s0; o_u = o0; tile = t; }
     else if (t < t0 + t1) { pw_u = w1; sw_u = s1; o_u = o1; tile = t - t0; }
@@ -418,6 +460,89 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_grouped_splitk(
         out[m] = SYN_TO_OUT(top);
         out[m + 8u] = SYN_TO_OUT(bot);
     }
+}
+
+// Вариант с MT тайлами на блок (KS = 8/MT варпов на тайл): меньше блоков и
+// больше чанков на варп — для подбора под форму (K=704 у down-проекции
+// экспертов делится на 8 варпов всего по 1–2 чанка).
+template <unsigned int MT>
+__device__ __forceinline__ void indexed_splitk_mt(
+    const unsigned long long* __restrict__ w_table,
+    const unsigned long long* __restrict__ s_table,
+    const unsigned int* __restrict__ idx,
+    const unsigned char* __restrict__ x_packed,
+    const unsigned char* __restrict__ x_scales,
+    unsigned int row_bytes, int rows_per_pair,
+    unsigned long long out_u, unsigned long long acc_u, unsigned long long wts_u,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w, unsigned int experts,
+    unsigned char* smem, float* red)
+{
+    constexpr unsigned int KS = SYN_SPLITK_WARPS / MT;
+    syn_out_t* out = (syn_out_t*)(size_t)out_u;
+    float* acc = (float*)(size_t)acc_u;
+    const float* wts = (const float*)(size_t)wts_u;
+    unsigned int e = blockIdx.z;
+    unsigned int ex = idx[e];
+    if (ex >= experts) ex = 0u;
+    const unsigned char* pw = (const unsigned char*)(size_t)w_table[ex];
+    const unsigned char* sw = (const unsigned char*)(size_t)s_table[ex];
+    unsigned int row = rows_per_pair ? e : 0u;
+    const unsigned char* px = x_packed + (size_t)row * row_bytes;
+    unsigned int x_sf_off = (row % 32u) * 16u + (row / 32u) * 4u;
+    load_x_smem(px, smem, K);
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int tg = warp / KS;
+    unsigned int wk = warp % KS;
+    unsigned int tile = blockIdx.x * MT + tg;
+    float top, bot;
+    mma_gemv_tile_splitk<KS>(pw, sw, smem, x_scales, tile, K, sf_inner_dim_w, x_sf_off,
+                             red + tg * (KS * 8u * 2u), top, bot, wk);
+    unsigned int lane = threadIdx.x & 31u;
+    if (wk == 0u && (lane & 3u) == 0u) {
+        unsigned int m = tile * 16u + (lane >> 2);
+        if (m + 8u < N || m < N) {
+            if (acc) {
+                float wv = wts[e];
+                atomicAdd(acc + m, wv * top);
+                atomicAdd(acc + m + 8u, wv * bot);
+            } else {
+                out[(size_t)e * N + m] = SYN_TO_OUT(top);
+                out[(size_t)e * N + m + 8u] = SYN_TO_OUT(bot);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void nvfp4_mma_gemv_shuf_indexed_splitk_mt2(
+    const unsigned long long* __restrict__ w_table,
+    const unsigned long long* __restrict__ s_table,
+    const unsigned int* __restrict__ idx,
+    const unsigned char* __restrict__ x_packed,
+    const unsigned char* __restrict__ x_scales,
+    unsigned int row_bytes, int rows_per_pair,
+    unsigned long long out_u, unsigned long long acc_u, unsigned long long wts_u,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w, unsigned int experts)
+{
+    extern __shared__ unsigned char smem[];
+    __shared__ float red[SYN_SPLITK_WARPS * 8u * 2u];
+    indexed_splitk_mt<2>(w_table, s_table, idx, x_packed, x_scales, row_bytes, rows_per_pair,
+                         out_u, acc_u, wts_u, N, K, sf_inner_dim_w, experts, smem, red);
+}
+
+extern "C" __global__ void nvfp4_mma_gemv_shuf_indexed_splitk_mt4(
+    const unsigned long long* __restrict__ w_table,
+    const unsigned long long* __restrict__ s_table,
+    const unsigned int* __restrict__ idx,
+    const unsigned char* __restrict__ x_packed,
+    const unsigned char* __restrict__ x_scales,
+    unsigned int row_bytes, int rows_per_pair,
+    unsigned long long out_u, unsigned long long acc_u, unsigned long long wts_u,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w, unsigned int experts)
+{
+    extern __shared__ unsigned char smem[];
+    __shared__ float red[SYN_SPLITK_WARPS * 8u * 2u];
+    indexed_splitk_mt<4>(w_table, s_table, idx, x_packed, x_scales, row_bytes, rows_per_pair,
+                         out_u, acc_u, wts_u, N, K, sf_inner_dim_w, experts, smem, red);
 }
 
 // Индексный GEMV экспертов: blockIdx.z — пара (токен, слот), эксперт берётся

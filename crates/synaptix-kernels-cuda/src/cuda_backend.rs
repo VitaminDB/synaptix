@@ -3981,45 +3981,6 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dec_router_topk(
-        &self,
-        x: &Storage,
-        w: &Storage,
-        pes: Option<&Storage>,
-        logits: &mut Storage,
-        counter: &mut Storage,
-        out_idx: &mut Storage,
-        out_w: &mut Storage,
-        acc_zero: Option<&mut Storage>,
-        e: usize,
-        h: usize,
-        k: usize,
-        _stream: &Stream,
-    ) -> Result<()> {
-        use crate::fused::llm_decode as ld;
-        let (ctx, stream) = ctx_stream_of(x, "dec_router_topk")?;
-        let kk = ld::LlmDecodeKernels::for_context(&ctx)?;
-        ld::router_topk(
-            &kk,
-            &stream,
-            dptr(x, 0, "dec_router_topk: x")?,
-            dptr(w, 0, "dec_router_topk: w")?,
-            dptr_opt(pes, "dec_router_topk: pes")?,
-            dptr(logits, 0, "dec_router_topk: logits")?,
-            dptr(counter, 0, "dec_router_topk: counter")?,
-            dptr(out_idx, 0, "dec_router_topk: idx")?,
-            dptr(out_w, 0, "dec_router_topk: w out")?,
-            match acc_zero {
-                Some(a) => dptr(a, 0, "dec_router_topk: acc")?,
-                None => 0,
-            },
-            e as u32,
-            h as u32,
-            k as u32,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn dec_geglu_quant_nvfp4(
         &self,
         gate: (&Storage, usize),
@@ -4030,15 +3991,29 @@ impl Backend for CudaBackend {
         scales: &mut Storage,
         rows: usize,
         inter: usize,
+        topk: Option<synaptix_core::backend::DecTopk<'_>>,
         _stream: &Stream,
     ) -> Result<()> {
-        use crate::fused::llm_decode as ld;
+        use crate::fused::llm_decode::{self as ld, TopkArgs};
         let (ctx, stream) = ctx_stream_of(gate.0, "dec_geglu_quant_nvfp4")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
         let bf16 = match dtype {
             DType::BF16 => true,
             DType::F16 => false,
             _ => return Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4: dtype F16|BF16")),
+        };
+        let ta = match topk {
+            Some(t) => TopkArgs {
+                logits: dptr(t.logits, 0, "dec_geglu_quant_nvfp4: logits")?,
+                pes: dptr_opt(t.pes, "dec_geglu_quant_nvfp4: pes")?,
+                idx: dptr(t.idx, 0, "dec_geglu_quant_nvfp4: idx")?,
+                w: dptr(t.w, 0, "dec_geglu_quant_nvfp4: w")?,
+                acc_zero: dptr(t.acc, 0, "dec_geglu_quant_nvfp4: acc")?,
+                e: t.e as u32,
+                k: t.k as u32,
+                h: t.h as u32,
+            },
+            None => TopkArgs::default(),
         };
         ld::geglu_quant_nvfp4(
             &k,
@@ -4051,6 +4026,7 @@ impl Backend for CudaBackend {
             dptr(scales, 0, "dec_geglu_quant_nvfp4: scales")?,
             rows as u32,
             inter as u32,
+            ta,
         )
     }
 
@@ -4116,12 +4092,22 @@ impl Backend for CudaBackend {
         x_scales: &Storage,
         out: &mut Storage,
         out_dtype: DType,
+        router: Option<(&Storage, &Storage, &mut Storage, usize)>,
         _stream: &Stream,
     ) -> Result<()> {
         let first = groups
             .first()
             .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: пустая группа"))?
             .0;
+        let router_rows = match router {
+            Some((w, x, logits, e)) => crate::best_cu::gemv::gemv_nvfp4::RouterRows {
+                w: dptr(w, 0, "dec_gemv_grouped: роутер w")?,
+                x: dptr(x, 0, "dec_gemv_grouped: роутер x")?,
+                logits: dptr(logits, 0, "dec_gemv_grouped: логиты")?,
+                rows: e as u32,
+            },
+            None => crate::best_cu::gemv::gemv_nvfp4::RouterRows::default(),
+        };
         let (ctx, stream) = ctx_stream_of(x_packed, "dec_gemv_grouped")?;
         let bf16 = match out_dtype {
             DType::BF16 => true,
@@ -4157,7 +4143,10 @@ impl Backend for CudaBackend {
                         .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: нет перемешанной копии"))?;
                     gs.push(GemvGroup { w_shuf: wa, scales: sa, out: out_base + *off as u64, n: w.n() as u32 });
                 }
-                gv::nvfp4_gemv_grouped_splitk(&kernels, &stream, &gs, &xp.slice().slice(..), &xs.slice().slice(..), k as u32)
+                gv::nvfp4_gemv_grouped_splitk(&kernels, &stream, &gs, &xp.slice().slice(..), &xs.slice().slice(..), k as u32, router_rows)
+            }
+            DType::MXFP8 if router_rows.rows > 0 => {
+                Err(SynaptixError::Unsupported("dec_gemv_grouped: роутер только в NVFP4-запуске"))
             }
             DType::MXFP8 => {
                 use crate::best_cu::gemv::gemv_mxfp8::{self as gm, MxGemvGroup};
@@ -4256,6 +4245,69 @@ impl Backend for CudaBackend {
             experts as u32,
             pairs as u32,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_flash_gqa(
+        &self,
+        q: &Storage,
+        k: &Storage,
+        v: &Storage,
+        tkv: &Storage,
+        scale: f32,
+        window: usize,
+        cap: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        splits: usize,
+        parts: (&mut Storage, &mut Storage, &mut Storage),
+        out: Option<&mut Storage>,
+        out_mx: Option<(&mut Storage, &mut Storage)>,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::attention::flash_decode_gqa as fg;
+        let out_p = match out {
+            Some(o) => dptr(o, 0, "dec_flash_gqa: out")?,
+            None => 0,
+        };
+        let (mxp, mxs) = match out_mx {
+            Some((p, sc)) => (dptr(p, 0, "dec_flash_gqa: mx packed")?, dptr(sc, 0, "dec_flash_gqa: mx scales")?),
+            None => (0, 0),
+        };
+        if out_p == 0 && mxp == 0 {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: нужен хотя бы один выход"));
+        }
+        let (ctx, stream) = ctx_stream_of(q, "dec_flash_gqa")?;
+        let kk = fg::FlashDecodeGqaKernels::for_context(&ctx)?;
+        fg::flash_decode_gqa(
+            &kk,
+            &stream,
+            dptr(q, 0, "dec_flash_gqa: q")?,
+            dptr(k, 0, "dec_flash_gqa: k")?,
+            dptr(v, 0, "dec_flash_gqa: v")?,
+            dptr(tkv, 0, "dec_flash_gqa: tkv")?,
+            scale,
+            window as u32,
+            cap as u32,
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            splits as u32,
+            dptr(parts.0, 0, "dec_flash_gqa: m")?,
+            dptr(parts.1, 0, "dec_flash_gqa: l")?,
+            dptr(parts.2, 0, "dec_flash_gqa: acc")?,
+            out_p,
+            mxp,
+            mxs,
+        )
+    }
+
+    fn dec_flash_gqa_supported(&self, hd: usize, nrep: usize) -> bool {
+        let Ok(ctx) = synaptix_core::device::cuda::get(0) else { return false };
+        crate::attention::flash_decode_gqa::FlashDecodeGqaKernels::for_context(&ctx)
+            .map(|k| k.supports(hd as u32, nrep as u32))
+            .unwrap_or(false)
     }
 
     fn embed_gather_mxfp8(

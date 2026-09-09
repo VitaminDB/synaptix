@@ -16,7 +16,6 @@ pub struct LlmDecodeKernels {
     _module: Arc<CudaModule>,
     attn_tail: CudaFunction,
     ffn_tail: CudaFunction,
-    router_topk: CudaFunction,
     geglu_f16: CudaFunction,
     geglu_bf16: CudaFunction,
     attn_prep: CudaFunction,
@@ -41,7 +40,6 @@ impl LlmDecodeKernels {
         let new = Arc::new(Self {
             attn_tail: load_fn(&module, "dec_attn_tail_bf16")?,
             ffn_tail: load_fn(&module, "dec_ffn_tail_bf16")?,
-            router_topk: load_fn(&module, "dec_router_topk_bf16")?,
             geglu_f16: load_fn(&module, "dec_geglu_quant_nvfp4_f16")?,
             geglu_bf16: load_fn(&module, "dec_geglu_quant_nvfp4_bf16")?,
             attn_prep: load_fn(&module, "dec_attn_prep_bf16")?,
@@ -56,10 +54,13 @@ fn launch_err(name: &str, e: cudarc::driver::DriverError) -> SynaptixError {
     SynaptixError::Cuda(format!("launch {name}: {e:?}"))
 }
 
-/// Блок одной строки: нити по H, но не больше 1024.
+/// Блок одной строки хвостов: по DEC_MAXE = 4 элемента на нить (строка живёт в
+/// регистрах), до 1024 нитей.
 fn row_block(h: u32) -> u32 {
-    h.next_multiple_of(32).clamp(256, 1024)
+    h.div_ceil(4).next_multiple_of(32).clamp(128, 1024)
 }
+
+const ROW_MAX_H: u32 = 4 * 1024;
 
 /// NVFP4-выход нормы: адреса packed и scales (0 — выход выключен).
 #[derive(Clone, Copy, Default)]
@@ -89,12 +90,15 @@ pub fn attn_tail(
     if h % 16 != 0 {
         return Err(SynaptixError::Cuda(format!("attn_tail: H={h} кратно 16")));
     }
+    if h > ROW_MAX_H {
+        return Err(SynaptixError::Cuda(format!("attn_tail: H={h} > {ROW_MAX_H}")));
+    }
     let hi = h as i32;
     let sf_inner = (h.div_ceil(64) * 4) as i32;
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (row_block(h), 1, 1),
-        shared_mem_bytes: 2 * h * 4,
+        shared_mem_bytes: h * 4,
     };
     let mut bld = stream.launch_builder(&k.attn_tail);
     bld.arg(&attn_out)
@@ -140,11 +144,14 @@ pub fn ffn_tail(
     if h % 32 != 0 {
         return Err(SynaptixError::Cuda(format!("ffn_tail: H={h} кратно 32")));
     }
+    if h > ROW_MAX_H {
+        return Err(SynaptixError::Cuda(format!("ffn_tail: H={h} > {ROW_MAX_H}")));
+    }
     let hi = h as i32;
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (row_block(h), 1, 1),
-        shared_mem_bytes: 2 * h * 4,
+        shared_mem_bytes: h * 4,
     };
     let mut bld = stream.launch_builder(&k.ffn_tail);
     bld.arg(&dense_out)
@@ -165,50 +172,24 @@ pub fn ffn_tail(
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_ffn_tail", e)).map(|_| ())
 }
 
-/// Роутер MoE: логиты + top-k + софтмакс + per-expert scale, см.
-/// `dec_router_topk_bf16`. `counter` — u32, изначально 0 (самосброс).
-#[allow(clippy::too_many_arguments)]
-pub fn router_topk(
-    k: &LlmDecodeKernels,
-    stream: &Arc<CudaStream>,
-    x: u64,
-    w: u64,
-    pes: u64,
-    logits: u64,
-    counter: u64,
-    out_idx: u64,
-    out_w: u64,
-    acc_zero: u64,
-    e: u32,
-    h: u32,
-    topk: u32,
-) -> Result<()> {
-    if topk == 0 || topk > 64 || h % 4 != 0 {
-        return Err(SynaptixError::Cuda(format!("router_topk: k={topk} (≤64), H={h} кратно 4")));
-    }
-    let (ei, hi, ki) = (e as i32, h as i32, topk as i32);
-    let cfg = LaunchConfig {
-        grid_dim: (e.div_ceil(8), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: (h + e) * 4,
-    };
-    let mut bld = stream.launch_builder(&k.router_topk);
-    bld.arg(&x)
-        .arg(&w)
-        .arg(&pes)
-        .arg(&logits)
-        .arg(&counter)
-        .arg(&out_idx)
-        .arg(&out_w)
-        .arg(&acc_zero)
-        .arg(&ei)
-        .arg(&hi)
-        .arg(&ki);
-    unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_router_topk", e)).map(|_| ())
+/// top-k роутера MoE, выполняемый последним блоком ядра geglu (device-адреса;
+/// `logits` f32 [e], `pes` f32 [e] | 0, выходы `idx` u32 [k], `w` f32 [k],
+/// `acc_zero` f32 [h] обнуляется).
+#[derive(Clone, Copy, Default)]
+pub struct TopkArgs {
+    pub logits: u64,
+    pub pes: u64,
+    pub idx: u64,
+    pub w: u64,
+    pub acc_zero: u64,
+    pub e: u32,
+    pub k: u32,
+    pub h: u32,
 }
 
 /// gelu_tanh(gate)·up → NVFP4-пара строк, см. `dec_geglu_quant_nvfp4_*`.
-/// `stride` — шаг строки в элементах у gate и up.
+/// `stride` — шаг строки в элементах у gate и up. `topk.e > 0` добавляет блок
+/// с top-k роутера.
 #[allow(clippy::too_many_arguments)]
 pub fn geglu_quant_nvfp4(
     k: &LlmDecodeKernels,
@@ -221,11 +202,15 @@ pub fn geglu_quant_nvfp4(
     scales: u64,
     rows: u32,
     inter: u32,
+    topk: TopkArgs,
 ) -> Result<()> {
     if inter % 16 != 0 {
         return Err(SynaptixError::Cuda(format!("geglu_quant: I={inter} кратно 16")));
     }
-    let groups = rows * (inter / 16);
+    if topk.e > 1024 || topk.k > 32 {
+        return Err(SynaptixError::Cuda(format!("geglu_quant: top-k e={} ≤ 1024, k={} ≤ 32", topk.e, topk.k)));
+    }
+    let groups = rows * (inter / 16) * 4;
     if groups == 0 {
         return Ok(());
     }
@@ -233,11 +218,13 @@ pub fn geglu_quant_nvfp4(
     let (ri, ii) = (rows as i32, inter as i32);
     let sf_inner = (inter.div_ceil(64) * 4) as i32;
     let stride_i = stride as i64;
+    let extra = u32::from(topk.e > 0);
     let cfg = LaunchConfig {
-        grid_dim: (groups.div_ceil(block), 1, 1),
+        grid_dim: (groups.div_ceil(block) + extra, 1, 1),
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
+    let (te, tk, th) = (topk.e as i32, topk.k as i32, topk.h as i32);
     let f = if bf16 { &k.geglu_bf16 } else { &k.geglu_f16 };
     let mut bld = stream.launch_builder(f);
     bld.arg(&gate)
@@ -247,7 +234,15 @@ pub fn geglu_quant_nvfp4(
         .arg(&scales)
         .arg(&ri)
         .arg(&ii)
-        .arg(&sf_inner);
+        .arg(&sf_inner)
+        .arg(&topk.logits)
+        .arg(&topk.pes)
+        .arg(&topk.idx)
+        .arg(&topk.w)
+        .arg(&topk.acc_zero)
+        .arg(&te)
+        .arg(&tk)
+        .arg(&th);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_geglu_quant_nvfp4", e)).map(|_| ())
 }
 

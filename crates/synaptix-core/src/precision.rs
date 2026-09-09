@@ -71,12 +71,13 @@ impl PrecisionConfig {
             || self.embed.is_quantized()
     }
 
-    /// Квантованные веса требуют F16-активаций (`linear_quant` принимает только
-    /// F16). Возвращает понятную ошибку, если compute не F16 при наличии кванта.
+    /// Квантованные веса требуют половинных активаций: `linear_quant`
+    /// принимает F16 и (с 09.09.2026) BF16 — где нативного BF16-пути нет,
+    /// QLinear сам обходит через F16. Возвращает понятную ошибку иначе.
     pub fn validate(&self) -> Result<(), String> {
-        if self.any_quantized() && self.compute != DType::F16 {
+        if self.any_quantized() && !matches!(self.compute, DType::F16 | DType::BF16) {
             return Err(format!(
-                "quantized weights требуют compute=f16 (сейчас {:?}); используйте --quant nvfp4 или --compute-dtype f16",
+                "quantized weights требуют compute=f16|bf16 (сейчас {:?}); используйте --quant nvfp4 или --compute-dtype f16",
                 self.compute
             ));
         }
@@ -118,10 +119,12 @@ mod tests {
     }
 
     #[test]
-    fn quant_with_non_f16_compute_rejected() {
+    fn quant_with_non_half_compute_rejected() {
         let mut p = PrecisionConfig::nvfp4();
-        p.compute = DType::BF16;
+        p.compute = DType::F32;
         assert!(p.validate().is_err());
+        p.compute = DType::BF16;
+        assert!(p.validate().is_ok());
     }
 
     #[test]

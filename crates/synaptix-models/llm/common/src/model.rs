@@ -791,9 +791,6 @@ pub struct DecodeState {
     pub rope_cos_local: Option<Tensor>,
     pub rope_sin_local: Option<Tensor>,
     pub logits: Tensor,
-    /// U32[1] — счётчик блоков слитого роутера MoE (ноль; ядро сбрасывает
-    /// его само после каждого запуска).
-    pub moe_counter: Tensor,
 }
 
 impl DecodeState {
@@ -2084,7 +2081,6 @@ impl DecoderModel {
             _ => (None, None),
         };
         let logits = Tensor::zeros(vec![batch, self.config.vocab_size], self.dtype, dev).coerr()?;
-        let moe_counter = Tensor::from_vec(vec![0u32], vec![1usize], dev).coerr()?;
         Ok(DecodeState {
             input,
             pos_dev,
@@ -2096,7 +2092,6 @@ impl DecoderModel {
             rope_cos_local,
             rope_sin_local,
             logits,
-            moe_counter,
         })
     }
 
@@ -2248,7 +2243,8 @@ impl DecoderModel {
         let mut h_pair: Option<(Tensor, Tensor)> = None;
         for idx in 0..nb {
             let blk = &self.blocks[idx];
-            if b == 1 && self.fused_block_ok(blk) {
+            let cache_bf16 = matches!(&kv.layers[idx], LayerCache::Full(l) if l.k.dtype() == DType::BF16 && l.v.dtype() == DType::BF16);
+            if b == 1 && cache_bf16 && self.fused_block_ok(blk) {
                 let next_blk = if idx + 1 < nb { Some(&self.blocks[idx + 1]) } else { None };
                 let (new_hidden, next_h, next_pair) =
                     self.forward_block_fused(blk, next_blk, &h, h_pair.take(), &hidden, &mut kv.layers[idx], state)?;
@@ -2359,7 +2355,9 @@ impl DecoderModel {
     /// (MXFP8|NVFP4), плотный MLP NVFP4 с gelu_tanh, плотный BF16-KV, у
     /// MoE-ветки — слитый путь. Qwen/Muse (silu, F16) остаются на прежнем.
     fn fused_block_ok(&self, blk: &Block) -> bool {
-        if self.dtype != DType::BF16 || self.kv_dtype != DType::BF16 {
+        // KV проверяется по факту у слоя (политика может просить MXFP8, а
+        // Gemma-4 его не получает ни на одном слое).
+        if self.dtype != DType::BF16 {
             return false;
         }
         if fused_decode_disabled() {
@@ -2450,34 +2448,50 @@ impl DecoderModel {
         })
         .coerr()?;
 
-        // Плотный MLP: gate|up одним запуском → geglu+квант → down.
-        let dense = {
+        // Плотный MLP: gate|up одним запуском (логиты роутера — его хвостовыми
+        // блоками) → geglu+квант (+ top-k роутера последним блоком) → down.
+        let router_in = match &blk.moe {
+            Some(_) => match tails.pop() {
+                Some(DecOut::Bf16(t)) => Some(t),
+                _ => unreachable!(),
+            },
+            None => None,
+        };
+        let (dense, topk) = {
             let DecOut::Quant(mp, ms) = &tails[0] else { unreachable!() };
             let gate = blk.mlp.gate_proj.quant_weight().expect("gate NVFP4");
             let up = blk.mlp.up_proj.quant_weight().expect("up NVFP4");
             let inter = gate.n();
-            let gu = prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped(&[gate, up], mp, ms, DType::BF16)).coerr()?;
-            let (dp, ds) = prof(dev, "mlp_act", || {
-                Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter)
+            let router = match (&blk.moe, &router_in) {
+                (Some(m), Some(rin)) => Some((m.ffn.router_weight(), rin)),
+                _ => None,
+            };
+            let (gu, logits) =
+                prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped(&[gate, up], mp, ms, DType::BF16, router)).coerr()?;
+            let topk_req = match (&blk.moe, &logits) {
+                (Some(m), Some(lg)) => Some((lg, m.ffn.per_expert_scale_dev(), m.ffn.top_k(), hsz)),
+                _ => None,
+            };
+            let (dp, ds, topk) = prof(dev, "mlp_act", || {
+                Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
             })
             .coerr()?;
-            prof(dev, "mlp_down", || blk.mlp.down_proj.forward_prequant(&dp, &ds, 1, DType::BF16))?
+            let down = blk.mlp.down_proj.quant_weight().expect("down NVFP4");
+            let (dense, _) = prof(dev, "mlp_down", || Tensor::dec_gemv_grouped(&[down], &dp, &ds, DType::BF16, None)).coerr()?;
+            (dense, topk)
         };
 
         // MoE-ветка: f32-аккумулятор взвешенных экспертов.
-        let moe_acc = match &blk.moe {
-            None => None,
-            Some(m) => {
-                let router_in = match tails.pop() {
-                    Some(DecOut::Bf16(t)) => t,
-                    _ => unreachable!(),
-                };
+        let moe_acc = match (&blk.moe, topk) {
+            (Some(m), Some((idx, w, mut acc))) => {
                 let (ep, es) = match &tails[1] {
                     DecOut::Quant(p, s) => (p, s),
                     _ => unreachable!(),
                 };
-                Some(prof(dev, "moe_dev", || m.ffn.forward_dev_fused((ep, es), &router_in, &mut state.moe_counter))?)
+                prof(dev, "moe_dev", || m.ffn.forward_experts_fused((ep, es), &idx, &w, &mut acc))?;
+                Some(acc)
             }
+            _ => None,
         };
 
         // Хвост FFN: пост-нормы, residual, layer_scalar, норма входа следующего слоя.
@@ -3059,7 +3073,7 @@ impl FullAttn {
         if let Some(v) = v_w {
             groups.push(v);
         }
-        let qkv = prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16)).coerr()?;
+        let (qkv, _) = prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16, None)).coerr()?;
         let (rope_cos, rope_sin) = match (self.sliding_window, &state.rope_cos_local, &state.rope_sin_local) {
             (Some(_), Some(c), Some(s)) => (c, s),
             _ => (&state.rope_cos, &state.rope_sin),
@@ -3090,6 +3104,26 @@ impl FullAttn {
             )
         })
         .coerr()?;
+        // GQA-ядро читает K/V один раз на группу голов; сегментов больше у
+        // global-слоёв — у них KV-голов мало, а контекст длинный. Его merge
+        // сразу квантует строку в MXFP8 — вход o_proj без отдельного ядра.
+        let gqa = Tensor::dec_flash_gqa_supported(dev, hd, nh / nkv.max(1));
+        let o_mx = self.o_proj.quant_dtype() == Some(DType::MXFP8);
+        if gqa {
+            let (tkv, window, splits) = match self.sliding_window {
+                Some(w) => (&state.ring_len_dev, Some(w), 8),
+                None => (&state.tcache_dev, None, 32),
+            };
+            let (attn, mx) = prof(dev, "attn_flash", || {
+                q.dec_flash_gqa(&kvl.k, &kvl.v, tkv, self.attn_scale, window, splits, !o_mx, o_mx)
+            })
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+            if let Some((p, sc)) = mx {
+                return prof(dev, "attn_oproj", || self.o_proj.forward_prequant(&p, &sc, 1, DType::BF16));
+            }
+            let attn = attn.expect("bf16-выход").reshape(vec![1usize, nh * hd]).coerr()?;
+            return prof(dev, "attn_oproj", || self.o_proj.forward(&attn));
+        }
         let attn = match self.sliding_window {
             Some(w) => prof(dev, "attn_flash", || {
                 q.flash_attention_window_dev(&kvl.k, &kvl.v, &state.ring_len_dev, self.attn_scale, (w - 1) as i32, true)
