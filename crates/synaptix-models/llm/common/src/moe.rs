@@ -1079,6 +1079,47 @@ impl MoeFfn {
             && (self.cfg.per_expert_scale.is_none() == self.per_expert_scale_dev.is_none())
     }
 
+    /// Готов ли слитый device-путь ([`Self::forward_dev_fused`]): всё, что
+    /// нужно [`Self::dev_path_ready`], плюс gelu_tanh-активация — только её
+    /// умеет ядро geglu+квант.
+    pub fn fused_ready(&self) -> bool {
+        self.dev_path_ready() && self.cfg.activation == Activation::GeluTanh
+    }
+
+    /// Шаг MoE четырьмя ядрами: роутер (логиты + top-k + софтмакс + scale +
+    /// обнуление аккумулятора), индексный GEMV gate/up, geglu с квантом,
+    /// индексный GEMV down со взвешенной f32-суммой в аккумулятор.
+    ///
+    /// `x` — NVFP4-пара входа экспертов (одна строка), `router_in` — bf16
+    /// вход роутера `[1, H]`, `counter` — U32[1] счётчик блоков роутера
+    /// (ноль на старте, самосброс). Возвращает f32 `[H]` — сумму
+    /// `Σ w_p · expert_p(x)`, ещё БЕЗ пост-нормы MoE-ветки.
+    pub fn forward_dev_fused(
+        &self,
+        x: (&Tensor, &Tensor),
+        router_in: &Tensor,
+        counter: &mut Tensor,
+    ) -> Result<Tensor, ModelError> {
+        let Some((gate_up, down)) = &self.dev_tables else {
+            return Err(ModelError::Forward("MoE: device-путь не готов".into()));
+        };
+        if self.cfg.activation != Activation::GeluTanh {
+            return Err(ModelError::Forward("MoE: слитый путь только для gelu_tanh".into()));
+        }
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE слитый путь: {e}"));
+        let k = self.cfg.num_experts_per_tok;
+        let i = self.cfg.moe_intermediate_size;
+        let (idx, w, mut acc) = router_in
+            .dec_router_topk(&self.router, self.per_expert_scale_dev.as_ref(), counter, k)
+            .map_err(ferr)?;
+        let gu = gate_up
+            .gemv_indexed_rows(&idx, x.0, x.1, false, DType::F16)
+            .map_err(ferr)?;
+        let (hp, hs) = Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, i), 2 * i, k, i).map_err(ferr)?;
+        down.gemv_indexed_accumulate(&idx, &hp, &hs, true, &w, &mut acc).map_err(ferr)?;
+        Ok(acc)
+    }
+
     /// Шаг MoE ЦЕЛИКОМ на карте: роутер, top-k, выбор экспертов и их счёт — ни
     /// одной синхронизации с хостом, поэтому вызов захватывается CUDA-графом.
     ///

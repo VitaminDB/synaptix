@@ -791,6 +791,9 @@ pub struct DecodeState {
     pub rope_cos_local: Option<Tensor>,
     pub rope_sin_local: Option<Tensor>,
     pub logits: Tensor,
+    /// U32[1] — счётчик блоков слитого роутера MoE (ноль; ядро сбрасывает
+    /// его само после каждого запуска).
+    pub moe_counter: Tensor,
 }
 
 impl DecodeState {
@@ -2081,6 +2084,7 @@ impl DecoderModel {
             _ => (None, None),
         };
         let logits = Tensor::zeros(vec![batch, self.config.vocab_size], self.dtype, dev).coerr()?;
+        let moe_counter = Tensor::from_vec(vec![0u32], vec![1usize], dev).coerr()?;
         Ok(DecodeState {
             input,
             pos_dev,
@@ -2092,6 +2096,7 @@ impl DecoderModel {
             rope_cos_local,
             rope_sin_local,
             logits,
+            moe_counter,
         })
     }
 
@@ -2237,8 +2242,24 @@ impl DecoderModel {
             rms_norm(&hidden, &self.blocks[0].pre_attn_norm, self.blocks[0].rms_eps)
         })
         .coerr()?;
+        // Вход внимания слитого пути: квант-пара, которую выдал хвост
+        // предыдущего слоя. `None` — пары нет (первый слой, слой после
+        // обычного пути): её посчитает сам слой из `h`.
+        let mut h_pair: Option<(Tensor, Tensor)> = None;
         for idx in 0..nb {
             let blk = &self.blocks[idx];
+            if b == 1 && self.fused_block_ok(blk) {
+                let next_blk = if idx + 1 < nb { Some(&self.blocks[idx + 1]) } else { None };
+                let (new_hidden, next_h, next_pair) =
+                    self.forward_block_fused(blk, next_blk, &h, h_pair.take(), &hidden, &mut kv.layers[idx], state)?;
+                hidden = new_hidden;
+                if let Some(nh) = next_h {
+                    h = nh;
+                }
+                h_pair = next_pair;
+                continue;
+            }
+            h_pair = None;
             let mixed = match &blk.mixer {
                 Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[idx], state)?,
                 Mixer::Linear(la) => la.forward_decode_dev(&h, &mut kv.layers[idx])?,
@@ -2295,11 +2316,202 @@ impl DecoderModel {
             }
         }
 
-        let normed = prof(dev, "rms_norm", || rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)).coerr()?;
-        let last = normed.narrow(1, 0, 1).coerr()?.squeeze(1).coerr()?;
-        let logits = self.lm_head_forward(&last)?;
+        // Финальная норма с квант-эпилогом: голова читает пару сразу, без
+        // отдельного квантования.
+        let last_in = hidden.reshape(vec![b, self.config.hidden_size]).coerr()?;
+        let logits = if b == 1 {
+            let (normed, pq) =
+                rms_norm_quant(&last_in, &self.final_norm, self.config.rms_norm_eps, self.lm_head.quant_dtype())?;
+            match pq {
+                Some((p, sc, _)) => {
+                    let lg = prof(dev, "lm_head", || self.lm_head.forward_prequant(&p, &sc, 1, normed.dtype()))?;
+                    self.head_epilogue(lg)?
+                }
+                None => self.lm_head_forward(&normed)?,
+            }
+        } else {
+            let normed = prof(dev, "rms_norm", || rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)).coerr()?;
+            let last = normed.narrow(1, 0, 1).coerr()?.squeeze(1).coerr()?;
+            self.lm_head_forward(&last)?
+        };
         prof(dev, "logits_copy", || state.logits.copy_from(&logits)).coerr()?;
         Ok(())
+    }
+
+    /// Масштаб и softcap логитов (то, что `lm_head_forward` делает после
+    /// самой проекции).
+    fn head_epilogue(&self, mut logits: Tensor) -> Result<Tensor, ModelError> {
+        if let Some(scale) = self.config.logit_scale {
+            logits = logits.mul_scalar(scale).coerr()?;
+        }
+        if let Some(cap) = self.config.logit_softcap {
+            logits = logits
+                .mul_scalar(1.0 / cap)
+                .and_then(|t| t.tanh())
+                .and_then(|t| t.mul_scalar(cap))
+                .coerr()?;
+        }
+        Ok(logits)
+    }
+
+    /// Годится ли блок для слитого device-пути (`forward_block_fused`):
+    /// BF16-счёт, полное внимание с квант-проекциями одного формата
+    /// (MXFP8|NVFP4), плотный MLP NVFP4 с gelu_tanh, плотный BF16-KV, у
+    /// MoE-ветки — слитый путь. Qwen/Muse (silu, F16) остаются на прежнем.
+    fn fused_block_ok(&self, blk: &Block) -> bool {
+        if self.dtype != DType::BF16 || self.kv_dtype != DType::BF16 {
+            return false;
+        }
+        if fused_decode_disabled() {
+            return false;
+        }
+        let Mixer::Full(fa) = &blk.mixer else { return false };
+        let fmt = fa.q_proj.quant_dtype();
+        if !matches!(fmt, Some(DType::MXFP8) | Some(DType::NVFP4)) {
+            return false;
+        }
+        if fa.k_proj.quant_dtype() != fmt || fa.o_proj.quant_dtype() != fmt {
+            return false;
+        }
+        if let Some(v) = &fa.v_proj {
+            if v.quant_dtype() != fmt {
+                return false;
+            }
+        }
+        if fa.attn_output_gate || fa.head_dim % 32 != 0 || fa.head_dim > 1024 {
+            return false;
+        }
+        if blk.mlp.activation != Activation::GeluTanh
+            || blk.mlp.gate_proj.quant_dtype() != Some(DType::NVFP4)
+            || blk.mlp.up_proj.quant_dtype() != Some(DType::NVFP4)
+            || blk.mlp.down_proj.quant_dtype() != Some(DType::NVFP4)
+            || blk.mlp.gate_proj.quant_weight().map(|w| w.n()) != blk.mlp.up_proj.quant_weight().map(|w| w.n())
+        {
+            return false;
+        }
+        if let Some(m) = &blk.moe {
+            if !m.ffn.fused_ready() {
+                return false;
+            }
+        }
+        self.config.hidden_size % 32 == 0
+    }
+
+    /// Слой декода слитыми ядрами (см. `llm_decode.cu`): внимание —
+    /// групповой GEMV q/k/v, нормы голов + RoPE + запись KV одним ядром,
+    /// flash, `o_proj`; хвост после внимания с квант-эпилогами; плотный MLP —
+    /// групповой gate/up, geglu+квант, down; MoE — четыре ядра; хвост FFN с
+    /// нормой входа следующего слоя. ~14 ядер на слой против ~74.
+    ///
+    /// Возвращает `(hidden, h_next_bf16, h_next_pair)`: bf16-вход следующего
+    /// слоя и/или его квант-пара (формат внимания следующего блока).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn forward_block_fused(
+        &self,
+        blk: &Block,
+        next_blk: Option<&Block>,
+        h: &Tensor,
+        h_pair: Option<(Tensor, Tensor)>,
+        hidden: &Tensor,
+        cache: &mut LayerCache,
+        state: &mut DecodeState,
+    ) -> Result<(Tensor, Option<Tensor>, Option<(Tensor, Tensor)>), ModelError> {
+        use synaptix_core::tensor::decode_fused::{DecOut, DecOutFmt};
+        let dev = self.device;
+        let hsz = self.config.hidden_size;
+        let Mixer::Full(fa) = &blk.mixer else {
+            return Err(ModelError::Forward("forward_block_fused: не полное внимание".into()));
+        };
+        let attn_fmt = fa.q_proj.quant_dtype().unwrap_or(DType::MXFP8);
+        let hidden_row = hidden.reshape(vec![1usize, hsz]).coerr()?;
+
+        // Квант-пара входа внимания: от хвоста предыдущего слоя или из `h`.
+        let pair = match h_pair {
+            Some(p) => p,
+            None => {
+                let hr = h.reshape(vec![1usize, hsz]).coerr()?;
+                prof(dev, "attn_quant", || match attn_fmt {
+                    DType::MXFP8 => hr.mxfp8_quantize_act(),
+                    _ => hr.nvfp4_quantize_act(),
+                })
+                .coerr()?
+            }
+        };
+        let attn_out = fa.forward_decode_fused(&pair, cache, state)?; // [1, nh·hd]
+
+        // Хвост после внимания: residual + нормы входов MLP, экспертов, роутера.
+        let mut outs: Vec<(&Tensor, DecOutFmt)> = vec![(&blk.pre_mlp_norm, DecOutFmt::Nvfp4)];
+        if let Some(m) = &blk.moe {
+            outs.push((&m.pre_norm, DecOutFmt::Nvfp4));
+            outs.push((&m.router_norm, DecOutFmt::Bf16));
+        }
+        let (hidden2, mut tails) = prof(dev, "attn_tail", || {
+            attn_out.dec_attn_tail(blk.post_attn_norm.as_ref(), &hidden_row, &outs, blk.post_eps, blk.rms_eps)
+        })
+        .coerr()?;
+
+        // Плотный MLP: gate|up одним запуском → geglu+квант → down.
+        let dense = {
+            let DecOut::Quant(mp, ms) = &tails[0] else { unreachable!() };
+            let gate = blk.mlp.gate_proj.quant_weight().expect("gate NVFP4");
+            let up = blk.mlp.up_proj.quant_weight().expect("up NVFP4");
+            let inter = gate.n();
+            let gu = prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped(&[gate, up], mp, ms, DType::BF16)).coerr()?;
+            let (dp, ds) = prof(dev, "mlp_act", || {
+                Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter)
+            })
+            .coerr()?;
+            prof(dev, "mlp_down", || blk.mlp.down_proj.forward_prequant(&dp, &ds, 1, DType::BF16))?
+        };
+
+        // MoE-ветка: f32-аккумулятор взвешенных экспертов.
+        let moe_acc = match &blk.moe {
+            None => None,
+            Some(m) => {
+                let router_in = match tails.pop() {
+                    Some(DecOut::Bf16(t)) => t,
+                    _ => unreachable!(),
+                };
+                let (ep, es) = match &tails[1] {
+                    DecOut::Quant(p, s) => (p, s),
+                    _ => unreachable!(),
+                };
+                Some(prof(dev, "moe_dev", || m.ffn.forward_dev_fused((ep, es), &router_in, &mut state.moe_counter))?)
+            }
+        };
+
+        // Хвост FFN: пост-нормы, residual, layer_scalar, норма входа следующего слоя.
+        let next = next_blk.map(|nb| {
+            let want_mx = matches!(&nb.mixer, Mixer::Full(f) if f.q_proj.quant_dtype() == Some(DType::MXFP8))
+                && self.fused_block_ok(nb);
+            // bf16-вход нужен всегда: обычному пути следующего слоя или квант
+            // NVFP4 из него; MXFP8-паре он не нужен, но дешевле выдать оба.
+            (&nb.pre_attn_norm, true, want_mx)
+        });
+        let (moe_w_dense, moe_w_moe) = match &blk.moe {
+            Some(m) => (Some(&m.post_dense), Some(&m.post_moe)),
+            None => (None, None),
+        };
+        let (hidden3, next_h, next_mx) = prof(dev, "ffn_tail", || {
+            dense.dec_ffn_tail(
+                moe_acc.as_ref(),
+                &hidden2,
+                moe_w_dense,
+                moe_w_moe,
+                blk.post_mlp_norm.as_ref(),
+                blk.layer_scalar.unwrap_or(1.0),
+                next,
+                blk.post_eps,
+                blk.rms_eps,
+            )
+        })
+        .coerr()?;
+        let hidden3 = hidden3.reshape(vec![1usize, 1, hsz]).coerr()?;
+        let next_h = match next_h {
+            Some(t) => Some(t.reshape(vec![1usize, 1, hsz]).coerr()?),
+            None => None,
+        };
+        Ok((hidden3, next_h, next_mx))
     }
 
     /// Аллоцирует [`PrefillState`] для фиксированного `chunk_size`. Все буферы
@@ -2822,6 +3034,75 @@ impl FullAttn {
         prof(dev, "attn_oproj", || self.o_proj.forward(&attn))
     }
 
+    /// Внимание декода слитыми ядрами: групповой GEMV q/k/v от готовой
+    /// квант-пары, нормы голов + RoPE + запись K/V одним ядром, flash,
+    /// `o_proj`. Возвращает выход `o_proj` `[1, nh·hd]` (bf16).
+    fn forward_decode_fused(
+        &self,
+        pair: &(Tensor, Tensor),
+        cache: &mut LayerCache,
+        state: &DecodeState,
+    ) -> Result<Tensor, ModelError> {
+        let kvl = match cache {
+            LayerCache::Full(k) => k,
+            LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
+        };
+        let dev = pair.0.device();
+        let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let q_w = self.q_proj.quant_weight().ok_or_else(|| missing("q_proj quant"))?;
+        let k_w = self.k_proj.quant_weight().ok_or_else(|| missing("k_proj quant"))?;
+        let v_w = match &self.v_proj {
+            Some(v) => Some(v.quant_weight().ok_or_else(|| missing("v_proj quant"))?),
+            None => None,
+        };
+        let mut groups = vec![q_w, k_w];
+        if let Some(v) = v_w {
+            groups.push(v);
+        }
+        let qkv = prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16)).coerr()?;
+        let (rope_cos, rope_sin) = match (self.sliding_window, &state.rope_cos_local, &state.rope_sin_local) {
+            (Some(_), Some(c), Some(s)) => (c, s),
+            _ => (&state.rope_cos, &state.rope_sin),
+        };
+        let kv_pos = if self.sliding_window.is_some() { &state.ring_pos_dev } else { &state.pos_dev };
+        let q_off = 0usize;
+        let k_off = nh * hd;
+        let v_off = k_off + nkv * hd;
+        let q = prof(dev, "attn_prep", || {
+            Tensor::dec_attn_prep(
+                (&qkv, q_off),
+                (&qkv, k_off),
+                v_w.map(|_| (&qkv, v_off)),
+                self.q_norm.as_ref(),
+                self.k_norm.as_ref(),
+                self.v_norm.is_some(),
+                rope_cos,
+                rope_sin,
+                &state.pos_dev,
+                self.rotary_dim,
+                kv_pos,
+                &mut kvl.k,
+                &mut kvl.v,
+                nh,
+                nkv,
+                hd,
+                self.rms_eps,
+            )
+        })
+        .coerr()?;
+        let attn = match self.sliding_window {
+            Some(w) => prof(dev, "attn_flash", || {
+                q.flash_attention_window_dev(&kvl.k, &kvl.v, &state.ring_len_dev, self.attn_scale, (w - 1) as i32, true)
+            }),
+            None => prof(dev, "attn_flash", || {
+                q.flash_attention_dev(&kvl.k, &kvl.v, &state.tcache_dev, self.attn_scale, true)
+            }),
+        }
+        .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let attn = attn.reshape(vec![1usize, nh * hd]).coerr()?;
+        prof(dev, "attn_oproj", || self.o_proj.forward(&attn))
+    }
+
     /// Device-резидентный prefill-шаг (T = `state.chunk_size`) для CUDA-graph.
     /// Структурно зеркалит [`Self::forward_decode_dev`]; отличия от decode:
     /// - `hidden` имеет форму `[1, T, hidden]` (T = chunk_size, decode = 1);
@@ -3233,6 +3514,13 @@ const SMALL_CHUNK_DEV: usize = 8;
 fn small_batch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SYN_LA_SMALLBATCH").as_deref() != Ok("0"))
+}
+
+/// Слитый device-путь декода можно выключить (`SYN_FUSED_DECODE=0`) — для
+/// A/B-сравнений с прежней цепочкой ядер.
+fn fused_decode_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("SYN_FUSED_DECODE").as_deref() == Ok("0"))
 }
 
 fn missing(what: &str) -> ModelError {

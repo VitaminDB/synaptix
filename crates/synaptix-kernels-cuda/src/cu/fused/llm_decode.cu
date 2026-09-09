@@ -195,7 +195,6 @@ __device__ __forceinline__ void norm_into(
     }
 }
 
-extern "C" {
 
 // ── Хвост после внимания ─────────────────────────────────────────────────
 //
@@ -207,7 +206,7 @@ extern "C" {
 //
 // Любой из выходов a/b/c можно выключить нулевым указателем веса. Один блок;
 // dynamic smem = 2·H·4 байт.
-__global__ void dec_attn_tail_bf16(
+extern "C" __global__ void dec_attn_tail_bf16(
     const bf16_t* __restrict__ attn_out,
     const bf16_t* __restrict__ post_w,
     const bf16_t* __restrict__ hidden_in,
@@ -266,7 +265,7 @@ __global__ void dec_attn_tail_bf16(
 //            следующего слоя)
 //
 // `moe_acc` — f32-сумма взвешенных выходов экспертов (эпилог индексного GEMV).
-__global__ void dec_ffn_tail_bf16(
+extern "C" __global__ void dec_ffn_tail_bf16(
     const bf16_t* __restrict__ dense_out,
     const float* __restrict__ moe_acc,
     const bf16_t* __restrict__ hidden_in,
@@ -337,7 +336,7 @@ __global__ void dec_ffn_tail_bf16(
 //   logits f32 [e] (скретч); counter u32 [1] (изначально 0)
 //   out_idx u32 [k]; out_w f32 [k]
 // Грид: ceil(e / 8) блоков по 256 нитей. Dynamic smem = h·4 + e·4 байт.
-__global__ void dec_router_topk_bf16(
+extern "C" __global__ void dec_router_topk_bf16(
     const bf16_t* __restrict__ x,
     const float* __restrict__ w,
     const float* __restrict__ pes,
@@ -475,12 +474,12 @@ __device__ __forceinline__ void geglu_quant_impl(
     scales[dq_tile_scale_offset((unsigned)row, (unsigned)col, (unsigned)sf_inner_dim)] = sb;
 }
 
-__global__ void dec_geglu_quant_nvfp4_f16(
+extern "C" __global__ void dec_geglu_quant_nvfp4_f16(
     const __half* gate, const __half* up, long long stride,
     unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim)
 { geglu_quant_impl<__half>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim); }
 
-__global__ void dec_geglu_quant_nvfp4_bf16(
+extern "C" __global__ void dec_geglu_quant_nvfp4_bf16(
     const bf16_t* gate, const bf16_t* up, long long stride,
     unsigned char* packed, unsigned char* scales, int rows, int inter, int sf_inner_dim)
 { geglu_quant_impl<bf16_t>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim); }
@@ -494,7 +493,7 @@ __global__ void dec_geglu_quant_nvfp4_bf16(
 //      снятый ДО нормы и RoPE — `attention_k_eq_v`)
 // RoPE — как rope_apply_impl: пары (d, d±half) по rotary_dim, таблицы
 // [cap, rotary_dim] bf16, позиция pos_ptr[0].
-__global__ void dec_attn_prep_bf16(
+extern "C" __global__ void dec_attn_prep_bf16(
     const bf16_t* __restrict__ q_in,
     const bf16_t* __restrict__ k_in,
     const bf16_t* __restrict__ v_in,
@@ -561,4 +560,3 @@ __global__ void dec_attn_prep_bf16(
     }
 }
 
-}  // extern "C"

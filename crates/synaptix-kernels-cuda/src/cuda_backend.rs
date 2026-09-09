@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use synaptix_core::backend::{Backend, BinaryOp, ReduceOp, UnaryOp};
 use synaptix_core::device::{Device, DeviceKind};
@@ -46,6 +47,35 @@ fn ask_caches(device: Device, attempt: u32, n_bytes: usize) {
     }
     let ask = n_bytes.max(MIN_RECLAIM).saturating_mul(attempt as usize);
     synaptix_core::memory::reclaim::reclaim(device, ask);
+}
+
+
+/// Device-адрес буфера плюс байтовое смещение — для слитых ядер декода, чьи
+/// многочисленные необязательные входы удобнее передавать числами.
+fn dptr(st: &Storage, off: usize, what: &str) -> Result<u64> {
+    let a = st
+        .device_address()
+        .ok_or_else(|| SynaptixError::Cuda(format!("{what}: буфер не на карте")))?;
+    Ok(a + off as u64)
+}
+
+fn dptr_opt(st: Option<&Storage>, what: &str) -> Result<u64> {
+    match st {
+        Some(s) => dptr(s, 0, what),
+        None => Ok(0),
+    }
+}
+
+/// Контекст и default-поток устройства, где лежит буфер.
+fn ctx_stream_of(
+    st: &Storage,
+    what: &str,
+) -> Result<(Arc<cudarc::driver::CudaContext>, Arc<cudarc::driver::CudaStream>)> {
+    let buf = st
+        .as_cuda()
+        .ok_or_else(|| SynaptixError::Cuda(format!("{what}: буфер не на карте")))?;
+    let ord = buf.ordinal();
+    Ok((synaptix_core::device::cuda::get(ord)?, synaptix_core::device::cuda::default_stream(ord)?))
 }
 
 impl Backend for CudaBackend {
@@ -3827,6 +3857,403 @@ impl Backend for CudaBackend {
             &mut out_view,
             n as u32,
             k as u32,
+            pairs as u32,
+        )
+    }
+
+
+    // ── Слитые ядра шага декода ─────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_attn_tail(
+        &self,
+        attn_out: &Storage,
+        post_w: Option<&Storage>,
+        hidden_in: &Storage,
+        hidden_out: &mut Storage,
+        outs: &mut [synaptix_core::backend::DecNormSpec<'_>],
+        h: usize,
+        eps_post: f32,
+        eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use synaptix_core::backend::DecNormOut;
+        use crate::fused::llm_decode::{self as ld, Nvfp4Out};
+        let (ctx, stream) = ctx_stream_of(attn_out, "dec_attn_tail")?;
+        let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let mut a = Nvfp4Out::default();
+        let mut b = Nvfp4Out::default();
+        let (mut w_c, mut c_out) = (0u64, 0u64);
+        let mut n4 = 0;
+        for spec in outs.iter_mut() {
+            let w = dptr(spec.weight, 0, "dec_attn_tail: вес")?;
+            match &mut spec.out {
+                DecNormOut::Bf16(o) => {
+                    if w_c != 0 {
+                        return Err(SynaptixError::Unsupported("dec_attn_tail: один bf16-выход"));
+                    }
+                    w_c = w;
+                    c_out = dptr(o, 0, "dec_attn_tail: bf16-выход")?;
+                }
+                DecNormOut::Nvfp4 { packed, scales } => {
+                    let o = Nvfp4Out {
+                        w,
+                        packed: dptr(packed, 0, "dec_attn_tail: packed")?,
+                        scales: dptr(scales, 0, "dec_attn_tail: scales")?,
+                    };
+                    match n4 {
+                        0 => a = o,
+                        1 => b = o,
+                        _ => return Err(SynaptixError::Unsupported("dec_attn_tail: до двух NVFP4-выходов")),
+                    }
+                    n4 += 1;
+                }
+                DecNormOut::Mxfp8 { .. } => {
+                    return Err(SynaptixError::Unsupported("dec_attn_tail: MXFP8-выход не поддержан"))
+                }
+            }
+        }
+        ld::attn_tail(
+            &k,
+            &stream,
+            dptr(attn_out, 0, "dec_attn_tail: attn_out")?,
+            dptr_opt(post_w, "dec_attn_tail: post_w")?,
+            dptr(hidden_in, 0, "dec_attn_tail: hidden_in")?,
+            dptr(hidden_out, 0, "dec_attn_tail: hidden_out")?,
+            a,
+            b,
+            w_c,
+            c_out,
+            h as u32,
+            eps_post,
+            eps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_ffn_tail(
+        &self,
+        dense_out: &Storage,
+        moe_acc: Option<&Storage>,
+        hidden_in: &Storage,
+        w_post_dense: Option<&Storage>,
+        w_post_moe: Option<&Storage>,
+        w_post_mlp: Option<&Storage>,
+        layer_scalar: f32,
+        hidden_out: &mut Storage,
+        next_w: Option<&Storage>,
+        next_bf16: Option<&mut Storage>,
+        next_mx: Option<(&mut Storage, &mut Storage)>,
+        h: usize,
+        eps_post: f32,
+        eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode as ld;
+        let (ctx, stream) = ctx_stream_of(dense_out, "dec_ffn_tail")?;
+        let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let (mxp, mxs) = match next_mx {
+            Some((p, s)) => (dptr(p, 0, "dec_ffn_tail: mx packed")?, dptr(s, 0, "dec_ffn_tail: mx scales")?),
+            None => (0, 0),
+        };
+        ld::ffn_tail(
+            &k,
+            &stream,
+            dptr(dense_out, 0, "dec_ffn_tail: dense")?,
+            dptr_opt(moe_acc, "dec_ffn_tail: moe_acc")?,
+            dptr(hidden_in, 0, "dec_ffn_tail: hidden_in")?,
+            dptr_opt(w_post_dense, "dec_ffn_tail: post_dense")?,
+            dptr_opt(w_post_moe, "dec_ffn_tail: post_moe")?,
+            dptr_opt(w_post_mlp, "dec_ffn_tail: post_mlp")?,
+            layer_scalar,
+            dptr(hidden_out, 0, "dec_ffn_tail: hidden_out")?,
+            dptr_opt(next_w, "dec_ffn_tail: next_w")?,
+            match next_bf16 {
+                Some(o) => dptr(o, 0, "dec_ffn_tail: next bf16")?,
+                None => 0,
+            },
+            mxp,
+            mxs,
+            h as u32,
+            eps_post,
+            eps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_router_topk(
+        &self,
+        x: &Storage,
+        w: &Storage,
+        pes: Option<&Storage>,
+        logits: &mut Storage,
+        counter: &mut Storage,
+        out_idx: &mut Storage,
+        out_w: &mut Storage,
+        acc_zero: Option<&mut Storage>,
+        e: usize,
+        h: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode as ld;
+        let (ctx, stream) = ctx_stream_of(x, "dec_router_topk")?;
+        let kk = ld::LlmDecodeKernels::for_context(&ctx)?;
+        ld::router_topk(
+            &kk,
+            &stream,
+            dptr(x, 0, "dec_router_topk: x")?,
+            dptr(w, 0, "dec_router_topk: w")?,
+            dptr_opt(pes, "dec_router_topk: pes")?,
+            dptr(logits, 0, "dec_router_topk: logits")?,
+            dptr(counter, 0, "dec_router_topk: counter")?,
+            dptr(out_idx, 0, "dec_router_topk: idx")?,
+            dptr(out_w, 0, "dec_router_topk: w out")?,
+            match acc_zero {
+                Some(a) => dptr(a, 0, "dec_router_topk: acc")?,
+                None => 0,
+            },
+            e as u32,
+            h as u32,
+            k as u32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_geglu_quant_nvfp4(
+        &self,
+        gate: (&Storage, usize),
+        up: (&Storage, usize),
+        stride: usize,
+        dtype: DType,
+        packed: &mut Storage,
+        scales: &mut Storage,
+        rows: usize,
+        inter: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode as ld;
+        let (ctx, stream) = ctx_stream_of(gate.0, "dec_geglu_quant_nvfp4")?;
+        let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let bf16 = match dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4: dtype F16|BF16")),
+        };
+        ld::geglu_quant_nvfp4(
+            &k,
+            &stream,
+            bf16,
+            dptr(gate.0, gate.1, "dec_geglu_quant_nvfp4: gate")?,
+            dptr(up.0, up.1, "dec_geglu_quant_nvfp4: up")?,
+            stride as u64,
+            dptr(packed, 0, "dec_geglu_quant_nvfp4: packed")?,
+            dptr(scales, 0, "dec_geglu_quant_nvfp4: scales")?,
+            rows as u32,
+            inter as u32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_attn_prep(
+        &self,
+        q: (&Storage, usize),
+        k: (&Storage, usize),
+        v: Option<(&Storage, usize)>,
+        q_norm: Option<&Storage>,
+        k_norm: Option<&Storage>,
+        v_norm: bool,
+        cos: &Storage,
+        sin: &Storage,
+        pos: &Storage,
+        rotary_dim: usize,
+        kv_pos: &Storage,
+        q_out: &mut Storage,
+        k_cache: &mut Storage,
+        v_cache: &mut Storage,
+        max_seq: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode as ld;
+        let (ctx, stream) = ctx_stream_of(q.0, "dec_attn_prep")?;
+        let kk = ld::LlmDecodeKernels::for_context(&ctx)?;
+        ld::attn_prep(
+            &kk,
+            &stream,
+            dptr(q.0, q.1, "dec_attn_prep: q")?,
+            dptr(k.0, k.1, "dec_attn_prep: k")?,
+            match v {
+                Some((st, off)) => dptr(st, off, "dec_attn_prep: v")?,
+                None => 0,
+            },
+            dptr_opt(q_norm, "dec_attn_prep: q_norm")?,
+            dptr_opt(k_norm, "dec_attn_prep: k_norm")?,
+            v_norm,
+            dptr(cos, 0, "dec_attn_prep: cos")?,
+            dptr(sin, 0, "dec_attn_prep: sin")?,
+            dptr(pos, 0, "dec_attn_prep: pos")?,
+            rotary_dim as u32,
+            dptr(kv_pos, 0, "dec_attn_prep: kv_pos")?,
+            dptr(q_out, 0, "dec_attn_prep: q_out")?,
+            dptr(k_cache, 0, "dec_attn_prep: k_cache")?,
+            dptr(v_cache, 0, "dec_attn_prep: v_cache")?,
+            max_seq as u32,
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            eps,
+        )
+    }
+
+    fn dec_gemv_grouped(
+        &self,
+        groups: &[(&QuantWeight, usize)],
+        x_packed: &Storage,
+        x_scales: &Storage,
+        out: &mut Storage,
+        out_dtype: DType,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let first = groups
+            .first()
+            .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: пустая группа"))?
+            .0;
+        let (ctx, stream) = ctx_stream_of(x_packed, "dec_gemv_grouped")?;
+        let bf16 = match out_dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_gemv_grouped: выход F16|BF16")),
+        };
+        let k = first.k();
+        let out_base = dptr(out, 0, "dec_gemv_grouped: out")?;
+        for (w, _) in groups {
+            if w.k() != k || w.dtype() != first.dtype() {
+                return Err(SynaptixError::Unsupported("dec_gemv_grouped: веса разной K или формата"));
+            }
+        }
+        let xp = x_packed
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: x non-cuda"))?;
+        let xs = x_scales
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: scales non-cuda"))?;
+        match first.dtype() {
+            DType::NVFP4 => {
+                use crate::best_cu::gemv::gemv_nvfp4::{self as gv, GemvGroup};
+                let kernels = if bf16 {
+                    gv::Nvfp4MmaGemvShufKernels::for_context_bf16(&ctx)?
+                } else {
+                    gv::Nvfp4MmaGemvShufKernels::for_context(&ctx)?
+                };
+                let mut gs = Vec::with_capacity(groups.len());
+                for (w, off) in groups {
+                    w.ensure_shuffled()?;
+                    let (wa, sa) = w
+                        .shuffled_addr()
+                        .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: нет перемешанной копии"))?;
+                    gs.push(GemvGroup { w_shuf: wa, scales: sa, out: out_base + *off as u64, n: w.n() as u32 });
+                }
+                gv::nvfp4_gemv_grouped_splitk(&kernels, &stream, &gs, &xp.slice().slice(..), &xs.slice().slice(..), k as u32)
+            }
+            DType::MXFP8 => {
+                use crate::best_cu::gemv::gemv_mxfp8::{self as gm, MxGemvGroup};
+                let kernels = if bf16 {
+                    gm::GemvMxfp8Kernels::for_context_bf16(&ctx)?
+                } else {
+                    gm::GemvMxfp8Kernels::for_context(&ctx)?
+                };
+                let mut gs = Vec::with_capacity(groups.len());
+                for (w, off) in groups {
+                    let packed = w
+                        .packed_arc()
+                        .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: packed освобождён"))?;
+                    let wa = packed
+                        .device_address()
+                        .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: вес не на карте"))?;
+                    let sa = w
+                        .scales()
+                        .device_address()
+                        .ok_or(SynaptixError::Unsupported("dec_gemv_grouped: масштабы не на карте"))?;
+                    gs.push(MxGemvGroup { w: wa, scales: sa, out: out_base + *off as u64, n: w.n() as u32 });
+                }
+                gm::gemv_mxfp8_grouped(&kernels, &stream, &gs, &xp.slice().slice(..), &xs.slice().slice(..), k as u32)
+            }
+            _ => Err(SynaptixError::Unsupported("dec_gemv_grouped: формат веса")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dec_gemv_indexed(
+        &self,
+        w_table: &Storage,
+        s_table: &Storage,
+        idx: &Storage,
+        x_packed: &Storage,
+        x_scales: &Storage,
+        rows_per_pair: bool,
+        out: synaptix_core::backend::DecIndexedOut<'_>,
+        n: usize,
+        k: usize,
+        experts: usize,
+        pairs: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use synaptix_core::backend::DecIndexedOut;
+        use crate::best_cu::gemv::gemv_nvfp4::{self as gv, IndexedEpilogue};
+        let (ctx, stream) = ctx_stream_of(w_table, "dec_gemv_indexed")?;
+        let (epilogue, bf16) = match out {
+            DecIndexedOut::Rows { out, dtype } => (
+                IndexedEpilogue::Rows { out: dptr(out, 0, "dec_gemv_indexed: out")? },
+                match dtype {
+                    DType::BF16 => true,
+                    DType::F16 => false,
+                    _ => return Err(SynaptixError::Unsupported("dec_gemv_indexed: строки F16|BF16")),
+                },
+            ),
+            DecIndexedOut::Accumulate { acc, wts } => (
+                IndexedEpilogue::Accumulate {
+                    acc: dptr(acc, 0, "dec_gemv_indexed: acc")?,
+                    wts: dptr(wts, 0, "dec_gemv_indexed: wts")?,
+                },
+                false,
+            ),
+        };
+        let kernels = if bf16 {
+            gv::Nvfp4MmaGemvShufKernels::for_context_bf16(&ctx)?
+        } else {
+            gv::Nvfp4MmaGemvShufKernels::for_context(&ctx)?
+        };
+        fn cuda<'a>(st: &'a Storage, what: &str) -> Result<&'a CudaBuf> {
+            st.as_cuda().ok_or_else(|| SynaptixError::Cuda(format!("dec_gemv_indexed: {what} не на карте")))
+        }
+        let wt = cuda(w_table, "таблица весов")?;
+        let st = cuda(s_table, "таблица масштабов")?;
+        let ib = cuda(idx, "idx")?;
+        let xp = cuda(x_packed, "активация")?;
+        let xs = cuda(x_scales, "масштабы активации")?;
+        let wt_v = unsafe { wt.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("dec_gemv_indexed: transmute таблицы".into()))?;
+        let st_v = unsafe { st.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("dec_gemv_indexed: transmute масштабов".into()))?;
+        let idx_v = unsafe { ib.slice().transmute::<u32>(pairs) }
+            .ok_or_else(|| SynaptixError::Cuda("dec_gemv_indexed: transmute idx".into()))?;
+        gv::nvfp4_gemv_indexed_splitk(
+            &kernels,
+            &stream,
+            &wt_v,
+            &st_v,
+            &idx_v,
+            &xp.slice().slice(..),
+            &xs.slice().slice(..),
+            rows_per_pair,
+            epilogue,
+            n as u32,
+            k as u32,
+            experts as u32,
             pairs as u32,
         )
     }

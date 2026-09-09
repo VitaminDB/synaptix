@@ -11,3 +11,4 @@ pub mod rms_mod_quant;
 pub mod rmsnorm_residual;
 pub mod silu_and_mul;
 pub mod swiglu;
+pub mod llm_decode;

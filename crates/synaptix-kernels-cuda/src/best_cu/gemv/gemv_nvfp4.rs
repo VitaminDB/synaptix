@@ -20,6 +20,8 @@ pub struct Nvfp4MmaGemvShufKernels {
     w8_persistent: CudaFunction,
     w8_batched: CudaFunction,
     ptr_gather: CudaFunction,
+    grouped_splitk: CudaFunction,
+    indexed_splitk: CudaFunction,
     num_sms: u32,
 }
 
@@ -84,6 +86,8 @@ impl Nvfp4MmaGemvShufKernels {
         let w8p = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_persistent")?;
         let w8b = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_batched")?;
         let ptr_gather = load_fn(&module, "nvfp4_expert_ptr_gather")?;
+        let grouped_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_grouped_splitk")?;
+        let indexed_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk")?;
         for f in [&w4, &w8, &w8p, &w8b] {
             f.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -101,6 +105,8 @@ impl Nvfp4MmaGemvShufKernels {
             w8_persistent: w8p,
             w8_batched: w8b,
             ptr_gather,
+            grouped_splitk,
+            indexed_splitk,
             _module: module,
             num_sms,
         });
@@ -353,5 +359,136 @@ pub fn nvfp4_expert_ptr_gather(
         .arg(&rb);
     unsafe { b.launch(cfg) }
         .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_expert_ptr_gather: {e:?}")))?;
+    Ok(())
+}
+
+/// Группа для [`nvfp4_gemv_grouped_splitk`]: device-адреса перемешанного
+/// веса, его масштабов и выхода плюс N. Выход — f16 или bf16 по модулю
+/// (`for_context` / `for_context_bf16`).
+#[derive(Clone, Copy)]
+pub struct GemvGroup {
+    pub w_shuf: u64,
+    pub scales: u64,
+    pub out: u64,
+    pub n: u32,
+}
+
+const SPLITK_THREADS: u32 = 256;
+
+/// До трёх весов одной K с общей квант-активацией (строка 0) одним запуском;
+/// каждый блок — 16-строчный тайл со split-K по 8 варпам. N кратны 16.
+pub fn nvfp4_gemv_grouped_splitk(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    groups: &[GemvGroup],
+    packed_x: &CudaView<u8>,
+    scales_x: &CudaView<u8>,
+    k: u32,
+) -> Result<()> {
+    if groups.is_empty() || groups.len() > 3 {
+        return Err(SynaptixError::Cuda("nvfp4_gemv_grouped_splitk: 1..3 группы".into()));
+    }
+    if k % 64 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "nvfp4_gemv_grouped_splitk: K={k} must be multiple of 64"
+        )));
+    }
+    let mut g = [GemvGroup { w_shuf: 0, scales: 0, out: 0, n: 0 }; 3];
+    let mut tiles = 0u32;
+    for (i, grp) in groups.iter().enumerate() {
+        if grp.n % 16 != 0 {
+            return Err(SynaptixError::Cuda(format!(
+                "nvfp4_gemv_grouped_splitk: N={} must be multiple of 16",
+                grp.n
+            )));
+        }
+        g[i] = *grp;
+        tiles += grp.n / 16;
+    }
+    if tiles == 0 {
+        return Ok(());
+    }
+    let sf_inner_w = sf_inner_dim(k);
+    let cfg = LaunchConfig {
+        grid_dim: (tiles, 1, 1),
+        block_dim: (SPLITK_THREADS, 1, 1),
+        shared_mem_bytes: k / 2,
+    };
+    let mut b = stream.launch_builder(&kernels.grouped_splitk);
+    b.arg(&g[0].w_shuf).arg(&g[0].scales).arg(&g[0].out).arg(&g[0].n)
+        .arg(&g[1].w_shuf).arg(&g[1].scales).arg(&g[1].out).arg(&g[1].n)
+        .arg(&g[2].w_shuf).arg(&g[2].scales).arg(&g[2].out).arg(&g[2].n)
+        .arg(packed_x)
+        .arg(scales_x)
+        .arg(&k)
+        .arg(&sf_inner_w);
+    unsafe { b.launch(cfg) }
+        .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_gemv_grouped_splitk: {e:?}")))?;
+    Ok(())
+}
+
+/// Куда кладёт индексный GEMV: строки `[pairs, N]` (f16/bf16 по модулю) или
+/// взвешенная f32-сумма `acc[N] += wts[p]·y_p` атомиками.
+#[derive(Clone, Copy)]
+pub enum IndexedEpilogue {
+    Rows { out: u64 },
+    Accumulate { acc: u64, wts: u64 },
+}
+
+/// Пакетный GEMV с выбором эксперта индексом на карте; блок — 16-строчный
+/// тайл со split-K, grid.z — пара. `row_bytes` = K/2 — шаг строки активации.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gemv_indexed_splitk(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    w_table: &CudaView<u64>,
+    s_table: &CudaView<u64>,
+    idx: &CudaView<u32>,
+    x_packed: &CudaView<u8>,
+    x_scales: &CudaView<u8>,
+    rows_per_pair: bool,
+    epilogue: IndexedEpilogue,
+    n: u32,
+    k: u32,
+    experts: u32,
+    pairs: u32,
+) -> Result<()> {
+    if k % 64 != 0 || n % 16 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "nvfp4_gemv_indexed_splitk: N={n} % 16, K={k} % 64 required"
+        )));
+    }
+    if pairs == 0 {
+        return Ok(());
+    }
+    let sf_inner_w = sf_inner_dim(k);
+    let cfg = LaunchConfig {
+        grid_dim: (n / 16, 1, pairs),
+        block_dim: (SPLITK_THREADS, 1, 1),
+        shared_mem_bytes: k / 2,
+    };
+    let (out_u, acc_u, wts_u) = match epilogue {
+        IndexedEpilogue::Rows { out } => (out, 0u64, 0u64),
+        IndexedEpilogue::Accumulate { acc, wts } => (0u64, acc, wts),
+    };
+    let row_bytes = k / 2;
+    let rpp: i32 = i32::from(rows_per_pair);
+    let mut b = stream.launch_builder(&kernels.indexed_splitk);
+    b.arg(w_table)
+        .arg(s_table)
+        .arg(idx)
+        .arg(x_packed)
+        .arg(x_scales)
+        .arg(&row_bytes)
+        .arg(&rpp)
+        .arg(&out_u)
+        .arg(&acc_u)
+        .arg(&wts_u)
+        .arg(&n)
+        .arg(&k)
+        .arg(&sf_inner_w)
+        .arg(&experts);
+    unsafe { b.launch(cfg) }
+        .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_gemv_indexed_splitk: {e:?}")))?;
     Ok(())
 }

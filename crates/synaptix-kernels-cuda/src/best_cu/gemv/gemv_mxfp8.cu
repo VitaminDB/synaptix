@@ -16,16 +16,11 @@ typedef __half syn_out_t;
 // (на M=1 DRAM-saturated, tensor-core throughput не нужен; проще и без тонкой
 // MMA-раскладки). E8M0-дек: scale = 2^(byte-127) = float_from_bits(byte<<23).
 // Один warp = одна строка N; 32 нити делят K-блоки.
-extern "C" __global__ void gemv_mxfp8_e4m3(const __nv_fp8_e4m3 *__restrict__ w,
-                                           const unsigned char *__restrict__ sw,
-                                           const __nv_fp8_e4m3 *__restrict__ x,
-                                           const unsigned char *__restrict__ sx,
-                                           syn_out_t *__restrict__ out, int N, int K) {
-  const int warps = blockDim.x >> 5;
-  const int row = blockIdx.x * warps + (threadIdx.x >> 5);
-  if (row >= N)
-    return;
-  const int lane = threadIdx.x & 31;
+__device__ __forceinline__ float gemv_mxfp8_row(const __nv_fp8_e4m3 *__restrict__ w,
+                                                const unsigned char *__restrict__ sw,
+                                                const __nv_fp8_e4m3 *__restrict__ x,
+                                                const unsigned char *__restrict__ sx,
+                                                int row, int K, int lane) {
   const int kb = K / 32;
 
   float acc = 0.f;
@@ -55,6 +50,45 @@ extern "C" __global__ void gemv_mxfp8_e4m3(const __nv_fp8_e4m3 *__restrict__ w,
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1)
     acc += __shfl_down_sync(0xffffffffu, acc, o);
+  return acc;
+}
+
+extern "C" __global__ void gemv_mxfp8_e4m3(const __nv_fp8_e4m3 *__restrict__ w,
+                                           const unsigned char *__restrict__ sw,
+                                           const __nv_fp8_e4m3 *__restrict__ x,
+                                           const unsigned char *__restrict__ sx,
+                                           syn_out_t *__restrict__ out, int N, int K) {
+  const int warps = blockDim.x >> 5;
+  const int row = blockIdx.x * warps + (threadIdx.x >> 5);
+  if (row >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  float acc = gemv_mxfp8_row(w, sw, x, sx, row, K, lane);
   if (lane == 0)
     out[row] = SYN_TO_OUT(acc);
+}
+
+// Групповой вариант: до трёх матриц одной K с общей активацией одним
+// запуском (q/k/v одного слоя). Варп — строка; строки идут подряд
+// [n0 | n1 | n2], варп сам выбирает матрицу по диапазону.
+extern "C" __global__ void gemv_mxfp8_e4m3_grouped(
+    unsigned long long w0, unsigned long long sw0, unsigned long long o0, int n0,
+    unsigned long long w1, unsigned long long sw1, unsigned long long o1, int n1,
+    unsigned long long w2, unsigned long long sw2, unsigned long long o2, int n2,
+    const __nv_fp8_e4m3 *__restrict__ x, const unsigned char *__restrict__ sx, int K) {
+  const int warps = blockDim.x >> 5;
+  int grow = blockIdx.x * warps + (threadIdx.x >> 5);
+  unsigned long long wu, su, ou; int n;
+  if (grow < n0) { wu = w0; su = sw0; ou = o0; n = n0; }
+  else if (grow < n0 + n1) { grow -= n0; wu = w1; su = sw1; ou = o1; n = n1; }
+  else { grow -= n0 + n1; wu = w2; su = sw2; ou = o2; n = n2; }
+  if (grow >= n)
+    return;
+  const __nv_fp8_e4m3 *w = (const __nv_fp8_e4m3 *)(size_t)wu;
+  const unsigned char *sw = (const unsigned char *)(size_t)su;
+  syn_out_t *out = (syn_out_t *)(size_t)ou;
+  const int lane = threadIdx.x & 31;
+  float acc = gemv_mxfp8_row(w, sw, x, sx, grow, K, lane);
+  if (lane == 0)
+    out[grow] = SYN_TO_OUT(acc);
 }

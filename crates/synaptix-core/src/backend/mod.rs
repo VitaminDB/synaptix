@@ -2,6 +2,7 @@ pub mod attn;
 pub mod registry;
 
 use crate::device::Device;
+use crate::dtype::DType;
 use crate::error::{Result, SynaptixError};
 use crate::stream::Stream;
 use crate::tensor::layout::Layout;
@@ -58,6 +59,28 @@ pub enum ReduceOp {
     Mean,
     Max,
     ArgMax,
+}
+
+
+/// Выход нормы в слитом хвосте слоя декода.
+pub enum DecNormOut<'a> {
+    Bf16(&'a mut Storage),
+    Nvfp4 { packed: &'a mut Storage, scales: &'a mut Storage },
+    Mxfp8 { packed: &'a mut Storage, scales: &'a mut Storage },
+}
+
+/// Норма от общего `hidden`: вес и куда писать.
+pub struct DecNormSpec<'a> {
+    pub weight: &'a Storage,
+    pub out: DecNormOut<'a>,
+}
+
+/// Эпилог индексного GEMV экспертов.
+pub enum DecIndexedOut<'a> {
+    /// `out[p, N]` в `dtype` (F16|BF16).
+    Rows { out: &'a mut Storage, dtype: DType },
+    /// `acc[N] += wts[p] · y_p` (f32; `wts` — F32[pairs]).
+    Accumulate { acc: &'a mut Storage, wts: &'a Storage },
 }
 
 pub trait Backend: Send + Sync + 'static {
@@ -765,6 +788,164 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("nvfp4_gemv_indexed не поддержан этим backend"))
+    }
+
+    // ── Слитые ядра шага декода (T = 1) ─────────────────────────────────
+    //
+    // Все буферы contiguous с нулевым смещением, если не сказано иное; пары
+    // квант-активаций — в раскладках `nvfp4_quantize_act` / `mxfp8_quantize_act`
+    // (у NVFP4 пишется только строка 0 масштабов — потребитель GEMV).
+
+    /// Хвост после внимания: `hidden = bf16(post_norm?(attn_out) + hidden_in)`
+    /// и до трёх норм от `hidden` с разными весами, каждая — в своём формате.
+    #[allow(clippy::too_many_arguments)]
+    fn dec_attn_tail(
+        &self,
+        _attn_out: &Storage,
+        _post_w: Option<&Storage>,
+        _hidden_in: &Storage,
+        _hidden_out: &mut Storage,
+        _outs: &mut [DecNormSpec<'_>],
+        _h: usize,
+        _eps_post: f32,
+        _eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_attn_tail не поддержан этим backend"))
+    }
+
+    /// Хвост FFN-части блока: пост-нормы плотной и MoE-веток, их сумма,
+    /// пост-норма MLP, residual, `layer_scalar` и норма входа следующего слоя
+    /// (bf16 и/или MXFP8-пара).
+    #[allow(clippy::too_many_arguments)]
+    fn dec_ffn_tail(
+        &self,
+        _dense_out: &Storage,
+        _moe_acc: Option<&Storage>,
+        _hidden_in: &Storage,
+        _w_post_dense: Option<&Storage>,
+        _w_post_moe: Option<&Storage>,
+        _w_post_mlp: Option<&Storage>,
+        _layer_scalar: f32,
+        _hidden_out: &mut Storage,
+        _next_w: Option<&Storage>,
+        _next_bf16: Option<&mut Storage>,
+        _next_mx: Option<(&mut Storage, &mut Storage)>,
+        _h: usize,
+        _eps_post: f32,
+        _eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_ffn_tail не поддержан этим backend"))
+    }
+
+    /// Роутер MoE одним запуском: логиты `w[e,h]·x`, top-k, софтмакс по k,
+    /// `per_expert_scale`; попутно обнуляет `acc_zero` (f32 [h]). `counter` —
+    /// U32[1], изначально ноль, ядро возвращает его в ноль само.
+    #[allow(clippy::too_many_arguments)]
+    fn dec_router_topk(
+        &self,
+        _x: &Storage,
+        _w: &Storage,
+        _pes: Option<&Storage>,
+        _logits: &mut Storage,
+        _counter: &mut Storage,
+        _out_idx: &mut Storage,
+        _out_w: &mut Storage,
+        _acc_zero: Option<&mut Storage>,
+        _e: usize,
+        _h: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_router_topk не поддержан этим backend"))
+    }
+
+    /// `gelu_tanh(gate)·up` → NVFP4-пара строк. `gate`/`up` — (storage,
+    /// байтовое смещение), `stride` — шаг строки в элементах, `dtype` F16|BF16.
+    #[allow(clippy::too_many_arguments)]
+    fn dec_geglu_quant_nvfp4(
+        &self,
+        _gate: (&Storage, usize),
+        _up: (&Storage, usize),
+        _stride: usize,
+        _dtype: DType,
+        _packed: &mut Storage,
+        _scales: &mut Storage,
+        _rows: usize,
+        _inter: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4 не поддержан этим backend"))
+    }
+
+    /// Нормы голов q/k(/v) + RoPE q/k + запись k/v в кэш `[nkv, max_seq, hd]`
+    /// на позицию `kv_pos` (U32[1] на карте). `v = None` — V берётся из сырого
+    /// K (`attention_k_eq_v`). `cos`/`sin` — `[cap, rotary_dim]`, позиция RoPE —
+    /// `pos` (U32[1]).
+    #[allow(clippy::too_many_arguments)]
+    fn dec_attn_prep(
+        &self,
+        _q: (&Storage, usize),
+        _k: (&Storage, usize),
+        _v: Option<(&Storage, usize)>,
+        _q_norm: Option<&Storage>,
+        _k_norm: Option<&Storage>,
+        _v_norm: bool,
+        _cos: &Storage,
+        _sin: &Storage,
+        _pos: &Storage,
+        _rotary_dim: usize,
+        _kv_pos: &Storage,
+        _q_out: &mut Storage,
+        _k_cache: &mut Storage,
+        _v_cache: &mut Storage,
+        _max_seq: usize,
+        _nh: usize,
+        _nkv: usize,
+        _hd: usize,
+        _eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_attn_prep не поддержан этим backend"))
+    }
+
+    /// Групповой GEMV декода: до трёх квант-весов одного формата и одной K от
+    /// общей квант-пары одним запуском; выходы — строки `out` по байтовым
+    /// смещениям, dtype `out_dtype` (F16|BF16).
+    #[allow(clippy::too_many_arguments)]
+    fn dec_gemv_grouped(
+        &self,
+        _groups: &[(&QuantWeight, usize)],
+        _x_packed: &Storage,
+        _x_scales: &Storage,
+        _out: &mut Storage,
+        _out_dtype: DType,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_gemv_grouped не поддержан этим backend"))
+    }
+
+    /// Индексный GEMV экспертов без скретчей указателей: эксперт пары `p` —
+    /// `idx[p]` (U32 на карте), веса — по таблицам адресов. Эпилог — строки
+    /// либо взвешенная f32-сумма (см. [`DecIndexedOut`]).
+    #[allow(clippy::too_many_arguments)]
+    fn dec_gemv_indexed(
+        &self,
+        _w_table: &Storage,
+        _s_table: &Storage,
+        _idx: &Storage,
+        _x_packed: &Storage,
+        _x_scales: &Storage,
+        _rows_per_pair: bool,
+        _out: DecIndexedOut<'_>,
+        _n: usize,
+        _k: usize,
+        _experts: usize,
+        _pairs: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_gemv_indexed не поддержан этим backend"))
     }
 
     fn embed_gather_mxfp8(

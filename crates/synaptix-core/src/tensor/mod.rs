@@ -4,6 +4,7 @@ pub mod compare;
 pub mod conversion;
 pub mod creation;
 pub mod debug;
+pub mod decode_fused;
 pub mod indexing;
 pub mod layout;
 pub mod ops;

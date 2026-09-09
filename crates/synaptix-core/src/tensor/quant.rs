@@ -378,6 +378,28 @@ impl ExpertTable {
         self.n
     }
 
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    /// I64[E] адресов перемешанных весов.
+    pub fn w_table_storage(&self) -> &Storage {
+        &self.w_table.storage
+    }
+
+    /// I64[E] адресов масштабов.
+    pub fn s_table_storage(&self) -> &Storage {
+        &self.s_table.storage
+    }
+
     /// Один GEMV на пару: `out[p] = W[idx[p]] · x`. Активация — ОДНА строка
     /// (декод), квантованная заранее; `idx` — U32 на устройстве.
     /// `rows_per_pair = false` — все пары читают строку 0 активации (первая
