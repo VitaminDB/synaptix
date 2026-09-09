@@ -29,6 +29,7 @@ synaptix-llm-qwen3    = { workspace = true }
 synaptix-llm-qwen4-exp = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
 synaptix-llm-llama    = { workspace = true }
+synaptix-llm-gemma4   = { workspace = true }
 synaptix-llm-gemma3   = { workspace = true }
 synaptix-llm-muse-glimmer = { workspace = true }
 

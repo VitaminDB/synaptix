@@ -100,6 +100,9 @@ fn cfg(with_shared: bool, norm_topk_prob: bool) -> MoeConfig {
         norm_topk_prob,
         chunk: 3, // меньше T — заодно проверяется склейка чанков
         skip_below: 0.0,
+        router_key: None,
+        per_expert_scale: None,
+        activation: synaptix_llm_common::Activation::Silu,
     }
 }
 

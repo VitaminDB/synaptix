@@ -32,6 +32,7 @@ use synaptix_core::dtype::DType;
 use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 
+use crate::config::Activation;
 use crate::model::ModelError;
 use crate::weights::{QLinear, WeightSource};
 
@@ -58,6 +59,14 @@ pub struct MoeConfig {
     /// весов ценой небольшой потери массы у последних слотов top-k. `0` —
     /// выключено, и это значение по умолчанию.
     pub skip_below: f32,
+    /// Имя веса роутера относительно `prefix`. `None` — `gate.weight`
+    /// (раскладка Qwen-MoE); у Gemma-4 это `router.proj.weight`.
+    pub router_key: Option<String>,
+    /// Множитель веса каждого эксперта, применяемый ПОСЛЕ нормировки top-k
+    /// (Gemma-4 `router.per_expert_scale`). `None` — единицы.
+    pub per_expert_scale: Option<Vec<f32>>,
+    /// Активация в эксперте: `silu(gate)·up` у Qwen, `gelu_tanh(gate)·up` у Gemma-4.
+    pub activation: Activation,
 }
 
 impl MoeConfig {
@@ -72,6 +81,9 @@ impl MoeConfig {
             norm_topk_prob: true,
             chunk: 512,
             skip_below: 0.0,
+            router_key: None,
+            per_expert_scale: None,
+            activation: Activation::Silu,
         }
     }
 }
@@ -809,13 +821,29 @@ impl MoeFfn {
             expert_storage,
         )?;
         let mut me = Self::load_parts(weights, prefix, cfg, device, compute, quant)?;
-        me.experts = ExpertStore::Resident(
-            gate_up
-                .into_iter()
-                .zip(down)
-                .map(|(gate_up, down)| Expert { gate_up, down })
-                .collect(),
-        );
+        let experts: Vec<Expert> = gate_up
+            .into_iter()
+            .zip(down)
+            .map(|(gate_up, down)| Expert { gate_up, down })
+            .collect();
+        // Перемешанную копию NVFP4-веса строит первое умножение — и кладёт её
+        // в default-пул, освобождая исходную в weights-пуле. У резидентной
+        // MoE, где за один префилл задействованы ВСЕ эксперты, это переселяет
+        // десяток гигабайт из пула в пул: оба остаются зарезервированными, и
+        // карта кончается на ровном месте. Строим копию сразу, под загрузкой —
+        // тогда она рождается и живёт там же, где исходная.
+        if expert_storage == device && device.is_cuda() {
+            for e in &experts {
+                for l in [&e.gate_up, &e.down] {
+                    if let Some(w) = l.quant_weight() {
+                        if w.dtype() == DType::NVFP4 {
+                            let _ = w.ensure_shuffled();
+                        }
+                    }
+                }
+            }
+        }
+        me.experts = ExpertStore::Resident(experts);
         Ok(me)
     }
 
@@ -827,11 +855,12 @@ impl MoeFfn {
         compute: DType,
         quant: DType,
     ) -> Result<Self, ModelError> {
+        let router_key = cfg.router_key.as_deref().unwrap_or("gate.weight");
         let router = weights
-            .tensor(&format!("{prefix}.gate.weight"), device, DType::F32)?;
+            .tensor(&format!("{prefix}.{router_key}"), device, DType::F32)?;
         if router.dims() != [cfg.num_experts, cfg.hidden_size] {
             return Err(ModelError::Load(format!(
-                "{prefix}.gate.weight: форма {:?}, ожидалась [{}, {}]",
+                "{prefix}.{router_key}: форма {:?}, ожидалась [{}, {}]",
                 router.dims(),
                 cfg.num_experts,
                 cfg.hidden_size
@@ -1003,6 +1032,20 @@ impl MoeFfn {
         &self.cfg
     }
 
+    /// Сколько байт весов держит слой — для планирования оффлоада блоков.
+    /// Ленивые эксперты (кэш) веса блока не занимают.
+    pub fn bytes(&self) -> usize {
+        let experts = match &self.experts {
+            ExpertStore::Resident(v) => v.iter().map(|e| e.bytes()).sum(),
+            ExpertStore::Lazy { .. } => 0,
+        };
+        let router = self.router.dtype().bytes_for_numel(self.router.numel());
+        let shared = self.shared.as_ref().map_or(0, |s| {
+            s.gate.bytes() + s.up.bytes() + s.down.bytes()
+        });
+        experts + router + shared
+    }
+
     /// Кого позвать для каждого токена.
     ///
     /// Возвращает по `k` пар `(эксперт, вес)` на токен, плоско: слот `s`
@@ -1042,6 +1085,7 @@ impl MoeFfn {
                         weights[i * k + s] = exps[s] / denom;
                     }
                 }
+                self.scale_per_expert(&experts, &mut weights);
                 return Ok((experts, weights));
             }
         }
@@ -1089,17 +1133,48 @@ impl MoeFfn {
                     weights[s] = ex / denom;
                 }
             });
+        self.scale_per_expert(&experts, &mut weights);
         Ok((experts, weights))
+    }
+
+    /// Персональный множитель эксперта (Gemma-4) поверх нормированных весов
+    /// top-k. Без него — no-op.
+    fn scale_per_expert(&self, experts: &[u32], weights: &mut [f32]) {
+        let Some(scale) = self.cfg.per_expert_scale.as_deref() else { return };
+        for (w, e) in weights.iter_mut().zip(experts) {
+            *w *= scale.get(*e as usize).copied().unwrap_or(1.0);
+        }
     }
 
     /// `x: [T, H]` → `[T, H]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+        self.forward_routed(x, None)
+    }
+
+    /// То же, но роутер смотрит на СВОЙ вход `router_in: [T, H]`, а не на тот,
+    /// что уходит экспертам. У Gemma-4 это разные тензоры: эксперты получают
+    /// `pre_feedforward_layernorm_2(x)`, роутер — ту же норму без веса,
+    /// домноженную на `router.scale·H^-1/2` (свёрнуто в вес нормы вызывающим).
+    pub fn forward_routed(
+        &self,
+        x: &Tensor,
+        router_in: Option<&Tensor>,
+    ) -> Result<Tensor, ModelError> {
         if x.rank() != 2 || x.dims()[1] != self.cfg.hidden_size {
             return Err(ModelError::Forward(format!(
                 "MoE: вход {:?}, ожидался [T, {}]",
                 x.dims(),
                 self.cfg.hidden_size
             )));
+        }
+        if let Some(r) = router_in {
+            if r.dims() != x.dims() {
+                return Err(ModelError::Forward(format!(
+                    "MoE: вход роутера {:?} не совпал с входом экспертов {:?}",
+                    r.dims(),
+                    x.dims()
+                )));
+            }
         }
         let total = x.dims()[0];
         let mut parts: Vec<Tensor> = Vec::new();
@@ -1109,7 +1184,15 @@ impl MoeFfn {
                 .narrow(0, start, len)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| ModelError::Forward(format!("MoE: срез токенов: {e}")))?;
-            let out = match self.forward_chunk(&chunk) {
+            let rchunk = match router_in {
+                Some(r) => Some(
+                    r.narrow(0, start, len)
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| ModelError::Forward(format!("MoE: срез роутера: {e}")))?,
+                ),
+                None => None,
+            };
+            let out = match self.forward_chunk(&chunk, rchunk.as_ref()) {
                 Ok(out) => out,
                 Err(e) if is_oom(&e) => {
                     // Кэш экспертов держит память, которой не хватило активациям:
@@ -1120,7 +1203,7 @@ impl MoeFfn {
                     let Some(cache) = &self.cache else { return Err(e) };
                     let want = (cache.used_bytes() / 2).max(MIN_CACHE_BYTES);
                     cache.set_capacity(want);
-                    self.forward_chunk(&chunk)?
+                    self.forward_chunk(&chunk, rchunk.as_ref())?
                 }
                 Err(e) => return Err(e),
             };
@@ -1135,11 +1218,12 @@ impl MoeFfn {
         Ok(out)
     }
 
-    fn forward_chunk(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+    fn forward_chunk(&self, x: &Tensor, router_in: Option<&Tensor>) -> Result<Tensor, ModelError> {
         use crate::profile::stage;
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
-        let (experts, weights) = stage("moe:route", || self.route(x))?;
+        let routed = router_in.unwrap_or(x);
+        let (experts, weights) = stage("moe:route", || self.route(routed))?;
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
@@ -1338,6 +1422,11 @@ impl MoeFfn {
             return Ok(None);
         }
 
+        if self.cfg.activation != Activation::Silu {
+            // Батч фьюзит silu прямо в квантование активации; для gelu такого
+            // ядра нет, и подменить его нечем — идём общим путём.
+            return Ok(None);
+        }
         let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
         let Ok((packed_x, scales_x)) = xf.nvfp4_quantize_act() else {
             return Ok(None);
@@ -1523,7 +1612,7 @@ impl MoeFfn {
         gate_up: &Tensor,
         m: usize,
     ) -> Result<Tensor, ModelError> {
-        if down.quant_dtype() == Some(DType::NVFP4) {
+        if down.quant_dtype() == Some(DType::NVFP4) && self.cfg.activation == Activation::Silu {
             if let Ok((packed, scales)) = gate_up.silu_mul_quant_nvfp4(1.0) {
                 return down.forward_prequant(&packed, &scales, m);
             }
@@ -1543,6 +1632,12 @@ impl MoeFfn {
             .narrow(1, i, i)
             .and_then(|t| t.contiguous())
             .map_err(|e| ModelError::Forward(format!("MoE: up: {e}")))?;
+        if self.cfg.activation == Activation::GeluTanh {
+            return gate
+                .gelu_tanh()
+                .and_then(|g| g.mul(&up))
+                .map_err(|e| ModelError::Forward(format!("MoE: geglu: {e}")));
+        }
         // Fused-ядро есть не на всех устройствах — тогда обычные silu и mul.
         match gate.silu_and_mul(&up) {
             Ok(h) => Ok(h),

@@ -47,6 +47,39 @@ impl LinearAttnConfig {
     }
 }
 
+/// Геометрия внимания global-слоёв, когда она отличается от sliding-слоёв
+/// (Gemma-4: голова 512 против 256, две KV-головы против восьми, V берётся
+/// из той же проекции, что и K).
+#[derive(Debug, Clone)]
+pub struct GlobalAttn {
+    pub head_dim: usize,
+    pub num_key_value_heads: usize,
+    /// `attention_k_eq_v`: своей матрицы V у слоя нет, значения — выход
+    /// `k_proj` ДО Q/K-нормы и RoPE.
+    pub k_eq_v: bool,
+}
+
+/// MoE-ветка, считающаяся ПАРАЛЛЕЛЬНО плотному MLP (Gemma-4: плотный MLP
+/// играет роль всегда активного эксперта, у каждой ветки свои нормы).
+#[derive(Debug, Clone)]
+pub struct MoeBranch {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+}
+
+/// Профильные расширения, которых нет у обычного dense-декодера. `None` в
+/// [`DecoderConfig::ext`] — модель без них (весь прежний парк).
+#[derive(Debug, Clone, Default)]
+pub struct DecoderExt {
+    pub global_attn: Option<GlobalAttn>,
+    /// RMS-норма без веса поверх V (Gemma-4 `v_norm`).
+    pub v_rms_norm: bool,
+    pub moe: Option<MoeBranch>,
+    /// Выход блока умножается на скаляр `layers.N.layer_scalar` из весов.
+    pub layer_scalar: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     pub vocab_size: usize,
@@ -82,6 +115,8 @@ pub struct DecoderConfig {
     pub tie_word_embeddings: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_ids: Vec<u32>,
+
+    pub ext: Option<DecoderExt>,
 }
 
 impl DecoderConfig {
@@ -104,6 +139,38 @@ impl DecoderConfig {
         let p = self.sliding_window_pattern;
         p <= 1 || (idx + 1) % p == 0
     }
+    /// Голова слоя: у global-слоя она может быть шире (Gemma-4).
+    pub fn head_dim_at(&self, idx: usize) -> usize {
+        match self.global_attn_at(idx) {
+            Some(g) => g.head_dim,
+            None => self.head_dim,
+        }
+    }
+    /// Сколько KV-голов у слоя.
+    pub fn kv_heads_at(&self, idx: usize) -> usize {
+        match self.global_attn_at(idx) {
+            Some(g) => g.num_key_value_heads,
+            None => self.num_key_value_heads,
+        }
+    }
+    /// Берёт ли слой V из проекции K (своей матрицы V у него нет).
+    pub fn k_eq_v_at(&self, idx: usize) -> bool {
+        self.global_attn_at(idx).is_some_and(|g| g.k_eq_v)
+    }
+    fn global_attn_at(&self, idx: usize) -> Option<&GlobalAttn> {
+        let g = self.ext.as_ref()?.global_attn.as_ref()?;
+        self.is_global_layer(idx).then_some(g)
+    }
+    /// Самая широкая голова модели — по ней считается ёмкость RoPE-кэша и
+    /// верхняя оценка KV.
+    pub fn max_head_dim(&self) -> usize {
+        let g = self.ext.as_ref().and_then(|e| e.global_attn.as_ref()).map_or(0, |g| g.head_dim);
+        self.head_dim.max(g)
+    }
+    pub fn moe_branch(&self) -> Option<&MoeBranch> {
+        self.ext.as_ref()?.moe.as_ref()
+    }
+
     pub fn rope_for(&self, idx: usize) -> &RopeSpec {
         if self.is_global_layer(idx) {
             &self.rope_global
@@ -119,7 +186,8 @@ impl DecoderConfig {
         }
     }
     pub fn simple_profile(&self) -> bool {
-        !self.attn_output_gate
+        self.ext.is_none()
+            && !self.attn_output_gate
             && !self.sandwich_norms
             && self.sliding_window.is_none()
             && self.linear.is_none()
@@ -132,7 +200,7 @@ impl DecoderConfig {
     /// attn-output-gate, partial-RoPE и Q/K-norm. НЕ поддержаны sandwich-нормы,
     /// sliding-window и отдельный local-RoPE (нужен per-layer rope-кэш в графе).
     pub fn graph_decode_ok(&self) -> bool {
-        self.rope_local.is_none() || self.rope_global.rotary_dim == 0
+        self.ext.is_none() && (self.rope_local.is_none() || self.rope_global.rotary_dim == 0)
     }
 
     /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph
@@ -141,7 +209,8 @@ impl DecoderConfig {
     /// реализует (муза префиллится host-путём). Linear-слои допустимы только в
     /// MTP-verify гибрида.
     pub fn graph_prefill_ok(&self) -> bool {
-        !self.sandwich_norms
+        self.ext.is_none()
+            && !self.sandwich_norms
             && self.sliding_window.is_none()
             && self.rope_local.is_none()
             && !self.embed_rms_norm

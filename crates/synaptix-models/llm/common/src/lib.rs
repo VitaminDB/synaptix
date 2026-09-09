@@ -8,7 +8,8 @@ pub mod mtp;
 pub mod weights;
 
 pub use config::{
-    Activation, DecoderConfig, LayerKind, LinearAttnConfig, NormGain, RopeSpec,
+    Activation, DecoderConfig, DecoderExt, GlobalAttn, LayerKind, LinearAttnConfig, MoeBranch,
+    NormGain, RopeSpec,
 };
 pub use generate::{
     eos_set, generate, generate_streaming, generate_streaming_resume, GenerationConfig,

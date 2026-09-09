@@ -69,6 +69,7 @@ fn qwen3_embedding_config() -> DecoderConfig {
         tie_word_embeddings: true,
         bos_token_id: Some(151643),
         eos_token_ids: vec![151643],
+        ext: None,
     }
 }
 

@@ -85,6 +85,7 @@ pub fn to_decoder_config(cfg: &LmConfig) -> DecoderConfig {
         tie_word_embeddings: true,
         bos_token_id: Some(cfg.bos_token_id),
         eos_token_ids: vec![cfg.eos_token_id],
+        ext: None,
     }
 }
 

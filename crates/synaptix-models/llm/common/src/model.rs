@@ -160,10 +160,15 @@ fn is_oom_err(e: &ModelError) -> bool {
 pub struct FullAttn {
     q_proj: QLinear,
     k_proj: QLinear,
-    v_proj: QLinear,
+    /// `None` — слой берёт значения из проекции K (`attention_k_eq_v` у
+    /// Gemma-4): своей матрицы V в чекпойнте нет.
+    v_proj: Option<QLinear>,
     o_proj: QLinear,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    /// RMS-норма поверх V без обучаемого веса (Gemma-4). Хранится вектором
+    /// единиц, чтобы путь совпал с обычной head-нормой.
+    v_norm: Option<Tensor>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -213,6 +218,22 @@ pub struct Mlp {
     activation: Activation,
 }
 
+/// MoE-ветка блока: считается ПАРАЛЛЕЛЬНО плотному MLP от одного и того же
+/// входа, выходы складываются под общей пост-нормой (Gemma-4, где плотный MLP
+/// играет роль всегда активного эксперта).
+pub struct MoeSide {
+    /// Вес RMS-нормы входа роутера. В HF норма роутера без веса, а результат
+    /// домножается на `router.scale · hidden^-1/2`; множитель свёрнут сюда.
+    router_norm: Tensor,
+    /// `pre_feedforward_layernorm_2` — вход экспертов.
+    pre_norm: Tensor,
+    /// `post_feedforward_layernorm_1` — поверх выхода плотного MLP.
+    post_dense: Tensor,
+    /// `post_feedforward_layernorm_2` — поверх выхода MoE.
+    post_moe: Tensor,
+    ffn: crate::moe::MoeFfn,
+}
+
 pub struct Block {
     pre_attn_norm: Tensor,
     post_attn_norm: Option<Tensor>,
@@ -220,6 +241,9 @@ pub struct Block {
     post_mlp_norm: Option<Tensor>,
     mixer: Mixer,
     mlp: Mlp,
+    moe: Option<MoeSide>,
+    /// Множитель на выходе блока (`layers.N.layer_scalar`).
+    layer_scalar: Option<f32>,
     rms_eps: f32,
     post_eps: f32,
 }
@@ -233,10 +257,14 @@ impl FullAttn {
         Ok(Self {
             q_proj: self.q_proj.to_device(dev)?,
             k_proj: self.k_proj.to_device(dev)?,
-            v_proj: self.v_proj.to_device(dev)?,
+            v_proj: match &self.v_proj {
+                Some(p) => Some(p.to_device(dev)?),
+                None => None,
+            },
             o_proj: self.o_proj.to_device(dev)?,
             q_norm: ot(&self.q_norm)?,
             k_norm: ot(&self.k_norm)?,
+            v_norm: ot(&self.v_norm)?,
             num_heads: self.num_heads,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
@@ -323,7 +351,7 @@ impl FullAttn {
     fn bytes(&self) -> usize {
         self.q_proj.bytes()
             + self.k_proj.bytes()
-            + self.v_proj.bytes()
+            + self.v_proj.as_ref().map_or(0, |p| p.bytes())
             + self.o_proj.bytes()
             + tensor_bytes(self.q_norm.as_ref())
             + tensor_bytes(self.k_norm.as_ref())
@@ -362,6 +390,7 @@ impl Block {
         };
         mixer
             + self.mlp.bytes()
+            + self.moe.as_ref().map_or(0, |m| m.ffn.bytes())
             + tensor_bytes(Some(&self.pre_attn_norm))
             + tensor_bytes(self.post_attn_norm.as_ref())
             + tensor_bytes(Some(&self.pre_mlp_norm))
@@ -380,6 +409,11 @@ impl Block {
         let ot = |x: &Option<Tensor>| -> Result<Option<Tensor>, ModelError> {
             Ok(match x { Some(v) => Some(t(v)?), None => None })
         };
+        if self.moe.is_some() {
+            return Err(ModelError::Build(
+                "host-stream блоков не поддержан для слоёв с MoE-веткой".into(),
+            ));
+        }
         let mixer = match &self.mixer {
             Mixer::Full(fa) => Mixer::Full(fa.to_device(dev)?),
             Mixer::Linear(la) => Mixer::Linear(la.to_device(dev)?),
@@ -391,6 +425,8 @@ impl Block {
             post_mlp_norm: ot(&self.post_mlp_norm)?,
             mixer,
             mlp: self.mlp.to_device(dev)?,
+            moe: None,
+            layer_scalar: self.layer_scalar,
             rms_eps: self.rms_eps,
             post_eps: self.post_eps,
         })
@@ -1016,7 +1052,10 @@ impl DecoderModel {
             QLinear::build(w, ld, compute)?
         };
 
-        let use_flash = cfg.simple_profile() || matches!(cfg.head_dim, 64 | 128 | 256);
+        // Флеш-ядро bf16 умеет голову, кратную 128 и не шире 512; тайловый
+        // быстрый путь — только 128/256. Профиль решается послойно: у Gemma-4
+        // global-слои шире sliding-слоёв.
+        let flash_ok = |hd: usize| cfg.simple_profile() || matches!(hd, 64 | 128 | 256 | 512);
         let lin = cfg.linear.as_ref();
         let q_scale = lin.map(|l| 1.0 / (l.key_head_dim as f32).sqrt()).unwrap_or(1.0);
 
@@ -1024,23 +1063,36 @@ impl DecoderModel {
         for l in 0..cfg.num_hidden_layers {
             let key = |s: &str| format!("model.layers.{l}.{s}");
             let mixer = match cfg.layer_kind(l) {
-                LayerKind::Full => Mixer::Full(FullAttn {
-                    q_proj: qlin(&key("self_attn.q_proj.weight"), attn_w)?,
-                    k_proj: qlin(&key("self_attn.k_proj.weight"), attn_w)?,
-                    v_proj: qlin(&key("self_attn.v_proj.weight"), attn_w)?,
-                    o_proj: qlin(&key("self_attn.o_proj.weight"), attn_w)?,
-                    q_norm: if cfg.qk_norm { Some(norm(&key("self_attn.q_norm.weight"))?) } else { None },
-                    k_norm: if cfg.qk_norm { Some(norm(&key("self_attn.k_norm.weight"))?) } else { None },
-                    num_heads: cfg.num_attention_heads,
-                    num_kv_heads: cfg.num_key_value_heads,
-                    head_dim: cfg.head_dim,
-                    rotary_dim: cfg.rope_for(l).rotary_dim,
-                    attn_output_gate: cfg.attn_output_gate,
-                    attn_scale: cfg.attn_scale,
-                    rms_eps: eps,
-                    use_flash,
-                    sliding_window: cfg.window_for(l),
-                }),
+                LayerKind::Full => {
+                    let hd = cfg.head_dim_at(l);
+                    let ones = |n: usize| -> Result<Tensor, ModelError> {
+                        Tensor::from_vec(vec![1.0_f32; n], vec![n], b_dev)
+                            .and_then(|t| t.to_dtype(compute))
+                            .map_err(|e| ModelError::Load(e.to_string()))
+                    };
+                    Mixer::Full(FullAttn {
+                        q_proj: qlin(&key("self_attn.q_proj.weight"), attn_w)?,
+                        k_proj: qlin(&key("self_attn.k_proj.weight"), attn_w)?,
+                        v_proj: if cfg.k_eq_v_at(l) {
+                            None
+                        } else {
+                            Some(qlin(&key("self_attn.v_proj.weight"), attn_w)?)
+                        },
+                        o_proj: qlin(&key("self_attn.o_proj.weight"), attn_w)?,
+                        q_norm: if cfg.qk_norm { Some(norm(&key("self_attn.q_norm.weight"))?) } else { None },
+                        k_norm: if cfg.qk_norm { Some(norm(&key("self_attn.k_norm.weight"))?) } else { None },
+                        v_norm: if cfg.ext.as_ref().is_some_and(|e| e.v_rms_norm) { Some(ones(hd)?) } else { None },
+                        num_heads: cfg.num_attention_heads,
+                        num_kv_heads: cfg.kv_heads_at(l),
+                        head_dim: hd,
+                        rotary_dim: cfg.rope_for(l).rotary_dim,
+                        attn_output_gate: cfg.attn_output_gate,
+                        attn_scale: cfg.attn_scale,
+                        rms_eps: eps,
+                        use_flash: flash_ok(hd),
+                        sliding_window: cfg.window_for(l),
+                    })
+                }
                 LayerKind::Linear => {
                     let lc = lin.ok_or_else(|| ModelError::Build("linear layer без LinearAttnConfig".into()))?;
                     let conv_w = host_f32(&key("linear_attn.conv1d.weight"))?;
@@ -1102,6 +1154,61 @@ impl DecoderModel {
                 down_proj: qlin(&key("mlp.down_proj.weight"), mlp_w)?,
                 activation: cfg.activation,
             };
+            // MoE-ветка: свои нормы, свой роутер. Множитель роутера
+            // (`router.scale · hidden^-1/2`) сворачивается в вес нормы — в HF
+            // норма роутера идёт без веса, а результат домножается отдельно.
+            let moe = match cfg.moe_branch() {
+                None => None,
+                Some(mb) => {
+                    let root = weights.tensor(&key("router.scale"), b_dev, DType::F32)?;
+                    let router_norm = root
+                        .mul_scalar(1.0 / (cfg.hidden_size as f32).sqrt())
+                        .and_then(|t| t.to_dtype(compute))
+                        .map_err(|e| ModelError::Load(e.to_string()))?;
+                    let per_expert_scale = weights
+                        .tensor(&key("router.per_expert_scale"), Device::Cpu, DType::F32)?
+                        .flatten_all()
+                        .and_then(|t| t.to_vec1::<f32>())
+                        .map_err(|e| ModelError::Load(e.to_string()))?;
+                    let mcfg = crate::moe::MoeConfig {
+                        hidden_size: cfg.hidden_size,
+                        moe_intermediate_size: mb.moe_intermediate_size,
+                        num_experts: mb.num_experts,
+                        num_experts_per_tok: mb.num_experts_per_tok,
+                        shared_intermediate_size: 0,
+                        norm_topk_prob: true,
+                        chunk: 512,
+                        skip_below: 0.0,
+                        router_key: Some("router.proj.weight".into()),
+                        per_expert_scale: Some(per_expert_scale),
+                        activation: cfg.activation,
+                    };
+                    let prefix = format!("model.layers.{l}");
+                    let ffn = crate::moe::MoeFfn::load(
+                        weights, &prefix, mcfg, device, compute, mlp_w,
+                    )?;
+                    Some(MoeSide {
+                        router_norm,
+                        pre_norm: norm(&key("pre_feedforward_layernorm_2.weight"))?,
+                        post_dense: norm(&key("post_feedforward_layernorm_1.weight"))?,
+                        post_moe: norm(&key("post_feedforward_layernorm_2.weight"))?,
+                        ffn,
+                    })
+                }
+            };
+            let layer_scalar = if cfg.ext.as_ref().is_some_and(|e| e.layer_scalar) {
+                let v = weights.tensor(&key("layer_scalar"), Device::Cpu, DType::F32)?;
+                Some(
+                    v.flatten_all()
+                        .and_then(|t| t.to_vec1::<f32>())
+                        .map_err(|e| ModelError::Load(e.to_string()))?
+                        .first()
+                        .copied()
+                        .unwrap_or(1.0),
+                )
+            } else {
+                None
+            };
             blocks.push(Block {
                 pre_attn_norm: norm(&key("input_layernorm.weight"))?,
                 post_attn_norm: match post_attn_key {
@@ -1115,6 +1222,8 @@ impl DecoderModel {
                 },
                 mixer,
                 mlp,
+                moe,
+                layer_scalar,
                 rms_eps: eps,
                 post_eps: cfg.post_norm_eps.unwrap_or(eps),
             });
@@ -1348,11 +1457,14 @@ impl DecoderModel {
         // реального). Dtype — ПОСЛОЙНЫЙ: sliding-слои остаются плотными
         // (см. `layer_kv_mxfp8`), поэтому суммируем по слоям, а не умножаем
         // одну ставку на их количество.
-        let dense = {
-            let elem = (self.dtype.size_in_bits() / 8).max(1);
-            2 * c.num_key_value_heads * c.head_dim * elem
+        let elem = (self.dtype.size_in_bits() / 8).max(1);
+        // Геометрия послойная: у Gemma-4 global-слой держит две головы по 512,
+        // sliding — восемь по 256.
+        let dense = |l: usize| 2 * c.kv_heads_at(l) * c.head_dim_at(l) * elem;
+        let quant = |l: usize| {
+            let hd = c.head_dim_at(l);
+            2 * c.kv_heads_at(l) * (hd + hd.div_ceil(32))
         };
-        let quant = 2 * c.num_key_value_heads * (c.head_dim + c.head_dim.div_ceil(32));
         let ring_ok = self.ring_kv_ok();
         (0..self.blocks.len())
             .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
@@ -1363,9 +1475,9 @@ impl DecoderModel {
                 if ring_ok && c.window_for(l).is_some() {
                     0
                 } else if self.layer_kv_mxfp8(l) {
-                    quant
+                    quant(l)
                 } else {
-                    dense
+                    dense(l)
                 }
             })
             .sum()
@@ -1385,8 +1497,14 @@ impl DecoderModel {
         let elem = (self.dtype.size_in_bits() / 8).max(1);
         (0..self.blocks.len())
             .filter(|l| matches!(c.layer_kind(*l), LayerKind::Full))
-            .filter_map(|l| c.window_for(l))
-            .map(|w| 2 * batch * c.num_key_value_heads * max_seq.min(w + RING_SLACK) * c.head_dim * elem)
+            .filter_map(|l| c.window_for(l).map(|w| (l, w)))
+            .map(|(l, w)| {
+                2 * batch
+                    * c.kv_heads_at(l)
+                    * max_seq.min(w + RING_SLACK)
+                    * c.head_dim_at(l)
+                    * elem
+            })
             .sum()
     }
 
@@ -1397,7 +1515,9 @@ impl DecoderModel {
     /// compute-dtype: иначе `kv_append` получил бы BF16-источник на
     /// MXFP8-буфер и падал с «dtype mismatch src/dst».
     fn layer_kv_mxfp8(&self, l: usize) -> bool {
-        if self.kv_dtype != DType::MXFP8 || self.config.head_dim % 32 != 0 {
+        // MXFP8-ядро внимания умеет голову 128 или 256 — голову 512
+        // (global-слои Gemma-4) читать нечем, такой слой держит плотный KV.
+        if self.kv_dtype != DType::MXFP8 || !matches!(self.config.head_dim_at(l), 128 | 256) {
             return false;
         }
         match self.blocks.get(l).map(|b| &b.mixer) {
@@ -1471,7 +1591,6 @@ impl DecoderModel {
             )));
         }
         let c = &self.config;
-        let n_kv = c.num_key_value_heads;
         let hd = c.head_dim;
         if self.kv_dtype == DType::MXFP8 && hd % 32 != 0 {
             // Квантованный кэш живёт блоками по 32 элемента. При head_dim не
@@ -1494,6 +1613,8 @@ impl DecoderModel {
                         Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
                         _ => max_seq,
                     };
+                    let n_kv = c.kv_heads_at(l);
+                    let hd = c.head_dim_at(l);
                     // Послойно: MXFP8 достаётся только слоям, чей путь чтения —
                     // flash_attention_mxfp8kv. Sliding-слои и любой слой без
                     // flash остаются в compute-dtype.
@@ -1699,8 +1820,13 @@ impl DecoderModel {
             let residual2 = hidden.clone();
             let h = prof(dev, "norm", || rms_norm(&hidden, &blk.pre_mlp_norm, blk.rms_eps).coerr())?;
             let mlp_out = prof(dev, "mlp", || blk.mlp.forward(&h))?;
+            let mlp_out = self.ffn_branches(blk, &hidden, mlp_out, batch, s)?;
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             let out = prof(dev, "residual", || residual2.add(&mlp_out).coerr())?;
+            let out = match blk.layer_scalar {
+                Some(a) if a != 1.0 => out.mul_scalar(a).coerr()?,
+                _ => out,
+            };
             if dump_layers { record_layer_norm(idx, "mlp", &out, s, past); }
             Ok(out)
         };
@@ -1724,6 +1850,41 @@ impl DecoderModel {
         })?;
         kv_cache.seq_len = past + s;
         Ok(hidden)
+    }
+
+    /// Выход FFN-части блока: у обычной модели это выход плотного MLP, у
+    /// модели с MoE-веткой — сумма `post_1(mlp)` и `post_2(moe)`, где роутер и
+    /// эксперты смотрят на вход блока ДО pre-нормы MLP (Gemma-4).
+    fn ffn_branches(
+        &self,
+        blk: &Block,
+        block_in: &Tensor,
+        mlp_out: Tensor,
+        batch: usize,
+        s: usize,
+    ) -> Result<Tensor, ModelError> {
+        let Some(moe) = &blk.moe else { return Ok(mlp_out) };
+        let dev = self.device;
+        let h = self.config.hidden_size;
+        let flat = |t: &Tensor| t.reshape(vec![batch * s, h]).and_then(|x| x.contiguous()).coerr();
+        let router_in = prof(dev, "moe_norm", || {
+            rms_norm(block_in, &moe.router_norm, blk.rms_eps).coerr()
+        })?;
+        let expert_in = prof(dev, "moe_norm", || {
+            rms_norm(block_in, &moe.pre_norm, blk.rms_eps).coerr()
+        })?;
+        let moe_out = prof(dev, "moe", || {
+            moe.ffn.forward_routed(&flat(&expert_in)?, Some(&flat(&router_in)?))
+        })?;
+        let moe_out = moe_out.reshape(vec![batch, s, h]).coerr()?;
+        let dense = rms_norm(&mlp_out, &moe.post_dense, blk.post_eps).coerr()?;
+        let sparse = rms_norm(&moe_out, &moe.post_moe, blk.post_eps).coerr()?;
+        let sparse = if sparse.dtype() == dense.dtype() {
+            sparse
+        } else {
+            sparse.to_dtype(dense.dtype()).coerr()?
+        };
+        prof(dev, "residual", || dense.add(&sparse).coerr())
     }
 
     /// Энкодер-проход: вернуть ВСЕ hidden states как HF `output_hidden_states=True`:
@@ -1789,6 +1950,11 @@ impl DecoderModel {
             let residual2 = hidden.clone();
             let h = rms_norm(&hidden, &blk.pre_mlp_norm, blk.rms_eps).coerr()?;
             let mlp_out = blk.mlp.forward(&h)?;
+            if blk.moe.is_some() {
+                return Err(ModelError::Forward(
+                    "forward_hidden_states: MoE-ветка не поддержана".into(),
+                ));
+            }
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             residual2.add(&mlp_out).coerr()
         };
@@ -2151,11 +2317,19 @@ impl FullAttn {
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let k = prof(device, "attn_kproj", || self.k_proj.forward(h))?.reshape(vec![batch, s, nkv, hd]).coerr()?
             .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let v = prof(device, "attn_vproj", || self.v_proj.forward(h))?.reshape(vec![batch, s, nkv, hd]).coerr()?
-            .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
+        // `attention_k_eq_v`: значения — тот же выход `k_proj`, снятый ДО
+        // Q/K-нормы и RoPE (в HF `value_states` держит ссылку на дорезанный
+        // тензор, а `key_states` переприсваивается).
+        let v = match &self.v_proj {
+            Some(vp) => prof(device, "attn_vproj", || vp.forward(h))?
+                .reshape(vec![batch, s, nkv, hd]).coerr()?
+                .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
+            None => k.clone(),
+        };
 
         let q = prof(device, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let k = prof(device, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
+        let v = prof(device, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
 
         let q = prof(device, "attn_rope", || partial_rope(&q, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
         let k = prof(device, "attn_rope", || partial_rope(&k, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
@@ -2352,7 +2526,12 @@ impl FullAttn {
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let k = proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?
             .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let v = proj_shared(&self.v_proj, h, &act, dev, "attn_vproj")?
+        let Some(v_proj) = self.v_proj.as_ref() else {
+            return Err(ModelError::Forward(
+                "device-путь не поддерживает слои с V=K (attention_k_eq_v)".into(),
+            ));
+        };
+        let v = proj_shared(v_proj, h, &act, dev, "attn_vproj")?
             .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
@@ -2460,7 +2639,12 @@ impl FullAttn {
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let k = proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?
             .reshape(vec![1, t, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let v = proj_shared(&self.v_proj, h, &act, dev, "attn_vproj")?
+        let Some(v_proj) = self.v_proj.as_ref() else {
+            return Err(ModelError::Forward(
+                "device-путь не поддерживает слои с V=K (attention_k_eq_v)".into(),
+            ));
+        };
+        let v = proj_shared(v_proj, h, &act, dev, "attn_vproj")?
             .reshape(vec![1, t, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let q = apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps)?;
         let k = apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps)?;

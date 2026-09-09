@@ -17,6 +17,7 @@ use synaptix_llm_common::{
     mrope, GenerationConfig, KvCache as LlmKvCache, LinearSnapshot, StreamSink,
 };
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
+use synaptix_llm_gemma4::pipeline::Gemma4Pipeline;
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
@@ -465,6 +466,7 @@ enum LlmPipeline {
     Hybrid(HybridPipeline),
     Llama(LlamaPipeline),
     Gemma3(GemmaPipeline),
+    Gemma4(Gemma4Pipeline),
     MuseGlimmer(MusePipeline),
 }
 
@@ -476,6 +478,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => p.model.rope_capacity(),
             Self::Llama(p) => p.model.rope_capacity(),
             Self::Gemma3(p) => p.model.rope_capacity(),
+            Self::Gemma4(p) => p.model.rope_capacity(),
             Self::MuseGlimmer(p) => p.model.rope_capacity(),
         }
     }
@@ -495,6 +498,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => p.model.kv_bytes_per_token(),
             Self::Llama(p) => p.model.kv_bytes_per_token(),
             Self::Gemma3(p) => p.model.kv_bytes_per_token(),
+            Self::Gemma4(p) => p.model.kv_bytes_per_token(),
             Self::MuseGlimmer(p) => p.model.kv_bytes_per_token(),
         }
     }
@@ -508,6 +512,8 @@ impl LlmPipeline {
             Self::Hybrid(p) => Some((p.model.block_bytes(), p.model.block_count())),
             Self::Llama(p) => Some((p.model.block_bytes(), p.model.block_count())),
             Self::Gemma3(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            // Ветка MoE блок целиком на хост не переносит — оффлоада блоков нет.
+            Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some((p.model.block_bytes(), p.model.block_count())),
             // У Qwen4Exp свой оффлоад — кэш экспертов.
             Self::Qwen4Exp(_) => None,
@@ -520,6 +526,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => Some(p.model.resident_blocks()),
             Self::Llama(p) => Some(p.model.resident_blocks()),
             Self::Gemma3(p) => Some(p.model.resident_blocks()),
+            Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.resident_blocks()),
             Self::Qwen4Exp(_) => None,
         }
@@ -531,6 +538,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => Some(p.model.set_block_residency(resident)),
             Self::Llama(p) => Some(p.model.set_block_residency(resident)),
             Self::Gemma3(p) => Some(p.model.set_block_residency(resident)),
+            Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.set_block_residency(resident)),
             Self::Qwen4Exp(_) => None,
         }
@@ -543,6 +551,7 @@ impl LlmPipeline {
             Self::Hybrid(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Llama(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Gemma3(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Gemma4(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::MuseGlimmer(p) => p.model.kv_fixed_bytes(batch, max_seq),
         }
     }
@@ -718,6 +727,11 @@ impl LlmPipeline {
                 }
                 Ok(())
             }
+            // У Gemma-4 стрим нативный: общий декодер умеет token-by-token.
+            LlmPipeline::Gemma4(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
             LlmPipeline::Gemma3(p) => {
                 use synaptix_llm_gemma3::pipeline::GenerationConfig as GCfg;
                 let gcfg = GCfg {
@@ -770,6 +784,11 @@ enum SessionKind {
     /// поэтому снимок не нужен; зато у sliding-слоёв кэш держит лишь последние
     /// W токенов — граница должна попадать в окно.
     Muse { dcache: Option<DFlashCache> },
+    /// Обычный декодер без рекуррентного состояния и без вспомогательных
+    /// кэшей: сессия — это ровно основной KV (Gemma-4). Sliding-слои у неё
+    /// держат кэш на всю длину контекста, а не ring-окном, поэтому граница
+    /// префикса всегда внутри буфера.
+    Plain,
     /// Qwen4Exp: весь кэш хода (KV+индексатор QSA, рекуррентное состояние GDN,
     /// свёртка PLE) живёт своим типом внутри пайплайна, поэтому общий
     /// `LlmKvCache` для такой сессии пустой — вся работа идёт через
@@ -816,6 +835,7 @@ impl LlmKvSession {
                     0
                 }
             }
+            SessionKind::Plain => n,
             // У Qwen4Exp свой кэш и свой счёт токенов — `self.ids` для него
             // не ведётся.
             SessionKind::Qwen4Exp(s) => s.reusable(prompt_ids),
@@ -837,6 +857,7 @@ impl LlmKvSession {
                     d.reset();
                 }
             }
+            SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => s.invalidate(),
         }
     }
@@ -868,6 +889,7 @@ impl LlmKvSession {
                     moved += d.park_to_host().map_err(|e| LlmError(e.to_string()))?;
                 }
             }
+            SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => {
                 moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
             }
@@ -899,6 +921,7 @@ impl LlmKvSession {
                     moved += d.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
                 }
             }
+            SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => {
                 moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
             }
@@ -931,6 +954,7 @@ impl LlmKvSession {
                     total += d.device_bytes();
                 }
             }
+            SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => total += s.device_bytes(),
         }
         total
@@ -950,6 +974,7 @@ impl LlmKvSession {
                     d.reset();
                 }
             }
+            SessionKind::Plain => {}
             // Qwen4Exp сбрасывает свой кэш сам, внутри хода.
             SessionKind::Qwen4Exp(_) => {}
         }
@@ -1033,6 +1058,15 @@ impl Llm {
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Muse { dcache },
+                }))
+            }
+            LlmPipeline::Gemma4(p) => {
+                let kv = p.make_kv_cache(ctx).map_err(|e| LlmError(e.to_string()))?;
+                Ok(Some(LlmKvSession {
+                    kv,
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Plain,
                 }))
             }
             LlmPipeline::Qwen4Exp(p) => {
@@ -1636,6 +1670,25 @@ impl<'a> LlmGeneration<'a> {
                     Err(e) => Err(LlmError(e.to_string())),
                 }
             }
+            LlmPipeline::Gemma4(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let reuse = session.reusable(prompt_ids);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                let res = p
+                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                    .map(|_| ());
+                session.ids = prompt_ids.to_vec();
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
             LlmPipeline::Qwen4Exp(p) => {
                 let SessionKind::Qwen4Exp(s) = &mut session.kind else {
                     return Err(LlmError("префикс-KV: сессия от другой модели".into()));
@@ -1878,8 +1931,11 @@ fn build_tokenizer(model: &Path) -> Result<HfTokenizer, LlmError> {
     HfTokenizer::from_bytes(&bytes).map_err(|e| LlmError(format!("tokenizer.json: {e}")))
 }
 
-/// Стоп-токены: eos из specials + `<|im_end|>` (конец хода чата).
-fn build_eos_ids(tok: &HfTokenizer, specials: &SpecialTokens) -> Vec<u32> {
+/// Стоп-токены: eos из specials, конец хода чата (ChatML `<|im_end|>`,
+/// Gemma-3 `<end_of_turn>`, Gemma-4 `<turn|>`) и весь список из
+/// `generation_config.json` — там он у некоторых моделей шире, чем в
+/// `config.json`, а стоп-токен «конец хода» живёт только там.
+fn build_eos_ids(tok: &HfTokenizer, specials: &SpecialTokens, model: &Path) -> Vec<u32> {
     let mut ids: Vec<u32> = Vec::new();
     let mut push = |id: Option<u32>| {
         if let Some(i) = id {
@@ -1892,6 +1948,21 @@ fn build_eos_ids(tok: &HfTokenizer, specials: &SpecialTokens) -> Vec<u32> {
     push(specials.id_of(SpecialTokenKind::ImEnd));
     push(tok.token_to_id("<|im_end|>"));
     push(tok.token_to_id("<|eot|>"));
+    push(tok.token_to_id("<end_of_turn>"));
+    push(tok.token_to_id("<turn|>"));
+    for name in ["generation_config.json", "config.json"] {
+        let Some(bytes) = read_model_file(model, name) else { continue };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        match v.get("eos_token_id") {
+            Some(serde_json::Value::Array(a)) => {
+                for x in a {
+                    push(x.as_u64().map(|x| x as u32));
+                }
+            }
+            Some(serde_json::Value::Number(n)) => push(n.as_u64().map(|x| x as u32)),
+            _ => {}
+        }
+    }
     ids
 }
 
@@ -1913,7 +1984,7 @@ fn build_facade(
 ) -> Result<(Llm, LlmTokenizer), LlmError> {
     let tokenizer = build_tokenizer(path)?;
     let specials = tokenizer.special_tokens().clone();
-    let eos_ids = build_eos_ids(&tokenizer, &specials);
+    let eos_ids = build_eos_ids(&tokenizer, &specials, path);
     let vocab_size = tokenizer.vocab_size(true);
     let template = load_template_source(path)
         .map(|src| ChatTemplate::from_source_with_specials(src, specials.clone()));
@@ -1968,6 +2039,9 @@ pub fn load_llm(
         LlmArch::Gemma3 => GemmaPipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Gemma3)
             .map_err(|e| LlmError(format!("load gemma3: {e}")))?,
+        LlmArch::Gemma4 => Gemma4Pipeline::load_with_precision(path, device, precision, max_seq)
+            .map(LlmPipeline::Gemma4)
+            .map_err(|e| LlmError(format!("load gemma4: {e}")))?,
         LlmArch::MuseGlimmer => {
             let mut p = MusePipeline::load_with_precision(path, device, precision, max_seq)
                 .map_err(|e| LlmError(format!("load muse_glimmer: {e}")))?;

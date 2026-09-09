@@ -121,6 +121,7 @@ impl Qwen3Config {
             tie_word_embeddings: self.tie_word_embeddings,
             bos_token_id: self.bos_token_id,
             eos_token_ids: self.eos_token_id.into_iter().collect(),
+            ext: None,
         }
     }
 

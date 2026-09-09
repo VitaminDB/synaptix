@@ -1,0 +1,25 @@
+[package]
+name = "synaptix-llm-gemma4"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Gemma4 (MoE рядом с плотным MLP, широкие global-слои с V=K, proportional RoPE)."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-io        = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

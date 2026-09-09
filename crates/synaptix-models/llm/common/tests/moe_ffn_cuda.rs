@@ -76,6 +76,9 @@ fn cfg() -> MoeConfig {
         norm_topk_prob: true,
         chunk: 4,
         skip_below: 0.0,
+        router_key: None,
+        per_expert_scale: None,
+        activation: synaptix_llm_common::Activation::Silu,
     }
 }
 
