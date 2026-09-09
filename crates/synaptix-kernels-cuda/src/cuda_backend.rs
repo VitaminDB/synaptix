@@ -580,10 +580,10 @@ impl Backend for CudaBackend {
                     let x_view = unsafe { x_buf.slice().transmute::<f16>(mk) }.ok_or_else(|| {
                         SynaptixError::Cuda("linear_quant MXFP8: transmute x→f16".into())
                     })?;
-                    let mut x_fp8 = stream.alloc_zeros::<u8>(mk).map_err(|e| {
+                    let mut x_fp8 = unsafe { stream.alloc::<u8>(mk) }.map_err(|e| {
                         SynaptixError::Cuda(format!("linear_quant MXFP8: alloc x_fp8: {e:?}"))
                     })?;
-                    let mut x_sc = stream.alloc_zeros::<u8>(mk / 32).map_err(|e| {
+                    let mut x_sc = unsafe { stream.alloc::<u8>(mk / 32) }.map_err(|e| {
                         SynaptixError::Cuda(format!("linear_quant MXFP8: alloc x_sc: {e:?}"))
                     })?;
                     crate::elementwise::quant::mxfp8_quant_natural(
@@ -3708,20 +3708,15 @@ impl Backend for CudaBackend {
 
         // Скретч под четыре массива указателей и смещения строк. Аллокация
         // graph-ordered: под захватом она уходит в граф вместе с ядрами.
-        let mut w_out = stream
-            .alloc_zeros::<u64>(pairs)
+        let mut w_out = unsafe { stream.alloc::<u64>(pairs) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
-        let mut s_out = stream
-            .alloc_zeros::<u64>(pairs)
+        let mut s_out = unsafe { stream.alloc::<u64>(pairs) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
-        let mut xp_out = stream
-            .alloc_zeros::<u64>(pairs)
+        let mut xp_out = unsafe { stream.alloc::<u64>(pairs) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
-        let mut xs_out = stream
-            .alloc_zeros::<u64>(pairs)
+        let mut xs_out = unsafe { stream.alloc::<u64>(pairs) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
-        let mut off_out = stream
-            .alloc_zeros::<u32>(pairs)
+        let mut off_out = unsafe { stream.alloc::<u32>(pairs) }
             .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
 
         // Таблицы адресов и индексы лежат байтами в общих буферах — читаем их

@@ -155,7 +155,7 @@ impl QuantWeight {
         let out_layout = Layout::contiguous(Shape::new(vec![n, self.k]), DType::F16);
         let backend = registry::backend_for(self.device)?;
         let mut storage =
-            backend.alloc_zeros(DType::F16.bytes_for_numel(n * self.k), self.device)?;
+            backend.alloc_uninit(DType::F16.bytes_for_numel(n * self.k), self.device)?;
         let stream = Stream::default_for(self.device)?;
         backend.embed_gather_mxfp8(
             &packed,
@@ -292,7 +292,7 @@ impl QuantWeight {
 
         let out_layout = Layout::contiguous(Shape::new(vec![weights.len(), n]), DType::F16);
         let backend = registry::backend_for(device)?;
-        let mut storage = backend.alloc_zeros(DType::F16.bytes_for_numel(weights.len() * n), device)?;
+        let mut storage = backend.alloc_uninit(DType::F16.bytes_for_numel(weights.len() * n), device)?;
         let stream = Stream::default_for(device)?;
         backend.nvfp4_gemv_batched(
             &w_shuf,
@@ -402,7 +402,7 @@ impl ExpertTable {
         let out_layout = Layout::contiguous(Shape::new(vec![pairs, self.n]), DType::F16);
         let backend = registry::backend_for(self.device)?;
         let mut storage =
-            backend.alloc_zeros(DType::F16.bytes_for_numel(pairs * self.n), self.device)?;
+            backend.alloc_uninit(DType::F16.bytes_for_numel(pairs * self.n), self.device)?;
         let stream = Stream::default_for(self.device)?;
         let idx_c = if idx.is_contiguous() { idx.clone() } else { idx.contiguous()? };
         backend.nvfp4_gemv_indexed(

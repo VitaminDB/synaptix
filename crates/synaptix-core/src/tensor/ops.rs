@@ -589,7 +589,7 @@ pub(crate) fn run_reduce(t: &Tensor, op: ReduceOp, dims: &[usize], keepdim: bool
     let backend = registry::backend_for(t.device())?;
     let src = t.contiguous_view()?;
     let out_bytes = out_dtype.bytes_for_numel(out_layout.numel());
-    let mut storage = backend.alloc_zeros(out_bytes, t.device())?;
+    let mut storage = backend.alloc_uninit(out_bytes, t.device())?;
     let stream = Stream::default_for(t.device())?;
     backend.reduce(op, (&src.storage, &src.layout), (&mut storage, &out_layout), &sorted, &stream)?;
     let mut output = Tensor::from_parts(Arc::new(storage), out_layout);
@@ -606,7 +606,7 @@ pub(crate) fn run_cast(t: &Tensor, target: DType) -> Result<Tensor> {
     let src = t.contiguous_view()?;
     let out_layout = Layout::contiguous(src.shape().clone(), target);
     let out_bytes = target.bytes_for_numel(out_layout.numel());
-    let mut storage = backend.alloc_zeros(out_bytes, t.device())?;
+    let mut storage = backend.alloc_uninit(out_bytes, t.device())?;
     let stream = Stream::default_for(t.device())?;
     backend.cast((&src.storage, &src.layout), (&mut storage, &out_layout), &stream)?;
     let mut output = Tensor::from_parts(Arc::new(storage), out_layout);
@@ -622,7 +622,7 @@ impl Tensor {
         let backend: &'static dyn Backend = registry::backend_for(self.device())?;
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.copy((&self.storage, &self.layout), (&mut storage, &out_layout), &stream)?;
         let mut out = Tensor::from_parts(Arc::new(storage), out_layout);
@@ -668,7 +668,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.silu_and_mul(
             (&gate.storage, &gate.layout),
@@ -699,7 +699,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.rms_norm(
             (&x.storage, &x.layout),
@@ -744,8 +744,8 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut hidden_st = backend.alloc_zeros(out_bytes, self.device())?;
-        let mut y_st = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut hidden_st = backend.alloc_uninit(out_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.rms_norm_residual(
             (&x.storage, &x.layout),
@@ -784,8 +784,8 @@ impl Tensor {
         let scales_bytes = (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128);
         let x = self.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -821,8 +821,8 @@ impl Tensor {
         let scales_bytes = (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128);
         let x = self.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -930,9 +930,9 @@ impl Tensor {
         let sh = shift.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -988,9 +988,9 @@ impl Tensor {
         let wv = w.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1052,9 +1052,9 @@ impl Tensor {
         let sh = shift.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1099,8 +1099,8 @@ impl Tensor {
         let scales_bytes = m * (k / 32);
         let x = self.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1153,9 +1153,9 @@ impl Tensor {
         let sh = shift.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1210,9 +1210,9 @@ impl Tensor {
         let wv = w.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1273,9 +1273,9 @@ impl Tensor {
         let sh = shift.contiguous_view()?;
         let backend = registry::backend_for(self.device())?;
         let y_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
-        let mut y_st = backend.alloc_zeros(dt.bytes_for_numel(y_layout.numel()), self.device())?;
-        let mut packed_st = backend.alloc_zeros(packed_bytes, self.device())?;
-        let mut scales_st = backend.alloc_zeros(scales_bytes, self.device())?;
+        let mut y_st = backend.alloc_uninit(dt.bytes_for_numel(y_layout.numel()), self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
@@ -1317,7 +1317,7 @@ impl Tensor {
         let backend = registry::backend_for(self.device())?;
         let out_layout = Layout::contiguous(Shape::new(vec![m, w.n()]), out_dt);
         let out_bytes = out_dt.bytes_for_numel(out_layout.numel());
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.linear_quant_prequant(
             &self.storage,
@@ -2363,7 +2363,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.layer_norm(
             (&x.storage, &x.layout),
@@ -2390,7 +2390,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.rope_split(
             (&x.storage, &x.layout),
@@ -2427,7 +2427,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.rope_split_partial(
             (&x.storage, &x.layout),
@@ -2686,7 +2686,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention(
             (&q.storage, &q.layout),
@@ -2719,7 +2719,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention_window(
             (&q.storage, &q.layout),
@@ -2777,7 +2777,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention_mxfp8kv(
             (&q.storage, &q.layout),
@@ -2846,7 +2846,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.rope_apply_dev(
             (&x.storage, &x.layout),
@@ -2947,7 +2947,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention_dev(
             (&q.storage, &q.layout),
@@ -2982,7 +2982,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention_window_dev(
             (&q.storage, &q.layout),
@@ -3056,7 +3056,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![b, nh, t_q, d]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.flash_attention_mxfp8kv_dev(
             (&q.storage, &q.layout),
@@ -3088,7 +3088,7 @@ impl Tensor {
         let out_layout = Layout::contiguous(Shape::new(vec![n, dim]), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;
-        let mut storage = backend.alloc_zeros(out_bytes, self.device())?;
+        let mut storage = backend.alloc_uninit(out_bytes, self.device())?;
         let stream = Stream::default_for(self.device())?;
         backend.embed_gather(
             (&table.storage, &table.layout),
