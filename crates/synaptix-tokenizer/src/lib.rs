@@ -26,6 +26,7 @@ pub use tiktoken::TiktokenTokenizer;
 pub use unigram::UnigramTokenizer;
 pub use wordpiece::WordPieceTokenizer;
 
+pub use parsers::gemma4::{Gemma4Call, Gemma4Ids, Gemma4Split, Gemma4StreamParser};
 pub use parsers::json_stream::{JsonStreamEvent, JsonStreamParser};
 pub use parsers::reasoning_stream::{ReasoningEvent, ReasoningStreamParser};
 pub use parsers::tool_call::{ToolCallEvent, ToolCallParser};
