@@ -1033,13 +1033,26 @@ impl DecoderModel {
         // для gather). Иначе грузим lm_head.weight и квантуем по `lm_head_dtype`
         // (NVFP4 [vocab,hidden] %64==0 → GEMV; экономит 2.5GB→0.7GB чтения/токен).
         let lm_head = if cfg.tie_word_embeddings {
-            QLinear::build(
-                embed_dense
-                    .clone()
-                    .ok_or_else(|| ModelError::Build("tied lm_head без embed".into()))?,
-                compute,
-                compute,
-            )?
+            // Голова связана с эмбеддингом, но КВАНТОВАТЬ её всё равно стоит:
+            // плотная BF16-голова на словаре 262k — это 1.5 ГБ чтения на
+            // КАЖДЫЙ токен декода (у Gemma-4 это была седьмая часть шага).
+            // Плотный эмбеддинг остаётся для gather'а, квант живёт рядом
+            // отдельной копией (NVFP4 — плюс 0.4 ГБ VRAM).
+            let dense = embed_dense
+                .clone()
+                .ok_or_else(|| ModelError::Build("tied lm_head без embed".into()))?;
+            if lm_head_dtype.is_quantized() && matches!(device, Device::Cuda(_)) {
+                let f16 = dense
+                    .to_dtype(DType::F16)
+                    .map_err(|e| ModelError::Build(e.to_string()))?;
+                let q = QLinear::build(f16, lm_head_dtype, compute)?;
+                if let Device::Cuda(o) = device {
+                    let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+                }
+                q
+            } else {
+                QLinear::build(dense, compute, compute)?
+            }
         } else if let Some(prequant) = weights.quant("lm_head.weight", device) {
             // Голова уже упакована в бандле — берём как есть.
             QLinear::Quant(prequant?)
@@ -1526,9 +1539,13 @@ impl DecoderModel {
         }
     }
 
+    /// Кольцевой KV у sliding-слоёв: буфер размером с окно вместо буфера на
+    /// весь контекст. Ограничение по голове — от device-ядра окна
+    /// (`flash_splitq_*_win_dev`, HD 128 либо 256); на голове 256 это Gemma-3
+    /// и sliding-слои Gemma-4, где иначе кэш растёт вдесятеро.
     fn ring_kv_ok(&self) -> bool {
         matches!(self.device, Device::Cuda(_))
-            && self.config.head_dim == 128
+            && matches!(self.config.head_dim, 128 | 256)
             && matches!(self.dtype, DType::F16 | DType::BF16)
     }
 
@@ -1581,6 +1598,20 @@ impl DecoderModel {
         max_seq: usize,
         allow_mxfp8: bool,
     ) -> Result<KvCache, ModelError> {
+        self.make_kv_cache_full(batch, max_seq, allow_mxfp8, true)
+    }
+
+    /// Как [`Self::make_kv_cache_ext`], но `allow_ring=false` заставляет
+    /// sliding-слои держать кэш на всю длину. Нужен энкодерному проходу: он
+    /// считает последовательность ОДНИМ куском, а кольцевой буфер рассчитан на
+    /// чанки не длиннее окна.
+    pub fn make_kv_cache_full(
+        &self,
+        batch: usize,
+        max_seq: usize,
+        allow_mxfp8: bool,
+        allow_ring: bool,
+    ) -> Result<KvCache, ModelError> {
         if max_seq == 0 {
             return Err(ModelError::Shape("make_kv_cache: max_seq must be > 0".into()));
         }
@@ -1604,7 +1635,7 @@ impl DecoderModel {
                 self.dtype
             );
         }
-        let ring_ok = self.ring_kv_ok();
+        let ring_ok = allow_ring && self.ring_kv_ok();
         let mut layers = Vec::with_capacity(self.blocks.len());
         for l in 0..self.blocks.len() {
             let lc = match c.layer_kind(l) {
@@ -1925,7 +1956,7 @@ impl DecoderModel {
         let dev = self.device;
         // Энкодерный проход читает KV через sdpa/flash-window, не через
         // mxfp8kv-ядро → кэш всегда плотный, даже если политика модели MXFP8.
-        let mut kv = self.make_kv_cache_ext(batch, s, false)?;
+        let mut kv = self.make_kv_cache_full(batch, s, false, false)?;
 
         // key-padding bias [1,S]: 0 для valid, MASK_NEG для pad → broadcast_add к
         // causal-маске [s,s] внутри FullAttn (scaled_dot_attention бродкастит [s,s]
@@ -2460,6 +2491,43 @@ impl FullAttn {
             if let Some(a) = dev_prefill {
                 return Ok(a);
             }
+            // Один запрос (декод): KV читается device-ядром прямо из
+            // предвыделенного буфера, длина едет device-скаляром, окно
+            // накладывает само ядро. Иначе слой уходил в sdpa: `narrow` по оси
+            // времени даёт нераскладываемый вид, flash отвечал NonContiguous, и
+            // на каждый слой каждого токена приходились repeat_kv (аллокация
+            // плюс broadcast) и полтора десятка запусков — 0.28 мс на слой при
+            // 0.02 мс работы.
+            let dev_decode = if s == 1
+                && self.use_flash
+                && pad_bias.is_none()
+                && bidi_spans.is_empty()
+                && matches!(device, Device::Cuda(_))
+                && matches!(kv.k.dtype(), DType::F16 | DType::BF16)
+            {
+                let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device).coerr()?;
+                let r = match self.sliding_window {
+                    Some(w) => q.flash_attention_window_dev(
+                        &kv.k, &kv.v, &tc, self.attn_scale, (w - 1) as i32, true,
+                    ),
+                    None => q.flash_attention_dev(&kv.k, &kv.v, &tc, self.attn_scale, true),
+                };
+                match r {
+                    Ok(a) => Some(a),
+                    Err(e @ (SynaptixError::Unsupported(_) | SynaptixError::NonContiguous)) => {
+                        if std::env::var("SYN_TRACE_DECODE").is_ok() {
+                            eprintln!("[DEC_FALLBACK] hd={hd} nh={nh} nkv={nkv} sw={:?} len={local_len} kv={:?}: {e:?}", self.sliding_window, kv.k.dtype());
+                        }
+                        None
+                    }
+                    Err(e) => return Err(ModelError::Forward(e.to_string())),
+                }
+            } else {
+                None
+            };
+            if let Some(a) = dev_decode {
+                return Ok(a);
+            }
             let k_total = kv.k.narrow(2, att_lo, att_len).coerr()?;
             let v_total = kv.v.narrow(2, att_lo, att_len).coerr()?;
             let flash_win = self.sliding_window.is_some()
@@ -2492,7 +2560,12 @@ impl FullAttn {
                     let k_rep = repeat_kv(&k_total, group).coerr()?;
                     let v_rep = repeat_kv(&v_total, group).coerr()?;
                     let window = self.sliding_window;
-                    if s == 1 && window.is_none() && pad_bias.is_none() && bidi_spans.is_empty() {
+                    // На одном запросе маска не нужна и со sliding-окном: срез
+                    // [att_lo, att_lo+att_len) УЖЕ обрезан и причинностью, и
+                    // окном, внутри него запрещённых ключей нет. Раньше сюда
+                    // попадали все 25 sliding-слоёв, и каждый на каждый токен
+                    // строил маску на хосте и вёз её на карту — 0.28 мс на слой.
+                    if s == 1 && pad_bias.is_none() && bidi_spans.is_empty() {
                         scaled_dot_attention(&q, &k_rep, &v_rep, self.attn_scale, None).coerr()?
                     } else {
                         let past_rel = past - kv.start - att_lo;

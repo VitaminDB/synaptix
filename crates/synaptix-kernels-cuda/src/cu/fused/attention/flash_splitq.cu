@@ -791,4 +791,18 @@ __global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_win_dev(
   flash_splitq_win_dev_impl<__nv_bfloat16, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride, window);
 }
 
+// Голова 256 — sliding-слои Gemma-3/Gemma-4. Без этих инстанциаций декод таких
+// слоёв уходил в sdpa: repeat_kv плюс полтора десятка запусков на слой.
+__global__ void FSQ_BOUNDS flash_splitq_f16_hd256_win_dev(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride, int window) {
+  flash_splitq_win_dev_impl<__half, 256>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride, window);
+}
+__global__ void FSQ_BOUNDS flash_splitq_bf16_hd256_win_dev(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride, int window) {
+  flash_splitq_win_dev_impl<__nv_bfloat16, 256>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride, window);
+}
+
 }  // extern "C"

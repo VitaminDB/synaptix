@@ -51,6 +51,8 @@ pub struct FlashSplitQKernels {
     f16_hd128_v5_win: CudaFunction,
     f16_hd128_win_dev: CudaFunction,
     bf16_hd128_win_dev: CudaFunction,
+    f16_hd256_win_dev: CudaFunction,
+    bf16_hd256_win_dev: CudaFunction,
     f16_hd128_bshd_facc: CudaFunction,
     f16_hd128_v5_facc: CudaFunction,
 }
@@ -95,6 +97,8 @@ impl FlashSplitQKernels {
         let f16_hd128_v5_win = load_fn(&module, "flash_splitq5_f16_hd128_win")?;
         let f16_hd128_win_dev = load_fn(&module, "flash_splitq_f16_hd128_win_dev")?;
         let bf16_hd128_win_dev = load_fn(&module, "flash_splitq_bf16_hd128_win_dev")?;
+        let f16_hd256_win_dev = load_fn(&module, "flash_splitq_f16_hd256_win_dev")?;
+        let bf16_hd256_win_dev = load_fn(&module, "flash_splitq_bf16_hd256_win_dev")?;
         let f16_hd128_bshd_facc = load_fn(&module, "flash_splitq_f16_hd128_bshd_facc")?;
         let f16_hd128_v5_facc = load_fn(&module, "flash_splitq5_f16_hd128_facc")?;
 
@@ -125,6 +129,8 @@ impl FlashSplitQKernels {
             &f16_hd128_win,
             &f16_hd128_win_dev,
             &bf16_hd128_win_dev,
+            &f16_hd256_win_dev,
+            &bf16_hd256_win_dev,
             &f16_hd64_dev,
             &f16_hd128_dev,
             &f16_hd256_dev,
@@ -163,6 +169,8 @@ impl FlashSplitQKernels {
             f16_hd128_v5_win,
             f16_hd128_win_dev,
             bf16_hd128_win_dev,
+            f16_hd256_win_dev,
+            bf16_hd256_win_dev,
             f16_hd128_bshd_facc,
             f16_hd128_v5_facc,
             _module: module,
@@ -555,6 +563,7 @@ pub fn flash_splitq_window_u8_dev(
     causal: bool,
     t_stride: u32,
     window: i32,
+    d: u32,
 ) -> Result<()> {
     if b == 0 || nh == 0 || t_q == 0 {
         return Ok(());
@@ -569,10 +578,14 @@ pub fn flash_splitq_window_u8_dev(
             "flash_splitq_window_dev: t_stride must be > 0".into(),
         ));
     }
-    let d: u32 = 128;
-    let func = match dtype {
-        DType::BF16 => &kernels.bf16_hd128_win_dev,
-        DType::F16 => &kernels.f16_hd128_win_dev,
+    let func = match (dtype, d) {
+        (DType::BF16, 128) => &kernels.bf16_hd128_win_dev,
+        (DType::F16, 128) => &kernels.f16_hd128_win_dev,
+        (DType::BF16, 256) => &kernels.bf16_hd256_win_dev,
+        (DType::F16, 256) => &kernels.f16_hd256_win_dev,
+        (DType::BF16 | DType::F16, _) => {
+            return Err(SynaptixError::Unsupported("flash_splitq_window_dev: HD (128/256)"))
+        }
         _ => return Err(SynaptixError::Unsupported("flash_splitq_window_dev: dtype (F16/BF16)")),
     };
     let cfg = splitq_cfg(b, nh, t_q, d);

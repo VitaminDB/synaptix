@@ -173,6 +173,11 @@ impl FromStr for LayerSyncMode {
 #[derive(Debug, Clone)]
 pub struct QuantPolicy {
     pub weights_storage: DType,
+    /// Хранение весов ВНИМАНИЯ, если оно отличается от общего
+    /// `weights_storage`. `None` — как у всех. У Gemma-4 квант проекций
+    /// внимания заметен на глаз (греческий текст ломается на отдельных
+    /// словах), а стоит он всего десятой доли скорости.
+    pub attn_storage: Option<DType>,
     pub compute: DType,
     pub kv_dtype: KvDtypePolicy,
     pub lm_head_storage: DType,
@@ -187,6 +192,7 @@ impl QuantPolicy {
     pub fn quality() -> Self {
         Self {
             weights_storage: DType::BF16,
+            attn_storage: None,
             compute: DType::BF16,
             kv_dtype: KvDtypePolicy::BF16,
             lm_head_storage: DType::BF16,
@@ -201,6 +207,7 @@ impl QuantPolicy {
     pub fn balance() -> Self {
         Self {
             weights_storage: DType::NVFP4,
+            attn_storage: None,
             compute: DType::F16,
             kv_dtype: KvDtypePolicy::F16,
             lm_head_storage: DType::MXFP8,
@@ -215,6 +222,7 @@ impl QuantPolicy {
     pub fn vram_saver() -> Self {
         Self {
             weights_storage: DType::NVFP4,
+            attn_storage: None,
             compute: DType::F16,
             kv_dtype: KvDtypePolicy::F16,
             lm_head_storage: DType::NVFP4,
@@ -243,6 +251,9 @@ impl QuantPolicy {
         p.kv = self.kv_dtype.to_dtype();
         p.lm_head = self.lm_head_storage;
         p.embed = self.embed_storage;
+        if let Some(a) = self.attn_storage {
+            p.attn_w = a;
+        }
         p.validate().map_err(LlmError::from)?;
         Ok(p)
     }
@@ -286,6 +297,13 @@ pub fn optimal_profile(path: &Path) -> OptimalProfile {
     let mut policy = QuantPolicy::balance();
     policy.kv_dtype = KvDtypePolicy::MXFP8;
     policy.preset_name = "optimal".to_string();
+    // Gemma-4: проекции внимания остаются плотными. NVFP4 на них даёт около
+    // десятой доли скорости декода (82 против 90 ток/с на 5090 Laptop), но
+    // ломает отдельные слова в ответе — у Gemma «тяжёлые» активации, и
+    // четырёх бит проекциям внимания не хватает.
+    if matches!(arch, Some(LlmArch::Gemma4)) {
+        policy.attn_storage = Some(DType::BF16);
+    }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
     OptimalProfile {
         policy,

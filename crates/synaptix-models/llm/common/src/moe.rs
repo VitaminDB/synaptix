@@ -1389,15 +1389,37 @@ impl MoeFfn {
         t: usize,
         k: usize,
     ) -> Result<Option<Tensor>, ModelError> {
-        let picked: Vec<Arc<Expert>> = {
-            let mut out = Vec::with_capacity(pairs.len());
-            for p in pairs {
-                match &self.cache {
-                    Some(cache) => out.push(self.resident_expert(experts[*p] as usize, cache)?),
-                    None => return Ok(None),
+        // Резидентная MoE (эксперты уже на карте) батчу тоже годится: кэш
+        // нужен только чтобы поднять эксперта при промахе. Без этой ветки
+        // decode шёл по одному GEMV на эксперта — 480 запусков ядер на токен.
+        enum Picked<'a> {
+            Cached(Vec<Arc<Expert>>),
+            Resident(Vec<&'a Expert>),
+        }
+        let picked = match (&self.cache, &self.experts) {
+            (Some(cache), _) => {
+                let mut out = Vec::with_capacity(pairs.len());
+                for p in pairs {
+                    out.push(self.resident_expert(experts[*p] as usize, cache)?);
                 }
+                Picked::Cached(out)
             }
-            out
+            (None, ExpertStore::Resident(all)) => {
+                let mut out = Vec::with_capacity(pairs.len());
+                for p in pairs {
+                    let idx = experts[*p] as usize;
+                    out.push(
+                        all.get(idx)
+                            .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {idx}")))?,
+                    );
+                }
+                Picked::Resident(out)
+            }
+            (None, ExpertStore::Lazy { .. }) => return Ok(None),
+        };
+        let picked: Vec<&Expert> = match &picked {
+            Picked::Cached(v) => v.iter().map(|e| e.as_ref()).collect(),
+            Picked::Resident(v) => v.clone(),
         };
         // Перемешанная копия нужна батчу; обычно её строит первое умножение,
         // но эксперт мог попасть в кэш и без него — тогда строим здесь, это
@@ -1422,11 +1444,6 @@ impl MoeFfn {
             return Ok(None);
         }
 
-        if self.cfg.activation != Activation::Silu {
-            // Батч фьюзит silu прямо в квантование активации; для gelu такого
-            // ядра нет, и подменить его нечем — идём общим путём.
-            return Ok(None);
-        }
         let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
         let Ok((packed_x, scales_x)) = xf.nvfp4_quantize_act() else {
             return Ok(None);
@@ -1441,7 +1458,18 @@ impl MoeFfn {
             return Ok(None);
         };
 
-        let Ok((packed_h, scales_h)) = gu.silu_mul_quant_nvfp4(1.0) else {
+        // Фьюз «активация + квантование» есть только для silu. У gelu (Gemma-4)
+        // считаем теми же ядрами по отдельности: это всё равно один проход на
+        // слой, а не на эксперта.
+        let quantized = match self.cfg.activation {
+            Activation::Silu => gu.silu_mul_quant_nvfp4(1.0).ok(),
+            Activation::GeluTanh => {
+                let h = self.swiglu(&gu)?;
+                let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
+                h.nvfp4_quantize_act().ok()
+            }
+        };
+        let Some((packed_h, scales_h)) = quantized else {
             return Ok(None);
         };
         let down: Vec<&QuantWeight> = picked.iter().map(|e| e.down.quant_weight().unwrap()).collect();

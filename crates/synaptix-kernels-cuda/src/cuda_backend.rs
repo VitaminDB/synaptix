@@ -2842,8 +2842,8 @@ impl Backend for CudaBackend {
         let t_q = q_lo.dims()[2];
         let d = q_lo.dims()[3];
         let nkv = k_lo.dims()[1];
-        if d != 128 {
-            return Err(SynaptixError::Unsupported("flash_window_dev: HD=128 only"));
+        if d != 128 && d != 256 {
+            return Err(SynaptixError::Unsupported("flash_window_dev: HD 128/256 only"));
         }
         if k_lo.dims()[0] != b || k_lo.dims()[3] != d || v_lo.dims() != k_lo.dims() {
             return Err(SynaptixError::Unsupported("flash_window_dev: k/v shape"));
@@ -2915,6 +2915,7 @@ impl Backend for CudaBackend {
             causal,
             t_stride_k,
             window,
+            d as u32,
         )
     }
 
