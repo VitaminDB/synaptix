@@ -19,10 +19,31 @@ pub struct GemvMxfp8Kernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<GemvMxfp8Kernels>)>>> = OnceLock::new();
+static CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<GemvMxfp8Kernels>)>>> = OnceLock::new();
 
 impl GemvMxfp8Kernels {
+    /// Выход F16.
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "gemv_mxfp8.cu")
+    }
+
+    /// Выход BF16 (тот же модуль, собранный с `-DSYN_OUT_BF16`): декод в BF16
+    /// пишет проекцию сразу в рабочем dtype, без cast-ядра после GEMV.
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_OUT_BF16"],
+            "gemv_mxfp8_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<GemvMxfp8Kernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -33,7 +54,7 @@ impl GemvMxfp8Kernels {
             }
         }
         let src = include_str!("gemv_mxfp8.cu");
-        let module = compile_module_with_opts(ctx, src, "gemv_mxfp8.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
         let gemv = load_fn(&module, "gemv_mxfp8_e4m3")?;
         let new = Arc::new(Self {
             gemv,
@@ -45,7 +66,9 @@ impl GemvMxfp8Kernels {
 }
 
 // MXFP8 GEMV (decode, M=1): y[N] = W[N,K] @ x[K]. w/x — E4M3 байты (natural
-// [.,K]); sw/sx — E8M0 per-32-block scales (natural [., K/32]). out — f16 [N].
+// [.,K]); sw/sx — E8M0 per-32-block scales (natural [., K/32]). out — f16 [N]
+// (или bf16 той же ширины, если `kernels` собраны `for_context_bf16`; вьюха
+// типизирована f16 лишь ради размера элемента).
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_mxfp8(
     kernels: &GemvMxfp8Kernels,

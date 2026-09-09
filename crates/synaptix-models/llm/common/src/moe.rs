@@ -1121,8 +1121,7 @@ impl MoeFfn {
         }
 
         // Эксперты: два пакетных GEMV с выбором веса по device-индексу.
-        let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
-        let (px, sx) = xf.nvfp4_quantize_act().map_err(ferr)?;
+        let (px, sx) = x.nvfp4_quantize_act().map_err(ferr)?;
         let gu = gate_up.gemv_indexed(&idx_flat, &px, &sx, false).map_err(ferr)?;
         let h = self.swiglu(&gu)?;
         let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
@@ -1752,7 +1751,7 @@ impl MoeFfn {
     ) -> Result<Tensor, ModelError> {
         if down.quant_dtype() == Some(DType::NVFP4) && self.cfg.activation == Activation::Silu {
             if let Ok((packed, scales)) = gate_up.silu_mul_quant_nvfp4(1.0) {
-                return down.forward_prequant(&packed, &scales, m);
+                return down.forward_prequant(&packed, &scales, m, DType::F16);
             }
         }
         let h = self.swiglu(gate_up)?;

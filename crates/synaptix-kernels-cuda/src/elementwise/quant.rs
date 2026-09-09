@@ -308,10 +308,31 @@ pub struct Mxfp8QuantKernels {
 }
 
 static MXFP8_CACHE: OnceLock<Mutex<Vec<(usize, Arc<Mxfp8QuantKernels>)>>> = OnceLock::new();
+static MXFP8_CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<Mxfp8QuantKernels>)>>> = OnceLock::new();
 
 impl Mxfp8QuantKernels {
+    /// Вход F16.
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = MXFP8_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, MXFP8_CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "mxfp8_quant.cu")
+    }
+
+    /// Вход BF16 (`-DSYN_IN_BF16`): активация BF16-декода квантуется без
+    /// cast-ядра. Арифметика та же: значения читаются в f32.
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(
+            ctx,
+            MXFP8_CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())),
+            &["-DSYN_IN_BF16"],
+            "mxfp8_quant_bf16.cu",
+        )
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<Mxfp8QuantKernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -322,7 +343,7 @@ impl Mxfp8QuantKernels {
             }
         }
         let src = include_str!("../cu/elementwise/mxfp8_quant.cu");
-        let module = compile_module_with_opts(ctx, src, "mxfp8_quant.cu", &[], Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_80"))?;
         let new = Arc::new(Self {
             quant_natural: load_fn(&module, "mxfp8_quant_natural")?,
             quant_natural_fast: load_fn(&module, "mxfp8_quant_natural_fast")?,

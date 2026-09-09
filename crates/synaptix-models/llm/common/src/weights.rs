@@ -40,6 +40,13 @@ pub trait WeightSource {
     }
 }
 
+/// Нативный BF16-путь квант-проекций (без cast'ов через F16). `SYN_QLINEAR_BF16=0`
+/// возвращает прежний обход — для A/B-сравнений нумерики.
+fn bf16_native_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_QLINEAR_BF16").as_deref() != Ok("0"))
+}
+
 pub enum QLinear {
     Dense(Linear),
     Quant(QuantWeight),
@@ -103,10 +110,11 @@ impl QLinear {
         packed: &Tensor,
         scales: &Tensor,
         m: usize,
+        out_dt: DType,
     ) -> Result<Tensor, ModelError> {
         match self {
             QLinear::Quant(w) if matches!(w.dtype(), DType::NVFP4 | DType::MXFP8) => packed
-                .linear_quant_prequant(scales, w, m, DType::F16)
+                .linear_quant_prequant(scales, w, m, out_dt)
                 .map_err(|e| ModelError::Forward(e.to_string())),
             _ => Err(ModelError::Forward("forward_prequant: вес не NVFP4/MXFP8".into())),
         }
@@ -121,12 +129,22 @@ impl QLinear {
             QLinear::Quant(w) => {
                 let in_dt = x.dtype();
                 if in_dt == DType::F16 {
-                    x.linear_quant(w).map_err(|e| ModelError::Forward(e.to_string()))
-                } else {
-                    let xf = x.to_dtype(DType::F16).map_err(|e| ModelError::Forward(e.to_string()))?;
-                    let yf = xf.linear_quant(w).map_err(|e| ModelError::Forward(e.to_string()))?;
-                    yf.to_dtype(in_dt).map_err(|e| ModelError::Forward(e.to_string()))
+                    return x.linear_quant(w).map_err(|e| ModelError::Forward(e.to_string()));
                 }
+                // BF16-активация: квант-ядра умеют читать её и писать выход в
+                // BF16 сами (NVFP4 — везде, MXFP8 — на декоде); cast'ы туда-обратно
+                // стоили по два ядра на проекцию. Где нативного пути нет
+                // (`Unsupported`), остаётся прежний обход через F16.
+                if in_dt == DType::BF16 && bf16_native_on() {
+                    match x.linear_quant(w) {
+                        Ok(y) => return Ok(y),
+                        Err(synaptix_core::error::SynaptixError::Unsupported(_)) => {}
+                        Err(e) => return Err(ModelError::Forward(e.to_string())),
+                    }
+                }
+                let xf = x.to_dtype(DType::F16).map_err(|e| ModelError::Forward(e.to_string()))?;
+                let yf = xf.linear_quant(w).map_err(|e| ModelError::Forward(e.to_string()))?;
+                yf.to_dtype(in_dt).map_err(|e| ModelError::Forward(e.to_string()))
             }
         }
     }

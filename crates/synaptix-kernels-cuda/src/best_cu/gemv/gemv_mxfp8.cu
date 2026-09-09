@@ -1,6 +1,15 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#ifdef SYN_OUT_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 syn_out_t;
+#define SYN_TO_OUT(v) __float2bfloat16(v)
+#else
+typedef __half syn_out_t;
+#define SYN_TO_OUT(v) __float2half(v)
+#endif
+
 // MXFP8 GEMV (decode, M=1): y[N] = W[N,K] @ x[K]. W/x = E4M3 bytes (natural
 // [.,K]) + E8M0 per-32-block scales (natural [., K/32]). Аналог gemv_nvfp4, но
 // decode memory-bound (читаем весь W раз) → SIMT-dequant вместо block-scale MMA
@@ -11,7 +20,7 @@ extern "C" __global__ void gemv_mxfp8_e4m3(const __nv_fp8_e4m3 *__restrict__ w,
                                            const unsigned char *__restrict__ sw,
                                            const __nv_fp8_e4m3 *__restrict__ x,
                                            const unsigned char *__restrict__ sx,
-                                           __half *__restrict__ out, int N, int K) {
+                                           syn_out_t *__restrict__ out, int N, int K) {
   const int warps = blockDim.x >> 5;
   const int row = blockIdx.x * warps + (threadIdx.x >> 5);
   if (row >= N)
@@ -47,5 +56,5 @@ extern "C" __global__ void gemv_mxfp8_e4m3(const __nv_fp8_e4m3 *__restrict__ w,
   for (int o = 16; o > 0; o >>= 1)
     acc += __shfl_down_sync(0xffffffffu, acc, o);
   if (lane == 0)
-    out[row] = __float2half(acc);
+    out[row] = SYN_TO_OUT(acc);
 }

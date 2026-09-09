@@ -543,9 +543,12 @@ impl Backend for CudaBackend {
             // требует permuted (bm/bk) scales хранить рядом с natural.
             DType::MXFP8 => {
                 use half::f16;
-                if bf16 {
+                // BF16-активация: декод (M=1) квантует и пишет выход прямо в
+                // BF16-модулях; prefill (M>1) идёт tiled-GEMM'ом с F16-входом —
+                // там `Unsupported`, и QLinear::forward берёт путь с cast'ом.
+                if bf16 && m != 1 {
                     return Err(SynaptixError::Unsupported(
-                        "linear_quant MXFP8: активация BF16 не поддержана",
+                        "linear_quant MXFP8: активация BF16 поддержана только при M=1",
                     ));
                 }
                 let nn = w.n();
@@ -554,7 +557,11 @@ impl Backend for CudaBackend {
                         "linear_quant MXFP8: K={k} должно быть кратно 32"
                     )));
                 }
-                let qk = crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?;
+                let qk = if bf16 {
+                    crate::elementwise::quant::Mxfp8QuantKernels::for_context_bf16(&ctx)?
+                } else {
+                    crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?
+                };
                 let w_packed_arc = w.packed_arc().ok_or_else(|| {
                     SynaptixError::Cuda("linear_quant MXFP8: packed W освобождён".into())
                 })?;
@@ -575,8 +582,11 @@ impl Backend for CudaBackend {
                 let mk = (m as usize) * k;
                 let mn = (m as usize) * nn;
                 if m == 1 {
-                    let gv =
-                        crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context(&ctx)?;
+                    let gv = if bf16 {
+                        crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context_bf16(&ctx)?
+                    } else {
+                        crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context(&ctx)?
+                    };
                     let x_view = unsafe { x_buf.slice().transmute::<f16>(mk) }.ok_or_else(|| {
                         SynaptixError::Cuda("linear_quant MXFP8: transmute x→f16".into())
                     })?;
@@ -1053,7 +1063,11 @@ impl Backend for CudaBackend {
         let ord = x_buf.ordinal();
         let ctx = synaptix_core::device::cuda::get(ord)?;
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let quant_k = crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?;
+        let quant_k = match x_lo.dtype() {
+            DType::F16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("nvfp4_quantize_act: x не F16/BF16")),
+        };
         let p_buf = packed_out
             .0
             .as_cuda_mut()
@@ -1302,16 +1316,24 @@ impl Backend for CudaBackend {
         if !x_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
         }
-        if x_lo.dtype() != DType::F16 {
-            return Err(SynaptixError::Unsupported("mxfp8_quantize_act: x не F16"));
-        }
+        let bf16 = match x_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("mxfp8_quantize_act: x не F16/BF16")),
+        };
         let x_buf = x_st
             .as_cuda()
             .ok_or(SynaptixError::Unsupported("mxfp8_quantize_act: x non-cuda"))?;
         let ord = x_buf.ordinal();
         let ctx = synaptix_core::device::cuda::get(ord)?;
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let qk = crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?;
+        // Вьюха типизирована f16 ради размера элемента; BF16-модуль читает те
+        // же байты как bf16.
+        let qk = if bf16 {
+            crate::elementwise::quant::Mxfp8QuantKernels::for_context_bf16(&ctx)?
+        } else {
+            crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?
+        };
         let n_el = m * k;
         let x_off = x_lo.byte_offset();
         let x_view = unsafe {
@@ -1393,6 +1415,49 @@ impl Backend for CudaBackend {
                     Some((p_buf.slice(), s_buf.slice())),
                 )?;
                 Ok(())
+            }
+            // Декод: активация уже квантована (natural [K] + [K/32]) — прямой
+            // GEMV, выход в F16 или BF16 по dtype `out`.
+            DType::MXFP8 if m == 1 => {
+                let k = w.k();
+                let nn = w.n();
+                let gv = if out_bf16 {
+                    crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context_bf16(&ctx)?
+                } else {
+                    crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context(&ctx)?
+                };
+                let w_packed_arc = w.packed_arc().ok_or_else(|| {
+                    SynaptixError::Cuda("linear_quant_prequant MXFP8: packed W освобождён".into())
+                })?;
+                let w_packed = w_packed_arc
+                    .as_cuda()
+                    .ok_or(SynaptixError::Unsupported("linear_quant_prequant MXFP8: packed W non-cuda"))?
+                    .slice();
+                let w_scales = w
+                    .scales()
+                    .as_cuda()
+                    .ok_or(SynaptixError::Unsupported("linear_quant_prequant MXFP8: scales W non-cuda"))?
+                    .slice();
+                if p_buf.slice().len() < k || s_buf.slice().len() < k / 32 {
+                    return Err(SynaptixError::Unsupported(
+                        "linear_quant_prequant MXFP8: пара активации короче K",
+                    ));
+                }
+                let mut out_view =
+                    unsafe { out_buf.slice_mut().transmute_mut::<half::f16>(nn) }.ok_or_else(|| {
+                        SynaptixError::Cuda("linear_quant_prequant MXFP8: transmute out".into())
+                    })?;
+                crate::best_cu::gemv::gemv_mxfp8::gemv_mxfp8(
+                    &gv,
+                    &stream,
+                    w_packed,
+                    w_scales,
+                    p_buf.slice(),
+                    s_buf.slice(),
+                    &mut out_view,
+                    nn as u32,
+                    k as u32,
+                )
             }
             DType::MXFP8 if out_bf16 => {
                 Err(SynaptixError::Unsupported("linear_quant_prequant MXFP8: BF16-выход не поддержан"))

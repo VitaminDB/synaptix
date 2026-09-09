@@ -2428,7 +2428,7 @@ impl Mlp {
     ) -> Result<Tensor, ModelError> {
         let dev = h.device();
         // gate и up берут один и тот же `h`: prequant из эпилога нормы, иначе 1×.
-        let act = pq.cloned().or_else(|| quant_act_shared(h));
+        let act = pq.cloned().or_else(|| quant_act_shared(h, self.gate_proj.quant_dtype()));
         let gate = proj_shared(&self.gate_proj, h, &act, dev, "mlp_gate")?;
         let up = proj_shared(&self.up_proj, h, &act, dev, "mlp_up")?;
         let gated = prof(dev, "mlp_act", || match self.activation {
@@ -2728,7 +2728,7 @@ impl FullAttn {
         // positions come from `state.pos_dev`/`tcache_dev` ([B]).
         let b = h.dims()[0];
         // q/k/v берут один `h` → квантуем 1× и переиспользуем во всех трёх.
-        let act = quant_act_shared(h);
+        let act = quant_act_shared(h, self.q_proj.quant_dtype());
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let qg = proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?;
         let (q, gate) = if self.attn_output_gate {
@@ -3092,7 +3092,7 @@ impl LinearAttn {
         let dev = h.device();
         // in_qkv/a/b/z берут один `h` → квантуем 1×; qkv/z через prequant (NVFP4),
         // a/b — Dense [N=48] (forward сам, prequant их не касается).
-        let act = quant_act_shared(h);
+        let act = quant_act_shared(h, self.in_proj_qkv.quant_dtype());
         let qkv = proj_shared(&self.in_proj_qkv, h, &act, dev, "lin_in_qkv")?;
         let a = prof(dev, "lin_in_a", || self.in_proj_a.forward(h))?;
         let b = prof(dev, "lin_in_b", || self.in_proj_b.forward(h))?;
@@ -3194,7 +3194,7 @@ impl LinearAttn {
         let ss = state.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev (sync_to_device?)"))?;
 
         let dev = h.device();
-        let act = quant_act_shared(h);
+        let act = quant_act_shared(h, self.in_proj_qkv.quant_dtype());
         let qkv = proj_shared(&self.in_proj_qkv, h, &act, dev, "lin_in_qkv")?;
         let a = prof(dev, "lin_in_a", || self.in_proj_a.forward(h))?;
         let b = prof(dev, "lin_in_b", || self.in_proj_b.forward(h))?;
@@ -3288,12 +3288,19 @@ fn rms_norm_quant(
     Ok((rms_norm(x, w, eps).coerr()?, None))
 }
 
-/// Квантует `h` в NVFP4 ОДИН раз для шаринга между проекциями из него (q/k/v;
-/// in_qkv/z; gate/up). None если backend не умеет (CPU) → проекции квантуют
-/// сами. Decode (m=1) с MXFP8-весом остаётся на gemv-пути (без prequant) —
-/// поэтому формат тут только NVFP4.
-fn quant_act_shared(h: &Tensor) -> Option<(Tensor, Tensor, DType)> {
-    h.nvfp4_quantize_act().ok().map(|(p, s)| (p, s, DType::NVFP4))
+/// Квантует `h` ОДИН раз в формате веса `fmt` для шаринга между проекциями из
+/// него (q/k/v; in_qkv/z; gate/up). None если backend не умеет (CPU) или
+/// формат не подходит → проекции квантуют сами.
+fn quant_act_shared(h: &Tensor, fmt: Option<DType>) -> Option<(Tensor, Tensor, DType)> {
+    match fmt {
+        Some(DType::NVFP4) => h.nvfp4_quantize_act().ok().map(|(p, s)| (p, s, DType::NVFP4)),
+        // MXFP8 — только декод: одна строка квантуется natural-раскладкой и
+        // уходит в GEMV; на префилле пара такого вида GEMM'у не годится.
+        Some(DType::MXFP8) if h.dims()[..h.rank() - 1].iter().product::<usize>() == 1 => {
+            h.mxfp8_quantize_act().ok().map(|(p, s)| (p, s, DType::MXFP8))
+        }
+        _ => None,
+    }
 }
 
 /// Проекция из `h` через общую квант-активацию `act` (без повторного quantize),
@@ -3311,7 +3318,7 @@ fn proj_shared(
             if ql.quant_dtype() == Some(*fmt) {
                 let lead = &h.dims()[..h.rank() - 1];
                 let m: usize = lead.iter().product();
-                let out = ql.forward_prequant(p, s, m)?; // [m, N]
+                let out = ql.forward_prequant(p, s, m, h.dtype())?; // [m, N]
                 let mut shape = lead.to_vec();
                 shape.push(out.dims()[out.rank() - 1]);
                 return out.reshape(shape).map_err(|e| ModelError::Forward(e.to_string()));

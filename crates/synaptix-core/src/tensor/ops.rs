@@ -767,8 +767,8 @@ impl Tensor {
     /// GEMV. Квантуем общий `h` 1× → [`Self::linear_quant_prequant`] для каждой
     /// проекции из него (убирает дублирующие quantize-ядра). `Unsupported` на CPU.
     pub fn nvfp4_quantize_act(&self) -> Result<(Tensor, Tensor)> {
-        if self.dtype() != DType::F16 {
-            return Err(SynaptixError::Unsupported("nvfp4_quantize_act: x должен быть F16"));
+        if !matches!(self.dtype(), DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("nvfp4_quantize_act: x должен быть F16/BF16"));
         }
         let dims = self.dims();
         if dims.is_empty() {
@@ -1083,8 +1083,8 @@ impl Tensor {
     /// [m·k/32])` — для шаринга между проекциями с MXFP8-весом
     /// ([`Self::linear_quant_prequant`]). `Unsupported` на CPU.
     pub fn mxfp8_quantize_act(&self) -> Result<(Tensor, Tensor)> {
-        if self.dtype() != DType::F16 {
-            return Err(SynaptixError::Unsupported("mxfp8_quantize_act: x должен быть F16"));
+        if !matches!(self.dtype(), DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("mxfp8_quantize_act: x должен быть F16/BF16"));
         }
         let dims = self.dims();
         if dims.is_empty() {
