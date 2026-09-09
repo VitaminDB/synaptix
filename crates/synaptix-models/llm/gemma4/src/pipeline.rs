@@ -490,3 +490,162 @@ fn splice_media(
     let out = Tensor::cat(&refs, 1).map_err(|e| PipelineError::Model(e.to_string()))?;
     Ok((out, runs))
 }
+
+// ── Графовый декод ──────────────────────────────────────────────────────────
+
+impl Gemma4Pipeline {
+    /// Можно ли захватить шаг декода в CUDA-граф.
+    ///
+    /// Про KV спрашиваем не политику, а ФАКТ: у Gemma-4 квантованный кэш не
+    /// достаётся ни одному слою (sliding отсекает окно, global — голова 512),
+    /// поэтому профиль с `kv = mxfp8` графу не мешает. Голова в MXFP8 тоже не
+    /// мешает: её скретчи прогреваются тремя прогонами до захвата. А вот
+    /// MXFP8-таблица эмбеддингов ходит своим ядром — с ней граф не берём.
+    pub fn graph_decode_supported(&self) -> bool {
+        matches!(self.model.device, Device::Cuda(_))
+            && matches!(self.model.dtype, DType::F16 | DType::BF16)
+            && self.model.kv_all_dense()
+            && !self.model.has_mxfp8_embed()
+            && self.model.graph_decode_ready()
+    }
+
+    pub fn generate_with_graph_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        self.generate_with_graph_resume(&mut kv, prompt_ids, gen_cfg, sink)
+    }
+
+    /// Как [`Self::generate_with_graph_streaming`], но префилл стартует с
+    /// `kv.seq_len` — кэш переиспользуется между ходами чата.
+    pub fn generate_with_graph_resume(
+        &self,
+        kv: &mut KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        use synaptix_infer::graph_capture::GraphCapturer;
+        use synaptix_infer::InferError;
+
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("пустой промпт".into()));
+        }
+        let cfg = self.cfg_with_eos(gen_cfg);
+        let eos = generate::eos_set(&cfg);
+        let mut sampler = generate::TokenSampler::new(&cfg, prompt_ids);
+        let device = self.model.device;
+        let Device::Cuda(ord) = device else {
+            return Err(PipelineError::Model("графовый декод требует CUDA".into()));
+        };
+        let l = prompt_ids.len();
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+
+        // Префилл идёт обычным путём: он упирается в счёт, а не в запуски ядер,
+        // и захватывать его смысла нет.
+        let suffix = &prompt_ids[prefix..];
+        let chunk = if cfg.prefill_batch > 0 { cfg.prefill_batch } else { 256 };
+        let t0 = std::time::Instant::now();
+        let mut logits_opt: Option<Tensor> = None;
+        let mut off = 0usize;
+        while off < suffix.len() {
+            let end = (off + chunk).min(suffix.len());
+            let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
+            let lg = no_grad(|| self.model.forward(&part, kv))
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
+            logits_opt = Some(lg);
+            off = end;
+        }
+        let logits = logits_opt.ok_or_else(|| PipelineError::Model("пустой хвост промпта".into()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
+        out.push(tok0);
+        let mut cancelled = !sink.on_token(tok0);
+
+        let mut state = self
+            .model
+            .make_decode_state()
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        // Кольцевой KV sliding-слоёв: сдвиг окна делает хост ДО запуска графа,
+        // а в граф уходят уже device-резидентные позиция и длина.
+        let start0 = self
+            .model
+            .ring_prepare_decode(kv, l)
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        state
+            .update_ring(tok0, l as u32, start0 as u32)
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)
+            .map_err(|e| PipelineError::Model(format!("stream: {e}")))?;
+
+        let mut capturer = GraphCapturer::new(3);
+        let graph = {
+            let model = &self.model;
+            let state_ref = &mut state;
+            let kv_ref = &mut *kv;
+            no_grad(|| {
+                capturer.capture_with(&stream, |_s| {
+                    model
+                        .forward_decode_dev(state_ref, kv_ref)
+                        .map_err(|e| InferError::Other(e.to_string()))
+                })
+            })
+        }
+        .map_err(|e| PipelineError::Model(format!("захват графа: {e}")))?;
+        let _ = graph.upload();
+
+        let dec_t0 = std::time::Instant::now();
+        // Шаг захвата уже посчитал логиты для следующего токена.
+        if !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&tok0) {
+            let tok1 = sampler.sample(&state.logits).map_err(PipelineError::from)?;
+            out.push(tok1);
+            cancelled = !sink.on_token(tok1);
+        }
+        while !cancelled && out.len() < cfg.max_new_tokens {
+            let last = *out.last().unwrap();
+            if eos.contains(&last) {
+                break;
+            }
+            let pos = l + out.len() - 1;
+            if pos >= kv.max_seq {
+                break;
+            }
+            let start = self
+                .model
+                .ring_prepare_decode(kv, pos)
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
+            state
+                .update_ring(last, pos as u32, start as u32)
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
+            graph
+                .launch()
+                .map_err(|e| PipelineError::Model(format!("запуск графа: {e:?}")))?;
+            // Запись логитов графом не отслеживается событиями — без барьера
+            // выгрузка на хост в сэмплере обогнала бы граф.
+            stream
+                .synchronize()
+                .map_err(|e| PipelineError::Model(format!("sync после запуска: {e:?}")))?;
+            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
+            out.push(tok);
+            cancelled = !sink.on_token(tok);
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
+        let new_tokens = out.len();
+        Ok((
+            out,
+            GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms },
+        ))
+    }
+}

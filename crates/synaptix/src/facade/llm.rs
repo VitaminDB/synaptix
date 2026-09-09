@@ -297,17 +297,24 @@ pub fn optimal_profile(path: &Path) -> OptimalProfile {
     let mut policy = QuantPolicy::balance();
     policy.kv_dtype = KvDtypePolicy::MXFP8;
     policy.preset_name = "optimal".to_string();
-    // Gemma-4: проекции внимания остаются плотными. NVFP4 на них даёт около
-    // десятой доли скорости декода (82 против 90 ток/с на 5090 Laptop), но
-    // ломает отдельные слова в ответе — у Gemma «тяжёлые» активации, и
-    // четырёх бит проекциям внимания не хватает.
+    // Gemma-4: проекции внимания в MXFP8, а не NVFP4. Четырёх бит им не
+    // хватает — у Gemma «тяжёлые» активации, и на NVFP4 в ответе
+    // воспроизводимо ломаются отдельные слова («в уютном угpду»). Восемь бит
+    // текст держат, а скорость почти та же: декод упирается в запуски ядер, а
+    // не в чтение весов (85.1 против 81.2 ток/с на 5090 Laptop — разница в
+    // пределах разброса, зато против плотного BF16 это +7 ток/с и −1.6 ГБ).
     if matches!(arch, Some(LlmArch::Gemma4)) {
-        policy.attn_storage = Some(DType::BF16);
+        policy.attn_storage = Some(DType::MXFP8);
     }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
+    // Графовый декод у Gemma-4: шаг захватывается целиком, включая MoE —
+    // роутер, top-k и выбор экспертов считаются на карте. Даёт около +15 % к
+    // декоду (97 против 85 ток/с на 5090 Laptop). У остальных архитектур он
+    // по-прежнему выключен: там его гасит квантованный KV.
+    let graph_decode = matches!(arch, Some(LlmArch::Gemma4));
     OptimalProfile {
         policy,
-        graph_decode: false,
+        graph_decode,
         speculation,
         layer_sync: LayerSyncMode::Auto,
     }
@@ -764,10 +771,19 @@ impl LlmPipeline {
                 Ok(())
             }
             // У Gemma-4 стрим нативный: общий декодер умеет token-by-token.
-            LlmPipeline::Gemma4(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            // Шаг декода захватывается CUDA-графом, когда профиль позволяет:
+            // MoE считается целиком на карте, поэтому выгрузок внутри шага нет.
+            LlmPipeline::Gemma4(p) => {
+                if graph_decode_enabled() && p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             LlmPipeline::Gemma3(p) => {
                 use synaptix_llm_gemma3::pipeline::GenerationConfig as GCfg;
                 let gcfg = GCfg {
@@ -1734,9 +1750,13 @@ impl<'a> LlmGeneration<'a> {
                 } else {
                     session.reset_for_full();
                 }
-                let res = p
-                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
-                    .map(|_| ());
+                let res = if graph_decode_enabled() && p.graph_decode_supported() {
+                    p.generate_with_graph_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                        .map(|_| ())
+                } else {
+                    p.generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                        .map(|_| ())
+                };
                 session.ids = prompt_ids.to_vec();
                 match res {
                     Ok(()) => Ok(reuse),

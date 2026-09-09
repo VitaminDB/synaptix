@@ -2,7 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, LaunchConfig,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
+    LaunchConfig,
     PushKernelArg,
 };
 use half::f16;
@@ -18,6 +19,7 @@ pub struct Nvfp4MmaGemvShufKernels {
     w8: CudaFunction,
     w8_persistent: CudaFunction,
     w8_batched: CudaFunction,
+    ptr_gather: CudaFunction,
     num_sms: u32,
 }
 
@@ -81,6 +83,7 @@ impl Nvfp4MmaGemvShufKernels {
         let w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8")?;
         let w8p = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_persistent")?;
         let w8b = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_batched")?;
+        let ptr_gather = load_fn(&module, "nvfp4_expert_ptr_gather")?;
         for f in [&w4, &w8, &w8p, &w8b] {
             f.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -97,6 +100,7 @@ impl Nvfp4MmaGemvShufKernels {
             w8,
             w8_persistent: w8p,
             w8_batched: w8b,
+            ptr_gather,
             _module: module,
             num_sms,
         });
@@ -120,6 +124,36 @@ pub fn nvfp4_mma_gemv_shuf_f16_batched(
     xp_ptrs: &CudaSlice<u64>,
     xs_ptrs: &CudaSlice<u64>,
     x_sf_offs: &CudaSlice<u32>,
+    out: &mut CudaViewMut<f16>,
+    n: u32,
+    k: u32,
+    experts: u32,
+) -> Result<()> {
+    nvfp4_mma_gemv_shuf_f16_batched_views(
+        kernels,
+        stream,
+        &w_ptrs.slice(..),
+        &sw_ptrs.slice(..),
+        &xp_ptrs.slice(..),
+        &xs_ptrs.slice(..),
+        &x_sf_offs.slice(..),
+        out,
+        n,
+        k,
+        experts,
+    )
+}
+
+/// То же, но по view'ам: указатели могут лежать в скретче, собранном ядром.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_mma_gemv_shuf_f16_batched_views(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    w_ptrs: &CudaView<u64>,
+    sw_ptrs: &CudaView<u64>,
+    xp_ptrs: &CudaView<u64>,
+    xs_ptrs: &CudaView<u64>,
+    x_sf_offs: &CudaView<u32>,
     out: &mut CudaViewMut<f16>,
     n: u32,
     k: u32,
@@ -262,5 +296,62 @@ pub fn nvfp4_mma_gemv_shuf_f16_view(
         b.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemv_shuf: {e:?}")))?;
     }
+    Ok(())
+}
+
+/// Собрать массивы указателей пакетного GEMV по device-индексам экспертов.
+/// Все буферы уже на карте — хост в выборе не участвует, поэтому вызов
+/// захватывается CUDA-графом.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_expert_ptr_gather(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    w_table: &CudaView<u64>,
+    s_table: &CudaView<u64>,
+    idx: &CudaView<u32>,
+    w_out: &mut CudaViewMut<u64>,
+    s_out: &mut CudaViewMut<u64>,
+    xp_out: &mut CudaViewMut<u64>,
+    xs_out: &mut CudaViewMut<u64>,
+    off_out: &mut CudaViewMut<u32>,
+    xp_base: u64,
+    xs_base: u64,
+    experts: u32,
+    pairs: u32,
+    rows_per_pair: bool,
+    row_bytes: u32,
+) -> Result<()> {
+    if pairs == 0 {
+        return Ok(());
+    }
+    let threads = 128u32;
+    let cfg = LaunchConfig {
+        grid_dim: (pairs.div_ceil(threads), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let xp = xp_base as i64;
+    let xs = xs_base as i64;
+    let e = experts as i32;
+    let p = pairs as i32;
+    let rpp = i32::from(rows_per_pair);
+    let rb = row_bytes as i32;
+    let mut b = stream.launch_builder(&kernels.ptr_gather);
+    b.arg(w_table)
+        .arg(s_table)
+        .arg(idx)
+        .arg(&mut *w_out)
+        .arg(&mut *s_out)
+        .arg(&mut *xp_out)
+        .arg(&mut *xs_out)
+        .arg(&mut *off_out)
+        .arg(&xp)
+        .arg(&xs)
+        .arg(&e)
+        .arg(&p)
+        .arg(&rpp)
+        .arg(&rb);
+    unsafe { b.launch(cfg) }
+        .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_expert_ptr_gather: {e:?}")))?;
     Ok(())
 }

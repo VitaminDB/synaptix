@@ -303,3 +303,49 @@ fn chunking_keeps_the_answer_within_quant_noise() {
         assert!(err < 0.10, "chunk={chunk}: разошлось с эталоном, L2={err}");
     }
 }
+
+/// Device-путь (роутер, top-k и выбор экспертов НА КАРТЕ) обязан совпасть с
+/// обычным: он считает то же самое, просто без выгрузок на хост. Расхождение
+/// тут — это молча испорченный ответ в графовом декоде.
+#[test]
+fn dev_path_matches_host_path() {
+    if !setup() {
+        return;
+    }
+    let device = Device::Cuda(0);
+    let compute = DType::BF16;
+    // Без shared expert: device-путь считает только разреженную часть.
+    let mut c = cfg();
+    c.shared_intermediate_size = 0;
+    c.per_expert_scale = Some((0..E).map(|e| 0.7 + 0.1 * e as f32).collect());
+
+    let w = weights();
+    let moe = MoeFfn::load(&w, "mlp", c, device, compute, DType::NVFP4).expect("сборка MoE");
+    assert!(moe.dev_path_ready(), "device-путь не собрался");
+
+    let x = noise(42, H);
+    let xt = Tensor::from_vec::<_, f32>(x, vec![1usize, H], device)
+        .and_then(|t| t.to_dtype(compute))
+        .expect("вход");
+
+    let host = moe.forward(&xt).expect("host-путь");
+    let dev = moe.forward_dev(&xt, None).expect("device-путь");
+    assert_eq!(host.dims(), dev.dims());
+
+    let to_vec = |t: &Tensor| {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .expect("на хост")
+    };
+    let (a, b) = (to_vec(&host), to_vec(&dev));
+    let mut num = 0f32;
+    let mut den = 0f32;
+    for (x, y) in a.iter().zip(&b) {
+        num += (x - y) * (x - y);
+        den += x * x;
+    }
+    let rel = (num / den.max(1e-12)).sqrt();
+    eprintln!("[moe dev] отн. L2 = {rel:.6}; host[..4]={:?} dev[..4]={:?}", &a[..4], &b[..4]);
+    assert!(rel < 1e-3, "device-путь разошёлся с host-путём: {rel}");
+}

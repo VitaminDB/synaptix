@@ -303,3 +303,42 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8_persistent(
         }
     }
 }
+
+// ── Выбор эксперта индексом НА КАРТЕ ────────────────────────────────────────
+//
+// Пакетный GEMV читает четыре массива указателей (вес, масштабы веса,
+// активация, масштабы активации) и массив смещений строки — раньше их собирал
+// хост по выбору роутера. Под захватом CUDA-графа так нельзя: выбор приходит
+// с карты. Ядро собирает те же массивы из ФИКСИРОВАННОЙ таблицы адресов
+// экспертов по индексам `idx`.
+//
+// `rows_per_pair = 0` — все пары читают строку 0 (у первой проекции эксперта
+// активация одна на токен); `1` — пара `p` читает строку `p` (у второй
+// проекции активацией служит выход первой, по строке на пару).
+extern "C" __global__ void nvfp4_expert_ptr_gather(
+    const long long* __restrict__ w_table,
+    const long long* __restrict__ s_table,
+    const unsigned int* __restrict__ idx,
+    long long* __restrict__ w_out,
+    long long* __restrict__ s_out,
+    long long* __restrict__ xp_out,
+    long long* __restrict__ xs_out,
+    unsigned int* __restrict__ off_out,
+    long long xp_base,
+    long long xs_base,
+    int experts,
+    int pairs,
+    int rows_per_pair,
+    int row_bytes) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) return;
+    int e = (int)idx[p];
+    if (e < 0 || e >= experts) e = 0;
+    int row = rows_per_pair ? p : 0;
+    w_out[p] = w_table[e];
+    s_out[p] = s_table[e];
+    xp_out[p] = xp_base + (long long)row * (long long)row_bytes;
+    xs_out[p] = xs_base;
+    // Та же раскладка tile'ов масштабов, что пишет квантователь активации.
+    off_out[p] = (unsigned int)((row % 32) * 16 + (row / 32) * 4);
+}

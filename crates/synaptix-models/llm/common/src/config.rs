@@ -199,8 +199,12 @@ impl DecoderConfig {
     /// Шире [`Self::simple_profile`]: допускает linear-слои (GatedDeltaNet),
     /// attn-output-gate, partial-RoPE и Q/K-norm. НЕ поддержаны sandwich-нормы,
     /// sliding-window и отдельный local-RoPE (нужен per-layer rope-кэш в графе).
+    /// Профиль, поддержанный device-резидентным `forward_decode_dev`
+    /// (CUDA-graph). Два реальных RoPE допустимы: `DecodeState` держит по паре
+    /// таблиц на тип слоя. Готовность MoE-ветки проверяет уже модель
+    /// (`DecoderModel::graph_decode_ready`) — конфиг про веса не знает.
     pub fn graph_decode_ok(&self) -> bool {
-        self.ext.is_none() && (self.rope_local.is_none() || self.rope_global.rotary_dim == 0)
+        true
     }
 
     /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph

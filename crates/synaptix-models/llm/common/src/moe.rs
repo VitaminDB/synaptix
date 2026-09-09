@@ -29,8 +29,11 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
-use synaptix_core::tensor::quant::QuantWeight;
+use synaptix_core::tensor::quant::{ExpertTable, QuantWeight};
 use synaptix_core::tensor::Tensor;
+
+use synaptix_core::error::SynaptixError as SynError;
+use synaptix_ops::attention::softmax_dim;
 
 use crate::config::Activation;
 use crate::model::ModelError;
@@ -764,6 +767,12 @@ pub struct MoeFfn {
     cfg: MoeConfig,
     cache: Option<Arc<ExpertCache>>,
     layer_id: usize,
+    /// Таблицы адресов экспертов для device-пути (графовый декод). `None` —
+    /// путь неприменим: эксперты не резидентны, не NVFP4 либо без
+    /// перемешанной копии.
+    dev_tables: Option<(ExpertTable, ExpertTable)>,
+    /// `per_expert_scale` на карте — device-путь берёт множитель оттуда.
+    per_expert_scale_dev: Option<Tensor>,
     /// `[E, H]` в F32: софтмакс роутера считается в полной точности, иначе
     /// на 512 экспертах порядок top-k пляшет от округления.
     router: Tensor,
@@ -844,6 +853,7 @@ impl MoeFfn {
             }
         }
         me.experts = ExpertStore::Resident(experts);
+        me.build_dev_tables();
         Ok(me)
     }
 
@@ -895,6 +905,8 @@ impl MoeFfn {
             cfg,
             cache: None,
             layer_id: 0,
+            dev_tables: None,
+            per_expert_scale_dev: None,
             router,
             experts: ExpertStore::Resident(Vec::new()),
             shared,
@@ -1030,6 +1042,104 @@ impl MoeFfn {
 
     pub fn config(&self) -> &MoeConfig {
         &self.cfg
+    }
+
+    /// Строит таблицы адресов экспертов и device-копию `per_expert_scale`.
+    /// Без них слой считается обычным путём (через хост).
+    fn build_dev_tables(&mut self) {
+        let ExpertStore::Resident(all) = &self.experts else { return };
+        if all.is_empty() || self.cache.is_some() {
+            return;
+        }
+        let gate_up: Vec<&QuantWeight> = all.iter().filter_map(|e| e.gate_up.quant_weight()).collect();
+        let down: Vec<&QuantWeight> = all.iter().filter_map(|e| e.down.quant_weight()).collect();
+        if gate_up.len() != all.len() || down.len() != all.len() {
+            return;
+        }
+        let (Some(gu), Some(dn)) = (ExpertTable::build(&gate_up), ExpertTable::build(&down)) else {
+            return;
+        };
+        // Таблицей `[E, 1]`, а не вектором: выбор идёт `embed_gather`'ом —
+        // это device-ядро. `index_select` не годится, он тащит индексы на
+        // хост, а под захватом графа выгрузок быть не может.
+        let scale = match self.cfg.per_expert_scale.as_ref() {
+            Some(v) => Tensor::from_vec(v.clone(), vec![v.len(), 1usize], self.device).ok(),
+            None => None,
+        };
+        self.dev_tables = Some((gu, dn));
+        self.per_expert_scale_dev = scale;
+    }
+
+    /// Готов ли слой считаться без единой выгрузки на хост (условие захвата
+    /// CUDA-графа).
+    pub fn dev_path_ready(&self) -> bool {
+        self.dev_tables.is_some()
+            && self.shared.is_none()
+            && self.cfg.norm_topk_prob
+            && (self.cfg.per_expert_scale.is_none() == self.per_expert_scale_dev.is_none())
+    }
+
+    /// Шаг MoE ЦЕЛИКОМ на карте: роутер, top-k, выбор экспертов и их счёт — ни
+    /// одной синхронизации с хостом, поэтому вызов захватывается CUDA-графом.
+    ///
+    /// Только для одного токена (`x: [1, H]`): именно так выглядит декод, а
+    /// префилл идёт обычным путём, где хост дешевле.
+    pub fn forward_dev(
+        &self,
+        x: &Tensor,
+        router_in: Option<&Tensor>,
+    ) -> Result<Tensor, ModelError> {
+        let Some((gate_up, down)) = &self.dev_tables else {
+            return Err(ModelError::Forward("MoE: device-путь не готов".into()));
+        };
+        if x.rank() != 2 || x.dims()[0] != 1 || x.dims()[1] != self.cfg.hidden_size {
+            return Err(ModelError::Forward(format!(
+                "MoE device-путь: вход {:?}, ожидался [1, {}]",
+                x.dims(),
+                self.cfg.hidden_size
+            )));
+        }
+        let k = self.cfg.num_experts_per_tok;
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE device-путь: {e}"));
+
+        // Роутер: логиты в F32, top-k на карте. Софтмакс по k выбранным
+        // логитам — это и есть общая софтмакс, делённая на сумму top-k.
+        let routed = router_in.unwrap_or(x);
+        let logits = routed
+            .to_dtype(DType::F32)
+            .and_then(|t| t.linear(&self.router))
+            .map_err(ferr)?;
+        let (vals, idx) = logits.topk_rows(k).map_err(ferr)?;
+        let mut w = softmax_dim(&vals, 1).map_err(ferr)?;
+        let idx_flat = idx.reshape(vec![k]).and_then(|t| t.contiguous()).map_err(ferr)?;
+        if let Some(scale) = &self.per_expert_scale_dev {
+            let g = scale
+                .embed_gather(&idx_flat)
+                .and_then(|t| t.reshape(vec![1usize, k]))
+                .map_err(ferr)?;
+            w = w.mul(&g).map_err(ferr)?;
+        }
+
+        // Эксперты: два пакетных GEMV с выбором веса по device-индексу.
+        let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
+        let (px, sx) = xf.nvfp4_quantize_act().map_err(ferr)?;
+        let gu = gate_up.gemv_indexed(&idx_flat, &px, &sx, false).map_err(ferr)?;
+        let h = self.swiglu(&gu)?;
+        let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
+        let (ph, sh) = h.nvfp4_quantize_act().map_err(ferr)?;
+        let parts = down.gemv_indexed(&idx_flat, &ph, &sh, true).map_err(ferr)?;
+
+        // Взвешивание и сумма по k — тоже на карте.
+        let wcol = w
+            .reshape(vec![k, 1usize])
+            .and_then(|t| t.to_dtype(parts.dtype()))
+            .map_err(ferr)?;
+        let mixed = parts.broadcast_mul(&wcol).map_err(ferr)?;
+        let out = mixed
+            .sum([0usize])
+            .and_then(|t| t.reshape(vec![1usize, self.cfg.hidden_size]))
+            .map_err(ferr)?;
+        self.to_compute(out)
     }
 
     /// Сколько байт весов держит слой — для планирования оффлоада блоков.

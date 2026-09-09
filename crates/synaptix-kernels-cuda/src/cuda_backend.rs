@@ -3655,6 +3655,122 @@ impl Backend for CudaBackend {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemv_indexed(
+        &self,
+        w_table: &Storage,
+        s_table: &Storage,
+        idx: (&Storage, &Layout),
+        x_packed: &Storage,
+        x_scales: &Storage,
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        experts: usize,
+        pairs: usize,
+        rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let (idx_st, idx_lo) = idx;
+        let (out_st, out_lo) = out;
+        if idx_lo.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("nvfp4_gemv_indexed: idx должен быть U32"));
+        }
+        if out_lo.dtype() != DType::F16 {
+            return Err(SynaptixError::Unsupported("nvfp4_gemv_indexed: out должен быть F16"));
+        }
+        if pairs == 0 {
+            return Ok(());
+        }
+        let wt = w_table
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: таблица не на карте"))?;
+        let ctx = wt.device().clone();
+        let ord = wt.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::best_cu::gemv::gemv_nvfp4::Nvfp4MmaGemvShufKernels::for_context(&ctx)?;
+
+        let st_buf = s_table
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: масштабы таблицы не на карте"))?;
+        let idx_buf = idx_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: idx не на карте"))?;
+        let xp_buf = x_packed
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: активация не на карте"))?;
+        let xs_buf = x_scales
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: масштабы активации не на карте"))?;
+        let (xp_base, _g1) = xp_buf.slice().device_ptr(&stream);
+        let (xs_base, _g2) = xs_buf.slice().device_ptr(&stream);
+
+        // Скретч под четыре массива указателей и смещения строк. Аллокация
+        // graph-ordered: под захватом она уходит в граф вместе с ядрами.
+        let mut w_out = stream
+            .alloc_zeros::<u64>(pairs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
+        let mut s_out = stream
+            .alloc_zeros::<u64>(pairs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
+        let mut xp_out = stream
+            .alloc_zeros::<u64>(pairs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
+        let mut xs_out = stream
+            .alloc_zeros::<u64>(pairs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
+        let mut off_out = stream
+            .alloc_zeros::<u32>(pairs)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemv_indexed: скретч: {e:?}")))?;
+
+        // Таблицы адресов и индексы лежат байтами в общих буферах — читаем их
+        // как u64/u32; выравнивание гарантировано аллокатором пула.
+        let wt_view = unsafe { wt.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemv_indexed: transmute таблицы".into()))?;
+        let st_view = unsafe { st_buf.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemv_indexed: transmute масштабов".into()))?;
+        let idx_view = unsafe { idx_buf.slice().transmute::<u32>(pairs) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemv_indexed: transmute idx".into()))?;
+        crate::best_cu::gemv::gemv_nvfp4::nvfp4_expert_ptr_gather(
+            &kernels,
+            &stream,
+            &wt_view,
+            &st_view,
+            &idx_view,
+            &mut w_out.slice_mut(..),
+            &mut s_out.slice_mut(..),
+            &mut xp_out.slice_mut(..),
+            &mut xs_out.slice_mut(..),
+            &mut off_out.slice_mut(..),
+            xp_base,
+            xs_base,
+            experts as u32,
+            pairs as u32,
+            rows_per_pair,
+            (k / 2) as u32,
+        )?;
+
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemv_indexed: out не на карте"))?;
+        let mut out_view = unsafe { out_buf.slice_mut().transmute_mut::<half::f16>(pairs * n) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemv_indexed: transmute out→f16".into()))?;
+        crate::best_cu::gemv::gemv_nvfp4::nvfp4_mma_gemv_shuf_f16_batched_views(
+            &kernels,
+            &stream,
+            &w_out.slice(..),
+            &s_out.slice(..),
+            &xp_out.slice(..),
+            &xs_out.slice(..),
+            &off_out.slice(..),
+            &mut out_view,
+            n as u32,
+            k as u32,
+            pairs as u32,
+        )
+    }
+
     fn embed_gather_mxfp8(
         &self,
         table: &Storage,

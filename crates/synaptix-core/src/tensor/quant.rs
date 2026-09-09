@@ -308,6 +308,13 @@ impl QuantWeight {
         Ok(Tensor::from_parts(std::sync::Arc::new(storage), out_layout))
     }
 
+    /// Адрес перемешанной копии и её масштабов на карте — из них строится
+    /// таблица [`ExpertTable`].
+    pub fn shuffled_addr(&self) -> Option<(u64, u64)> {
+        let shuf = self.shuffled()?;
+        Some((storage_addr(shuf)?, storage_addr(&self.scales)?))
+    }
+
     pub fn shuffled(&self) -> Option<&Storage> {
         self.shuffled.get().map(|s| s.as_ref())
     }
@@ -317,5 +324,101 @@ impl QuantWeight {
         init: impl FnOnce() -> Result<Arc<Storage>>,
     ) -> Result<&Storage> {
         self.shuffled.get_or_try_init(init).map(|s| s.as_ref())
+    }
+}
+
+
+fn storage_addr(st: &Storage) -> Option<u64> {
+    st.device_address()
+}
+
+/// Стопка NVFP4-экспертов, адресуемая индексом НА КАРТЕ.
+///
+/// Таблица адресов перемешанных весов строится один раз (адреса стабильны:
+/// копии живут столько же, сколько сама модель), а какой эксперт считать —
+/// решает тензор индексов на устройстве. Нужна графовому декоду MoE: под
+/// захватом CUDA-графа выбор не может проходить через хост.
+pub struct ExpertTable {
+    /// I64[E] — адреса перемешанных весов.
+    w_table: Tensor,
+    /// I64[E] — адреса масштабов весов.
+    s_table: Tensor,
+    n: usize,
+    k: usize,
+    count: usize,
+    device: Device,
+}
+
+impl ExpertTable {
+    /// `None` — веса не NVFP4, разной формы либо без перемешанной копии
+    /// (её строит `ensure_shuffled` на загрузке).
+    pub fn build(weights: &[&QuantWeight]) -> Option<Self> {
+        let first = weights.first()?;
+        if first.dtype != DType::NVFP4 || !first.device.is_cuda() {
+            return None;
+        }
+        let (n, k, device) = (first.n, first.k, first.device);
+        let mut w = Vec::with_capacity(weights.len());
+        let mut sc = Vec::with_capacity(weights.len());
+        for it in weights {
+            if it.n != n || it.k != k || it.device != device || it.dtype != DType::NVFP4 {
+                return None;
+            }
+            let (wa, sa) = it.shuffled_addr()?;
+            w.push(wa as i64);
+            sc.push(sa as i64);
+        }
+        let count = weights.len();
+        let w_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
+        let s_table = Tensor::from_vec::<_, i64>(sc, vec![count], device).ok()?;
+        Some(Self { w_table, s_table, n, k, count, device })
+    }
+
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Один GEMV на пару: `out[p] = W[idx[p]] · x`. Активация — ОДНА строка
+    /// (декод), квантованная заранее; `idx` — U32 на устройстве.
+    /// `rows_per_pair = false` — все пары читают строку 0 активации (первая
+    /// проекция эксперта); `true` — пара `p` читает строку `p` (вторая
+    /// проекция, где активация уже своя на пару).
+    pub fn gemv_indexed(
+        &self,
+        idx: &Tensor,
+        packed: &Tensor,
+        scales: &Tensor,
+        rows_per_pair: bool,
+    ) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        if idx.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("gemv_indexed: idx должен быть U32"));
+        }
+        let pairs = idx.numel();
+        let out_layout = Layout::contiguous(Shape::new(vec![pairs, self.n]), DType::F16);
+        let backend = registry::backend_for(self.device)?;
+        let mut storage =
+            backend.alloc_zeros(DType::F16.bytes_for_numel(pairs * self.n), self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        let idx_c = if idx.is_contiguous() { idx.clone() } else { idx.contiguous()? };
+        backend.nvfp4_gemv_indexed(
+            &self.w_table.storage,
+            &self.s_table.storage,
+            (&idx_c.storage, &idx_c.layout),
+            &packed.storage,
+            &scales.storage,
+            (&mut storage, &out_layout),
+            self.n,
+            self.k,
+            self.count,
+            pairs,
+            rows_per_pair,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(std::sync::Arc::new(storage), out_layout))
     }
 }

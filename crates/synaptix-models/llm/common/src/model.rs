@@ -786,6 +786,10 @@ pub struct DecodeState {
     pub ring_len_dev: Tensor,
     pub rope_cos: Tensor,
     pub rope_sin: Tensor,
+    /// Таблицы RoPE sliding-слоёв, когда они отличаются от global (Gemma:
+    /// другая база И другая ширина головы). `None` — RoPE один на всю модель.
+    pub rope_cos_local: Option<Tensor>,
+    pub rope_sin_local: Option<Tensor>,
     pub logits: Tensor,
 }
 
@@ -1549,6 +1553,23 @@ impl DecoderModel {
             && matches!(self.dtype, DType::F16 | DType::BF16)
     }
 
+    /// Достаётся ли хоть одному слою квантованный KV. Политика модели может
+    /// просить MXFP8, но послойно он включается не везде
+    /// ([`Self::layer_kv_mxfp8`]): у Gemma-4, например, ни один слой его не
+    /// получает — sliding отсекает окно, global отсекает голова 512.
+    pub fn kv_all_dense(&self) -> bool {
+        (0..self.blocks.len()).all(|l| !self.layer_kv_mxfp8(l))
+    }
+
+    /// MXFP8 у ТАБЛИЦЫ эмбеддингов (gather ходит своим ядром). Отдельно от
+    /// головы: голову граф переживает, её скретчи прогреваются до захвата.
+    pub fn has_mxfp8_embed(&self) -> bool {
+        self.embed_q
+            .as_ref()
+            .map(|q| q.dtype() == DType::MXFP8)
+            .unwrap_or(false)
+    }
+
     pub fn has_mxfp8_head_or_embed(&self) -> bool {
         self.embed_q
             .as_ref()
@@ -2037,17 +2058,41 @@ impl DecoderModel {
         let tcache_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let ring_pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let ring_len_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
+        let dup = |r: &RopeCache| -> Result<(Tensor, Tensor), ModelError> {
+            let (cos, sin) = (r.cos(), r.sin());
+            Ok((
+                Tensor::cat(&[cos, cos], 1).coerr()?.to_dtype(self.dtype).coerr()?,
+                Tensor::cat(&[sin, sin], 1).coerr()?.to_dtype(self.dtype).coerr()?,
+            ))
+        };
         let rope = if self.config.rope_global.rotary_dim > 0 {
             &self.rope_global
         } else {
             self.rope_local.as_ref().unwrap_or(&self.rope_global)
         };
-        let cos = rope.cos();
-        let sin = rope.sin();
-        let rope_cos = Tensor::cat(&[cos, cos], 1).coerr()?.to_dtype(self.dtype).coerr()?;
-        let rope_sin = Tensor::cat(&[sin, sin], 1).coerr()?.to_dtype(self.dtype).coerr()?;
+        let (rope_cos, rope_sin) = dup(rope)?;
+        // Вторая пара нужна, только если sliding-слои вращаются иначе: у Gemma
+        // у них и база другая, и голова уже.
+        let (rope_cos_local, rope_sin_local) = match self.rope_local.as_ref() {
+            Some(r) if self.config.rope_global.rotary_dim > 0 => {
+                let (c, s) = dup(r)?;
+                (Some(c), Some(s))
+            }
+            _ => (None, None),
+        };
         let logits = Tensor::zeros(vec![batch, self.config.vocab_size], self.dtype, dev).coerr()?;
-        Ok(DecodeState { input, pos_dev, tcache_dev, ring_pos_dev, ring_len_dev, rope_cos, rope_sin, logits })
+        Ok(DecodeState {
+            input,
+            pos_dev,
+            tcache_dev,
+            ring_pos_dev,
+            ring_len_dev,
+            rope_cos,
+            rope_sin,
+            rope_cos_local,
+            rope_sin_local,
+            logits,
+        })
     }
 
     pub fn ring_prepare_decode(&self, kv: &mut KvCache, pos: usize) -> Result<usize, ModelError> {
@@ -2127,9 +2172,44 @@ impl DecoderModel {
         self.config.linear.is_some()
     }
 
-    pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
+    /// Готова ли модель к графовому декоду: профиль конфига плюс веса —
+    /// MoE-ветка обязана уметь считаться целиком на карте (иначе внутри шага
+    /// будет выгрузка на хост, а под захватом графа она нелегальна).
+    pub fn graph_decode_ready(&self) -> bool {
+        let trace = std::env::var("SYN_TRACE_GRAPH").is_ok();
+        let no = |why: &str| {
+            if trace {
+                eprintln!("[GRAPH_NO] {why}");
+            }
+            false
+        };
         if !self.config.graph_decode_ok() {
-            return Err(ModelError::Forward("forward_decode_dev: профиль не поддержан (два реальных RoPE)".into()));
+            return no("профиль конфига");
+        }
+        if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
+            return no("sliding без ring-KV");
+        }
+        if !matches!(self.device, Device::Cuda(_)) {
+            return no("не CUDA");
+        }
+        if !self.blocks_all_resident() {
+            return no("блоки не резидентны");
+        }
+        for (i, b) in self.blocks.iter().enumerate() {
+            if let Some(m) = &b.moe {
+                if !m.ffn.dev_path_ready() {
+                    return no(&format!("MoE слоя {i} без device-пути"));
+                }
+            }
+        }
+        true
+    }
+
+    pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
+        if !self.graph_decode_ready() {
+            return Err(ModelError::Forward(
+                "forward_decode_dev: профиль не поддержан (MoE без device-пути, оффлоад блоков или sliding без ring-KV)".into(),
+            ));
         }
         if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
             return Err(ModelError::Forward("forward_decode_dev: sliding без ring-KV не поддержан".into()));
@@ -2169,7 +2249,40 @@ impl DecoderModel {
                 fused_add_norm(dev, &mixed, &hidden, &blk.pre_mlp_norm, blk.rms_eps)?;
             hidden = new_hidden;
             let mlp_out = blk.mlp.forward(&h_mlp)?;
+            // MoE-ветка: роутер и выбор экспертов идут НА КАРТЕ
+            // (`MoeFfn::forward_dev`), иначе граф не захватился бы.
+            let mlp_out = match &blk.moe {
+                None => mlp_out,
+                Some(moe) => {
+                    let hsz = self.config.hidden_size;
+                    let flat = |t: &Tensor| t.reshape(vec![b, hsz]).and_then(|x| x.contiguous()).coerr();
+                    let router_in = rms_norm(&hidden, &moe.router_norm, blk.rms_eps).coerr()?;
+                    let expert_in = rms_norm(&hidden, &moe.pre_norm, blk.rms_eps).coerr()?;
+                    let moe_out = prof(dev, "moe_dev", || {
+                        moe.ffn.forward_dev(&flat(&expert_in)?, Some(&flat(&router_in)?))
+                    })?;
+                    let moe_out = moe_out.reshape(vec![b, 1, hsz]).coerr()?;
+                    let dense = rms_norm(&mlp_out, &moe.post_dense, blk.post_eps).coerr()?;
+                    let sparse = rms_norm(&moe_out, &moe.post_moe, blk.post_eps).coerr()?;
+                    let sparse = if sparse.dtype() == dense.dtype() {
+                        sparse
+                    } else {
+                        sparse.to_dtype(dense.dtype()).coerr()?
+                    };
+                    dense.add(&sparse).coerr()?
+                }
+            };
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
+            // `layer_scalar` умножает СУММУ с residual, поэтому слить сложение
+            // со следующей нормой одним ядром тут нельзя.
+            if let Some(a) = blk.layer_scalar.filter(|a| *a != 1.0) {
+                hidden = hidden.add(&mlp_out).coerr()?.mul_scalar(a).coerr()?;
+                if idx + 1 < nb {
+                    let nx = &self.blocks[idx + 1];
+                    h = rms_norm(&hidden, &nx.pre_attn_norm, nx.rms_eps).coerr()?;
+                }
+                continue;
+            }
             if idx + 1 < nb {
                 // hidden = hidden + mlp_out; h = norm(hidden, next.pre_attn).
                 let nb_next = &self.blocks[idx + 1];
@@ -2629,18 +2742,23 @@ impl FullAttn {
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let k = proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?
             .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let Some(v_proj) = self.v_proj.as_ref() else {
-            return Err(ModelError::Forward(
-                "device-путь не поддерживает слои с V=K (attention_k_eq_v)".into(),
-            ));
+        // `attention_k_eq_v`: значения — выход `k_proj` ДО Q/K-нормы и RoPE.
+        let v = match self.v_proj.as_ref() {
+            Some(vp) => proj_shared(vp, h, &act, dev, "attn_vproj")?
+                .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
+            None => k.clone(),
         };
-        let v = proj_shared(v_proj, h, &act, dev, "attn_vproj")?
-            .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
+        let v = prof(dev, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
+        // Sliding- и global-слои вращаются разными таблицами (Gemma).
+        let (rope_cos, rope_sin) = match (self.sliding_window, &state.rope_cos_local, &state.rope_sin_local) {
+            (Some(_), Some(c), Some(s)) => (c, s),
+            _ => (&state.rope_cos, &state.rope_sin),
+        };
         let (q, k) = if self.rotary_dim > 0 {
-            let q = prof(dev, "attn_rope", || q.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
-            let k = prof(dev, "attn_rope", || k.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
+            let q = prof(dev, "attn_rope", || q.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
+            let k = prof(dev, "attn_rope", || k.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
             (q, k)
         } else {
             (q, k)

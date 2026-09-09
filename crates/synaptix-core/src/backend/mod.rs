@@ -743,6 +743,30 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("nvfp4_gemv_batched не поддержан этим backend"))
     }
 
+    /// Пакетный NVFP4-GEMV, где эксперт для каждой пары выбирается индексом
+    /// НА КАРТЕ (`idx`), а не хостом. Таблицы `w_table`/`s_table` — I64-адреса
+    /// перемешанных весов и их масштабов, построенные один раз. Нужен
+    /// графовому декоду MoE: под захватом графа выгрузки на хост быть не может.
+    /// Активация — одна строка (декод), поэтому смещений строк нет.
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemv_indexed(
+        &self,
+        _w_table: &Storage,
+        _s_table: &Storage,
+        _idx: (&Storage, &Layout),
+        _x_packed: &Storage,
+        _x_scales: &Storage,
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _experts: usize,
+        _pairs: usize,
+        _rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_gemv_indexed не поддержан этим backend"))
+    }
+
     fn embed_gather_mxfp8(
         &self,
         _table: &Storage,
