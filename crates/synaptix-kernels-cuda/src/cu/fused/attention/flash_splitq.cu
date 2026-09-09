@@ -399,8 +399,13 @@ __device__ __forceinline__ void flash_splitq_impl(
     // ─── scale (exp2-домен) + маски: OOB q-строк, OOB kv, causal.
     // Fast-path: полный тайл без масок (на больших S — почти все тайлы). ───
     // warp-инвариантное условие (causal — по минимальной q-строке warp'а), без divergence
-    bool full_tile = (kv_count_local == BN) && (q_count == BM) && (window == 0)
-        && (!causal || kv_base_local + BN - 1 <= q_pos_base + (int)q_base + warp_id * 16);
+    // Окно: тайл целиком внутри, если самая дальняя строка warp'а (+15) видит
+    // первый ключ тайла, а первая строка — последний (иначе masked-путь).
+    int wq_lo = q_pos_base + (int)q_base + warp_id * 16;
+    bool full_tile = (kv_count_local == BN) && (q_count == BM)
+        && (!causal || kv_base_local + BN - 1 <= wq_lo)
+        && (window == 0
+            || (kv_base_local >= wq_lo + 15 - window && kv_base_local + BN - 1 <= wq_lo + window));
     // full-тайл: S остаётся RAW — масштаб уезжает в exp2-FMA (p = exp2(s·sc2 −
     // mn)) и в bm·sc2 (1 fmul вместо 16; max монотонен при sc2>0). masked-путь
     // масштабирует в msk() как раньше → exp_mul=1.
@@ -624,6 +629,321 @@ __device__ __forceinline__ void flash_splitq_win_dev_impl(
   __syncthreads();
   flash_splitq_impl<T, HD>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_sh, causal, t_stride, 0, window);
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HD=512 (global-слои Gemma-4). Голова 512 не помещается в регистры ни
+// Q-фрагментами (128 рег), ни O-аккумулятором (256 рег), поэтому:
+//   • Q-тайл 64×512 лежит в smem и читается ldmatrix'ом на каждом k-шаге;
+//   • S = Q·Kᵀ считается по всем 512 измерениям, а O — ПОЛОВИНОЙ головы на
+//     блок (grid.z = 2): каждая половина пересчитывает S заново (QK ×2,
+//     PV ×1 → 1.5× идеала по FLOP), зато укладывается в ~190 рег/поток;
+//   • V грузится только своей половиной (256 столбцов).
+// smem: Q 64×520 + K 16×520 + V 16×264 (bf16) = 90 КБ (лимит блока 99) → один блок на SM.
+template <typename T>
+__device__ __forceinline__ void flash_splitq_hd512_impl(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    T* __restrict__ out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  constexpr int HD = 512;
+  constexpr int HO = 256;
+  constexpr int BM = 64;
+  // BN=16: smem на блок у sm_120 — 99 КБ, Q-тайл берёт 65 из них.
+  constexpr int BN = 16;
+  constexpr int THREADS = 128;
+  constexpr int K_STEPS = HD / 16;
+  constexpr int SN_TILES = BN / 8;
+  constexpr int ON_TILES = HO / 8;
+  constexpr int PV_KSTEPS = BN / 16;
+  constexpr int Q_LD = HD + 8;
+  constexpr int K_LD = HD + 8;
+  constexpr int V_LD = HO + 8;
+  constexpr int Q_CHUNKS = BM * HD / 8;
+  constexpr int K_CHUNKS = BN * HD / 8;
+  constexpr int V_CHUNKS = BN * HO / 8;
+
+  unsigned int q_tile = blockIdx.x;
+  unsigned int bh     = blockIdx.y;
+  int half            = (int)blockIdx.z;
+  unsigned int b      = bh / NH;
+  unsigned int h      = bh % NH;
+  unsigned int tid    = threadIdx.x;
+  int warp_id = (int)(tid >> 5);
+  int lane    = (int)(tid & 31);
+
+  if ((int)b >= B) return;
+  unsigned int q_base = q_tile * BM;
+  if ((int)q_base >= Tq) return;
+  int q_count = (int)((Tq - (int)q_base) < BM ? (Tq - (int)q_base) : BM);
+
+  int n_rep = NH / NKV;
+  unsigned int kv_h = h / n_rep;
+  int q_pos_base = (Tkv >= Tq) ? (Tkv - Tq) : 0;
+
+  long kv_stride = (t_stride > 0) ? (long)t_stride : (long)Tkv;
+  size_t kv_base_offset = ((size_t)b * NKV + kv_h) * (size_t)kv_stride * HD;
+  size_t q_base_offset  = ((size_t)b * NH + h) * (size_t)Tq * HD;
+
+  extern __shared__ unsigned char smem[];
+  T* q_sm = (T*)smem;
+  T* k_sm = q_sm + BM * Q_LD;
+  T* v_sm = k_sm + BN * K_LD;
+
+  // Q-тайл → smem один раз (строки за q_count — нули).
+  for (int chunk = (int)tid; chunk < Q_CHUNKS; chunk += THREADS) {
+    int r = chunk / (HD / 8);
+    int d = (chunk % (HD / 8)) * 8;
+    unsigned int dst = fsq_smem_ptr(q_sm + r * Q_LD + d);
+    if (r < q_count) {
+      fsq_cp_async_16(dst, q + q_base_offset + (size_t)(q_base + r) * HD + d);
+    } else {
+      fsq_cp_async_16_zero(dst);
+    }
+  }
+  fsq_cp_async_commit();
+
+  float o_acc[ON_TILES][4];
+  #pragma unroll
+  for (int n = 0; n < ON_TILES; ++n) {
+    o_acc[n][0] = 0.0f; o_acc[n][1] = 0.0f; o_acc[n][2] = 0.0f; o_acc[n][3] = 0.0f;
+  }
+  float m_lo = FSQ_NEG_INF, m_hi = FSQ_NEG_INF;
+  float l_lo = 0.0f, l_hi = 0.0f;
+
+  int wrow_lo = warp_id * 16 + lane / 4;
+  int wrow_hi = wrow_lo + 8;
+  int q_pos_lo = q_pos_base + (int)q_base + wrow_lo;
+  int q_pos_hi = q_pos_base + (int)q_base + wrow_hi;
+  const float sc2 = scale * FSQ_LOG2E;
+
+  auto issue_kv_load = [&](int kv_block_idx) {
+    int kv_base_local = kv_block_idx * BN;
+    for (int chunk = (int)tid; chunk < K_CHUNKS; chunk += THREADS) {
+      int t_local = chunk / (HD / 8);
+      int d = (chunk % (HD / 8)) * 8;
+      unsigned int dst = fsq_smem_ptr(k_sm + t_local * K_LD + d);
+      int kv_t = kv_base_local + t_local;
+      if (kv_t < Tkv) {
+        fsq_cp_async_16(dst, &k[kv_base_offset + (size_t)kv_t * HD + d]);
+      } else {
+        fsq_cp_async_16_zero(dst);
+      }
+    }
+    for (int chunk = (int)tid; chunk < V_CHUNKS; chunk += THREADS) {
+      int t_local = chunk / (HO / 8);
+      int d = (chunk % (HO / 8)) * 8;
+      unsigned int dst = fsq_smem_ptr(v_sm + t_local * V_LD + d);
+      int kv_t = kv_base_local + t_local;
+      if (kv_t < Tkv) {
+        fsq_cp_async_16(dst, &v[kv_base_offset + (size_t)kv_t * HD + half * HO + d]);
+      } else {
+        fsq_cp_async_16_zero(dst);
+      }
+    }
+    fsq_cp_async_commit();
+  };
+
+  int n_kv_blocks = (Tkv + BN - 1) / BN;
+  if (causal) {
+    int kv_hi = q_pos_base + (int)q_base + BM;
+    int blocks_needed = (kv_hi + BN - 1) / BN;
+    if (blocks_needed < n_kv_blocks) n_kv_blocks = blocks_needed;
+  }
+
+  for (int kv_block = 0; kv_block < n_kv_blocks; ++kv_block) {
+    issue_kv_load(kv_block);
+    FSQ_CP_ASYNC_WAIT_GROUP(0);
+    __syncthreads();
+
+    int kv_base_local = kv_block * BN;
+    int rem = Tkv - kv_base_local;
+    int kv_count_local = rem < BN ? rem : BN;
+
+    float s_frag[SN_TILES][4];
+    #pragma unroll
+    for (int n = 0; n < SN_TILES; ++n) {
+      s_frag[n][0] = 0.0f; s_frag[n][1] = 0.0f; s_frag[n][2] = 0.0f; s_frag[n][3] = 0.0f;
+    }
+    {
+      // kp снаружи: пара Q-фрагментов (32 измерения) читается из smem один
+      // раз и идёт на все SN_TILES столбцовых тайлов K.
+      unsigned int q_row_addr = fsq_smem_ptr(q_sm + (warp_id * 16 + (lane & 15)) * Q_LD + ((lane >> 4) & 1) * 8);
+      unsigned int k_row_addr = fsq_smem_ptr(k_sm + (lane & 7) * K_LD + ((lane >> 3) & 3) * 8);
+      #pragma unroll
+      for (int kp = 0; kp < K_STEPS / 2; ++kp) {
+        unsigned int qa[2][4];
+        fsq_ldmatrix_x4(qa[0][0], qa[0][1], qa[0][2], qa[0][3], q_row_addr + (kp * 32) * 2);
+        fsq_ldmatrix_x4(qa[1][0], qa[1][1], qa[1][2], qa[1][3], q_row_addr + (kp * 32 + 16) * 2);
+        #pragma unroll
+        for (int n = 0; n < SN_TILES; ++n) {
+          unsigned int kb[4];
+          fsq_ldmatrix_x4(kb[0], kb[1], kb[2], kb[3], k_row_addr + (n * 8 * K_LD + kp * 32) * 2);
+          fsq_mma16x8x16<T>(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
+              qa[0][0], qa[0][1], qa[0][2], qa[0][3], kb[0], kb[1],
+              s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
+          fsq_mma16x8x16<T>(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
+              qa[1][0], qa[1][1], qa[1][2], qa[1][3], kb[2], kb[3],
+              s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
+        }
+      }
+    }
+
+    bool full_tile = (kv_count_local == BN) && (q_count == BM)
+        && (!causal || kv_base_local + BN - 1 <= q_pos_base + (int)q_base + warp_id * 16);
+    float exp_mul = full_tile ? sc2 : 1.0f;
+    if (!full_tile) {
+      int col_base = (lane % 4) * 2;
+      #pragma unroll
+      for (int n = 0; n < SN_TILES; ++n) {
+        int c0 = n * 8 + col_base;
+        int c1 = c0 + 1;
+        auto msk = [&](float s, int q_row_idx, int q_pos, int kv_c) {
+          if (q_row_idx >= q_count) return FSQ_NEG_INF;
+          if (kv_c >= kv_count_local) return FSQ_NEG_INF;
+          if (causal && kv_c + kv_base_local > q_pos) return FSQ_NEG_INF;
+          return s * sc2;
+        };
+        s_frag[n][0] = msk(s_frag[n][0], wrow_lo, q_pos_lo, c0);
+        s_frag[n][1] = msk(s_frag[n][1], wrow_lo, q_pos_lo, c1);
+        s_frag[n][2] = msk(s_frag[n][2], wrow_hi, q_pos_hi, c0);
+        s_frag[n][3] = msk(s_frag[n][3], wrow_hi, q_pos_hi, c1);
+      }
+    }
+
+    float bm_lo = FSQ_NEG_INF, bm_hi = FSQ_NEG_INF;
+    #pragma unroll
+    for (int n = 0; n < SN_TILES; ++n) {
+      bm_lo = fmaxf(bm_lo, fmaxf(s_frag[n][0], s_frag[n][1]));
+      bm_hi = fmaxf(bm_hi, fmaxf(s_frag[n][2], s_frag[n][3]));
+    }
+    bm_lo = fmaxf(bm_lo, __shfl_xor_sync(0xffffffffu, bm_lo, 1));
+    bm_lo = fmaxf(bm_lo, __shfl_xor_sync(0xffffffffu, bm_lo, 2));
+    bm_hi = fmaxf(bm_hi, __shfl_xor_sync(0xffffffffu, bm_hi, 1));
+    bm_hi = fmaxf(bm_hi, __shfl_xor_sync(0xffffffffu, bm_hi, 2));
+    bm_lo *= exp_mul;
+    bm_hi *= exp_mul;
+
+    float mn_lo = fmaxf(m_lo, bm_lo);
+    float mn_hi = fmaxf(m_hi, bm_hi);
+    float alpha_lo, alpha_hi;
+    if (!fsq_is_finite(m_lo)) alpha_lo = 0.0f;
+    else if (!fsq_is_finite(mn_lo)) alpha_lo = 1.0f;
+    else alpha_lo = fsq_exp2(m_lo - mn_lo);
+    if (!fsq_is_finite(m_hi)) alpha_hi = 0.0f;
+    else if (!fsq_is_finite(mn_hi)) alpha_hi = 1.0f;
+    else alpha_hi = fsq_exp2(m_hi - mn_hi);
+
+    float rs_lo = 0.0f, rs_hi = 0.0f;
+    #pragma unroll
+    for (int n = 0; n < SN_TILES; ++n) {
+      float p0 = (!fsq_is_finite(mn_lo) || s_frag[n][0] == FSQ_NEG_INF) ? 0.0f : fsq_exp2(fmaf(s_frag[n][0], exp_mul, -mn_lo));
+      float p1 = (!fsq_is_finite(mn_lo) || s_frag[n][1] == FSQ_NEG_INF) ? 0.0f : fsq_exp2(fmaf(s_frag[n][1], exp_mul, -mn_lo));
+      float p2 = (!fsq_is_finite(mn_hi) || s_frag[n][2] == FSQ_NEG_INF) ? 0.0f : fsq_exp2(fmaf(s_frag[n][2], exp_mul, -mn_hi));
+      float p3 = (!fsq_is_finite(mn_hi) || s_frag[n][3] == FSQ_NEG_INF) ? 0.0f : fsq_exp2(fmaf(s_frag[n][3], exp_mul, -mn_hi));
+      s_frag[n][0] = p0; s_frag[n][1] = p1; s_frag[n][2] = p2; s_frag[n][3] = p3;
+      rs_lo += p0 + p1;
+      rs_hi += p2 + p3;
+    }
+    rs_lo += __shfl_xor_sync(0xffffffffu, rs_lo, 1);
+    rs_lo += __shfl_xor_sync(0xffffffffu, rs_lo, 2);
+    rs_hi += __shfl_xor_sync(0xffffffffu, rs_hi, 1);
+    rs_hi += __shfl_xor_sync(0xffffffffu, rs_hi, 2);
+
+    m_lo = mn_lo; m_hi = mn_hi;
+    l_lo = l_lo * alpha_lo + rs_lo;
+    l_hi = l_hi * alpha_hi + rs_hi;
+
+    if (!__all_sync(0xffffffffu, alpha_lo == 1.0f && alpha_hi == 1.0f)) {
+      #pragma unroll
+      for (int n = 0; n < ON_TILES; ++n) {
+        o_acc[n][0] *= alpha_lo; o_acc[n][1] *= alpha_lo;
+        o_acc[n][2] *= alpha_hi; o_acc[n][3] *= alpha_hi;
+      }
+    }
+
+    {
+      constexpr int PV_NP = ON_TILES / 2;
+      unsigned int v_row_addr = fsq_smem_ptr(v_sm + (lane & 15) * V_LD + ((lane >> 4) & 1) * 8);
+      #pragma unroll
+      for (int kk = 0; kk < PV_KSTEPS; ++kk) {
+        unsigned int a0 = fsq_pack2(s_frag[2 * kk][0],     s_frag[2 * kk][1],     T{});
+        unsigned int a1 = fsq_pack2(s_frag[2 * kk][2],     s_frag[2 * kk][3],     T{});
+        unsigned int a2 = fsq_pack2(s_frag[2 * kk + 1][0], s_frag[2 * kk + 1][1], T{});
+        unsigned int a3 = fsq_pack2(s_frag[2 * kk + 1][2], s_frag[2 * kk + 1][3], T{});
+        #pragma unroll
+        for (int np = 0; np < PV_NP; ++np) {
+          unsigned int vb[4];
+          fsq_ldmatrix_x4_trans(vb[0], vb[1], vb[2], vb[3], v_row_addr + (kk * 16 * V_LD + np * 16) * 2);
+          fsq_mma16x8x16<T>(o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3],
+              a0, a1, a2, a3, vb[0], vb[1],
+              o_acc[2 * np][0], o_acc[2 * np][1], o_acc[2 * np][2], o_acc[2 * np][3]);
+          fsq_mma16x8x16<T>(o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3],
+              a0, a1, a2, a3, vb[2], vb[3],
+              o_acc[2 * np + 1][0], o_acc[2 * np + 1][1], o_acc[2 * np + 1][2], o_acc[2 * np + 1][3]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  {
+    int col_lo = (lane % 4) * 2;
+    float inv_lo = (l_lo > 0.0f) ? 1.0f / l_lo : 0.0f;
+    float inv_hi = (l_hi > 0.0f) ? 1.0f / l_hi : 0.0f;
+    bool lo_valid = wrow_lo < q_count;
+    bool hi_valid = wrow_hi < q_count;
+    #pragma unroll
+    for (int n = 0; n < ON_TILES; ++n) {
+      int d_lo = half * HO + n * 8 + col_lo;
+      if (lo_valid) {
+        size_t off = q_base_offset + (size_t)(q_base + wrow_lo) * HD + d_lo;
+        fsq_store_f(&out[off], o_acc[n][0] * inv_lo);
+        fsq_store_f(&out[off + 1], o_acc[n][1] * inv_lo);
+      }
+      if (hi_valid) {
+        size_t off = q_base_offset + (size_t)(q_base + wrow_hi) * HD + d_lo;
+        fsq_store_f(&out[off], o_acc[n][2] * inv_hi);
+        fsq_store_f(&out[off + 1], o_acc[n][3] * inv_hi);
+      }
+    }
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void flash_splitq_hd512_dev_impl(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    T* __restrict__ out, float scale,
+    int B, int NH, int NKV, int Tq, const int* __restrict__ Tkv_ptr, int causal, int t_stride) {
+  __shared__ int Tkv_sh;
+  if (threadIdx.x == 0) Tkv_sh = *Tkv_ptr;
+  __syncthreads();
+  flash_splitq_hd512_impl<T>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_sh, causal, t_stride);
+}
+
+extern "C" {
+
+__global__ void __launch_bounds__(128, 1) flash_splitq_f16_hd512(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_hd512_impl<__half>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride);
+}
+__global__ void __launch_bounds__(128, 1) flash_splitq_bf16_hd512(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_hd512_impl<__nv_bfloat16>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride);
+}
+__global__ void __launch_bounds__(128, 1) flash_splitq_f16_hd512_dev(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride) {
+  flash_splitq_hd512_dev_impl<__half>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride);
+}
+__global__ void __launch_bounds__(128, 1) flash_splitq_bf16_hd512_dev(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, const int* Tkv_ptr, int causal, int t_stride) {
+  flash_splitq_hd512_dev_impl<__nv_bfloat16>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv_ptr, causal, t_stride);
+}
+
+}  // extern "C" (hd512)
 
 extern "C" {
 

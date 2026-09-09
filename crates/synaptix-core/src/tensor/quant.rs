@@ -257,6 +257,64 @@ impl QuantWeight {
         Ok(())
     }
 
+    /// Групповой GEMM экспертов на префилле: `x_packed`/`x_scales` — один
+    /// квантованный буфер `[rows_total, k]` (см. `nvfp4_quantize_act`), строки
+    /// эксперта `weights[g]` — сегмент `[row_off[g], row_off[g]+rows[g])`,
+    /// кратный 128. Выход `[rows_total, n]` в `out_dt`; строки вне сегментов
+    /// не пишутся.
+    pub fn gemm_grouped(
+        weights: &[&QuantWeight],
+        x_packed: &Tensor,
+        x_scales: &Tensor,
+        row_off: &[u32],
+        rows: &[u32],
+        rows_total: usize,
+        out_dt: DType,
+    ) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        if weights.is_empty() || weights.len() != row_off.len() || weights.len() != rows.len() {
+            return Err(SynaptixError::Unsupported("gemm_grouped: пустой или неровный батч"));
+        }
+        let first = weights[0];
+        if first.dtype != DType::NVFP4 {
+            return Err(SynaptixError::Unsupported("gemm_grouped: только NVFP4"));
+        }
+        let (n, k, device) = (first.n, first.k, first.device);
+        let mut w_shuf: Vec<&Storage> = Vec::with_capacity(weights.len());
+        let mut w_scales: Vec<&Storage> = Vec::with_capacity(weights.len());
+        for w in weights {
+            if w.n != n || w.k != k || w.device != device || w.dtype != DType::NVFP4 {
+                return Err(SynaptixError::Unsupported("gemm_grouped: разнородные веса"));
+            }
+            let Some(shuf) = w.shuffled() else {
+                return Err(SynaptixError::Unsupported("gemm_grouped: нет перемешанной копии"));
+            };
+            w_shuf.push(shuf);
+            w_scales.push(&w.scales);
+        }
+        let out_layout = Layout::contiguous(Shape::new(vec![rows_total, n]), out_dt);
+        let backend = registry::backend_for(device)?;
+        let mut storage = backend.alloc_uninit(out_dt.bytes_for_numel(rows_total * n), device)?;
+        let stream = Stream::default_for(device)?;
+        backend.nvfp4_gemm_grouped(
+            &w_shuf,
+            &w_scales,
+            &x_packed.storage,
+            &x_scales.storage,
+            row_off,
+            rows,
+            (&mut storage, &out_layout),
+            n,
+            k,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(std::sync::Arc::new(storage), out_layout))
+    }
+
     pub fn gemv_batched(
         weights: &[&QuantWeight],
         acts: &[(&Tensor, &Tensor)],

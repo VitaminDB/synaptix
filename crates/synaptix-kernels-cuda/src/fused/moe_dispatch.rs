@@ -29,6 +29,8 @@ pub struct MoeDispatchKernels {
     gather_f32: CudaFunction,
     gather_f16: CudaFunction,
     gather_bf16: CudaFunction,
+    combine_f16: CudaFunction,
+    combine_bf16: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<MoeDispatchKernels>)>>> = OnceLock::new();
@@ -54,6 +56,8 @@ impl MoeDispatchKernels {
             gather_f32: load_fn(&module, "moe_gather_f32")?,
             gather_f16: load_fn(&module, "moe_gather_f16")?,
             gather_bf16: load_fn(&module, "moe_gather_bf16")?,
+            combine_f16: load_fn(&module, "moe_combine_f16")?,
+            combine_bf16: load_fn(&module, "moe_combine_bf16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -203,4 +207,45 @@ pub fn moe_gather_bf16(
     d: u32,
 ) -> Result<()> {
     moe_gather::<bf16>(k, s, x, idx, out, n, d, DType::BF16)
+}
+
+/// `out[t, :] = Σ_s w[t·k+s] · y[inv[t·k+s], :]` — сборка выхода MoE одним
+/// ядром. `y` [rows, d], `inv`/`w` [t·k] (U32 / F32), `out` [t, d]; d % 8 == 0.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine_u8(
+    kernels: &MoeDispatchKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    y: &CudaSlice<u8>,
+    inv: &CudaSlice<u8>,
+    w: &CudaSlice<u8>,
+    out: &mut CudaSlice<u8>,
+    t: u32,
+    k: u32,
+    d: u32,
+) -> Result<()> {
+    if t == 0 || d == 0 {
+        return Ok(());
+    }
+    if d % 8 != 0 {
+        return Err(SynaptixError::Cuda(format!("moe_combine: d={d} must be a multiple of 8")));
+    }
+    let func = match dtype {
+        DType::F16 => &kernels.combine_f16,
+        DType::BF16 => &kernels.combine_bf16,
+        other => return Err(SynaptixError::Cuda(format!("moe_combine: unsupported dtype {other:?}"))),
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (t, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (t_i, k_i, d_i) = (t as i32, k as i32, d as i32);
+    let mut bld = stream.launch_builder(func);
+    bld.arg(y).arg(inv).arg(w).arg(&mut *out).arg(&t_i).arg(&k_i).arg(&d_i);
+    unsafe {
+        bld.launch(cfg)
+            .map_err(|e| SynaptixError::Cuda(format!("launch moe_combine: {e:?}")))?;
+    }
+    Ok(())
 }

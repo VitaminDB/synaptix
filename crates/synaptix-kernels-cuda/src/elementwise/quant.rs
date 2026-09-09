@@ -213,6 +213,7 @@ pub fn silu_mul_quantize_nvfp4_u8(
     outer_dim: u32,
     inner_dim: u32,
     inv_pre: f32,
+    act: u32,
 ) -> Result<()> {
     if inner_dim % 16 != 0 {
         return Err(SynaptixError::Cuda(format!(
@@ -243,7 +244,8 @@ pub fn silu_mul_quantize_nvfp4_u8(
         .arg(&inner_dim)
         .arg(&sf_inner_dim)
         .arg(&outer_cov)
-        .arg(&inv_pre);
+        .arg(&inv_pre)
+        .arg(&act);
     unsafe {
         b.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch silu_mul_quantize_nvfp4: {e:?}")))?;

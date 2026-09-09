@@ -1194,7 +1194,7 @@ impl DecoderModel {
                         num_experts_per_tok: mb.num_experts_per_tok,
                         shared_intermediate_size: 0,
                         norm_topk_prob: true,
-                        chunk: 512,
+                        chunk: crate::moe::prefill_chunk_tokens(2048),
                         skip_below: 0.0,
                         router_key: Some("router.proj.weight".into()),
                         per_expert_scale: Some(per_expert_scale),
@@ -1551,6 +1551,15 @@ impl DecoderModel {
         matches!(self.device, Device::Cuda(_))
             && matches!(self.config.head_dim, 128 | 256)
             && matches!(self.dtype, DType::F16 | DType::BF16)
+    }
+
+    /// Самый длинный чанк префилла, который помещается в кольцевой KV
+    /// sliding-слоёв (`w + RING_SLACK` ёмкости): `None` — кольца нет, промпт
+    /// можно префиллить целиком.
+    pub fn max_prefill_chunk(&self) -> Option<usize> {
+        let ring = self.ring_kv_ok()
+            && (0..self.blocks.len()).any(|l| self.config.window_for(l).is_some());
+        ring.then_some(RING_SLACK)
     }
 
     /// Достаётся ли хоть одному слою квантованный KV. Политика модели может
@@ -2809,7 +2818,7 @@ impl FullAttn {
                 && self.sliding_window.is_none()
                 && matches!(device, Device::Cuda(_))
                 && matches!(kv.k.dtype(), DType::F16 | DType::BF16)
-                && matches!(hd, 64 | 128 | 256)
+                && matches!(hd, 64 | 128 | 256 | 512)
             {
                 let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device).coerr()?;
                 match q.flash_attention_prefill_dev(&kv.k, &kv.v, &tc, self.attn_scale, true) {
@@ -2828,6 +2837,45 @@ impl FullAttn {
                 None
             };
             if let Some(a) = dev_prefill {
+                return Ok(a);
+            }
+            // Sliding-слой на префилле (Gemma: голова 256, окно 1024): то же
+            // оконное device-ядро, что и на декоде, — оно общее по числу
+            // запросов (сетка по q-тайлам, causal и окно внутри). Без этого
+            // слой уходил в SDPA: `repeat_kv` и матрица скоров nh×s×att_len в
+            // F32 на каждый чанк — 35 мс на слой при 2048 токенах, 73 % всего
+            // префилла Gemma-4.
+            let dev_prefill_win = if s > 1
+                && self.use_flash
+                && pad_bias.is_none()
+                && bidi_spans.is_empty()
+                && matches!(device, Device::Cuda(_))
+                && matches!(kv.k.dtype(), DType::F16 | DType::BF16)
+                && matches!(hd, 128 | 256)
+            {
+                match self.sliding_window {
+                    Some(w) => {
+                        let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device)
+                            .coerr()?;
+                        match q.flash_attention_window_dev(
+                            &kv.k, &kv.v, &tc, self.attn_scale, (w - 1) as i32, true,
+                        ) {
+                            Ok(a) => Some(a),
+                            Err(e @ (SynaptixError::Unsupported(_) | SynaptixError::NonContiguous)) => {
+                                if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                                    eprintln!("[FA_WIN_PREFILL_SKIP] {e:?}");
+                                }
+                                None
+                            }
+                            Err(e) => return Err(ModelError::Forward(e.to_string())),
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let Some(a) = dev_prefill_win {
                 return Ok(a);
             }
             // Один запрос (декод): KV читается device-ядром прямо из

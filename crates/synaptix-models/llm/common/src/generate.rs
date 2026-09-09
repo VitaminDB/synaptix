@@ -257,6 +257,11 @@ pub fn generate_streaming_resume(
     } else {
         cfg.prefill_batch.max(1)
     };
+    // Кольцевой KV sliding-слоёв не примет чанк длиннее своего запаса.
+    let chunk = match model.max_prefill_chunk() {
+        Some(cap) => chunk.min(cap),
+        None => chunk,
+    };
     let t0 = Instant::now();
     let mut last_logits: Option<Tensor> = None;
     let mut off = prefix;

@@ -288,6 +288,7 @@ __global__ void quantize_f16_to_nvfp4_fast(
         packed + ((size_t)outer * inner_dim + (size_t)block_col * 16u) / 2) = out8;
 }
 
+// `act`: 0 — silu(gate)·up, 1 — gelu_tanh(gate)·up (эксперты Gemma-4).
 __global__ void silu_mul_quantize_nvfp4_fast(
     const syn_in_t* __restrict__ x,
     unsigned char* __restrict__ packed,
@@ -296,7 +297,8 @@ __global__ void silu_mul_quantize_nvfp4_fast(
     unsigned int inner_dim,
     unsigned int sf_inner_dim,
     unsigned int outer_cov,
-    float inv_pre
+    float inv_pre,
+    unsigned int act
 ) {
     unsigned int groups_per_row = inner_dim >> 4;
     unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -333,12 +335,22 @@ __global__ void silu_mul_quantize_nvfp4_fast(
         float g1 = fminf(fmaxf(fg.y, -65504.0f), 65504.0f);
         float u0 = fminf(fmaxf(fu.x, -65504.0f), 65504.0f);
         float u1 = fminf(fmaxf(fu.y, -65504.0f), 65504.0f);
-        float e0 = __expf(-fabsf(g0));
-        float e1 = __expf(-fabsf(g1));
-        float s0 = (g0 >= 0.0f) ? (1.0f / (1.0f + e0)) : (e0 / (1.0f + e0));
-        float s1 = (g1 >= 0.0f) ? (1.0f / (1.0f + e1)) : (e1 / (1.0f + e1));
-        float a0 = g0 * s0 * u0 * inv_pre;
-        float a1 = g1 * s1 * u1 * inv_pre;
+        float a0, a1;
+        if (act == 1u) {
+            float c0 = g0 * g0 * g0;
+            float c1 = g1 * g1 * g1;
+            float t0 = 0.5f * g0 * (1.0f + tanhf(0.7978845608028654f * (g0 + 0.044715f * c0)));
+            float t1 = 0.5f * g1 * (1.0f + tanhf(0.7978845608028654f * (g1 + 0.044715f * c1)));
+            a0 = t0 * u0 * inv_pre;
+            a1 = t1 * u1 * inv_pre;
+        } else {
+            float e0 = __expf(-fabsf(g0));
+            float e1 = __expf(-fabsf(g1));
+            float s0 = (g0 >= 0.0f) ? (1.0f / (1.0f + e0)) : (e0 / (1.0f + e0));
+            float s1 = (g1 >= 0.0f) ? (1.0f / (1.0f + e1)) : (e1 / (1.0f + e1));
+            a0 = g0 * s0 * u0 * inv_pre;
+            a1 = g1 * s1 * u1 * inv_pre;
+        }
         v[2 * i] = a0;
         v[2 * i + 1] = a1;
         amax = fmaxf(amax, fmaxf(fabsf(a0), fabsf(a1)));

@@ -22,6 +22,9 @@ use crate::kernels::compile::{compile_module_with_opts, load_fn};
 const BM: u32 = 64;
 const BN: u32 = 32;
 const THREADS: u32 = 128;
+/// smem ядра HD=512: Q 64×(512+8) + K 16×(512+8) + V 16×(256+8), по 2 байта —
+/// 90 КБ при лимите 99 КБ на блок у sm_120.
+const HD512_SMEM_BYTES: u32 = (64 * 520 + 16 * 520 + 16 * 264) * 2;
 
 pub struct FlashSplitQKernels {
     _module: Arc<CudaModule>,
@@ -55,6 +58,10 @@ pub struct FlashSplitQKernels {
     bf16_hd256_win_dev: CudaFunction,
     f16_hd128_bshd_facc: CudaFunction,
     f16_hd128_v5_facc: CudaFunction,
+    f16_hd512: CudaFunction,
+    bf16_hd512: CudaFunction,
+    f16_hd512_dev: CudaFunction,
+    bf16_hd512_dev: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashSplitQKernels>)>>> = OnceLock::new();
@@ -101,6 +108,18 @@ impl FlashSplitQKernels {
         let bf16_hd256_win_dev = load_fn(&module, "flash_splitq_bf16_hd256_win_dev")?;
         let f16_hd128_bshd_facc = load_fn(&module, "flash_splitq_f16_hd128_bshd_facc")?;
         let f16_hd128_v5_facc = load_fn(&module, "flash_splitq5_f16_hd128_facc")?;
+        let f16_hd512 = load_fn(&module, "flash_splitq_f16_hd512")?;
+        let bf16_hd512 = load_fn(&module, "flash_splitq_bf16_hd512")?;
+        let f16_hd512_dev = load_fn(&module, "flash_splitq_f16_hd512_dev")?;
+        let bf16_hd512_dev = load_fn(&module, "flash_splitq_bf16_hd512_dev")?;
+        // HD=512: Q-тайл в smem + K полной ширины + половина V — 90 КБ.
+        for func in [&f16_hd512, &bf16_hd512, &f16_hd512_dev, &bf16_hd512_dev] {
+            func.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                HD512_SMEM_BYTES as i32,
+            )
+            .map_err(|e| SynaptixError::Cuda(format!("set_attribute flash_splitq hd512 shared: {e:?}")))?;
+        }
 
         // v5: smem = 2 (K,V) × 64 × 136 × 2 = 34816 Б < 48 KB, но ставим с запасом.
         for func in [&f16_hd128_v5, &bf16_hd128_v5, &bf16_hd128_v5_win, &f16_hd128_v5_win, &f16_hd128_v5_facc] {
@@ -173,6 +192,10 @@ impl FlashSplitQKernels {
             bf16_hd256_win_dev,
             f16_hd128_bshd_facc,
             f16_hd128_v5_facc,
+            f16_hd512,
+            bf16_hd512,
+            f16_hd512_dev,
+            bf16_hd512_dev,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -644,10 +667,122 @@ pub fn flash_splitq_window_u8_dev(
     Ok(())
 }
 
-/// Как [`flash_splitq_u8`], но активная длина KV читается ядром из device-буфера
-/// `tcache` (i32) — для CUDA-graph prefill (грид статичен по Tq). Контракт =
-/// host-варианта, но Tkv читается ядром из device-буфера.
+/// FA-5 для головы 512 (global-слои Gemma-4): grid.z = 2 — половина O на
+/// блок, S пересчитывается в каждой. `tkv` — либо число на хосте, либо
+/// device-скаляр (`tcache`), как у `flash_splitq_u8`/`_dev`.
 #[allow(clippy::too_many_arguments)]
+pub fn flash_splitq_hd512_u8(
+    kernels: &FlashSplitQKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    q: &CudaSlice<u8>,
+    q_off: usize,
+    k: &CudaSlice<u8>,
+    k_off: usize,
+    v: &CudaSlice<u8>,
+    v_off: usize,
+    out: &mut CudaSlice<u8>,
+    out_off: usize,
+    tkv: Hd512Tkv<'_>,
+    b: u32,
+    nh: u32,
+    nkv: u32,
+    t_q: u32,
+    scale: f32,
+    causal: bool,
+    t_stride: u32,
+) -> Result<()> {
+    const D: usize = 512;
+    if b == 0 || nh == 0 || t_q == 0 {
+        return Ok(());
+    }
+    if nkv == 0 || nh % nkv != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "flash_splitq_hd512: NH={nh} must be a multiple of NKV={nkv}"
+        )));
+    }
+    let t_stride_eff = match (&tkv, t_stride) {
+        (Hd512Tkv::Host(t), 0) => *t as usize,
+        (Hd512Tkv::Device(..), 0) => {
+            return Err(SynaptixError::Cuda(
+                "flash_splitq_hd512_dev: t_stride must be > 0".into(),
+            ))
+        }
+        (_, ts) => ts as usize,
+    };
+    let func = match (dtype, &tkv) {
+        (DType::F16, Hd512Tkv::Host(_)) => &kernels.f16_hd512,
+        (DType::BF16, Hd512Tkv::Host(_)) => &kernels.bf16_hd512,
+        (DType::F16, Hd512Tkv::Device(..)) => &kernels.f16_hd512_dev,
+        (DType::BF16, Hd512Tkv::Device(..)) => &kernels.bf16_hd512_dev,
+        _ => return Err(SynaptixError::Unsupported("flash_splitq_hd512: dtype (F16/BF16)")),
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (t_q.div_ceil(BM), b * nh, 2),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: HD512_SMEM_BYTES,
+    };
+    let esz = 2usize;
+    let q_n = (b as usize) * (nh as usize) * (t_q as usize) * D;
+    let kv_n = (b as usize) * (nkv as usize) * t_stride_eff * D;
+    let (b_i, nh_i, nkv_i, tq_i) = (b as i32, nh as i32, nkv as i32, t_q as i32);
+    let causal_i: i32 = if causal { 1 } else { 0 };
+    let ts_i: i32 = t_stride as i32;
+    let q_v = unsafe {
+        q.slice(q_off..q_off + q_n * esz)
+            .transmute::<bf16>(q_n)
+            .ok_or_else(|| SynaptixError::Cuda("flash_splitq_hd512: transmute q".into()))?
+    };
+    let k_v = unsafe {
+        k.slice(k_off..k_off + kv_n * esz)
+            .transmute::<bf16>(kv_n)
+            .ok_or_else(|| SynaptixError::Cuda("flash_splitq_hd512: transmute k".into()))?
+    };
+    let v_v = unsafe {
+        v.slice(v_off..v_off + kv_n * esz)
+            .transmute::<bf16>(kv_n)
+            .ok_or_else(|| SynaptixError::Cuda("flash_splitq_hd512: transmute v".into()))?
+    };
+    let mut o_s = out.slice_mut(out_off..out_off + q_n * esz);
+    let mut o_v = unsafe {
+        o_s.transmute_mut::<bf16>(q_n)
+            .ok_or_else(|| SynaptixError::Cuda("flash_splitq_hd512: transmute out".into()))?
+    };
+    let mut bld = stream.launch_builder(func);
+    bld.arg(&q_v).arg(&k_v).arg(&v_v).arg(&mut o_v).arg(&scale).arg(&b_i).arg(&nh_i).arg(&nkv_i).arg(&tq_i);
+    match tkv {
+        Hd512Tkv::Host(t) => {
+            let t_i = t as i32;
+            bld.arg(&t_i).arg(&causal_i).arg(&ts_i);
+            unsafe {
+                bld.launch(cfg)
+                    .map_err(|e| SynaptixError::Cuda(format!("launch flash_splitq_hd512: {e:?}")))?;
+            }
+        }
+        Hd512Tkv::Device(tcache, tc_off) => {
+            let tc_view = unsafe {
+                tcache
+                    .slice(tc_off..tc_off + 4)
+                    .transmute::<i32>(1)
+                    .ok_or_else(|| SynaptixError::Cuda("flash_splitq_hd512_dev: transmute tcache".into()))?
+            };
+            bld.arg(&tc_view).arg(&causal_i).arg(&ts_i);
+            unsafe {
+                bld.launch(cfg)
+                    .map_err(|e| SynaptixError::Cuda(format!("launch flash_splitq_hd512_dev: {e:?}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Откуда ядро HD=512 берёт длину KV.
+pub enum Hd512Tkv<'a> {
+    Host(u32),
+    /// Device-скаляр i32 (`t_cache`) и его байтовое смещение.
+    Device(&'a CudaSlice<u8>, usize),
+}
+
 pub fn flash_splitq_u8_dev(
     kernels: &FlashSplitQKernels,
     stream: &Arc<CudaStream>,

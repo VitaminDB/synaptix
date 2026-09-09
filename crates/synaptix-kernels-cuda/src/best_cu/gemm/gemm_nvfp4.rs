@@ -116,6 +116,7 @@ pub struct Nvfp4MmaGemmShufKernels {
     r_2x2_m4n4: CudaFunction,
     r_4x2_m2n8: CudaFunction,
     r_2x2_m4n8: CudaFunction,
+    r_2x2_m4n8_grouped: CudaFunction,
 
 }
 
@@ -174,6 +175,7 @@ impl Nvfp4MmaGemmShufKernels {
         let r_2x2_m4n4 = load_fn(&module, "nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n4")?;
         let r_4x2_m2n8 = load_fn(&module, "nvfp4_mma_gemm_shuf_2dr_f16_4x2_m2n8")?;
         let r_2x2_m4n8 = load_fn(&module, "nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n8")?;
+        let r_2x2_m4n8_grouped = load_fn(&module, "nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n8_grouped")?;
         for f in [
             &w4,
             &w8,
@@ -215,6 +217,7 @@ impl Nvfp4MmaGemmShufKernels {
             r_2x2_m4n4,
             r_4x2_m2n8,
             r_2x2_m4n8,
+            r_2x2_m4n8_grouped,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -388,6 +391,55 @@ pub fn nvfp4_mma_gemm_shuf_n8_f16_view(
     unsafe {
         b.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemm_shuf_n8: {e:?}")))?;
+    }
+    Ok(())
+}
+
+
+/// Групповой GEMM экспертов: `table` — [3·G] u64 (см. ядро), `max_rows` —
+/// самый длинный сегмент. Все сегменты кратны 128 строк, N кратно 128.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_mma_gemm_shuf_2dr_grouped_view(
+    kernels: &Nvfp4MmaGemmShufKernels,
+    stream: &Arc<CudaStream>,
+    table: &CudaSlice<u64>,
+    packed_x: &CudaSlice<u8>,
+    scales_x: &CudaSlice<u8>,
+    out: &mut CudaViewMut<f16>,
+    n: u32,
+    k: u32,
+    groups: u32,
+    max_rows: u32,
+) -> Result<()> {
+    if k % 64 != 0 || n % 128 != 0 || max_rows % 128 != 0 {
+        return Err(SynaptixError::Cuda(format!(
+            "nvfp4_mma_gemm_shuf_2dr_grouped: K={k}%64, N={n}%128, rows={max_rows}%128"
+        )));
+    }
+    if groups == 0 || max_rows == 0 {
+        return Ok(());
+    }
+    let cfg = Gemm2drConfig::R_2X2_M4N8;
+    let sf_inner_w = sf_inner_dim(k);
+    let sf_inner_x = sf_inner_dim(k);
+    let launch_cfg = LaunchConfig {
+        grid_dim: (n / 128, max_rows / 128, groups),
+        block_dim: (cfg.threads(), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&kernels.r_2x2_m4n8_grouped);
+    b.arg(table)
+        .arg(packed_x)
+        .arg(scales_x)
+        .arg(&mut *out)
+        .arg(&n)
+        .arg(&k)
+        .arg(&sf_inner_w)
+        .arg(&sf_inner_x)
+        .arg(&groups);
+    unsafe {
+        b.launch(launch_cfg)
+            .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemm_shuf_2dr_grouped: {e:?}")))?;
     }
     Ok(())
 }

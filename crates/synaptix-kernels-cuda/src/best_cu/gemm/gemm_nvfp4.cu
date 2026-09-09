@@ -605,6 +605,33 @@ __device__ __forceinline__ void mma_gemm_shuf_2dr_impl(
     }
 }
 
+// Групповой GEMM экспертов MoE (префилл): один запуск на все эксперты слоя.
+// `table` [3·G] u64: адреса перемешанных весов, адреса их масштабов,
+// (row_off << 32) | rows. Активация — один квантованный буфер [R, K/2] со
+// строками эксперта в сегменте [row_off, row_off+rows), row_off и rows кратны
+// 128 (тайл масштабов NVFP4 и BLOCK_N ядра). grid = (N/128, max_rows/128, G).
+extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_2x2_m4n8_grouped(
+    const unsigned long long* __restrict__ table,
+    const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,
+    syn_out_t* __restrict__ out, unsigned int N, unsigned int K,
+    unsigned int sf_inner_dim_w, unsigned int sf_inner_dim_x, unsigned int groups)
+{
+    unsigned int g = blockIdx.z;
+    if (g >= groups) return;
+    unsigned long long rr = table[2u * groups + g];
+    unsigned int rows = (unsigned int)(rr & 0xffffffffull);
+    unsigned int row_off = (unsigned int)(rr >> 32);
+    if (blockIdx.y * 128u >= rows) return;
+    const unsigned char* w  = reinterpret_cast<const unsigned char*>(table[g]);
+    const unsigned char* ws = reinterpret_cast<const unsigned char*>(table[groups + g]);
+    mma_gemm_shuf_2dr_impl<2, 2, 4, 8>(
+        w, ws,
+        packed_x + (size_t)row_off * (size_t)(K >> 1),
+        scales_x + (size_t)(row_off >> 7) * (size_t)sf_inner_dim_x * 128u,
+        out + (size_t)row_off * (size_t)N,
+        N, K, sf_inner_dim_w, sf_inner_dim_x);
+}
+
 extern "C" __global__ void nvfp4_mma_gemm_shuf_2dr_f16_4x4_m2n2(
     const unsigned char* __restrict__ packed_w, const unsigned char* __restrict__ scales_w,
     const unsigned char* __restrict__ packed_x, const unsigned char* __restrict__ scales_x,

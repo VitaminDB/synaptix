@@ -804,6 +804,49 @@ impl Tensor {
     }
 
     pub fn silu_mul_quant_nvfp4(&self, inv_pre: f32) -> Result<(Tensor, Tensor)> {
+        self.act_mul_quant_nvfp4(inv_pre, false)
+    }
+
+    /// Сборка выхода MoE одним ядром: `self` — строки экспертов `[rows, d]`,
+    /// `inv` U32 `[t·k]` — какая строка принадлежит паре (токен, слот), `w`
+    /// F32 `[t·k]` — вес пары; результат `[t, d]` = Σ по слотам.
+    pub fn moe_combine(&self, inv: &Tensor, w: &Tensor, k: usize) -> Result<Tensor> {
+        if self.rank() != 2 {
+            return Err(SynaptixError::Unsupported("moe_combine: ждём [rows, d]"));
+        }
+        let d = self.dims()[1];
+        let pairs = inv.layout.numel();
+        if k == 0 || pairs % k != 0 || w.layout.numel() != pairs {
+            return Err(SynaptixError::Unsupported("moe_combine: inv/w не согласованы с k"));
+        }
+        let t = pairs / k;
+        let y = self.contiguous_view()?;
+        let inv = inv.contiguous_view()?;
+        let w = w.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let out_layout = Layout::contiguous(Shape::new(vec![t, d]), self.dtype());
+        let mut storage = backend.alloc_uninit(self.dtype().bytes_for_numel(t * d), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.moe_combine(
+            (&y.storage, &y.layout),
+            (&inv.storage, &inv.layout),
+            (&w.storage, &w.layout),
+            (&mut storage, &out_layout),
+            t,
+            k,
+            d,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
+    /// `gelu_tanh(gate)·up` → NVFP4 одним ядром (эксперты Gemma-4); раскладка
+    /// входа и выхода — как у [`Self::silu_mul_quant_nvfp4`].
+    pub fn gelu_tanh_mul_quant_nvfp4(&self, inv_pre: f32) -> Result<(Tensor, Tensor)> {
+        self.act_mul_quant_nvfp4(inv_pre, true)
+    }
+
+    fn act_mul_quant_nvfp4(&self, inv_pre: f32, gelu: bool) -> Result<(Tensor, Tensor)> {
         if !matches!(self.dtype(), DType::F16 | DType::BF16) {
             return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: dtype не F16/BF16"));
         }
@@ -826,15 +869,27 @@ impl Tensor {
         let packed_layout = Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8);
         let scales_layout = Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8);
         let stream = Stream::default_for(self.device())?;
-        backend.silu_mul_quant_nvfp4(
-            (&x.storage, &x.layout),
-            (&mut packed_st, &packed_layout),
-            (&mut scales_st, &scales_layout),
-            m,
-            k,
-            inv_pre,
-            &stream,
-        )?;
+        if gelu {
+            backend.gelu_tanh_mul_quant_nvfp4(
+                (&x.storage, &x.layout),
+                (&mut packed_st, &packed_layout),
+                (&mut scales_st, &scales_layout),
+                m,
+                k,
+                inv_pre,
+                &stream,
+            )?;
+        } else {
+            backend.silu_mul_quant_nvfp4(
+                (&x.storage, &x.layout),
+                (&mut packed_st, &packed_layout),
+                (&mut scales_st, &scales_layout),
+                m,
+                k,
+                inv_pre,
+                &stream,
+            )?;
+        }
         Ok((
             Tensor::from_parts(Arc::new(packed_st), packed_layout),
             Tensor::from_parts(Arc::new(scales_st), scales_layout),

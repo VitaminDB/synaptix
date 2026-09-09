@@ -265,6 +265,20 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4 не поддержан этим backend"))
     }
 
+    /// Как [`Self::silu_mul_quant_nvfp4`], но активация — `gelu_tanh` (эксперты Gemma-4).
+    fn gelu_tanh_mul_quant_nvfp4(
+        &self,
+        _x: (&Storage, &Layout),
+        _packed_out: (&mut Storage, &Layout),
+        _scales_out: (&mut Storage, &Layout),
+        _m: usize,
+        _k: usize,
+        _inv_pre: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("gelu_tanh_mul_quant_nvfp4 не поддержан этим backend"))
+    }
+
     /// Fused ternary elementwise: kind 0 = gated-residual `out=x+b*c` (формы
     /// равны), 1 = то же с `c`-строкой `[D]`, 2 = adaLN-мод `out=x*(1+b)+c`
     /// (`b`/`c` строки `[D]`). Раунды повторяют decomposed → бит-в-бит.
@@ -765,6 +779,44 @@ pub trait Backend: Send + Sync + 'static {
     /// строке каждая отдельными запусками упирается в launch overhead.
     /// Default `Unsupported` → вызывающий считает эксперты по одному.
     #[allow(clippy::too_many_arguments)]
+    /// Сборка выхода MoE: `out[t, :] = Σ_s w[t·k+s] · y[inv[t·k+s], :]`.
+    /// `y` [rows, d], `inv` U32 [t·k], `w` F32 [t·k], `out` [t, d].
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine(
+        &self,
+        _y: (&Storage, &Layout),
+        _inv: (&Storage, &Layout),
+        _w: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _t: usize,
+        _k: usize,
+        _d: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("moe_combine не поддержан этим backend"))
+    }
+
+    /// Групповой NVFP4-GEMM экспертов MoE на префилле: активация — один
+    /// квантованный буфер `[rows_total, k]`, строки эксперта `g` лежат в
+    /// сегменте `[row_off[g], row_off[g]+rows[g])` (оба кратны 128); выход
+    /// `[rows_total, n]`. Один запуск на все эксперты.
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemm_grouped(
+        &self,
+        _w_shuf: &[&Storage],
+        _w_scales: &[&Storage],
+        _x_packed: &Storage,
+        _x_scales: &Storage,
+        _row_off: &[u32],
+        _rows: &[u32],
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_gemm_grouped не поддержан этим backend"))
+    }
+
     fn nvfp4_gemv_batched(
         &self,
         _w_shuf: &[&Storage],

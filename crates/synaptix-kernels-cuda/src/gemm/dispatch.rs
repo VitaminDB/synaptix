@@ -469,13 +469,14 @@ pub fn nvfp4_quantize_act(
     quant_k: &Nvfp4QuantKernels,
     stream: &Arc<CudaStream>,
     x_u8: &CudaSlice<u8>,
+    x_off_bytes: usize,
     packed_out: &mut CudaSlice<u8>,
     scales_out: &mut CudaSlice<u8>,
     m: u32,
     k: u32,
 ) -> Result<()> {
     let mk = (m as usize) * (k as usize);
-    let x_view = unsafe { x_u8.transmute::<f16>(mk) }
+    let x_view = unsafe { x_u8.slice(x_off_bytes..x_off_bytes + mk * 2).transmute::<f16>(mk) }
         .ok_or_else(|| SynaptixError::Cuda("nvfp4_quantize_act: transmute x→f16".into()))?;
     quantize_f16_to_nvfp4_view(quant_k, stream, &x_view, packed_out, scales_out, m, k)
 }

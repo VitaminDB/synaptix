@@ -78,6 +78,58 @@ fn ctx_stream_of(
     Ok((synaptix_core::device::cuda::get(ord)?, synaptix_core::device::cuda::default_stream(ord)?))
 }
 
+/// `act(gate)·up` → NVFP4 одним ядром: `act` 0 — silu, 1 — gelu_tanh.
+#[allow(clippy::too_many_arguments)]
+fn act_mul_quant_nvfp4_cuda(
+    x: (&Storage, &Layout),
+    packed_out: (&mut Storage, &Layout),
+    scales_out: (&mut Storage, &Layout),
+    m: usize,
+    k: usize,
+    inv_pre: f32,
+    act: u32,
+    _stream: &Stream,
+) -> Result<()> {
+    {
+        let (x_st, x_lo) = x;
+        if !x_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let x_buf = x_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: x non-cuda"))?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let quant_k = match x_lo.dtype() {
+            DType::F16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: dtype")),
+        };
+        let p_buf = packed_out
+            .0
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: packed non-cuda"))?;
+        let p_slice = p_buf.slice_mut();
+        let s_buf = scales_out
+            .0
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: scales non-cuda"))?;
+        crate::elementwise::quant::silu_mul_quantize_nvfp4_u8(
+            &quant_k,
+            &stream,
+            x_buf.slice(),
+            x_lo.byte_offset(),
+            p_slice,
+            s_buf.slice_mut(),
+            m as u32,
+            k as u32,
+            inv_pre,
+            act,
+        )
+    }
+}
+
 impl Backend for CudaBackend {
     fn device_kind(&self) -> Device {
         Device::Cuda(0)
@@ -1084,7 +1136,7 @@ impl Backend for CudaBackend {
         _stream: &Stream,
     ) -> Result<()> {
         let (x_st, x_lo) = x;
-        if !x_lo.is_contiguous() || x_lo.byte_offset() != 0 {
+        if !x_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
         }
         let x_buf = x_st
@@ -1111,6 +1163,7 @@ impl Backend for CudaBackend {
             &quant_k,
             &stream,
             x_buf.slice(),
+            x_lo.byte_offset(),
             p_slice,
             s_buf.slice_mut(),
             m as u32,
@@ -1126,43 +1179,22 @@ impl Backend for CudaBackend {
         m: usize,
         k: usize,
         inv_pre: f32,
-        _stream: &Stream,
+        stream: &Stream,
     ) -> Result<()> {
-        let (x_st, x_lo) = x;
-        if !x_lo.is_contiguous() {
-            return Err(SynaptixError::NonContiguous);
-        }
-        let x_buf = x_st
-            .as_cuda()
-            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: x non-cuda"))?;
-        let ord = x_buf.ordinal();
-        let ctx = synaptix_core::device::cuda::get(ord)?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let quant_k = match x_lo.dtype() {
-            DType::F16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
-            DType::BF16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
-            _ => return Err(SynaptixError::Unsupported("silu_mul_quant_nvfp4: dtype")),
-        };
-        let p_buf = packed_out
-            .0
-            .as_cuda_mut()
-            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: packed non-cuda"))?;
-        let p_slice = p_buf.slice_mut();
-        let s_buf = scales_out
-            .0
-            .as_cuda_mut()
-            .ok_or(SynaptixError::Unsupported("silu_mul_quant_nvfp4: scales non-cuda"))?;
-        crate::elementwise::quant::silu_mul_quantize_nvfp4_u8(
-            &quant_k,
-            &stream,
-            x_buf.slice(),
-            x_lo.byte_offset(),
-            p_slice,
-            s_buf.slice_mut(),
-            m as u32,
-            k as u32,
-            inv_pre,
-        )
+        act_mul_quant_nvfp4_cuda(x, packed_out, scales_out, m, k, inv_pre, 0, stream)
+    }
+
+    fn gelu_tanh_mul_quant_nvfp4(
+        &self,
+        x: (&Storage, &Layout),
+        packed_out: (&mut Storage, &Layout),
+        scales_out: (&mut Storage, &Layout),
+        m: usize,
+        k: usize,
+        inv_pre: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        act_mul_quant_nvfp4_cuda(x, packed_out, scales_out, m, k, inv_pre, 1, stream)
     }
 
     fn rms_mod_quant_nvfp4(
@@ -3197,9 +3229,9 @@ impl Backend for CudaBackend {
                 "cuda flash_prefill_dev: GQA constraint NH % NKV == 0",
             ));
         }
-        if !matches!(d, 64 | 128 | 256) {
+        if !matches!(d, 64 | 128 | 256 | 512) {
             return Err(SynaptixError::Unsupported(
-                "cuda flash_prefill_dev: HD must be 64, 128 or 256",
+                "cuda flash_prefill_dev: HD must be 64, 128, 256 or 512",
             ));
         }
         if !q_lo.is_contiguous() {
@@ -3253,6 +3285,29 @@ impl Backend for CudaBackend {
             "cuda flash_prefill_dev: out non-cuda",
         ))?;
         let kernels = crate::attention::flash_splitq::FlashSplitQKernels::for_context(&ctx)?;
+        if d == 512 {
+            return crate::attention::flash_splitq::flash_splitq_hd512_u8(
+                &kernels,
+                &stream,
+                dtype,
+                q_buf.slice(),
+                q_lo.byte_offset(),
+                k_buf.slice(),
+                k_lo.byte_offset(),
+                v_buf.slice(),
+                v_lo.byte_offset(),
+                out_buf.slice_mut(),
+                0,
+                crate::attention::flash_splitq::Hd512Tkv::Device(tc_buf.slice(), tc_lo.byte_offset()),
+                b as u32,
+                nh as u32,
+                nkv as u32,
+                t_q as u32,
+                scale,
+                causal,
+                t_stride,
+            );
+        }
         crate::attention::flash_splitq::flash_splitq_u8_dev(
             &kernels,
             &stream,
@@ -3646,6 +3701,133 @@ impl Backend for CudaBackend {
             &mut dst_slice,
             n as u32,
             k as u32,
+        )
+    }
+
+    fn moe_combine(
+        &self,
+        y: (&Storage, &Layout),
+        inv: (&Storage, &Layout),
+        w: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        t: usize,
+        k: usize,
+        d: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (y_st, y_lo) = y;
+        if !y_lo.is_contiguous() || !inv.1.is_contiguous() || !w.1.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        if inv.1.dtype() != DType::U32 || w.1.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported("moe_combine: inv должен быть U32, w — F32"));
+        }
+        let y_buf = y_st.as_cuda().ok_or(SynaptixError::Unsupported("moe_combine: y non-cuda"))?;
+        let ord = y_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::fused::moe_dispatch::MoeDispatchKernels::for_context(&ctx)?;
+        let inv_buf = inv.0.as_cuda().ok_or(SynaptixError::Unsupported("moe_combine: inv non-cuda"))?;
+        let w_buf = w.0.as_cuda().ok_or(SynaptixError::Unsupported("moe_combine: w non-cuda"))?;
+        let out_buf = out.0.as_cuda_mut().ok_or(SynaptixError::Unsupported("moe_combine: out non-cuda"))?;
+        crate::fused::moe_dispatch::moe_combine_u8(
+            &kernels,
+            &stream,
+            y_lo.dtype(),
+            y_buf.slice(),
+            inv_buf.slice(),
+            w_buf.slice(),
+            out_buf.slice_mut(),
+            t as u32,
+            k as u32,
+            d as u32,
+        )
+    }
+
+    fn nvfp4_gemm_grouped(
+        &self,
+        w_shuf: &[&Storage],
+        w_scales: &[&Storage],
+        x_packed: &Storage,
+        x_scales: &Storage,
+        row_off: &[u32],
+        rows: &[u32],
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (out_st, out_lo) = out;
+        let groups = w_shuf.len();
+        if groups == 0 {
+            return Ok(());
+        }
+        if w_scales.len() != groups || row_off.len() != groups || rows.len() != groups {
+            return Err(SynaptixError::Unsupported("nvfp4_gemm_grouped: неровные таблицы"));
+        }
+        let out_bf16 = match out_lo.dtype() {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("nvfp4_gemm_grouped: out не F16/BF16")),
+        };
+        let first = w_shuf[0]
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemm_grouped: вес не на карте"))?;
+        let ctx = first.device().clone();
+        let ord = first.ordinal();
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = if out_bf16 {
+            crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context_bf16(&ctx)?
+        } else {
+            crate::best_cu::gemm::gemm_nvfp4::Nvfp4MmaGemmShufKernels::for_context(&ctx)?
+        };
+        use cudarc::driver::DevicePtr;
+        let addr = |st: &Storage, what: &'static str| -> Result<u64> {
+            let buf = st.as_cuda().ok_or(SynaptixError::Unsupported(what))?;
+            let (ptr, _guard) = buf.slice().device_ptr(&stream);
+            Ok(ptr)
+        };
+        let mut table: Vec<u64> = Vec::with_capacity(3 * groups);
+        for st in w_shuf {
+            table.push(addr(st, "nvfp4_gemm_grouped: вес не на карте")?);
+        }
+        for st in w_scales {
+            table.push(addr(st, "nvfp4_gemm_grouped: масштабы веса не на карте")?);
+        }
+        let mut max_rows = 0u32;
+        for (off, r) in row_off.iter().zip(rows) {
+            if off % 128 != 0 || r % 128 != 0 {
+                return Err(SynaptixError::Unsupported("nvfp4_gemm_grouped: сегмент не кратен 128"));
+            }
+            max_rows = max_rows.max(*r);
+            table.push(((*off as u64) << 32) | (*r as u64));
+        }
+        let table_dev = stream
+            .memcpy_stod(&table)
+            .map_err(|e| SynaptixError::Cuda(format!("nvfp4_gemm_grouped: таблица: {e:?}")))?;
+        let px = x_packed
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemm_grouped: активация не на карте"))?;
+        let sx = x_scales
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemm_grouped: масштабы активации не на карте"))?;
+        let out_buf = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("nvfp4_gemm_grouped: out не на карте"))?;
+        let numel = out_lo.numel();
+        let mut out_view = unsafe { out_buf.slice_mut().transmute_mut::<half::f16>(numel) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_gemm_grouped: transmute out".into()))?;
+        crate::best_cu::gemm::gemm_nvfp4::nvfp4_mma_gemm_shuf_2dr_grouped_view(
+            &kernels,
+            &stream,
+            &table_dev,
+            px.slice(),
+            sx.slice(),
+            &mut out_view,
+            n as u32,
+            k as u32,
+            groups as u32,
+            max_rows,
         )
     }
 

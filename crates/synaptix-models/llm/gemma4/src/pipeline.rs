@@ -359,6 +359,7 @@ impl Gemma4Pipeline {
             0 => l,
             n => n.max(1),
         };
+        let chunk = self.model.max_prefill_chunk().map_or(chunk, |cap| chunk.min(cap));
         let t0 = std::time::Instant::now();
         let mut last_hidden = None;
         let mut off = 0usize;
@@ -552,7 +553,11 @@ impl Gemma4Pipeline {
         // Префилл идёт обычным путём: он упирается в счёт, а не в запуски ядер,
         // и захватывать его смысла нет.
         let suffix = &prompt_ids[prefix..];
-        let chunk = if cfg.prefill_batch > 0 { cfg.prefill_batch } else { 256 };
+        // Чанк — как можно длиннее: MoE считает экспертов групповым GEMM, и
+        // его цена на слой почти не зависит от числа токенов в чанке; предел
+        // ставит кольцевой KV sliding-слоёв (2048 у Gemma-4).
+        let ring_cap = self.model.max_prefill_chunk().unwrap_or(usize::MAX);
+        let chunk = if cfg.prefill_batch > 0 { cfg.prefill_batch } else { 2048 }.min(ring_cap);
         let t0 = std::time::Instant::now();
         let mut logits_opt: Option<Tensor> = None;
         let mut off = 0usize;

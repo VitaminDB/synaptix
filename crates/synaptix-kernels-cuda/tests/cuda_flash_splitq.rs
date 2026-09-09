@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::{bf16, f16};
 use synaptix_core::dtype::DType;
-use synaptix_kernels_cuda::attention::flash_splitq::{
+use synaptix_kernels_cuda::attention::flash_splitq::{flash_splitq_hd512_u8, Hd512Tkv, 
     flash_splitq_u8, flash_splitq_u8_dev, FlashSplitQKernels,
 };
 
@@ -219,4 +219,79 @@ fn splitq_dev_matches_host_tkv() {
     let a: Vec<u8> = stream.clone_dtoh(&out_host).unwrap();
     let bts: Vec<u8> = stream.clone_dtoh(&out_dev).unwrap();
     assert_eq!(a, bts, "dev-вариант разошёлся с host-Tkv");
+}
+
+/// HD=512 (global-слои Gemma-4): host-Tkv против CPU-эталона и dev-вариант
+/// бит-в-бит с host-вариантом на préalloc-буфере.
+#[allow(clippy::too_many_arguments)]
+fn case_hd512(b: usize, nh: usize, nkv: usize, tq: usize, tkv: usize, dt: DType, causal: bool, tol: f32, tag: &str) {
+    let Some((ctx, stream)) = setup() else { return };
+    let kernels = FlashSplitQKernels::for_context(&ctx).expect("compile flash_splitq");
+    let d = 512usize;
+    let scale = 1.0 / (d as f32).sqrt();
+    let rnd = |v: Vec<f32>| -> Vec<f32> {
+        match dt {
+            DType::F16 => v.iter().map(|x| f16::from_f32(*x).to_f32()).collect(),
+            DType::BF16 => v.iter().map(|x| bf16::from_f32(*x).to_f32()).collect(),
+            _ => unreachable!(),
+        }
+    };
+    let qf = rnd(det_f32(0x51A, b * nh * tq * d, 0.3));
+    let kf = rnd(det_f32(0x52B, b * nkv * tkv * d, 0.3));
+    let vf = rnd(det_f32(0x53C, b * nkv * tkv * d, 0.3));
+    let exp = cpu_sdpa(&qf, &kf, &vf, b, nh, nkv, tq, tkv, d, scale, causal);
+    let dq = htod_f16(&stream, &qf, dt);
+    let dk = htod_f16(&stream, &kf, dt);
+    let dv = htod_f16(&stream, &vf, dt);
+    let out_n = b * nh * tq * d;
+    let mut dout: CudaSlice<u8> = stream.alloc_zeros(out_n * 2).unwrap();
+    flash_splitq_hd512_u8(
+        &kernels, &stream, dt, &dq, 0, &dk, 0, &dv, 0, &mut dout, 0, Hd512Tkv::Host(tkv as u32),
+        b as u32, nh as u32, nkv as u32, tq as u32, scale, causal, 0,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let got = dtoh_f32(&stream, &dout, out_n, dt);
+    let m = max_abs(&got, &exp);
+    eprintln!("[splitq hd512 {tag}] max_abs={m:.4}");
+    assert!(m < tol, "{tag}: max_abs={m}");
+
+    // dev-вариант: KV в буфере ёмкостью cap = tkv + 64 (t_stride = cap).
+    let cap = tkv + 64;
+    let mut kf_cap = vec![0.0f32; b * nkv * cap * d];
+    let mut vf_cap = vec![0.0f32; b * nkv * cap * d];
+    for bi in 0..b {
+        for h in 0..nkv {
+            let src = (bi * nkv + h) * tkv * d;
+            let dst = (bi * nkv + h) * cap * d;
+            kf_cap[dst..dst + tkv * d].copy_from_slice(&kf[src..src + tkv * d]);
+            vf_cap[dst..dst + tkv * d].copy_from_slice(&vf[src..src + tkv * d]);
+        }
+    }
+    let dk2 = htod_f16(&stream, &kf_cap, dt);
+    let dv2 = htod_f16(&stream, &vf_cap, dt);
+    let tc: CudaSlice<u8> = stream.clone_htod(&(tkv as i32).to_le_bytes()).unwrap();
+    let mut dout2: CudaSlice<u8> = stream.alloc_zeros(out_n * 2).unwrap();
+    flash_splitq_hd512_u8(
+        &kernels, &stream, dt, &dq, 0, &dk2, 0, &dv2, 0, &mut dout2, 0, Hd512Tkv::Device(&tc, 0),
+        b as u32, nh as u32, nkv as u32, tq as u32, scale, causal, cap as u32,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let a: Vec<u8> = stream.clone_dtoh(&dout).unwrap();
+    let bts: Vec<u8> = stream.clone_dtoh(&dout2).unwrap();
+    assert_eq!(a, bts, "{tag}: dev-вариант разошёлся с host-Tkv");
+}
+
+#[test]
+fn splitq_hd512_bf16_causal_gqa() {
+    case_hd512(1, 16, 2, 100, 164, DType::BF16, true, 0.08, "bf16 causal gqa");
+}
+#[test]
+fn splitq_hd512_f16_noncausal() {
+    case_hd512(2, 4, 4, 48, 80, DType::F16, false, 0.03, "f16 noncausal");
+}
+#[test]
+fn splitq_hd512_small_tq() {
+    case_hd512(1, 8, 2, 3, 300, DType::F16, true, 0.03, "f16 tq=3");
 }

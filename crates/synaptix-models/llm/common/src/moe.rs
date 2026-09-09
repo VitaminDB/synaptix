@@ -744,6 +744,16 @@ fn batch_tokens() -> usize {
     })
 }
 
+/// Сколько токенов MoE берёт в один чанк префилла: `SYN_MOE_CHUNK` либо
+/// умолчание архитектуры.
+pub fn prefill_chunk_tokens(default: usize) -> usize {
+    std::env::var("SYN_MOE_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 pub trait ExpertSource: Send + Sync {
     fn fetch(&self, layer: usize, expert: usize, device: Device)
         -> Result<(QLinear, QLinear), ModelError>;
@@ -1396,6 +1406,9 @@ impl MoeFfn {
                 return Ok(out);
             }
         }
+        if let Some(out) = self.forward_chunk_segmented(x, &experts, &weights)? {
+            return Ok(out);
+        }
 
         // Пары (токен, слот), сгруппированные по эксперту: каждый эксперт
         // получает один GEMM вместо GEMV на токен.
@@ -1494,6 +1507,131 @@ impl MoeFfn {
             }
             None => Ok(mixed),
         }
+    }
+
+    /// Префилл по резидентным NVFP4-экспертам без оффлоада: строки каждого
+    /// эксперта кладутся в сегмент, выровненный на 128 (тайл масштабов
+    /// NVFP4 и блок группового GEMM), и весь слой считается пятью ядрами:
+    /// сбор строк, квант буфера, групповой GEMM gate_up, слитая
+    /// `act(gate)·up` + квант, групповой GEMM down. Прежний цикл делал ~13
+    /// ядер НА ЭКСПЕРТА (срез, обнуление хвоста, квант, GEMM, два среза
+    /// gate/up, активация, умножение, обнуление, квант, GEMM, каст) по
+    /// 22 блока на запуск — 11 мс на слой при 2048 токенах у Gemma-4.
+    /// `None` — предпосылки не выполнены, считать прежним путём.
+    fn forward_chunk_segmented(
+        &self,
+        x: &Tensor,
+        experts: &[u32],
+        weights: &[f32],
+    ) -> Result<Option<Tensor>, ModelError> {
+        use crate::profile::stage;
+        let ExpertStore::Resident(all) = &self.experts else { return Ok(None) };
+        if self.cache.is_some()
+            || !self.device.is_cuda()
+            || !matches!(x.dtype(), DType::BF16 | DType::F16)
+            || self.cfg.hidden_size % 128 != 0
+            || (2 * self.cfg.moe_intermediate_size) % 128 != 0
+            || self.cfg.moe_intermediate_size % 64 != 0
+            || self.cfg.skip_below > 0.0
+        {
+            return Ok(None);
+        }
+        let nvfp4 = all.iter().all(|e| {
+            e.gate_up.quant_dtype() == Some(DType::NVFP4)
+                && e.down.quant_dtype() == Some(DType::NVFP4)
+        });
+        if !nvfp4 || std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0") {
+            return Ok(None);
+        }
+
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        let h = self.cfg.hidden_size;
+        let mut order: Vec<u32> = (0..(t * k) as u32).collect();
+        order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
+
+        // Раскладка сегментов: строки эксперта подряд, хвост до кратного 128
+        // (256 у горячих ≥ 1280 строк — так GEMM не строит padded-копию)
+        // дублирует первую строку сегмента с нулевым весом.
+        let mut rows: Vec<u32> = Vec::with_capacity(t * k + 128 * self.cfg.num_experts);
+        let mut inverse = vec![0u32; t * k];
+        let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut pos = 0usize;
+        while pos < order.len() {
+            let expert = experts[order[pos] as usize] as usize;
+            let mut end = pos + 1;
+            while end < order.len() && experts[order[end] as usize] as usize == expert {
+                end += 1;
+            }
+            let cnt = end - pos;
+            let m_pad = cnt.div_ceil(128) * 128;
+            let start = rows.len();
+            for (i, p) in order[pos..end].iter().enumerate() {
+                rows.push(*p / k as u32);
+                inverse[*p as usize] = (start + i) as u32;
+            }
+            // Хвост сегмента дублирует первую строку: в сборку он не попадает.
+            let first = rows[start];
+            rows.resize(start + m_pad, first);
+            segs.push((expert, start, m_pad));
+            pos = end;
+        }
+        let r_pad = rows.len();
+
+        let gathered = stage("moe:gather", || -> Result<Tensor, ModelError> {
+            let row_idx = Tensor::from_vec::<_, u32>(rows, vec![r_pad], self.device)
+                .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
+            take_rows(x, &row_idx)
+        })?;
+
+        // Весь буфер квантуется одним ядром: тайл масштабов NVFP4 — 128 строк,
+        // и сегменты, выровненные на 128, читаются групповым GEMM по смещению.
+        let stacked = stage("moe:expert", || -> Result<Tensor, ModelError> {
+            let gate_up: Vec<&QuantWeight> = segs
+                .iter()
+                .map(|(e, _, _)| all[*e].gate_up.quant_weight().expect("проверено выше"))
+                .collect();
+            let down: Vec<&QuantWeight> = segs
+                .iter()
+                .map(|(e, _, _)| all[*e].down.quant_weight().expect("проверено выше"))
+                .collect();
+            let row_off: Vec<u32> = segs.iter().map(|(_, s, _)| *s as u32).collect();
+            let seg_rows: Vec<u32> = segs.iter().map(|(_, _, m)| *m as u32).collect();
+            let (px, sx) = gathered
+                .nvfp4_quantize_act()
+                .map_err(|e| ModelError::Forward(format!("MoE: квант входа: {e}")))?;
+            let gu = QuantWeight::gemm_grouped(&gate_up, &px, &sx, &row_off, &seg_rows, r_pad, self.compute)
+                .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM gate_up: {e}")))?;
+            let (ph, sh) = match self.cfg.activation {
+                Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
+                Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
+            }
+            .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
+            QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, r_pad, self.compute)
+                .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM down: {e}")))
+        })?;
+        // Взвешивание, обратная перестановка и сумма по слотам — одно ядро.
+        let inverse = Tensor::from_vec::<_, u32>(inverse, vec![t * k], self.device)
+            .map_err(|e| ModelError::Forward(format!("MoE: обратные индексы: {e}")))?;
+        let pair_w = Tensor::from_vec::<_, f32>(weights.to_vec(), vec![t * k], self.device)
+            .map_err(|e| ModelError::Forward(format!("MoE: веса пар: {e}")))?;
+        let mixed = stage("moe:scatter", || {
+            stacked
+                .moe_combine(&inverse, &pair_w, k)
+                .map_err(|e| ModelError::Forward(format!("MoE: сборка выхода: {e}")))
+        })?;
+        let _ = h;
+        let mixed = self.to_compute(mixed)?;
+        let out = match &self.shared {
+            Some(shared) => {
+                let s = stage("moe:shared", || self.shared_forward(shared, x))?;
+                mixed
+                    .add(&s)
+                    .map_err(|e| ModelError::Forward(format!("MoE: shared expert: {e}")))?
+            }
+            None => mixed,
+        };
+        Ok(Some(out))
     }
 
     /// Декод горстки токенов: все пары «токен × выбранный эксперт» считаются
@@ -1801,9 +1939,13 @@ impl MoeFfn {
         gate_up: &Tensor,
         m: usize,
     ) -> Result<Tensor, ModelError> {
-        if down.quant_dtype() == Some(DType::NVFP4) && self.cfg.activation == Activation::Silu {
-            if let Ok((packed, scales)) = gate_up.silu_mul_quant_nvfp4(1.0) {
-                return down.forward_prequant(&packed, &scales, m, DType::F16);
+        if down.quant_dtype() == Some(DType::NVFP4) {
+            let fused = match self.cfg.activation {
+                Activation::Silu => gate_up.silu_mul_quant_nvfp4(1.0),
+                Activation::GeluTanh => gate_up.gelu_tanh_mul_quant_nvfp4(1.0),
+            };
+            if let Ok((packed, scales)) = fused {
+                return down.forward_prequant(&packed, &scales, m, self.compute);
             }
         }
         let h = self.swiglu(gate_up)?;
