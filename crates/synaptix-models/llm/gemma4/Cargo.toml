@@ -16,7 +16,7 @@ synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-tokenizer = { workspace = true }
 synaptix-bundle    = { workspace = true }
-synaptix-io        = { workspace = true }
+synaptix-io        = { workspace = true, features = ["image"] }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

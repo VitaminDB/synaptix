@@ -1724,12 +1724,28 @@ impl DecoderModel {
         kv_cache: &mut KvCache,
         rope_pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
+        self.forward_from_hidden_spans(hidden, kv_cache, rope_pos, &[])
+    }
+
+    /// Как [`Self::forward_from_hidden_pos`], но внутри перечисленных участков
+    /// внимание ДВУСТОРОННЕЕ: токен видит весь свой участок, а не только
+    /// предшествующую часть. Так устроены блоки картинки у Gemma-4
+    /// (`use_bidirectional_attention = "vision"`). Участки задаются
+    /// абсолютными позициями `[начало, конец)` в контексте.
+    pub fn forward_from_hidden_spans(
+        &self,
+        hidden: &Tensor,
+        kv_cache: &mut KvCache,
+        rope_pos: RopePositions,
+        spans: &[(usize, usize)],
+    ) -> Result<Tensor, ModelError> {
         if hidden.rank() != 3 {
             return Err(ModelError::Shape(format!("hidden must be [B, S, H], got {:?}", hidden.dims())));
         }
         let batch = hidden.dims()[0];
         let s = hidden.dims()[1];
-        self.run_blocks(hidden.clone(), kv_cache, batch, s, rope_pos)
+        let mut sink = Vec::new();
+        self.run_blocks_tapped(hidden.clone(), kv_cache, batch, s, &[], &mut sink, rope_pos, spans)
     }
 
     /// Как [`Self::forward`], но с явными позициями RoPE — декод после
@@ -1768,7 +1784,7 @@ impl DecoderModel {
         let s = input_ids.dims()[1];
         let hidden = self.embed_ids(input_ids)?;
         let mut tapped = Vec::with_capacity(taps.len());
-        let out = self.run_blocks_tapped(hidden, kv_cache, batch, s, taps, &mut tapped, RopePositions::Sequential)?;
+        let out = self.run_blocks_tapped(hidden, kv_cache, batch, s, taps, &mut tapped, RopePositions::Sequential, &[])?;
         Ok((out, tapped))
     }
 
@@ -1781,9 +1797,10 @@ impl DecoderModel {
         rope_pos: RopePositions,
     ) -> Result<Tensor, ModelError> {
         let mut sink = Vec::new();
-        self.run_blocks_tapped(hidden, kv_cache, batch, s, &[], &mut sink, rope_pos)
+        self.run_blocks_tapped(hidden, kv_cache, batch, s, &[], &mut sink, rope_pos, &[])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks_tapped(
         &self,
         mut hidden: Tensor,
@@ -1793,6 +1810,7 @@ impl DecoderModel {
         taps: &[usize],
         tapped: &mut Vec<Tensor>,
         rope_pos: RopePositions,
+        spans: &[(usize, usize)],
     ) -> Result<Tensor, ModelError> {
         let past = kv_cache.seq_len;
         if past + s > kv_cache.max_seq {
@@ -1810,7 +1828,7 @@ impl DecoderModel {
             let h = prof(dev, "norm", || rms_norm(hidden, &blk.pre_attn_norm, blk.rms_eps).coerr())?;
             let is_lin = matches!(&blk.mixer, Mixer::Linear(_));
             let mixed = match &blk.mixer {
-                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos))?,
+                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos, spans))?,
                 Mixer::Linear(la) => prof(dev, "attn_linear", || la.forward(&h, &mut kv_cache.layers[idx], s, self.device, self.dtype))?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
@@ -1936,7 +1954,7 @@ impl DecoderModel {
             let mixed = match &blk.mixer {
                 Mixer::Full(fa) => fa.forward(
                     &h, &mut kv.layers[idx], 0, s, batch, self.rope_at(idx),
-                    self.kv_dtype, dev, self.dtype, pad_ref, RopePositions::Sequential,
+                    self.kv_dtype, dev, self.dtype, pad_ref, RopePositions::Sequential, &[],
                 )?,
                 Mixer::Linear(_) => {
                     return Err(ModelError::Forward(
@@ -2298,6 +2316,9 @@ impl FullAttn {
         compute: DType,
         pad_bias: Option<&Tensor>,
         rope_pos: RopePositions,
+        // Участки `[начало, конец)` в абсолютных позициях, внутри которых
+        // внимание двустороннее (блоки картинки Gemma-4).
+        bidi_spans: &[(usize, usize)],
     ) -> Result<Tensor, ModelError> {
         let kv = match cache {
             LayerCache::Full(k) => k,
@@ -2338,8 +2359,10 @@ impl FullAttn {
         let group = nh / nkv;
         // pad_bias (key-padding для энкодера) несовместим с flash (flash маскирует
         // только чисто-causal) → форсим sdpa-путь, где маску можно дополнить.
-        let flash_eligible =
-            self.use_flash && self.sliding_window.is_none() && pad_bias.is_none();
+        let flash_eligible = self.use_flash
+            && self.sliding_window.is_none()
+            && pad_bias.is_none()
+            && bidi_spans.is_empty();
         let _core_dev = device;
         // Квант KV — по фактическому dtype буфера слоя, а не по политике модели:
         // `make_kv_cache` держит MXFP8 только там, где кэш читает
@@ -2442,6 +2465,7 @@ impl FullAttn {
             let flash_win = self.sliding_window.is_some()
                 && self.use_flash
                 && pad_bias.is_none()
+                && bidi_spans.is_empty()
                 && hd == 128;
             let flashed = if flash_eligible {
                 match q.flash_attention(&k_total, &v_total, self.attn_scale, true) {
@@ -2468,11 +2492,17 @@ impl FullAttn {
                     let k_rep = repeat_kv(&k_total, group).coerr()?;
                     let v_rep = repeat_kv(&v_total, group).coerr()?;
                     let window = self.sliding_window;
-                    if s == 1 && window.is_none() && pad_bias.is_none() {
+                    if s == 1 && window.is_none() && pad_bias.is_none() && bidi_spans.is_empty() {
                         scaled_dot_attention(&q, &k_rep, &v_rep, self.attn_scale, None).coerr()?
                     } else {
                         let past_rel = past - kv.start - att_lo;
-                        let mask = build_mask(s, att_len, past_rel, window, device, compute).coerr()?;
+                        // Абсолютная позиция ключа `j` = (kv.start + att_lo) + j,
+                        // запроса `i` = past + i.
+                        let key_base = kv.start + att_lo;
+                        let mask = build_mask(
+                            s, att_len, past_rel, window, device, compute, bidi_spans, past, key_base,
+                        )
+                        .coerr()?;
                         let mask = match pad_bias {
                             Some(pb) => mask.broadcast_add(pb).coerr()?,
                             None => mask,
@@ -3230,14 +3260,36 @@ fn repeat_kv(x: &Tensor, group_size: usize) -> CoreResult<Tensor> {
     x_b.reshape(vec![b, n_kv * group_size, s, d])
 }
 
-fn build_mask(s_new: usize, s_total: usize, past: usize, window: Option<usize>, device: Device, dtype: DType) -> CoreResult<Tensor> {
+#[allow(clippy::too_many_arguments)]
+fn build_mask(
+    s_new: usize,
+    s_total: usize,
+    past: usize,
+    window: Option<usize>,
+    device: Device,
+    dtype: DType,
+    bidi_spans: &[(usize, usize)],
+    q_abs_base: usize,
+    k_abs_base: usize,
+) -> CoreResult<Tensor> {
+    // Внутри своего участка токен смотрит вперёд: у Gemma-4 так устроены блоки
+    // картинки. Участок ищем по АБСОЛЮТНОЙ позиции — локальные индексы маски
+    // сдвинуты и ring-стартом sliding-слоя, и началом чанка префилла.
+    let span_of = |abs: usize| -> Option<usize> {
+        bidi_spans.iter().position(|(a, b)| abs >= *a && abs < *b)
+    };
     let mut data = vec![0.0_f32; s_new * s_total];
     for i in 0..s_new {
         let qi = past + i;
+        let q_span = if bidi_spans.is_empty() { None } else { span_of(q_abs_base + i) };
         for j in 0..s_total {
-            let causal_ok = j <= qi;
+            let same_span = match q_span {
+                Some(sp) => span_of(k_abs_base + j) == Some(sp),
+                None => false,
+            };
+            let causal_ok = j <= qi || same_span;
             let window_ok = match window {
-                Some(w) => qi < j + w,
+                Some(w) => qi < j + w || same_span,
                 None => true,
             };
             if !(causal_ok && window_ok) {

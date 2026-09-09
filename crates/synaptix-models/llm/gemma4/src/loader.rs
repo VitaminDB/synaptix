@@ -141,6 +141,21 @@ impl Gemma4Weights {
         source_contains(&self.source, &format!("{VISION_PREFIX}.patch_embedder.input_proj.weight"))
     }
 
+    /// Вес под ТОЧНЫМ именем, без подстановки префикса текстовой башни:
+    /// так читаются `model.vision_tower.*` и `model.embed_vision.*`.
+    pub fn raw_tensor(
+        &self,
+        key: &str,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Tensor, ModelError> {
+        let r = match &self.source {
+            Source::Files(l) => l.load_to(key, device, dtype),
+            Source::Bundle(l) => l.load_to(key, device, dtype),
+        };
+        r.map_err(|e| ModelError::Load(format!("load '{key}': {e}")))
+    }
+
     /// `model.layers.0.…` (имена общего декодера) → фактическое имя в чекпойнте.
     fn resolve(&self, key: &str) -> String {
         if !self.text_prefix {

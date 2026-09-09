@@ -17,7 +17,7 @@ use synaptix_llm_common::{
     mrope, GenerationConfig, KvCache as LlmKvCache, LinearSnapshot, StreamSink,
 };
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
-use synaptix_llm_gemma4::pipeline::Gemma4Pipeline;
+use synaptix_llm_gemma4::pipeline::{Gemma4Pipeline, MediaInput as Gemma4MediaInput};
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
@@ -628,6 +628,19 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
+            LlmPipeline::Gemma4(p) => {
+                let Some(embeds) = concat_media(media, MediaKind::Image)? else {
+                    return Err(LlmError("Gemma-4 принимает только картинки".into()));
+                };
+                let pad = p
+                    .config
+                    .image_token_id
+                    .ok_or_else(|| LlmError("config.json без image_token_id".into()))?;
+                let inputs = [Gemma4MediaInput { pad, embeds }];
+                p.generate_media_streaming(prompt_ids, &inputs, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             _ => Err(LlmError("архитектура не принимает медиа-вход".into())),
         }
     }
@@ -640,6 +653,11 @@ impl LlmPipeline {
             LlmPipeline::Hybrid(_) | LlmPipeline::Qwen4Exp(_) => format!(
                 "{QWEN_VISION_START_TOKEN}{}{QWEN_VISION_END_TOKEN}",
                 QWEN_IMAGE_PAD_TOKEN.repeat(tokens)
+            ),
+            // Gemma-4: `<|image>` … `<image|>` вокруг прогона мягких токенов.
+            LlmPipeline::Gemma4(_) => format!(
+                "{GEMMA4_IMAGE_START_TOKEN}{}{GEMMA4_IMAGE_END_TOKEN}",
+                GEMMA4_IMAGE_PAD_TOKEN.repeat(tokens)
             ),
             _ => format!(
                 "{IMAGE_START_TOKEN}{}{IMAGE_END_TOKEN}",
@@ -1207,6 +1225,9 @@ impl Llm {
                     q.config.image_token_id.is_some()
                         && Qwen4ExpPipeline::bundle_has_vision(&self.model_path)
                 }
+                LlmPipeline::Gemma4(g) => {
+                    g.config.image_token_id.is_some() && g.has_vision_config()
+                }
                 _ => false,
             },
             Err(_) => false,
@@ -1220,6 +1241,7 @@ impl Llm {
                 LlmPipeline::MuseGlimmer(m) => m.has_vision(),
                 LlmPipeline::Hybrid(h) => h.has_vision(),
                 LlmPipeline::Qwen4Exp(q) => q.has_vision(),
+                LlmPipeline::Gemma4(g) => g.has_vision(),
                 _ => false,
             },
             Err(_) => false,
@@ -1258,6 +1280,9 @@ impl Llm {
                 q.load_vision(&self.model_path, self.compute_dtype)
                     .map_err(|e| LlmError(format!("vision load: {e}")))
             }
+            LlmPipeline::Gemma4(g) => g
+                .ensure_vision(self.compute_dtype)
+                .map_err(|e| LlmError(format!("vision load: {e}"))),
             _ => Ok(false),
         }
     }
@@ -1269,6 +1294,7 @@ impl Llm {
                 LlmPipeline::MuseGlimmer(m) => m.release_vision(),
                 LlmPipeline::Hybrid(h) => h.release_vision(),
                 LlmPipeline::Qwen4Exp(q) => q.release_vision(),
+                LlmPipeline::Gemma4(g) => g.release_vision(),
                 _ => {}
             }
         }
@@ -1303,6 +1329,11 @@ impl Llm {
                 q.encode_image(path, limits)
                     .map_err(|e| LlmError(format!("image encode: {e}")))?
             }
+            LlmPipeline::Gemma4(g) => (
+                g.encode_image(path, max_tokens)
+                    .map_err(|e| LlmError(format!("image encode: {e}")))?,
+                (0, 0),
+            ),
             _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
         let tokens = embeds.dims()[0];
@@ -1359,6 +1390,11 @@ const IMAGE_PAD_TOKEN: &str = "<|patch|>";
 const QWEN_VISION_START_TOKEN: &str = "<|vision_start|>";
 const QWEN_VISION_END_TOKEN: &str = "<|vision_end|>";
 const QWEN_IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+/// То же у Gemma-4: `boi`/`eoi` из tokenizer_config и заполнитель мягкого
+/// токена (`image_token_id` = 258880).
+const GEMMA4_IMAGE_START_TOKEN: &str = "<|image>";
+const GEMMA4_IMAGE_END_TOKEN: &str = "<image|>";
+const GEMMA4_IMAGE_PAD_TOKEN: &str = "<|image|>";
 
 pub struct LlmTokenizer {
     tokenizer: HfTokenizer,

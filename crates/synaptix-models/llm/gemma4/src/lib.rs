@@ -5,7 +5,9 @@
 pub mod config;
 pub mod loader;
 pub mod pipeline;
+pub mod vision;
 
 pub use config::{ConfigError, Gemma4Config, LayerType};
 pub use loader::{is_bundle, read_aux, Gemma4Weights, LoadError};
 pub use pipeline::{Gemma4Pipeline, PipelineError};
+pub use vision::{VisionConfig, VisionTower};
