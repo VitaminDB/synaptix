@@ -55,6 +55,32 @@ impl QuantWeight {
         })
     }
 
+    /// Перемешанная раскладка NVFP4-веса (`[n, k/2]` байт) на хосте — та же,
+    /// что строит ядро `nvfp4_w_repack`: тайлы 16 строк × 64 значения кладутся
+    /// подряд (512 байт), внутри тайла — строка за строкой по 32 байта. Так
+    /// эксперт можно держать в pinned-зеркале уже готовым к GEMV/GEMM и
+    /// поднимать на карту одной DMA, без перепаковки на устройстве.
+    /// Требует `n % 16 == 0`, `k % 64 == 0`, `dst.len() == src.len() == n·k/2`.
+    pub fn nvfp4_repack_host(src: &[u8], dst: &mut [u8], n: usize, k: usize) -> Result<()> {
+        if n % 16 != 0 || k % 64 != 0 || src.len() != n * k / 2 || dst.len() != src.len() {
+            return Err(SynaptixError::Unsupported("nvfp4_repack_host: форма"));
+        }
+        let row_bytes = k / 2;
+        let k_chunks = k / 64;
+        for m_block in 0..n / 16 {
+            for k_chunk in 0..k_chunks {
+                let dst_base = m_block * k_chunks * 512 + k_chunk * 512;
+                for row_in_block in 0..16 {
+                    let row = m_block * 16 + row_in_block;
+                    let s = row * row_bytes + k_chunk * 32;
+                    let d = dst_base + row_in_block * 32;
+                    dst[d..d + 32].copy_from_slice(&src[s..s + 32]);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Вес, от которого остались только перемешанные байты: так выглядит
     /// NVFP4 после первого умножения — `shuffled` построен, сырой packed
     /// освобождён. Устройство берём по scales: packed'а больше нет.

@@ -217,6 +217,11 @@ impl LinearAttn {
         state: &mut GatedDeltaNetState,
         s: usize,
     ) -> Result<Tensor, ModelError> {
+        if s == 1 {
+            if let Some(r) = self.decode_step(h, state) {
+                return r;
+            }
+        }
         let core = match self.core_on_device(h, state, s) {
             Some(Ok(core)) => core,
             Some(Err(e)) => return Err(e),
@@ -250,6 +255,88 @@ impl LinearAttn {
         };
         let core = coerr(Tensor::cat(&[&first, &second], 1))?;
         Ok((self.finish(h, &core, s)?, snap))
+    }
+
+    /// Шаг декода (один токен) слитым device-путём: conv-update + prep +
+    /// gated delta rule + RmsNorm·sigmoid(z) — три ядра вместо чанкового
+    /// скана на одном токене (~15 ядер и bmm по 64×128 на голову).
+    /// `None` — путь неприменим (не CUDA, не F16), считаем как раньше.
+    fn decode_step(
+        &self,
+        h: &Tensor,
+        state: &mut GatedDeltaNetState,
+    ) -> Option<Result<Tensor, ModelError>> {
+        if !crate::norm::fused_on()
+            || !matches!(self.device, Device::Cuda(_))
+            || self.compute != DType::F16
+            || self.conv_w_dev.is_none()
+            || self.dk != self.dv
+        {
+            return None;
+        }
+        Some(self.decode_step_inner(h, state))
+    }
+
+    fn decode_step_inner(
+        &self,
+        h: &Tensor,
+        state: &mut GatedDeltaNetState,
+    ) -> Result<Tensor, ModelError> {
+        let (dk, dv, h_v) = (self.dk, self.dv, self.num_v_heads);
+        let (qkv, a, b, z) = stage("la:proj", || -> Result<_, ModelError> {
+            let qkv = self.in_proj_qkv.forward(h)?;
+            let a = coerr(self.in_proj_a.forward(h)?.to_dtype(DType::F16))?;
+            let b = coerr(self.in_proj_b.forward(h)?.to_dtype(DType::F16))?;
+            let z = coerr(self.in_proj_z.forward(h)?.to_dtype(DType::F16))?;
+            Ok((qkv, a, b, z))
+        })?;
+        let conv_w = self.conv_w_dev.as_ref().unwrap();
+        let a_log = self.a_log_dev.as_ref().unwrap();
+        let dt_bias = self.dt_bias_dev.as_ref().unwrap();
+        if state.conv_state_dev.is_none() {
+            let cs = coerr(coerr(Tensor::from_vec(
+                state.conv_state.clone(),
+                vec![self.conv_k - 1, self.conv_dim],
+                self.device,
+            ))?
+            .to_dtype(self.compute))?;
+            state.conv_state_dev = Some(cs);
+        }
+        if state.ssm_state_dev.is_none() {
+            let ss = coerr(Tensor::from_vec(
+                state.ssm_state.clone(),
+                vec![h_v, dk, dv],
+                self.device,
+            ))?;
+            state.ssm_state_dev = Some(ss);
+        }
+        let out = stage("la:scan", || -> Result<_, ModelError> {
+            let cs = state.conv_state_dev.as_mut().unwrap();
+            let ss = state.ssm_state_dev.as_mut().unwrap();
+            coerr(qkv.linear_attn_decode_step(
+                conv_w,
+                &a,
+                &b,
+                dt_bias,
+                a_log,
+                &z,
+                &self.norm_weight,
+                cs,
+                ss,
+                self.num_k_heads,
+                h_v,
+                dk,
+                dv,
+                self.conv_k,
+                self.q_scale,
+                self.rms_eps,
+                self.gate_sigmoid,
+            ))
+        })?;
+        stage("la:finish", || {
+            let normed = coerr(out.reshape(vec![1, self.value_dim]))?;
+            self.out_proj.forward(&normed)
+        })
     }
 
     fn finish(&self, h: &Tensor, core: &Tensor, s: usize) -> Result<Tensor, ModelError> {

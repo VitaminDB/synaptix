@@ -218,6 +218,7 @@ fn gated_delta_rule_fused_rms_matches_separate() {
         h as u32,
         hk as u32,
         hv as u32,
+        false,
     )
     .unwrap();
     stream.synchronize().unwrap();

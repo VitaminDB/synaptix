@@ -221,6 +221,34 @@ impl SynBundleLoader {
         Some(self.build_quant_slice(&key, expert, device))
     }
 
+    /// Сырые блобы `.qpacked`/`.qscales` квантованного веса — срезы того же
+    /// mmap, из которого `load_quant_expert` режет экспертов. Нужны, чтобы
+    /// зеркалировать стопку в pinned-RAM по диапазону адресов: подкачка
+    /// эксперта попадает в зеркало по указателю среза.
+    pub fn quant_blob_slices(&self, name: &str) -> Option<Result<(&[u8], &[u8])>> {
+        let (key, _) = self.quant_entry(name)?;
+        let manifest = self.quant_manifest()?;
+        let r = (|| -> Result<(&[u8], &[u8])> {
+            let (bytes, _) = self.st_bytes()?;
+            let idx = self.index()?;
+            let take = |blob: &str| -> Result<&[u8]> {
+                let meta = idx
+                    .by_name
+                    .get(blob)
+                    .ok_or_else(|| IoError::Bundle(format!("`{blob}`: блоб не найден в бандле")))?;
+                Ok(&bytes[meta.off..meta.off + meta.len])
+            };
+            Ok((take(&manifest.packed_name(&key))?, take(&manifest.scales_name(&key))?))
+        })();
+        Some(r)
+    }
+
+    /// Формат кванта веса (`None` — не квантован или формат неизвестен).
+    pub fn quant_kind(&self, name: &str) -> Option<synaptix_bundle::inspect::QuantKind> {
+        let (_, entry) = self.quant_entry(name)?;
+        entry.kind()
+    }
+
     /// Форма квантованного веса: `(число матриц, N, K)`. `None` — вес в
     /// бандле не квантован.
     pub fn quant_dims(&self, name: &str) -> Option<(usize, usize, usize)> {
@@ -298,9 +326,27 @@ impl SynBundleLoader {
             synaptix_bundle::inspect::QuantKind::Nvfp4 => DType::NVFP4,
             synaptix_bundle::inspect::QuantKind::Mxfp8 => DType::MXFP8,
         };
-        let packed = Tensor::from_raw_slice(packed_bytes, vec![packed_bytes.len()], DType::U8, device)
-            .map_err(IoError::Core)?;
         let scales = Tensor::from_raw_slice(scales_bytes, vec![scales_bytes.len()], DType::U8, device)
+            .map_err(IoError::Core)?;
+        // Pinned-зеркало стопки уже в перемешанной раскладке GEMV/GEMM: одна DMA
+        // и вес готов, без перепаковки на карте (см. `MirrorRange::nvfp4_repack`).
+        if dtype == DType::NVFP4 && matches!(device, Device::Cuda(_)) {
+            if let Some((mirror, true)) =
+                synaptix_core::device::cuda::offload_pin_resolve_tagged(packed_bytes)
+            {
+                let shuffled = synaptix_core::device::cuda::pinned_slice_to_device(device, mirror)
+                    .map_err(IoError::Core)?;
+                return QuantWeight::from_shuffled(
+                    std::sync::Arc::new(shuffled),
+                    scales.storage_arc(),
+                    dtype,
+                    n,
+                    k,
+                )
+                .map_err(IoError::Core);
+            }
+        }
+        let packed = Tensor::from_raw_slice(packed_bytes, vec![packed_bytes.len()], DType::U8, device)
             .map_err(IoError::Core)?;
         QuantWeight::new(packed.storage_arc(), scales.storage_arc(), dtype, n, k)
             .map_err(IoError::Core)

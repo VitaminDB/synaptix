@@ -72,6 +72,10 @@ impl VideoPromptInfo {
 }
 
 pub struct Qwen4ExpPipeline {
+    /// Pinned-зеркало стопок экспертов в RAM (см. [`host_mirror_for`]).
+    /// Первое поле — гард умирает раньше модели, а с ней и mmap-диапазонов,
+    /// на которые он ссылается.
+    _host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     pub model: Qwen4ExpModel,
     pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
     pub config: Qwen4ExpConfig,
@@ -202,6 +206,7 @@ impl Qwen4ExpPipeline {
         let lazy = expert_cache.is_some() && weights.has_lazy_experts(0);
         let expert_source: Option<Arc<dyn ExpertSource>> = lazy
             .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
+        let host_mirror = if lazy { host_mirror_for(&weights) } else { None };
         if let Some(cache) = &expert_cache {
             eprintln!(
                 "[qwen4_exp] эксперты {}, на карте кэш {:.1} ГБ",
@@ -251,7 +256,16 @@ impl Qwen4ExpPipeline {
         } else {
             None
         };
-        Ok(Self { model, vision: None, config, chat_template, mtp, tokenizer, max_seq: cap })
+        Ok(Self {
+            _host_mirror: host_mirror,
+            model,
+            vision: None,
+            config,
+            chat_template,
+            mtp,
+            tokenizer,
+            max_seq: cap,
+        })
     }
 
     /// Поднять vision-башню из того же бандла. `false` — компонента нет.
@@ -1037,6 +1051,66 @@ fn fit_cache_to_vram(cache: &Arc<ExpertCache>, cfg: &Qwen4ExpConfig, device: Dev
 
 /// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
 /// остальное — в системной памяти. Размер задаётся
+/// Сколько байт RAM свободно под зеркало (MemAvailable из /proc/meminfo).
+fn mem_available_bytes() -> Option<usize> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Pinned-зеркало стопок экспертов в RAM. Подкачка эксперта из mmap идёт
+/// «страничный кэш → копия в pinned-буфер → DMA» и упирается в 8–12 ГБ/с;
+/// из зеркала DMA идёт напрямую (~40 ГБ/с). Регистрировать страницы mmap
+/// как pinned (`cuMemHostRegister`) драйвер на этой платформе не даёт, потому
+/// копия. Бюджет — `SYN_QWEN4EXP_HOST_MIRROR_GB` (0 — выключить), по умолчанию
+/// всё, что влезает в MemAvailable минус запас 10 ГБ; скопированные страницы
+/// mmap отдаются системе, так что RAM в сумме растёт лишь на то, чего в
+/// страничном кэше не было. Копировщики работают фоном: пока диапазон не
+/// догнан, подкачка идёт прежним путём.
+fn host_mirror_for(
+    weights: &Qwen4ExpWeights,
+) -> Option<synaptix_core::device::cuda::OffloadPinCacheGuard> {
+    use synaptix_core::device::cuda::{offload_pin_cache_active, OffloadPinCacheGuard};
+    const GB: f64 = (1u64 << 30) as f64;
+    let ranges = weights.expert_blob_ranges();
+    if ranges.is_empty() || offload_pin_cache_active() {
+        return None;
+    }
+    let total: usize = ranges.iter().map(|r| r.bytes.len()).sum();
+    let avail = mem_available_bytes().unwrap_or(0);
+    let budget = match std::env::var("SYN_QWEN4EXP_HOST_MIRROR_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(gb) if gb <= 0.0 => return None,
+        Some(gb) => (gb * GB) as usize,
+        None => avail.saturating_sub(10 << 30),
+    };
+    let budget = budget.min(total);
+    if budget < (2usize << 30) {
+        eprintln!(
+            "[qwen4_exp] зеркало экспертов в RAM не поднято: доступно {:.1} ГБ, стопки {:.1} ГБ",
+            avail as f64 / GB,
+            total as f64 / GB
+        );
+        return None;
+    }
+    let workers = std::env::var("SYN_QWEN4EXP_HOST_MIRROR_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    eprintln!(
+        "[qwen4_exp] зеркало экспертов в RAM: до {:.1} ГБ из {:.1} ГБ (RAM доступно {:.1} ГБ), \
+         копировщиков {workers}",
+        budget as f64 / GB,
+        total as f64 / GB,
+        avail as f64 / GB
+    );
+    Some(OffloadPinCacheGuard::new_pooled(&ranges, workers, budget))
+}
+
 /// `SYN_QWEN4EXP_EXPERT_CACHE_GB` (0 — грузить эксперты целиком на
 /// устройство, как раньше); по умолчанию 12 ГБ, и только для моделей, чьи
 /// эксперты заведомо не влезают в память карты.

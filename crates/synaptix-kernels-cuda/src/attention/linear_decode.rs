@@ -62,6 +62,7 @@ pub fn linear_attn_decode_step_u8_dev(
     conv_kernel: u32,
     q_scale: f32,
     eps: f32,
+    gate_sigmoid: bool,
 ) -> Result<()> {
     if num_k == 0 || num_v % num_k != 0 {
         return Err(SynaptixError::Cuda(format!(
@@ -230,6 +231,7 @@ pub fn linear_attn_decode_step_u8_dev(
             shared_mem_bytes: shared,
         };
         let b_u = 1u32;
+        let gate_mode: u32 = gate_sigmoid as u32;
         let mut bld = stream.launch_builder(gdr_kernels.step_fused_rms_fn());
         bld.arg(&q)
             .arg(&k)
@@ -245,7 +247,8 @@ pub fn linear_attn_decode_step_u8_dev(
             .arg(&b_u)
             .arg(&num_v)
             .arg(&dk)
-            .arg(&dv);
+            .arg(&dv)
+            .arg(&gate_mode);
         unsafe {
             bld.launch(cfg)
                 .map_err(|e| lerr("gated_delta_rule_step_fused_rms_norm", e))?;

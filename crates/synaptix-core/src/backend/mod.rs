@@ -486,6 +486,83 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("flash_attention не поддержан этим backend"))
     }
 
+    /// Групповой RMS: `x`/`out` `[rows, groups·group]`, `w` `[groups·group]`,
+    /// нормировка по каждой группе отдельно (gated-residual потоки Qwen4Exp).
+    #[allow(clippy::too_many_arguments)]
+    fn group_rms(
+        &self,
+        _x: (&Storage, &Layout),
+        _w: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _rows: usize,
+        _groups: usize,
+        _group: usize,
+        _eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("group_rms не поддержан этим backend"))
+    }
+
+    /// `out[r, i] = mean_c sigmoid(up[r, c·H + i]) · normed[r, c·H + i]`.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_mix(
+        &self,
+        _up: (&Storage, &Layout),
+        _normed: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _rows: usize,
+        _hc: usize,
+        _h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("hc_mix не поддержан этим backend"))
+    }
+
+    /// `out[r, c·H + i] = hyper[r, c·H + i] + block[r, i] · w[r, c]`.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_inject(
+        &self,
+        _hyper: (&Storage, &Layout),
+        _block: (&Storage, &Layout),
+        _w: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _rows: usize,
+        _hc: usize,
+        _h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("hc_inject не поддержан этим backend"))
+    }
+
+    /// `out = act(x · scale)`: act 0 — silu, 1 — sigmoid, 2 — 2·sigmoid.
+    fn scale_act(
+        &self,
+        _x: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _scale: f32,
+        _act: u32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("scale_act не поддержан этим backend"))
+    }
+
+    /// `out[t, i] = Σ_j w[t·k + j] · parts[t·k + j, i]` — сборка выходов
+    /// экспертов MoE с весами роутера (`w` — F32).
+    #[allow(clippy::too_many_arguments)]
+    fn weighted_rows_sum(
+        &self,
+        _parts: (&Storage, &Layout),
+        _w: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _t: usize,
+        _k: usize,
+        _h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("weighted_rows_sum не поддержан этим backend"))
+    }
+
     /// Top-k по строкам матрицы: `values`/`indices` формы `[rows, k]`. Нужен
     /// роутеру MoE — иначе на хост уезжает вся матрица логитов. Default
     /// Unsupported → caller считает на процессоре.
@@ -1106,6 +1183,7 @@ pub trait Backend: Send + Sync + 'static {
         _conv_kernel: usize,
         _q_scale: f32,
         _eps: f32,
+        _gate_sigmoid: bool,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("linear_attn_decode_step не поддержан этим backend"))

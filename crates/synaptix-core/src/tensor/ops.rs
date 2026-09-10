@@ -2556,6 +2556,130 @@ impl Tensor {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    /// Групповой RMS одним ядром: `self` `[.., groups·group]`, `w` `[groups·group]`.
+    pub fn group_rms_fused(&self, w: &Tensor, group: usize, eps: f32) -> Result<Self> {
+        let last = *self.dims().last().ok_or(SynaptixError::Unsupported("group_rms: скаляр"))?;
+        if group == 0 || last % group != 0 || w.numel() != last {
+            return Err(SynaptixError::Unsupported("group_rms: форма"));
+        }
+        let rows = self.numel() / last;
+        let src = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let wc = if w.is_contiguous() { w.clone() } else { w.contiguous()? };
+        let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(self.dtype().bytes_for_numel(self.numel()), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.group_rms(
+            (&src.storage, &src.layout),
+            (&wc.storage, &wc.layout),
+            (&mut out, &out_layout),
+            rows,
+            last / group,
+            group,
+            eps,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
+    /// `out[r, i] = mean_c sigmoid(self[r, c·H + i]) · normed[r, c·H + i]`;
+    /// `self`/`normed` `[rows, hc·H]` → `[rows, H]`.
+    pub fn hc_mix_fused(&self, normed: &Tensor, hc: usize) -> Result<Self> {
+        if self.rank() != 2 || self.dims() != normed.dims() || hc == 0 || self.dims()[1] % hc != 0 {
+            return Err(SynaptixError::Unsupported("hc_mix: форма"));
+        }
+        let (rows, h) = (self.dims()[0], self.dims()[1] / hc);
+        let a = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let b = if normed.is_contiguous() { normed.clone() } else { normed.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![rows, h]), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(self.dtype().bytes_for_numel(rows * h), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.hc_mix(
+            (&a.storage, &a.layout),
+            (&b.storage, &b.layout),
+            (&mut out, &out_layout),
+            rows,
+            hc,
+            h,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
+    /// `out[r, c·H + i] = self[r, c·H + i] + block[r, i] · w[r, c]`;
+    /// `self` `[rows, hc·H]`, `block` `[rows, H]`, `w` `[rows, hc]`.
+    pub fn hc_inject_fused(&self, block: &Tensor, w: &Tensor, hc: usize) -> Result<Self> {
+        if self.rank() != 2 || hc == 0 || self.dims()[1] % hc != 0 {
+            return Err(SynaptixError::Unsupported("hc_inject: форма"));
+        }
+        let (rows, h) = (self.dims()[0], self.dims()[1] / hc);
+        if block.numel() != rows * h || w.numel() != rows * hc {
+            return Err(SynaptixError::Unsupported("hc_inject: форма block/w"));
+        }
+        let a = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let b = if block.is_contiguous() { block.clone() } else { block.contiguous()? };
+        let wc = if w.is_contiguous() { w.clone() } else { w.contiguous()? };
+        let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(self.dtype().bytes_for_numel(self.numel()), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.hc_inject(
+            (&a.storage, &a.layout),
+            (&b.storage, &b.layout),
+            (&wc.storage, &wc.layout),
+            (&mut out, &out_layout),
+            rows,
+            hc,
+            h,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
+    /// `act(self · scale)` одним ядром: act 0 — silu, 1 — sigmoid, 2 — 2·sigmoid.
+    pub fn scale_act_fused(&self, scale: f32, act: u32) -> Result<Self> {
+        let src = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let out_layout = Layout::contiguous(self.shape().clone(), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(self.dtype().bytes_for_numel(self.numel()), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.scale_act(
+            (&src.storage, &src.layout),
+            (&mut out, &out_layout),
+            self.numel(),
+            scale,
+            act,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
+    /// `out[t, i] = Σ_j w[t·k + j] · self[t·k + j, i]`; `self` `[t·k, H]`,
+    /// `w` F32 `[t·k]` → `[t, H]`.
+    pub fn weighted_rows_sum_fused(&self, w: &Tensor, t: usize, k: usize) -> Result<Self> {
+        if self.rank() != 2 || self.dims()[0] != t * k || w.numel() != t * k {
+            return Err(SynaptixError::Unsupported("weighted_rows_sum: форма"));
+        }
+        let h = self.dims()[1];
+        let a = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
+        let wc = if w.is_contiguous() { w.clone() } else { w.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![t, h]), self.dtype());
+        let backend = registry::backend_for(self.device())?;
+        let mut out = backend.alloc_uninit(self.dtype().bytes_for_numel(t * h), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.weighted_rows_sum(
+            (&a.storage, &a.layout),
+            (&wc.storage, &wc.layout),
+            (&mut out, &out_layout),
+            t,
+            k,
+            h,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
     /// Top-k по строкам `[rows, cols]`: возвращает `(значения, индексы)` формы
     /// `[rows, k]`, отсортированные по убыванию.
     pub fn topk_rows(&self, k: usize) -> Result<(Self, Self)> {
@@ -3315,6 +3439,7 @@ impl Tensor {
     /// `[num_v,dk,dv]` (F32) обновляются in-place (стабильные указатели persistent-
     /// буфера → один граф для всех decode-шагов). Возвращает `out` F16
     /// `[1, value_dim]` (= нормированный gated SSM-выход до `out_proj`).
+    /// `gate_sigmoid` — гейт выхода `sigmoid(z)` (Qwen4Exp) вместо `silu(z)`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_attn_decode_step(
         &self,
@@ -3334,6 +3459,7 @@ impl Tensor {
         conv_kernel: usize,
         q_scale: f32,
         eps: f32,
+        gate_sigmoid: bool,
     ) -> Result<Self> {
         let dev = self.device();
         let value_dim = num_v * dv;
@@ -3382,6 +3508,7 @@ impl Tensor {
             conv_kernel,
             q_scale,
             eps,
+            gate_sigmoid,
             &stream,
         )?;
         Ok(Tensor::from_parts(Arc::new(out_storage), out_layout))

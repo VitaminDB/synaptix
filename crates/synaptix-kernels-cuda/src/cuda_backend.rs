@@ -2180,6 +2180,186 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn group_rms(
+        &self,
+        x: (&Storage, &Layout),
+        w: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        rows: usize,
+        groups: usize,
+        group: usize,
+        eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for (lo, what) in [(x.1, "x"), (w.1, "w"), (out.1, "out")] {
+            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("group_rms: только contiguous F16"));
+            }
+            let _ = what;
+        }
+        let xb = x.0.as_cuda().ok_or(SynaptixError::Unsupported("group_rms: non-cuda"))?;
+        let wb = w.0.as_cuda().ok_or(SynaptixError::Unsupported("group_rms: w non-cuda"))?;
+        let ctx = xb.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(xb.ordinal())?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        let (xo, wo, oo) = (x.1.byte_offset(), w.1.byte_offset(), out.1.byte_offset());
+        let ob = out.0.as_cuda_mut().ok_or(SynaptixError::Unsupported("group_rms: out non-cuda"))?;
+        crate::kernels::qwen4_decode::group_rms_f16(
+            &k,
+            &stream,
+            (xb.slice(), xo),
+            (wb.slice(), wo),
+            (ob.slice_mut(), oo),
+            rows as u32,
+            groups as u32,
+            group as u32,
+            eps,
+        )
+    }
+
+    fn hc_mix(
+        &self,
+        up: (&Storage, &Layout),
+        normed: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        rows: usize,
+        hc: usize,
+        h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [up.1, normed.1, out.1] {
+            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("hc_mix: только contiguous F16"));
+            }
+        }
+        let ub = up.0.as_cuda().ok_or(SynaptixError::Unsupported("hc_mix: non-cuda"))?;
+        let nb = normed.0.as_cuda().ok_or(SynaptixError::Unsupported("hc_mix: non-cuda"))?;
+        let ctx = ub.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(ub.ordinal())?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        let (uo, no, oo) = (up.1.byte_offset(), normed.1.byte_offset(), out.1.byte_offset());
+        let ob = out.0.as_cuda_mut().ok_or(SynaptixError::Unsupported("hc_mix: out non-cuda"))?;
+        crate::kernels::qwen4_decode::hc_mix_f16(
+            &k,
+            &stream,
+            (ub.slice(), uo),
+            (nb.slice(), no),
+            (ob.slice_mut(), oo),
+            rows as u32,
+            hc as u32,
+            h as u32,
+        )
+    }
+
+    fn hc_inject(
+        &self,
+        hyper: (&Storage, &Layout),
+        block: (&Storage, &Layout),
+        w: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        rows: usize,
+        hc: usize,
+        h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [hyper.1, block.1, w.1, out.1] {
+            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("hc_inject: только contiguous F16"));
+            }
+        }
+        let hb = hyper.0.as_cuda().ok_or(SynaptixError::Unsupported("hc_inject: non-cuda"))?;
+        let bb = block.0.as_cuda().ok_or(SynaptixError::Unsupported("hc_inject: non-cuda"))?;
+        let wb = w.0.as_cuda().ok_or(SynaptixError::Unsupported("hc_inject: non-cuda"))?;
+        let ctx = hb.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(hb.ordinal())?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        let (ho, bo, wo, oo) =
+            (hyper.1.byte_offset(), block.1.byte_offset(), w.1.byte_offset(), out.1.byte_offset());
+        let ob = out.0.as_cuda_mut().ok_or(SynaptixError::Unsupported("hc_inject: out non-cuda"))?;
+        crate::kernels::qwen4_decode::hc_inject_f16(
+            &k,
+            &stream,
+            (hb.slice(), ho),
+            (bb.slice(), bo),
+            (wb.slice(), wo),
+            (ob.slice_mut(), oo),
+            rows as u32,
+            hc as u32,
+            h as u32,
+        )
+    }
+
+    fn scale_act(
+        &self,
+        x: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        n: usize,
+        scale: f32,
+        act: u32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [x.1, out.1] {
+            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("scale_act: только contiguous F16"));
+            }
+        }
+        let xb = x.0.as_cuda().ok_or(SynaptixError::Unsupported("scale_act: non-cuda"))?;
+        let ctx = xb.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(xb.ordinal())?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        let (xo, oo) = (x.1.byte_offset(), out.1.byte_offset());
+        let ob = out.0.as_cuda_mut().ok_or(SynaptixError::Unsupported("scale_act: out non-cuda"))?;
+        crate::kernels::qwen4_decode::scale_act_f16(
+            &k,
+            &stream,
+            (xb.slice(), xo),
+            (ob.slice_mut(), oo),
+            n as u32,
+            scale,
+            act,
+        )
+    }
+
+    fn weighted_rows_sum(
+        &self,
+        parts: (&Storage, &Layout),
+        w: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        t: usize,
+        kk: usize,
+        h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [parts.1, out.1] {
+            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("weighted_rows_sum: только contiguous F16"));
+            }
+        }
+        if w.1.dtype() != DType::F32 || !w.1.strides().is_contiguous(w.1.shape()) {
+            return Err(SynaptixError::Unsupported("weighted_rows_sum: веса только F32"));
+        }
+        let pb = parts.0.as_cuda().ok_or(SynaptixError::Unsupported("weighted_rows_sum: non-cuda"))?;
+        let wb = w.0.as_cuda().ok_or(SynaptixError::Unsupported("weighted_rows_sum: w non-cuda"))?;
+        let ctx = pb.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(pb.ordinal())?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        let (po, wo, oo) = (parts.1.byte_offset(), w.1.byte_offset(), out.1.byte_offset());
+        let ob = out
+            .0
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("weighted_rows_sum: out non-cuda"))?;
+        crate::kernels::qwen4_decode::weighted_rows_sum_f16(
+            &k,
+            &stream,
+            (pb.slice(), po),
+            (wb.slice(), wo),
+            (ob.slice_mut(), oo),
+            t as u32,
+            kk as u32,
+            h as u32,
+        )
+    }
+
     fn topk_rows(
         &self,
         scores: (&Storage, &Layout),
@@ -4930,6 +5110,7 @@ impl Backend for CudaBackend {
         conv_kernel: usize,
         q_scale: f32,
         eps: f32,
+        gate_sigmoid: bool,
         _stream: &Stream,
     ) -> Result<()> {
         for (st, name, want) in [
@@ -5041,6 +5222,7 @@ impl Backend for CudaBackend {
             conv_kernel as u32,
             q_scale,
             eps,
+            gate_sigmoid,
         )
     }
 

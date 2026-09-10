@@ -749,15 +749,34 @@ mod inner {
         bytes: &[u8],
     ) -> Result<cudarc::driver::CudaSlice<u8>> {
         let ord = stream.context().ordinal();
-        // Под [`ExpertsAllocGuard`] — в пул экспертов: pinned-зеркало MoE
-        // ходит именно сюда, а вытесняться эксперт должен вместе со своим
-        // пулом, иначе трим опять ничего не вернёт.
-        let pool = if experts_alloc() { experts_pool(ord)? } else { weights_pool(ord)? };
-        let ptr = unsafe {
-            cudarc::driver::result::mem_pool::alloc_async(pool, bytes.len(), stream.cu_stream())
-        }
-        .map_err(|e| SynaptixError::Cuda(format!("alloc from weights-pool({}): {e:?}", bytes.len())))?;
-        let mut sl = unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes.len()) };
+        // Под [`ExpertsAllocGuard`] — в арену/пул экспертов тем же путём, что
+        // и staging-подкачка (`alloc_bytes_uninit`): эксперт обязан лечь в
+        // slab арены, иначе вытеснение не вернёт драйверу ничего и учёт
+        // `fit_to_vram` разойдётся с реальностью.
+        let mut sl = if experts_alloc() {
+            match unsafe { alloc_bytes_uninit(stream, bytes.len()) } {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = stream.synchronize();
+                    let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                    unsafe { alloc_bytes_uninit(stream, bytes.len()) }.map_err(|e| {
+                        SynaptixError::Cuda(format!(
+                            "weights_htod alloc({}) after trim: {e:?}",
+                            bytes.len()
+                        ))
+                    })?
+                }
+            }
+        } else {
+            let pool = weights_pool(ord)?;
+            let ptr = unsafe {
+                cudarc::driver::result::mem_pool::alloc_async(pool, bytes.len(), stream.cu_stream())
+            }
+            .map_err(|e| {
+                SynaptixError::Cuda(format!("alloc from weights-pool({}): {e:?}", bytes.len()))
+            })?;
+            unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes.len()) }
+        };
         stream
             .memcpy_htod(bytes, &mut sl)
             .map_err(|e| SynaptixError::Cuda(format!("weights_htod memcpy: {e:?}")))?;
@@ -809,9 +828,20 @@ mod inner {
     // `ready`; запрос ниже знака → DMA из pinned (~45GB/s, async, без staging),
     // выше → фоллбэк staging (кэш догонит). Гейт по диапазонам шардов —
     // содержимое mmap иммутабельно → ptr ≡ контент.
+    /// Диапазон mmap под pinned-зеркало. `nvfp4_repack = Some((n, k))` —
+    /// стопка NVFP4-матриц `[n, k]` (по `n·k/2` байт каждая): зеркало хранит
+    /// их уже в перемешанной раскладке GEMV/GEMM (`QuantWeight::nvfp4_repack_host`),
+    /// и подкачка обходится без перепаковки на карте.
+    pub struct MirrorRange<'a> {
+        pub bytes: &'a [u8],
+        pub nvfp4_repack: Option<(usize, usize)>,
+    }
+
     struct ShardPin {
         base: usize,
         len: usize,
+        /// `(байт на матрицу, n, k)` — зеркало перемешано поматрично.
+        repack: Option<(usize, usize, usize)>,
         /// raw-ptr pinned-зеркала (запись фоном выше `ready`, чтение ниже);
         /// 0 = буфер ещё не аллоцирован (lazy: на первом проходе ПОСЛЕ снятия
         /// паузы — иначе 44GB pinned висели с старта и вместе с CPU-блоками
@@ -833,6 +863,16 @@ mod inner {
     /// `true` если pinned-кэш offload-весов уже активен (не создавать второй).
     pub fn offload_pin_cache_active() -> bool {
         OFFLOAD_PIN_CACHE.read().is_some()
+    }
+
+    /// Прогресс активного pinned-кэша: `(готово байт, всего байт)`.
+    pub fn offload_pin_cache_progress() -> Option<(usize, usize)> {
+        use std::sync::atomic::Ordering;
+        let rd = OFFLOAD_PIN_CACHE.read();
+        let c = rd.as_ref()?;
+        let ready = c.shards.iter().map(|s| s.ready.load(Ordering::Acquire)).sum();
+        let total = c.shards.iter().map(|s| s.len).sum();
+        Some((ready, total))
     }
 
     /// RAII-гард pinned-кэша: стартует фоновое зеркалирование `ranges`
@@ -868,6 +908,152 @@ mod inner {
             self.cache.paused.store(false, std::sync::atomic::Ordering::Release);
         }
 
+        /// Зеркало из МНОГИХ диапазонов (стопки экспертов MoE: сотни блобов по
+        /// 50–800 МБ) ограниченным числом копировщиков и бюджетом RAM.
+        /// Диапазоны берутся в порядке списка; когда очередной не влезает в
+        /// `budget_bytes`, он остаётся незеркалированным (staging-путь), а
+        /// следующие меньшие ещё могут влезть. Зеркала аллоцируются лениво,
+        /// перед копией своего диапазона.
+        pub fn new_pooled(ranges: &[MirrorRange<'_>], workers: usize, budget_bytes: usize) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let shards: Vec<ShardPin> = ranges
+                .iter()
+                .filter(|r| !r.bytes.is_empty())
+                .map(|r| {
+                    let repack = r.nvfp4_repack.and_then(|(n, k)| {
+                        let slice = n * k / 2;
+                        (n % 16 == 0 && k % 64 == 0 && slice > 0 && r.bytes.len() % slice == 0)
+                            .then_some((slice, n, k))
+                    });
+                    ShardPin {
+                        base: r.bytes.as_ptr() as usize,
+                        len: r.bytes.len(),
+                        repack,
+                        bptr: AtomicUsize::new(0),
+                        ready: AtomicUsize::new(0),
+                        buf: parking_lot::Mutex::new(None),
+                    }
+                })
+                .collect();
+            let cache = Arc::new(OffloadPinCache {
+                shards,
+                cancel: std::sync::atomic::AtomicBool::new(false),
+                paused: std::sync::atomic::AtomicBool::new(false),
+            });
+            *OFFLOAD_PIN_CACHE.write() = Some(cache.clone());
+            let next = Arc::new(AtomicUsize::new(0));
+            let pinned = Arc::new(AtomicUsize::new(0));
+            let workers = (0..workers.max(1))
+                .map(|_| {
+                    let c = cache.clone();
+                    let next = next.clone();
+                    let pinned = pinned.clone();
+                    std::thread::spawn(move || {
+                        const CHUNK: usize = 64 << 20;
+                        loop {
+                            if c.cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let i = next.fetch_add(1, Ordering::AcqRel);
+                            let Some(sh) = c.shards.get(i) else { return };
+                            // Бюджет: резервируем место до аллокации, иначе два
+                            // копировщика перешагнут потолок разом.
+                            let mut cur = pinned.load(Ordering::Acquire);
+                            let ok = loop {
+                                if cur + sh.len > budget_bytes {
+                                    break false;
+                                }
+                                match pinned.compare_exchange_weak(
+                                    cur,
+                                    cur + sh.len,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(v) => cur = v,
+                                }
+                            };
+                            if !ok {
+                                continue;
+                            }
+                            let b = crate::memory::pinned::PinnedBuf::new_uninit(sh.len);
+                            if !b.is_pinned() {
+                                // Драйвер не дал page-locked память — зеркало
+                                // бесполезно (DMA из pageable = staging драйвера).
+                                pinned.fetch_sub(sh.len, Ordering::AcqRel);
+                                continue;
+                            }
+                            let bptr = b.as_ptr() as usize;
+                            *sh.buf.lock() = Some(b);
+                            sh.bptr.store(bptr, Ordering::Release);
+                            let mut off = 0usize;
+                            while off < sh.len {
+                                if c.cancel.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                // Кусок — целое число матриц, если зеркало перемешанное.
+                                let n = match sh.repack {
+                                    Some((slice, _, _)) => (CHUNK / slice).max(1) * slice,
+                                    None => CHUNK,
+                                }
+                                .min(sh.len - off);
+                                // SAFETY: src — mmap-диапазон (жив по контракту
+                                // гарда, ro); dst — своё зеркало выше водяного знака.
+                                let src = unsafe {
+                                    std::slice::from_raw_parts((sh.base + off) as *const u8, n)
+                                };
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut((bptr + off) as *mut u8, n)
+                                };
+                                match sh.repack {
+                                    Some((slice, rn, rk)) => {
+                                        for (s, d) in src.chunks(slice).zip(dst.chunks_mut(slice)) {
+                                            if crate::tensor::quant::QuantWeight::nvfp4_repack_host(
+                                                s, d, rn, rk,
+                                            )
+                                            .is_err()
+                                            {
+                                                d.copy_from_slice(s);
+                                            }
+                                        }
+                                    }
+                                    None => dst.copy_from_slice(src),
+                                }
+                                sh.ready.store(off + n, Ordering::Release);
+                                let pg = 4096usize;
+                                let a0 = (sh.base + off).div_ceil(pg) * pg;
+                                let a1 = (sh.base + off + n) / pg * pg;
+                                if a1 > a0 {
+                                    unsafe {
+                                        let _ = libc::madvise(
+                                            a0 as *mut libc::c_void,
+                                            a1 - a0,
+                                            libc::MADV_DONTNEED,
+                                        );
+                                    }
+                                }
+                                off += n;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            Self { cache, workers }
+        }
+
+        /// Сколько байт зеркала уже готово к DMA и сколько всего заказано.
+        pub fn progress(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering;
+            let ready = self.cache.shards.iter().map(|s| s.ready.load(Ordering::Acquire)).sum();
+            let total = self.cache.shards.iter().map(|s| s.len).sum();
+            (ready, total)
+        }
+
+        /// Все копировщики закончили (успели или упёрлись в бюджет).
+        pub fn finished(&self) -> bool {
+            self.workers.iter().all(|w| w.is_finished())
+        }
+
         fn build(ranges: &[&[u8]], paused: bool, eager_alloc: bool) -> Self {
             let shards: Vec<ShardPin> = ranges
                 .iter()
@@ -882,6 +1068,7 @@ mod inner {
                     ShardPin {
                         base: s.as_ptr() as usize,
                         len: s.len(),
+                        repack: None,
                         bptr: std::sync::atomic::AtomicUsize::new(bptr),
                         ready: std::sync::atomic::AtomicUsize::new(0),
                         buf: parking_lot::Mutex::new(buf),
@@ -964,8 +1151,21 @@ mod inner {
     }
 
     /// Pinned-зеркало диапазона `bytes` (mmap-шард): `Some(слайс зеркала)` если
-    /// кэш активен и догнал диапазон, иначе `None` (staging-путь).
+    /// кэш активен и догнал диапазон, иначе `None` (staging-путь). Для
+    /// перемешанных шардов (NVFP4-стопки) — `None`: их байты не равны
+    /// исходным, читать их надо через [`offload_pin_resolve_tagged`].
     pub fn offload_pin_resolve(bytes: &[u8]) -> Option<&'static [u8]> {
+        match offload_pin_resolve_tagged(bytes) {
+            Some((m, false)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Как [`offload_pin_resolve`], но отдаёт и перемешанные шарды: второй
+    /// элемент — `true`, если байты зеркала лежат в раскладке
+    /// `QuantWeight::nvfp4_repack_host` (поднимать как `from_shuffled`).
+    /// Требует, чтобы `bytes` был целым числом матриц шарда.
+    pub fn offload_pin_resolve_tagged(bytes: &[u8]) -> Option<(&'static [u8], bool)> {
         use std::sync::atomic::Ordering;
         let rd = OFFLOAD_PIN_CACHE.read();
         let cache = rd.as_ref()?;
@@ -973,6 +1173,11 @@ mod inner {
         for sh in &cache.shards {
             if p >= sh.base && p + bytes.len() <= sh.base + sh.len {
                 let off = p - sh.base;
+                if let Some((slice, _, _)) = sh.repack {
+                    if off % slice != 0 || bytes.len() % slice != 0 {
+                        return None;
+                    }
+                }
                 if sh.ready.load(Ordering::Acquire) < off + bytes.len() {
                     return None; // зеркало ещё не догнало — staging, кэш догонит
                 }
@@ -981,10 +1186,24 @@ mod inner {
                     return None; // буфер ещё не аллоцирован (lazy)
                 }
                 // SAFETY: диапазон ниже водяного знака — записан и стабилен.
-                return Some(unsafe { std::slice::from_raw_parts((bptr + off) as *const u8, bytes.len()) });
+                let m = unsafe { std::slice::from_raw_parts((bptr + off) as *const u8, bytes.len()) };
+                return Some((m, sh.repack.is_some()));
             }
         }
         None
+    }
+
+    /// DMA из закреплённой памяти (зеркала) на устройство: приёмник — из
+    /// пула весов/экспертов (см. [`weights_htod`]). Для НЕзакреплённых байтов
+    /// драйвер уйдёт в свой staging — вызывать только со слайсом зеркала.
+    pub fn pinned_slice_to_device(device: crate::device::Device, bytes: &[u8]) -> Result<crate::tensor::storage::Storage> {
+        let ord = device.ordinal();
+        let stream = alloc_stream(ord)?;
+        let buf = weights_htod(&stream, bytes)?;
+        let ctx = get(ord)?;
+        Ok(crate::tensor::storage::Storage::Cuda(crate::tensor::storage::CudaBuf::new(
+            ctx, stream, buf, ord,
+        )))
     }
 
     /// H2D `bytes` в регион существующего device-буфера по сырому указателю

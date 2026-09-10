@@ -16,6 +16,15 @@ pub struct GatedResidual {
     eps: f32,
 }
 
+/// Слитое ядро неприменимо (не CUDA/не F16/неконтигуозно) — идём прежней цепочкой.
+fn fallback(e: &synaptix_core::error::SynaptixError) -> bool {
+    !crate::norm::fused_on() || matches!(
+        e,
+        synaptix_core::error::SynaptixError::Unsupported(_)
+            | synaptix_core::error::SynaptixError::NonContiguous
+    )
+}
+
 pub struct Mixed {
     pub mixed: Tensor,
     pub hyper: Tensor,
@@ -75,18 +84,36 @@ impl GatedResidual {
 
         let inv = 1.0 / self.hc_count as f32;
         let mix = self.down.forward(&normed)?;
-        let mix = coerr(coerr(mix.mul_scalar(inv))?.silu())?;
-        let mix = coerr(self.up.forward(&mix)?.sigmoid())?;
-
-        let split = vec![tokens, self.hc_count, self.hidden];
-        let weighted = coerr(mix.mul(&normed))?;
-        let mixed = coerr(coerr(weighted.reshape(split))?.mean_keepdim(1))?;
-        let mixed = coerr(mixed.reshape(vec![tokens, self.hidden]))?;
+        let off = || Err(synaptix_core::error::SynaptixError::Unsupported("выключено"));
+        let mix = match if crate::norm::fused_on() { mix.scale_act_fused(inv, 0) } else { off() } {
+            Ok(t) => t,
+            Err(e) if fallback(&e) => coerr(coerr(mix.mul_scalar(inv))?.silu())?,
+            Err(e) => return Err(ModelError::Forward(e.to_string())),
+        };
+        let up = self.up.forward(&mix)?;
+        // sigmoid(up) · normed, среднее по потокам — одним ядром.
+        let mixed = match if crate::norm::fused_on() { up.hc_mix_fused(&normed, self.hc_count) } else { off() } {
+            Ok(t) => t,
+            Err(e) if fallback(&e) => {
+                let mix = coerr(up.sigmoid())?;
+                let split = vec![tokens, self.hc_count, self.hidden];
+                let weighted = coerr(mix.mul(&normed))?;
+                let mixed = coerr(coerr(weighted.reshape(split))?.mean_keepdim(1))?;
+                coerr(mixed.reshape(vec![tokens, self.hidden]))?
+            }
+            Err(e) => return Err(ModelError::Forward(e.to_string())),
+        };
 
         let inject_weights = match &self.inject {
             Some(w) => {
                 let g = w.forward(&normed)?;
-                Some(coerr(coerr(coerr(g.mul_scalar(inv))?.sigmoid())?.mul_scalar(2.0))?)
+                Some(match if crate::norm::fused_on() { g.scale_act_fused(inv, 2) } else { off() } {
+                    Ok(t) => t,
+                    Err(e) if fallback(&e) => {
+                        coerr(coerr(coerr(g.mul_scalar(inv))?.sigmoid())?.mul_scalar(2.0))?
+                    }
+                    Err(e) => return Err(ModelError::Forward(e.to_string())),
+                })
             }
             None => None,
         };
@@ -100,6 +127,13 @@ impl GatedResidual {
         inject_weights: &Tensor,
     ) -> Result<Tensor, ModelError> {
         let tokens = hyper.dims()[0];
+        if crate::norm::fused_on() {
+            match hyper.hc_inject_fused(block_out, inject_weights, self.hc_count) {
+                Ok(t) => return Ok(t),
+                Err(e) if fallback(&e) => {}
+                Err(e) => return Err(ModelError::Forward(e.to_string())),
+            }
+        }
         let out = coerr(coerr(block_out.contiguous())?.reshape(vec![tokens, 1, self.hidden]))?;
         let w = coerr(inject_weights.reshape(vec![tokens, self.hc_count, 1]))?;
         let injection = coerr(coerr(out.broadcast_mul(&w))?

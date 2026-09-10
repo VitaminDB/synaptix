@@ -86,6 +86,12 @@ pub fn ctx<T>(r: Result<T, ModelError>, what: &str) -> Result<T, ModelError> {
     })
 }
 
+/// Слитые ядра декода/потоков (`SYN_QWEN4EXP_FUSED=0` — прежние цепочки, для A/B).
+pub fn fused_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_FUSED").as_deref() != Ok("0"))
+}
+
 pub fn rms(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor, ModelError> {
     coerr(rms_norm(x, weight, eps))
 }
@@ -100,6 +106,16 @@ pub fn group_rms(x: &Tensor, weight: &Tensor, group: usize, eps: f32) -> Result<
     }
     if last == group {
         return rms(x, weight, eps);
+    }
+    // Одно ядро вместо десятка элементарных операций (F16 на CUDA); где путь
+    // неприменим — прежняя цепочка.
+    if fused_on() {
+        match x.group_rms_fused(weight, group, eps) {
+            Ok(t) => return Ok(t),
+            Err(synaptix_core::error::SynaptixError::Unsupported(_))
+            | Err(synaptix_core::error::SynaptixError::NonContiguous) => {}
+            Err(e) => return Err(ModelError::Forward(e.to_string())),
+        }
     }
     let groups = last / group;
     let mut grouped = dims.clone();

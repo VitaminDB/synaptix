@@ -744,6 +744,19 @@ fn batch_tokens() -> usize {
     })
 }
 
+/// Сколько экспертов группового GEMM держится резидентными разом при
+/// оффлоаде (`SYN_MOE_GROUP`, по умолчанию 128 ≈ 340 МБ у Qwen4Exp).
+fn segmented_group() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SYN_MOE_GROUP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+            .max(1)
+    })
+}
+
 /// Сколько токенов MoE берёт в один чанк префилла: `SYN_MOE_CHUNK` либо
 /// умолчание архитектуры.
 pub fn prefill_chunk_tokens(default: usize) -> usize {
@@ -1525,9 +1538,15 @@ impl MoeFfn {
         weights: &[f32],
     ) -> Result<Option<Tensor>, ModelError> {
         use crate::profile::stage;
-        let ExpertStore::Resident(all) = &self.experts else { return Ok(None) };
-        if self.cache.is_some()
-            || !self.device.is_cuda()
+        // Эксперты либо резидентны целиком, либо приходят из кэша оффлоада:
+        // к этому моменту `prefetch` поднял всех экспертов чанка, и группа
+        // берётся по `Arc` — вытеснение из кэша посреди GEMM ей не страшно.
+        let resident_all = match (&self.experts, &self.cache) {
+            (ExpertStore::Resident(all), None) => Some(all),
+            (ExpertStore::Lazy { .. }, Some(_)) | (ExpertStore::Resident(_), Some(_)) => None,
+            (ExpertStore::Lazy { .. }, None) => return Ok(None),
+        };
+        if !self.device.is_cuda()
             || !matches!(x.dtype(), DType::BF16 | DType::F16)
             || self.cfg.hidden_size % 128 != 0
             || (2 * self.cfg.moe_intermediate_size) % 128 != 0
@@ -1536,11 +1555,16 @@ impl MoeFfn {
         {
             return Ok(None);
         }
-        let nvfp4 = all.iter().all(|e| {
+        let nvfp4_pair = |e: &Expert| {
             e.gate_up.quant_dtype() == Some(DType::NVFP4)
                 && e.down.quant_dtype() == Some(DType::NVFP4)
-        });
-        if !nvfp4 || std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0") {
+        };
+        if let Some(all) = resident_all {
+            if !all.iter().all(nvfp4_pair) {
+                return Ok(None);
+            }
+        }
+        if std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
 
@@ -1586,29 +1610,88 @@ impl MoeFfn {
 
         // Весь буфер квантуется одним ядром: тайл масштабов NVFP4 — 128 строк,
         // и сегменты, выровненные на 128, читаются групповым GEMM по смещению.
+        // С кэшем оффлоада эксперты берутся группами по `SYN_MOE_GROUP` штук:
+        // `Arc` держит их живыми на время GEMM, и лишняя резидентность сверх
+        // потолка кэша ограничена размером группы.
+        let group_n = match resident_all {
+            Some(_) => segs.len().max(1),
+            None => segmented_group(),
+        };
         let stacked = stage("moe:expert", || -> Result<Tensor, ModelError> {
-            let gate_up: Vec<&QuantWeight> = segs
-                .iter()
-                .map(|(e, _, _)| all[*e].gate_up.quant_weight().expect("проверено выше"))
-                .collect();
-            let down: Vec<&QuantWeight> = segs
-                .iter()
-                .map(|(e, _, _)| all[*e].down.quant_weight().expect("проверено выше"))
-                .collect();
-            let row_off: Vec<u32> = segs.iter().map(|(_, s, _)| *s as u32).collect();
-            let seg_rows: Vec<u32> = segs.iter().map(|(_, _, m)| *m as u32).collect();
-            let (px, sx) = gathered
-                .nvfp4_quantize_act()
-                .map_err(|e| ModelError::Forward(format!("MoE: квант входа: {e}")))?;
-            let gu = QuantWeight::gemm_grouped(&gate_up, &px, &sx, &row_off, &seg_rows, r_pad, self.compute)
-                .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM gate_up: {e}")))?;
-            let (ph, sh) = match self.cfg.activation {
-                Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
-                Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
+            let mut parts: Vec<Tensor> = Vec::new();
+            let mut g0 = 0usize;
+            while g0 < segs.len() {
+                let g1 = (g0 + group_n).min(segs.len());
+                let row0 = segs[g0].1;
+                let row1 = segs[g1 - 1].1 + segs[g1 - 1].2;
+                let g_rows = row1 - row0;
+                let mut held: Vec<Arc<Expert>> = Vec::new();
+                let mut refs: Vec<&Expert> = Vec::with_capacity(g1 - g0);
+                match (resident_all, &self.cache) {
+                    (Some(all), _) => {
+                        for (e, _, _) in &segs[g0..g1] {
+                            refs.push(&all[*e]);
+                        }
+                    }
+                    (None, Some(cache)) => {
+                        for (e, _, _) in &segs[g0..g1] {
+                            held.push(self.resident_expert(*e, cache)?);
+                        }
+                        for e in &held {
+                            if !nvfp4_pair(e) {
+                                return Err(ModelError::Forward("MoE: эксперт не NVFP4".into()));
+                            }
+                            refs.push(e.as_ref());
+                        }
+                    }
+                    (None, None) => unreachable!("проверено выше"),
+                }
+                let mut gate_up: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
+                let mut down: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
+                for e in &refs {
+                    let (gu, dn) = (
+                        e.gate_up.quant_weight().expect("проверено выше"),
+                        e.down.quant_weight().expect("проверено выше"),
+                    );
+                    // Групповому GEMM нужна перемешанная копия; из зеркала
+                    // эксперт приходит уже перемешанным, иначе строим один раз.
+                    gu.ensure_shuffled()
+                        .and_then(|_| dn.ensure_shuffled())
+                        .map_err(|e| ModelError::Forward(format!("MoE: перепаковка: {e}")))?;
+                    gate_up.push(gu);
+                    down.push(dn);
+                }
+                let row_off: Vec<u32> = segs[g0..g1].iter().map(|(_, s, _)| (*s - row0) as u32).collect();
+                let seg_rows: Vec<u32> = segs[g0..g1].iter().map(|(_, _, m)| *m as u32).collect();
+                let xin = if g0 == 0 && g1 == segs.len() {
+                    gathered.clone()
+                } else {
+                    gathered
+                        .narrow(0, row0, g_rows)
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| ModelError::Forward(format!("MoE: срез группы: {e}")))?
+                };
+                let (px, sx) = xin
+                    .nvfp4_quantize_act()
+                    .map_err(|e| ModelError::Forward(format!("MoE: квант входа: {e}")))?;
+                let gu = QuantWeight::gemm_grouped(&gate_up, &px, &sx, &row_off, &seg_rows, g_rows, self.compute)
+                    .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM gate_up: {e}")))?;
+                let (ph, sh) = match self.cfg.activation {
+                    Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
+                    Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
+                }
+                .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
+                let part = QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, g_rows, self.compute)
+                    .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM down: {e}")))?;
+                parts.push(part);
+                g0 = g1;
             }
-            .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
-            QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, r_pad, self.compute)
-                .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM down: {e}")))
+            if parts.len() == 1 {
+                Ok(parts.pop().expect("одна часть"))
+            } else {
+                let refs: Vec<&Tensor> = parts.iter().collect();
+                Tensor::cat(&refs, 0).map_err(|e| ModelError::Forward(format!("MoE: сборка групп: {e}")))
+            }
         })?;
         // Взвешивание, обратная перестановка и сумма по слотам — одно ядро.
         let inverse = Tensor::from_vec::<_, u32>(inverse, vec![t * k], self.device)
@@ -1780,6 +1863,15 @@ impl MoeFfn {
         };
 
         let scale: Vec<f32> = pairs.iter().map(|p| weights[*p]).collect();
+        if pairs.len() == t * k {
+            let w32 = Tensor::from_vec::<_, f32>(scale.clone(), vec![pairs.len()], self.device)
+                .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
+            match parts.weighted_rows_sum_fused(&w32, t, k) {
+                Ok(s) => return Ok(Some(s)),
+                Err(SynError::Unsupported(_)) | Err(SynError::NonContiguous) => {}
+                Err(e) => return Err(ModelError::Forward(format!("MoE: сумма по экспертам: {e}"))),
+            }
+        }
         let scale = Tensor::from_vec::<_, f32>(scale, vec![pairs.len(), 1], self.device)
             .and_then(|s| s.to_dtype(parts.dtype()))
             .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;

@@ -128,8 +128,10 @@ impl GatedDeltaRuleKernels {
         h: u32,
         hk: u32,
         hv: u32,
+        gate_sigmoid: bool,
     ) -> Result<()> {
         debug_assert_eq!(hk, hv, "fused gdr+rms требует hk == hv");
+        let gate_mode: u32 = gate_sigmoid as u32;
         let shared_bytes = ((3 * hk + hv + 4) as usize * std::mem::size_of::<f32>()) as u32;
         let cfg = LaunchConfig {
             grid_dim: (b, h, 1),
@@ -152,7 +154,8 @@ impl GatedDeltaRuleKernels {
             .arg(&b)
             .arg(&h)
             .arg(&hk)
-            .arg(&hv);
+            .arg(&hv)
+            .arg(&gate_mode);
         unsafe {
             builder.launch(cfg).map_err(|e| {
                 SynaptixError::Cuda(format!(

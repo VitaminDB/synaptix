@@ -3464,7 +3464,7 @@ impl LinearAttn {
             .linear_attn_decode_step(
                 conv_w, &a, &b, dt_bias, a_log, &z, norm_w, cs, ss,
                 self.num_k_heads, self.num_v_heads, self.dk, self.dv, self.conv_k,
-                self.q_scale, self.rms_eps,
+                self.q_scale, self.rms_eps, false,
             ))
             .coerr()?;
         let out = out.reshape(vec![1, 1, self.value_dim]).coerr()?;
@@ -3573,7 +3573,7 @@ impl LinearAttn {
                 .linear_attn_decode_step(
                     conv_w, &a_t, &b_t, dt_bias, a_log, &z_t, norm_w, cs, ss,
                     self.num_k_heads, self.num_v_heads, self.dk, self.dv, self.conv_k,
-                    self.q_scale, self.rms_eps,
+                    self.q_scale, self.rms_eps, false,
                 ))
                 .coerr()?;
             parts.push(out_t.reshape(vec![1usize, 1, self.value_dim]).coerr()?);

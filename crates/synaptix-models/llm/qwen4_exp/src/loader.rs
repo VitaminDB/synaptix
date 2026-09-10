@@ -186,6 +186,30 @@ impl Qwen4ExpWeights {
         }
     }
 
+    /// Диапазоны mmap всех стопок экспертов (`gate_up_proj`/`down_proj`,
+    /// packed + scales) в порядке слоёв — под pinned-зеркало в RAM. Пусто,
+    /// если источник не квантованный бандл.
+    pub fn expert_blob_ranges(&self) -> Vec<synaptix_core::device::cuda::MirrorRange<'_>> {
+        use synaptix_core::device::cuda::MirrorRange;
+        let Source::Bundle(l) = &self.source else { return Vec::new() };
+        let mut out = Vec::with_capacity(self.config.num_hidden_layers * 4);
+        for layer in 0..self.config.num_hidden_layers {
+            for name in ["gate_up_proj", "down_proj"] {
+                let key = self.resolve(&format!("{LM_PREFIX}.layers.{layer}.mlp.experts.{name}"));
+                let Some(Ok((packed, scales))) = l.quant_blob_slices(&key) else { continue };
+                // NVFP4-стопка: зеркало хранит матрицы перемешанными — как их
+                // читают ядра; иные форматы — байт в байт.
+                let repack = match (l.quant_kind(&key), l.quant_dims(&key)) {
+                    (Some(synaptix_bundle::inspect::QuantKind::Nvfp4), Some((_, n, k))) => Some((n, k)),
+                    _ => None,
+                };
+                out.push(MirrorRange { bytes: packed, nvfp4_repack: repack });
+                out.push(MirrorRange { bytes: scales, nvfp4_repack: None });
+            }
+        }
+        out
+    }
+
     /// Готов ли источник отдавать экспертов по одному (квантованный бандл).
     pub fn has_lazy_experts(&self, layer: usize) -> bool {
         let key = format!("{LM_PREFIX}.layers.{layer}.mlp.experts.gate_up_proj");

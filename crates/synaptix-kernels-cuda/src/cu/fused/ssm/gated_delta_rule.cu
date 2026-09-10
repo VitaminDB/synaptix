@@ -147,7 +147,8 @@ extern "C" __global__ void gated_delta_rule_step_fused_rms_norm_f32_to_f16(
     unsigned int B,
     unsigned int H,
     unsigned int hk,
-    unsigned int hv
+    unsigned int hv,
+    unsigned int gate_mode                   // 0: silu(gate), 1: sigmoid(gate)
 ) {
     unsigned int bi = blockIdx.x;
     unsigned int hi = blockIdx.y;
@@ -253,7 +254,7 @@ extern "C" __global__ void gated_delta_rule_step_fused_rms_norm_f32_to_f16(
     float w   = __half2float(weight_f16[tid]);
     float gz  = __half2float(gate_f16[base_v + tid]);
     float sig = 1.0f / (1.0f + __expf(-gz));
-    float silu = gz * sig;
-    float result = w * xv * inv * silu;
+    float act = gate_mode ? sig : gz * sig;
+    float result = w * xv * inv * act;
     out_f16[base_v + tid] = __float2half(result);
 }
