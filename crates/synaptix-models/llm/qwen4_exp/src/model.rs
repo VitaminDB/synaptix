@@ -492,6 +492,42 @@ impl Qwen4ExpModel {
         (self.kv_dtype == DType::MXFP8 || crate::attention::kv_fp8()) && self.device != Device::Cpu
     }
 
+    /// `SYN_QWEN4EXP_TRACE_MEM=1`: раскладка VRAM перед каждым слоем
+    /// послойного префилла — кэш экспертов по своему учёту, арена, пулы,
+    /// свободное по драйверу. Нужна, когда OOM ловится «посреди слоя» и по
+    /// сводке аллокатора не видно, кто держит память.
+    fn trace_prefill_mem(&self, layer: usize) {
+        let Device::Cuda(ord) = self.device else { return };
+        let gb = |x: u64| x as f64 / (1u64 << 30) as f64;
+        let (cache_used, cache_cap, resident) = match self.expert_cache() {
+            Some(c) => {
+                let st = c.stats();
+                (st.bytes as u64, c.capacity_bytes() as u64, st.resident)
+            }
+            None => (0, 0, 0),
+        };
+        let arena = synaptix_core::memory::expert_arena::stats();
+        let (ex_rsv, ex_used) =
+            synaptix_core::device::cuda::experts_pool_stats(ord).unwrap_or((0, 0));
+        let (act_rsv, act_used) =
+            synaptix_core::device::cuda::activations_pool_stats(ord).unwrap_or((0, 0));
+        let (free, _) = synaptix_core::device::cuda::mem_info(ord).unwrap_or((0, 0));
+        eprintln!(
+            "[qwen4_exp] слой {layer}: кэш {resident} шт {:.2}/{:.2} ГБ; арена {} slab'ов {:.2} ГБ (живых {:.2}); \
+             пул экспертов {:.2}/{:.2} ГБ, пул активаций {:.2}/{:.2} ГБ; свободно {:.2} ГБ",
+            gb(cache_used),
+            gb(cache_cap),
+            arena.slabs,
+            gb(arena.reserved as u64),
+            gb(arena.live as u64),
+            gb(ex_used),
+            gb(ex_rsv),
+            gb(act_used),
+            gb(act_rsv),
+            gb(free as u64),
+        );
+    }
+
     pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
         self.expert_cache.as_ref().map(|c| c.stats())
     }
@@ -681,17 +717,43 @@ impl Qwen4ExpModel {
         let hc = self.config.hc_count;
         let width = hc * self.config.hidden_size;
 
-        let embeds = self.embed_with_media(tokens, media)?;
-        let hidden = coerr(embeds.reshape(vec![s, 1, self.config.hidden_size]))?;
-        let ones = coerr(Tensor::zeros(
-            vec![s, hc, self.config.hidden_size],
-            self.compute,
-            self.device,
-        ))?;
-        let mut stream = coerr(coerr(hidden.broadcast_add(&ones))?.reshape(vec![1, s, width]))?;
+        // Поток hyper-connections на весь промпт — единственный буфер «на
+        // токен» этого прохода (20 КБ на токен у Flash-Next). Собираем его
+        // чанками: прежний `zeros [s, hc, hidden]` + результат broadcast_add
+        // жили до конца префилла вместе с эмбеддингами — три копии на весь
+        // промпт вместо одной, 3,75 ГБ лишних на 146k токенов, и ход упирался
+        // в OOM на первом же слое (журнал 10.09.2026).
+        let mut stream = {
+            let embeds = self.embed_with_media(tokens, media)?;
+            let mut stream = coerr(Tensor::empty_uninit(
+                vec![1, s, width],
+                self.compute,
+                self.device,
+            ))?;
+            let zeros = coerr(Tensor::zeros(
+                vec![chunk, hc, self.config.hidden_size],
+                self.compute,
+                self.device,
+            ))?;
+            let mut start = 0usize;
+            while start < s {
+                let len = chunk.min(s - start);
+                let piece = coerr(coerr(coerr(embeds.narrow(0, start, len))?.contiguous())?
+                    .reshape(vec![len, 1, self.config.hidden_size]))?;
+                let z = if len == chunk { zeros.clone() } else { coerr(zeros.narrow(0, 0, len))? };
+                let row = coerr(coerr(piece.broadcast_add(&z))?.reshape(vec![1, len, width]))?;
+                coerr(stream.copy_rows_from(start, &row))?;
+                start += len;
+            }
+            stream
+        };
 
         let mut ple_slot = 0usize;
+        let trace_mem = std::env::var("SYN_QWEN4EXP_TRACE_MEM").is_ok();
         for (l, block) in self.blocks.iter().enumerate() {
+            if trace_mem {
+                self.trace_prefill_mem(l);
+            }
             let ple_here = block.ple.as_ref().map(|ple| (ple, ple_slot));
             if ple_here.is_some() {
                 ple_slot += 1;
@@ -723,43 +785,51 @@ impl Qwen4ExpModel {
                     piece = coerr(piece.add(&delta))?;
                 }
 
-                let mixed = stage("hc", || {
-                    ctx(block.attn_hc.forward(&piece), &format!("слой {l} attn_hc"))
-                })?;
-                let out = match (&block.mixer, &mut cache.layers[l]) {
-                    (Mixer::Linear(la), LayerState::Linear(state)) => stage("linear_attn", || {
-                        ctx(la.forward(&mixed.mixed, state, len), &format!("слой {l} linear_attn"))
-                    })?,
-                    (Mixer::Qsa(qa), LayerState::Qsa(state)) => {
-                        let (kv, idx) = state.as_mut();
-                        let (out, _) = stage("qsa", || {
-                            ctx(
-                                qa.forward(
-                                    &mixed.mixed,
-                                    kv,
-                                    idx,
-                                    past + start,
-                                    len,
-                                    &self.rope,
-                                    pos,
-                                ),
-                                &format!("слой {l} qsa"),
-                            )
-                        })?;
-                        out
-                    }
-                    _ => return Err(ModelError::Shape(format!("слой {l}: кэш не того типа"))),
+                // Внимание — в своём блоке: его буферы (смесь, выход, впрыск —
+                // по 335 МБ на чанк 16k) обязаны уйти до MoE, иначе они
+                // складываются с перестановками экспертов в один пик, а
+                // shadowing в Rust ничего не освобождает до конца итерации.
+                let mixed = {
+                    let mixed = stage("hc", || {
+                        ctx(block.attn_hc.forward(&piece), &format!("слой {l} attn_hc"))
+                    })?;
+                    let out = match (&block.mixer, &mut cache.layers[l]) {
+                        (Mixer::Linear(la), LayerState::Linear(state)) => stage("linear_attn", || {
+                            ctx(la.forward(&mixed.mixed, state, len), &format!("слой {l} linear_attn"))
+                        })?,
+                        (Mixer::Qsa(qa), LayerState::Qsa(state)) => {
+                            let (kv, idx) = state.as_mut();
+                            let (out, _) = stage("qsa", || {
+                                ctx(
+                                    qa.forward(
+                                        &mixed.mixed,
+                                        kv,
+                                        idx,
+                                        past + start,
+                                        len,
+                                        &self.rope,
+                                        pos,
+                                    ),
+                                    &format!("слой {l} qsa"),
+                                )
+                            })?;
+                            out
+                        }
+                        _ => return Err(ModelError::Shape(format!("слой {l}: кэш не того типа"))),
+                    };
+                    let injected = ctx(block.attn_hc.inject(
+                        &mixed.hyper,
+                        &out,
+                        mixed
+                            .inject_weights
+                            .as_ref()
+                            .ok_or_else(|| ModelError::Forward("attn hc без inject".into()))?,
+                    ), &format!("слой {l} attn_inject"))?;
+                    drop(out);
+                    drop(mixed);
+                    drop(piece);
+                    ctx(block.mlp_hc.forward(&injected), &format!("слой {l} mlp_hc"))?
                 };
-                let injected = ctx(block.attn_hc.inject(
-                    &mixed.hyper,
-                    &out,
-                    mixed
-                        .inject_weights
-                        .as_ref()
-                        .ok_or_else(|| ModelError::Forward("attn hc без inject".into()))?,
-                ), &format!("слой {l} attn_inject"))?;
-
-                let mixed = ctx(block.mlp_hc.forward(&injected), &format!("слой {l} mlp_hc"))?;
                 let out = stage("moe", || {
                     ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
                 })?;

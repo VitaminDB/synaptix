@@ -732,6 +732,14 @@ impl Qwen4ExpPipeline {
         let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
+        // Чанк послойного прохода — по свободной VRAM: поток всех токенов
+        // уже заказан, и если под активации чанка 16k места не остаётся,
+        // чанк уменьшается, а не кэш экспертов ужимается ниже слоя.
+        let chunk = if by_layers {
+            layer_major_chunk(&self.config, self.model.device, cfg.prefill_batch, fresh.len())
+        } else {
+            cfg.prefill_batch
+        };
         if let Some(cache) = self.model.expert_cache() {
             // Послойный префилл держит поток всех токенов хвоста; если его не
             // учесть, аллокатор упрётся в OOM посреди слоя и `reclaim` ужмёт
@@ -739,7 +747,7 @@ impl Qwen4ExpPipeline {
             let stream_tokens = if by_layers { fresh.len() } else { 0 };
             cache.fit_to_vram(activation_reserve_prefill(
                 &self.config,
-                fresh.len().min(cfg.prefill_batch),
+                fresh.len().min(chunk),
                 stream_tokens,
             ));
             cache.set_scratch_mode(true);
@@ -747,41 +755,80 @@ impl Qwen4ExpPipeline {
         let prefill_start = Instant::now();
         let want_stream = self.mtp.is_some();
         let mut tail_stream: Option<Tensor> = None;
-        let mut logits = no_grad(|| -> Result<_, ModelError> {
-            if by_layers {
-                let (hidden, stream) =
-                    self.model.prefill_by_layers(
-                        fresh,
-                        media,
-                        cache,
-                        cfg.prefill_batch,
-                        prefill_pos,
-                    )?;
-                if want_stream {
-                    tail_stream = Some(stream);
-                }
-                return self.model.lm_head_forward(&hidden);
-            }
-            let mut last = None;
-            let mut offset = reuse;
-            while offset < prompt_ids.len() {
-                let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
-                let chunk = &prompt_ids[offset..offset + take];
-                let slice = media_for_chunk(prompt_ids, media, offset, take)?;
-                let done = offset + take >= prompt_ids.len();
-                if want_stream && done {
+        // Страховка послойного прохода: оценка чанка по свободной VRAM — лишь
+        // оценка, а OOM посреди слоя иначе роняет весь ход (synthos повторяет
+        // его с тем же чанком). Откатываем кэш к состоянию до префилла и
+        // идём чанком вдвое меньше.
+        let mut chunk = chunk;
+        let mut logits = if by_layers {
+            let pre_prefill = cache.snapshot().map_err(PipelineError::from)?;
+            loop {
+                let attempt = no_grad(|| -> Result<_, ModelError> {
                     let (hidden, stream) =
-                        self.model.forward_media_with_stream(chunk, &slice, cache, prefill_pos)?;
-                    tail_stream = Some(last_row(&stream)?);
-                    last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
-                } else {
-                    last =
-                        Some(self.model.forward_media_last(chunk, &slice, cache, prefill_pos)?);
+                        self.model.prefill_by_layers(fresh, media, cache, chunk, prefill_pos)?;
+                    if want_stream {
+                        tail_stream = Some(stream);
+                    }
+                    self.model.lm_head_forward(&hidden)
+                });
+                match attempt {
+                    Ok(l) => break l,
+                    Err(e) if chunk > MIN_LAYER_CHUNK && is_oom(&e) => {
+                        cache.restore(&pre_prefill).map_err(PipelineError::from)?;
+                        tail_stream = None;
+                        let next = (chunk / 2).max(MIN_LAYER_CHUNK);
+                        eprintln!(
+                            "[qwen4_exp] OOM в послойном префилле на чанке {chunk} ({e}); \
+                             откат кэша, повтор чанком {next}"
+                        );
+                        if let Some(ec) = self.model.expert_cache() {
+                            ec.clear_scratch();
+                            if let Device::Cuda(ord) = self.model.device {
+                                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                                let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+                            }
+                            ec.fit_to_vram(activation_reserve_prefill(
+                                &self.config,
+                                fresh.len().min(next),
+                                fresh.len(),
+                            ));
+                        }
+                        chunk = next;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                offset += take;
             }
-            last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
-        })?;
+        } else {
+            no_grad(|| -> Result<_, ModelError> {
+                let mut last = None;
+                let mut offset = reuse;
+                while offset < prompt_ids.len() {
+                    let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
+                    let chunk = &prompt_ids[offset..offset + take];
+                    let slice = media_for_chunk(prompt_ids, media, offset, take)?;
+                    let done = offset + take >= prompt_ids.len();
+                    if want_stream && done {
+                        let (hidden, stream) = self.model.forward_media_with_stream(
+                            chunk,
+                            &slice,
+                            cache,
+                            prefill_pos,
+                        )?;
+                        tail_stream = Some(last_row(&stream)?);
+                        last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
+                    } else {
+                        last = Some(self.model.forward_media_last(
+                            chunk,
+                            &slice,
+                            cache,
+                            prefill_pos,
+                        )?);
+                    }
+                    offset += take;
+                }
+                last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
+            })?
+        };
         // Точка возврата для следующего хода — ровно здесь, до декода.
         let boundary = match want_session {
             true => Some(cache.snapshot().map_err(PipelineError::from)?),
@@ -1020,12 +1067,86 @@ fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize, kv: DType) -> usize {
 /// Сколько токенов разом считает декод (шаг + спекулятивный черновик).
 const DECODE_TOKENS: usize = 8;
 
+/// Нижняя граница чанка послойного префилла: мельче — групповому GEMM
+/// экспертов достаётся по три десятка строк, и префилл встаёт на запусках.
+const MIN_LAYER_CHUNK: usize = 4096;
+
 /// Резерв под префилл: активации чанка плюс поток hyper-connections всех
-/// `stream_tokens` токенов послойного прохода (F16, две живые копии на
-/// границе `hidden + delta`).
+/// `stream_tokens` токенов послойного прохода (одна копия F16, чанки
+/// копируются в него и из него) и эмбеддинги промпта, живущие, пока поток
+/// собирается. Раньше здесь закладывались две копии потока — и ровно
+/// столько `prefill_by_layers` держал по факту, так что на 146k токенов
+/// кэшу экспертов оставалось меньше группы.
 fn activation_reserve_prefill(cfg: &Qwen4ExpConfig, chunk_tokens: usize, stream_tokens: usize) -> usize {
-    let stream = stream_tokens.saturating_mul(cfg.hc_count.max(1) * cfg.hidden_size * 2 * 2);
+    let per_token = cfg.hc_count.max(1) * cfg.hidden_size * 2 + cfg.hidden_size * 2;
+    let stream = stream_tokens.saturating_mul(per_token);
     activation_reserve(cfg, chunk_tokens).saturating_add(stream)
+}
+
+/// Чанк послойного префилла под свободную VRAM. На 24 ГБ при промпте у cap
+/// модели (262k) поток hyper-connections и KV забирают ≈9 ГБ, и на
+/// активации чанка 16k (≈7 ГБ с запасом) места уже нет: кэш экспертов
+/// ужимался до минимума, а пул активаций всё равно упирался в OOM на слое
+/// 4 (журнал 11.09.2026). Чанк делим пополам, пока активации чанка вместе
+/// с потоком не влезают в свободное за вычетом слоя экспертов (меньше слоя
+/// в кэше — и каждый чанк перечитывает стопку). Замер 250k: чанк 8192
+/// проходит с 0,1 ГБ запаса, 16384 падает; по этой формуле выходит 4096.
+/// Нижняя граница 4096: мельче — групповому GEMM экспертов достаётся по
+/// три десятка строк, и префилл встаёт на запусках ядер.
+fn layer_major_chunk(cfg: &Qwen4ExpConfig, device: Device, want: usize, stream_tokens: usize) -> usize {
+    // `SYN_QWEN4EXP_LAYER_CHUNK` — чанк в обход оценки (для A/B и проверки
+    // отката по OOM).
+    if let Some(forced) = std::env::var("SYN_QWEN4EXP_LAYER_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return forced;
+    }
+    if want <= MIN_LAYER_CHUNK {
+        return want;
+    }
+    let Device::Cuda(ord) = device else { return want };
+    let Ok((free, _)) = synaptix_core::device::cuda::mem_info(ord) else {
+        return want;
+    };
+    // Кэш экспертов может ужаться до своего минимума — его slab'ы тоже наши.
+    let cache_min: usize = 1 << 30;
+    let room =
+        free + synaptix_core::memory::expert_arena::reserved_bytes().saturating_sub(cache_min);
+    // Слой экспертов NVFP4: три проекции по полбайта на вес плюс масштабы.
+    let layer_experts =
+        cfg.moe.num_experts * (cfg.hidden_size * cfg.moe.moe_intermediate_size * 3 / 2) * 17 / 16;
+    // Поток на все токены (эмбеддинги живут только до цикла по слоям, к
+    // чанкам они уже отпущены).
+    let stream = stream_tokens.saturating_mul(cfg.hc_count.max(1) * cfg.hidden_size * 2);
+    // Накладные, которых нет в учёте: арена держит slab'ы под огрызки и под
+    // группу GEMM, вынутую из кэша по `Arc` (2,5 ГБ slab'ов при кэше в 1 ГБ
+    // на 250k), пул активаций не переиспользует часть слабины.
+    let overhead: usize = 3 << 30;
+    let budget = room.saturating_sub(layer_experts + stream + overhead);
+    let mut chunk = want;
+    while chunk > MIN_LAYER_CHUNK && activation_reserve(cfg, chunk) > budget {
+        chunk /= 2;
+    }
+    let chunk = chunk.max(MIN_LAYER_CHUNK);
+    if chunk < want {
+        eprintln!(
+            "[qwen4_exp] чанк послойного префилла {want} → {chunk}: на активации чанка \
+             остаётся {:.1} ГБ (свободно {:.1} ГБ, поток {} ток {:.1} ГБ)",
+            budget as f64 / (1u64 << 30) as f64,
+            room as f64 / (1u64 << 30) as f64,
+            stream_tokens,
+            stream as f64 / (1u64 << 30) as f64,
+        );
+    }
+    chunk
+}
+
+/// Ошибка аллокатора CUDA о нехватке памяти (в любой из его формулировок).
+fn is_oom<E: std::fmt::Display>(e: &E) -> bool {
+    let s = e.to_string();
+    s.contains("OUT_OF_MEMORY") || s.contains("out of memory") || s.contains(": OOM")
 }
 
 fn activation_reserve(cfg: &Qwen4ExpConfig, tokens: usize) -> usize {

@@ -101,7 +101,9 @@ fn qwen4exp_chat_bench() {
         .encode("<|im_end|>\n<|im_start|>assistant\n")
         .expect("encode");
 
-    let max_seq = ctx + tail * turns + max_new * (turns + 1) + 512;
+    // SYN_BENCH_SESSION — ёмкость сессии как в чате (synthos берёт её с
+    // двойным запасом, до cap модели 262143), чтобы воспроизвести пик VRAM.
+    let max_seq = env_usize("SYN_BENCH_SESSION", ctx + tail * turns + max_new * (turns + 1) + 512);
     let mut session = model
         .new_kv_session(max_seq, max_new)
         .expect("session")
