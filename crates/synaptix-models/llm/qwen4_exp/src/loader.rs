@@ -35,6 +35,9 @@ pub struct Qwen4ExpWeights {
     pub dtype: DType,
 }
 
+/// Кусок зеркала экспертов в RAM (см. `expert_blob_ranges`).
+const MIRROR_PIECE: usize = 64 << 20;
+
 impl Qwen4ExpWeights {
     pub fn open(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
         let path = path.as_ref();
@@ -203,8 +206,24 @@ impl Qwen4ExpWeights {
                     (Some(synaptix_bundle::inspect::QuantKind::Nvfp4), Some((_, n, k))) => Some((n, k)),
                     _ => None,
                 };
-                out.push(MirrorRange { bytes: packed, nvfp4_repack: repack });
-                out.push(MirrorRange { bytes: scales, nvfp4_repack: None });
+                // Диапазоны режем на куски ≤64 МБ (целое число матриц):
+                // `cuMemHostAlloc` держит драйверную блокировку на всё время
+                // закрепления страниц, и один кусок в 800 МБ останавливал
+                // загрузку весов и подкачку на сотни миллисекунд.
+                let slice = repack.map(|(n, k)| n * k / 2).unwrap_or(1).max(1);
+                let piece = (MIRROR_PIECE / slice).max(1) * slice;
+                for b in packed.chunks(piece) {
+                    out.push(MirrorRange { bytes: b, nvfp4_repack: repack });
+                }
+                let scales_per = l
+                    .quant_dims(&key)
+                    .map(|(slices, _, _)| scales.len() / slices.max(1))
+                    .unwrap_or(1)
+                    .max(1);
+                let piece = (MIRROR_PIECE / scales_per).max(1) * scales_per;
+                for b in scales.chunks(piece) {
+                    out.push(MirrorRange { bytes: b, nvfp4_repack: None });
+                }
             }
         }
         out

@@ -256,6 +256,9 @@ impl Qwen4ExpPipeline {
         } else {
             None
         };
+        if let Some(m) = &host_mirror {
+            m.resume();
+        }
         Ok(Self {
             _host_mirror: host_mirror,
             model,
@@ -718,16 +721,6 @@ impl Qwen4ExpPipeline {
         // декоду оно и пригодится. И ужимаем кэш ПОД длину промпта: активации
         // префилла считаются после экспертов, и ловить на них OOM дороже, чем
         // подкачать пару сотен экспертов заново.
-        if let Some(cache) = self.model.expert_cache() {
-            cache.fit_to_vram(activation_reserve(
-                &self.config,
-                prompt_ids.len().min(cfg.prefill_batch),
-            ));
-            cache.set_scratch_mode(true);
-        }
-        let prefill_start = Instant::now();
-        let want_stream = self.mtp.is_some();
-        let mut tail_stream: Option<Tensor> = None;
         // Промпт длиннее чанка выгоднее считать слой за слоем: эксперты слоя
         // тогда поднимаются на карту один раз на весь промпт, а не на каждый
         // чанк. Цена — поток всех токенов в памяти, поэтому короткие промпты
@@ -739,6 +732,21 @@ impl Qwen4ExpPipeline {
         let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
+        if let Some(cache) = self.model.expert_cache() {
+            // Послойный префилл держит поток всех токенов хвоста; если его не
+            // учесть, аллокатор упрётся в OOM посреди слоя и `reclaim` ужмёт
+            // кэш до минимума — дальше каждый чанк перечитывает всю стопку.
+            let stream_tokens = if by_layers { fresh.len() } else { 0 };
+            cache.fit_to_vram(activation_reserve_prefill(
+                &self.config,
+                fresh.len().min(cfg.prefill_batch),
+                stream_tokens,
+            ));
+            cache.set_scratch_mode(true);
+        }
+        let prefill_start = Instant::now();
+        let want_stream = self.mtp.is_some();
+        let mut tail_stream: Option<Tensor> = None;
         let mut logits = no_grad(|| -> Result<_, ModelError> {
             if by_layers {
                 let (hidden, stream) =
@@ -783,6 +791,13 @@ impl Qwen4ExpPipeline {
         if let Some(cache) = self.model.expert_cache() {
             cache.set_scratch_mode(false);
             cache.clear_scratch();
+            // Пул активаций после длинного префилла держит гигабайты слабины,
+            // и `fit_to_vram` видел бы их как занятые: после 80k кэш замирал
+            // на 5 ГБ при потолке 12. Отдаём слабину драйверу до подгонки.
+            if let Device::Cuda(ord) = self.model.device {
+                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+            }
             // Пик хода позади: декод считает по горстке токенов, и кэшу можно
             // вернуться к потолку — на нём и держится скорость генерации.
             cache.fit_to_vram(activation_reserve(&self.config, DECODE_TOKENS));
@@ -1005,6 +1020,14 @@ fn model_kv_reserve(cfg: &Qwen4ExpConfig, max_seq: usize, kv: DType) -> usize {
 /// Сколько токенов разом считает декод (шаг + спекулятивный черновик).
 const DECODE_TOKENS: usize = 8;
 
+/// Резерв под префилл: активации чанка плюс поток hyper-connections всех
+/// `stream_tokens` токенов послойного прохода (F16, две живые копии на
+/// границе `hidden + delta`).
+fn activation_reserve_prefill(cfg: &Qwen4ExpConfig, chunk_tokens: usize, stream_tokens: usize) -> usize {
+    let stream = stream_tokens.saturating_mul(cfg.hc_count.max(1) * cfg.hidden_size * 2 * 2);
+    activation_reserve(cfg, chunk_tokens).saturating_add(stream)
+}
+
 fn activation_reserve(cfg: &Qwen4ExpConfig, tokens: usize) -> usize {
     let hidden = cfg.hidden_size;
     // поток hyper-connections (f32) с копиями + перестановки MoE: сбор строк,
@@ -1108,7 +1131,9 @@ fn host_mirror_for(
         total as f64 / GB,
         avail as f64 / GB
     );
-    Some(OffloadPinCacheGuard::new_pooled(&ranges, workers, budget))
+    // Старт на паузе: заполнение читает весь бандл и отняло бы NVMe у
+    // загрузки весов (3 → 20 с). Продолжаем, когда модель поднята.
+    Some(OffloadPinCacheGuard::new_pooled_paused(&ranges, workers, budget, true))
 }
 
 /// `SYN_QWEN4EXP_EXPERT_CACHE_GB` (0 — грузить эксперты целиком на

@@ -179,6 +179,10 @@ pub struct ExpertCache {
 struct Resident {
     expert: Arc<Expert>,
     used: bool,
+    /// Сколько раз к эксперту обращались за последние проходы вытеснения
+    /// (затухает вдвое на каждом четвёртом проходе): по сумме `heat` slab'а
+    /// выбирается жертва — самый холодный, а не самый старый.
+    heat: u16,
     /// Slab арены — по нему идёт вытеснение: драйверу возвращается только
     /// slab целиком, поэтому выкидывать резидентов надо группой.
     slab: Option<u64>,
@@ -196,6 +200,8 @@ struct CacheInner {
     scratch_bytes: usize,
     hits: u64,
     misses: u64,
+    /// Счётчик проходов вытеснения slab'ов — ритм затухания `heat`.
+    evict_passes: u32,
     skipped: u64,
     fetched: u64,
     fetch_nanos: u64,
@@ -249,6 +255,7 @@ impl ExpertCache {
                 scratch_order: VecDeque::new(),
                 scratch_bytes: 0,
                 hits: 0,
+                evict_passes: 0,
                 misses: 0,
                 skipped: 0,
                 fetched: 0,
@@ -402,6 +409,7 @@ impl ExpertCache {
         let found = match inner.map.get_mut(&key) {
             Some(r) => {
                 r.used = true;
+                r.heat = r.heat.saturating_add(1);
                 Some(r.expert.clone())
             }
             None => inner.scratch.get(&key).map(|r| r.expert.clone()),
@@ -471,7 +479,7 @@ impl ExpertCache {
             }
             inner.scratch_bytes += bytes;
             inner.scratch_order.push_back(key);
-            inner.scratch.insert(key, Resident { expert, used: false, slab });
+            inner.scratch.insert(key, Resident { expert, used: false, heat: 0, slab });
             return;
         }
         while inner.bytes + inner.scratch_bytes + bytes > capacity {
@@ -481,7 +489,7 @@ impl ExpertCache {
         }
         inner.bytes += bytes;
         inner.order.push_back(key);
-        inner.map.insert(key, Resident { expert, used: false, slab });
+        inner.map.insert(key, Resident { expert, used: false, heat: 0, slab });
     }
 
     /// Занято экспертами всего (прогретые + набор префилла).
@@ -583,9 +591,38 @@ impl CacheInner {
         self.evict_one()
     }
 
-    /// Выкинуть самый старый slab целиком. `false` — вытеснять нечего.
+    /// Выкинуть slab целиком: самый холодный по сумме обращений его
+    /// резидентов (при равенстве — самый старый). Раньше уходил просто самый
+    /// старый slab, и горячие эксперты, попавшие в него, перечитывались с
+    /// хоста каждые несколько токенов. `false` — вытеснять нечего.
     fn evict_slab(&mut self) -> bool {
-        for slab in synaptix_core::memory::expert_arena::slabs_by_age() {
+        let by_age = synaptix_core::memory::expert_arena::slabs_by_age();
+        if by_age.is_empty() {
+            return false;
+        }
+        // Затухание: каждый четвёртый проход делит жар пополам, чтобы
+        // «горячий когда-то» не жил в кэше вечно.
+        self.evict_passes = self.evict_passes.wrapping_add(1);
+        if self.evict_passes % 4 == 0 {
+            for r in self.map.values_mut() {
+                r.heat >>= 1;
+            }
+        }
+        let mut heat: HashMap<u64, (u64, usize)> = HashMap::with_capacity(by_age.len());
+        for r in self.map.values().chain(self.scratch.values()) {
+            if let Some(s) = r.slab {
+                let e = heat.entry(s).or_insert((0, 0));
+                e.0 += r.heat as u64;
+                e.1 += 1;
+            }
+        }
+        // Порядок кандидатов: по возрастанию жара, среди равных — старшие
+        // (`SYN_EXPERT_EVICT=age` — прежний порядок, только по возрасту).
+        let mut ordered: Vec<u64> = by_age.iter().copied().filter(|s| heat.contains_key(s)).collect();
+        if !evict_by_age() {
+            ordered.sort_by_key(|s| heat.get(s).map(|(h, _)| *h).unwrap_or(0));
+        }
+        for slab in ordered {
             let mut freed = false;
             let doomed: Vec<(usize, usize)> = self
                 .scratch
@@ -742,6 +779,12 @@ fn batch_tokens() -> usize {
             .unwrap_or(4)
             .max(1)
     })
+}
+
+/// Вытеснять slab'ы только по возрасту (`SYN_EXPERT_EVICT=age`) — для A/B.
+fn evict_by_age() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_EXPERT_EVICT").as_deref() == Ok("age"))
 }
 
 /// Сколько экспертов группового GEMM держится резидентными разом при
@@ -1634,6 +1677,13 @@ impl MoeFfn {
                         }
                     }
                     (None, Some(cache)) => {
+                        // Промахи группы — одной параллельной пачкой: кэш мог
+                        // ужаться и растерять поднятое `prefetch`'ем, а брать
+                        // их по одному значит подкачивать последовательно.
+                        let ids: Vec<u32> = segs[g0..g1].iter().map(|(e, _, _)| *e as u32).collect();
+                        if let Some(job) = self.fetch_job(&ids, &vec![1.0; ids.len()], false) {
+                            job.run();
+                        }
                         for (e, _, _) in &segs[g0..g1] {
                             held.push(self.resident_expert(*e, cache)?);
                         }

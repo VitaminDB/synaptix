@@ -915,6 +915,18 @@ mod inner {
         /// следующие меньшие ещё могут влезть. Зеркала аллоцируются лениво,
         /// перед копией своего диапазона.
         pub fn new_pooled(ranges: &[MirrorRange<'_>], workers: usize, budget_bytes: usize) -> Self {
+            Self::new_pooled_paused(ranges, workers, budget_bytes, false)
+        }
+
+        /// Как [`Self::new_pooled`], но с `paused = true` копировщики ждут
+        /// [`Self::resume`]: заполнение зеркала читает весь бандл с диска и
+        /// не должно отнимать NVMe у загрузки весов.
+        pub fn new_pooled_paused(
+            ranges: &[MirrorRange<'_>],
+            workers: usize,
+            budget_bytes: usize,
+            paused: bool,
+        ) -> Self {
             use std::sync::atomic::{AtomicUsize, Ordering};
             let shards: Vec<ShardPin> = ranges
                 .iter()
@@ -938,7 +950,7 @@ mod inner {
             let cache = Arc::new(OffloadPinCache {
                 shards,
                 cancel: std::sync::atomic::AtomicBool::new(false),
-                paused: std::sync::atomic::AtomicBool::new(false),
+                paused: std::sync::atomic::AtomicBool::new(paused),
             });
             *OFFLOAD_PIN_CACHE.write() = Some(cache.clone());
             let next = Arc::new(AtomicUsize::new(0));
@@ -953,6 +965,10 @@ mod inner {
                         loop {
                             if c.cancel.load(Ordering::Relaxed) {
                                 return;
+                            }
+                            if c.paused.load(Ordering::Acquire) {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                continue;
                             }
                             let i = next.fetch_add(1, Ordering::AcqRel);
                             let Some(sh) = c.shards.get(i) else { return };
@@ -1135,7 +1151,12 @@ mod inner {
             for w in self.workers.drain(..) {
                 let _ = w.join();
             }
-            *OFFLOAD_PIN_CACHE.write() = None;
+            // Снимаем только СВОЙ кэш: гард другой модели (LTX/Gemma рядом с
+            // Qwen4Exp) мог уже занять слот, и обнулять его чужим Drop'ом нельзя.
+            let mut slot = OFFLOAD_PIN_CACHE.write();
+            if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &self.cache)) {
+                *slot = None;
+            }
         }
     }
 
