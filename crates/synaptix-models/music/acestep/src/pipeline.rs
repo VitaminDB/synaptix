@@ -678,9 +678,11 @@ pub fn generate_music(
     let (codes, meta) = {
         let cap_sec = if auto { 600 } else { duration_sec as usize };
         // User metadata overrides (None -> "N/A" in the DiT metas, omitted from CoT).
+        // duration 0 — «авто»: ar_generate берёт длительность из CoT, а явную
+        // пользовательскую CoT не перетирает.
         let base = Metadata {
             caption: caption.to_string(),
-            duration: if auto { 30 } else { duration_sec },
+            duration: duration_sec,
             bpm: extras.bpm,
             keyscale: extras.keyscale.clone(),
             timesignature: extras.timesig.clone(),
@@ -720,7 +722,11 @@ pub fn generate_music(
             // Turbo / AR off: no 5Hz LM codes — the DiT denoises from noise with a
             // silence source latent (frames derived from the explicit duration).
             eprintln!("[t] AR skipped (use_ar=false)");
-            (Vec::new(), base)
+            let mut m = base;
+            if auto {
+                m.duration = 30;
+            }
+            (Vec::new(), m)
         }
     };
     eprintln!(
@@ -729,6 +735,12 @@ pub fn generate_music(
         codes.len() as f32 / 5.0,
         meta.duration
     );
+    if cot {
+        eprintln!(
+            "[music] CoT: bpm={:?} keyscale={:?} timesig={:?} language={:?} caption={:?}",
+            meta.bpm, meta.keyscale, meta.timesignature, meta.language, meta.caption
+        );
+    }
 
     let t2 = std::time::Instant::now();
     let (text_hidden, lyric_hidden) = {
@@ -753,14 +765,20 @@ pub fn generate_music(
             let n = ids.len();
             Ok(Tensor::from_vec(ids, vec![1usize, n], device)?)
         };
+        // DiT получает caption из CoT, когда он есть (`use_cot_caption=True` у
+        // ACE-Step по умолчанию); без CoT meta.caption — исходный текст.
+        let dit_caption = if meta.caption.is_empty() { caption } else { meta.caption.as_str() };
         let cap_prompt = build_text_prompt(
-            caption,
+            dit_caption,
             meta.duration,
             meta.bpm,
             meta.timesignature.as_deref(),
             meta.keyscale.as_deref(),
         );
-        let lyr_prompt = build_lyric_prompt(lyric, meta.language.as_deref().unwrap_or("en"));
+        // Язык неизвестен (CoT не запускался или его не назвал) — "unknown", как
+        // `vocal_language` по умолчанию у ACE-Step: прежний "en" заставлял DiT
+        // петь русскую лирику как английскую.
+        let lyr_prompt = build_lyric_prompt(lyric, meta.language.as_deref().unwrap_or("unknown"));
         let cap = te.caption_hidden(&enc_ids(&cap_prompt)?)?;
         let lyr = te.lyric_embed(&enc_ids(&lyr_prompt)?)?;
         (cap.to_dtype(DType::F32)?, lyr.to_dtype(DType::F32)?)

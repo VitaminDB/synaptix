@@ -439,12 +439,34 @@ pub fn ar_generate(
     opts: &CodesGenOptions,
     use_cot: bool,
 ) -> Result<(Vec<u32>, Metadata), AceError> {
-    let meta = if use_cot {
-        generate_phase1(lm, tok, caption, lyrics, base, opts, 512)?
+    let mut meta = if use_cot {
+        let mut m = generate_phase1(lm, tok, caption, lyrics, base, opts, 512)?;
+        // Заданное пользователем сильнее CoT — LM только заполняет пустое, как
+        // `_update_metadata_from_lm` у ACE-Step. Раньше CoT молча перетирал
+        // BPM/тональность/размер и длительность. `base.duration == 0` — «авто».
+        if base.bpm.is_some() {
+            m.bpm = base.bpm;
+        }
+        if base.keyscale.is_some() {
+            m.keyscale = base.keyscale.clone();
+        }
+        if base.timesignature.is_some() {
+            m.timesignature = base.timesignature.clone();
+        }
+        if base.duration > 0 {
+            m.duration = base.duration;
+        }
+        m
     } else {
         base.clone()
     };
-    let cap = if meta.caption.is_empty() { caption } else { &meta.caption };
-    let codes = generate_codes(lm, tok, cap, lyrics, &meta, opts)?;
+    if meta.duration == 0 {
+        // «Авто», а CoT длительность не назвал.
+        meta.duration = 30;
+    }
+    // В `# Caption` — исходный текст пользователя; caption из CoT живёт только
+    // в <think> (build_formatted_prompt_with_cot у ACE-Step). Раньше туда шёл
+    // CoT-caption, да ещё обрезанный по первой строке, — теги терялись.
+    let codes = generate_codes(lm, tok, caption, lyrics, &meta, opts)?;
     Ok((codes, meta))
 }
