@@ -205,6 +205,44 @@ fn matmul_nn_f32_vs_cpu() {
     }
 }
 
+/// M больше, чем влезает в один запуск (grid.y ≤ 65535 блоков по 128 строк):
+/// так выглядит conv1d-im2col VAE ACE-Step на треке в несколько минут
+/// (M = длина в сэмплах). Раньше — CUDA_ERROR_INVALID_VALUE на запуске.
+/// Сверяем строки по обе стороны стыка полос и хвост.
+#[test]
+fn matmul_nn_bf16_tall_m_crosses_launch_bands() {
+    synaptix_kernels_cuda::ensure_registered();
+    if !have_gpu() {
+        return;
+    }
+    let _nograd = synaptix_core::grad::NoGradGuard::new();
+    let stream = synaptix_core::device::cuda::default_stream(0).unwrap();
+    let (m, k, n) = (8_400_000usize, 32usize, 64usize);
+    let a_host = det(0x5A5A, m * k, 0.3);
+    let b_host = det(0x6B6B, k * n, 0.3);
+    let a: Vec<bf16> = a_host.iter().map(|&v| bf16::from_f32(v)).collect();
+    let b: Vec<bf16> = b_host.iter().map(|&v| bf16::from_f32(v)).collect();
+    let at = Tensor::from_vec(a, (m, k), Device::Cuda(0)).unwrap();
+    let bt = Tensor::from_vec(b, (k, n), Device::Cuda(0)).unwrap();
+    let c = at.matmul(&bt).expect("tall-M matmul");
+    assert_eq!(c.dims(), &[m, n]);
+    stream.synchronize().unwrap();
+    let bytes: Vec<u8> = stream
+        .clone_dtoh(c.storage().as_cuda().unwrap().slice())
+        .unwrap();
+    let all = bytemuck::cast_slice::<u8, bf16>(&bytes);
+    let band = 65_535 * 128;
+    for &row in &[0usize, 1, band - 1, band, band + 1, m - 1] {
+        let got: Vec<f32> = all[row * n..(row + 1) * n].iter().map(|v| v.to_f32()).collect();
+        let want: Vec<f32> = (0..n)
+            .map(|j| (0..k).map(|kk| a_host[row * k + kk] as f64 * b_host[kk * n + j] as f64).sum::<f64>() as f32)
+            .collect();
+        let cos = cos_sim(&got, &want);
+        eprintln!("[matmul_nn bf16 tall-M row {row}] cos={cos:.6}");
+        assert!(cos >= 0.99, "tall-M row {row}: cos={cos} < 0.99");
+    }
+}
+
 #[test]
 fn matmul_nn_bf16_vs_cpu() {
     synaptix_kernels_cuda::ensure_registered();

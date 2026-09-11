@@ -10,6 +10,9 @@ use crate::AceError;
 
 type R<T> = Result<T, AceError>;
 
+/// Текст ошибки [`AceStepVae::encode_mean_tiled`], прерванного `cancel`.
+pub const ENCODE_CANCELLED: &str = "VAE encode cancelled";
+
 fn ceil_div(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
@@ -279,6 +282,57 @@ impl AceStepVae {
         let h = self.encoder.forward(&x)?;
         let lat = self.cfg.decoder_input_channels;
         Ok(h.narrow(1, 0, lat)?.contiguous()?.to_dtype(DType::F32)?)
+    }
+
+    /// `encode_mean` окнами — для треков длиннее десятков секунд. Целиком
+    /// энкодер на них не живёт: residual-свёртки идут через im2col по
+    /// сэмплам (~19 ГБ на 3,5 минуты стерео), а M матмула = длина сигнала.
+    /// Окно = `chunk_frames` латентных кадров ядра + `overlap_frames` контекста
+    /// с каждой стороны; из окна берётся только ядро. `cancel` опрашивается
+    /// перед каждым окном — `Err` с [`ENCODE_CANCELLED`].
+    pub fn encode_mean_tiled(
+        &self,
+        audio: &Tensor,
+        chunk_frames: usize,
+        overlap_frames: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> R<Tensor> {
+        let x = Self::as_bcl(audio)?;
+        let hop = self.cfg.hop_length();
+        let len = x.dims()[2];
+        let t = ceil_div(len.max(1), hop);
+        let chunk_frames = chunk_frames.max(1);
+        if cancel() {
+            return Err(AceError::Other(ENCODE_CANCELLED.into()));
+        }
+        if t <= chunk_frames + 2 * overlap_frames {
+            return self.encode_mean(&x);
+        }
+        let x = if t * hop > len {
+            let d = x.dims().to_vec();
+            let z = Tensor::zeros(vec![d[0], d[1], t * hop - len], x.dtype(), x.device())?;
+            Tensor::cat(&[&x, &z], 2)?
+        } else {
+            x
+        };
+        let mut cores: Vec<Tensor> = Vec::new();
+        let mut core_start = 0usize;
+        while core_start < t {
+            if cancel() {
+                return Err(AceError::Other(ENCODE_CANCELLED.into()));
+            }
+            let core_end = (core_start + chunk_frames).min(t);
+            let win_start = core_start.saturating_sub(overlap_frames);
+            let win_end = (core_end + overlap_frames).min(t);
+            let seg = x.narrow(2, win_start * hop, (win_end - win_start) * hop)?.contiguous()?;
+            let lat = self.encode_mean(&seg)?;
+            let off = core_start - win_start;
+            let core_len = (core_end - core_start).min(lat.dims()[2].saturating_sub(off));
+            cores.push(lat.narrow(2, off, core_len)?.contiguous()?);
+            core_start = core_end;
+        }
+        let refs: Vec<&Tensor> = cores.iter().collect();
+        Ok(Tensor::cat(&refs, 2)?)
     }
 
     pub fn decode(&self, z: &Tensor) -> R<Tensor> {

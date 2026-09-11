@@ -61,34 +61,45 @@ pub fn gemm_f32_nn_u8(
     if m == 0 || n == 0 || batch == 0 {
         return Ok(());
     }
-    let (am, bk, cm) = ((m * k) as usize, (k * n) as usize, (m * n) as usize);
-    let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+    // Высокий M режем на полосы (grid.y ≤ 65535, i32-индексы в ядре) — см.
+    // `gemm_f16::max_rows_per_launch`.
+    let rows_per_launch = super::gemm_f16::max_rows_per_launch(BM, k.max(n));
+    let (am, bk, cm) = (m as usize * k as usize, k as usize * n as usize, m as usize * n as usize);
+    let (ni, ki) = (n as i32, k as i32);
     for bi in 0..batch as usize {
-        let a_off = bi * am * 4;
         let b_off = if b_broadcast { 0 } else { bi * bk * 4 };
-        let c_off = bi * cm * 4;
-        let a_v = unsafe { a.slice(a_off..a_off + am * 4).transmute::<f32>(am) }
-            .ok_or_else(|| SynaptixError::Cuda("gemm_f32: transmute a".into()))?;
         let b_v = unsafe { b.slice(b_off..b_off + bk * 4).transmute::<f32>(bk) }
             .ok_or_else(|| SynaptixError::Cuda("gemm_f32: transmute b".into()))?;
-        let mut c_s = c.slice_mut(c_off..c_off + cm * 4);
-        let mut c_v = unsafe { c_s.transmute_mut::<f32>(cm) }
-            .ok_or_else(|| SynaptixError::Cuda("gemm_f32: transmute c".into()))?;
-        let launch = LaunchConfig {
-            grid_dim: (n.div_ceil(BN), m.div_ceil(BM), 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut bld = stream.launch_builder(&kernels.nn);
-        bld.arg(&a_v)
-            .arg(&b_v)
-            .arg(&mut c_v)
-            .arg(&mi)
-            .arg(&ni)
-            .arg(&ki);
-        unsafe {
-            bld.launch(launch)
-                .map_err(|e| SynaptixError::Cuda(format!("launch gemm_f32_nn: {e:?}")))?;
+        let mut m0 = 0u32;
+        while m0 < m {
+            let rows = (m - m0).min(rows_per_launch);
+            let a_len = rows as usize * k as usize;
+            let c_len = rows as usize * n as usize;
+            let a_off = (bi * am + m0 as usize * k as usize) * 4;
+            let c_off = (bi * cm + m0 as usize * n as usize) * 4;
+            let a_v = unsafe { a.slice(a_off..a_off + a_len * 4).transmute::<f32>(a_len) }
+                .ok_or_else(|| SynaptixError::Cuda("gemm_f32: transmute a".into()))?;
+            let mut c_s = c.slice_mut(c_off..c_off + c_len * 4);
+            let mut c_v = unsafe { c_s.transmute_mut::<f32>(c_len) }
+                .ok_or_else(|| SynaptixError::Cuda("gemm_f32: transmute c".into()))?;
+            let mi = rows as i32;
+            let launch = LaunchConfig {
+                grid_dim: (n.div_ceil(BN), rows.div_ceil(BM), 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut bld = stream.launch_builder(&kernels.nn);
+            bld.arg(&a_v)
+                .arg(&b_v)
+                .arg(&mut c_v)
+                .arg(&mi)
+                .arg(&ni)
+                .arg(&ki);
+            unsafe {
+                bld.launch(launch)
+                    .map_err(|e| SynaptixError::Cuda(format!("launch gemm_f32_nn: {e:?}")))?;
+            }
+            m0 += rows;
         }
     }
     Ok(())

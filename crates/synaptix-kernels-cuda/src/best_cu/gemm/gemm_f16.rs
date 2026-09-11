@@ -141,6 +141,18 @@ impl GemmF16Kernels {
     }
 }
 
+/// Сколько строк M отдать одному запуску NN-ядра с тайлом `bm` строк:
+/// grid.y ограничен 65535 блоками, а ядро индексирует строки×ширину
+/// (`width` = max(K, N)) в i32. Кратно `bm`, чтобы полные полосы шли
+/// быстрым ядром, а partial доставался только последней.
+pub(crate) fn max_rows_per_launch(bm: u32, width: u32) -> u32 {
+    const MAX_GRID_Y: u64 = 65_535;
+    let by_grid = MAX_GRID_Y * bm as u64;
+    let by_index = i32::MAX as u64 / width.max(1) as u64;
+    let rows = by_grid.min(by_index) / bm as u64 * bm as u64;
+    rows.max(bm as u64) as u32
+}
+
 fn launch_cfg(m: u32, n: u32, swizzle: bool) -> LaunchConfig {
     let (gx, gy, gz) = if swizzle {
         let n_swz = n.div_ceil(SWIZZLE_STRIDE).max(1);
@@ -285,49 +297,69 @@ pub fn gemm_nn_u8(
         None
     };
 
-    let partial = m % BM != 0 || n_eff % BN != 0;
-    let cfg = pick_config(m);
-    let (kfn, swizzle) = if partial {
-        let f = match dtype {
-            DType::F16 => kernels.fnref_part(),
-            _ => kernels.fnref_bf16_part(),
+    let pick_kernel = |rows: u32| -> Result<(&CudaFunction, bool)> {
+        if rows % BM != 0 || n_eff % BN != 0 {
+            let f = match dtype {
+                DType::F16 => kernels.fnref_part(),
+                _ => kernels.fnref_bf16_part(),
+            }
+            .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: нет part-ядра".into()))?;
+            Ok((f, false))
+        } else {
+            let cfg = pick_config(rows);
+            let f = match dtype {
+                DType::F16 => kernels.fnref(cfg),
+                _ => kernels.fnref_bf16(cfg),
+            }
+            .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: нет ядра".into()))?;
+            Ok((f, cfg.swizzle))
         }
-        .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: нет part-ядра".into()))?;
-        (f, false)
-    } else {
-        let f = match dtype {
-            DType::F16 => kernels.fnref(cfg),
-            _ => kernels.fnref_bf16(cfg),
-        }
-        .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: нет ядра".into()))?;
-        (f, cfg.swizzle)
     };
-    let (am, bk, cm) = ((m * k) as usize, (k * n_eff) as usize, (m * n_eff) as usize);
-    let (mi, ni, ki) = (m as i32, n_eff as i32, k as i32);
+    // Высокий M (conv1d-im2col VAE: M = длина аудио в сэмплах, 10+ млн на
+    // трек в несколько минут) режем на полосы строк: grid.y ≤ 65535 блоков,
+    // а смещения внутри ядра — i32. Иначе запуск падал с
+    // CUDA_ERROR_INVALID_VALUE. Размеры считаем в usize: m*k в u32
+    // переполнялся на тех же формах.
+    let rows_per_launch = max_rows_per_launch(BM, k.max(n_eff));
+    let (am, bk, cm) = (
+        m as usize * k as usize,
+        k as usize * n_eff as usize,
+        m as usize * n_eff as usize,
+    );
+    let (ni, ki) = (n_eff as i32, k as i32);
     {
         let c_target: &mut CudaSlice<u8> = c_pad.as_mut().unwrap_or(c);
         for bi in 0..batch as usize {
-            let a_off = bi * am * 2;
             let b_off = if b_broadcast { 0 } else { bi * bk * 2 };
-            let c_off = bi * cm * 2;
-            let a_v = unsafe { a.slice(a_off..a_off + am * 2).transmute::<f16>(am) }
-                .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: transmute a".into()))?;
             let b_v = unsafe { b.slice(b_off..b_off + bk * 2).transmute::<f16>(bk) }
                 .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: transmute b".into()))?;
-            let mut c_s = c_target.slice_mut(c_off..c_off + cm * 2);
-            let mut c_v = unsafe { c_s.transmute_mut::<f16>(cm) }
-                .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: transmute c".into()))?;
-            let launch = launch_cfg(m, n_eff, swizzle);
-            let mut bld = stream.launch_builder(kfn);
-            bld.arg(&a_v)
-                .arg(&b_v)
-                .arg(&mut c_v)
-                .arg(&mi)
-                .arg(&ni)
-                .arg(&ki);
-            unsafe {
-                bld.launch(launch)
-                    .map_err(|e| SynaptixError::Cuda(format!("launch gemm_nn_u8: {e:?}")))?;
+            let mut m0 = 0u32;
+            while m0 < m {
+                let rows = (m - m0).min(rows_per_launch);
+                let (kfn, swizzle) = pick_kernel(rows)?;
+                let a_len = rows as usize * k as usize;
+                let c_len = rows as usize * n_eff as usize;
+                let a_off = (bi * am + m0 as usize * k as usize) * 2;
+                let c_off = (bi * cm + m0 as usize * n_eff as usize) * 2;
+                let a_v = unsafe { a.slice(a_off..a_off + a_len * 2).transmute::<f16>(a_len) }
+                    .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: transmute a".into()))?;
+                let mut c_s = c_target.slice_mut(c_off..c_off + c_len * 2);
+                let mut c_v = unsafe { c_s.transmute_mut::<f16>(c_len) }
+                    .ok_or_else(|| SynaptixError::Cuda("gemm_nn_u8: transmute c".into()))?;
+                let mi = rows as i32;
+                let launch = launch_cfg(rows, n_eff, swizzle);
+                let mut bld = stream.launch_builder(kfn);
+                bld.arg(&a_v)
+                    .arg(&b_v)
+                    .arg(&mut c_v)
+                    .arg(&mi)
+                    .arg(&ni)
+                    .arg(&ki);
+                unsafe {
+                    bld.launch(launch)
+                        .map_err(|e| SynaptixError::Cuda(format!("launch gemm_nn_u8: {e:?}")))?;
+                }
+                m0 += rows;
             }
         }
     }
