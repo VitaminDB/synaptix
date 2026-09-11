@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use synaptix_audio::io::{read_wav_mono_f32, write_wav_mono_f32};
+use synaptix_audio::io::{read_wav_stereo_f32, write_wav_mono_f32};
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_music_acestep::ar::CodesGenOptions;
 use synaptix_music_acestep::pipeline::{generate_music, EditMode, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions};
+use synaptix_music_acestep::text_encoder::TRACK_NAMES;
 use synaptix_music_acestep::vae::AceStepVae;
 
 use crate::commands::device;
@@ -36,6 +37,7 @@ pub struct MusicArgs {
     pub retake_variance: f32,
     pub retake_seed: u64,
     pub mode: String,
+    pub track: String,
     pub src_audio: Option<PathBuf>,
     pub repaint_start: f32,
     pub repaint_end: f32,
@@ -120,21 +122,28 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         "retake" => EditMode::Retake,
         "repaint" | "extend" => EditMode::Repaint,
         "edit" => EditMode::Edit,
-        "extract" | "cover" => EditMode::Extract,
+        "extract" => EditMode::Extract,
+        "cover" => EditMode::Cover,
         _ if args.retake_variance > 0.0 => EditMode::Retake,
         _ => EditMode::Text2Music,
     };
-    // src_latent для repaint/extend/edit/extract: исходное аудио → VAE → [1,T,64].
-    let src_latent = if matches!(mode, EditMode::Repaint | EditMode::Edit | EditMode::Extract) {
+    if mode == EditMode::Extract && !TRACK_NAMES.contains(&args.track.as_str()) {
+        return Err(format!("--track: ожидалось одно из {TRACK_NAMES:?}, получено '{}'", args.track).into());
+    }
+    // src_latent для repaint/extend/edit/extract/cover: исходное аудио → VAE → [1,T,64].
+    let src_latent = if matches!(
+        mode,
+        EditMode::Repaint | EditMode::Edit | EditMode::Extract | EditMode::Cover
+    ) {
         let sp = args.src_audio.as_ref().ok_or("режим требует --src-audio <wav>")?;
-        let (mono, asr) = read_wav_mono_f32(sp)?;
+        // Стерео как есть (панорама помогает extract), в [-1, 1] — как
+        // `_normalize_audio_to_stereo_48k` у ACE-Step.
+        let (mut flat, asr) = read_wav_stereo_f32(sp)?;
         if asr != 48000 {
             return Err(format!("--src-audio: ожидался 48 kHz, получено {asr} Hz").into());
         }
-        let n = mono.len();
-        let mut flat = Vec::with_capacity(2 * n);
-        flat.extend_from_slice(&mono);
-        flat.extend_from_slice(&mono);
+        flat.iter_mut().for_each(|s| *s = s.clamp(-1.0, 1.0));
+        let n = flat.len() / 2;
         let at = Tensor::from_vec(flat, vec![1usize, 2, n], dev)?.to_dtype(compute)?;
         let vae_enc = AceStepVae::open(&vae, dev)?;
         let lat = vae_enc.encode_mean(&at)?; // [1,64,T]
@@ -144,6 +153,7 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let edit = EditOptions {
         mode,
+        track_name: args.track.clone(),
         retake_variance: args.retake_variance,
         retake_seed: args.retake_seed,
         src_latent,

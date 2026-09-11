@@ -85,8 +85,8 @@ fn main() {
         let tok = HfTokenizer::from_bytes(&read_bundle_file(&te_path, "tokenizer.json").unwrap()).unwrap();
         let ids = |s: &str| { let mut i = tok.encode(s, false).unwrap().ids; if i.is_empty() { i.push(151643); } let n=i.len(); Tensor::from_vec(i, vec![1,n], device).unwrap() };
         let ids_f = |t: &Tensor| { let f: Vec<f32> = t.flatten_all().unwrap().to_vec1::<u32>().unwrap().iter().map(|&v| v as f32).collect(); Tensor::from_vec(f, vec![1, t.dims()[1]], device).unwrap() };
-        use synaptix_music_acestep::text_encoder::{build_text_prompt, build_lyric_prompt};
-        let tp = build_text_prompt(caption, 8, Some(120), Some("4/4"), Some("C minor"));
+        use synaptix_music_acestep::text_encoder::{build_text_prompt, build_lyric_prompt, TASK_INSTRUCTION};
+        let tp = build_text_prompt(TASK_INSTRUCTION, caption, 8, Some(120), Some("4/4"), Some("C minor"));
         let lp = build_lyric_prompt("", "en");
         let cap_ids = ids(&tp);
         let lyr_ids = ids(&lp);

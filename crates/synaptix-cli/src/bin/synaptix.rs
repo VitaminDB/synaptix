@@ -381,9 +381,13 @@ enum Commands {
         /// retake: seed второго шума, миксуемого при retake_variance>0.
         #[arg(long, default_value_t = 1)]
         retake_seed: u64,
-        /// Режим: text2music (default) | retake | repaint | extend | edit.
+        /// Режим: text2music (default) | retake | repaint | extend | edit | extract | cover.
         #[arg(long, default_value = "text2music")]
         mode: String,
+        /// extract: дорожка — vocals | backing_vocals | drums | bass | guitar | keyboard |
+        /// percussion | strings | synth | fx | brass | woodwinds.
+        #[arg(long, default_value = "vocals")]
+        track: String,
         /// Исходное аудио (48 kHz wav) для repaint/extend/edit → VAE-латент.
         #[arg(long)]
         src_audio: Option<PathBuf>,
@@ -817,13 +821,13 @@ fn main() -> ExitCode {
         Commands::Music {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
-            quant, quant_encoder, retake_variance, retake_seed, mode, src_audio, repaint_start,
+            quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
             repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
             edit_source_lyric, no_ar, bpm, keyscale, timesig, norm,
         } => music::run(music::MusicArgs {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
-            quant, quant_encoder, retake_variance, retake_seed, mode, src_audio, repaint_start,
+            quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
             repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
             edit_source_lyric, use_ar: !no_ar, bpm, keyscale, timesig, norm,
         }),

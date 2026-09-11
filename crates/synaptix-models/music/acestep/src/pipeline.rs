@@ -45,12 +45,22 @@ pub enum EditMode {
     Retake,
     Repaint,
     Edit,
+    /// Выделение стема `track_name` из `src_latent`, как задача `extract`
+    /// ACE-Step: без 5Hz LM, инструкция DiT «Extract the {TRACK} track…»,
+    /// контекст — исходник во всю длину.
     Extract,
+    /// Кавер: прежний путь (LM-коды по тегам, исходный латент в контексте,
+    /// инструкция text2music). У ACE-Step cover устроен иначе — коды из
+    /// исходника и своя инструкция; пока не перенесено.
+    Cover,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct EditOptions {
     pub mode: EditMode,
+    /// Extract: дорожка из [`crate::text_encoder::TRACK_NAMES`]; пусто —
+    /// «Extract the track from the audio:» без имени.
+    pub track_name: String,
     pub retake_variance: f32,
     pub retake_seed: u64,
     pub src_latent: Option<Tensor>,
@@ -700,8 +710,26 @@ pub fn generate_music(
         });
     }
 
-    let auto = duration_sec == 0;
-    let cot = use_cot || auto;
+    // Extract — как у ACE-Step: 5Hz LM не участвует (`skip_lm_tasks`,
+    // inference.py:612). Её CoT-caption спорит с инструкцией extract, и DiT
+    // пересобирает исходник вместо стема: в чате «Vocal» CoT описал трек как
+    // «instrumental jazz-funk…», и вокал оставался. Caption и лирика — от
+    // пользователя, пустой caption — имя дорожки (так делает UI ACE-Step),
+    // длительность — длина исходника.
+    let extract_src = match edit.mode {
+        EditMode::Extract => Some(
+            edit.src_latent
+                .as_ref()
+                .ok_or_else(|| AceError::Other("extract: нужен src_latent на входе".into()))?,
+        ),
+        _ => None,
+    };
+    let caption = match extract_src {
+        Some(_) if caption.trim().is_empty() => edit.track_name.trim(),
+        _ => caption,
+    };
+    let auto = duration_sec == 0 && extract_src.is_none();
+    let cot = (use_cot || auto) && extract_src.is_none();
 
     let (codes, meta) = {
         let cap_sec = if auto { 600 } else { duration_sec as usize };
@@ -716,7 +744,7 @@ pub fn generate_music(
             timesignature: extras.timesig.clone(),
             ..Metadata::default()
         };
-        if extras.use_ar {
+        if extras.use_ar && extract_src.is_none() {
             let cap = cap_sec * 5 + 2048;
             let load_lm = || -> Result<AceStepLm, AceError> {
                 let t_open = std::time::Instant::now();
@@ -747,6 +775,12 @@ pub fn generate_music(
             let r = ar_generate(lm, &lm_tok, caption, lyric, &base, codes_opts, cot)?;
             eprintln!("[t] AR generate ({} codes): {:.1}s", r.0.len(), t_ar.elapsed().as_secs_f32());
             r
+        } else if let Some(src) = extract_src {
+            eprintln!("[t] AR skipped (extract: LM не участвует, как у ACE-Step)");
+            // Python: audio_duration = длина исходника, в Metas — int(секунд).
+            let mut m = base;
+            m.duration = ((src.dims()[1] / 25) as u32).max(1);
+            (Vec::new(), m)
         } else {
             // Turbo / AR off: no 5Hz LM codes — the DiT denoises from noise with a
             // silence source latent (frames derived from the explicit duration).
@@ -773,7 +807,9 @@ pub fn generate_music(
 
     let t2 = std::time::Instant::now();
     let (text_hidden, lyric_hidden) = {
-        use crate::text_encoder::{build_lyric_prompt, build_text_prompt};
+        use crate::text_encoder::{
+            build_lyric_prompt, build_text_prompt, extract_instruction, TASK_INSTRUCTION,
+        };
         let te_owned;
         let te: &TextEncoder = match cache.as_deref_mut() {
             Some(c) => cached_or_load(&mut c.text_encoder, || {
@@ -798,7 +834,13 @@ pub fn generate_music(
         // DiT получает caption из CoT, когда он есть (`use_cot_caption=True` у
         // ACE-Step по умолчанию); без CoT meta.caption — исходный текст.
         let dit_caption = if meta.caption.is_empty() { caption } else { meta.caption.as_str() };
+        let instruction = match extract_src {
+            Some(_) => extract_instruction(&edit.track_name),
+            None => TASK_INSTRUCTION.to_string(),
+        };
+        eprintln!("[music] DiT: instruction={instruction:?} caption={dit_caption:?}");
         let cap_prompt = build_text_prompt(
+            &instruction,
             dit_caption,
             meta.duration,
             meta.bpm,
@@ -818,16 +860,33 @@ pub fn generate_music(
 
     let t3 = std::time::Instant::now();
     let dit_ck = CompLoader::open(paths.dit, None, device)?;
-    let lm_hints = if codes.is_empty() {
-        // No AR (turbo): silence source, frames from the explicit duration
-        // (25 latent frames/sec). is_covers=False -> silence src (matches Python).
-        let tf = (meta.duration as usize).max(1) * 25;
-        load_silence_latent(paths.dit, tf, device)?
-    } else {
-        let fsq = Fsq::load(&dit_ck, "tokenizer.quantizer")?;
-        let detok = Detokenizer::load(&dit_ck, &cfg)?;
-        detok.forward(&fsq.get_output_from_indices(&codes)?)?
+    let src_half = match extract_src {
+        // Extract: контекст — латент исходника во всю длину (is_covers=False →
+        // src_latents = латент исходника, conditioning_masks.py:93).
+        Some(s) => s.to_device(device)?.to_dtype(DType::F32)?.contiguous()?,
+        None => {
+            let lm_hints = if codes.is_empty() {
+                // No AR (turbo): silence source, frames from the explicit duration
+                // (25 latent frames/sec). is_covers=False -> silence src (matches Python).
+                let tf = (meta.duration as usize).max(1) * 25;
+                load_silence_latent(paths.dit, tf, device)?
+            } else {
+                let fsq = Fsq::load(&dit_ck, "tokenizer.quantizer")?;
+                let detok = Detokenizer::load(&dit_ck, &cfg)?;
+                detok.forward(&fsq.get_output_from_indices(&codes)?)?
+            };
+            if matches!(edit.mode, EditMode::Cover) {
+                let s = edit
+                    .src_latent
+                    .as_ref()
+                    .ok_or_else(|| AceError::Other("cover: нужен src_latent на входе".into()))?;
+                align_latent_len(s, lm_hints.dims()[1], device)?
+            } else {
+                lm_hints
+            }
+        }
     };
+    let t_frames = src_half.dims()[1];
     let enc_cond = {
         let cond = ConditionEncoder::load(&dit_ck, &cfg)?;
         let timbre_ref = load_silence_latent(paths.dit, cfg.timbre_fix_frame, device)?;
@@ -839,17 +898,7 @@ pub fn generate_music(
         .broadcast_as(vec![1usize, l, cfg.encoder_hidden_size])?
         .contiguous()?;
 
-    let t_frames = lm_hints.dims()[1];
-    let src_half = if matches!(edit.mode, EditMode::Extract) {
-        let s = edit
-            .src_latent
-            .as_ref()
-            .ok_or_else(|| AceError::Other("extract/cover: нужен src_latent на входе".into()))?;
-        align_latent_len(s, t_frames, device)?
-    } else {
-        lm_hints.clone()
-    };
-    let chunk = Tensor::ones(vec![1usize, t_frames, 64], DType::F32, device)?;
+    let chunk =Tensor::ones(vec![1usize, t_frames, 64], DType::F32, device)?;
     let context = Tensor::cat(&[&src_half, &chunk], 2)?;
 
     eprintln!("[t] cond (dit_ck load + fsq/detok/cond/silence): {:.1}s", t3.elapsed().as_secs_f32());

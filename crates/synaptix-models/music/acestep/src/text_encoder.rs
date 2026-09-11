@@ -15,7 +15,28 @@ use crate::AceError;
 // "Generate audio semantic tokens…" (that one drives the 5Hz LM, tokenizer.rs).
 pub const TASK_INSTRUCTION: &str = "Fill the audio semantic mask based on the given conditions:";
 
+/// Дорожки задачи extract — Python `TRACK_NAMES` (constants.py:153): base-DiT
+/// учился выделять ровно эти стемы.
+pub const TRACK_NAMES: &[&str] = &[
+    "woodwinds", "brass", "fx", "synth", "strings", "percussion",
+    "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals",
+];
+
+/// Инструкция DiT для extract — Python `TASK_INSTRUCTIONS["extract"]` с именем
+/// дорожки капсом, без имени — `["extract_default"]` (task_utils.py:80). Именно
+/// она говорит DiT «выдели стем»; с инструкцией text2music при исходнике в
+/// контексте DiT пересобирает весь микс.
+pub fn extract_instruction(track: &str) -> String {
+    let track = track.trim();
+    if track.is_empty() {
+        "Extract the track from the audio:".into()
+    } else {
+        format!("Extract the {} track from the audio:", track.to_uppercase())
+    }
+}
+
 pub fn build_text_prompt(
+    instruction: &str,
     caption: &str,
     duration_s: u32,
     bpm: Option<u32>,
@@ -29,7 +50,7 @@ pub fn build_text_prompt(
         "- bpm: {bpm_s}\n- timesignature: {timesig_s}\n- keyscale: {keyscale_s}\n- duration: {duration_s} seconds\n"
     );
     format!(
-        "# Instruction\n{TASK_INSTRUCTION}\n\n# Caption\n{caption}\n\n# Metas\n{metas}<|endoftext|>\n<|endoftext|>"
+        "# Instruction\n{instruction}\n\n# Caption\n{caption}\n\n# Metas\n{metas}<|endoftext|>\n<|endoftext|>"
     )
 }
 
@@ -122,5 +143,34 @@ impl TextEncoder {
 
     pub fn device(&self) -> Device {
         self.device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_instruction_matches_python() {
+        assert_eq!(extract_instruction("vocals"), "Extract the VOCALS track from the audio:");
+        assert_eq!(
+            extract_instruction(" backing_vocals "),
+            "Extract the BACKING_VOCALS track from the audio:"
+        );
+        assert_eq!(extract_instruction(""), "Extract the track from the audio:");
+    }
+
+    #[test]
+    fn text_prompt_carries_given_instruction() {
+        let p = build_text_prompt(&extract_instruction("drums"), "drums", 193, None, None, None);
+        assert!(
+            p.starts_with(
+                "# Instruction\nExtract the DRUMS track from the audio:\n\n# Caption\ndrums\n\n# Metas\n"
+            ),
+            "{p}"
+        );
+        assert!(p.contains("- duration: 193 seconds\n"), "{p}");
+        let t = build_text_prompt(TASK_INSTRUCTION, "x", 8, None, None, None);
+        assert!(t.starts_with("# Instruction\nFill the audio semantic mask"), "{t}");
     }
 }
