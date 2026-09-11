@@ -318,6 +318,24 @@ pub fn optimal_profile(path: &Path) -> OptimalProfile {
         policy.embed_storage = DType::BF16;
         policy.lm_head_storage = DType::NVFP4;
     }
+    // Gemma-3: те же «тяжёлые» активации, что у Gemma-4, — счёт в F16
+    // переполняет residual (>65504), и модель выдаёт один и тот же токен
+    // (11.09.2026: `ltx-gemma-3-12b-qat` на профиле balance отвечал
+    // 262207×32). Счёт BF16, проекции внимания MXFP8, эмбеддинги и голова
+    // (у Gemma-3 они связаны) BF16 — ровно тот набор, что сверен с
+    // transformers в `ltx_gemma_hidden_states_match`.
+    // KV плотный: с MXFP8-кэшем ответ Gemma-3 зависит от нарезки префилла
+    // уже на втором токене (74 токена одним чанком и 26+48 расходятся), с
+    // BF16 — только в хвосте, как у остальных архитектур. Sliding-слои
+    // держат ring-окно, глобальных — каждый шестой, так что плотный кэш
+    // стоит недорого.
+    if matches!(arch, Some(LlmArch::Gemma3)) {
+        policy.attn_storage = Some(DType::MXFP8);
+        policy.compute = DType::BF16;
+        policy.embed_storage = DType::BF16;
+        policy.lm_head_storage = DType::BF16;
+        policy.kv_dtype = KvDtypePolicy::BF16;
+    }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
     // Графовый декод у Gemma-4: шаг захватывается целиком, включая MoE —
     // роутер, top-k и выбор экспертов считаются на карте. Даёт около +15 % к
@@ -716,28 +734,14 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
-            // Llama/Gemma3 ещё не имеют нативного token-by-token стрима: гоняем
-            // eager generate и прокручиваем полученные id через sink (псевдо-стрим;
-            // сэмплинг top_k/top_p/min_p/repeat_penalty этими пайплайнами пока не
-            // поддержан и опускается — для syn_chat сегодня это Qwen3-only путь).
-            LlmPipeline::Llama(p) => {
-                use synaptix_llm_llama::pipeline::GenerationConfig as LCfg;
-                let lcfg = LCfg {
-                    max_new_tokens: cfg.max_new_tokens,
-                    temperature: cfg.temperature,
-                    seed: cfg.seed,
-                    eos_token_id: cfg.eos_token_ids.first().copied(),
-                    max_seq: cfg.max_seq,
-                };
-                let (new_ids, _) =
-                    p.generate(prompt_ids, lcfg).map_err(|e| LlmError(e.to_string()))?;
-                for id in new_ids {
-                    if !sink.on_token(id) {
-                        break;
-                    }
-                }
-                Ok(())
-            }
+            // Llama/Gemma-3 — нативный стрим общего декодера с полным
+            // сэмплером (до 11.09.2026 гоняли eager `generate` и прокручивали
+            // id через sink, без top_k/top_p/штрафов). Тем же путём идёт и
+            // ход с префикс-KV — чтобы ход с кэшем и без совпадали.
+            LlmPipeline::Llama(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
             // У Gemma-4 стрим нативный: общий декодер умеет token-by-token.
             // Шаг декода захватывается CUDA-графом, когда профиль позволяет:
             // MoE считается целиком на карте, поэтому выгрузок внутри шага нет.
@@ -752,24 +756,10 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
-            LlmPipeline::Gemma3(p) => {
-                use synaptix_llm_gemma3::pipeline::GenerationConfig as GCfg;
-                let gcfg = GCfg {
-                    max_new_tokens: cfg.max_new_tokens,
-                    temperature: cfg.temperature,
-                    seed: cfg.seed,
-                    eos_token_id: cfg.eos_token_ids.first().copied(),
-                    max_seq: cfg.max_seq,
-                };
-                let (new_ids, _) =
-                    p.generate(prompt_ids, gcfg).map_err(|e| LlmError(e.to_string()))?;
-                for id in new_ids {
-                    if !sink.on_token(id) {
-                        break;
-                    }
-                }
-                Ok(())
-            }
+            LlmPipeline::Gemma3(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
         }
     }
 }
@@ -852,9 +842,9 @@ enum SessionKind {
     /// W токенов — граница должна попадать в окно.
     Muse { dcache: Option<DFlashCache> },
     /// Обычный декодер без рекуррентного состояния и без вспомогательных
-    /// кэшей: сессия — это ровно основной KV (Gemma-4). Sliding-слои у неё
-    /// держат кэш на всю длину контекста, а не ring-окном, поэтому граница
-    /// префикса всегда внутри буфера.
+    /// кэшей: сессия — это ровно основной KV (Gemma-4, плотный Qwen3, Llama,
+    /// Gemma-3). Если sliding-слои держат кэш ring-окном (Gemma-3 на CUDA),
+    /// граница префикса обязана лежать в окне — это проверяет `reusable`.
     Plain,
     /// Qwen4Exp: весь кэш хода (KV+индексатор QSA, рекуррентное состояние GDN,
     /// свёртка PLE) живёт своим типом внутри пайплайна, поэтому общий
@@ -902,7 +892,14 @@ impl LlmKvSession {
                     0
                 }
             }
-            SessionKind::Plain => n,
+            // Без ring-окон `ring_start_max` — ноль, и граница всегда годится.
+            SessionKind::Plain => {
+                if n >= self.kv.ring_start_max() {
+                    n
+                } else {
+                    0
+                }
+            }
             // У Qwen4Exp свой кэш и свой счёт токенов — `self.ids` для него
             // не ведётся.
             SessionKind::Qwen4Exp(s) => s.reusable(prompt_ids),
@@ -1079,6 +1076,23 @@ impl LlmKvSession {
     }
 }
 
+/// Сессия плотного декодера на общей модели: ровно основной KV на `ctx`.
+fn plain_session(
+    model: &synaptix_llm_common::DecoderModel,
+    ctx: usize,
+) -> Result<Option<LlmKvSession>, LlmError> {
+    let kv = model
+        .make_kv_cache(1, ctx)
+        .map_err(|e| LlmError(e.to_string()))?;
+    Ok(Some(LlmKvSession {
+        kv,
+        ids: Vec::new(),
+        ctx_tokens: ctx,
+        kind: SessionKind::Plain,
+        media: Vec::new(),
+    }))
+}
+
 pub struct Llm {
     pipeline: Mutex<LlmPipeline>,
     config: LlmConfig,
@@ -1108,9 +1122,10 @@ impl Llm {
     /// ответа (последнее нужно кэшу MTP-головы гибрида: он растёт быстрее
     /// основного).
     ///
-    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша.
-    /// Поддержаны гибрид Qwen3.6/3.8 (с MTP) и Muse-Glimmer (включая
-    /// DFlash-декод); остальные работают как раньше, без переиспользования.
+    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша:
+    /// сегодня это только гибрид Qwen3.6/3.8 без MTP-головы. Остальные —
+    /// гибрид с MTP, Muse-Glimmer (включая DFlash-декод), Gemma-4, Qwen4Exp,
+    /// плотный Qwen3, Llama, Gemma-3 — сессию держат.
     /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
     /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
     /// Все архитектуры с сессией и башней зрения: гибрид Qwen3.6/3.8,
@@ -1189,6 +1204,10 @@ impl Llm {
                     media: Vec::new(),
                 }))
             }
+            // Плотные декодеры на общей модели: сессия — ровно основной KV.
+            LlmPipeline::Qwen3(p) => plain_session(&p.model, ctx),
+            LlmPipeline::Llama(p) => plain_session(&p.model, ctx),
+            LlmPipeline::Gemma3(p) => plain_session(&p.model, ctx),
             LlmPipeline::Qwen4Exp(p) => {
                 // Весь кэш этой модели (KV+индексатор QSA, рекуррентное
                 // состояние GDN, свёртка PLE) — свой тип пайплайна, поэтому
@@ -1203,7 +1222,6 @@ impl Llm {
                     media: Vec::new(),
                 }))
             }
-            _ => Ok(None),
         }
     }
 
@@ -1863,7 +1881,70 @@ impl<'a> LlmGeneration<'a> {
                     .map_err(|e| LlmError(e.to_string()))?;
                 Ok(reuse)
             }
-            _ => Err(LlmError("префикс-KV: архитектура не поддержана".into())),
+            // Плотные декодеры: точка возврата — весь промпт, кэш усекается
+            // по `seq_len`. Медиа у них нет, так что `session.media` пуст.
+            LlmPipeline::Qwen3(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let reuse = session.reusable(prompt_ids);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                // Путь декода — как в `generate_streaming`: обычный стрим
+                // общего декодера.
+                let res = p
+                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                    .map(|_| ());
+                session.ids = prompt_ids.to_vec();
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            LlmPipeline::Llama(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let reuse = session.reusable(prompt_ids);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                let res = p
+                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                    .map(|_| ());
+                session.ids = prompt_ids.to_vec();
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            LlmPipeline::Gemma3(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                // Сравнивать префиксы нужно в том виде, в каком промпт видит
+                // движок: Gemma ставит BOS в начало.
+                let ids = p.maybe_prepend_bos(prompt_ids);
+                let reuse = session.reusable(&ids);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                let res = p
+                    .generate_streaming_resume(&mut session.kv, &ids, cfg, &mut sink)
+                    .map(|_| ());
+                session.ids = ids;
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
         }
     }
 

@@ -41,6 +41,17 @@ pub struct GenerationStats {
     pub decode_ms: u128,
 }
 
+impl GenerationStats {
+    fn from_common(st: synaptix_llm_common::GenerationStats) -> Self {
+        Self {
+            prompt_tokens: st.prompt_tokens,
+            new_tokens: st.new_tokens,
+            prefill_ms: st.prefill_ms,
+            decode_ms: st.decode_ms,
+        }
+    }
+}
+
 /// `tokenizer.json` из HF-каталога или из `.syn`-бандла: 33 МБ JSON
 /// десериализуются одинаково, различается лишь способ достать байты.
 fn load_tokenizer(path: &Path) -> Result<HfTokenizer, String> {
@@ -267,6 +278,72 @@ impl GemmaPipeline {
             decode_ms,
         };
         Ok((new_tokens, stats))
+    }
+
+    /// Промпт в том виде, в каком его видит движок: Gemma требует BOS в
+    /// начале — без него выход вырождается. Вызывающему нужен именно он,
+    /// чтобы сравнивать префиксы кэша.
+    pub fn maybe_prepend_bos(&self, prompt_ids: &[u32]) -> Vec<u32> {
+        match self.config.bos_token_id {
+            Some(bos) if prompt_ids.first() != Some(&bos) => {
+                let mut v = Vec::with_capacity(prompt_ids.len() + 1);
+                v.push(bos);
+                v.extend_from_slice(prompt_ids);
+                v
+            }
+            _ => prompt_ids.to_vec(),
+        }
+    }
+
+    /// Стоп-токены общего декодера: если вызывающий их не задал — все EOS
+    /// конфига (Gemma: <eos> и <end_of_turn>).
+    fn common_cfg_with_eos(
+        &self,
+        mut cfg: synaptix_llm_common::GenerationConfig,
+    ) -> synaptix_llm_common::GenerationConfig {
+        if cfg.eos_token_id.is_none() && cfg.eos_token_ids.is_empty() {
+            cfg.eos_token_ids = self.config.eos_ids();
+        }
+        cfg
+    }
+
+    /// Стрим token-by-token общим декодером — с полным сэмплером
+    /// (top-k/top-p/min-p/штрафы), в отличие от [`Self::generate`].
+    pub fn generate_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let prompt_ids = prompt.as_slice();
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_streaming(&self.model, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+
+    /// Как [`Self::generate_streaming`], но префилл стартует с `kv.seq_len`
+    /// (префикс-KV): история прошлого хода не считается заново. Вызывающий
+    /// отвечает за то, что `prompt_ids[..kv.seq_len]` — ровно те токены, что
+    /// лежат в кэше (уже с BOS).
+    pub fn generate_streaming_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 
     pub fn generate_text(

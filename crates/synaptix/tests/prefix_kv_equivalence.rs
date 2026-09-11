@@ -463,3 +463,144 @@ fn prefix_kv_survives_host_park() {
     );
     assert_eq!(parked2, resident2, "токены расходятся");
 }
+
+/// Любой бандл с сессией (плотный Qwen3, Llama, Gemma-3, Gemma-4, гибрид,
+/// Muse, Qwen4Exp): два хода чата по шаблону модели, второй обязан
+/// продолжить с кэша и выдать то же начало ответа, что ход с нуля.
+///
+/// `SYN_PREFIX_KV_BUNDLE=… cargo test -p synaptix --release --test
+/// prefix_kv_equivalence prefix_kv_bundle -- --nocapture --test-threads=1`.
+#[test]
+fn prefix_kv_bundle_matches_full_prefill() {
+    use synaptix::facade::llm::{optimal_profile, Message};
+    let Ok(path) = std::env::var("SYN_PREFIX_KV_BUNDLE") else {
+        eprintln!("SYN_PREFIX_KV_BUNDLE не задан — пропускаем");
+        return;
+    };
+    reclaim_vram();
+    let mut policy = optimal_profile(Path::new(&path)).policy;
+    // A/B: `SYN_PREFIX_KV_KV_DTYPE=bf16|f16` — плотный KV вместо профильного.
+    match std::env::var("SYN_PREFIX_KV_KV_DTYPE").ok().as_deref() {
+        Some("bf16") => policy.kv_dtype = synaptix::facade::llm::KvDtypePolicy::BF16,
+        Some("f16") => policy.kv_dtype = synaptix::facade::llm::KvDtypePolicy::F16,
+        _ => {}
+    }
+    let (model, tok) =
+        load_llm_with_policy(Path::new(&path), policy, &Device::Cuda(0)).expect("load");
+
+    let msgs1 = [
+        Message::system("Отвечай кратко, одним предложением."),
+        Message::user("Чем TCP отличается от UDP?"),
+    ];
+    let prompt1 = tok
+        .apply_chat_template_ex_tools(&msgs1, true, false, None)
+        .expect("chat template 1");
+    let ids1 = tok.encode(&prompt1).expect("encode 1");
+    let ctx = 4096usize;
+    let max_new = 32usize;
+    let eos = tok.eos_ids().to_vec();
+
+    let mut session = model
+        .new_kv_session(ctx, max_new)
+        .expect("session")
+        .expect("архитектура умеет префикс-KV");
+    let mut a1 = Vec::new();
+    let mut t1 = String::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos.clone());
+        r.generate_streaming_cached(&mut session, &ids1, &tok, |id, s| {
+            a1.push(id);
+            t1.push_str(s);
+            true
+        })
+        .expect("cached turn 1");
+    }
+    eprintln!(
+        "ход 1: промпт {} ток → {t1:?}; id {:?}; eos {:?}; промпт {:?}",
+        ids1.len(),
+        a1,
+        eos,
+        prompt1
+    );
+    while a1.last().is_some_and(|t| eos.contains(t)) {
+        a1.pop();
+    }
+    // Хвост промпта хода 2 — по шаблону, за маркером ответа; сам промпт
+    // собирается из токенов хода 1 (шаблон может отрисовать прошлый ход иначе,
+    // чем выглядел его generation prompt).
+    const MARK: &str = "QQXZ";
+    let msgs2 = [
+        msgs1[0].clone(),
+        msgs1[1].clone(),
+        Message::assistant(MARK),
+        Message::user("А что такое QUIC?"),
+    ];
+    let prompt2 = tok
+        .apply_chat_template_ex_tools(&msgs2, true, false, None)
+        .expect("chat template 2");
+    let at = prompt2.rfind(MARK).expect("маркер ответа в промпте 2");
+    let mut ids2 = ids1.clone();
+    ids2.extend_from_slice(&a1);
+    ids2.extend(tok.encode(&prompt2[at + MARK.len()..]).expect("encode tail"));
+
+    let mut cached2 = Vec::new();
+    let mut t2 = String::new();
+    let reused = {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos.clone());
+        r.generate_streaming_cached(&mut session, &ids2, &tok, |id, s| {
+            cached2.push(id);
+            t2.push_str(s);
+            true
+        })
+        .expect("cached turn 2")
+    };
+    eprintln!("ход 2: промпт {} ток, из кэша {reused} → {t2:?}", ids2.len());
+    assert!(
+        reused > 0 && reused <= ids1.len() && ids1.len() - reused < 64,
+        "ход 2 переиспользовал {reused} из {} ток промпта 1",
+        ids1.len()
+    );
+
+    let mut fresh2 = Vec::new();
+    let mut t2_ref = String::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos);
+        r.generate_streaming(&ids2, &tok, |id, s| {
+            fresh2.push(id);
+            t2_ref.push_str(s);
+            true
+        })
+        .expect("fresh turn 2");
+    }
+    let diff = cached2.iter().zip(&fresh2).position(|(x, y)| x != y);
+    eprintln!("эталон без сессии → {t2_ref:?}; первое расхождение: {diff:?}");
+    // Детерминизм самого стека: второй ход с нуля обязан повторить первый.
+    // `SYN_PREFIX_KV_CHUNK=<n>` режет его префилл чанками по n — если с
+    // чанком, равным длине префикса, он повторяет кэшированный ход, то
+    // расхождение выше — только от формы GEMM, а не от самого кэша.
+    if let Some(n) = std::env::var("SYN_PREFIX_KV_CHUNK").ok().and_then(|v| v.parse().ok()) {
+        synaptix::facade::llm::set_prefill_chunk_size(n);
+    }
+    let mut fresh2b = Vec::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(tok.eos_ids().to_vec());
+        r.generate_streaming(&ids2, &tok, |id, _| {
+            fresh2b.push(id);
+            true
+        })
+        .expect("fresh turn 2b");
+    }
+    let diff_ff = fresh2b.iter().zip(&fresh2).position(|(x, y)| x != y);
+    let diff_cb = fresh2b.iter().zip(&cached2).position(|(x, y)| x != y);
+    eprintln!(
+        "два хода с нуля: первое расхождение {diff_ff:?}; второй против кэшированного: {diff_cb:?}"
+    );
+    assert!(
+        diff.map_or(true, |d| d >= 4),
+        "кэшированный ход разошёлся с полным префиллом с токена {diff:?}"
+    );
+}
