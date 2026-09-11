@@ -101,6 +101,49 @@ pub struct Qwen4ExpSession {
     ids: Vec<u32>,
     /// Состояние в этой точке. `None` — сессия пустая.
     snap: Option<CacheSnapshot>,
+    /// Медиа, вошедшие в кэшированный префикс. Токены заполнителей у двух
+    /// разных картинок одинаковы, так что промпт с той же разметкой, но
+    /// другим вложением на её месте префиксом считаться не должен.
+    media: Vec<MediaSig>,
+}
+
+/// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaSig {
+    pad: u32,
+    rows: usize,
+    hash: u64,
+}
+
+/// Отпечатки медиа по префиксу `ids`: у каждой модальности берутся ровно те
+/// строки, чьи заполнители стоят в `ids`. Хэш по битам f32 — эмбеддинги
+/// приходят из кэша башни, так что одна и та же картинка даёт одни и те же
+/// байты.
+fn media_sigs(inputs: &[MediaInput], ids: &[u32]) -> Result<Vec<MediaSig>, PipelineError> {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    for m in inputs {
+        let rows = ids.iter().filter(|t| **t == m.pad).count().min(m.embeds.dims()[0]);
+        if rows == 0 {
+            continue;
+        }
+        let host = m
+            .embeds
+            .narrow(0, 0, rows)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.to_device(Device::Cpu))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| PipelineError::Model(format!("медиа: отпечаток эмбеддингов: {e}")))?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        for v in &host {
+            v.to_bits().hash(&mut h);
+        }
+        out.push(MediaSig { pad: m.pad, rows, hash: h.finish() });
+    }
+    Ok(out)
 }
 
 impl Qwen4ExpSession {
@@ -119,6 +162,19 @@ impl Qwen4ExpSession {
         n
     }
 
+    /// То же для промпта с медиа: помимо токенов должны совпасть и строки
+    /// вложений, вошедшие в кэшированный префикс.
+    pub fn reusable_media(&self, prompt_ids: &[u32], inputs: &[MediaInput]) -> usize {
+        let n = self.reusable(prompt_ids);
+        if n == 0 {
+            return 0;
+        }
+        match media_sigs(inputs, &self.ids) {
+            Ok(sigs) if sigs == self.media => n,
+            _ => 0,
+        }
+    }
+
     pub fn ctx_tokens(&self) -> usize {
         self.cache.max_seq
     }
@@ -131,6 +187,7 @@ impl Qwen4ExpSession {
     pub fn invalidate(&mut self) {
         self.ids.clear();
         self.snap = None;
+        self.media.clear();
         self.cache.reset();
     }
 
@@ -611,6 +668,7 @@ impl Qwen4ExpPipeline {
             cache: self.make_cache(ctx_tokens)?,
             ids: Vec::new(),
             snap: None,
+            media: Vec::new(),
         })
     }
 
@@ -625,6 +683,20 @@ impl Qwen4ExpPipeline {
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
         self.run_stream(prompt_ids, &[], cfg, sink, Some(session))
+    }
+
+    /// Как [`Self::generate_cached_streaming`], но с медиа-вложениями:
+    /// строки заполнителей, посчитанные прошлым ходом, живут в кэше вместе
+    /// с остальным префиксом — префиллится только хвост.
+    pub fn generate_cached_media_streaming(
+        &self,
+        session: &mut Qwen4ExpSession,
+        prompt_ids: &[u32],
+        inputs: &[MediaInput],
+        cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        self.run_stream(prompt_ids, inputs, cfg, sink, Some(session))
     }
 
     /// Генерация с медиа-вложениями: `media` — пары «id заполнителя → строки
@@ -675,11 +747,9 @@ impl Qwen4ExpPipeline {
         let (prefill_pos, decode_pos) = (pos, pos);
 
         // Кэш хода: свой одноразовый или тот, что живёт в сессии между
-        // ходами. Медиа-промпт префикс-KV не поддерживает — эмбеддинги
-        // заполнителей в кэш не заносятся, и продолжать с него нельзя.
-        if !inputs.is_empty() {
-            session = None;
-        }
+        // ходами. Медиа-промпт сессию не выключает: состояние заполнителей
+        // лежит в кэше как у любых токенов, а подмену вложения при тех же
+        // токенах ловит отпечаток строк (`reusable_media`).
         if let Some(s) = session.as_deref_mut() {
             // Ход не влезает в кэш сессии — пересоздаём его под новый
             // размер, префикс при этом теряется.
@@ -687,11 +757,12 @@ impl Qwen4ExpPipeline {
                 s.cache = self.make_cache(budget)?;
                 s.ids.clear();
                 s.snap = None;
+                s.media.clear();
             }
         }
         let reuse = session
             .as_deref()
-            .map(|s| s.reusable(prompt_ids))
+            .map(|s| s.reusable_media(prompt_ids, inputs))
             .unwrap_or(0);
         // Флаг снимаем заранее: дальше `session` занята заимствованием кэша.
         let want_session = session.is_some();
@@ -729,6 +800,8 @@ impl Qwen4ExpPipeline {
         // в кэше сессии. Позиции при этом абсолютные — `cache.seq_len`
         // указывает на границу.
         let fresh = &prompt_ids[reuse..];
+        // Хвосту достаются только те строки медиа, чьи заполнители в нём.
+        let tail_media = media_for_chunk(prompt_ids, media, reuse, fresh.len())?;
         let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
@@ -764,8 +837,13 @@ impl Qwen4ExpPipeline {
             let pre_prefill = cache.snapshot().map_err(PipelineError::from)?;
             loop {
                 let attempt = no_grad(|| -> Result<_, ModelError> {
-                    let (hidden, stream) =
-                        self.model.prefill_by_layers(fresh, media, cache, chunk, prefill_pos)?;
+                    let (hidden, stream) = self.model.prefill_by_layers(
+                        fresh,
+                        &tail_media,
+                        cache,
+                        chunk,
+                        prefill_pos,
+                    )?;
                     if want_stream {
                         tail_stream = Some(stream);
                     }
@@ -958,6 +1036,7 @@ impl Qwen4ExpPipeline {
         if let (Some(s), Some(snap)) = (session, boundary) {
             s.ids = prompt_ids.to_vec();
             s.snap = Some(snap);
+            s.media = media_sigs(inputs, prompt_ids)?;
         }
 
         Ok((

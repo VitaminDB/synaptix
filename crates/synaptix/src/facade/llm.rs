@@ -640,27 +640,7 @@ impl LlmPipeline {
             // блок картинки и блок группы кадров — это `t = 1`, ось времени
             // ведёт таймкод в тексте (см. `VideoPromptInfo::prompt_block`).
             LlmPipeline::Qwen4Exp(p) => {
-                let mut inputs: Vec<Qwen4MediaInput> = Vec::new();
-                for (kind, pad) in [
-                    (MediaKind::Image, p.config.image_token_id),
-                    (MediaKind::Video, p.config.video_token_id),
-                ] {
-                    let Some(embeds) = concat_media(media, kind)? else { continue };
-                    let pad = pad.ok_or_else(|| {
-                        LlmError(format!("config.json без id заполнителя для {kind:?}"))
-                    })?;
-                    let grids: Vec<mrope::Grid3> = media
-                        .iter()
-                        .filter(|m| m.kind == kind)
-                        .flat_map(|m| {
-                            std::iter::repeat_n(
-                                mrope::Grid3::image(m.grid_hw.0, m.grid_hw.1),
-                                m.blocks,
-                            )
-                        })
-                        .collect();
-                    inputs.push(Qwen4MediaInput { pad, embeds, grids });
-                }
+                let inputs = qwen4_media_inputs(p, media)?;
                 p.generate_media_streaming(prompt_ids, &inputs, cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
@@ -1077,6 +1057,15 @@ impl Llm {
     /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша.
     /// Поддержаны гибрид Qwen3.6/3.8 (с MTP) и Muse-Glimmer (включая
     /// DFlash-декод); остальные работают как раньше, без переиспользования.
+    /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
+    /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
+    pub fn kv_session_media_ok(&self) -> bool {
+        self.pipeline
+            .lock()
+            .map(|p| matches!(&*p, LlmPipeline::Qwen4Exp(_)))
+            .unwrap_or(false)
+    }
+
     pub fn new_kv_session(
         &self,
         ctx_tokens: usize,
@@ -1788,6 +1777,67 @@ impl<'a> LlmGeneration<'a> {
         }
     }
 
+    /// Префикс-KV для промпта с медиа-вложениями: как
+    /// [`Self::generate_streaming_cached`], но строки вложений идут в
+    /// кэш вместе с остальным префиксом. Поддержано у Qwen4Exp; для прочих
+    /// архитектур — ошибка, вызывающий идёт [`Self::generate_streaming_media`].
+    pub fn generate_streaming_cached_media<F>(
+        &mut self,
+        session: &mut LlmKvSession,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        media: &[&MediaEmbedding],
+        on_token: F,
+    ) -> Result<usize, LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        if session.is_parked() {
+            session.unpark_to(self.model.device)?;
+        }
+        let pipeline = self
+            .model
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let cfg = GenerationConfig {
+            max_new_tokens: self.opts.max_new_tokens,
+            temperature: self.opts.temperature,
+            top_k: self.opts.top_k,
+            top_p: self.opts.top_p,
+            min_p: self.opts.min_p,
+            repetition_penalty: self.opts.repeat_penalty,
+            repeat_last_n: self.opts.repeat_last_n,
+            presence_penalty: self.opts.presence_penalty,
+            frequency_penalty: self.opts.frequency_penalty,
+            seed: self.opts.seed,
+            eos_token_id: None,
+            eos_token_ids: self.stop_tokens.clone(),
+            max_seq: Some(session.ctx_tokens),
+            prefill_batch: prefill_chunk_size(),
+        };
+        let mut sink = DeltaSink {
+            tokenizer,
+            on_token,
+            acc: Vec::new(),
+            decoded: String::new(),
+            stop_sequences: &self.stop_sequences,
+        };
+        match &*pipeline {
+            LlmPipeline::Qwen4Exp(p) => {
+                let SessionKind::Qwen4Exp(s) = &mut session.kind else {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                };
+                let inputs = qwen4_media_inputs(p, media)?;
+                let (_, _, reuse) = p
+                    .generate_cached_media_streaming(s, prompt_ids, &inputs, cfg, &mut sink)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(reuse)
+            }
+            _ => Err(LlmError("префикс-KV с медиа: архитектура не поддержана".into())),
+        }
+    }
+
     /// Стриминг по промпту с медиа-вложениями.
     ///
     /// `media` перечисляется **в том же порядке, в каком блоки-заполнители
@@ -1841,6 +1891,34 @@ impl<'a> LlmGeneration<'a> {
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
         pipeline.generate_streaming_media(prompt_ids, media, cfg, &mut sink)
     }
+}
+
+/// Медиа-входы Qwen4Exp: эмбеддинги по модальности в порядке появления в
+/// промпте плюс трёхмерная сетка каждого блока для M-RoPE (блок картинки и
+/// блок группы кадров — `t = 1`).
+fn qwen4_media_inputs(
+    p: &Qwen4ExpPipeline,
+    media: &[&MediaEmbedding],
+) -> Result<Vec<Qwen4MediaInput>, LlmError> {
+    let mut inputs: Vec<Qwen4MediaInput> = Vec::new();
+    for (kind, pad) in [
+        (MediaKind::Image, p.config.image_token_id),
+        (MediaKind::Video, p.config.video_token_id),
+    ] {
+        let Some(embeds) = concat_media(media, kind)? else { continue };
+        let pad = pad.ok_or_else(|| {
+            LlmError(format!("config.json без id заполнителя для {kind:?}"))
+        })?;
+        let grids: Vec<mrope::Grid3> = media
+            .iter()
+            .filter(|m| m.kind == kind)
+            .flat_map(|m| {
+                std::iter::repeat_n(mrope::Grid3::image(m.grid_hw.0, m.grid_hw.1), m.blocks)
+            })
+            .collect();
+        inputs.push(Qwen4MediaInput { pad, embeds, grids });
+    }
+    Ok(inputs)
 }
 
 /// Склеивает эмбеддинги одной модальности в порядке следования вложений.
