@@ -493,8 +493,49 @@ impl MusePipeline {
         self.generate_with_media(prompt_ids, &media, gen_cfg, sink)
     }
 
+    /// Как [`Self::generate_with_mixed_media`], но вход уже разобран по
+    /// парам «заполнитель → склейка эмбеддингов модальности».
+    pub fn generate_with_media_pairs(
+        &self,
+        prompt_ids: &[u32],
+        media: &[(u32, &Tensor)],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        self.generate_with_media(prompt_ids, media, gen_cfg, sink)
+    }
+
     fn generate_with_media(
         &self,
+        prompt_ids: &[u32],
+        media: &[(u32, &Tensor)],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg.clone());
+        let l = self.maybe_prepend_bos(prompt_ids).len();
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_media_resume(&mut kv, prompt_ids, media, gen_cfg, sink)
+    }
+
+    /// Как [`Self::generate_with_mixed_media`], но по ГОТОВОМУ кэшу:
+    /// префилл стартует с `kv.seq_len` (префикс-KV), строки вложений берутся
+    /// только для заполнителей хвоста. Вызывающий отвечает за то, что
+    /// `prompt_ids[..kv.seq_len]` — ровно те токены (и те же эмбеддинги на
+    /// местах заполнителей), что лежат в кэше, и что граница не ниже начала
+    /// ring-окна sliding-слоёв. Спекулятивные пути (DFlash / CUDA-graph) на
+    /// медиа-промпте не применяются, greedy идёт lookup-декодом — ровно как
+    /// в ходе без кэша.
+    pub fn generate_with_media_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
         prompt_ids: &[u32],
         media: &[(u32, &Tensor)],
         gen_cfg: GenerationConfig,
@@ -505,32 +546,46 @@ impl MusePipeline {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("empty prompt".into()));
         }
+        if media.is_empty() {
+            return Err(PipelineError::Model("generate_with_media без медиа".into()));
+        }
+        // Промпт в том виде, в каком его видит текстовый путь: сессия
+        // сравнивает префиксы именно по нему.
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let prompt_ids = prompt.as_slice();
         let cfg = self.prepare_cfg(gen_cfg);
         let device = self.model.device;
         let l = prompt_ids.len();
-        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > kv.max_seq {
+            return Err(PipelineError::Forward(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
         let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
 
         let t0 = std::time::Instant::now();
-        let emb = self.embed_with_media_pads(prompt_ids, media)?;
+        // Префикс-KV: всё до `kv.seq_len` уже посчитано. Минус один токен —
+        // логиты нужно получить хотя бы из одного forward'а.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        let tail_media = media_rows_for(prompt_ids, media, prefix, l - prefix)?;
+        let tail_refs: Vec<(u32, &Tensor)> = tail_media.iter().map(|(p, t)| (*p, t)).collect();
+        let emb = self.embed_with_media_pads(&prompt_ids[prefix..], &tail_refs)?;
         let chunk = match cfg.prefill_batch {
             0 => 512,
             n => n.min(synaptix_llm_common::model::RING_SLACK),
         };
-        let mut off = 0usize;
+        let mut off = prefix;
         let mut last_hidden = None;
         while off < l {
             let step = chunk.min(l - off);
             let part = emb
-                .narrow(1, off, step)
+                .narrow(1, off - prefix, step)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let h = no_grad(|| self.model.forward_from_hidden(&part, &mut kv))
+            let h = no_grad(|| self.model.forward_from_hidden(&part, kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             last_hidden = Some(h);
             off += step;
@@ -550,7 +605,7 @@ impl MusePipeline {
             let mut all_ids: Vec<u32> = prompt_ids.to_vec();
             all_ids.push(first);
             if sink.on_token(first) && !eos.contains(&first) {
-                self.lookup_loop(&mut kv, &mut all_ids, &mut out, &cfg, &eos, sink)?;
+                self.lookup_loop(kv, &mut all_ids, &mut out, &cfg, &eos, sink)?;
             }
         } else {
             loop {
@@ -564,7 +619,7 @@ impl MusePipeline {
                 }
                 let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
-                logits = no_grad(|| self.model.forward(&step, &mut kv))
+                logits = no_grad(|| self.model.forward(&step, kv))
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
             }
         }
@@ -1318,4 +1373,36 @@ impl From<ModelError> for PipelineError {
     fn from(e: ModelError) -> Self {
         Self::Model(e.to_string())
     }
+}
+
+/// Строки медиа-эмбеддингов, чьи заполнители попадают в `[offset, offset+len)`
+/// промпта. Заполнители нумеруются по всему промпту, поэтому при префилле
+/// хвоста из каждой модальности берутся ровно строки его слотов.
+fn media_rows_for(
+    prompt: &[u32],
+    media: &[(u32, &Tensor)],
+    offset: usize,
+    len: usize,
+) -> Result<Vec<(u32, Tensor)>, PipelineError> {
+    let mut out = Vec::with_capacity(media.len());
+    for (pad, feats) in media {
+        let before = prompt[..offset].iter().filter(|t| *t == pad).count();
+        let inside = prompt[offset..offset + len].iter().filter(|t| *t == pad).count();
+        if inside == 0 {
+            continue;
+        }
+        let avail = feats.dims()[0];
+        if before + inside > avail {
+            return Err(PipelineError::Forward(format!(
+                "медиа-токенов в промпте больше, чем строк эмбеддингов: {} > {avail}",
+                before + inside
+            )));
+        }
+        let rows = feats
+            .narrow(0, before, inside)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| PipelineError::Forward(format!("медиа: срез строк: {e}")))?;
+        out.push((*pad, rows));
+    }
+    Ok(out)
 }

@@ -17,6 +17,40 @@ pub use synaptix_llm_common::generate::{GenerationConfig, GenerationStats, Strea
 
 /// M-RoPE на медиа-промпте включён по умолчанию; `SYN_HYBRID_MROPE=0` —
 /// выключатель для A/B-сравнения с 1D-позициями.
+/// Строки медиа-эмбеддингов, чьи заполнители попадают в `[offset, offset+len)`
+/// промпта. Заполнители нумеруются по всему промпту, поэтому при префилле
+/// хвоста из каждой модальности берутся ровно строки его слотов.
+fn media_rows_for(
+    prompt: &[u32],
+    inputs: &[MediaInput],
+    offset: usize,
+    len: usize,
+) -> Result<Vec<(u32, synaptix_core::tensor::Tensor)>, PipelineError> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for m in inputs {
+        let before = prompt[..offset].iter().filter(|t| **t == m.pad).count();
+        let inside = prompt[offset..offset + len].iter().filter(|t| **t == m.pad).count();
+        if inside == 0 {
+            continue;
+        }
+        let avail = m.embeds.dims()[0];
+        if before + inside > avail {
+            return Err(PipelineError::Forward(format!(
+                "заполнитель {}: в промпте {} строк эмбеддингов, а vision дал {avail}",
+                m.pad,
+                before + inside
+            )));
+        }
+        let rows = m
+            .embeds
+            .narrow(0, before, inside)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| PipelineError::Forward(format!("медиа: срез строк: {e}")))?;
+        out.push((m.pad, rows));
+    }
+    Ok(out)
+}
+
 fn mrope_enabled() -> bool {
     std::env::var("SYN_HYBRID_MROPE").map(|v| v != "0").unwrap_or(true)
 }
@@ -605,6 +639,42 @@ impl HybridPipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.prepare_cfg(gen_cfg.clone());
+        let l = self.maybe_prepend_bos(prompt_ids).len();
+        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_media_resume(&mut kv, prompt_ids, inputs, gen_cfg, sink, None)
+    }
+
+    /// Как [`Self::generate_with_media`], но по ГОТОВОМУ кэшу: префилл
+    /// стартует с `kv.seq_len` (префикс-KV), строки вложений берутся только
+    /// для заполнителей хвоста. Вызывающий отвечает за то, что
+    /// `prompt_ids[..kv.seq_len]` — ровно те токены (и те же эмбеддинги на
+    /// местах заполнителей), что лежат в кэше, а linear-состояние GDN
+    /// восстановлено на эту границу (см. `KvCache::snapshot_linear_full`).
+    ///
+    /// `on_prefill` зовётся на границе, кратной чанку GDN-скана, — там
+    /// вызывающий снимает новую точку возврата, как в
+    /// [`Self::generate_mtp_resume`]. Кэш MTP-головы этот путь не ведёт:
+    /// декод после M-RoPE-промпта идёт по 1D-позициям со сдвигом, и
+    /// спекуляция на нём не применяется.
+    pub fn generate_with_media_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        inputs: &[MediaInput],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+        mut on_prefill: Option<
+            &mut dyn FnMut(usize, &synaptix_llm_common::KvCache) -> Result<(), PipelineError>,
+        >,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
         use synaptix_core::grad::no_grad;
         use synaptix_core::tensor::Tensor;
 
@@ -614,9 +684,14 @@ impl HybridPipeline {
         if inputs.is_empty() {
             return Err(PipelineError::Model("generate_with_media без медиа".into()));
         }
-        let media: Vec<(u32, &Tensor)> = inputs.iter().map(|m| (m.pad, &m.embeds)).collect();
+        // Промпт в том виде, в каком его видит текстовый путь: сессия
+        // сравнивает префиксы именно по нему.
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let prompt_ids = prompt.as_slice();
 
         // M-RoPE: таблицы cos/sin на весь промпт + сдвиг позиций декода.
+        // Таблицы индексируются абсолютной позицией, поэтому префилл хвоста
+        // с `kv.seq_len` берёт из них ровно свои строки.
         let mrope_on = mrope_enabled() && inputs.iter().all(|m| !m.grids.is_empty());
         let mrope_tables = match (&self.config.mrope, mrope_on) {
             (Some(spec), true) => {
@@ -653,16 +728,27 @@ impl HybridPipeline {
         let cfg = self.prepare_cfg(gen_cfg);
         let device = self.model.device;
         let l = prompt_ids.len();
-        let kv_max = cfg.max_seq.unwrap_or(l + cfg.max_new_tokens + 1);
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        if l > kv.max_seq {
+            return Err(PipelineError::Forward(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
         let eos = synaptix_llm_common::generate::eos_set(&cfg);
         let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
 
         let t0 = std::time::Instant::now();
-        let emb = self.embed_with_media(prompt_ids, &media)?;
+        // Префикс-KV: всё до `kv.seq_len` уже посчитано на прошлом ходу.
+        // Минус один токен — логиты нужно получить хотя бы из одного forward'а.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        // Эмбеддинги только хвоста: заполнители нумеруются по всему промпту,
+        // так что из каждой модальности берутся ровно те строки, чьи слоты
+        // попали в хвост (граница может резать блок картинки пополам —
+        // точка возврата ставится по чанку GDN, а не по краю блока).
+        let tail_media = media_rows_for(prompt_ids, inputs, prefix, l - prefix)?;
+        let tail_refs: Vec<(u32, &Tensor)> = tail_media.iter().map(|(p, t)| (*p, t)).collect();
+        let emb = self.embed_with_media(&prompt_ids[prefix..], &tail_refs)?;
         // Префилл чанками, как в текстовом пути: пик активаций гибрида
         // растёт с длиной чанка, и single-shot по длинной истории с
         // картинкой упирался в OOM. `prepare_cfg` уже выровнял чанк по
@@ -671,18 +757,42 @@ impl HybridPipeline {
             0 => l,
             n => n.max(1),
         };
-        let mut off = 0usize;
+        // Точка возврата — на границе, кратной CS=64 GDN-скана (см.
+        // `generate_mtp_inner`): разрез посередине его чанка оставляет
+        // состояние частичного чанка и расходится с непрерывным префиллом.
+        let snap_at = if on_prefill.is_some() {
+            (l / GDN_CHUNK) * GDN_CHUNK
+        } else {
+            0
+        };
+        let mut off = prefix;
         let mut last_hidden = None;
         while off < l {
-            let step = chunk.min(l - off);
+            let mut end = (off + chunk).min(l);
+            if snap_at > off && end > snap_at {
+                end = snap_at;
+            }
             let part = emb
-                .narrow(1, off, step)
+                .narrow(1, off - prefix, end - off)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let h = no_grad(|| self.model.forward_from_hidden_pos(&part, &mut kv, prefill_pos))
+            let h = no_grad(|| self.model.forward_from_hidden_pos(&part, kv, prefill_pos))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             last_hidden = Some(h);
-            off += step;
+            off = end;
+            // Снимок — до декода и с согласованными host/dev половинами
+            // GDN-состояния (см. `generate_mtp_inner`).
+            if off == snap_at && snap_at > prefix {
+                if let Some(cb) = on_prefill.as_mut() {
+                    self.model
+                        .sync_decode_host_state(kv)
+                        .map_err(|e| PipelineError::Forward(format!("prefix sync host: {e}")))?;
+                    self.model
+                        .sync_decode_dev_state(kv)
+                        .map_err(|e| PipelineError::Forward(format!("prefix sync dev: {e}")))?;
+                    cb(off, kv)?;
+                }
+            }
         }
         let hidden =
             last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
@@ -705,7 +815,7 @@ impl HybridPipeline {
             }
             let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            logits = no_grad(|| self.model.forward_pos(&step, &mut kv, decode_pos))
+            logits = no_grad(|| self.model.forward_pos(&step, kv, decode_pos))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
         }
         let decode_ms = dec_t0.elapsed().as_millis();

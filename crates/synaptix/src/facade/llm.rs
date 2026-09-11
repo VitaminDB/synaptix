@@ -607,31 +607,14 @@ impl LlmPipeline {
     ) -> Result<(), LlmError> {
         match self {
             LlmPipeline::MuseGlimmer(p) => {
-                let images = concat_media(media, MediaKind::Image)?;
-                let video = concat_media(media, MediaKind::Video)?;
-                p.generate_with_mixed_media(prompt_ids, images.as_ref(), video.as_ref(), cfg, sink)
+                let pairs = muse_media_inputs(p, media)?;
+                let refs: Vec<(u32, &Tensor)> = pairs.iter().map(|(pad, t)| (*pad, t)).collect();
+                p.generate_with_media_pairs(prompt_ids, &refs, cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
             LlmPipeline::Hybrid(p) => {
-                // По модальности: склейка эмбеддингов + сетка каждого блока
-                // (у видео — одна сетка на каждую группу кадров) для M-RoPE.
-                let mut inputs: Vec<MediaInput> = Vec::new();
-                for (kind, pad) in [
-                    (MediaKind::Image, p.config.image_token_id),
-                    (MediaKind::Video, p.config.video_token_id),
-                ] {
-                    let Some(embeds) = concat_media(media, kind)? else { continue };
-                    let pad = pad.ok_or_else(|| {
-                        LlmError(format!("config.json без id заполнителя для {kind:?}"))
-                    })?;
-                    let grids: Vec<(usize, usize)> = media
-                        .iter()
-                        .filter(|m| m.kind == kind)
-                        .flat_map(|m| std::iter::repeat_n(m.grid_hw, m.blocks))
-                        .collect();
-                    inputs.push(MediaInput { pad, embeds, grids });
-                }
+                let inputs = hybrid_media_inputs(p, media)?;
                 p.generate_with_media(prompt_ids, &inputs, cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
@@ -646,14 +629,7 @@ impl LlmPipeline {
                     .map_err(|e| LlmError(e.to_string()))
             }
             LlmPipeline::Gemma4(p) => {
-                let Some(embeds) = concat_media(media, MediaKind::Image)? else {
-                    return Err(LlmError("Gemma-4 принимает только картинки".into()));
-                };
-                let pad = p
-                    .config
-                    .image_token_id
-                    .ok_or_else(|| LlmError("config.json без image_token_id".into()))?;
-                let inputs = [Gemma4MediaInput { pad, embeds }];
+                let inputs = gemma4_media_inputs(p, media)?;
                 p.generate_media_streaming(prompt_ids, &inputs, cfg, sink)
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
@@ -813,6 +789,49 @@ pub struct LlmKvSession {
     ids: Vec<u32>,
     ctx_tokens: usize,
     kind: SessionKind,
+    /// Медиа, вошедшие в кэшированный префикс (`ids`). Токены заполнителей у
+    /// двух разных картинок одинаковы, так что промпт с той же разметкой, но
+    /// другим вложением на её месте префиксом считаться не должен. У
+    /// Qwen4Exp то же ведёт сама [`Qwen4ExpSession`].
+    media: Vec<MediaSig>,
+}
+
+/// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaSig {
+    pad: u32,
+    rows: usize,
+    hash: u64,
+}
+
+/// Отпечатки медиа по префиксу `ids`: у каждой модальности берутся ровно те
+/// строки, чьи заполнители стоят в `ids`. Хэш по битам f32 — эмбеддинги
+/// приходят из кэша башни, так что одна и та же картинка даёт одни и те же
+/// байты.
+fn media_sigs(pairs: &[(u32, &Tensor)], ids: &[u32]) -> Result<Vec<MediaSig>, LlmError> {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    for (pad, embeds) in pairs {
+        let rows = ids.iter().filter(|t| *t == pad).count().min(embeds.dims()[0]);
+        if rows == 0 {
+            continue;
+        }
+        let host = embeds
+            .narrow(0, 0, rows)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.to_device(Device::Cpu))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| LlmError(format!("медиа: отпечаток эмбеддингов: {e}")))?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        for v in &host {
+            v.to_bits().hash(&mut h);
+        }
+        out.push(MediaSig { pad: *pad, rows, hash: h.finish() });
+    }
+    Ok(out)
 }
 
 /// Что, кроме основного KV, нужно донести до следующего хода.
@@ -823,6 +842,10 @@ enum SessionKind {
         mtp_kv: LlmKvCache,
         snap: Option<Vec<LinearSnapshot>>,
         mtp_len: usize,
+        /// Кэш MTP-головы идёт вровень с основным до `mtp_len`. Медиа-ход
+        /// его не ведёт (декод после M-RoPE-промпта — без спекуляции), после
+        /// него текстовый MTP-путь обязан префиллить заново.
+        mtp_synced: bool,
     },
     /// Muse-Glimmer: роллинг-окно контекста DFlash-драфтера. Linear-слоёв нет,
     /// поэтому снимок не нужен; зато у sliding-слоёв кэш держит лишь последние
@@ -886,15 +909,44 @@ impl LlmKvSession {
         }
     }
 
+    /// То же для промпта с медиа: помимо токенов должны совпасть и строки
+    /// вложений, вошедшие в кэшированный префикс. `pairs` — «заполнитель →
+    /// склейка эмбеддингов модальности» в порядке появления в промпте.
+    fn reusable_media(&self, prompt_ids: &[u32], pairs: &[(u32, &Tensor)]) -> usize {
+        let n = self.reusable(prompt_ids);
+        if n == 0 {
+            return 0;
+        }
+        match media_sigs(pairs, &self.ids) {
+            Ok(sigs) if sigs == self.media => n,
+            _ => 0,
+        }
+    }
+
+    /// Запомнить отпечатки медиа точки возврата после медиа-хода. Ошибка
+    /// снятия отпечатка обесценивает точку целиком: лучше полный префилл на
+    /// следующем ходу, чем префикс с непроверяемыми строками.
+    fn remember_media(&mut self, pairs: &[(u32, &Tensor)]) {
+        match media_sigs(pairs, &self.ids) {
+            Ok(sigs) => self.media = sigs,
+            Err(_) => {
+                self.ids.clear();
+                self.media.clear();
+            }
+        }
+    }
+
     /// Забыть префикс (смена чата/модели, сжатие истории).
     pub fn invalidate(&mut self) {
         self.ids.clear();
+        self.media.clear();
         self.kv.reset();
         match &mut self.kind {
-            SessionKind::Hybrid { mtp_kv, snap, mtp_len } => {
+            SessionKind::Hybrid { mtp_kv, snap, mtp_len, mtp_synced } => {
                 mtp_kv.reset();
                 *snap = None;
                 *mtp_len = 0;
+                *mtp_synced = true;
             }
             SessionKind::Muse { dcache } => {
                 if let Some(d) = dcache.as_mut() {
@@ -1007,11 +1059,13 @@ impl LlmKvSession {
     /// Сбросить кэш к пустому состоянию перед полным префиллом.
     fn reset_for_full(&mut self) {
         self.kv.reset();
+        self.media.clear();
         match &mut self.kind {
-            SessionKind::Hybrid { mtp_kv, snap, mtp_len } => {
+            SessionKind::Hybrid { mtp_kv, snap, mtp_len, mtp_synced } => {
                 mtp_kv.reset();
                 *snap = None;
                 *mtp_len = 0;
+                *mtp_synced = true;
             }
             SessionKind::Muse { dcache } => {
                 if let Some(d) = dcache.as_mut() {
@@ -1059,10 +1113,20 @@ impl Llm {
     /// DFlash-декод); остальные работают как раньше, без переиспользования.
     /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
     /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
+    /// Все архитектуры с сессией и башней зрения: гибрид Qwen3.6/3.8,
+    /// Muse-Glimmer, Gemma-4, Qwen4Exp.
     pub fn kv_session_media_ok(&self) -> bool {
         self.pipeline
             .lock()
-            .map(|p| matches!(&*p, LlmPipeline::Qwen4Exp(_)))
+            .map(|p| {
+                matches!(
+                    &*p,
+                    LlmPipeline::Hybrid(_)
+                        | LlmPipeline::MuseGlimmer(_)
+                        | LlmPipeline::Gemma4(_)
+                        | LlmPipeline::Qwen4Exp(_)
+                )
+            })
             .unwrap_or(false)
     }
 
@@ -1088,7 +1152,8 @@ impl Llm {
                     kv,
                     ids: Vec::new(),
                     ctx_tokens: ctx,
-                    kind: SessionKind::Hybrid { mtp_kv, snap: None, mtp_len: 0 },
+                    kind: SessionKind::Hybrid { mtp_kv, snap: None, mtp_len: 0, mtp_synced: true },
+                    media: Vec::new(),
                 }))
             }
             LlmPipeline::MuseGlimmer(p) => {
@@ -1111,6 +1176,7 @@ impl Llm {
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Muse { dcache },
+                    media: Vec::new(),
                 }))
             }
             LlmPipeline::Gemma4(p) => {
@@ -1120,6 +1186,7 @@ impl Llm {
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Plain,
+                    media: Vec::new(),
                 }))
             }
             LlmPipeline::Qwen4Exp(p) => {
@@ -1133,6 +1200,7 @@ impl Llm {
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Qwen4Exp(Box::new(session)),
+                    media: Vec::new(),
                 }))
             }
             _ => Ok(None),
@@ -1627,10 +1695,18 @@ impl<'a> LlmGeneration<'a> {
                 }
                 // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
                 let ids = p.maybe_prepend_bos(prompt_ids);
-                let reuse = session.reusable(&ids);
+                // Префикс с медиа-строками текстовому промпту не принадлежит,
+                // а после медиа-хода кэш MTP-головы отстал от основного —
+                // в обоих случаях честный полный префилл.
+                let mtp_synced = matches!(session.kind, SessionKind::Hybrid { mtp_synced: true, .. });
+                let reuse = if session.media.is_empty() && mtp_synced {
+                    session.reusable(&ids)
+                } else {
+                    0
+                };
                 if reuse > 0 {
                     session.kv.seq_len = reuse;
-                    let SessionKind::Hybrid { mtp_kv, snap, mtp_len } = &mut session.kind else {
+                    let SessionKind::Hybrid { mtp_kv, snap, mtp_len, .. } = &mut session.kind else {
                         unreachable!("проверено выше")
                     };
                     if let Some(sn) = snap.as_ref() {
@@ -1647,9 +1723,11 @@ impl<'a> LlmGeneration<'a> {
                 }
 
                 let LlmKvSession { kv, ids: sess_ids, kind, .. } = session;
-                let SessionKind::Hybrid { mtp_kv, snap, mtp_len } = kind else {
+                let SessionKind::Hybrid { mtp_kv, snap, mtp_len, mtp_synced } = kind else {
                     unreachable!("проверено выше")
                 };
+                // Полный префилл через MTP-путь снова выравнивает обе головы.
+                *mtp_synced = true;
                 let mut new_snap: Option<Vec<LinearSnapshot>> = None;
                 let mut new_mtp_len = 0usize;
                 let mut new_len = 0usize;
@@ -1687,7 +1765,12 @@ impl<'a> LlmGeneration<'a> {
                     return Err(LlmError("префикс-KV: сессия от другой модели".into()));
                 }
                 let ids = p.maybe_prepend_bos(prompt_ids);
-                let mut reuse = session.reusable(&ids);
+                // Префикс с медиа-строками текстовому промпту не принадлежит.
+                let mut reuse = if session.media.is_empty() {
+                    session.reusable(&ids)
+                } else {
+                    0
+                };
                 // Путь декода выбирается так же, как в `generate_streaming`.
                 let dflash_path =
                     cfg.temperature == 0.0 && dflash_enabled() && p.has_dflash();
@@ -1736,6 +1819,7 @@ impl<'a> LlmGeneration<'a> {
                 // У Muse точка возврата — весь промпт: linear-слоёв нет, а
                 // attention-кэш усекается по `seq_len` (в пределах ring-окна).
                 *sess_ids = ids;
+                session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -1745,7 +1829,12 @@ impl<'a> LlmGeneration<'a> {
                 if !matches!(session.kind, SessionKind::Plain) {
                     return Err(LlmError("префикс-KV: сессия от другой модели".into()));
                 }
-                let reuse = session.reusable(prompt_ids);
+                // Префикс с медиа-строками текстовому промпту не принадлежит.
+                let reuse = if session.media.is_empty() {
+                    session.reusable(prompt_ids)
+                } else {
+                    0
+                };
                 if reuse > 0 {
                     session.kv.seq_len = reuse;
                 } else {
@@ -1759,6 +1848,7 @@ impl<'a> LlmGeneration<'a> {
                         .map(|_| ())
                 };
                 session.ids = prompt_ids.to_vec();
+                session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -1779,8 +1869,10 @@ impl<'a> LlmGeneration<'a> {
 
     /// Префикс-KV для промпта с медиа-вложениями: как
     /// [`Self::generate_streaming_cached`], но строки вложений идут в
-    /// кэш вместе с остальным префиксом. Поддержано у Qwen4Exp; для прочих
-    /// архитектур — ошибка, вызывающий идёт [`Self::generate_streaming_media`].
+    /// кэш вместе с остальным префиксом. Подмена картинки при той же
+    /// разметке ловится отпечатком строк (см. [`MediaSig`]). Поддержано у
+    /// всех архитектур с сессией и башней (см. [`Llm::kv_session_media_ok`]);
+    /// для прочих — ошибка, вызывающий идёт [`Self::generate_streaming_media`].
     pub fn generate_streaming_cached_media<F>(
         &mut self,
         session: &mut LlmKvSession,
@@ -1833,6 +1925,112 @@ impl<'a> LlmGeneration<'a> {
                     .generate_cached_media_streaming(s, prompt_ids, &inputs, cfg, &mut sink)
                     .map_err(|e| LlmError(e.to_string()))?;
                 Ok(reuse)
+            }
+            LlmPipeline::Hybrid(p) => {
+                if !matches!(session.kind, SessionKind::Hybrid { .. }) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let inputs = hybrid_media_inputs(p, media)?;
+                let pairs: Vec<(u32, &Tensor)> = inputs.iter().map(|m| (m.pad, &m.embeds)).collect();
+                let ids = p.maybe_prepend_bos(prompt_ids);
+                let reuse = session.reusable_media(&ids, &pairs);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                    let SessionKind::Hybrid { snap, .. } = &mut session.kind else {
+                        unreachable!("проверено выше")
+                    };
+                    if let Some(sn) = snap.as_ref() {
+                        session
+                            .kv
+                            .restore_linear(sn)
+                            .map_err(|e| LlmError(e.to_string()))?;
+                    }
+                } else {
+                    session.reset_for_full();
+                }
+                let LlmKvSession { kv, ids: sess_ids, kind, .. } = &mut *session;
+                let SessionKind::Hybrid { snap, mtp_synced, .. } = kind else {
+                    unreachable!("проверено выше")
+                };
+                // Кэш MTP-головы этот ход не ведёт — текстовый MTP-путь после
+                // него обязан префиллить заново.
+                *mtp_synced = false;
+                let mut new_snap: Option<Vec<LinearSnapshot>> = None;
+                let mut new_len = 0usize;
+                let res = p.generate_with_media_resume(
+                    kv,
+                    &ids,
+                    &inputs,
+                    cfg,
+                    &mut sink,
+                    Some(&mut |at: usize, kv_at: &LlmKvCache| {
+                        new_snap = Some(kv_at.snapshot_linear_full()?);
+                        new_len = at;
+                        Ok(())
+                    }),
+                );
+                // Точка возврата обновляется, только если движок её снял (см.
+                // текстовый путь): иначе прежняя остаётся префиксом промпта.
+                if let Some(sn) = new_snap {
+                    *snap = Some(sn);
+                    *sess_ids = ids[..new_len].to_vec();
+                }
+                session.remember_media(&pairs);
+                match res {
+                    Ok(_) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            LlmPipeline::MuseGlimmer(p) => {
+                if !matches!(session.kind, SessionKind::Muse { .. }) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let pairs = muse_media_inputs(p, media)?;
+                let refs: Vec<(u32, &Tensor)> = pairs.iter().map(|(pad, t)| (*pad, t)).collect();
+                let ids = p.maybe_prepend_bos(prompt_ids);
+                let reuse = session.reusable_media(&ids, &refs);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                // Контекст DFlash-драфтера медиа-ход не ведёт: сбрасываем, чтобы
+                // текстовый greedy-ход после него не откатился на чужую границу.
+                if let SessionKind::Muse { dcache: Some(d) } = &mut session.kind {
+                    d.reset();
+                }
+                let res = p
+                    .generate_with_media_resume(&mut session.kv, &ids, &refs, cfg, &mut sink)
+                    .map(|_| ());
+                // У Muse точка возврата — весь промпт (см. текстовый путь).
+                session.ids = ids;
+                session.remember_media(&refs);
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
+            LlmPipeline::Gemma4(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                let inputs = gemma4_media_inputs(p, media)?;
+                let pairs: Vec<(u32, &Tensor)> = inputs.iter().map(|m| (m.pad, &m.embeds)).collect();
+                let reuse = session.reusable_media(prompt_ids, &pairs);
+                if reuse > 0 {
+                    session.kv.seq_len = reuse;
+                } else {
+                    session.reset_for_full();
+                }
+                let res = p
+                    .generate_media_resume(&mut session.kv, prompt_ids, &inputs, cfg, &mut sink)
+                    .map(|_| ());
+                session.ids = prompt_ids.to_vec();
+                session.remember_media(&pairs);
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
             }
             _ => Err(LlmError("префикс-KV с медиа: архитектура не поддержана".into())),
         }
@@ -1919,6 +2117,73 @@ fn qwen4_media_inputs(
         inputs.push(Qwen4MediaInput { pad, embeds, grids });
     }
     Ok(inputs)
+}
+
+/// Медиа-входы гибрида: по модальности — склейка эмбеддингов плюс сетка
+/// каждого блока (у видео — одна на каждую группу кадров) для M-RoPE.
+fn hybrid_media_inputs(
+    p: &HybridPipeline,
+    media: &[&MediaEmbedding],
+) -> Result<Vec<MediaInput>, LlmError> {
+    let mut inputs: Vec<MediaInput> = Vec::new();
+    for (kind, pad) in [
+        (MediaKind::Image, p.config.image_token_id),
+        (MediaKind::Video, p.config.video_token_id),
+    ] {
+        let Some(embeds) = concat_media(media, kind)? else { continue };
+        let pad = pad.ok_or_else(|| {
+            LlmError(format!("config.json без id заполнителя для {kind:?}"))
+        })?;
+        let grids: Vec<(usize, usize)> = media
+            .iter()
+            .filter(|m| m.kind == kind)
+            .flat_map(|m| std::iter::repeat_n(m.grid_hw, m.blocks))
+            .collect();
+        inputs.push(MediaInput { pad, embeds, grids });
+    }
+    Ok(inputs)
+}
+
+/// Медиа-входы Muse-Glimmer: пары «заполнитель → склейка эмбеддингов
+/// модальности» — картинки под `image_token_id`, видео под `video_token_id`.
+fn muse_media_inputs(
+    p: &MusePipeline,
+    media: &[&MediaEmbedding],
+) -> Result<Vec<(u32, Tensor)>, LlmError> {
+    let mut pairs = Vec::new();
+    if let Some(t) = concat_media(media, MediaKind::Image)? {
+        let pad = p
+            .config
+            .image_token_id
+            .ok_or_else(|| LlmError("config.json без image_token_id".into()))?;
+        pairs.push((pad, t));
+    }
+    if let Some(t) = concat_media(media, MediaKind::Video)? {
+        let pad = p
+            .config
+            .video_token_id
+            .ok_or_else(|| LlmError("config.json без video_token_id".into()))?;
+        pairs.push((pad, t));
+    }
+    if pairs.is_empty() {
+        return Err(LlmError("generate_streaming_media без вложений".into()));
+    }
+    Ok(pairs)
+}
+
+/// Медиа-входы Gemma-4: только картинки, один заполнитель.
+fn gemma4_media_inputs(
+    p: &Gemma4Pipeline,
+    media: &[&MediaEmbedding],
+) -> Result<Vec<Gemma4MediaInput>, LlmError> {
+    let Some(embeds) = concat_media(media, MediaKind::Image)? else {
+        return Err(LlmError("Gemma-4 принимает только картинки".into()));
+    };
+    let pad = p
+        .config
+        .image_token_id
+        .ok_or_else(|| LlmError("config.json без image_token_id".into()))?;
+    Ok(vec![Gemma4MediaInput { pad, embeds }])
 }
 
 /// Склеивает эмбеддинги одной модальности в порядке следования вложений.

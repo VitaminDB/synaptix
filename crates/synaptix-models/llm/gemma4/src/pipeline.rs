@@ -329,32 +329,68 @@ impl Gemma4Pipeline {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("пустой промпт".into()));
         }
-        let cfg = self.cfg_with_eos(gen_cfg);
-        let device = self.model.device;
-        let kv_max = cfg.max_seq.unwrap_or(prompt_ids.len() + cfg.max_new_tokens);
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
         let mut kv = self
             .model
             .make_kv_cache(1, kv_max)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
+        self.generate_media_resume(&mut kv, prompt_ids, media, gen_cfg, sink)
+    }
 
-        let ids = Tensor::from_vec(prompt_ids.to_vec(), vec![1usize, prompt_ids.len()], device)
+    /// Как [`Self::generate_media_streaming`], но по ГОТОВОМУ кэшу: префилл
+    /// стартует с `kv.seq_len` (префикс-KV), эмбеддинги вложений берутся
+    /// только для заполнителей хвоста. Вызывающий отвечает за то, что
+    /// `prompt_ids[..kv.seq_len]` — ровно те токены (и те же эмбеддинги на
+    /// местах заполнителей), что лежат в кэше. Граница префикса — конец
+    /// прошлого промпта, внутрь блока картинки она не попадает, так что
+    /// двусторонние участки хвоста целы.
+    pub fn generate_media_resume(
+        &self,
+        kv: &mut KvCache,
+        prompt_ids: &[u32],
+        media: &[MediaInput],
+        gen_cfg: GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("пустой промпт".into()));
+        }
+        let cfg = self.cfg_with_eos(gen_cfg);
+        let device = self.model.device;
+        let l = prompt_ids.len();
+        if l > kv.max_seq {
+            return Err(PipelineError::Model(format!(
+                "промпт {l} ток не влезает в KV-кэш на {} ток",
+                kv.max_seq
+            )));
+        }
+        // Префикс-KV: всё до `kv.seq_len` уже посчитано. Минус один токен —
+        // логиты нужно получить хотя бы из одного forward'а.
+        let prefix = kv.seq_len.min(l.saturating_sub(1));
+        kv.seq_len = prefix;
+        let tail = &prompt_ids[prefix..];
+
+        let ids = Tensor::from_vec(tail.to_vec(), vec![1usize, tail.len()], device)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
         let mut hidden = self
             .model
             .embed_ids(&ids)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
 
+        // Участки двустороннего внимания — в АБСОЛЮТНЫХ позициях контекста.
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for input in media {
-            let (patched, runs) = splice_media(&hidden, prompt_ids, input)?;
+            let Some(tail_input) = media_rows_for(prompt_ids, input, prefix, l - prefix)? else {
+                continue;
+            };
+            let (patched, runs) = splice_media(&hidden, tail, &tail_input)?;
             hidden = patched;
-            spans.extend(runs);
+            spans.extend(runs.into_iter().map(|(a, b)| (a + prefix, b + prefix)));
         }
 
         // Префилл чанками: пик активаций MoE растёт с длиной чанка. Границы
-        // чанков произвольны — двусторонние участки задаются АБСОЛЮТНЫМИ
+        // чанков произвольны — двусторонние участки заданы абсолютными
         // позициями и переживают разрез.
-        let l = prompt_ids.len();
         let chunk = match cfg.prefill_batch {
             0 => l,
             n => n.max(1),
@@ -362,17 +398,17 @@ impl Gemma4Pipeline {
         let chunk = self.model.max_prefill_chunk().map_or(chunk, |cap| chunk.min(cap));
         let t0 = std::time::Instant::now();
         let mut last_hidden = None;
-        let mut off = 0usize;
+        let mut off = prefix;
         while off < l {
             let step = chunk.min(l - off);
             let part = hidden
-                .narrow(1, off, step)
+                .narrow(1, off - prefix, step)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| PipelineError::Model(e.to_string()))?;
             let h = no_grad(|| {
                 self.model.forward_from_hidden_spans(
                     &part,
-                    &mut kv,
+                    kv,
                     RopePositions::Sequential,
                     &spans,
                 )
@@ -403,7 +439,7 @@ impl Gemma4Pipeline {
             }
             let step = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
                 .map_err(|e| PipelineError::Model(e.to_string()))?;
-            logits = no_grad(|| self.model.forward(&step, &mut kv))
+            logits = no_grad(|| self.model.forward(&step, kv))
                 .map_err(|e| PipelineError::Model(e.to_string()))?;
         }
         let decode_ms = dec_t0.elapsed().as_millis();
@@ -413,6 +449,36 @@ impl Gemma4Pipeline {
             GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms },
         ))
     }
+}
+
+/// Строки эмбеддингов, чьи заполнители попадают в `[offset, offset+len)`
+/// промпта: заполнители нумеруются по всему промпту, поэтому при префилле
+/// хвоста берутся ровно строки его слотов. `None` — в хвосте слотов этой
+/// модальности нет.
+fn media_rows_for(
+    prompt: &[u32],
+    input: &MediaInput,
+    offset: usize,
+    len: usize,
+) -> Result<Option<MediaInput>, PipelineError> {
+    let before = prompt[..offset].iter().filter(|t| **t == input.pad).count();
+    let inside = prompt[offset..offset + len].iter().filter(|t| **t == input.pad).count();
+    if inside == 0 {
+        return Ok(None);
+    }
+    let have = input.embeds.dims()[0];
+    if before + inside > have {
+        return Err(PipelineError::Model(format!(
+            "заполнителей {}, а эмбеддингов {have}",
+            before + inside
+        )));
+    }
+    let embeds = input
+        .embeds
+        .narrow(0, before, inside)
+        .and_then(|t| t.contiguous())
+        .map_err(|e| PipelineError::Model(format!("медиа: срез строк: {e}")))?;
+    Ok(Some(MediaInput { pad: input.pad, embeds }))
 }
 
 /// Подставляет эмбеддинги медиа на места прогонов токена-заполнителя.
