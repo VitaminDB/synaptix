@@ -627,6 +627,29 @@ pub struct GenExtras {
     pub keyscale: Option<String>,
     pub timesig: Option<String>,
     pub norm_mode: NormMode,
+    /// Сообщать, какой компонент сейчас в памяти (см. [`StageHook`]).
+    pub on_stage: Option<StageHook>,
+}
+
+/// Компонент пайплайна, только что оказавшийся в памяти.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicStage {
+    Lm,
+    TextEncoder,
+    Dit,
+    Vae,
+}
+
+/// Колбэк стадий: зовётся после загрузки (или взятия из кэша) компонента с
+/// путём его бандла. Без резидентного кэша компоненты живут по очереди, и
+/// UI по нему показывает, что сейчас занимает VRAM.
+#[derive(Clone)]
+pub struct StageHook(pub std::sync::Arc<dyn Fn(MusicStage, &std::path::Path) + Send + Sync>);
+
+impl std::fmt::Debug for StageHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StageHook")
+    }
 }
 
 impl GenExtras {
@@ -658,6 +681,11 @@ pub fn generate_music(
     let cfg = DitConfig::xl_base();
     let seed = codes_opts.seed;
     let enc_compute = compute;
+    let stage = |s: MusicStage, p: &std::path::Path| {
+        if let Some(h) = &extras.on_stage {
+            (h.0)(s, p);
+        }
+    };
 
     if let Some(c) = cache.as_deref_mut() {
         c.ensure_key(&CacheKey {
@@ -713,6 +741,7 @@ pub fn generate_music(
                     &lm_owned
                 }
             };
+            stage(MusicStage::Lm, paths.lm);
             let lm_tok = AceTokenizer::from_bytes(&read_bundle_file(paths.lm, "tokenizer.json")?)?;
             let t_ar = std::time::Instant::now();
             let r = ar_generate(lm, &lm_tok, caption, lyric, &base, codes_opts, cot)?;
@@ -755,6 +784,7 @@ pub fn generate_music(
                 &te_owned
             }
         };
+        stage(MusicStage::TextEncoder, paths.text_encoder);
         let tok = HfTokenizer::from_bytes(&read_bundle_file(paths.text_encoder, "tokenizer.json")?)
             .map_err(|e| AceError::Load(e.to_string()))?;
         let enc_ids = |s: &str| -> Result<Tensor, AceError> {
@@ -839,6 +869,7 @@ pub fn generate_music(
                 &dit_owned
             }
         };
+        stage(MusicStage::Dit, paths.dit);
         let x0 = {
             let base = Tensor::randn_seeded(vec![1usize, t_frames, 64], seed, Device::Cpu)?;
             let mixed = if matches!(edit.mode, EditMode::Retake) && edit.retake_variance > 0.0 {
@@ -898,6 +929,7 @@ pub fn generate_music(
             &vae_owned
         }
     };
+    stage(MusicStage::Vae, paths.vae);
     let latent_ncl = latent.transpose(1, 2)?.contiguous()?;
     let audio = vae.decode_tiled(&latent_ncl, 500, 32)?;
     let ch0 = audio.narrow(1, 0, 1)?.contiguous()?;

@@ -168,6 +168,7 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         keyscale: s(&args.keyscale),
         timesig: s(&args.timesig),
         norm_mode,
+        on_stage: None,
     };
     let t0 = std::time::Instant::now();
     let (samples, sr, _latent) = generate_music(
