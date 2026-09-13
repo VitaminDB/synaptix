@@ -39,6 +39,9 @@ use super::arch::{config_max_seq, detect_llm_arch, read_model_file, LlmArch};
 
 pub use synaptix_core::device::Device;
 pub use synaptix_llm_common::GenerationConfig as RawGenerationConfig;
+pub use super::sampling::{
+    sampling_profile, ReasoningLevels, ReasoningVar, SamplingPreset, SamplingProfile,
+};
 
 #[derive(Debug, Clone)]
 pub struct LlmError(pub String);
@@ -1520,6 +1523,9 @@ const GEMMA4_IMAGE_PAD_TOKEN: &str = "<|image|>";
 pub struct LlmTokenizer {
     tokenizer: HfTokenizer,
     template: Option<ChatTemplate>,
+    /// Уровни глубины размышлений, которые понимает шаблон (см.
+    /// [`super::sampling::reasoning_levels`]).
+    reasoning: Option<ReasoningLevels>,
     eos_ids: Vec<u32>,
 }
 
@@ -1544,19 +1550,34 @@ impl LlmTokenizer {
         enable_thinking: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> Result<String, LlmError> {
+        self.apply_chat_template_reasoning(messages, add_generation_prompt, enable_thinking, None, tools)
+    }
+
+    /// Уровни глубины размышлений, которые понимает шаблон модели.
+    pub fn reasoning_levels(&self) -> Option<&ReasoningLevels> {
+        self.reasoning.as_ref()
+    }
+
+    /// Как [`Self::apply_chat_template_ex_tools`], но с глубиной размышлений:
+    /// `effort` — уровень из [`Self::reasoning_levels`]. `None` или уровень,
+    /// которого шаблон не знает, — уровень шаблона по умолчанию.
+    pub fn apply_chat_template_reasoning(
+        &self,
+        messages: &[Message],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        effort: Option<&str>,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<String, LlmError> {
         let msgs: Vec<TokMessage> = messages.iter().map(Message::to_tok).collect();
         match &self.template {
             Some(tmpl) => {
-                // Канальные шаблоны (Muse Glimmer) не знают про
-                // `enable_thinking`: у них глубина рассуждений задаётся
-                // строкой `reasoning_strength` в системном блоке, а совсем
-                // отключить reasoning протокол не позволяет. Отдаём обе
-                // переменные — лишнюю шаблон просто не прочитает.
-                let strength = if enable_thinking { "high" } else { "low" };
-                let mut opts = RenderOptions::new()
-                    .with_generation_prompt(add_generation_prompt)
-                    .with_var("enable_thinking", serde_json::Value::Bool(enable_thinking))
-                    .with_var("reasoning_strength", serde_json::Value::String(strength.into()));
+                let mut opts = super::sampling::with_thinking_vars(
+                    RenderOptions::new().with_generation_prompt(add_generation_prompt),
+                    self.reasoning.as_ref(),
+                    enable_thinking,
+                    effort,
+                );
                 if let Some(t) = tools {
                     if !t.is_empty() {
                         opts = opts.with_var("tools", serde_json::Value::Array(t.to_vec()));
@@ -2422,7 +2443,7 @@ mod stream_delta_tests {
 
 /// Источник jinja-шаблона: `chat_template.jinja` либо
 /// `tokenizer_config.json["chat_template"]`. None → fallback ChatML.
-fn load_template_source(model: &Path) -> Option<String> {
+pub(crate) fn load_template_source(model: &Path) -> Option<String> {
     if let Some(bytes) = read_model_file(model, "chat_template.jinja") {
         if let Ok(s) = String::from_utf8(bytes) {
             if !s.trim().is_empty() {
@@ -2498,6 +2519,9 @@ fn build_facade(
     let vocab_size = tokenizer.vocab_size(true);
     let template = load_template_source(path)
         .map(|src| ChatTemplate::from_source_with_specials(src, specials.clone()));
+    let reasoning = template
+        .as_ref()
+        .and_then(|t| super::sampling::reasoning_levels(detect_llm_arch(path).ok(), t.source()));
 
     let capacity = pipeline.rope_capacity();
     let max_seq_len = max_seq
@@ -2512,7 +2536,7 @@ fn build_facade(
         model_path: path.to_path_buf(),
         compute_dtype,
     };
-    let tok = LlmTokenizer { tokenizer, template, eos_ids };
+    let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids };
     Ok((model, tok))
 }
 

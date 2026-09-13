@@ -10,4 +10,5 @@ pub mod diarization;
 pub mod embedding;
 pub mod llm;
 pub mod rerank;
+pub mod sampling;
 pub mod tts;
