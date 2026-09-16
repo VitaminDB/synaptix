@@ -132,6 +132,13 @@ requires sm_120 (Blackwell).
 
 Young, single-author, and moving fast. The API is not stable; expect breaking changes.
 
+## How it is built
+
+One developer, with Claude (Anthropic) as a daily coding assistant. The architecture, the
+CUDA kernel work and every number in this README are mine — measured on my hardware, with
+the losses reported next to the wins. The assistant carries a large share of the typing,
+the test scaffolding and the refactors.
+
 ## Support
 
 synaptix is free and open source. If it is useful to you, you can support its development
