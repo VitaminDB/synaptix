@@ -179,6 +179,28 @@ fn cuda_version_from_build_system() -> (usize, usize) {
             return (major, minor);
         }
     }
+
+    // synaptix patch: a toolkit newer than the bindings (Arch moves `cuda` to a new
+    // minor on its own schedule) takes the newest bound minor of the same major. CUDA
+    // keeps minor-version compatibility within a major, and with dynamic loading the
+    // symbols resolve against the installed runtime anyway. Upstream panics here,
+    // which broke every fresh build the day cuda 13.4 landed. See PATCH.md.
+    let parsed = version_number
+        .split_once('.')
+        .and_then(|(ma, mi)| Some((ma.parse::<usize>().ok()?, mi.parse::<usize>().ok()?)));
+    if let Some((major, minor)) = parsed {
+        let newest_bound = SUPPORTED_CUDA_VERSIONS
+            .iter()
+            .map(|&(v, _)| v)
+            .find(|&(m, n)| m == major && n < minor);
+        if let Some((m, n)) = newest_bound {
+            println!(
+                "cargo:warning=CUDA toolkit {version_number} is newer than cudarc's bindings; building against the CUDA {m}.{n} API"
+            );
+            return (m, n);
+        }
+    }
+
     panic!("Unsupported cuda toolkit version: `{version_number}`. Please raise a github issue.")
 }
 

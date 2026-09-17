@@ -55,3 +55,13 @@ with `SYN_GRAPH_DECODE=1` and Qwen3-1.7B present.
    alternatives were a borrowed-buffer flag threaded through every storage type,
    or leaking every expert allocation.
 
+4. **Newer toolkit minor** (`build.rs`) — with `cuda-version-from-build-system`,
+   upstream panics on any `nvcc` version missing from `SUPPORTED_CUDA_VERSIONS`.
+   Arch upgraded `cuda` 13.3 → 13.4 on 17.09.2026 and every fresh build (release
+   workflow, AUR `synthos-git`) died in this build script, while incremental
+   builds kept working on a cached build-script output. The patch maps an unknown
+   newer minor to the newest bound minor of the same major, with a
+   `cargo:warning`. That is sound because CUDA is minor-version compatible within
+   a major and the libraries are loaded dynamically — synthos built against 13.3
+   already ran on the 13.4 runtime. A new *major* still panics, on purpose. When
+   re-vendoring, keep this block unless upstream added the version.
