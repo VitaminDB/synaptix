@@ -24,9 +24,22 @@ fn five_seconds_is_124_frames() {
     assert_eq!(frames_for_duration(5.0) as f64 / 24.0, 124.0 / 24.0);
 }
 
+/// Временная ось — по клиповой сетке VAE, а не `ceil(frames / 4)`: 5 латентов
+/// на 17-кадровый клип плюс 2 на хвост из 5 кадров, т.е. `5n + 2` для
+/// `17n + 5` кадров — как `video_latent_num_frames` у эталона.
 #[test]
-fn latent_dimensions_follow_16x_4x() {
-    assert_eq!(latent_frames(124), 31);
+fn latent_frames_follow_vae_clip_grid() {
+    assert_eq!(latent_frames(5), 2);
+    assert_eq!(latent_frames(22), 7);
+    assert_eq!(latent_frames(124), 37);
+    assert_eq!(latent_frames(362), 107);
+    for n in 0..22 {
+        assert_eq!(latent_frames(17 * n + 5), 5 * n + 2, "n={n}");
+    }
+}
+
+#[test]
+fn latent_grid_is_16x_spatial() {
     assert_eq!(latent_grid(1344, 768), (48, 84));
     assert_eq!(latent_grid(1280, 720), (45, 80));
 }
@@ -42,10 +55,10 @@ fn audio_latents_run_at_40hz() {
 fn geometry_video_tokens_match_patching() {
     let g = Geometry::new(1344, 768, 124);
     assert_eq!(g.frame_count, 124);
-    assert_eq!(g.latent_t, 31);
+    assert_eq!(g.latent_t, 37);
     assert_eq!(g.latent_h, 48);
     assert_eq!(g.latent_w, 84);
-    assert_eq!(g.video_tokens([1, 2, 2]), 31 * 24 * 42);
+    assert_eq!(g.video_tokens([1, 2, 2]), 37 * 24 * 42);
 }
 
 #[test]
