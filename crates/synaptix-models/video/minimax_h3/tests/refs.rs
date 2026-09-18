@@ -47,6 +47,22 @@ fn limits_of_released_checkpoint() {
 }
 
 #[test]
+fn labels_number_each_kind_and_count_soundtracks() {
+    use synaptix_video_minimax_h3::refs::labels;
+    let got = labels(&[
+        (RefKind::Video, true),
+        (RefKind::Image, false),
+        (RefKind::Audio, true),
+        (RefKind::Video, false),
+        (RefKind::Image, false),
+    ]);
+    assert_eq!(
+        got,
+        ["<Video 1> + <Audio 1>", "<Picture 1>", "<Audio 2>", "<Video 2>", "<Picture 2>"]
+    );
+}
+
+#[test]
 fn python_rounding() {
     assert_eq!(round_half_even(22.5), 22.0);
     assert_eq!(round_half_even(23.5), 24.0);

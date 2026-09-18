@@ -163,6 +163,41 @@ pub fn validate(sources: &[RefSource]) -> Result<(), H3Error> {
     Ok(())
 }
 
+/// Метки, под которыми презентация покажет референсы модели, — на них и
+/// ссылается промпт. Вход — тип и «есть дорожка» (для видео: просили звук и
+/// он в файле есть), в порядке списка. Нумерация своя у каждого типа; дорожка
+/// видео занимает очередной `<Audio j>` раньше отдельных аудио после неё.
+pub fn labels(refs: &[(RefKind, bool)]) -> Vec<String> {
+    let (mut img, mut vid, mut aud) = (0usize, 0usize, 0usize);
+    refs.iter()
+        .map(|(kind, with_audio)| match kind {
+            RefKind::Image => {
+                img += 1;
+                format!("<Picture {img}>")
+            }
+            RefKind::Audio => {
+                aud += 1;
+                format!("<Audio {aud}>")
+            }
+            RefKind::Video => {
+                vid += 1;
+                if *with_audio {
+                    aud += 1;
+                    format!("<Video {vid}> + <Audio {aud}>")
+                } else {
+                    format!("<Video {vid}>")
+                }
+            }
+        })
+        .collect()
+}
+
+/// Есть ли в файле аудиопоток. От этого зависит нумерация `<Audio j>`, так
+/// что узнать это надо до прогона — когда пишется промпт.
+pub fn has_audio_stream(path: &Path) -> bool {
+    probe(path).map(|p| p.has_audio).unwrap_or(false)
+}
+
 /// `round()` Питона: половина — к чётному. Эталон округляет им размеры холста.
 pub fn round_half_even(x: f64) -> f64 {
     let r = x.round();

@@ -472,10 +472,13 @@ pub fn denoise_one(
 
     let v_rows_t = patchify_video(&v_lat, patch)?;
     let a_rows_t = pack_audio(&a_lat)?;
-    let v_rows =
-        merge_stream_rows(&v_rows_t, req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
-    let a_rows =
-        merge_stream_rows(&a_rows_t, req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
+    let cast = |t: &Option<Tensor>, like: &Tensor| -> R<Option<Tensor>> {
+        t.as_ref().map(|c| c.to_device(like.device())?.to_dtype(like.dtype())).transpose()
+    };
+    let cond_video = cast(&req.cond_rows.video, &v_rows_t)?;
+    let cond_audio = cast(&req.cond_rows.audio, &a_rows_t)?;
+    let v_rows = merge_stream_rows(&v_rows_t, cond_video.as_ref(), &prep.layout.img_update)?;
+    let a_rows = merge_stream_rows(&a_rows_t, cond_audio.as_ref(), &prep.layout.audio_update)?;
     let v_emb = dit.embed_video(&v_rows)?;
     let a_emb = dit.embed_audio(&a_rows)?;
     let hidden = assemble_hidden(prep, &prep.refined_cond, &v_emb, &a_emb)?;
@@ -531,6 +534,13 @@ pub fn denoise_av(
 
     check_cond_rows("видео", req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
     check_cond_rows("аудио", req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
+    // Cond-строки приходят из VAE в F32 (зашумление считается в нём), целевые
+    // идут в вычислительном типе DiT — приводим один раз, а не на каждом шаге.
+    let cast = |t: &Option<Tensor>| -> R<Option<Tensor>> {
+        t.as_ref().map(|c| c.to_device(device)?.to_dtype(compute)).transpose()
+    };
+    let cond_video = cast(&req.cond_rows.video)?;
+    let cond_audio = cast(&req.cond_rows.audio)?;
 
     let steps = sched.steps();
     let patch = cfg.patch_size;
@@ -550,8 +560,8 @@ pub fn denoise_av(
         }
         let v_rows_t = patchify_video(&v_lat, patch)?;
         let a_rows_t = pack_audio(&a_lat)?;
-        let v_rows = merge_stream_rows(&v_rows_t, req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
-        let a_rows = merge_stream_rows(&a_rows_t, req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
+        let v_rows = merge_stream_rows(&v_rows_t, cond_video.as_ref(), &prep.layout.img_update)?;
+        let a_rows = merge_stream_rows(&a_rows_t, cond_audio.as_ref(), &prep.layout.audio_update)?;
 
         let v_emb = dit.embed_video(&v_rows)?;
         let a_emb = dit.embed_audio(&a_rows)?;

@@ -298,11 +298,63 @@ impl VaeEncoder {
         self.quant_conv.forward(&h)
     }
 
+    /// Клип крупнее этого (в элементах первой активации `ch × T × H × W`)
+    /// кодируется пространственными плитками, как `tiled_encode` эталона:
+    /// 17 кадров 768×1344 — это 2,2 млрд элементов, индексы CUDA-ядер (i32)
+    /// на таком тензоре переполняются, да и гигабайты активаций ни к чему.
+    /// Одиночный кадр генерации остаётся цельным — как и раньше.
+    const TILE_THRESHOLD: usize = 1 << 30;
+
+    fn moments_auto(&self, x: &Tensor) -> R<Tensor> {
+        let d = x.dims();
+        if self.cfg.ch * d[2] * d[3] * d[4] <= Self::TILE_THRESHOLD {
+            return self.moments(x);
+        }
+        let ratio = self.cfg.vae_ratio;
+        let (ys, yl, yo) = split_tiles(d[3], VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
+        let (xs, xl, xo) = split_tiles(d[4], VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
+        let mut rows: Vec<Vec<Tensor>> = Vec::with_capacity(ys.len());
+        for (&y0, &ylen) in ys.iter().zip(&yl) {
+            let mut row = Vec::with_capacity(xs.len());
+            for (&x0, &xlen) in xs.iter().zip(&xl) {
+                let tile = x.narrow(3, y0, ylen)?.narrow(4, x0, xlen)?.contiguous()?;
+                row.push(self.moments(&tile)?);
+            }
+            rows.push(row);
+        }
+        let mut result_rows: Vec<Tensor> = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let mut parts: Vec<Tensor> = Vec::with_capacity(rows[i].len());
+            for j in 0..rows[i].len() {
+                let mut tile = rows[i][j].clone();
+                if i > 0 {
+                    tile = blend_axis(&rows[i - 1][j], &tile, yo[i - 1] / ratio, 3)?;
+                }
+                if j > 0 {
+                    tile = blend_axis(&rows[i][j - 1], &tile, xo[j - 1] / ratio, 4)?;
+                }
+                if i + 1 < rows.len() {
+                    let hl = tile.dims()[3];
+                    tile = tile.narrow(3, 0, hl - yo[i] / ratio)?.contiguous()?;
+                }
+                if j + 1 < rows[i].len() {
+                    let wl = tile.dims()[4];
+                    tile = tile.narrow(4, 0, wl - xo[j] / ratio)?.contiguous()?;
+                }
+                parts.push(tile);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            result_rows.push(Tensor::cat(&refs, 4)?);
+        }
+        let refs: Vec<&Tensor> = result_rows.iter().collect();
+        Tensor::cat(&refs, 3)
+    }
+
     pub fn encode(&self, frames: &Tensor) -> Result<Tensor, H3Error> {
         let x = if frames.rank() == 4 { frames.reshape(shape_insert_t(frames))? } else { frames.clone() };
         let t = x.dims()[2];
         let moments = if t == 1 {
-            let m = self.moments(
+            let m = self.moments_auto(
                 &self.normalize_pixels(&x.to_device(self.device)?.to_dtype(self.dtype)?)?,
             )?;
             let mt = m.dims()[2];
@@ -359,7 +411,7 @@ impl VaeEncoder {
                 c = Tensor::cat(&pads, 2)?;
             }
             let norm = self.normalize_pixels(&c.to_dtype(self.dtype)?)?;
-            parts.push(self.moments(&norm)?);
+            parts.push(self.moments_auto(&norm)?);
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
         let z = Tensor::cat(&refs, 2)?;

@@ -413,19 +413,79 @@ fn causal_mask(n: usize, dtype: DType, device: Device) -> R<Tensor> {
         .map_err(|e| VisionError::Forward(e.to_string()))
 }
 
+/// `x[rows] += feat`. Vision-строки идут сплошными блоками (по блоку на
+/// картинку или группу кадров), поэтому обходимся срезами: индексный тензор
+/// `[rows, hidden]` для `scatter_add` — это сотни мегабайт на референсе в
+/// 2048 px, а собрать его на карте нельзя — бинарных ядер для `U32` нет
+/// (так падало любое кондиционирование картинкой: «cuda binary: dtype»).
 fn scatter_add_rows(x: &Tensor, feat: &Tensor, rows: &[usize]) -> R<Tensor> {
     if rows.is_empty() {
         return Ok(x.clone());
     }
     let e = |r: Result<Tensor, SynaptixError>| r.map_err(|x| VisionError::Forward(x.to_string()));
-    let hidden = x.dims()[1];
-    let idx: Vec<u32> = rows.iter().map(|r| *r as u32).collect();
-    let idx = e(Tensor::from_vec(idx, vec![rows.len(), 1], x.device()))?;
-    let idx = e(idx.broadcast_mul(&e(Tensor::ones(vec![1, hidden], idx.dtype(), x.device()))?))?;
     let feat = if feat.dtype() == x.dtype() {
         feat.clone()
     } else {
         e(feat.to_dtype(x.dtype()))?
     };
-    e(x.scatter_add(0, &idx, &feat))
+    let total = x.dims()[0];
+    let mut parts: Vec<Tensor> = Vec::new();
+    let mut cursor = 0usize;
+    for (start, len, offset) in row_runs(rows) {
+        if start < cursor || start + len > total {
+            return Err(VisionError::Forward(format!(
+                "deepstack: строки {start}..{} вне порядка или за пределами {total}",
+                start + len
+            )));
+        }
+        if start > cursor {
+            parts.push(e(e(x.narrow(0, cursor, start - cursor))?.contiguous())?);
+        }
+        let base = e(e(x.narrow(0, start, len))?.contiguous())?;
+        let add = e(e(feat.narrow(0, offset, len))?.contiguous())?;
+        parts.push(e(base.add(&add))?);
+        cursor = start + len;
+    }
+    if cursor < total {
+        parts.push(e(e(x.narrow(0, cursor, total - cursor))?.contiguous())?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    e(Tensor::cat(&refs, 0))
+}
+
+/// Серии подряд идущих строк: `(первая строка, длина, смещение в feat)`.
+fn row_runs(rows: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < rows.len() {
+        let mut j = i + 1;
+        while j < rows.len() && rows[j] == rows[j - 1] + 1 {
+            j += 1;
+        }
+        runs.push((rows[i], j - i, i));
+        i = j;
+    }
+    runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_runs_split_at_gaps() {
+        assert_eq!(row_runs(&[3, 4, 5, 9, 10, 20]), vec![(3, 3, 0), (9, 2, 3), (20, 1, 5)]);
+        assert!(row_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn scatter_add_rows_adds_blocks_in_place() {
+        synaptix_kernels_cpu::ensure_registered();
+        let x = Tensor::zeros(vec![6, 2], DType::F32, Device::Cpu).unwrap();
+        let feat =
+            Tensor::from_vec(vec![1f32, 1.0, 2.0, 2.0, 3.0, 3.0], vec![3, 2], Device::Cpu).unwrap();
+        let out = scatter_add_rows(&x, &feat, &[1, 2, 4]).unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0]);
+    }
 }
