@@ -45,11 +45,11 @@ impl EncoderHandle {
         }
         let cfg = src.read("config.json")?;
         let tok = src.read("tokenizer.json")?;
-        let weights = DirWeights::from_loader(src.loader(device)?);
+        let weights = std::sync::Arc::new(DirWeights::from_loader(src.loader(device)?));
         let inner = H3Encoder::from_parts(
             &cfg,
             &tok,
-            &weights,
+            weights,
             device,
             compute,
             quant,

@@ -14,7 +14,7 @@ use crate::preprocess::{
     prepare_frame_groups, prepare_tensor, ImageGrid, PreprocessLimits, VideoPixelLimits,
 };
 use crate::presentation::{assemble, EncodedPresentation, H3Presentation};
-use crate::text_model::{build_mrope, rope_positions, TextConfig, TextEncoder, VisionSpan};
+use crate::text_model::{build_mrope, rope_positions, SharedWeights, TextConfig, TextEncoder, VisionSpan};
 
 pub const H3_ENCODER_LAYERS: usize = 50;
 
@@ -84,8 +84,8 @@ impl H3Encoder {
         let tok_path = tokenizer_json.unwrap_or_else(|| dir.join("tokenizer.json"));
         let tok_bytes = std::fs::read(&tok_path)
             .map_err(|e| VisionError::Load(format!("{}: {e}", tok_path.display())))?;
-        let weights = DirWeights::open(dir, device)?;
-        Self::from_parts(&cfg_bytes, &tok_bytes, &weights, device, compute, quant, layers)
+        let weights: SharedWeights = std::sync::Arc::new(DirWeights::open(dir, device)?);
+        Self::from_parts(&cfg_bytes, &tok_bytes, weights, device, compute, quant, layers)
     }
 
     /// Собрать энкодер из уже прочитанных `config.json` / `tokenizer.json` и
@@ -94,7 +94,7 @@ impl H3Encoder {
     pub fn from_parts(
         cfg_bytes: &[u8],
         tokenizer_json: &[u8],
-        weights: &dyn VisionWeights,
+        weights: SharedWeights,
         device: Device,
         compute: DType,
         quant: DType,
@@ -104,8 +104,8 @@ impl H3Encoder {
             .map_err(|e| VisionError::Load(e.to_string()))?;
         let tcfg = TextConfig::from_hf_bytes(cfg_bytes)?;
 
-        let vision = VisionTower::build(vcfg, weights, device, compute)?;
-        let text = TextEncoder::build(tcfg, weights, device, compute, quant, layers)?;
+        let vision = VisionTower::build(vcfg, weights.as_ref(), device, compute)?;
+        let text = TextEncoder::build_shared(tcfg, weights, device, compute, quant, layers)?;
 
         let tokenizer = HfTokenizer::from_bytes(tokenizer_json)
             .map_err(|e| VisionError::Load(format!("tokenizer.json: {e}")))?;

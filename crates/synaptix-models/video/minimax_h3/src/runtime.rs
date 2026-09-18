@@ -12,6 +12,7 @@ static SHIFT_A: AtomicU64 = AtomicU64::new(0);
 
 static MEMORY_MODE: AtomicUsize = AtomicUsize::new(0);
 static NBLOCKS_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LOAD_RESERVE: AtomicUsize = AtomicUsize::new(0);
 static VAE_GRID: AtomicUsize = AtomicUsize::new(0);
 static VAE_TILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -83,6 +84,15 @@ pub fn set_memory_mode(mode: usize) {
 }
 pub fn memory_mode() -> usize {
     MEMORY_MODE.load(Ordering::Relaxed)
+}
+
+/// Сколько VRAM сверх своих нужд загрузка DiT оставляет свободной (под
+/// активации/adaLN-кэш, если вызывающий не держит якорь сам).
+pub fn set_load_reserve_bytes(bytes: usize) {
+    LOAD_RESERVE.store(bytes, Ordering::Relaxed);
+}
+pub fn load_reserve_bytes() -> usize {
+    LOAD_RESERVE.load(Ordering::Relaxed)
 }
 
 pub fn set_nblocks_cap(cap: Option<usize>) {

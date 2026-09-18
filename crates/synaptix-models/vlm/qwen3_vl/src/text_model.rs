@@ -78,6 +78,20 @@ impl TextConfig {
         Self::from_hf_bytes(&bytes)
     }
 
+    /// Размер одного слоя: (в выбранном кванте, плотный в `compute`).
+    pub fn layer_bytes(&self, quant: DType, compute: DType) -> (usize, usize) {
+        let h = self.hidden_size;
+        let numel = h * self.head_dim * (2 * self.num_attention_heads + 2 * self.num_key_value_heads)
+            + 3 * h * self.intermediate_size;
+        let dense = numel * compute.bytes_for_numel(1).max(1);
+        let q = match quant {
+            DType::NVFP4 => numel / 2 + numel / 16,
+            DType::MXFP8 => numel + numel / 32,
+            _ => dense,
+        };
+        (q, dense)
+    }
+
     pub fn group_size(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }
@@ -249,12 +263,35 @@ pub fn rope_positions(seq_len: usize, spans: &[VisionSpan]) -> Vec<[u32; 3]> {
     out
 }
 
+/// Общий источник весов: нужен владеющий, чтобы слои, не влезшие на карту,
+/// читать из него уже во время forward.
+pub type SharedWeights = std::sync::Arc<dyn VisionWeights + Send + Sync>;
+
 pub struct TextEncoder {
     pub config: TextConfig,
     embed: Tensor,
+    /// Резидентный префикс слоёв.
     layers: Vec<Layer>,
+    /// Сколько слоёв всего; слои `layers.len()..num_layers` стримятся.
+    num_layers: usize,
+    weights: Option<SharedWeights>,
+    quant: DType,
     device: Device,
     dtype: DType,
+}
+
+fn free_vram(device: Device) -> Option<usize> {
+    match device {
+        Device::Cuda(ord) => synaptix_core::device::cuda::mem_info(ord).ok().map(|(f, _)| f),
+        _ => None,
+    }
+}
+
+fn trim_pool(device: Device) {
+    if let Device::Cuda(ord) = device {
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
+    }
 }
 
 impl TextEncoder {
@@ -272,10 +309,135 @@ impl TextEncoder {
         for i in 0..n {
             layers.push(Layer::load(weights, i, device, compute, quant)?);
         }
-        Ok(Self { config, embed, layers, device, dtype: compute })
+        Ok(Self { config, embed, layers, num_layers: n, weights: None, quant, device, dtype: compute })
+    }
+
+    /// Как [`Self::build`], но на карту кладётся только то, что влезает:
+    /// остальные слои читаются из `weights` по одному во время forward.
+    /// Проход энкодера по слоям одноразовый, поэтому копия на хосте не
+    /// нужна — слой едет из mmap-источника, считается и освобождается.
+    /// Раньше MXFP8 (~25 ГБ) и dense (~49 ГБ) на карте 24 ГБ падали OOM
+    /// посреди загрузки.
+    pub fn build_shared(
+        config: TextConfig,
+        weights: SharedWeights,
+        device: Device,
+        compute: DType,
+        quant: DType,
+        num_layers: usize,
+    ) -> Result<Self, VisionError> {
+        let n = num_layers.min(config.num_hidden_layers);
+        let embed = weights.tensor(&format!("{LM}.embed_tokens.weight"), device, compute)?;
+        let (lq, ldense) = config.layer_bytes(quant, compute);
+        // Остаток после резидентных слоёв: два стримящихся слоя (текущий +
+        // префетч), сырой вес под квантование и активации (башня зрения на
+        // референсах + внимание по всей презентации).
+        let act = std::env::var("H3_ENCODER_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096)
+            << 20;
+        let reserve = 2 * lq + ldense / 2 + act;
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(free) = free_vram(device) {
+                if free < reserve + lq {
+                    trim_pool(device);
+                    if free_vram(device).unwrap_or(0) < reserve + lq {
+                        eprintln!(
+                            "[qwen3-vl] VRAM кончилась на слое {i}/{n} — слои {i}..{n} стримятся из источника в forward"
+                        );
+                        break;
+                    }
+                }
+            }
+            layers.push(Layer::load(weights.as_ref(), i, device, compute, quant)?);
+        }
+        Ok(Self {
+            config,
+            embed,
+            layers,
+            num_layers: n,
+            weights: Some(weights),
+            quant,
+            device,
+            dtype: compute,
+        })
+    }
+
+    /// Слои по порядку: резидентные как есть, остальные грузятся из
+    /// источника, следующий — параллельно счёту текущего.
+    fn for_each_layer<F>(&self, mut body: F) -> R<()>
+    where
+        F: FnMut(usize, &Layer) -> R<()>,
+    {
+        for (i, l) in self.layers.iter().enumerate() {
+            body(i, l)?;
+        }
+        let first = self.layers.len();
+        let n = self.num_layers;
+        if first >= n {
+            return Ok(());
+        }
+        let Some(weights) = self.weights.as_ref() else {
+            return Err(VisionError::Forward("стриминг слоёв без источника весов".into()));
+        };
+        let (dev, compute, quant) = (self.device, self.dtype, self.quant);
+        let ls = match dev {
+            Device::Cuda(ord) => Some(
+                synaptix_core::device::cuda::loader_stream(ord)
+                    .map_err(|e| VisionError::Forward(e.to_string()))?,
+            ),
+            _ => None,
+        };
+        let load = |idx: usize, on_loader: bool| -> R<Layer> {
+            if let (true, Some(ls)) = (on_loader, ls.as_ref()) {
+                synaptix_core::device::cuda::set_alloc_stream(Some(ls.clone()));
+                let r = Layer::load(weights.as_ref(), idx, dev, compute, quant);
+                let _ = ls.synchronize();
+                synaptix_core::device::cuda::set_alloc_stream(None);
+                r
+            } else {
+                Layer::load(weights.as_ref(), idx, dev, compute, quant)
+            }
+        };
+        let mut staged = Some(load(first, false));
+        for idx in first..n {
+            let cur = match staged.take() {
+                Some(r) => r?,
+                None => unreachable!(),
+            };
+            let load = &load;
+            let (step, next) = std::thread::scope(|sp| {
+                let h = (idx + 1 < n).then(|| sp.spawn(move || load(idx + 1, true)));
+                let step = body(idx, &cur);
+                let next = h.map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(VisionError::Forward("поток префетча слоя упал".into()))
+                    })
+                });
+                (step, next)
+            });
+            // Освобождение слоя стоит в хвосте compute-стрима — без синка пул
+            // берёт под следующий слой новые сегменты.
+            if let Device::Cuda(ord) = dev {
+                if let Ok(cs) = synaptix_core::device::cuda::default_stream(ord) {
+                    let _ = cs.synchronize();
+                }
+            }
+            drop(cur);
+            step?;
+            staged = next;
+        }
+        Ok(())
     }
 
     pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Сколько слоёв лежит на устройстве; остальные стримятся.
+    pub fn resident_layers(&self) -> usize {
         self.layers.len()
     }
 
@@ -311,7 +473,7 @@ impl TextEncoder {
         let e = |r: Result<Tensor, SynaptixError>| r.map_err(|x| VisionError::Forward(x.to_string()));
 
         let mut x = hidden.clone();
-        for (li, layer) in self.layers.iter().enumerate() {
+        self.for_each_layer(|li, layer| {
             if li < deepstack.len() {
                 let (feat, rows) = &deepstack[li];
                 x = scatter_add_rows(&x, feat, rows)?;
@@ -359,7 +521,8 @@ impl TextEncoder {
             let u = layer.up.forward(&h)?;
             let act = e(g.silu_and_mul(&u))?;
             x = e(x.add(&layer.down.forward(&act)?))?;
-        }
+            Ok(())
+        })?;
         Ok(x)
     }
 }

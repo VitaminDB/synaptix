@@ -87,6 +87,10 @@ impl Lin {
         Self(q)
     }
 
+    fn to_device(&self, dev: Device) -> R<Self> {
+        Ok(Self(self.0.to_device(dev)?))
+    }
+
     pub fn forward(&self, x: &Tensor) -> R<Tensor> {
         let rows = x.dims()[0];
         if rows <= LIN_CHUNK_ROWS || !self.0.is_quant() {
@@ -134,6 +138,21 @@ pub struct Attention {
 }
 
 impl Attention {
+    fn to_device(&self, dev: Device) -> R<Self> {
+        Ok(Self {
+            q_proj: self.q_proj.to_device(dev)?,
+            k_proj: self.k_proj.to_device(dev)?,
+            v_proj: self.v_proj.to_device(dev)?,
+            out: self.out.to_device(dev)?,
+            q_norm: self.q_norm.to_device(dev)?,
+            k_norm: self.k_norm.to_device(dev)?,
+            heads: self.heads,
+            head_dim: self.head_dim,
+            eps: self.eps,
+            scale: self.scale,
+        })
+    }
+
     pub fn load(
         ckpt: &H3Checkpoint,
         prefix: &str,
@@ -372,6 +391,10 @@ pub struct Mlp {
 }
 
 impl Mlp {
+    fn to_device(&self, dev: Device) -> R<Self> {
+        Ok(Self { fc1: self.fc1.to_device(dev)?, fc2: self.fc2.to_device(dev)?, ffn: self.ffn })
+    }
+
     pub fn load(
         ckpt: &H3Checkpoint,
         prefix: &str,
@@ -537,6 +560,18 @@ pub struct DiTBlock {
 }
 
 impl DiTBlock {
+    /// Копия блока на другом устройстве: выселение на хост и обратный ввоз
+    /// при стриминге (см. [`H3Dit::for_each_block`]).
+    pub fn to_device(&self, dev: Device) -> R<Self> {
+        Ok(Self {
+            norm1: self.norm1.to_device(dev)?,
+            norm2: self.norm2.to_device(dev)?,
+            attn: self.attn.to_device(dev)?,
+            mlp: self.mlp.to_device(dev)?,
+            eps: self.eps,
+        })
+    }
+
     pub fn load(
         ckpt: &H3Checkpoint,
         idx: usize,
@@ -849,6 +884,8 @@ pub struct H3Dit {
     device: Device,
     compute: DType,
     stream: Option<Arc<H3Checkpoint>>,
+    /// Блоки `host_from..` лежат на хосте и стримятся в forward.
+    host_from: usize,
 }
 
 impl H3Dit {
@@ -876,9 +913,42 @@ impl H3Dit {
         let condition = Lin::load(ckpt, "condition_proj", true, quant, compute)?;
         let token_refiner = TokenRefiner::load(ckpt, &cfg, quant, compute)?;
 
+        // Блоки, которым не хватило VRAM, уезжают на хост и стримятся в
+        // forward. Раньше режим памяти на загрузку не влиял: MXFP8 (~20 ГБ)
+        // и dense (~38 ГБ) на карте 24 ГБ падали OOM посреди загрузки.
+        let mode = crate::memory::H3MemoryMode::current();
+        let cuda = matches!(device, Device::Cuda(_));
+        let (blk_q, blk_dense) = block_bytes(ckpt, quant, compute);
+        // Место, которое должно остаться после резидентных блоков: два
+        // стримящихся блока (текущий + префетч), сырой вес под квантование
+        // и запас на хвост модели.
+        let reserve = 2 * blk_q + blk_dense / 2 + (1usize << 30) + runtime::load_reserve_bytes();
+        let mut host_from = match mode {
+            crate::memory::H3MemoryMode::BlockOffload if cuda => 0,
+            _ => nblocks,
+        };
         let mut blocks = Vec::with_capacity(nblocks);
         for i in 0..nblocks {
-            blocks.push(DiTBlock::load(ckpt, i, &cfg, quant, compute)?);
+            if cuda
+                && host_from == nblocks
+                && mode == crate::memory::H3MemoryMode::Auto
+                && crate::memory::free_vram(device) < reserve + blk_q
+            {
+                host_from = i;
+                eprintln!(
+                    "[h3] VRAM кончилась на блоке {i}/{nblocks} — блоки {i}..{nblocks} на хост, стримятся в forward"
+                );
+            }
+            let blk = DiTBlock::load(ckpt, i, &cfg, quant, compute)?;
+            if i >= host_from {
+                synaptix_core::device::cuda::set_offload_pinned(true);
+                let host = blk.to_device(Device::Cpu);
+                synaptix_core::device::cuda::set_offload_pinned(false);
+                blocks.push(host?);
+                drop(blk);
+            } else {
+                blocks.push(blk);
+            }
             crate::memory::trim_pool(device);
         }
         let final_layer = FinalLayer::load(ckpt, &cfg, compute)?;
@@ -922,7 +992,86 @@ impl H3Dit {
             device,
             compute,
             stream: None,
+            host_from,
         })
+    }
+
+    /// Сколько блоков лежит на устройстве; остальные стримятся с хоста.
+    pub fn resident_blocks(&self) -> usize {
+        self.host_from.min(self.blocks.len())
+    }
+
+    /// Проход по блокам: резидентные как есть, остальные приезжают с хоста,
+    /// следующий префетчится на loader-стриме во время счёта текущего
+    /// (та же схема, что `DecoderModel::for_each_block` у LLM).
+    fn for_each_block<F>(&self, mut body: F) -> R<()>
+    where
+        F: FnMut(usize, &DiTBlock) -> R<()>,
+    {
+        let n = self.blocks.len();
+        let first = self.resident_blocks();
+        let ord = match self.device {
+            Device::Cuda(o) if first < n => o,
+            _ => {
+                for (i, b) in self.blocks.iter().enumerate() {
+                    body(i, b)?;
+                }
+                return Ok(());
+            }
+        };
+        let dev = self.device;
+        for (i, b) in self.blocks[..first].iter().enumerate() {
+            body(i, b)?;
+        }
+        let ls = synaptix_core::device::cuda::loader_stream(ord)?;
+        synaptix_core::device::cuda::set_offload_pinned(true);
+        let mut staged = Some(self.blocks[first].to_device(dev));
+        let mut result = Ok(());
+        for idx in first..n {
+            let cur = match staged.take() {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    result = Err(e);
+                    break;
+                }
+                None => unreachable!(),
+            };
+            let lsc = ls.clone();
+            let (step, next) = std::thread::scope(|sp| {
+                let h = (idx + 1 < n).then(|| {
+                    sp.spawn(move || {
+                        synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
+                        synaptix_core::device::cuda::set_offload_pinned(true);
+                        let r = self.blocks[idx + 1].to_device(dev);
+                        let _ = lsc.synchronize();
+                        synaptix_core::device::cuda::set_offload_pinned(false);
+                        synaptix_core::device::cuda::set_alloc_stream(None);
+                        r
+                    })
+                });
+                let step = body(idx, &cur);
+                let next = h.map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(SynaptixError::Other("h3: поток префетча блока упал".into()))
+                    })
+                });
+                (step, next)
+            });
+            // Освобождение буферов блока стоит в хвосте compute-стрима: без
+            // синка пул считает их занятыми и берёт под следующий блок новые
+            // сегменты (см. тот же комментарий у LLM).
+            if let Ok(cs) = synaptix_core::device::cuda::default_stream(ord) {
+                let _ = cs.synchronize();
+            }
+            drop(cur);
+            if let Err(e) = step {
+                result = Err(e);
+                break;
+            }
+            staged = next;
+        }
+        synaptix_core::device::cuda::set_offload_pinned(false);
+        result
     }
 
     pub fn with_stream(mut self, ckpt: Arc<H3Checkpoint>) -> Self {
@@ -1070,7 +1219,7 @@ impl H3Dit {
             }
         }
         let mut h = hidden.clone();
-        for (i, block) in self.blocks.iter().enumerate() {
+        self.for_each_block(|i, block| {
             let mods = BlockMods::from_cache(cache, i, step)?;
             h = block.forward(&h, &mods, segments, rope, i)?;
             if step == crate::pipeline::dump_step() && (i < 2 || i % 5 == 0) {
@@ -1079,7 +1228,8 @@ impl H3Dit {
             if prof {
                 eprintln!("[h3-blk] блок {i} · {}", crate::pipeline::tensor_stats("h", &h));
             }
-        }
+            Ok(())
+        })?;
         let shift = cache.final_chunk(step, 0)?;
         let scale = cache.final_chunk(step, 1)?;
         let (v, a) = self.final_layer.forward(&h, &shift, &scale, video_seg, audio_seg)?;
@@ -1117,6 +1267,30 @@ fn load_adaln(
     }
     let b = ckpt.get_as(&format!("{prefix}.linear.bias"), DType::F32)?;
     Ok(AdalnProj::new(w, b, expand, modalities, cfg.hidden_size))
+}
+
+/// Размер одного DiT-блока: (в выбранном кванте, плотный в `compute`).
+pub fn block_bytes(ckpt: &H3Checkpoint, quant: DType, compute: DType) -> (usize, usize) {
+    let cbytes = compute.bytes_for_numel(1).max(1);
+    let (mut q, mut dense) = (0usize, 0usize);
+    for (name, dt, shape) in ckpt.infos() {
+        if !name.starts_with("blocks.0.") || name.contains("adaln_proj") {
+            continue;
+        }
+        let numel: usize = shape.iter().product();
+        let d = numel * cbytes;
+        dense += d;
+        let quantizable = shape.len() == 2
+            && name.ends_with(".weight")
+            && (name.contains(".attn.") || name.contains(".mlp."))
+            && dt != DType::F32;
+        q += match quant {
+            DType::NVFP4 if quantizable => numel / 2 + numel / 16,
+            DType::MXFP8 if quantizable => numel + numel / 32,
+            _ => d,
+        };
+    }
+    (q, dense)
 }
 
 pub fn dit_resident_bytes(
