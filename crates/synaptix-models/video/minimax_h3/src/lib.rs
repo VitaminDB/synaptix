@@ -7,6 +7,7 @@ pub mod layout;
 pub mod loader;
 pub mod memory;
 pub mod pipeline;
+pub mod refs;
 pub mod rope;
 pub mod runtime;
 pub mod scheduler;

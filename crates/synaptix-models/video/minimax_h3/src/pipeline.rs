@@ -373,6 +373,20 @@ fn assemble_hidden(
     Tensor::cat(&refs, 0)
 }
 
+/// Раскладка резервирует cond-строки по геометрии референсов, а сами строки
+/// приходят из VAE отдельно — расхождение иначе всплывёт как выход за границы
+/// посреди `merge_stream_rows`.
+fn check_cond_rows(what: &str, cond: Option<&Tensor>, update: &[bool]) -> Result<(), H3Error> {
+    let reserved = update.iter().filter(|u| !**u).count();
+    let have = cond.map(|c| c.dims()[0]).unwrap_or(0);
+    if reserved != have {
+        return Err(H3Error::Layout(format!(
+            "{what}: раскладка ждёт {reserved} cond-строк, закодировано {have} —              ключевые кадры/референсы запроса и их латенты не совпадают"
+        )));
+    }
+    Ok(())
+}
+
 fn merge_stream_rows(
     target: &Tensor,
     cond: Option<&Tensor>,
@@ -514,6 +528,9 @@ pub fn denoise_av(
             (req.init_video.clone().unwrap_or(v), req.init_audio.clone().unwrap_or(a))
         }
     };
+
+    check_cond_rows("видео", req.cond_rows.video.as_ref(), &prep.layout.img_update)?;
+    check_cond_rows("аудио", req.cond_rows.audio.as_ref(), &prep.layout.audio_update)?;
 
     let steps = sched.steps();
     let patch = cfg.patch_size;
@@ -716,7 +733,7 @@ pub fn cond_rows_from_audio_latents(
     Ok(Some(Tensor::cat(&refs, 0)?))
 }
 
-fn apply_noise_aug(rows: &Tensor, aug: f32, seed: u64) -> Result<Tensor, H3Error> {
+pub(crate) fn apply_noise_aug(rows: &Tensor, aug: f32, seed: u64) -> Result<Tensor, H3Error> {
     if aug >= 1.0 {
         return Ok(rows.clone());
     }

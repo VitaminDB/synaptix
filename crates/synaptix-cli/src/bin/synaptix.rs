@@ -638,6 +638,18 @@ enum Commands {
         /// Последний кадр (fl2va).
         #[arg(long)]
         last_frame: Option<PathBuf>,
+        /// Референс (ref2va): картинка, видео или аудио — тип по расширению.
+        /// Повторяется до 12 раз; порядок значим — он задаёт номера
+        /// <Picture i> / <Video k> / <Audio j>, на которые ссылается промпт.
+        #[arg(long = "ref")]
+        refs: Vec<PathBuf>,
+        /// Не брать звуковую дорожку видео-референсов.
+        #[arg(long)]
+        ref_mute_video: bool,
+        /// Размер картинок-референсов: match — до площади кадра, max — 2048
+        /// по короткой стороне, как у выпущенной модели (в разы медленнее).
+        #[arg(long, default_value = "match")]
+        ref_image_size: String,
         #[arg(long, default_value_t = 1344)]
         width: usize,
         #[arg(long, default_value_t = 768)]
@@ -870,12 +882,12 @@ fn main() -> ExitCode {
         }),
         Commands::H3 {
             model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
-            width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
+            refs, ref_mute_video, ref_image_size, width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
             quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
             list_pipelines, variant, device, prof, keep_wav,
         } => h3::run(h3::H3Args {
             model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
-            width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
+            refs, ref_mute_video, ref_image_size, width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
             quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
             list_pipelines, variant, device, prof, keep_wav,
         }),

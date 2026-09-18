@@ -409,6 +409,106 @@ pub fn prepare_video(
     Ok(PreparedVideo { patches: tensor, grid, group_timestamps })
 }
 
+/// Пиксельный бюджет видео у HF-процессора Qwen3-VL: считается по всем кадрам
+/// разом (`t·h·w`), а не по кадру — `video_preprocessor_config.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoPixelLimits {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+}
+
+impl Default for VideoPixelLimits {
+    fn default() -> Self {
+        Self { min_pixels: 4096, max_pixels: 25_165_824 }
+    }
+}
+
+/// `smart_resize` видео-процессора HF: стороны кратны `factor`, бюджет — на
+/// `ceil(frames / tps)·tps` кадров сразу.
+pub fn smart_resize_video(
+    frames: usize,
+    h: usize,
+    w: usize,
+    tps: usize,
+    factor: usize,
+    limits: VideoPixelLimits,
+) -> (usize, usize) {
+    let tps = tps.max(1);
+    let round_to = |v: usize| ((v as f64 / factor as f64).round() as usize).max(1) * factor;
+    let (mut hb, mut wb) = (round_to(h), round_to(w));
+    let tb = frames.max(1).div_ceil(tps) * tps;
+    let src = (frames.max(1) * h * w) as f64;
+    if tb * hb * wb > limits.max_pixels {
+        let beta = (src / limits.max_pixels as f64).sqrt();
+        hb = (((h as f64 / beta) / factor as f64).floor() as usize).max(1) * factor;
+        wb = (((w as f64 / beta) / factor as f64).floor() as usize).max(1) * factor;
+    } else if tb * hb * wb < limits.min_pixels {
+        let beta = (limits.min_pixels as f64 / src).sqrt();
+        hb = (((h as f64 * beta) / factor as f64).ceil() as usize).max(1) * factor;
+        wb = (((w as f64 * beta) / factor as f64).ceil() as usize).max(1) * factor;
+    }
+    (hb, wb)
+}
+
+/// Уже выбранные кадры одного видео (`[3, H, W]` в `[0, 1]`, общий размер) →
+/// по блоку патчей на temporal-группу, каждый со своей сеткой `t = 1`.
+///
+/// Башня считает внимание внутри группы кадров, так что блок на группу даёт те
+/// же признаки, что один проход по всему видео, а презентация H3 как раз
+/// кладёт перед каждой группой свою метку времени. Неполная последняя группа
+/// добивается повтором последнего кадра.
+pub fn prepare_frame_groups(
+    frames: &[Tensor],
+    cfg: &VisionConfig,
+    limits: VideoPixelLimits,
+    device: Device,
+) -> Result<Vec<PreparedImage>, PreprocessError> {
+    let Some(first) = frames.first() else {
+        return Ok(Vec::new());
+    };
+    let dims = first.dims().to_vec();
+    if dims.len() != 3 || dims[0] != 3 {
+        return Err(PreprocessError::Shape(format!("ожидался [3, H, W], получено {dims:?}")));
+    }
+    let (h, w) = (dims[1], dims[2]);
+    let tps = cfg.temporal_patch_size.max(1);
+    let (nh, nw) = smart_resize_video(frames.len(), h, w, tps, cfg.size_factor(), limits);
+
+    let mut chw: Vec<Vec<f32>> = Vec::with_capacity(frames.len());
+    for f in frames {
+        if f.dims() != dims.as_slice() {
+            return Err(PreprocessError::Shape(format!(
+                "кадры видео разного размера: {:?} и {dims:?}",
+                f.dims()
+            )));
+        }
+        let resized = if (nh, nw) == (h, w) {
+            f.clone()
+        } else {
+            synaptix_io::image::augment::resize_bilinear(f, nh, nw)
+                .map_err(|e| PreprocessError::Load(e.to_string()))?
+        };
+        let mut flat = resized
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| PreprocessError::Shape(e.to_string()))?;
+        for v in flat.iter_mut() {
+            *v = (*v - 0.5) / 0.5;
+        }
+        chw.push(flat);
+    }
+
+    let mut out = Vec::with_capacity(chw.len().div_ceil(tps));
+    for group in chw.chunks(tps) {
+        let (patches, grid) = patchify_video(group, 3, nh, nw, cfg);
+        let tensor = Tensor::from_vec(patches, vec![grid.patches(), cfg.patch_features()], device)
+            .map_err(|e| PreprocessError::Shape(e.to_string()))?;
+        out.push(PreparedImage { patches: tensor, grid });
+    }
+    Ok(out)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PreprocessError {
     #[error("image load: {0}")]

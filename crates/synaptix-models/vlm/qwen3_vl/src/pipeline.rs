@@ -10,7 +10,9 @@ use synaptix_tokenizer::{HfTokenizer, Tokenizer as _};
 
 use crate::config::VisionConfig;
 use crate::model::{VisionError, VisionTower, VisionWeights};
-use crate::preprocess::{prepare_tensor, ImageGrid, PreprocessLimits};
+use crate::preprocess::{
+    prepare_frame_groups, prepare_tensor, ImageGrid, PreprocessLimits, VideoPixelLimits,
+};
 use crate::presentation::{assemble, EncodedPresentation, H3Presentation};
 use crate::text_model::{build_mrope, rope_positions, TextConfig, TextEncoder, VisionSpan};
 
@@ -134,6 +136,34 @@ impl H3Encoder {
         let prepared = prepare_tensor(rgb, &self.vision.config, self.limits, self.device)
             .map_err(|e| VisionError::Forward(e.to_string()))?;
         Ok((prepared.patches, prepared.grid))
+    }
+
+    /// Как [`Self::prepare_image`], но со своим пиксельным бюджетом: референсы
+    /// H3 идут в башню крупнее ключевых кадров (до 4096² у HF-процессора).
+    pub fn prepare_image_with(
+        &self,
+        rgb: &Tensor,
+        limits: PreprocessLimits,
+    ) -> Result<(Tensor, ImageGrid), VisionError> {
+        let prepared = prepare_tensor(rgb, &self.vision.config, limits, self.device)
+            .map_err(|e| VisionError::Forward(e.to_string()))?;
+        Ok((prepared.patches, prepared.grid))
+    }
+
+    /// Кадры видео-референса (уже выбранные, `[3, H, W]` в `[0, 1]`) → блок
+    /// патчей на temporal-группу, в порядке следования.
+    pub fn prepare_video_groups(
+        &self,
+        frames: &[Tensor],
+        limits: VideoPixelLimits,
+    ) -> Result<Vec<(Tensor, ImageGrid)>, VisionError> {
+        let groups = prepare_frame_groups(frames, &self.vision.config, limits, self.device)
+            .map_err(|e| VisionError::Forward(e.to_string()))?;
+        Ok(groups.into_iter().map(|g| (g.patches, g.grid)).collect())
+    }
+
+    pub fn temporal_patch_size(&self) -> usize {
+        self.vision.config.temporal_patch_size.max(1)
     }
 
     pub fn encode(

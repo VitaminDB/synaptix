@@ -61,7 +61,11 @@ impl H3Presentation {
                     n_aud += 1;
                     items.push(PresentationItem::Text(format!("<Audio {n_aud}>: ")));
                 }
-                RefItem::Video { blocks } => {
+                RefItem::Video { blocks, with_audio } => {
+                    if *with_audio {
+                        n_aud += 1;
+                        items.push(PresentationItem::Text(format!("<Audio {n_aud}>: ")));
+                    }
                     n_vid += 1;
                     items.push(PresentationItem::Text(format!("<Video {n_vid}>: ")));
                     for b in blocks {
@@ -100,7 +104,9 @@ pub struct VideoBlock {
 pub enum RefItem {
     Image { grid: ImageGrid },
     Audio,
-    Video { blocks: Vec<VideoBlock> },
+    /// `with_audio` — у видео есть своя дорожка: её метка `<Audio j>: ` идёт
+    /// перед `<Video k>: `, в том же порядке, в каком строки лягут в раскладку.
+    Video { blocks: Vec<VideoBlock>, with_audio: bool },
 }
 
 #[derive(Debug, Clone)]

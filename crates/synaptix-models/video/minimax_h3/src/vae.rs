@@ -302,7 +302,9 @@ impl VaeEncoder {
         let x = if frames.rank() == 4 { frames.reshape(shape_insert_t(frames))? } else { frames.clone() };
         let t = x.dims()[2];
         let moments = if t == 1 {
-            let m = self.moments(&self.normalize_pixels(&x.to_dtype(self.dtype)?)?)?;
+            let m = self.moments(
+                &self.normalize_pixels(&x.to_device(self.device)?.to_dtype(self.dtype)?)?,
+            )?;
             let mt = m.dims()[2];
             m.narrow(2, mt - 1, 1)?.contiguous()?
         } else {
@@ -316,14 +318,39 @@ impl VaeEncoder {
     }
 
     fn encode_temporal(&self, x: &Tensor) -> Result<Tensor, H3Error> {
-        let clip = self.cfg.clip_length;
         let total = x.dims()[2];
+        self.moments_by_clips(total, &mut |start, len| {
+            Ok(x.narrow(2, start, len)?.contiguous()?)
+        })
+    }
+
+    /// Видео клип за клипом: `fetch(start, len)` отдаёт `[1, 3, len, H, W]` в
+    /// `[-1, 1]` на любом устройстве. Так 15-секундный референс (гигабайты
+    /// пикселей) не лежит целиком ни на карте, ни во float на хосте.
+    pub fn encode_clips(
+        &self,
+        total: usize,
+        fetch: &mut dyn FnMut(usize, usize) -> Result<Tensor, H3Error>,
+    ) -> Result<Tensor, H3Error> {
+        let z = self.moments_by_clips(total, fetch)?.to_dtype(DType::F32)?;
+        let ch = z.dims()[1] / 2;
+        let mean = z.narrow(1, 0, ch)?.contiguous()?;
+        let (m, s) = self.latent_stats()?;
+        Ok(mean.broadcast_sub(&m)?.broadcast_div(&s)?)
+    }
+
+    fn moments_by_clips(
+        &self,
+        total: usize,
+        fetch: &mut dyn FnMut(usize, usize) -> Result<Tensor, H3Error>,
+    ) -> Result<Tensor, H3Error> {
+        let clip = self.cfg.clip_length;
         let nclips = total.div_ceil(clip);
         let mut parts = Vec::with_capacity(nclips);
         for i in 0..nclips {
             let start = i * clip;
             let len = clip.min(total - start);
-            let mut c = x.narrow(2, start, len)?.contiguous()?;
+            let mut c = fetch(start, len)?.to_device(self.device)?;
             if len < clip {
                 let last = c.narrow(2, len - 1, 1)?.contiguous()?;
                 let mut pads: Vec<&Tensor> = vec![&c];

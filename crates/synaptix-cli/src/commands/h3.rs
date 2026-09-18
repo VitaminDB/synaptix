@@ -14,6 +14,9 @@ pub struct H3Args {
     pub encoder: Option<PathBuf>,
     pub first_frame: Option<PathBuf>,
     pub last_frame: Option<PathBuf>,
+    pub refs: Vec<PathBuf>,
+    pub ref_mute_video: bool,
+    pub ref_image_size: String,
     pub width: usize,
     pub height: usize,
     pub duration: f64,
@@ -79,11 +82,30 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let quant_dit = parse_dtype(args.quant_transformer.as_deref(), DType::NVFP4)?;
     let quant_enc = parse_dtype(args.quant_encoder.as_deref(), DType::NVFP4)?;
 
+    let ref_sources = args
+        .refs
+        .iter()
+        .map(|p| h3::refs::RefSource::from_path(p, !args.ref_mute_video))
+        .collect::<Result<Vec<_>, _>>()?;
+    h3::refs::validate(&ref_sources)?;
+    if !ref_sources.is_empty() && (args.first_frame.is_some() || args.last_frame.is_some()) {
+        return Err("референсы (ref2va) и ключевые кадры (fl2va) — разные чекпойнты, вместе не идут".into());
+    }
+    let ref_image_size = match args.ref_image_size.as_str() {
+        "match" => h3::refs::RefImageSize::Match,
+        "max" => h3::refs::RefImageSize::Max,
+        other => return Err(format!("неизвестный ref-image-size: {other} (match|max)").into()),
+    };
+
     let variant = args
         .variant
         .as_deref()
         .and_then(h3::config::H3Variant::parse)
-        .unwrap_or(h3::config::H3Variant::Fl2va);
+        .unwrap_or(if ref_sources.is_empty() {
+            h3::config::H3Variant::Fl2va
+        } else {
+            h3::config::H3Variant::Ref2va
+        });
     let paths = h3::H3Paths::open_variant(&args.model_dir, variant)?;
 
     let spec = match &args.pipeline {
@@ -141,9 +163,32 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         keyframe_rgb.push(img);
     }
 
+    let ref_media = if ref_sources.is_empty() {
+        Vec::new()
+    } else {
+        eprintln!("[h3] декодирование референсов");
+        let media = h3::refs::decode(
+            &ref_sources,
+            &h3::refs::RefOptions {
+                image_size: ref_image_size,
+                target_width: geometry.width,
+                target_height: geometry.height,
+                frame_count: geometry.frame_count,
+            },
+        )?;
+        for (src, m) in ref_sources.iter().zip(&media) {
+            eprintln!("[h3]   {} — {}", src.path().display(), m.describe());
+        }
+        media
+    };
+
     let merge = encoder.merge_size();
     let grids: Vec<h3::text_encoder::ImageGrid> = images.iter().map(|(_, g)| *g).collect();
-    let presentation = if grids.is_empty() {
+    let presentation = if !ref_media.is_empty() {
+        let inputs = h3::refs::encoder_inputs(&encoder, &ref_media)?;
+        images = inputs.vision;
+        h3::text_encoder::presentation_ref2va(&args.prompt, &inputs.items, merge)
+    } else if grids.is_empty() {
         h3::text_encoder::presentation_t2va(&args.prompt)
     } else {
         h3::text_encoder::presentation_fl2va(&args.prompt, &grids, merge)
@@ -191,6 +236,46 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|(i, _)| h3::layout::Keyframe { resolved_frame_index: *i })
         .collect();
+
+    if !ref_media.is_empty() && !ckpt.config.supports_references() {
+        return Err(format!(
+            "чекпойнт {} — партиция FL2VA, референсы понимает только Ref2VA",
+            paths.transformer_dir().display()
+        )
+        .into());
+    }
+    // Референсы кодируются до загрузки DiT: VAE на кадре 2048 px или на
+    // 15-секундном видео нужна свободная карта.
+    if !ref_media.is_empty() {
+        eprintln!("[h3] кодирование референсов через VAE");
+        let vw = h3::loader::ComponentLoader::open_file(paths.video_vae_file(), device)?;
+        let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config()?, device, compute)?;
+        let has_audio = ref_media.iter().any(|m| match m {
+            h3::refs::RefMedia::Audio(_) => true,
+            h3::refs::RefMedia::Video(v) => v.audio.is_some(),
+            h3::refs::RefMedia::Image(_) => false,
+        });
+        let audio_enc = if has_audio {
+            let aw = h3::loader::ComponentLoader::open_file(paths.audio_vae_file(), device)?;
+            Some(h3::audio_vae::AudioVae::load_full(&aw, ckpt.audio_vae_config()?, device, compute)?)
+        } else {
+            None
+        };
+        let latents = h3::refs::encode_latents(
+            &ref_media,
+            &enc,
+            audio_enc.as_ref(),
+            ckpt.config.patch_size,
+            device,
+            args.seed.unwrap_or(0),
+        )?;
+        drop(enc);
+        drop(audio_enc);
+        h3::memory::trim_pool(device);
+        req.refs = latents.blocks;
+        req.cond_rows = latents.cond_rows;
+    }
+    drop(ref_media);
 
     let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit)?;
     let prep = h3::pipeline::prepare(&dit, &req, &sched)?;
