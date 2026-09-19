@@ -118,24 +118,37 @@ impl GemmaPipeline {
         let config = weights.config.clone();
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
-        // Dense-веса (bf16/f16, без кванта), не влезающие в свободную VRAM с
-        // запасом → host-stream блоков (CPU-резидент + per-block pinned-H2D в
-        // forward): bf16-Gemma 24GB работает text-энкодером на 24GB-карте.
-        // Квант-пути (mxfp8/nvfp4 ~6-12GB) остаются резидентными как раньше.
-        let block_device = if !precision.attn_w.is_quantized() && device.is_cuda() {
+        // Блоки, не влезающие в свободную VRAM с запасом → host-stream (CPU-
+        // резидент + per-block pinned-H2D в forward): bf16-Gemma 24GB работает
+        // text-энкодером на 24GB-карте. Раньше квант-пути (mxfp8/nvfp4 ~6-12GB)
+        // всегда оставались резидентными, и на карте ~7 ГБ LTX падал OOM ещё
+        // при загрузке энкодера; теперь объём считается и для кванта (квант
+        // делается на карте поблочно, на хост едет уже компактный блок).
+        let block_device = if device.is_cuda() {
             let h = dcfg.hidden_size;
             let heads_dim = dcfg.num_attention_heads * dcfg.head_dim;
             let kv_dim = dcfg.num_key_value_heads * dcfg.head_dim;
-            let per_layer = 2 * h * heads_dim + 2 * h * kv_dim + 3 * h * dcfg.intermediate_size;
-            let esz = (precision.compute.size_in_bits() / 8).max(1) as usize;
-            let blocks_bytes = dcfg.num_hidden_layers * per_layer * esz;
+            let esz = (precision.compute.size_in_bits() / 8).max(1) as f64;
+            let bytes_per = |dt: DType| -> f64 {
+                match dt {
+                    DType::NVFP4 => 0.5625,
+                    DType::MXFP8 => 1.03125,
+                    _ => esz,
+                }
+            };
+            let attn = (2 * h * heads_dim + 2 * h * kv_dim) as f64 * bytes_per(precision.attn_w);
+            let mlp = (3 * h * dcfg.intermediate_size) as f64 * bytes_per(precision.mlp_w);
+            let blocks_bytes = (dcfg.num_hidden_layers as f64 * (attn + mlp)) as usize;
             let free = synaptix_core::device::cuda::mem_info(device.ordinal())
                 .map(|(f, _)| f)
                 .unwrap_or(usize::MAX);
             if blocks_bytes + (6usize << 30) > free {
                 eprintln!(
-                    "  Gemma dense {:.1}GB + запас > свободно {:.1}GB → host-stream блоков",
-                    blocks_bytes as f64 / 1e9, free as f64 / 1e9
+                    "  Gemma блоки {:.1}GB ({:?}/{:?}) + запас > свободно {:.1}GB → host-stream блоков",
+                    blocks_bytes as f64 / 1e9,
+                    precision.attn_w,
+                    precision.mlp_w,
+                    free as f64 / 1e9
                 );
                 Some(Device::Cpu)
             } else {

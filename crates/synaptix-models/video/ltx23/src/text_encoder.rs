@@ -349,6 +349,38 @@ impl FeatureExtractorV2 {
 
     /// `states`: 49 тензоров `[1,T,D]`. `valid` `[1,T,1]` (1/0). → `[1,T,out]`.
     fn forward(&self, states: &[Tensor], valid: &Tensor) -> R<Tensor> {
+        let (t, d) = (states[0].dims()[1], states[0].dims()[2]);
+        let l = states.len();
+        // Склейка `[T, D·L]` и её промежуточные копии — по 385 МБ на 1024
+        // токенах; на малой карте (7 ГБ) вместе с весами коннектора их не
+        // уложить. Тогда — порциями по токенам (RMS считается по каждому
+        // токену отдельно, результат тот же); на большой карте путь прежний.
+        let esz = states[0].dtype().bytes_for_numel(1).max(1);
+        let need = 5 * t * d * l * esz + (1usize << 30);
+        let free = match states[0].device() {
+            Device::Cuda(o) => synaptix_core::device::cuda::mem_info(o).map(|(f, _)| f).unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+        if free >= need {
+            return self.forward_part(states, valid, false);
+        }
+        const CHUNK: usize = 128;
+        let mut outs = Vec::with_capacity(t.div_ceil(CHUNK));
+        let mut s0 = 0;
+        while s0 < t {
+            let len = CHUNK.min(t - s0);
+            let part: Vec<Tensor> =
+                states.iter().map(|s| s.narrow(1, s0, len)?.contiguous()).collect::<R<Vec<_>>>()?;
+            outs.push(self.forward_part(&part, &valid.narrow(1, s0, len)?.contiguous()?, true)?);
+            s0 += len;
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        Tensor::cat(&refs, 1)
+    }
+
+    /// `lean` — без транспонированной копии веса агрегатора (1,5 ГБ на
+    /// каждую порцию): GEMM прямо по `[out, in]`.
+    fn forward_part(&self, states: &[Tensor], valid: &Tensor, lean: bool) -> R<Tensor> {
         let (b, t, d) = (states[0].dims()[0], states[0].dims()[1], states[0].dims()[2]);
         let l = states.len();
         // stack по последней оси → [B,T,D,L]
@@ -368,6 +400,9 @@ impl FeatureExtractorV2 {
         let out_dim = self.aggregate.w.dims()[0];
         let scale = ((out_dim as f64 / self.embedding_dim as f64).sqrt()) as f32;
         let rescaled = normed.mul_scalar(scale)?;
+        if lean {
+            return rescaled.contiguous()?.linear_bias_residual(&self.aggregate.w, self.aggregate.b.as_ref(), None);
+        }
         self.aggregate.fwd(&rescaled)
     }
 }
