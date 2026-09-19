@@ -1,7 +1,8 @@
 //! [`SdxlModel`] — держатель четырёх нейрокомпонентов SDXL и двух CLIP-
 //! токенайзеров, плюс кодирование промпта в conditioning для UNet.
 //!
-//! Раскладка HF-директории `stable-diffusion-xl-base-1.0/`:
+//! Источник — HF-каталог или `.syn`-бандл ([`crate::source`]). Раскладка
+//! каталога `stable-diffusion-xl-base-1.0/`:
 //!   text_encoder/   model.fp16.safetensors           CLIP-L  (768, quick_gelu)
 //!   text_encoder_2/ model.fp16.safetensors           bigG    (1280, gelu, +proj)
 //!   unet/           diffusion_pytorch_model.fp16...   UNet2DConditionModel
@@ -16,7 +17,7 @@ use synaptix_nn::text::{ClipTextConfig, ClipTextEncoder};
 use synaptix_nn::unet::{UNet2DConditionConfig, UNet2DConditionModel};
 use synaptix_nn::vae::{AutoencoderKlConfig, KlVae};
 
-use crate::loader::ComponentWeights;
+use crate::source::{self, SdxlSource};
 use crate::tokenizer::ClipTokenizer;
 use crate::SdxlError;
 
@@ -64,54 +65,36 @@ impl SdxlModel {
         dtype: DType,
         quant: DType,
     ) -> Result<Self, SdxlError> {
-        let dir = dir.as_ref();
-
-        let tok_l = ClipTokenizer::from_dir(dir.join("tokenizer"))?;
-        let tok_g = ClipTokenizer::from_dir(dir.join("tokenizer_2"))?;
+        let src = SdxlSource::open(dir)?;
+        let (tok_l, tok_g) = tokenizers(&src)?;
 
         let clip_l = {
-            let w = ComponentWeights::open(
-                dir.join("text_encoder/model.fp16.safetensors"),
-                device,
-                dtype,
-            )?;
-            ClipTextEncoder::load(&ClipTextConfig::clip_l(), "text_model", &|n| w.get(n))?
+            let w = src.weights(source::TEXT_ENCODER)?;
+            ClipTextEncoder::load(&ClipTextConfig::clip_l(), "text_model", &|n| w.get(n, device, dtype))?
         };
 
         let clip_g = {
-            let w = ComponentWeights::open(
-                dir.join("text_encoder_2/model.fp16.safetensors"),
-                device,
-                dtype,
-            )?;
-            let enc =
-                ClipTextEncoder::load(&ClipTextConfig::clip_bigg(), "text_model", &|n| w.get(n))?;
-            let proj = Linear::new(w.get("text_projection.weight")?, None)?;
+            let w = src.weights(source::TEXT_ENCODER_2)?;
+            let get = |n: &str| w.get(n, device, dtype);
+            let enc = ClipTextEncoder::load(&ClipTextConfig::clip_bigg(), "text_model", &get)?;
+            let proj = Linear::new(get("text_projection.weight")?, None)?;
             enc.with_projection(proj)
         };
 
         let unet = {
-            let w = ComponentWeights::open(
-                dir.join("unet/diffusion_pytorch_model.fp16.safetensors"),
-                device,
-                dtype,
-            )?;
+            let w = src.weights(source::UNET)?;
             // Точность весов UNet: quant квантует attn/GEGLU-линейки (resnet/conv dense).
             synaptix_nn::unet::unet_2d_condition::set_unet_precision(quant, dtype);
-            let unet = UNet2DConditionModel::load(&UNet2DConditionConfig::sdxl(), &|n| w.get(n))?;
+            let unet = UNet2DConditionModel::load(&UNet2DConditionConfig::sdxl(), &|n| w.get(n, device, dtype));
             synaptix_nn::unet::unet_2d_condition::set_unet_precision(DType::BF16, DType::BF16);
-            unet
+            unet?
         };
 
         // VAE: F16 переполняется (5-бит экспонента) → BF16 (F32-range, быстрее F32).
         let vae_dtype = if dtype == DType::F16 { DType::BF16 } else { dtype };
         let vae = {
-            let w = ComponentWeights::open(
-                dir.join("vae/diffusion_pytorch_model.fp16.safetensors"),
-                device,
-                vae_dtype,
-            )?;
-            KlVae::load(&AutoencoderKlConfig::sdxl(), &|n| w.get(n))?
+            let w = src.weights(source::VAE)?;
+            KlVae::load(&AutoencoderKlConfig::sdxl(), &|n| w.get(n, device, vae_dtype))?
         };
 
         Ok(Self { clip_l, clip_g, unet, vae, tok_l, tok_g, device, dtype, vae_dtype })
@@ -151,4 +134,16 @@ impl SdxlModel {
 
         Ok(PromptEmbeds { encoder_hidden_states: ehs, pooled })
     }
+}
+
+/// Оба CLIP-токенайзера из источника (`tokenizer/`, `tokenizer_2/`).
+pub fn tokenizers(src: &SdxlSource) -> Result<(ClipTokenizer, ClipTokenizer), SdxlError> {
+    let one = |d: &str| -> Result<ClipTokenizer, SdxlError> {
+        ClipTokenizer::from_parts(
+            &src.read(&format!("{d}/vocab.json"))?,
+            &src.read(&format!("{d}/merges.txt"))?,
+            src.read_opt(&format!("{d}/tokenizer_config.json")).as_deref(),
+        )
+    };
+    Ok((one("tokenizer")?, one("tokenizer_2")?))
 }

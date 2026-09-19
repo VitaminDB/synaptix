@@ -3,19 +3,24 @@
 //! Тяжёлые нейрокомпоненты (CLIP-L + bigG text-энкодеры, UNet2DConditionModel,
 //! AutoencoderKL) живут в [`synaptix_nn`] и проверены bit-exact к HF
 //! diffusers/transformers (см. `tests/ref_{clip,vae,unet}.rs`). Здесь собирается
-//! txt2img-пайплайн поверх них: CLIP-токенайзер ([`tokenizer`]), загрузка весов
-//! из HF-директории ([`loader`]/[`model`]), CFG + Euler-планировщик и VAE-декод
-//! ([`pipeline`]).
+//! пайплайн поверх них: CLIP-токенайзер ([`tokenizer`]), источник весов —
+//! HF-каталог или `.syn`-бандл ([`source`]), Euler SDXL ([`scheduler`]),
+//! txt2img одним вызовом ([`model`]/[`pipeline`], CLI `synaptix imagine`) и
+//! стадии для нод с img2img ([`stages`]).
 
 pub mod config;
-pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod scheduler;
+pub mod source;
+pub mod stages;
 pub mod tokenizer;
 
 pub use config::Txt2ImgParams;
 pub use model::SdxlModel;
 pub use pipeline::SdxlPipeline;
+pub use source::SdxlSource;
+pub use stages::{SdxlCheckpoint, SdxlConditioning, SdxlSampleParams, SdxlUnet};
 pub use tokenizer::ClipTokenizer;
 
 pub type Result<T> = std::result::Result<T, SdxlError>;
@@ -34,4 +39,6 @@ pub enum SdxlError {
     Tensor(#[from] synaptix_core::error::SynaptixError),
     #[error("diffusion: {0}")]
     Diffusion(#[from] synaptix_diffusion::DiffusionError),
+    #[error("отменено")]
+    Cancelled,
 }

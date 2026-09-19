@@ -67,14 +67,7 @@ impl ClipTokenizer {
     /// объект с полем `content`). Возвращает None → дефолт `<|endoftext|>`.
     fn pad_token_from_config(dir: &Path) -> Option<String> {
         let bytes = std::fs::read(dir.join("tokenizer_config.json")).ok()?;
-        let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        match cfg.get("pad_token")? {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => {
-                o.get("content").and_then(|c| c.as_str()).map(str::to_string)
-            }
-            _ => None,
-        }
+        Self::pad_token_from_json(&bytes)
     }
 
     /// `pad_token` = None → паддинг `<|endoftext|>` (дефолт CLIP).
@@ -85,11 +78,32 @@ impl ClipTokenizer {
     ) -> Result<Self, SdxlError> {
         let vocab_bytes = std::fs::read(vocab_path.as_ref())
             .map_err(|e| SdxlError::Tokenizer(format!("vocab.json: {e}")))?;
-        let vocab: HashMap<String, u32> = serde_json::from_slice(&vocab_bytes)
-            .map_err(|e| SdxlError::Tokenizer(format!("vocab.json parse: {e}")))?;
-
         let merges_text = std::fs::read_to_string(merges_path.as_ref())
             .map_err(|e| SdxlError::Tokenizer(format!("merges.txt: {e}")))?;
+        Self::from_bytes(&vocab_bytes, &merges_text, pad_token)
+    }
+
+    /// Из содержимого `vocab.json` / `merges.txt` и `tokenizer_config.json`
+    /// (для `.syn`-бандла, где файлы лежат вспомогательными чанками).
+    pub fn from_parts(vocab_json: &[u8], merges_txt: &[u8], config_json: Option<&[u8]>) -> Result<Self, SdxlError> {
+        let pad = config_json.and_then(Self::pad_token_from_json);
+        let merges = std::str::from_utf8(merges_txt).map_err(|e| SdxlError::Tokenizer(format!("merges.txt: {e}")))?;
+        Self::from_bytes(vocab_json, merges, pad.as_deref())
+    }
+
+    fn pad_token_from_json(bytes: &[u8]) -> Option<String> {
+        let cfg: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        match cfg.get("pad_token")? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => o.get("content").and_then(|c| c.as_str()).map(str::to_string),
+            _ => None,
+        }
+    }
+
+    fn from_bytes(vocab_bytes: &[u8], merges_text: &str, pad_token: Option<&str>) -> Result<Self, SdxlError> {
+        let vocab: HashMap<String, u32> = serde_json::from_slice(vocab_bytes)
+            .map_err(|e| SdxlError::Tokenizer(format!("vocab.json parse: {e}")))?;
+
         let mut bpe_ranks = HashMap::new();
         let mut rank = 0usize;
         for line in merges_text.lines() {
