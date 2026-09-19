@@ -262,6 +262,9 @@ pub fn generate_streaming_resume(
         Some(cap) => chunk.min(cap),
         None => chunk,
     };
+    // MoE с экспертами в RAM: кэш экспертов под префилл уступает место
+    // активациям чанка, под декод — забирает почти всё.
+    model.fit_expert_cache(chunk.min(prompt_len - prefix));
     let t0 = Instant::now();
     let mut last_logits: Option<Tensor> = None;
     let mut off = prefix;
@@ -282,6 +285,7 @@ pub fn generate_streaming_resume(
     out.push(first);
     let mut cancelled = !sink.on_token(first);
 
+    model.fit_expert_cache(1);
     let dec_t0 = Instant::now();
     while !cancelled && out.len() < cfg.max_new_tokens {
         let last = *out.last().unwrap();

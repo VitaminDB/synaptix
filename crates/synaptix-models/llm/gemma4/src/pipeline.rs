@@ -88,7 +88,9 @@ impl Gemma4Pipeline {
         let rope_capacity = max_seq
             .unwrap_or(config.max_position_embeddings)
             .min(config.max_position_embeddings);
-        let model = DecoderModel::build(
+        // `build_auto`: не влезла на карту (OOM) — эксперты уходят в RAM и
+        // ездят через кэш, таблица эмбеддингов — тоже в RAM.
+        let model = DecoderModel::build_auto(
             &dcfg,
             &weights,
             device,
@@ -396,6 +398,7 @@ impl Gemma4Pipeline {
             n => n.max(1),
         };
         let chunk = self.model.max_prefill_chunk().map_or(chunk, |cap| chunk.min(cap));
+        self.model.fit_expert_cache(chunk.min(l - prefix));
         let t0 = std::time::Instant::now();
         let mut last_hidden = None;
         let mut off = prefix;
@@ -427,6 +430,7 @@ impl Gemma4Pipeline {
         let eos = generate::eos_set(&cfg);
         let mut sampler = generate::TokenSampler::new(&cfg, prompt_ids);
         let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        self.model.fit_expert_cache(1);
         let dec_t0 = std::time::Instant::now();
         loop {
             let tok = sampler.sample(&logits).map_err(PipelineError::from)?;

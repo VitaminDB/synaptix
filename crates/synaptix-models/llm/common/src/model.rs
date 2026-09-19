@@ -440,6 +440,11 @@ pub struct DecoderModel {
     pub kv_dtype: DType,
     embed: Option<Tensor>,
     embed_q: Option<QuantWeight>,
+    /// Таблица эмбеддингов в RAM (оффлоад блоков, т.е. модель не влезла):
+    /// строки токенов выбираются на хосте и едут на карту — на декоде это
+    /// одна строка, а VRAM освобождается на всю таблицу (у 248k×5120 — 1.3 ГБ
+    /// в MXFP8, 2.5 ГБ плотно). `embed` и `embed_q` тогда пусты.
+    embed_host: Option<Tensor>,
     embed_norm: Option<Tensor>,
     final_norm: Tensor,
     lm_head: QLinear,
@@ -454,6 +459,11 @@ pub struct DecoderModel {
     /// стримятся по одному во время forward'а с префетчем следующего.
     /// Равно числу блоков — вся модель резидентна (обычный путь).
     resident_blocks: usize,
+    /// MoE, не влезшая на карту: эксперты живут в RAM, на карту едут
+    /// выбранные роутером — через этот общий кэш. Блоки (внимание, плотный
+    /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
+    /// ([`Self::fit_expert_cache`]).
+    expert_cache: Option<std::sync::Arc<crate::moe::ExpertCache>>,
 }
 
 pub struct KvCacheLayer {
@@ -919,8 +929,11 @@ impl DecoderModel {
         match resident(()) {
             Ok(m) => Ok(m),
             Err(e) if is_oom_err(&e) => {
+                // Всё, что успела занять неудачная попытка (веса, транзиенты
+                // кванта), — драйверу, из всех пулов, а не только default.
                 if let Device::Cuda(o) = device {
-                    let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(o);
+                    let _ = synaptix_core::device::cuda::synchronize_all(o);
+                    let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
                 }
                 offload(())
             }
@@ -948,7 +961,20 @@ impl DecoderModel {
     ) -> Result<Self, ModelError> {
         let eps = cfg.rms_norm_eps;
         let one_plus = cfg.norm_gain == NormGain::OnePlus;
-        let b_dev = block_device.unwrap_or(device);
+        // MoE в оффлоаде: стримить блоки она не умеет (`Block::to_device`), да
+        // и незачем — почти весь её вес в экспертах. Блоки остаются на карте,
+        // эксперты уходят в RAM и ездят через кэш.
+        let expert_offload = cfg.moe_branch().is_some()
+            && matches!(device, Device::Cuda(_))
+            && block_device.is_some_and(|d| d.is_cpu());
+        let b_dev = if expert_offload { device } else { block_device.unwrap_or(device) };
+        let expert_cache = expert_offload.then(|| {
+            // Ёмкость на загрузке — минимальная: память нужна весам. Под фазу
+            // её поднимет `fit_expert_cache`; потолок — «сколько влезет».
+            let c = crate::moe::ExpertCache::new(device, 64usize << 30);
+            c.set_capacity(crate::moe::MIN_CACHE_BYTES);
+            c
+        });
 
         // Квантование выполняется на GPU (CPU-backend не реализует quantize_nvfp4/
         // mxfp8), результат кладётся на `b_dev`:
@@ -997,13 +1023,26 @@ impl DecoderModel {
         let prequant_embed = weights
             .quant("model.embed_tokens.weight", device)
             .transpose()?;
-        let mut embed_dense = match prequant_embed {
-            Some(_) => None,
-            None => Some(weights.tensor("model.embed_tokens.weight", device, compute)?),
+        // Оффлоад блоков значит, что модель на карту не влезла: таблица
+        // эмбеддингов тогда живёт в RAM (см. `embed_host`). Упакованную в
+        // бандле таблицу на хосте не выбрать (gather кванта — только ядром),
+        // она и так компактная — остаётся на карте.
+        let embed_on_host = prequant_embed.is_none()
+            && matches!(device, Device::Cuda(_))
+            && block_device.is_some_and(|d| d.is_cpu());
+        let embed_host = if embed_on_host {
+            Some(weights.tensor("model.embed_tokens.weight", Device::Cpu, compute)?)
+        } else {
+            None
+        };
+        let mut embed_dense = match (&prequant_embed, embed_on_host) {
+            (Some(_), _) | (None, true) => None,
+            (None, false) => Some(weights.tensor("model.embed_tokens.weight", device, compute)?),
         };
         let embed_quant = if let Some(q) = prequant_embed {
             Some(q)
         } else if embed_dtype == DType::MXFP8
+            && !embed_on_host
             && !cfg.tie_word_embeddings
             && matches!(device, Device::Cuda(_))
             && cfg.hidden_size % 32 == 0
@@ -1042,9 +1081,16 @@ impl DecoderModel {
             // КАЖДЫЙ токен декода (у Gemma-4 это была седьмая часть шага).
             // Плотный эмбеддинг остаётся для gather'а, квант живёт рядом
             // отдельной копией (NVFP4 — плюс 0.4 ГБ VRAM).
-            let dense = embed_dense
-                .clone()
-                .ok_or_else(|| ModelError::Build("tied lm_head без embed".into()))?;
+            let dense = match &embed_dense {
+                Some(d) => d.clone(),
+                // Таблица на хосте — голове нужна своя копия на карте.
+                None if embed_on_host => weights.tensor(
+                    "model.embed_tokens.weight",
+                    device,
+                    if lm_head_dtype.is_quantized() { DType::F16 } else { compute },
+                )?,
+                None => return Err(ModelError::Build("tied lm_head без embed".into())),
+            };
             if lm_head_dtype.is_quantized() && matches!(device, Device::Cuda(_)) {
                 let f16 = dense
                     .to_dtype(DType::F16)
@@ -1201,9 +1247,19 @@ impl DecoderModel {
                         activation: cfg.activation,
                     };
                     let prefix = format!("model.layers.{l}");
-                    let ffn = crate::moe::MoeFfn::load(
-                        weights, &prefix, mcfg, device, compute, mlp_w,
-                    )?;
+                    let ffn = match &expert_cache {
+                        Some(cache) => crate::moe::MoeFfn::load_offloaded(
+                            weights,
+                            &prefix,
+                            mcfg,
+                            device,
+                            compute,
+                            mlp_w,
+                            cache.clone(),
+                            l,
+                        )?,
+                        None => crate::moe::MoeFfn::load(weights, &prefix, mcfg, device, compute, mlp_w)?,
+                    };
                     Some(MoeSide {
                         router_norm,
                         pre_norm: norm(&key("pre_feedforward_layernorm_2.weight"))?,
@@ -1272,6 +1328,7 @@ impl DecoderModel {
             kv_dtype: compute,
             embed: embed_dense,
             embed_q: embed_quant,
+            embed_host,
             embed_norm,
             final_norm,
             lm_head,
@@ -1280,7 +1337,8 @@ impl DecoderModel {
             rope_local,
             rope_capacity,
             embed_scale: cfg.embed_scale,
-            resident_blocks: if block_device.is_some_and(|d| d != device) { 0 } else { n_blocks },
+            resident_blocks: if b_dev != device { 0 } else { n_blocks },
+            expert_cache,
         })
     }
 
@@ -1587,7 +1645,46 @@ impl DecoderModel {
             || self.lm_head.quant_dtype() == Some(DType::MXFP8)
     }
 
+    /// Кэш экспертов MoE в оффлоаде (см. `expert_cache`).
+    pub fn expert_cache(&self) -> Option<&std::sync::Arc<crate::moe::ExpertCache>> {
+        self.expert_cache.as_ref()
+    }
+
+    /// Подогнать кэш экспертов под фазу: оставить свободными `reserve` байт
+    /// под активации (префилл чанком `tokens` токенов или шаг декода),
+    /// остальное отдать экспертам. Без оффлоада экспертов — ничего.
+    pub fn fit_expert_cache(&self, tokens: usize) {
+        if let Some(cache) = &self.expert_cache {
+            let hidden = self.config.hidden_size.max(1);
+            // Активации чанка: остаток, нормы, внимание, плотный MLP и
+            // выбранные эксперты — с запасом ~64 байта на элемент скрытого
+            // слоя, плюс гигабайт на кэши ядер и слабину пулов.
+            let reserve = (1usize << 30) + tokens * hidden * 64;
+            cache.fit_to_vram(reserve);
+        }
+    }
+
+    /// Таблица эмбеддингов в RAM (см. `embed_host`): device-пути (графы) с
+    /// такой моделью не работают — выбор строк идёт через хост.
+    pub fn embed_on_host(&self) -> bool {
+        self.embed_host.is_some()
+    }
+
+    /// Строки таблицы в RAM → на карту: индексы (их мало) читаются на хост,
+    /// выбранные строки едут одной копией.
+    fn gather_host(&self, table: &Tensor, ids: &Tensor) -> Result<Tensor, ModelError> {
+        let idx = ids.contiguous().and_then(|t| t.to_device(Device::Cpu)).coerr()?;
+        table.index_select(0, &idx).and_then(|r| r.to_device(self.device)).coerr()
+    }
+
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
+        if let Some(table) = &self.embed_host {
+            let mut dims = input_ids.dims().to_vec();
+            let flat = input_ids.contiguous().and_then(|t| t.reshape(vec![input_ids.numel()])).coerr()?;
+            let emb = self.gather_host(table, &flat)?;
+            dims.push(self.config.hidden_size);
+            return emb.reshape(dims).coerr();
+        }
         match (&self.embed_q, &self.embed) {
             (Some(q), _) => {
                 let mut dims = input_ids.dims().to_vec();
@@ -1607,6 +1704,9 @@ impl DecoderModel {
     /// Сырой gather эмбеддингов без `embed_scale`/`embed_rms_norm` — DFlash-драфтер
     /// эмбеддит anchor/mask-токены именно так (норма target'а к ним не применяется).
     pub fn embed_rows(&self, ids_flat: &Tensor) -> Result<Tensor, ModelError> {
+        if let Some(table) = &self.embed_host {
+            return self.gather_host(table, ids_flat);
+        }
         match (&self.embed_q, &self.embed) {
             (Some(q), _) => q.embed_gather(ids_flat).coerr(),
             (None, Some(t)) => t.embed_gather(ids_flat).coerr(),
@@ -2203,6 +2303,9 @@ impl DecoderModel {
         }
         if !self.blocks_all_resident() {
             return no("блоки не резидентны");
+        }
+        if self.embed_on_host() {
+            return no("эмбеддинги в RAM");
         }
         for (i, b) in self.blocks.iter().enumerate() {
             if let Some(m) = &b.moe {

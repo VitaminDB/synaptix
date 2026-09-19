@@ -296,6 +296,7 @@ impl HybridPipeline {
             // адреса их весов меняются — захваченный граф ссылался бы на
             // освобождённую память.
             && self.model.blocks_all_resident()
+            && !self.model.embed_on_host()
     }
 
     /// Захватывать ли MTP-шаг в CUDA-граф. Та же арифметика, что у
@@ -308,6 +309,7 @@ impl HybridPipeline {
         !self.model.has_mxfp8_head_or_embed()
             && self.model.kv_dtype != DType::MXFP8
             && self.model.blocks_all_resident()
+            && !self.model.embed_on_host()
     }
 
 

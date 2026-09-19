@@ -1219,6 +1219,7 @@ impl MusePipeline {
             // Частичный оффлоад: адреса весов меняются каждый ход, граф их
             // захватить не может.
             && self.model.blocks_all_resident()
+            && !self.model.embed_on_host()
     }
 
     pub fn generate_with_graph_streaming(

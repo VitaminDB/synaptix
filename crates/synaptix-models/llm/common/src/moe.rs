@@ -566,7 +566,7 @@ impl synaptix_core::memory::reclaim::Reclaimable for ExpertCache {
 
 /// Ниже этого кэш не ужимаем: без резидентных экспертов каждый токен
 /// перечитывает с диска все свои десять — генерация встаёт.
-const MIN_CACHE_BYTES: usize = 1 << 30;
+pub const MIN_CACHE_BYTES: usize = 1 << 30;
 
 impl CacheInner {
     /// Шаг «часов»: эксперт, к которому обращались с прошлого круга, получает
