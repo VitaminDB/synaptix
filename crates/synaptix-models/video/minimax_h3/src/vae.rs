@@ -491,6 +491,19 @@ struct VitAttention {
 }
 
 impl VitAttention {
+    fn to_dtype(&self, dt: DType) -> R<Self> {
+        Ok(Self {
+            qkv_w: self.qkv_w.to_dtype(dt)?,
+            qkv_b: self.qkv_b.to_dtype(dt)?,
+            out_w: self.out_w.to_dtype(dt)?,
+            out_b: self.out_b.to_dtype(dt)?,
+            heads: self.heads,
+            dim_head: self.dim_head,
+            eps: self.eps,
+            scale: self.scale,
+        })
+    }
+
     fn load(
         w: &ComponentLoader,
         prefix: &str,
@@ -574,6 +587,16 @@ struct VitFeedForward {
 }
 
 impl VitFeedForward {
+    fn to_dtype(&self, dt: DType) -> R<Self> {
+        Ok(Self {
+            w1: self.w1.to_dtype(dt)?,
+            b1: self.b1.to_dtype(dt)?,
+            w2: self.w2.to_dtype(dt)?,
+            b2: self.b2.to_dtype(dt)?,
+            inner: self.inner,
+        })
+    }
+
     fn load(w: &ComponentLoader, prefix: &str, dtype: DType) -> Result<Self, H3Error> {
         let w1 = w.get_as(&format!("{prefix}.w1.weight"), dtype)?;
         let inner = w1.dims()[0] / 2;
@@ -610,6 +633,18 @@ struct VitBlock {
 }
 
 impl VitBlock {
+    fn to_dtype(&self, dt: DType) -> R<Self> {
+        Ok(Self {
+            norm1: self.norm1.to_dtype(dt)?,
+            norm2: self.norm2.to_dtype(dt)?,
+            scale1: self.scale1.to_dtype(dt)?,
+            scale2: self.scale2.to_dtype(dt)?,
+            attn: self.attn.to_dtype(dt)?,
+            ff: self.ff.to_dtype(dt)?,
+            eps: self.eps,
+        })
+    }
+
     fn load(
         w: &ComponentLoader,
         idx: usize,
@@ -656,7 +691,11 @@ pub struct VaeDecoder {
     x_embed_w: Tensor,
     x_embed_b: Tensor,
     register_tokens: Tensor,
+    /// Резидентный префикс ViT-блоков; остальные (`blocks.len()..num_layers`)
+    /// читаются из `stream` в каждом проходе — на малой карте 36 блоков
+    /// (~4,5 ГБ в BF16) рядом с активациями не помещаются.
     blocks: Vec<VitBlock>,
+    stream: Option<std::sync::Arc<ComponentLoader>>,
     norm_out_w: Tensor,
     norm_out_b: Tensor,
     proj_out_w: Tensor,
@@ -675,8 +714,29 @@ impl VaeDecoder {
         dtype: DType,
     ) -> Result<Self, H3Error> {
         let vit = cfg.vit_decoder_kwargs.clone();
+        // Блоки на карту, пока свободной VRAM хватает на запас (активации
+        // тайла, два стримящихся блока, рабочий стол); остальные — из
+        // источника в проходе. На большой карте всё резидентно, как раньше.
+        let blk = {
+            let d = vit.dim();
+            let el = dtype.bytes_for_numel(1).max(1);
+            (4 * d * d + 3 * d * 4 * d) * el
+        };
+        let reserve = 2 * blk + (3usize << 30);
         let mut blocks = Vec::with_capacity(vit.num_layers);
+        let mut stream = None;
         for i in 0..vit.num_layers {
+            if device.is_cuda() && crate::memory::free_vram(device) < reserve + blk {
+                crate::memory::trim_pool(device);
+                if crate::memory::free_vram(device) < reserve + blk {
+                    eprintln!(
+                        "[h3-vae] VRAM: на карте {i}/{} ViT-блоков, остальные читаются из бандла в проходе",
+                        vit.num_layers
+                    );
+                    stream = Some(std::sync::Arc::new(w.duplicate()));
+                    break;
+                }
+            }
             blocks.push(VitBlock::load(w, i, &vit, dtype)?);
         }
         Ok(Self {
@@ -685,6 +745,7 @@ impl VaeDecoder {
             x_embed_b: w.get_as("decoder.x_embedder.bias", dtype)?,
             register_tokens: w.get_as("decoder.register_tokens", dtype)?,
             blocks,
+            stream,
             norm_out_w: w.get_as("decoder.norm_out.weight", dtype)?,
             norm_out_b: w.get_as("decoder.norm_out.bias", dtype)?,
             proj_out_w: w.get_as("decoder.proj_out.weight", dtype)?,
@@ -708,6 +769,67 @@ impl VaeDecoder {
         let std = Tensor::from_vec(IMAGENET_STD.to_vec(), vec![1, 3, 1, 1, 1], x.device())?;
         let y = x.to_dtype(DType::F32)?;
         y.broadcast_mul(&std)?.broadcast_add(&mean)?.clamp(0.0, 1.0)
+    }
+
+    /// Блоки по порядку: резидентные как есть, остальные грузятся из
+    /// источника, следующий — на loader-стриме параллельно счёту текущего.
+    fn for_each_block<F>(&self, mut body: F) -> R<()>
+    where
+        F: FnMut(usize, &VitBlock) -> R<()>,
+    {
+        for (i, b) in self.blocks.iter().enumerate() {
+            body(i, b)?;
+        }
+        let first = self.blocks.len();
+        let n = self.vit.num_layers;
+        let Some(w) = self.stream.as_ref().filter(|_| first < n) else {
+            return Ok(());
+        };
+        let (dev, dt, vit) = (self.device, self.dtype, &self.vit);
+        // Поток префетча грузит веса в типе файла (только H2D на
+        // loader-стриме, с синком); приведение к `dt` — уже здесь, на
+        // compute-стриме: ядро приведения, запущенное из потока префетча,
+        // не ждало копию на loader-стриме и читало мусор (кадр из шума).
+        let native = w.tensor_dtype("decoder.transformer_blocks.0.norm1.weight").unwrap_or(dt);
+        let ls = match dev {
+            Device::Cuda(o) => Some(synaptix_core::device::cuda::loader_stream(o)?),
+            _ => None,
+        };
+        let load = |idx: usize, on_loader: bool| -> R<VitBlock> {
+            let r = if let (true, Some(ls)) = (on_loader, ls.as_ref()) {
+                synaptix_core::device::cuda::set_alloc_stream(Some(ls.clone()));
+                let r = VitBlock::load(w, idx, vit, native);
+                let _ = ls.synchronize();
+                synaptix_core::device::cuda::set_alloc_stream(None);
+                r
+            } else {
+                VitBlock::load(w, idx, vit, native)
+            };
+            r.map_err(|e| SynaptixError::Other(e.to_string()))
+        };
+        let mut staged = Some(load(first, false));
+        for idx in first..n {
+            let raw = staged.take().expect("staged")?;
+            let cur = if native == dt { raw } else { raw.to_dtype(dt)? };
+            let load = &load;
+            let (step, next) = std::thread::scope(|sp| {
+                let h = (idx + 1 < n).then(|| sp.spawn(move || load(idx + 1, true)));
+                let step = body(idx, &cur);
+                let next = h.map(|h| {
+                    h.join().unwrap_or_else(|_| Err(SynaptixError::Other("h3-vae: поток префетча блока упал".into())))
+                });
+                (step, next)
+            });
+            if let Device::Cuda(o) = dev {
+                if let Ok(cs) = synaptix_core::device::cuda::default_stream(o) {
+                    let _ = cs.synchronize();
+                }
+            }
+            drop(cur);
+            step?;
+            staged = next;
+        }
+        Ok(())
     }
 
     fn vit_forward(&self, z: &Tensor) -> R<Tensor> {
@@ -735,12 +857,13 @@ impl VaeDecoder {
         let rope = RopeTables::from_angles(angles, s + nreg + 1, half, x.device())
             .map_err(err_tensor)?;
 
-        for (bi, b) in self.blocks.iter().enumerate() {
+        self.for_each_block(|bi, b| {
             x = b.forward(&x, &rope)?;
             if bi == 0 {
                 crate::pipeline::dump_tensor("vit_blk0", &x);
             }
-        }
+            Ok(())
+        })?;
         crate::pipeline::dump_tensor("vit_last", &x);
 
         let x = x.narrow(0, 0, s)?.contiguous()?;

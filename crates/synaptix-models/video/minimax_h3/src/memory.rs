@@ -152,9 +152,12 @@ pub fn free_vram(device: Device) -> usize {
     }
 }
 
+/// Вернуть драйверу свободное во всех пулах устройства: активации стадий
+/// лежат в пуле активаций, который сам ничего не отдаёт, а
+/// `hard_trim_cuda_mempool_device` трогает только default-пул.
 pub fn trim_pool(device: Device) {
     if let Device::Cuda(ord) = device {
         let _ = synaptix_core::device::cuda::synchronize_all(ord);
-        let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
     }
 }

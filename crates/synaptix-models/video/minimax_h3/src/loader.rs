@@ -280,6 +280,16 @@ pub struct ComponentLoader {
 }
 
 impl ComponentLoader {
+    /// Тип тензора в файле (без загрузки).
+    pub fn tensor_dtype(&self, name: &str) -> Option<DType> {
+        self.loader.tensor_info(name).map(|i| i.dtype)
+    }
+
+    /// Копия с общим mmap (для стриминга весов из другого потока).
+    pub fn duplicate(&self) -> Self {
+        Self { loader: self.loader.clone_with_device(self.device), device: self.device }
+    }
+
     pub fn open_file(path: impl AsRef<Path>, device: Device) -> Result<Self, H3Error> {
         let path = path.as_ref();
         if !path.exists() {
