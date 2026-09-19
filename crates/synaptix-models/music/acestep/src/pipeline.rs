@@ -145,8 +145,12 @@ pub fn denoise(
         (None, None)
     };
 
-    let graph_ok = x_init.dims()[1] <= 8192;
-    if cfg && !opts.dcw.is_active() && !dit.is_quantized() && graph_ok {
+    // Захват денойза CUDA-графом сейчас падает при синке графа
+    // (CUDA_ERROR_ILLEGAL_INSTRUCTION, плотный DiT с CFG — и на HEAD до
+    // стриминга слоёв), а обычный путь даёт тот же звук бит в бит и почти
+    // так же быстро (8 шагов 0,3 с). Граф — только по SYN_ACESTEP_GRAPH=1.
+    let graph_ok = x_init.dims()[1] <= 8192 && std::env::var("SYN_ACESTEP_GRAPH").is_ok_and(|v| v == "1");
+    if cfg && !opts.dcw.is_active() && !dit.is_quantized() && dit.fully_resident() && graph_ok {
         if let synaptix_core::device::Device::Cuda(ord) = x_init.device() {
             return denoise_graph(
                 dit,
