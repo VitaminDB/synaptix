@@ -101,10 +101,32 @@ mod inner {
     /// Compute-стрим для ядра по home-стриму его входа: loader-стрим (H2D весов)
     /// никогда не исполняет ядра — перенаправляем на default; остальные стримы
     /// (default, capture-стрим CUDA-графа) сохраняются как есть.
+    ///
+    /// Ядро, запущенное из САМОГО потока префетча (на нём стоит override
+    /// alloc-стрима = loader), читает вход, который ещё едет на loader-стриме:
+    /// поток префетча приводит тип или квантует сразу после копии. Тогда
+    /// default сначала ждёт всё, что поставлено в loader до этой точки
+    /// (событие + `cuStreamWaitEvent`), — иначе ядро читало недокопированный
+    /// вес и тихо выдавало мусор (кадр H3 из шума 19.09.2026; тот же риск у
+    /// стриминга слоёв энкодера qwen3_vl с квантом и у плотного оффлоада
+    /// LTX: `scale_shift_table` в F32, слияние LoRA). Ядра основного потока
+    /// по уже приехавшим весам (их home-стрим тоже loader) не ждут: поток
+    /// префетча синкнул loader до передачи, а ожидание здесь сериализовало бы
+    /// счёт со стримом следующего блока.
     pub fn compute_stream_for(src: &Arc<CudaStream>, ordinal: usize) -> Result<Arc<CudaStream>> {
         if let Some(l) = LOADER_STREAMS.read().get(&ordinal) {
             if Arc::ptr_eq(l, src) {
-                return default_stream(ordinal);
+                let d = default_stream(ordinal)?;
+                let from_prefetch = ALLOC_STREAM_OVERRIDE
+                    .with(|c| c.borrow().as_ref().is_some_and(|s| Arc::ptr_eq(s, l)));
+                if from_prefetch {
+                    let ev = src
+                        .record_event(None)
+                        .map_err(|e| SynaptixError::Cuda(format!("loader→compute: событие: {e:?}")))?;
+                    d.wait(&ev)
+                        .map_err(|e| SynaptixError::Cuda(format!("loader→compute: ожидание: {e:?}")))?;
+                }
+                return Ok(d);
             }
         }
         Ok(src.clone())
