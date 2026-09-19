@@ -267,6 +267,42 @@ pub type NGramTableFactory<'a> = dyn Fn(usize) -> Result<Box<dyn NGramRows>, Mod
 pub enum EmbedTable {
     Dense(Tensor),
     Quant(QuantWeight),
+    /// Плотная таблица в RAM: строки токенов выбираются на хосте и едут на
+    /// карту. Малая карта — таблица (248k×2560, 0,64 ГБ в MXFP8) там лишняя.
+    Host(Tensor),
+}
+
+/// Держать ли таблицу эмбеддингов в RAM: на карте, где до загрузки свободно
+/// меньше 16 ГБ (модель там и так едва помещается рядом с кэшем экспертов).
+/// `SYN_QWEN4EXP_EMBED_HOST=1|0` — принудительно.
+fn embed_on_host(device: Device) -> bool {
+    if let Ok(v) = std::env::var("SYN_QWEN4EXP_EMBED_HOST") {
+        return v.trim() == "1";
+    }
+    match device {
+        Device::Cuda(o) => synaptix_core::device::cuda::mem_info(o)
+            .map(|(free, _)| free < (16usize << 30))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Квантованная таблица → плотная в RAM: строки деквантуются тем же
+/// gather-ядром на карте, порциями (пик — порция, а не таблица).
+fn dequant_to_host(q: &QuantWeight, rows: usize, device: Device, compute: DType) -> Result<Tensor, ModelError> {
+    const CHUNK: usize = 8192;
+    let mut parts = Vec::with_capacity(rows.div_ceil(CHUNK));
+    let mut start = 0usize;
+    while start < rows {
+        let n = CHUNK.min(rows - start);
+        let ids: Vec<u32> = (start as u32..(start + n) as u32).collect();
+        let idx = coerr(Tensor::from_vec(ids, vec![n], device))?;
+        let part = coerr(q.embed_gather(&idx).and_then(|t| t.to_dtype(compute)).and_then(|t| t.to_device(Device::Cpu)))?;
+        parts.push(part);
+        start += n;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    coerr(Tensor::cat(&refs, 0))
 }
 
 pub struct Qwen4ExpModel {
@@ -319,14 +355,23 @@ impl Qwen4ExpModel {
         expert_source: Option<Arc<dyn ExpertSource>>,
     ) -> Result<Self, ModelError> {
         let embed_key = format!("{LM_PREFIX}.embed_tokens.weight");
+        let host = embed_on_host(device) && !cfg.tie_word_embeddings;
         let embed = match weights.quant(&embed_key, device) {
+            Some(q) if host => {
+                let q = q?;
+                let t = dequant_to_host(&q, cfg.vocab_size, device, compute)?;
+                drop(q);
+                eprintln!("[qwen4_exp] таблица эмбеддингов в RAM ({:.2} ГБ): на карте для неё мало места", (t.numel() * 2) as f64 / 1e9);
+                EmbedTable::Host(t)
+            }
             Some(q) => EmbedTable::Quant(q?),
+            None if host => EmbedTable::Host(weights.tensor(&embed_key, Device::Cpu, compute)?),
             None => EmbedTable::Dense(weights.tensor(&embed_key, device, compute)?),
         };
         let lm_head = if cfg.tie_word_embeddings {
             match &embed {
                 EmbedTable::Dense(t) => QLinear::build(t.clone(), compute, compute)?,
-                EmbedTable::Quant(_) => {
+                EmbedTable::Quant(_) | EmbedTable::Host(_) => {
                     return Err(ModelError::Build(
                         "tie_word_embeddings с квантованными эмбеддингами не поддержан".into(),
                     ))
@@ -630,6 +675,10 @@ impl Qwen4ExpModel {
     }
 
     pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor, ModelError> {
+        if let EmbedTable::Host(t) = &self.embed {
+            let ids = coerr(Tensor::from_vec(tokens.to_vec(), vec![tokens.len()], Device::Cpu))?;
+            return coerr(t.index_select(0, &ids).and_then(|r| r.to_device(self.device)));
+        }
         let ids = Tensor::from_vec(tokens.to_vec(), vec![tokens.len()], self.device)
             .map_err(|e| ModelError::Forward(e.to_string()))?;
         match &self.embed {
@@ -638,6 +687,7 @@ impl Qwen4ExpModel {
                 let rows = coerr(q.embed_gather(&ids))?;
                 coerr(rows.to_dtype(self.compute))
             }
+            EmbedTable::Host(_) => unreachable!("разобран выше"),
         }
     }
 

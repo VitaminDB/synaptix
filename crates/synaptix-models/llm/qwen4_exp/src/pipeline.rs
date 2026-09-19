@@ -580,6 +580,10 @@ impl Qwen4ExpPipeline {
         // слоя, поэтому мелкий чанк означает лишний полный прогон весов через
         // шину. Внешнюю настройку (её ставят ради пика VRAM у плотных
         // моделей) поднимаем до своего минимума, но не опускаем ниже неё.
+        if let Some(small) = self.small_card_chunk() {
+            cfg.prefill_batch = small;
+            return cfg;
+        }
         let want = prefill_chunk();
         if cfg.prefill_batch < want {
             if cfg.prefill_batch > 0 {
@@ -592,6 +596,29 @@ impl Qwen4ExpPipeline {
             cfg.prefill_batch = want;
         }
         cfg
+    }
+
+    /// Малая карта: если на старте хода доступно (свободно плюс то, что
+    /// держит кэш экспертов) меньше 3,5 ГБ, чанк префилла — 256 токенов.
+    /// Учёт активаций здесь грубый (арена экспертов растёт slab'ами по
+    /// 256 МБ), поэтому порог — по замерам: на карте 7 ГБ после загрузки
+    /// свободно 2,9 ГБ — чанк 512 падает OOM в групповом GEMM экспертов, 256
+    /// проходит; при 9 ГБ (4,2 ГБ свободно) проходит и чанк по умолчанию.
+    /// `SYN_QWEN4EXP_PREFILL_CHUNK` сильнее.
+    fn small_card_chunk(&self) -> Option<usize> {
+        if std::env::var("SYN_QWEN4EXP_PREFILL_CHUNK").is_ok() {
+            return None;
+        }
+        let Device::Cuda(ord) = self.model.device else { return None };
+        let free = synaptix_core::device::cuda::mem_info(ord).ok()?.0;
+        let held = self.model.expert_cache().map(|c| c.used_bytes()).unwrap_or(0);
+        (free + held < (7usize << 29)).then(|| {
+            eprintln!(
+                "[qwen4_exp] малая карта: доступно {:.1} ГБ — чанк префилла 256 токенов",
+                (free + held) as f64 / (1u64 << 30) as f64
+            );
+            256
+        })
     }
 
     pub fn generate(
