@@ -246,3 +246,78 @@ fn tokens_match() {
     let ours = tok.encode(&p).unwrap();
     assert_eq!(ours.ids, ids);
 }
+
+/// Урезанный DiT dev (1 double + 1 single блок на настоящих весах, все
+/// эмбеддеры, guidance-эмбеддинг, модуляция, финал) против diffusers:
+/// `scripts/reference/gen_flux2_dev_mini.py`. 32B целиком на CPU не поднять,
+/// а guidance-эмбеддинг есть только у dev — его klein не проверяет.
+///
+/// ```sh
+/// FLUX2_DEV=…/flux.2-dev.syn FLUX2_DEV_MINI_REF=…/refout/dev_mini \
+///   cargo test --release -p synaptix-image-flux2 --test reference dev_mini -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn dev_mini_dit_matches() {
+    let (Ok(model), Ok(refd)) = (std::env::var("FLUX2_DEV"), std::env::var("FLUX2_DEV_MINI_REF")) else {
+        return;
+    };
+    synaptix_kernels_cuda::cuda_backend::ensure_registered();
+    synaptix_kernels_cpu::ensure_registered();
+    let refd = PathBuf::from(refd);
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(refd.join("mini.json")).unwrap()).unwrap();
+    let (sigma, guidance) = (meta["sigma"].as_f64().unwrap() as f32, meta["guidance"].as_f64().unwrap() as f32);
+    let (h, w, l) = (
+        meta["h"].as_u64().unwrap() as usize,
+        meta["w"].as_u64().unwrap() as usize,
+        meta["txt"].as_u64().unwrap() as usize,
+    );
+    let src = synaptix_image_flux2::Flux2Source::open(&model).unwrap();
+    let mut cfg = synaptix_image_flux2::Flux2Model::open(&model, Device::Cuda(0), DType::BF16, DType::BF16)
+        .unwrap()
+        .config()
+        .clone();
+    assert!(cfg.guidance_embeds, "это не dev: нет guidance-эмбеддинга");
+    cfg.num_layers = 1;
+    cfg.num_single_layers = 1;
+    let dev = Device::Cuda(0);
+    // FLUX2_MINI_F32=1 — счёт в F32: вклад guidance мал, и в BF16 его
+    // заметно шумит округление.
+    let dt = if std::env::var("FLUX2_MINI_F32").is_ok_and(|v| v == "1") { DType::F32 } else { DType::BF16 };
+    let weights = src.weights(synaptix_image_flux2::source::TRANSFORMER).unwrap();
+    let t = synaptix_image_flux2::Flux2Transformer::load(
+        &weights,
+        &cfg,
+        dev,
+        dt,
+        dt,
+        Placement::Resident,
+        l + h * w,
+    )
+    .unwrap();
+    let (img, is) = load_ref(&refd, "mini_img");
+    let (txt, ts) = load_ref(&refd, "mini_txt");
+    let img = Tensor::from_vec(img, is, dev).unwrap().to_dtype(dt).unwrap();
+    let txt = Tensor::from_vec(txt, ts, dev).unwrap().to_dtype(dt).unwrap();
+    let mut ids: Vec<[f64; 4]> = (0..l).map(|i| [0.0, 0.0, 0.0, i as f64]).collect();
+    for y in 0..h {
+        for x in 0..w {
+            ids.push([0.0, y as f64, x as f64, 0.0]);
+        }
+    }
+    let (c, s) = build_rope(&ids, &cfg.axes_dims, cfg.rope_theta, dev).unwrap();
+    let v = t.forward(&img, &txt, sigma, Some(guidance), &c, &s).unwrap();
+    let (r, _) = load_ref(&refd, "mini_out");
+    let (cos, rel, mx) = compare(&to_vec(&v), &r);
+    eprintln!("dev mini DiT {dt:?} (guidance {guidance}): cos {cos:.6} rel {rel:.4} max {mx:.3}");
+    // Вклад guidance в одном блоке мал (косинус выходов g=4 и g=1 ~0,99997),
+    // поэтому отдельно сверяется именно он: разность выходов g=4 − g=1.
+    let v1 = t.forward(&img, &txt, sigma, Some(1.0), &c, &s).unwrap();
+    let (r1, _) = load_ref(&refd, "mini_out_g1");
+    let ours: Vec<f32> = to_vec(&v).iter().zip(to_vec(&v1)).map(|(a, b)| a - b).collect();
+    let theirs: Vec<f32> = r.iter().zip(&r1).map(|(a, b)| a - b).collect();
+    let (dcos, drel, _) = compare(&ours, &theirs);
+    eprintln!("  вклад guidance (g=4 − g=1): cos {dcos:.6} rel {drel:.4}");
+    assert!(cos > 0.999, "cos {cos}");
+    assert!(dcos > 0.99, "вклад guidance: cos {dcos}");
+}
