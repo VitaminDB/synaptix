@@ -216,7 +216,26 @@ impl VaeAttention {
         let k = self.to_k.forward(&seq)?.reshape(vec![b, 1, hw, c])?;
         let v = self.to_v.forward(&seq)?.reshape(vec![b, 1, hw, c])?;
         let scale = 1.0 / (self.channels as f32).sqrt();
-        let attn = scaled_dot_attention(&q, &k, &v, scale, None)?;
+        // Одна голова на всё полотно: при 1024² (латент 128×128) матрица
+        // очков `[HW, HW]` в F32 — 1 ГБ, и ещё столько же у softmax. Порции
+        // по запросам дают тот же результат (softmax идёт по ключам каждой
+        // строки) при памяти ~Q_CHUNK·HW: VAE-декод 1024² на карте 7 ГБ
+        // рядом с удержанным DiT падал OOM ровно здесь.
+        const Q_CHUNK: usize = 2048;
+        let attn = if hw > 2 * Q_CHUNK {
+            let mut parts = Vec::with_capacity(hw.div_ceil(Q_CHUNK));
+            let mut start = 0;
+            while start < hw {
+                let len = Q_CHUNK.min(hw - start);
+                let qc = q.narrow(2, start, len)?.contiguous()?;
+                parts.push(scaled_dot_attention(&qc, &k, &v, scale, None)?);
+                start += len;
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 2)?
+        } else {
+            scaled_dot_attention(&q, &k, &v, scale, None)?
+        };
         let attn = attn.reshape(vec![b, hw, c])?;
         let out = self.to_out.forward(&attn)?;
         // [B,HW,C] -> [B,C,HW] -> [B,C,H,W]
