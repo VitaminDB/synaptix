@@ -40,9 +40,9 @@ impl BundleWeightSource {
 }
 
 impl WeightSource for BundleWeightSource {
-    fn tensor(&self, key: &str, _device: Device, dtype: DType) -> Result<Tensor, ModelError> {
+    fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, ModelError> {
         self.loader
-            .get(self.resolve(key), dtype)
+            .get_on(self.resolve(key), device, dtype)
             .map_err(|e| ModelError::Load(e.to_string()))
     }
     fn contains(&self, key: &str) -> bool {
@@ -123,11 +123,48 @@ impl AceStepLm {
             config.intermediate_size
         );
         let dcfg = to_decoder_config(&config);
-        let model = DecoderModel::build(
+        // Не влезла на карту (4B в BF16 — 8,4 ГБ) — блоки уходят на хост и
+        // стримятся, таблица эмбеддингов — в RAM.
+        let model = DecoderModel::build_auto(
             &dcfg, &src, device, compute, quant_w, quant_w, compute, compute, rope_capacity,
         )
         .map_err(|e| AceError::Load(e.to_string()))?;
         Ok(Self { model, config, device, compute })
+    }
+
+    /// LM не влезла и стримит блоки с хоста: на время AR вернуть на карту
+    /// столько блоков, сколько влезет, оставив `reserve` байт под KV и
+    /// активации. Возвращает прежнюю резидентность — после AR её надо
+    /// восстановить ([`Self::restore_blocks`]), чтобы память досталась DiT и
+    /// VAE. `None` — модель и так вся на карте.
+    pub fn fit_blocks(&mut self, reserve: usize) -> Option<usize> {
+        let (total, resident) = (self.model.block_count(), self.model.resident_blocks());
+        let Device::Cuda(ord) = self.device else { return None };
+        if resident >= total {
+            return None;
+        }
+        let blk = self.model.block_bytes().max(1);
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let free = synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        let spare = free.saturating_sub(reserve) / blk;
+        if spare > 0 {
+            let got = self.model.set_block_residency((resident + spare).min(total));
+            eprintln!("[acestep-lm] на время AR блоков на карте {resident} → {got} из {total}");
+        }
+        Some(resident)
+    }
+
+    /// Вернуть резидентность, что была до [`Self::fit_blocks`], и отдать
+    /// освободившееся драйверу.
+    pub fn restore_blocks(&mut self, resident: usize) {
+        if self.model.resident_blocks() > resident {
+            self.model.set_block_residency(resident);
+            if let Device::Cuda(ord) = self.device {
+                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+            }
+        }
     }
 
     pub fn make_kv(&self, batch: usize, max_seq: usize) -> Result<KvCache, AceError> {

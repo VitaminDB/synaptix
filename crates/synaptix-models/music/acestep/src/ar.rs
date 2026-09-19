@@ -83,7 +83,9 @@ pub fn generate_codes(
         return Ok(codes);
     }
 
-    {
+    // CUDA-граф декода — только когда модель целиком на карте: при оффлоаде
+    // блоки приезжают с хоста заново каждый шаг, граф их не захватит.
+    if lm.model.graph_decode_ready() {
         if let synaptix_core::device::Device::Cuda(ord) = device {
             if let Some(mut uk) = ukv.take() {
                 // CFG: cond+uncond as one batch-2 decode (weights read once

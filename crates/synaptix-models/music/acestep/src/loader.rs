@@ -30,8 +30,14 @@ impl CompLoader {
     }
 
     pub fn get(&self, name: &str, dtype: DType) -> Result<Tensor, AceError> {
+        self.get_on(name, self.device, dtype)
+    }
+
+    /// Как [`Self::get`], но на заданное устройство (оффлоад LM читает блоки
+    /// сразу в RAM).
+    pub fn get_on(&self, name: &str, device: Device, dtype: DType) -> Result<Tensor, AceError> {
         self.inner
-            .load_to(name, self.device, dtype)
+            .load_to(name, device, dtype)
             .map_err(|e| AceError::Load(format!("get '{name}': {e}")))
     }
 

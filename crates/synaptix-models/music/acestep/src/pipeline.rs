@@ -615,10 +615,17 @@ fn cached_or_load<'c, T>(
     slot: &'c mut Option<T>,
     load: impl FnOnce() -> Result<T, AceError>,
 ) -> Result<&'c T, AceError> {
+    Ok(cached_or_load_mut(slot, load)?)
+}
+
+fn cached_or_load_mut<'c, T>(
+    slot: &'c mut Option<T>,
+    load: impl FnOnce() -> Result<T, AceError>,
+) -> Result<&'c mut T, AceError> {
     if slot.is_none() {
         *slot = Some(load()?);
     }
-    Ok(slot.as_ref().expect("slot just filled"))
+    Ok(slot.as_mut().expect("slot just filled"))
 }
 
 /// Output loudness normalization mode (matches the old Rust output node).
@@ -756,8 +763,8 @@ pub fn generate_music(
                 eprintln!("[t] LM load: {:.1}s", t_open.elapsed().as_secs_f32());
                 Ok(m)
             };
-            let lm_owned;
-            let lm: &AceStepLm = match cache.as_deref_mut() {
+            let mut lm_owned;
+            let lm: &mut AceStepLm = match cache.as_deref_mut() {
                 Some(c) => {
                     // Ёмкость rope у кэшированной LM меньше запроса — перезагрузка.
                     if c.lm.is_some() && c.lm_capacity < cap {
@@ -766,17 +773,25 @@ pub fn generate_music(
                     if c.lm.is_none() {
                         c.lm_capacity = cap;
                     }
-                    cached_or_load(&mut c.lm, load_lm)?
+                    cached_or_load_mut(&mut c.lm, load_lm)?
                 }
                 None => {
                     lm_owned = load_lm()?;
-                    &lm_owned
+                    &mut lm_owned
                 }
             };
             stage(MusicStage::Lm, paths.lm);
             let lm_tok = AceTokenizer::from_bytes(&read_bundle_file(paths.lm, "tokenizer.json")?)?;
             let t_ar = std::time::Instant::now();
-            let r = ar_generate(lm, &lm_tok, caption, lyric, &base, codes_opts, cot)?;
+            // Малая карта: LM стримит блоки — на время AR часть возвращается на
+            // карту (запас 1,5 ГБ под KV двух веток CFG и активации), после —
+            // обратно, чтобы DiT и VAE получили память.
+            let before = lm.fit_blocks(3usize << 29);
+            let r = ar_generate(lm, &lm_tok, caption, lyric, &base, codes_opts, cot);
+            if let Some(b) = before {
+                lm.restore_blocks(b);
+            }
+            let r = r?;
             eprintln!("[t] AR generate ({} codes): {:.1}s", r.0.len(), t_ar.elapsed().as_secs_f32());
             r
         } else if let Some(src) = extract_src {
