@@ -36,25 +36,51 @@ impl TmaDesc {
     }
 
     /// Закодированные байты `CUtensorMap` → слот арены.
+    ///
+    /// Под захватом CUDA-графа копия идёт отдельным, не захватываемым
+    /// стримом с синком: иначе она стала бы узлом графа с источником в уже
+    /// освобождённом буфере хоста.
     fn upload(stream: &Arc<CudaStream>, bytes: &[u8], what: &str) -> Result<Self> {
         debug_assert_eq!(bytes.len(), TMA_DESC_BYTES);
-        let arena = DescArena::for_stream(stream)?;
-        let slot = arena.take_slot(stream.context().ordinal())?;
+        let ord = stream.context().ordinal();
+        let (arena, slot) = DescArena::take(stream)?;
         let off = slot as usize * TMA_DESC_BYTES;
-        {
+        let capturing = synaptix_core::device::cuda::graph_capturing();
+        let res = {
             let mut buf = arena.buf.lock();
             let mut view = buf.slice_mut(off..off + TMA_DESC_BYTES);
-            if let Err(e) = stream.memcpy_htod(bytes, &mut view) {
-                arena.free.lock().push(slot);
-                return Err(SynaptixError::Cuda(format!("htod {what}: {e:?}")));
+            if capturing {
+                side_stream(stream, ord).and_then(|side| {
+                    side.memcpy_htod(bytes, &mut view)
+                        .and_then(|_| side.synchronize())
+                        .map_err(|e| SynaptixError::Cuda(format!("{e:?}")))
+                })
+            } else {
+                stream.memcpy_htod(bytes, &mut view).map_err(|e| SynaptixError::Cuda(format!("{e:?}")))
             }
+        };
+        if let Err(e) = res {
+            arena.free.lock().push(slot);
+            return Err(SynaptixError::Cuda(format!("htod {what}: {e}")));
         }
-        Ok(Self { dev_ptr: arena.base + off as u64, slot, arena })
+        let me = Self { dev_ptr: arena.base + off as u64, slot, arena };
+        if capturing {
+            me.arena.pinned.lock().insert(me.slot);
+        }
+        Ok(me)
     }
 }
 
 impl Drop for TmaDesc {
     fn drop(&mut self) {
+        // Дескриптор, попавший в захваченный CUDA-граф, живёт вечно: граф
+        // читает его по адресу при каждом replay, а кэши GEMM сбрасываются
+        // (переполнение, смена весов) когда им удобно. Раньше слот уходил в
+        // оборот, в нём оказывался чужой дескриптор, и граф денойза ACE-Step
+        // падал CUDA_ERROR_ILLEGAL_INSTRUCTION на `gn_bf16_tma_*`.
+        if self.arena.pinned.lock().contains(&self.slot) {
+            return;
+        }
         // Слот может ещё читать запущенное ядро — в оборот он вернётся только
         // после синка (см. `DescArena::take_slot`).
         self.arena.pending.lock().push(self.slot);
@@ -63,8 +89,29 @@ impl Drop for TmaDesc {
 
 unsafe impl<'a, 'b: 'a> PushKernelArg<&'b TmaDesc> for LaunchArgs<'a> {
     fn arg(&mut self, d: &'b TmaDesc) -> &mut Self {
+        // Запуск под захватом графа — граф запомнил адрес слота навсегда.
+        if synaptix_core::device::cuda::graph_capturing() {
+            d.arena.pinned.lock().insert(d.slot);
+        }
         self.arg(&d.dev_ptr)
     }
+}
+
+/// Не захватываемый стрим устройства для загрузки дескрипторов во время
+/// захвата CUDA-графа (режим RELAXED разрешает работу других стримов).
+fn side_stream(stream: &Arc<CudaStream>, ord: usize) -> Result<Arc<CudaStream>> {
+    static SIDE: OnceLock<Mutex<Vec<(usize, Arc<CudaStream>)>>> = OnceLock::new();
+    let list = SIDE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut g = list.lock();
+    if let Some((_, s)) = g.iter().find(|(o, _)| *o == ord) {
+        return Ok(s.clone());
+    }
+    let s = stream
+        .context()
+        .new_stream()
+        .map_err(|e| SynaptixError::Cuda(format!("TMA side stream: {e:?}")))?;
+    g.push((ord, s.clone()));
+    Ok(s)
 }
 
 /// Арена дескрипторов одного устройства: один буфер, слоты по 128 Б.
@@ -74,56 +121,85 @@ struct DescArena {
     free: Mutex<Vec<u32>>,
     /// Слоты сброшенных дескрипторов — переиспользуются после синка.
     pending: Mutex<Vec<u32>>,
+    /// Слоты дескрипторов, на которые ссылается захваченный CUDA-граф: в
+    /// оборот не возвращаются никогда.
+    pinned: Mutex<std::collections::HashSet<u32>>,
 }
 
+/// Арены по устройствам; текущая — последняя. Когда в текущей не остаётся
+/// слотов (их держат живые кэши и графы), заводится ещё одна — по 4 МБ.
 static ARENAS: OnceLock<Mutex<Vec<(usize, Arc<DescArena>)>>> = OnceLock::new();
 
 impl DescArena {
-    fn for_stream(stream: &Arc<CudaStream>) -> Result<Arc<Self>> {
-        let ord = stream.context().ordinal();
-        let list = ARENAS.get_or_init(|| Mutex::new(Vec::new()));
-        let mut g = list.lock();
-        if let Some((_, a)) = g.iter().find(|(o, _)| *o == ord) {
-            return Ok(a.clone());
-        }
+    fn new(stream: &Arc<CudaStream>) -> Result<Arc<Self>> {
         // Один сегмент default-пула на всё время жизни процесса — по замыслу:
         // именно он и держит все дескрипторы, а не сегменты весов.
         let buf = stream
             .alloc_zeros::<u8>(ARENA_SLOTS as usize * TMA_DESC_BYTES)
             .map_err(|e| SynaptixError::Cuda(format!("TMA desc arena alloc: {e:?}")))?;
         let (base, _) = buf.device_ptr(stream);
-        let arena = Arc::new(Self {
+        Ok(Arc::new(Self {
             buf: Mutex::new(buf),
             base,
             free: Mutex::new((0..ARENA_SLOTS).rev().collect()),
             pending: Mutex::new(Vec::new()),
-        });
-        g.push((ord, arena.clone()));
-        Ok(arena)
+            pinned: Mutex::new(std::collections::HashSet::new()),
+        }))
+    }
+
+    /// Текущая арена устройства и свободный слот в ней.
+    fn take(stream: &Arc<CudaStream>) -> Result<(Arc<Self>, u32)> {
+        let ord = stream.context().ordinal();
+        let list = ARENAS.get_or_init(|| Mutex::new(Vec::new()));
+        let current = {
+            let g = list.lock();
+            g.iter().rev().find(|(o, _)| *o == ord).map(|(_, a)| a.clone())
+        };
+        let arena = match current {
+            Some(a) => a,
+            None => {
+                let a = Self::new(stream)?;
+                list.lock().push((ord, a.clone()));
+                a
+            }
+        };
+        if let Some(slot) = arena.take_slot(ord) {
+            return Ok((arena, slot));
+        }
+        // Всё держат живые записи и графы — ещё одна арена.
+        let a = Self::new(stream)?;
+        list.lock().push((ord, a.clone()));
+        let slot = a
+            .take_slot(ord)
+            .ok_or_else(|| SynaptixError::Cuda("TMA desc arena exhausted".into()))?;
+        Ok((a, slot))
     }
 
     fn reclaim_pending(&self, ord: usize) {
+        // Под захватом графа синк запрещён — слоты подождут следующего раза.
+        if synaptix_core::device::cuda::graph_capturing() {
+            return;
+        }
         let _ = synaptix_core::device::cuda::synchronize_all(ord);
         let mut p = self.pending.lock();
         self.free.lock().extend(p.drain(..));
     }
 
-    fn take_slot(&self, ord: usize) -> Result<u32> {
+    fn take_slot(&self, ord: usize) -> Option<u32> {
         if let Some(s) = self.free.lock().pop() {
-            return Ok(s);
+            return Some(s);
         }
         self.reclaim_pending(ord);
         if let Some(s) = self.free.lock().pop() {
-            return Ok(s);
+            return Some(s);
         }
         // Всё занято живыми записями кэшей — сбросить их: дескрипторы
         // восстанавливаются лениво на первом же вызове.
-        crate::best_cu::gemm::gemm_nvfp4::clear_desc_cache();
-        self.reclaim_pending(ord);
-        self.free
-            .lock()
-            .pop()
-            .ok_or_else(|| SynaptixError::Cuda("TMA desc arena exhausted".into()))
+        if !synaptix_core::device::cuda::graph_capturing() {
+            crate::best_cu::gemm::gemm_nvfp4::clear_desc_cache();
+            self.reclaim_pending(ord);
+        }
+        self.free.lock().pop()
     }
 }
 

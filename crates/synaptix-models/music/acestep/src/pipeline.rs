@@ -145,10 +145,12 @@ pub fn denoise(
         (None, None)
     };
 
-    // Захват денойза CUDA-графом сейчас падает при синке графа
-    // (CUDA_ERROR_ILLEGAL_INSTRUCTION, плотный DiT с CFG — и на HEAD до
-    // стриминга слоёв), а обычный путь даёт тот же звук бит в бит и почти
-    // так же быстро (8 шагов 0,3 с). Граф — только по SYN_ACESTEP_GRAPH=1.
+    // Граф денойза — только по SYN_ACESTEP_GRAPH=1: DiT упирается в счёт, а
+    // не в запуски ядер, и граф не быстрее (50 шагов, 30 с музыки: 6,7 с
+    // против 6,3 с без него; звук бит в бит). Падение графа
+    // CUDA_ERROR_ILLEGAL_INSTRUCTION на `gn_bf16_tma_*` было в арене
+    // TMA-дескрипторов (слот, на который ссылался граф, уходил в оборот) —
+    // исправлено в synaptix-kernels-cuda `tma.rs`.
     let graph_ok = x_init.dims()[1] <= 8192 && std::env::var("SYN_ACESTEP_GRAPH").is_ok_and(|v| v == "1");
     if cfg && !opts.dcw.is_active() && !dit.is_quantized() && dit.fully_resident() && graph_ok {
         if let synaptix_core::device::Device::Cuda(ord) = x_init.device() {
