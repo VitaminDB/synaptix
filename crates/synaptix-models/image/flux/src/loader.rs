@@ -1,4 +1,4 @@
-//! Загрузка одного компонента FLUX из HF-директории.
+//! Загрузка одного компонента FLUX из HF-директории или `.syn`-бандла.
 //!
 //! FLUX (diffusers-раскладка) хранит каждую подмодель в своём подкаталоге
 //! (`text_encoder/`, `text_encoder_2/`, `transformer/`, `vae/`). Крупные —
@@ -13,6 +13,7 @@ use synaptix_core::{device::Device, dtype::DType, error::SynaptixError, tensor::
 use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader};
 use synaptix_io::weights::WeightLoader;
 
+use crate::source::{FluxComponent, FluxSource};
 use crate::FluxError;
 
 pub struct ComponentWeights {
@@ -57,6 +58,16 @@ impl ComponentWeights {
             .map_err(|e| FluxError::Load(e.to_string()))?
             .with_device(device);
         Ok(Self { loader, device, dtype })
+    }
+
+    /// Подмодель из [`FluxSource`] — каталог или `.syn`-бандл.
+    pub fn from_source(
+        source: &FluxSource,
+        component: FluxComponent,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, FluxError> {
+        Ok(Self { loader: source.loader(component, device)?, device, dtype })
     }
 
     /// Тензор по HF-имени, приведённый к compute-dtype на целевом устройстве.

@@ -26,5 +26,6 @@ regex              = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu = { workspace = true }
+synaptix-io          = { workspace = true, features = ["image"] }
 synaptix-test-utils  = { workspace = true }
 half                 = { workspace = true }

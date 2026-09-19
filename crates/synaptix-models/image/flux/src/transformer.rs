@@ -93,16 +93,52 @@ pub fn prof_dump() {
     });
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FluxConfig {
     pub num_layers: usize,        // 19 double
     pub num_single_layers: usize, // 38 single
     pub in_channels: usize,       // 64
+    /// guidance-distilled (dev): guidance подаётся эмбеддингом. У schnell
+    /// эмбеддера нет — модель считает без guidance.
+    pub guidance_embeds: bool,
 }
 
 impl FluxConfig {
     pub fn dev() -> Self {
-        Self { num_layers: 19, num_single_layers: 38, in_channels: 64 }
+        Self { num_layers: 19, num_single_layers: 38, in_channels: 64, guidance_embeds: true }
+    }
+
+    pub fn schnell() -> Self {
+        Self { guidance_embeds: false, ..Self::dev() }
+    }
+
+    /// `transformer/config.json` diffusers. Размеры внимания зашиты в ядра
+    /// (24 головы × 128) — другая форма значит другую архитектуру, а не
+    /// вариант FLUX.1, и загружать её молча нельзя.
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| SynaptixError::Other(format!("transformer/config.json: {e}")))?;
+        let num = |k: &str, def: usize| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(def);
+        let heads = num("num_attention_heads", NUM_HEADS);
+        let head_dim = num("attention_head_dim", HEAD_DIM);
+        if heads != NUM_HEADS || head_dim != HEAD_DIM {
+            return Err(SynaptixError::Other(format!(
+                "FLUX: внимание {heads}×{head_dim} не поддерживается (ожидается {NUM_HEADS}×{HEAD_DIM})"
+            )));
+        }
+        let joint = num("joint_attention_dim", 4096);
+        let pooled = num("pooled_projection_dim", 768);
+        if joint != 4096 || pooled != 768 {
+            return Err(SynaptixError::Other(format!(
+                "FLUX: энкодеры {joint}/{pooled} не поддерживаются (ожидается T5-XXL 4096 и CLIP-L 768)"
+            )));
+        }
+        Ok(Self {
+            num_layers: num("num_layers", 19),
+            num_single_layers: num("num_single_layers", 38),
+            in_channels: num("in_channels", 64),
+            guidance_embeds: v.get("guidance_embeds").and_then(|x| x.as_bool()).unwrap_or(true),
+        })
     }
 }
 
@@ -562,7 +598,8 @@ pub struct FluxTransformer {
     x_embedder: QuantLinear,
     context_embedder: QuantLinear,
     ts_embed: MlpEmbed,
-    guid_embed: MlpEmbed,
+    /// `None` у моделей без guidance-эмбеддера (schnell).
+    guid_embed: Option<MlpEmbed>,
     text_embed: MlpEmbed,
     blocks: Vec<DoubleBlock>,
     single_blocks: Vec<SingleBlock>,
@@ -585,7 +622,11 @@ impl FluxTransformer {
         let x_embedder = lin(get, "x_embedder")?;
         let context_embedder = lin(get, "context_embedder")?;
         let ts_embed = MlpEmbed::load(get, "time_text_embed.timestep_embedder")?;
-        let guid_embed = MlpEmbed::load(get, "time_text_embed.guidance_embedder")?;
+        let guid_embed = if cfg.guidance_embeds {
+            Some(MlpEmbed::load(get, "time_text_embed.guidance_embedder")?)
+        } else {
+            None
+        };
         let text_embed = MlpEmbed::load(get, "time_text_embed.text_embedder")?;
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
@@ -653,7 +694,7 @@ impl FluxTransformer {
         self.x_embedder = lin_to(&self.x_embedder, dev)?;
         self.context_embedder = lin_to(&self.context_embedder, dev)?;
         self.ts_embed = self.ts_embed.to_device(dev)?;
-        self.guid_embed = self.guid_embed.to_device(dev)?;
+        self.guid_embed = self.guid_embed.as_ref().map(|g| g.to_device(dev)).transpose()?;
         self.text_embed = self.text_embed.to_device(dev)?;
         self.norm_out = lin_to(&self.norm_out, dev)?;
         self.proj_out = lin_to(&self.proj_out, dev)?;
@@ -671,7 +712,7 @@ impl FluxTransformer {
         self.x_embedder = lin_to(&self.x_embedder, dev)?;
         self.context_embedder = lin_to(&self.context_embedder, dev)?;
         self.ts_embed = self.ts_embed.to_device(dev)?;
-        self.guid_embed = self.guid_embed.to_device(dev)?;
+        self.guid_embed = self.guid_embed.as_ref().map(|g| g.to_device(dev)).transpose()?;
         self.text_embed = self.text_embed.to_device(dev)?;
         self.norm_out = lin_to(&self.norm_out, dev)?;
         self.proj_out = lin_to(&self.proj_out, dev)?;
@@ -756,14 +797,14 @@ impl FluxTransformer {
 
         // temb (timestep И guidance ×1000)
         let t1000 = timestep.to_dtype(dt)?.mul_scalar(1000.0)?;
-        let g1000 = guidance.to_dtype(dt)?.mul_scalar(1000.0)?;
         let ts_proj = timestep_embedding(&t1000, 256, dev)?.to_dtype(dt)?;
-        let g_proj = timestep_embedding(&g1000, 256, dev)?.to_dtype(dt)?;
-        let temb = self
-            .ts_embed
-            .forward(&ts_proj)?
-            .add(&self.guid_embed.forward(&g_proj)?)?
-            .add(&self.text_embed.forward(pooled)?)?; // [B,3072]
+        let mut temb = self.ts_embed.forward(&ts_proj)?;
+        if let Some(guid_embed) = &self.guid_embed {
+            let g1000 = guidance.to_dtype(dt)?.mul_scalar(1000.0)?;
+            let g_proj = timestep_embedding(&g1000, 256, dev)?.to_dtype(dt)?;
+            temb = temb.add(&guid_embed.forward(&g_proj)?)?;
+        }
+        let temb = temb.add(&self.text_embed.forward(pooled)?)?; // [B,3072]
         grab!("temb", temb);
 
         let (cos, sin) = build_rope(txt_seq, img_h, img_w, dev)?;
@@ -859,5 +900,26 @@ impl FluxTransformer {
         out.push(("out_img".into(), i2));
         out.push(("out_txt".into(), t2));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::FluxConfig;
+
+    #[test]
+    fn dev_and_schnell_configs() {
+        let dev = br#"{"attention_head_dim":128,"guidance_embeds":true,"in_channels":64,
+            "joint_attention_dim":4096,"num_attention_heads":24,"num_layers":19,
+            "num_single_layers":38,"pooled_projection_dim":768}"#;
+        assert_eq!(FluxConfig::from_json(dev).unwrap(), FluxConfig::dev());
+        let schnell = br#"{"guidance_embeds":false,"num_layers":19,"num_single_layers":38}"#;
+        assert_eq!(FluxConfig::from_json(schnell).unwrap(), FluxConfig::schnell());
+    }
+
+    #[test]
+    fn foreign_attention_shape_is_rejected() {
+        let other = br#"{"num_attention_heads":48,"attention_head_dim":128}"#;
+        assert!(FluxConfig::from_json(other).is_err());
     }
 }

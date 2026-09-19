@@ -24,7 +24,14 @@ pub struct ImagineArgs {
     pub storage_dtype: Option<String>,
 }
 
+/// Каталог diffusers или `.syn`-бандл с `model_index.json` пайплайна FLUX.
 fn is_flux(model: &std::path::Path) -> bool {
+    if model.is_file() {
+        return synaptix_bundle::Bundle::open(model)
+            .ok()
+            .and_then(|b| b.read_file("model_index.json").ok().map(|c| c.into_owned()))
+            .is_some_and(|b| String::from_utf8_lossy(&b).contains("Flux"));
+    }
     std::fs::read_to_string(model.join("model_index.json"))
         .map(|s| s.contains("Flux"))
         .unwrap_or(false)

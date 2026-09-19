@@ -400,7 +400,8 @@ pub struct AutoencoderKlEncoder {
     mid_resnet2: ResnetBlock2D,
     conv_norm_out: GroupNormLayer,
     conv_out: Conv2dLayer,
-    quant_conv: Conv2dLayer,
+    /// Как у декодера: у FLUX `quant_conv` нет, moments идут прямо из `conv_out`.
+    quant_conv: Option<Conv2dLayer>,
     latent_channels: usize,
 }
 
@@ -443,7 +444,11 @@ impl AutoencoderKlEncoder {
 
         let conv_norm_out = GroupNormLayer::load(get, "encoder.conv_norm_out", ng, eps)?;
         let conv_out = Conv2dLayer::load(get, "encoder.conv_out", (1, 1))?;
-        let quant_conv = Conv2dLayer::load(get, "quant_conv", (0, 0))?;
+        let quant_conv = if cfg.use_quant_conv {
+            Some(Conv2dLayer::load(get, "quant_conv", (0, 0))?)
+        } else {
+            None
+        };
 
         Ok(Self {
             conv_in,
@@ -475,7 +480,10 @@ impl AutoencoderKlEncoder {
         h = self.mid_resnet2.forward(&h)?;
         let h = self.conv_norm_out.forward_silu(&h)?;
         let h = self.conv_out.forward(&h)?;
-        self.quant_conv.forward(&h)
+        match &self.quant_conv {
+            Some(q) => q.forward(&h),
+            None => Ok(h),
+        }
     }
 
     /// Разбить moments на `(mean, logvar)` по каналам.

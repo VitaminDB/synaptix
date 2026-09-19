@@ -59,15 +59,26 @@ impl ClipTokenizer {
     /// их правильность важна для bit-exact.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, FluxError> {
         let dir = dir.as_ref();
-        let pad_token = Self::pad_token_from_config(dir);
+        let pad_token = std::fs::read(dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|b| Self::pad_token_from_config(&b));
         Self::from_files(dir.join("vocab.json"), dir.join("merges.txt"), pad_token.as_deref())
+    }
+
+    /// Те же три файла, но из байтов — для `.syn`-бандла, где они лежат
+    /// вспомогательными файлами, а не на диске. `config` — содержимое
+    /// `tokenizer_config.json`, если есть.
+    pub fn from_bytes(vocab: &[u8], merges: &[u8], config: Option<&[u8]>) -> Result<Self, FluxError> {
+        let pad_token = config.and_then(Self::pad_token_from_config);
+        let merges = std::str::from_utf8(merges)
+            .map_err(|e| FluxError::Tokenizer(format!("merges.txt utf-8: {e}")))?;
+        Self::build(vocab, merges, pad_token.as_deref())
     }
 
     /// Читает `pad_token` из tokenizer_config.json (строка либо AddedToken-
     /// объект с полем `content`). Возвращает None → дефолт `<|endoftext|>`.
-    fn pad_token_from_config(dir: &Path) -> Option<String> {
-        let bytes = std::fs::read(dir.join("tokenizer_config.json")).ok()?;
-        let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    fn pad_token_from_config(bytes: &[u8]) -> Option<String> {
+        let cfg: serde_json::Value = serde_json::from_slice(bytes).ok()?;
         match cfg.get("pad_token")? {
             serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Object(o) => {
@@ -85,11 +96,15 @@ impl ClipTokenizer {
     ) -> Result<Self, FluxError> {
         let vocab_bytes = std::fs::read(vocab_path.as_ref())
             .map_err(|e| FluxError::Tokenizer(format!("vocab.json: {e}")))?;
-        let vocab: HashMap<String, u32> = serde_json::from_slice(&vocab_bytes)
-            .map_err(|e| FluxError::Tokenizer(format!("vocab.json parse: {e}")))?;
-
         let merges_text = std::fs::read_to_string(merges_path.as_ref())
             .map_err(|e| FluxError::Tokenizer(format!("merges.txt: {e}")))?;
+        Self::build(&vocab_bytes, &merges_text, pad_token)
+    }
+
+    fn build(vocab_bytes: &[u8], merges_text: &str, pad_token: Option<&str>) -> Result<Self, FluxError> {
+        let vocab: HashMap<String, u32> = serde_json::from_slice(vocab_bytes)
+            .map_err(|e| FluxError::Tokenizer(format!("vocab.json parse: {e}")))?;
+
         let mut bpe_ranks = HashMap::new();
         let mut rank = 0usize;
         for line in merges_text.lines() {
