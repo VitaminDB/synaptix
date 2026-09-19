@@ -136,6 +136,10 @@ impl Weights {
             .map_err(|e| SynaptixError::Other(format!("load '{name}': {e}")))
     }
 
+    pub fn names(&self) -> Vec<String> {
+        self.loader.infos().map(|(n, _, _)| n.to_string()).collect()
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.loader.tensor_info(name).is_some()
     }

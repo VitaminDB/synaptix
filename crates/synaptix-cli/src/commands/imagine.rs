@@ -24,24 +24,28 @@ pub struct ImagineArgs {
     pub storage_dtype: Option<String>,
 }
 
-/// Каталог diffusers или `.syn`-бандл с `model_index.json` пайплайна FLUX.
-fn is_flux(model: &std::path::Path) -> bool {
+/// `model_index.json` каталога diffusers или `.syn`-бандла.
+fn model_index(model: &std::path::Path) -> String {
     if model.is_file() {
         return synaptix_bundle::Bundle::open(model)
             .ok()
             .and_then(|b| b.read_file("model_index.json").ok().map(|c| c.into_owned()))
-            .is_some_and(|b| String::from_utf8_lossy(&b).contains("Flux"));
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
     }
-    std::fs::read_to_string(model.join("model_index.json"))
-        .map(|s| s.contains("Flux"))
-        .unwrap_or(false)
+    std::fs::read_to_string(model.join("model_index.json")).unwrap_or_default()
 }
 
 pub fn run(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.model.exists() {
         return Err(format!("model dir not found: {}", args.model.display()).into());
     }
-    if is_flux(&args.model) {
+    let index = model_index(&args.model);
+    // `Flux2Pipeline`/`Flux2KleinPipeline` — другая архитектура, чем FLUX.1.
+    if index.contains("Flux2") {
+        return run_flux2(args);
+    }
+    if index.contains("Flux") {
         return run_flux(args);
     }
 
@@ -173,5 +177,60 @@ fn run_flux(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     synaptix_io::image::save_image(&image, &args.output)?;
     eprintln!("synaptix imagine [FLUX]: saved {}", args.output.display());
+    Ok(())
+}
+
+/// FLUX.2 (dev / klein): стадии `Flux2Model` подряд. Энкодер — BF16, DiT —
+/// `--quant nvfp4|mxfp8` или плотный BF16; что не влезло в VRAM, стримится.
+fn run_flux2(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_image_flux2::{Flux2Model, SampleParams};
+
+    let dev = device::resolve(&args.device);
+    let want = args.quant.as_deref().or(args.storage_dtype.as_deref()).unwrap_or("none");
+    let quant = match want.to_lowercase().as_str() {
+        "none" | "bf16" | "f16" | "f32" => DType::BF16,
+        "nvfp4" => DType::NVFP4,
+        "mxfp8" | "fp8" => DType::MXFP8,
+        other => return Err(format!("неизвестный --quant/--storage-dtype: {other} (none|nvfp4|mxfp8)").into()),
+    };
+    let t0 = std::time::Instant::now();
+    let m = Flux2Model::open(&args.model, dev, DType::BF16, quant)?;
+    eprintln!(
+        "synaptix imagine [FLUX.2 {:?}]: {} | {}×{} | {} steps | guidance {} | seed {} | quant={quant:?} {dev:?}",
+        m.variant(),
+        args.model.display(),
+        args.width,
+        args.height,
+        args.steps,
+        args.guidance_scale,
+        args.seed,
+    );
+    let cond = m.encode_prompt(&args.prompt, m.variant().uses_cfg(args.guidance_scale))?;
+    let t = m.load_transformer(Flux2Model::tokens_for(args.width, args.height, 0))?;
+    let p = SampleParams {
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+        guidance: args.guidance_scale,
+        seed: args.seed,
+        denoise: 1.0,
+    };
+    let bar = indicatif::ProgressBar::new(p.steps as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("  {bar:40} {pos}/{len} steps [{elapsed_precise}]").unwrap(),
+    );
+    let lat = m.sample(&t, &cond, None, None, &p, &mut |i, _| {
+        bar.set_position(i as u64);
+        true
+    })?;
+    bar.finish_and_clear();
+    drop(t);
+    let image = m.decode(&lat)?;
+    synaptix_io::image::save_image(&image, &args.output)?;
+    eprintln!(
+        "synaptix imagine [FLUX.2]: saved {} ({:.1}s)",
+        args.output.display(),
+        t0.elapsed().as_secs_f32()
+    );
     Ok(())
 }
