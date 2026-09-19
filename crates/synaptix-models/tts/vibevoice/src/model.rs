@@ -28,13 +28,8 @@ impl VibeVoiceModel {
     pub fn load(ckpt: &VibeVoiceCheckpoint, rope_capacity: usize) -> Result<Self> {
         let cfg = ckpt.config.clone();
         let src = ckpt.source();
-        let lm = Qwen2Model::load(
-            src,
-            &cfg.decoder_config,
-            "model.language_model",
-            "lm_head.weight",
-            rope_capacity,
-        )?;
+        // Сначала всё, что обязано жить на карте (токенайзеры речи,
+        // коннекторы, голова), потом LM: не влезшие слои LM уедут на хост.
         let acoustic = AcousticTokenizer::load(
             src,
             &cfg.acoustic_tokenizer_config,
@@ -48,6 +43,15 @@ impl VibeVoiceModel {
         let acoustic_connector = SpeechConnector::load(src, "model.acoustic_connector")?;
         let semantic_connector = SpeechConnector::load(src, "model.semantic_connector")?;
         let head = DiffusionHead::load(src, &cfg.diffusion_head_config, "model.prediction_head")?;
+        // Запас под KV двух веток CFG, активации и декод акустического VAE.
+        let lm = Qwen2Model::load(
+            src,
+            &cfg.decoder_config,
+            "model.language_model",
+            "lm_head.weight",
+            rope_capacity,
+            3usize << 30,
+        )?;
         let scaling = read_scalar(src, "model.speech_scaling_factor")?;
         let bias = read_scalar(src, "model.speech_bias_factor")?;
         Ok(Self {

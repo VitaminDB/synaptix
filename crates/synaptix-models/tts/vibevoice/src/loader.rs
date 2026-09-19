@@ -17,6 +17,12 @@ pub trait WeightSource {
     fn get(&self, name: &str) -> Result<Tensor>;
     fn has(&self, name: &str) -> bool;
 
+    /// Как [`Self::get`], но на заданное устройство (таблицы, которые живут
+    /// в RAM, читаются сразу туда, без захода на карту).
+    fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
+        self.get(name)?.to_device(device).map_err(crate::err)
+    }
+
     fn opt(&self, name: &str) -> Result<Option<Tensor>> {
         if self.has(name) {
             Ok(Some(self.get(name)?))
@@ -54,6 +60,12 @@ impl<L: WeightLoader> WeightSource for LoaderSource<L> {
 
     fn has(&self, name: &str) -> bool {
         self.names.contains(name)
+    }
+
+    fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
+        self.loader
+            .load_to(name, device, self.dtype)
+            .map_err(|e| VibeVoiceError::Load(format!("{name}: {e}")))
     }
 }
 
@@ -148,6 +160,10 @@ impl VibeVoiceCheckpoint {
 impl WeightSource for VibeVoiceCheckpoint {
     fn get(&self, name: &str) -> Result<Tensor> {
         self.source.get(name)
+    }
+
+    fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
+        self.source.get_on(name, device)
     }
 
     fn has(&self, name: &str) -> bool {
