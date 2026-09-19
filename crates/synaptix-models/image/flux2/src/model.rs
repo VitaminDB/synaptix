@@ -57,7 +57,48 @@ impl std::fmt::Debug for Flux2References {
     }
 }
 
+/// Размер, до которого пайплайн приводит референс: площадь не больше
+/// 1024² (с сохранением пропорций), стороны вниз до кратного 16 — как
+/// `_resize_to_target_area` + обрезка у diffusers.
+pub fn reference_size(w: usize, h: usize) -> (usize, usize) {
+    const TARGET: f64 = 1024.0 * 1024.0;
+    let area = (w * h).max(1) as f64;
+    let (w, h) = if area > TARGET {
+        let s = (TARGET / area).sqrt();
+        ((w as f64 * s) as usize, (h as f64 * s) as usize)
+    } else {
+        (w, h)
+    };
+    (snap_side(w), snap_side(h))
+}
+
+fn ref_ids(sizes: &[(usize, usize)]) -> Vec<[f64; 4]> {
+    let mut ids = Vec::new();
+    for (j, &(w, h)) in sizes.iter().enumerate() {
+        let t = REF_T_STEP + REF_T_STEP * j as f64;
+        for y in 0..h / SIDE_MULTIPLE {
+            for x in 0..w / SIDE_MULTIPLE {
+                ids.push([t, y as f64, x as f64, 0.0]);
+            }
+        }
+    }
+    ids
+}
+
 impl Flux2References {
+    /// Склеить референсы по порядку, как если бы все картинки кодировались
+    /// одним вызовом: координата `t` перенумеровывается (10, 20, …).
+    pub fn join(parts: &[&Flux2References]) -> Result<Self, Flux2Error> {
+        let parts: Vec<&Flux2References> = parts.iter().copied().filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(Flux2Error::Config("нет референсных картинок".into()));
+        }
+        let tokens: Vec<&Tensor> = parts.iter().map(|p| &p.tokens).collect();
+        let tokens = Tensor::cat(&tokens, 1)?;
+        let sizes: Vec<(usize, usize)> = parts.iter().flat_map(|p| p.sizes.iter().copied()).collect();
+        Ok(Self { ids: ref_ids(&sizes), tokens, sizes })
+    }
+
     pub fn len(&self) -> usize {
         self.sizes.len()
     }
@@ -246,21 +287,15 @@ impl Flux2Model {
     /// для правки. Координата `t` — 10, 20, … по порядку.
     pub fn encode_references(&self, images: &[Tensor]) -> Result<Flux2References, Flux2Error> {
         let mut parts = Vec::with_capacity(images.len());
-        let mut ids = Vec::new();
         let mut sizes = Vec::new();
-        for (j, img) in images.iter().enumerate() {
+        for img in images {
             let lat = self.encode_image(img)?; // [1, 128, h, w]
             let d = lat.dims().to_vec();
             let (c, h, w) = (d[1], d[2], d[3]);
-            let t = REF_T_STEP + REF_T_STEP * j as f64;
-            for y in 0..h {
-                for x in 0..w {
-                    ids.push([t, y as f64, x as f64, 0.0]);
-                }
-            }
             parts.push(pack(&lat)?.reshape((h * w, c))?);
-            sizes.push((img.dims()[2], img.dims()[1]));
+            sizes.push((w * SIDE_MULTIPLE, h * SIDE_MULTIPLE));
         }
+        let ids = ref_ids(&sizes);
         if parts.is_empty() {
             return Err(Flux2Error::Config("нет референсных картинок".into()));
         }
@@ -430,6 +465,24 @@ pub fn release_pools(device: Device) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_size_caps_area() {
+        assert_eq!(reference_size(1024, 768), (1024, 768));
+        let (w, h) = reference_size(4032, 3024);
+        assert!(w * h <= 1024 * 1024 && w % 16 == 0 && h % 16 == 0, "{w}x{h}");
+        assert!((w as f64 / h as f64 - 4.0 / 3.0).abs() < 0.02);
+        assert_eq!(reference_size(1000, 1000), (992, 992));
+    }
+
+    #[test]
+    fn ref_ids_renumber_time() {
+        let ids = ref_ids(&[(32, 16), (16, 16)]);
+        assert_eq!(ids.len(), 2 + 1);
+        assert_eq!(ids[0], [10.0, 0.0, 0.0, 0.0]);
+        assert_eq!(ids[1], [10.0, 0.0, 1.0, 0.0]);
+        assert_eq!(ids[2], [20.0, 0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn snap_and_tokens() {
