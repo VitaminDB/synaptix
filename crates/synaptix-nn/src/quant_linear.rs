@@ -25,6 +25,13 @@ fn nvfp4_weight_only() -> bool {
 }
 
 fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
+    quant_matmul_target(x, w, F16_TARGET)
+}
+
+/// `target` — к какому максимуму приводится вход перед GEMM в F16. Выход
+/// такого GEMM тоже F16: `|y| ≤ target·‖w_row‖₁`, и при огромных активациях
+/// (остаточный поток Qwen-Image ~10⁹) цель 64 даёт inf на выходе.
+fn quant_matmul_target(x: &Tensor, w: &QuantWeight, target: f32) -> Result<Tensor> {
     let in_dt = x.dtype();
     if in_dt == DType::F16 {
         return x.linear_quant(w);
@@ -36,11 +43,15 @@ fn quant_matmul(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
         }
         return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
     }
+    // max|x| в два этапа: по строкам (быстрое ядро reduce_rows), затем по
+    // столбцу максимумов — одна общая редукция по всему тензору шла через
+    // generic-путь и на больших активациях стоила больше самих квант-GEMM.
     let scale = match x
         .abs()
+        .and_then(|t| if t.rank() >= 2 { t.max_keepdim(t.rank() - 1) } else { Ok(t) })
         .and_then(|t| t.max_all())
         .and_then(|t| t.to_dtype(DType::F32))
-        .and_then(|t| t.mul_scalar(1.0 / F16_TARGET))
+        .and_then(|t| t.mul_scalar(1.0 / target))
         .and_then(|t| t.add_scalar(f32::MIN_POSITIVE))
         .and_then(|t| t.reshape(vec![1]))
     {
@@ -97,6 +108,23 @@ impl QuantLinear {
 
     pub fn dense(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         Ok(QuantLinear::Dense(Linear::new(weight, bias)?))
+    }
+
+    /// Как `forward`, но вход квант-GEMM с F16-выходом (MXFP8; NVFP4 на не-BF16
+    /// входе) приводится к максимуму `target`, а не 64: у моделей с огромными
+    /// активациями выход иначе переполняет F16. Плотный слой и нативный
+    /// NVFP4 на BF16 (выход BF16) считаются как обычно.
+    pub fn forward_target(&self, x: &Tensor, target: f32) -> Result<Tensor> {
+        match self {
+            QuantLinear::Dense(l) => l.forward(x),
+            QuantLinear::Quant { w, bias } => {
+                let y = quant_matmul_target(x, w, target)?;
+                match bias {
+                    Some(b) => y.broadcast_add(b),
+                    None => Ok(y),
+                }
+            }
+        }
     }
 
     pub fn is_quant(&self) -> bool {

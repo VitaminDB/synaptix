@@ -579,6 +579,28 @@ pub fn run_binary(
                 }
                 ok
             };
+            // Скаляр: b — одно значение на весь тензор (все оси stride 0 или
+            // размера 1), например масштаб активаций перед квант-GEMM. Тот же
+            // colb с одной группой на весь тензор (b_idx = i/numel = 0).
+            let b_is_scalar = !b_is_row
+                && !b_is_col
+                && numel > 0
+                && numel <= i32::MAX as usize
+                && bs.iter().zip(dst_lo.dims()).all(|(&s, &dim)| s == 0 || dim == 1);
+            if b_is_scalar {
+                let func_colb = match dtype {
+                    DType::F32 => &kernels.binary_colb_f32,
+                    DType::F16 => &kernels.binary_colb_f16,
+                    _ => &kernels.binary_colb_bf16,
+                };
+                unsafe {
+                    return launch_binary_fast(
+                        &stream, func_colb, a_buf, b_buf, dst_buf, dtype,
+                        numel as i64, a_lo.offset() as i64, b_lo.offset() as i64,
+                        Some(numel as i32), op_code, cfg,
+                    );
+                }
+            }
             if b_is_col {
                 let func_colb = match dtype {
                     DType::F32 => &kernels.binary_colb_f32,
