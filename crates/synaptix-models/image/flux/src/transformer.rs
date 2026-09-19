@@ -470,6 +470,33 @@ struct DoubleBlock {
 }
 
 impl DoubleBlock {
+    fn load<F: Fn(&str) -> Result<Tensor>>(get: &F, i: usize) -> Result<Self> {
+        let p = format!("transformer_blocks.{i}");
+        let a = &format!("{p}.attn");
+        Ok(DoubleBlock {
+            norm1: lin(get, &format!("{p}.norm1.linear"))?,
+            norm1_ctx: lin(get, &format!("{p}.norm1_context.linear"))?,
+            attn: Attn {
+                to_q: lin(get, &format!("{a}.to_q"))?,
+                to_k: lin(get, &format!("{a}.to_k"))?,
+                to_v: lin(get, &format!("{a}.to_v"))?,
+                norm_q: get(&format!("{a}.norm_q.weight"))?,
+                norm_k: get(&format!("{a}.norm_k.weight"))?,
+                add_q: Some(lin(get, &format!("{a}.add_q_proj"))?),
+                add_k: Some(lin(get, &format!("{a}.add_k_proj"))?),
+                add_v: Some(lin(get, &format!("{a}.add_v_proj"))?),
+                norm_aq: Some(get(&format!("{a}.norm_added_q.weight"))?),
+                norm_ak: Some(get(&format!("{a}.norm_added_k.weight"))?),
+                to_out: Some(lin(get, &format!("{a}.to_out.0"))?),
+                to_add_out: Some(lin(get, &format!("{a}.to_add_out"))?),
+            },
+            ff0: lin(get, &format!("{p}.ff.net.0.proj"))?,
+            ff2: lin(get, &format!("{p}.ff.net.2"))?,
+            ffc0: lin(get, &format!("{p}.ff_context.net.0.proj"))?,
+            ffc2: lin(get, &format!("{p}.ff_context.net.2"))?,
+        })
+    }
+
     fn to_device(&self, dev: Device) -> Result<Self> {
         Ok(Self {
             norm1: lin_to(&self.norm1, dev)?,
@@ -554,6 +581,30 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
+    fn load<F: Fn(&str) -> Result<Tensor>>(get: &F, i: usize) -> Result<Self> {
+        let p = format!("single_transformer_blocks.{i}");
+        let a = &format!("{p}.attn");
+        Ok(SingleBlock {
+            norm: lin(get, &format!("{p}.norm.linear"))?,
+            attn: Attn {
+                to_q: lin(get, &format!("{a}.to_q"))?,
+                to_k: lin(get, &format!("{a}.to_k"))?,
+                to_v: lin(get, &format!("{a}.to_v"))?,
+                norm_q: get(&format!("{a}.norm_q.weight"))?,
+                norm_k: get(&format!("{a}.norm_k.weight"))?,
+                add_q: None,
+                add_k: None,
+                add_v: None,
+                norm_aq: None,
+                norm_ak: None,
+                to_out: None,
+                to_add_out: None,
+            },
+            proj_mlp: lin(get, &format!("{p}.proj_mlp"))?,
+            proj_out: lin(get, &format!("{p}.proj_out"))?,
+        })
+    }
+
     fn to_device(&self, dev: Device) -> Result<Self> {
         Ok(Self {
             norm: lin_to(&self.norm, dev)?,
@@ -594,6 +645,93 @@ impl SingleBlock {
     }
 }
 
+/// Проход по блокам: `blocks[..resident]` как есть, остальные приезжают на
+/// `dev`; следующий — на loader-стриме параллельно счёту текущего (схема
+/// `H3Dit::for_each_block`). Раньше блок копировался синхронно прямо перед
+/// своим forward, и H2D не пряталась за счётом.
+fn stream_each<B, F>(
+    blocks: &[B],
+    resident: usize,
+    dev: Option<Device>,
+    to_dev: fn(&B, Device) -> Result<B>,
+    mut body: F,
+) -> Result<()>
+where
+    B: Send + Sync,
+    F: FnMut(usize, &B) -> Result<()>,
+{
+    let n = blocks.len();
+    let (dev, ord) = match dev {
+        Some(Device::Cuda(o)) if resident < n => (Device::Cuda(o), o),
+        Some(d) if resident < n => {
+            for (i, b) in blocks.iter().enumerate() {
+                if i < resident {
+                    body(i, b)?;
+                } else {
+                    body(i, &to_dev(b, d)?)?;
+                }
+            }
+            return Ok(());
+        }
+        _ => {
+            for (i, b) in blocks.iter().enumerate() {
+                body(i, b)?;
+            }
+            return Ok(());
+        }
+    };
+    for (i, b) in blocks[..resident].iter().enumerate() {
+        body(i, b)?;
+    }
+    let ls = synaptix_core::device::cuda::loader_stream(ord)?;
+    synaptix_core::device::cuda::set_offload_pinned(true);
+    let mut staged = Some(to_dev(&blocks[resident], dev));
+    let mut result = Ok(());
+    for idx in resident..n {
+        let cur = match staged.take() {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
+                result = Err(e);
+                break;
+            }
+            None => unreachable!(),
+        };
+        let lsc = ls.clone();
+        let (step, next) = std::thread::scope(|sp| {
+            let h = (idx + 1 < n).then(|| {
+                let nb = &blocks[idx + 1];
+                sp.spawn(move || {
+                    synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
+                    synaptix_core::device::cuda::set_offload_pinned(true);
+                    let r = to_dev(nb, dev);
+                    let _ = lsc.synchronize();
+                    synaptix_core::device::cuda::set_offload_pinned(false);
+                    synaptix_core::device::cuda::set_alloc_stream(None);
+                    r
+                })
+            });
+            let step = body(idx, &cur);
+            let next = h.map(|h| {
+                h.join().unwrap_or_else(|_| Err(SynaptixError::Other("FLUX: поток префетча блока упал".into())))
+            });
+            (step, next)
+        });
+        // Освобождение блока стоит в хвосте compute-стрима — без синка пул
+        // берёт под следующий блок новые сегменты.
+        if let Ok(cs) = synaptix_core::device::cuda::default_stream(ord) {
+            let _ = cs.synchronize();
+        }
+        drop(cur);
+        if let Err(e) = step {
+            result = Err(e);
+            break;
+        }
+        staged = next;
+    }
+    synaptix_core::device::cuda::set_offload_pinned(false);
+    result
+}
+
 pub struct FluxTransformer {
     x_embedder: QuantLinear,
     context_embedder: QuantLinear,
@@ -631,50 +769,11 @@ impl FluxTransformer {
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let p = format!("transformer_blocks.{i}");
-            let a = &format!("{p}.attn");
-            blocks.push(DoubleBlock {
-                norm1: lin(get, &format!("{p}.norm1.linear"))?,
-                norm1_ctx: lin(get, &format!("{p}.norm1_context.linear"))?,
-                attn: Attn {
-                    to_q: lin(get, &format!("{a}.to_q"))?,
-                    to_k: lin(get, &format!("{a}.to_k"))?,
-                    to_v: lin(get, &format!("{a}.to_v"))?,
-                    norm_q: get(&format!("{a}.norm_q.weight"))?,
-                    norm_k: get(&format!("{a}.norm_k.weight"))?,
-                    add_q: Some(lin(get, &format!("{a}.add_q_proj"))?),
-                    add_k: Some(lin(get, &format!("{a}.add_k_proj"))?),
-                    add_v: Some(lin(get, &format!("{a}.add_v_proj"))?),
-                    norm_aq: Some(get(&format!("{a}.norm_added_q.weight"))?),
-                    norm_ak: Some(get(&format!("{a}.norm_added_k.weight"))?),
-                    to_out: Some(lin(get, &format!("{a}.to_out.0"))?),
-                    to_add_out: Some(lin(get, &format!("{a}.to_add_out"))?),
-                },
-                ff0: lin(get, &format!("{p}.ff.net.0.proj"))?,
-                ff2: lin(get, &format!("{p}.ff.net.2"))?,
-                ffc0: lin(get, &format!("{p}.ff_context.net.0.proj"))?,
-                ffc2: lin(get, &format!("{p}.ff_context.net.2"))?,
-            });
+            blocks.push(DoubleBlock::load(get, i)?);
         }
-
         let mut single_blocks = Vec::with_capacity(cfg.num_single_layers);
         for i in 0..cfg.num_single_layers {
-            let p = format!("single_transformer_blocks.{i}");
-            let a = &format!("{p}.attn");
-            single_blocks.push(SingleBlock {
-                norm: lin(get, &format!("{p}.norm.linear"))?,
-                attn: Attn {
-                    to_q: lin(get, &format!("{a}.to_q"))?,
-                    to_k: lin(get, &format!("{a}.to_k"))?,
-                    to_v: lin(get, &format!("{a}.to_v"))?,
-                    norm_q: get(&format!("{a}.norm_q.weight"))?,
-                    norm_k: get(&format!("{a}.norm_k.weight"))?,
-                    add_q: None, add_k: None, add_v: None,
-                    norm_aq: None, norm_ak: None, to_out: None, to_add_out: None,
-                },
-                proj_mlp: lin(get, &format!("{p}.proj_mlp"))?,
-                proj_out: lin(get, &format!("{p}.proj_out"))?,
-            });
+            single_blocks.push(SingleBlock::load(get, i)?);
         }
 
         let norm_out = lin(get, "norm_out.linear")?;
@@ -684,6 +783,120 @@ impl FluxTransformer {
             blocks, single_blocks, norm_out, proj_out, stream: None,
             resident_double: 0, resident_single: 0,
         })
+    }
+
+    /// Как [`Self::load`] (веса на карте, квант по [`set_load_precision`]), но
+    /// перед каждым блоком свободная VRAM сверяется с `reserve` + сам блок:
+    /// не влезшие блоки квантуются на карте и уезжают пиннованной копией на
+    /// хост, в forward стримятся с префетчем. `force_stream` — все блоки на
+    /// хост. Так NVFP4/MXFP8 работают и на карте ~7 ГБ (раньше квант всегда
+    /// клался на карту целиком: ~6,6 ГБ NVFP4 / ~12 ГБ MXFP8 + активации).
+    pub fn load_budgeted<F>(cfg: &FluxConfig, get: &F, dev: Device, reserve: usize, force_stream: bool) -> Result<Self>
+    where
+        F: Fn(&str) -> Result<Tensor>,
+    {
+        let ord = match dev {
+            Device::Cuda(o) => o,
+            _ => return Self::load(cfg, get),
+        };
+        let x_embedder = lin(get, "x_embedder")?;
+        let context_embedder = lin(get, "context_embedder")?;
+        let ts_embed = MlpEmbed::load(get, "time_text_embed.timestep_embedder")?;
+        let guid_embed = if cfg.guidance_embeds {
+            Some(MlpEmbed::load(get, "time_text_embed.guidance_embedder")?)
+        } else {
+            None
+        };
+        let text_embed = MlpEmbed::load(get, "time_text_embed.text_embedder")?;
+        let norm_out = lin(get, "norm_out.linear")?;
+        let proj_out = lin(get, "proj_out")?;
+
+        let (qd, comp) = load_prec();
+        let bpp = |params: usize| match qd {
+            DType::NVFP4 => params / 2 + params / 16,
+            DType::MXFP8 => params + params / 32,
+            _ => params * comp.bytes_for_numel(1).max(1),
+        };
+        let d = INNER;
+        // double: norm1/norm1_context 12d², внимание 8d², два FF 16d²; single: 15d².
+        let (dbl, sgl) = (bpp(36 * d * d), bpp(15 * d * d));
+        let free = || synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        let trim = || {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+            let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        };
+        let mut offload = force_stream;
+        let announce = |i: usize, kind: &str| {
+            eprintln!("[FLUX] VRAM: с {kind}-блока {i} блоки DiT уезжают на хост и стримятся в forward");
+        };
+        let fits = |need: usize| {
+            if free() >= reserve + need {
+                return true;
+            }
+            trim();
+            free() >= reserve + need
+        };
+        let to_host = |b: Result<DoubleBlock>| -> Result<DoubleBlock> {
+            let b = b?;
+            synaptix_core::device::cuda::set_offload_pinned(true);
+            let h = b.to_device(Device::Cpu);
+            synaptix_core::device::cuda::set_offload_pinned(false);
+            drop(b);
+            trim();
+            h
+        };
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        let mut rd = 0;
+        for i in 0..cfg.num_layers {
+            if !offload && !fits(dbl) {
+                offload = true;
+                announce(i, "double");
+            }
+            if offload {
+                blocks.push(to_host(DoubleBlock::load(get, i))?);
+            } else {
+                blocks.push(DoubleBlock::load(get, i)?);
+                rd += 1;
+            }
+        }
+        let mut single_blocks = Vec::with_capacity(cfg.num_single_layers);
+        let mut rs = 0;
+        for i in 0..cfg.num_single_layers {
+            if !offload && !fits(sgl) {
+                offload = true;
+                announce(i, "single");
+            }
+            let b = SingleBlock::load(get, i)?;
+            if offload {
+                synaptix_core::device::cuda::set_offload_pinned(true);
+                let h = b.to_device(Device::Cpu);
+                synaptix_core::device::cuda::set_offload_pinned(false);
+                drop(b);
+                trim();
+                single_blocks.push(h?);
+            } else {
+                single_blocks.push(b);
+                rs += 1;
+            }
+        }
+        eprintln!(
+            "[FLUX] {qd:?}: на карте {rd}/{} double + {rs}/{} single блоков, остальные — пиннованная копия на хосте",
+            cfg.num_layers, cfg.num_single_layers
+        );
+        Ok(Self {
+            x_embedder, context_embedder, ts_embed, guid_embed, text_embed,
+            blocks, single_blocks, norm_out, proj_out,
+            stream: if offload { Some(dev) } else { None },
+            resident_double: rd, resident_single: rs,
+        })
+    }
+
+    /// Сколько блоков (double, single) лежит на карте.
+    pub fn resident_blocks(&self) -> (usize, usize) {
+        match self.stream {
+            Some(_) => (self.resident_double, self.resident_single),
+            None => (self.blocks.len(), self.single_blocks.len()),
+        }
     }
 
     /// Включить layer-streaming: мелкие части (эмбеддеры, norm_out, proj_out)
@@ -814,19 +1027,15 @@ impl FluxTransformer {
             prof_sync(&dev);
         }
         let t_dbl = std::time::Instant::now();
-        for (i, blk) in self.blocks.iter().enumerate() {
+        let rd = if self.stream.is_some() { self.resident_double } else { self.blocks.len() };
+        stream_each(&self.blocks, rd, self.stream, DoubleBlock::to_device, |i, blk| {
             let probe = i == 0 || i == 14;
             if cap.is_some() && probe {
                 grab!(format!("db{i}in_img"), img);
                 grab!(format!("db{i}in_txt"), txt);
                 dbg_start();
             }
-            let (i2, t2) = match self.stream {
-                Some(d) if i >= self.resident_double => {
-                    blk.to_device(d)?.forward(&img, &txt, &temb, &cos, &sin)? // streamed
-                }
-                _ => blk.forward(&img, &txt, &temb, &cos, &sin)?, // резидент (или stream=None)
-            };
+            let (i2, t2) = blk.forward(&img, &txt, &temb, &cos, &sin)?;
             img = i2;
             txt = t2;
             if probe {
@@ -839,19 +1048,16 @@ impl FluxTransformer {
             if i == 9 || i == 18 {
                 grab!(format!("depthD{i}_img"), img);
             }
-        }
+            Ok(())
+        })?;
         if prof {
             prof_sync(&dev);
             prof_add("double", t_dbl.elapsed().as_secs_f64());
         }
         let t_sgl = std::time::Instant::now();
-        for (i, blk) in self.single_blocks.iter().enumerate() {
-            let (i2, t2) = match self.stream {
-                Some(d) if i >= self.resident_single => {
-                    blk.to_device(d)?.forward(&img, &txt, &temb, &cos, &sin)? // streamed
-                }
-                _ => blk.forward(&img, &txt, &temb, &cos, &sin)?, // резидент (или stream=None)
-            };
+        let rs = if self.stream.is_some() { self.resident_single } else { self.single_blocks.len() };
+        stream_each(&self.single_blocks, rs, self.stream, SingleBlock::to_device, |i, blk| {
+            let (i2, t2) = blk.forward(&img, &txt, &temb, &cos, &sin)?;
             img = i2;
             txt = t2;
             if i == 0 {
@@ -861,7 +1067,8 @@ impl FluxTransformer {
             if i == 9 || i == 18 || i == 37 {
                 grab!(format!("depthS{i}_img"), img);
             }
-        }
+            Ok(())
+        })?;
         if prof {
             prof_sync(&dev);
             prof_add("single", t_sgl.elapsed().as_secs_f64());

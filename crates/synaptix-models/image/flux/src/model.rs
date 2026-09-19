@@ -206,6 +206,7 @@ impl FluxModel {
     pub fn encode_prompt(&self, prompt: &str, max_seq_len: usize) -> Result<FluxConditioning, FluxError> {
         let _ng = synaptix_core::grad::NoGradGuard::new();
         let dev = self.device;
+        release_pools(dev);
         let edt = self.encoder_dtype();
         let max_seq_len = max_seq_len.clamp(1, T5_MAX_DEV);
 
@@ -229,10 +230,20 @@ impl FluxModel {
         t5_ids.resize(max_seq_len, 0); // pad_token_id = 0
         let t5 = {
             let ids = Tensor::from_vec(t5_ids, (1, max_seq_len), dev)?;
+            let cfg = T5Config::xxl();
             let enc = {
                 let _g = weights_guard(dev);
-                let w = ComponentWeights::from_source(&self.source, FluxComponent::T5Text, dev, edt)?;
-                T5Encoder::load(&T5Config::xxl(), &|n| w.get(n))?
+                let w = std::sync::Arc::new(ComponentWeights::from_source(&self.source, FluxComponent::T5Text, dev, edt)?);
+                if dev.is_cuda() {
+                    // T5-XXL в BF16 — 9,5 ГБ: на малой карте часть блоков
+                    // читается из источника прямо в forward. Запас: два
+                    // стримящихся блока, активации и рабочий стол.
+                    let reserve = 2 * T5Encoder::block_bytes(&cfg, 2) + 1_500_000_000;
+                    let get: crate::t5::T5WeightSource = std::sync::Arc::new(move |n: &str| w.get(n));
+                    T5Encoder::load_budgeted(&cfg, get, dev, reserve)?
+                } else {
+                    T5Encoder::load(&cfg, &|n| w.get(n))?
+                }
             };
             enc.forward(&ids)?
         };
@@ -254,11 +265,34 @@ impl FluxModel {
 
         if is_quant && dev.is_cuda() {
             // Квант при загрузке: плотный вес читается в compute и сразу
-            // квантуется, так что на карте остаётся ~6 ГБ (NVFP4) / ~12 ГБ
-            // (MXFP8) — стриминг не нужен даже на 2048².
-            eprintln!("[FLUX] quant={:?} compute={dt:?}: квантую трансформер резидентно", self.quant);
+            // квантуется (~6,6 ГБ NVFP4 / ~12 ГБ MXFP8). На малой карте то,
+            // что не влезло с запасом под активации, уезжает пиннованной
+            // копией на хост и стримится в forward.
+            eprintln!("[FLUX] quant={:?} compute={dt:?}: квантую трансформер", self.quant);
             let w = ComponentWeights::from_source(&self.source, FluxComponent::Transformer, dev, dt)?;
-            return Ok(FluxTransformer::load(&self.config, &|nm| w.get(nm))?);
+            return Ok(match self.offload {
+                OffloadMode::Resident => FluxTransformer::load(&self.config, &|nm| w.get(nm))?,
+                mode => {
+                    // Рабочий стол + активации + два стримящихся блока
+                    // (текущий и префетч), у каждого на первом умножении
+                    // временно живёт ещё и перемешанная копия весов — отсюда
+                    // 4 блока (замер MXFP8 1024² в 7 ГБ: с 2 блоками минимум
+                    // свободной VRAM падал до 0,03 ГБ).
+                    let d = 3072usize;
+                    let blk = match self.quant {
+                        DType::NVFP4 => 36 * d * d * 9 / 16,
+                        _ => 36 * d * d * 33 / 32,
+                    };
+                    let reserve = 1_500_000_000usize + tokens * 220_000 + 4 * blk;
+                    FluxTransformer::load_budgeted(
+                        &self.config,
+                        &|nm| w.get(nm),
+                        dev,
+                        reserve,
+                        mode == OffloadMode::Stream,
+                    )?
+                }
+            });
         }
         if !dev.is_cuda() {
             let w = ComponentWeights::from_source(&self.source, FluxComponent::Transformer, Device::Cpu, dt)?;
@@ -377,6 +411,10 @@ impl FluxModel {
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor, FluxError> {
         let _ng = synaptix_core::grad::NoGradGuard::new();
         let dev = self.device;
+        // Память отпущенного DiT лежит в пулах: без возврата драйверу
+        // активациям VAE (1024² в F32 — несколько ГБ) на малой карте места
+        // не оставалось (замер в 7 ГБ: минимум свободной 0,03 ГБ).
+        release_pools(dev);
         let lat = latent
             .to_device(dev)?
             .to_dtype(DType::F32)?
@@ -411,6 +449,7 @@ impl FluxModel {
             )));
         }
         let dev = self.device;
+        release_pools(dev);
         let x = image
             .to_device(dev)?
             .to_dtype(DType::F32)?

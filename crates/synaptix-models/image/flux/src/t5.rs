@@ -153,12 +153,43 @@ impl T5Block {
     }
 }
 
+/// Источник весов T5 для стриминга блоков: имя тензора → тензор на
+/// устройстве энкодера. Нужен владеющий и потокобезопасный — следующий блок
+/// грузится в отдельном потоке параллельно счёту текущего.
+pub type T5WeightSource = std::sync::Arc<dyn Fn(&str) -> Result<Tensor> + Send + Sync>;
+
 pub struct T5Encoder {
     embed: Tensor, // shared.weight [vocab, d_model]
     rel_bias: Tensor,
+    /// Резидентный префикс блоков; `blocks.len()..num_layers` стримятся.
     blocks: Vec<T5Block>,
     final_ln: Tensor,
     config: T5Config,
+    stream: Option<T5WeightSource>,
+}
+
+fn load_block<F>(cfg: &T5Config, i: usize, get: &F) -> Result<T5Block>
+where
+    F: Fn(&str) -> Result<Tensor> + ?Sized,
+{
+    let lin = |name: &str| -> Result<Linear> { Linear::new(get(name)?, None) };
+    let p = format!("encoder.block.{i}");
+    Ok(T5Block {
+        ln0: get(&format!("{p}.layer.0.layer_norm.weight"))?,
+        attn: T5Attention {
+            q: lin(&format!("{p}.layer.0.SelfAttention.q.weight"))?,
+            k: lin(&format!("{p}.layer.0.SelfAttention.k.weight"))?,
+            v: lin(&format!("{p}.layer.0.SelfAttention.v.weight"))?,
+            o: lin(&format!("{p}.layer.0.SelfAttention.o.weight"))?,
+            num_heads: cfg.num_heads,
+            d_kv: cfg.d_kv,
+        },
+        ln1: get(&format!("{p}.layer.1.layer_norm.weight"))?,
+        wi_0: lin(&format!("{p}.layer.1.DenseReluDense.wi_0.weight"))?,
+        wi_1: lin(&format!("{p}.layer.1.DenseReluDense.wi_1.weight"))?,
+        wo: lin(&format!("{p}.layer.1.DenseReluDense.wo.weight"))?,
+        eps: cfg.eps,
+    })
 }
 
 impl T5Encoder {
@@ -170,32 +201,120 @@ impl T5Encoder {
     where
         F: Fn(&str) -> Result<Tensor>,
     {
-        let lin = |name: &str| -> Result<Linear> { Linear::new(get(name)?, None) };
         let embed = get("shared.weight")?;
         let rel_bias =
             get("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let p = format!("encoder.block.{i}");
-            blocks.push(T5Block {
-                ln0: get(&format!("{p}.layer.0.layer_norm.weight"))?,
-                attn: T5Attention {
-                    q: lin(&format!("{p}.layer.0.SelfAttention.q.weight"))?,
-                    k: lin(&format!("{p}.layer.0.SelfAttention.k.weight"))?,
-                    v: lin(&format!("{p}.layer.0.SelfAttention.v.weight"))?,
-                    o: lin(&format!("{p}.layer.0.SelfAttention.o.weight"))?,
-                    num_heads: cfg.num_heads,
-                    d_kv: cfg.d_kv,
-                },
-                ln1: get(&format!("{p}.layer.1.layer_norm.weight"))?,
-                wi_0: lin(&format!("{p}.layer.1.DenseReluDense.wi_0.weight"))?,
-                wi_1: lin(&format!("{p}.layer.1.DenseReluDense.wi_1.weight"))?,
-                wo: lin(&format!("{p}.layer.1.DenseReluDense.wo.weight"))?,
-                eps: cfg.eps,
-            });
+            blocks.push(load_block(cfg, i, get)?);
         }
         let final_ln = get("encoder.final_layer_norm.weight")?;
-        Ok(Self { embed, rel_bias, blocks, final_ln, config: cfg.clone() })
+        Ok(Self { embed, rel_bias, blocks, final_ln, config: cfg.clone(), stream: None })
+    }
+
+    /// Байт на блок в `bytes_per_param` (2 для BF16).
+    pub fn block_bytes(cfg: &T5Config, bytes_per_param: usize) -> usize {
+        let (d, inner, ff) = (cfg.d_model, cfg.inner_dim(), cfg.d_ff);
+        (4 * d * inner + 3 * d * ff) * bytes_per_param
+    }
+
+    /// Как [`Self::load`], но на карту кладутся блоки, пока свободной VRAM
+    /// больше `reserve` + блок; остальные читаются из `get` по одному прямо в
+    /// forward (следующий — параллельно счёту текущего). Проход энкодера
+    /// одноразовый, поэтому копия на хосте не нужна: T5-XXL (9,5 ГБ в BF16)
+    /// проходит и на карте в 7 ГБ.
+    pub fn load_budgeted(cfg: &T5Config, get: T5WeightSource, device: Device, reserve: usize) -> Result<Self> {
+        let embed = get("shared.weight")?;
+        let rel_bias = get("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")?;
+        let final_ln = get("encoder.final_layer_norm.weight")?;
+        let blk = Self::block_bytes(cfg, 2);
+        let free = || match device {
+            Device::Cuda(o) => synaptix_core::device::cuda::mem_info(o).map(|(f, _)| f).unwrap_or(0),
+            _ => usize::MAX,
+        };
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if free() < reserve + blk {
+                if let Device::Cuda(o) = device {
+                    let _ = synaptix_core::device::cuda::synchronize_all(o);
+                    let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+                }
+                if free() < reserve + blk {
+                    eprintln!(
+                        "[FLUX] T5: на карте {i}/{} блоков, остальные читаются из источника в forward",
+                        cfg.num_layers
+                    );
+                    break;
+                }
+            }
+            blocks.push(load_block(cfg, i, get.as_ref())?);
+        }
+        let stream = (blocks.len() < cfg.num_layers).then_some(get);
+        Ok(Self { embed, rel_bias, blocks, final_ln, config: cfg.clone(), stream })
+    }
+
+    /// Сколько блоков лежит на карте.
+    pub fn resident_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Блоки по порядку: резидентные как есть, остальные грузятся из
+    /// источника, следующий — на loader-стриме параллельно счёту текущего.
+    fn for_each_block<F>(&self, mut body: F) -> Result<()>
+    where
+        F: FnMut(&T5Block) -> Result<()>,
+    {
+        for b in &self.blocks {
+            body(b)?;
+        }
+        let first = self.blocks.len();
+        let n = self.config.num_layers;
+        if first >= n {
+            return Ok(());
+        }
+        let get = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| SynaptixError::Other("T5: стриминг блоков без источника весов".into()))?;
+        let dev = self.embed.device();
+        let ls = match dev {
+            Device::Cuda(o) => Some(synaptix_core::device::cuda::loader_stream(o)?),
+            _ => None,
+        };
+        let cfg = &self.config;
+        let load = |idx: usize, on_loader: bool| -> Result<T5Block> {
+            if let (true, Some(ls)) = (on_loader, ls.as_ref()) {
+                synaptix_core::device::cuda::set_alloc_stream(Some(ls.clone()));
+                let r = load_block(cfg, idx, get.as_ref());
+                let _ = ls.synchronize();
+                synaptix_core::device::cuda::set_alloc_stream(None);
+                r
+            } else {
+                load_block(cfg, idx, get.as_ref())
+            }
+        };
+        let mut staged = Some(load(first, false));
+        for idx in first..n {
+            let cur = staged.take().expect("staged")?;
+            let load = &load;
+            let (step, next) = std::thread::scope(|sp| {
+                let h = (idx + 1 < n).then(|| sp.spawn(move || load(idx + 1, true)));
+                let step = body(&cur);
+                let next = h.map(|h| {
+                    h.join().unwrap_or_else(|_| Err(SynaptixError::Other("T5: поток префетча блока упал".into())))
+                });
+                (step, next)
+            });
+            if let Device::Cuda(o) = dev {
+                if let Ok(cs) = synaptix_core::device::cuda::default_stream(o) {
+                    let _ = cs.synchronize();
+                }
+            }
+            drop(cur);
+            step?;
+            staged = next;
+        }
+        Ok(())
     }
 
     /// `input_ids: [B, S]` (U32) → `last_hidden_state: [B, S, d_model]`.
@@ -222,9 +341,10 @@ impl T5Encoder {
             input_ids.device(),
         )?;
         let mut h = h;
-        for blk in &self.blocks {
+        self.for_each_block(|blk| {
             h = blk.forward(&h, &bias)?;
-        }
+            Ok(())
+        })?;
         rms_norm(&h, &self.final_ln, self.config.eps)
     }
 }
