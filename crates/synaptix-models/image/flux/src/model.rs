@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use synaptix_core::device::cuda::WeightsAllocGuard;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_diffusion::schedulers::randn_seeded;
 use synaptix_nn::text::{ClipTextConfig, ClipTextEncoder};
@@ -69,6 +70,23 @@ pub struct SampleParams {
     /// Доля шума для img2img: 1.0 — с чистого шума (txt2img), меньше —
     /// от исходного латента. Без `init` не используется.
     pub denoise: f32,
+}
+
+/// Вернуть драйверу свободное во ВСЕХ пулах устройства. Веса без
+/// [`WeightsAllocGuard`] и активации живут в пуле активаций, а у него
+/// порог освобождения — бесконечность: после T5 там оставалось ~10 ГБ
+/// зарезервированных, и ни трансформер, ни следующая видео-модель их не
+/// видели. Обычный `trim_cuda_mempool_device` трогает только default-пул.
+pub fn release_pools(device: Device) {
+    if let Device::Cuda(ord) = device {
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+    }
+}
+
+/// Веса — в weights-пул (а не вперемешку с активациями), на выходе из
+/// области видимости staging-буферы загрузки отдаются драйверу.
+fn weights_guard(device: Device) -> WeightsAllocGuard {
+    WeightsAllocGuard::for_device(device)
 }
 
 /// Снап стороны к кратному [`SIDE_MULTIPLE`] (вниз, но не меньше 16).
@@ -194,8 +212,11 @@ impl FluxModel {
         let clip_ids = self.clip_tok.encode(prompt, CLIP_MAX);
         let pooled = {
             let ids = Tensor::from_vec(clip_ids, (1, CLIP_MAX), dev)?;
-            let w = ComponentWeights::from_source(&self.source, FluxComponent::ClipText, dev, edt)?;
-            let enc = ClipTextEncoder::load(&ClipTextConfig::clip_l(), "text_model", &|n| w.get(n))?;
+            let enc = {
+                let _g = weights_guard(dev);
+                let w = ComponentWeights::from_source(&self.source, FluxComponent::ClipText, dev, edt)?;
+                ClipTextEncoder::load(&ClipTextConfig::clip_l(), "text_model", &|n| w.get(n))?
+            };
             enc.forward(&ids)?.pooled_output
         };
 
@@ -208,10 +229,14 @@ impl FluxModel {
         t5_ids.resize(max_seq_len, 0); // pad_token_id = 0
         let t5 = {
             let ids = Tensor::from_vec(t5_ids, (1, max_seq_len), dev)?;
-            let w = ComponentWeights::from_source(&self.source, FluxComponent::T5Text, dev, edt)?;
-            let enc = T5Encoder::load(&T5Config::xxl(), &|n| w.get(n))?;
+            let enc = {
+                let _g = weights_guard(dev);
+                let w = ComponentWeights::from_source(&self.source, FluxComponent::T5Text, dev, edt)?;
+                T5Encoder::load(&T5Config::xxl(), &|n| w.get(n))?
+            };
             enc.forward(&ids)?
         };
+        release_pools(dev);
         Ok(FluxConditioning { pooled, t5 })
     }
 
@@ -222,6 +247,10 @@ impl FluxModel {
         let dt = self.compute;
         let is_quant = self.quant.is_quantized();
         set_load_precision(if is_quant { self.quant } else { dt }, dt);
+        // Всё отпущенное прошлыми стадиями — драйверу, иначе замер свободной
+        // VRAM ниже занижен, а квантованным весам негде лечь.
+        release_pools(dev);
+        let _g = weights_guard(dev);
 
         if is_quant && dev.is_cuda() {
             // Квант при загрузке: плотный вес читается в compute и сразу
@@ -242,12 +271,11 @@ impl FluxModel {
             OffloadMode::Stream => true,
             OffloadMode::Auto => {
                 let ord = if let Device::Cuda(o) = dev { o } else { 0 };
-                // Энкодеры только что освободили ~10 ГБ в пул — вернём их
-                // драйверу, иначе mem_get_info занизит свободное.
-                let _ = synaptix_core::device::cuda::synchronize(ord);
-                synaptix_core::memory::cuda_pool::trim_cuda_mempool_device(ord).ok();
                 let weight_bytes = self.source.component_bytes(FluxComponent::Transformer)?;
-                let reserve = 300_000_000u64 + tokens * 96_000;
+                // Запас под активации плюс 1,5 ГБ под рабочий стол: карта одна
+                // на модель и композитор, и при сотнях свободных мегабайт KWin
+                // начинает ронять atomic commit.
+                let reserve = 1_500_000_000u64 + tokens * 96_000;
                 match synaptix_core::device::cuda::mem_info(ord) {
                     Ok((free, total)) => {
                         let resident = (free as u64) >= weight_bytes + reserve;
@@ -355,14 +383,20 @@ impl FluxModel {
             .mul_scalar(1.0 / self.vae_scaling)?
             .add_scalar(self.vae_shift)?;
         let image = {
-            let w = ComponentWeights::from_source(&self.source, FluxComponent::Vae, dev, DType::F32)?;
-            let vae = AutoencoderKlDecoder::load(&AutoencoderKlConfig::flux(), &|nm| w.get(nm))?;
+            let vae = {
+                let _g = weights_guard(dev);
+                let w = ComponentWeights::from_source(&self.source, FluxComponent::Vae, dev, DType::F32)?;
+                AutoencoderKlDecoder::load(&AutoencoderKlConfig::flux(), &|nm| w.get(nm))?
+            };
             vae.decode(&lat)?
         };
         let image = image.affine(0.5, 0.5)?.clamp(0.0, 1.0)?;
         let d = image.dims().to_vec();
         let chw = image.narrow(0, 0, 1)?.reshape(vec![d[1], d[2], d[3]])?;
-        Ok(chw.contiguous()?.to_dtype(DType::F32)?.to_device(Device::Cpu)?)
+        let out = chw.contiguous()?.to_dtype(DType::F32)?.to_device(Device::Cpu)?;
+        drop((image, chw, lat));
+        release_pools(dev);
+        Ok(out)
     }
 
     /// Картинка `[3, H, W]` в [0, 1] → нормированный латент `[1, 16, h, w]`
@@ -382,11 +416,17 @@ impl FluxModel {
             .to_dtype(DType::F32)?
             .reshape(vec![1, d[0], d[1], d[2]])?
             .affine(2.0, -1.0)?;
-        let w = ComponentWeights::from_source(&self.source, FluxComponent::Vae, dev, DType::F32)?;
-        let enc = AutoencoderKlEncoder::load(&AutoencoderKlConfig::flux(), &|nm| w.get(nm))?;
+        let enc = {
+            let _g = weights_guard(dev);
+            let w = ComponentWeights::from_source(&self.source, FluxComponent::Vae, dev, DType::F32)?;
+            AutoencoderKlEncoder::load(&AutoencoderKlConfig::flux(), &|nm| w.get(nm))?
+        };
         let moments = enc.encode(&x)?;
         let (mean, _logvar) = enc.split_moments(&moments)?;
-        Ok(mean.add_scalar(-self.vae_shift)?.mul_scalar(self.vae_scaling)?)
+        let latent = mean.add_scalar(-self.vae_shift)?.mul_scalar(self.vae_scaling)?;
+        drop((enc, moments, mean, x));
+        release_pools(dev);
+        Ok(latent)
     }
 }
 

@@ -10,12 +10,15 @@
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_image_flux::{FluxError, FluxModel, SampleParams};
 
-fn setup() -> Option<(String, String, std::path::PathBuf)> {
+/// `(каталог diffusers, если задан и есть; бандл; куда класть картинки)`.
+/// Каталог нужен только сравнению бандла с исходником.
+fn setup() -> Option<(Option<String>, String, std::path::PathBuf)> {
     synaptix_kernels_cuda::cuda_backend::ensure_registered();
     synaptix_kernels_cpu::ensure_registered();
     let out = std::path::PathBuf::from(std::env::var("FLUX_OUT").unwrap_or_else(|_| "/tmp/flux_e2e".into()));
     std::fs::create_dir_all(&out).ok();
-    Some((std::env::var("FLUX_DIR").ok()?, std::env::var("FLUX_SYN").ok()?, out))
+    let dir = std::env::var("FLUX_DIR").ok().filter(|d| std::path::Path::new(d).is_dir());
+    Some((dir, std::env::var("FLUX_SYN").ok()?, out))
 }
 
 const PROMPT: &str = "a lighthouse on a rocky coast at sunset, dramatic clouds, photo";
@@ -55,8 +58,8 @@ fn bits(t: &Tensor) -> Vec<u32> {
 #[test]
 #[ignore]
 fn bundle_and_directory_give_identical_image() {
-    let Some((dir, syn, out)) = setup() else {
-        eprintln!("SKIP: задайте FLUX_DIR и FLUX_SYN");
+    let Some((Some(dir), syn, out)) = setup() else {
+        eprintln!("SKIP: задайте FLUX_DIR (существующий каталог) и FLUX_SYN");
         return;
     };
     let p = params(11);
@@ -124,4 +127,34 @@ fn img2img_keeps_size_and_cancel_stops() {
     });
     assert!(matches!(r, Err(FluxError::Cancelled)), "ожидалась отмена");
     assert_eq!(seen, 2);
+}
+
+/// Стадии возвращают VRAM драйверу: веса T5 без weights-пула оседали в пуле
+/// активаций (порог освобождения — бесконечность), и после кодирования
+/// промпта ~10 ГБ оставались занятыми до конца процесса.
+#[test]
+#[ignore]
+fn stages_return_vram_to_driver() {
+    let Some((_, syn, _)) = setup() else {
+        eprintln!("SKIP: задайте FLUX_SYN");
+        return;
+    };
+    let free = || synaptix_core::device::cuda::mem_info(0).map(|(f, _)| f as f64 / 1e9).unwrap();
+    let m = FluxModel::open(&syn, Device::Cuda(0), DType::F16, DType::NVFP4).unwrap();
+    // Прошлые тесты процесса могли оставить своё в пулах — старт с чистого.
+    synaptix_image_flux::model::release_pools(Device::Cuda(0));
+    let start = free();
+    let cond = m.encode_prompt(PROMPT, m.default_max_seq_len()).unwrap();
+    let after_encode = free();
+    eprintln!("free: старт {start:.2} ГБ, после T5 {after_encode:.2} ГБ");
+    assert!(start - after_encode < 0.5, "T5 не отдал VRAM: {start:.2} → {after_encode:.2} ГБ");
+    let p = params(3);
+    let tr = m.load_transformer(FluxModel::tokens_for(p.width, p.height, 512)).unwrap();
+    let lat = m.sample(&tr, &cond, None, &SampleParams { steps: 2, ..p }, &mut |_, _| true).unwrap();
+    drop(tr);
+    synaptix_image_flux::model::release_pools(Device::Cuda(0));
+    let _ = m.decode(&lat).unwrap();
+    let end = free();
+    eprintln!("free после денойза и декода: {end:.2} ГБ");
+    assert!(start - end < 0.5, "стадии не вернули VRAM: {start:.2} → {end:.2} ГБ");
 }
