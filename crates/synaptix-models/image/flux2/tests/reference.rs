@@ -181,6 +181,45 @@ fn full_generation_matches() {
     }
 }
 
+/// Все блоки DiT стримятся прямо из источника (путь «RAM не хватает»):
+/// квант делается на каждом шаге заново, результат — тот же, что резидентно.
+#[test]
+#[ignore]
+fn full_generation_streamed_from_source() {
+    let Some((model, refd)) = setup() else { return };
+    std::env::set_var("FLUX2_STREAM_FROM", "source");
+    for quant in [DType::MXFP8, DType::BF16] {
+        let m = open(&model, quant).with_memory(Placement::Stream);
+        let (pe, pe_shape) = load_ref(&refd, "prompt_embeds");
+        let (noise, ns) = load_ref(&refd, "noise");
+        let cond = synaptix_image_flux2::Flux2Conditioning {
+            embeds: Tensor::from_vec(pe, pe_shape, Device::Cpu).unwrap().to_dtype(DType::BF16).unwrap(),
+            negative: None,
+        };
+        let (h, w) = (ns[2] * 16, ns[3] * 16);
+        let t = m.load_transformer(Flux2Model::tokens_for(w, h, 0)).unwrap();
+        assert_eq!(t.residency().source, m.config().num_blocks());
+        let p = SampleParams {
+            width: w,
+            height: h,
+            steps: m.variant().default_steps(),
+            guidance: m.variant().default_guidance(),
+            seed: 0,
+            denoise: 1.0,
+        };
+        let noise = Tensor::from_vec(noise, ns, Device::Cpu).unwrap();
+        let lat = m.sample_from_noise(&t, &cond, None, None, Some(&noise), &p, &mut |_, _| true).unwrap();
+        drop(t);
+        let img = m.decode(&lat).unwrap();
+        let (r, _) = load_ref(&refd, "image");
+        let ps = psnr(&to_vec(&img), &r);
+        eprintln!("генерация {quant:?}, все блоки из источника: PSNR {ps:.2} дБ");
+        let min = if quant == DType::BF16 { 28.0 } else { 20.0 };
+        assert!(ps > min, "{quant:?}: psnr {ps}");
+    }
+    std::env::remove_var("FLUX2_STREAM_FROM");
+}
+
 fn save_ppm(img: &Tensor, path: &str) {
     let d = img.dims().to_vec();
     let (h, w) = (d[1], d[2]);

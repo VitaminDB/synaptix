@@ -38,12 +38,19 @@ pub fn weight_bytes(params: usize, quant: DType, compute: DType) -> usize {
     }
 }
 
+/// Источник тензоров блока: имя → тензор на устройстве в запрошенном типе.
+type Getter<'a> = dyn Fn(&str, DType) -> Result<Tensor> + 'a;
+
 /// Линейный слой без bias: квантуемый вес читается сразу в F16 (без
 /// промежуточной BF16-копии на карте), плотный — в `compute`.
-fn lin(w: &Weights, name: &str, dev: Device, compute: DType, quant: DType) -> Result<QuantLinear> {
-    let q = quant.is_quantized() && dev.is_cuda();
-    let raw = w.get(&format!("{name}.weight"), dev, if q { DType::F16 } else { compute })?;
+fn lin_g(g: &Getter<'_>, name: &str, cuda: bool, compute: DType, quant: DType) -> Result<QuantLinear> {
+    let q = quant.is_quantized() && cuda;
+    let raw = g(&format!("{name}.weight"), if q { DType::F16 } else { compute })?;
     QuantLinear::build(raw, None, if q { quant } else { compute }, compute)
+}
+
+fn lin(w: &Weights, name: &str, dev: Device, compute: DType, quant: DType) -> Result<QuantLinear> {
+    lin_g(&|n, dt| w.get(n, dev, dt), name, dev.is_cuda(), compute, quant)
 }
 
 fn dense(w: &Weights, name: &str, dev: Device, compute: DType) -> Result<QuantLinear> {
@@ -281,13 +288,27 @@ fn ql_to(l: &QuantLinear, dev: Device) -> Result<QuantLinear> {
     l.to_device(dev)
 }
 
+/// Префикс имён тензоров блока `idx`.
+fn block_prefix(cfg: &Flux2Config, idx: usize) -> String {
+    if idx < cfg.num_layers {
+        format!("transformer_blocks.{idx}.")
+    } else {
+        format!("single_transformer_blocks.{}.", idx - cfg.num_layers)
+    }
+}
+
 impl Block {
     fn load(w: &Weights, cfg: &Flux2Config, idx: usize, dev: Device, compute: DType, quant: DType) -> Result<Self> {
-        let norm = |n: String| w.get(&n, dev, compute);
+        Self::load_g(&|n, dt| w.get(n, dev, dt), cfg, idx, dev.is_cuda(), compute, quant)
+    }
+
+    fn load_g(g: &Getter<'_>, cfg: &Flux2Config, idx: usize, cuda: bool, compute: DType, quant: DType) -> Result<Self> {
+        let norm = |n: String| g(&n, compute);
+        let lin = |name: &str| lin_g(g, name, cuda, compute, quant);
         if idx < cfg.num_layers {
             let p = format!("transformer_blocks.{idx}");
             let a = format!("{p}.attn");
-            let l = |n: &str| lin(w, &format!("{a}.{n}"), dev, compute, quant);
+            let l = |n: &str| lin(&format!("{a}.{n}"));
             Ok(Block::Double(DoubleBlock {
                 to_q: l("to_q")?,
                 to_k: l("to_k")?,
@@ -301,18 +322,18 @@ impl Block {
                 norm_ak: norm(format!("{a}.norm_added_k.weight"))?,
                 to_out: l("to_out.0")?,
                 to_add_out: l("to_add_out")?,
-                ff_in: lin(w, &format!("{p}.ff.linear_in"), dev, compute, quant)?,
-                ff_out: lin(w, &format!("{p}.ff.linear_out"), dev, compute, quant)?,
-                ffc_in: lin(w, &format!("{p}.ff_context.linear_in"), dev, compute, quant)?,
-                ffc_out: lin(w, &format!("{p}.ff_context.linear_out"), dev, compute, quant)?,
+                ff_in: lin(&format!("{p}.ff.linear_in"))?,
+                ff_out: lin(&format!("{p}.ff.linear_out"))?,
+                ffc_in: lin(&format!("{p}.ff_context.linear_in"))?,
+                ffc_out: lin(&format!("{p}.ff_context.linear_out"))?,
             }))
         } else {
             let a = format!("single_transformer_blocks.{}.attn", idx - cfg.num_layers);
             Ok(Block::Single(SingleBlock {
-                qkv_mlp: lin(w, &format!("{a}.to_qkv_mlp_proj"), dev, compute, quant)?,
+                qkv_mlp: lin(&format!("{a}.to_qkv_mlp_proj"))?,
                 norm_q: norm(format!("{a}.norm_q.weight"))?,
                 norm_k: norm(format!("{a}.norm_k.weight"))?,
-                to_out: lin(w, &format!("{a}.to_out"), dev, compute, quant)?,
+                to_out: lin(&format!("{a}.to_out"))?,
             }))
         }
     }
@@ -445,6 +466,16 @@ enum Slot {
     Source,
 }
 
+/// Блок, доставленный на карту потоком префетча: готовый (копия с хоста)
+/// или сырые тензоры источника в типе файла — квант и приведение типа
+/// делаются уже в основном потоке. Ядра, запущенные из потока префетча, не
+/// ждут копию на loader-стриме и читают недокачанные веса (так на VAE H3
+/// выходил кадр из шума).
+enum Staged {
+    Ready(Block),
+    Raw(std::collections::HashMap<String, Tensor>),
+}
+
 pub struct Flux2Transformer {
     cfg: Flux2Config,
     device: Device,
@@ -524,7 +555,11 @@ impl Flux2Transformer {
         let reserve = act + 2 * max_blk + raw_transient + memory::DESKTOP_MARGIN;
         // Хост: пиннованные копии только если RAM хватает с запасом, иначе
         // блоки читаются из mmap-источника на каждом шаге.
-        let host_ok = |need: u64| memory::host_available().map(|a| a > need + (12u64 << 30)).unwrap_or(false);
+        // FLUX2_STREAM_FROM=source — диагностика: не держать копию на хосте.
+        let force_source = std::env::var("FLUX2_STREAM_FROM").is_ok_and(|v| v == "source");
+        let host_ok = |need: u64| {
+            !force_source && memory::host_available().map(|a| a > need + (12u64 << 30)).unwrap_or(false)
+        };
 
         let mut slots = Vec::with_capacity(n);
         let mut first_off: Option<usize> = match placement {
@@ -611,12 +646,40 @@ impl Flux2Transformer {
         r
     }
 
-    /// Копия нерезидентного блока на карте.
-    fn stage(&self, idx: usize) -> Result<Block> {
+    /// Копия нерезидентного блока на карте (в потоке префетча — только
+    /// копирование, без ядер).
+    fn stage(&self, idx: usize) -> Result<Staged> {
         match &self.slots[idx] {
             Slot::Device(_) => Err(SynaptixError::Other(format!("flux2: блок {idx} и так на карте"))),
-            Slot::Host(b) => b.to_device(self.device),
-            Slot::Source => Block::load(&self.weights, &self.cfg, idx, self.device, self.compute, self.quant),
+            Slot::Host(b) => b.to_device(self.device).map(Staged::Ready),
+            Slot::Source => {
+                let prefix = block_prefix(&self.cfg, idx);
+                let mut raw = std::collections::HashMap::new();
+                for n in self.weights.names().into_iter().filter(|n| n.starts_with(&prefix)) {
+                    let dt = self.weights.raw(&n).map(|(_, dt, _)| dt).unwrap_or(self.compute);
+                    let t = self.weights.get(&n, self.device, dt)?;
+                    raw.insert(n, t);
+                }
+                Ok(Staged::Raw(raw))
+            }
+        }
+    }
+
+    /// Готовый блок из доставленного (квант — здесь, на compute-стриме).
+    fn finish(&self, idx: usize, s: Staged) -> Result<Block> {
+        match s {
+            Staged::Ready(b) => Ok(b),
+            Staged::Raw(raw) => {
+                let get = |n: &str, dt: DType| -> Result<Tensor> {
+                    let t = raw.get(n).ok_or_else(|| SynaptixError::Other(format!("flux2: нет тензора {n}")))?;
+                    if t.dtype() == dt {
+                        Ok(t.clone())
+                    } else {
+                        t.to_dtype(dt)
+                    }
+                };
+                Block::load_g(&get, &self.cfg, idx, self.device.is_cuda(), self.compute, self.quant)
+            }
         }
     }
 
@@ -655,7 +718,13 @@ impl Flux2Transformer {
                 continue;
             }
             let cur = match staged.take() {
-                Some(Ok(b)) => b,
+                Some(Ok(b)) => match self.finish(i, b) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                },
                 Some(Err(e)) => {
                     result = Err(e);
                     break;
