@@ -1,0 +1,26 @@
+[package]
+name = "synaptix-image-qwen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen-Image и Qwen-Image-Edit (2509/2511): правка картинок по инструкции, нативно на synaptix."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-diffusion = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+thiserror          = { workspace = true }
+serde_json         = { workspace = true }
+half               = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
