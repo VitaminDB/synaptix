@@ -30,14 +30,30 @@ impl Flux2Scheduler {
     /// приводятся к f32 (как `np.array(sigmas).astype(np.float32)`), затем
     /// `exp(mu) / (exp(mu) + (1/σ − 1))`.
     pub fn new(num_steps: usize, image_seq_len: usize) -> Self {
+        Self::with_strength(num_steps, image_seq_len, 1.0)
+    }
+
+    /// img2img: все `num_steps` шагов, начиная с времени `t₀ = strength` (до
+    /// сдвига): `linspace(t₀, t₀/N, N)` → сдвиг → sigmas. При `strength = 1`
+    /// совпадает с [`Self::new`].
+    ///
+    /// Не как `get_timesteps` у img2img-пайплайнов diffusers (отрезать
+    /// начальные шаги полного расписания): у klein всего 4 шага, и сила
+    /// ступенчатая — 0.5 и 0.7 дают одно и то же. И не «σ = strength»: сдвиг
+    /// FLUX.2 сильный (μ ≈ 2 на 4 шагах), композиция решается при σ > 0.9, и
+    /// σ = 0.8 уже почти копия исходника. По времени до сдвига шкала ровная:
+    /// 0.3 — лёгкая правка, 0.6 — другой стиль при той же композиции, 1 —
+    /// картинка заново.
+    pub fn with_strength(num_steps: usize, image_seq_len: usize, strength: f32) -> Self {
         let n = num_steps.max(1);
         let em = empirical_mu(image_seq_len, n).exp();
+        let t0 = (strength as f64).clamp(1e-4, 1.0) as f32 as f64;
         let mut sigmas: Vec<f32> = (0..n)
             .map(|i| {
                 let lin = if n == 1 {
-                    1.0
+                    t0
                 } else {
-                    1.0 + i as f64 * ((1.0 / n as f64 - 1.0) / (n - 1) as f64)
+                    t0 + i as f64 * ((t0 / n as f64 - t0) / (n - 1) as f64)
                 } as f32 as f64;
                 (em / (em + (1.0 / lin - 1.0))) as f32
             })
@@ -52,14 +68,6 @@ impl Flux2Scheduler {
 
     pub fn sigma(&self, i: usize) -> f32 {
         self.sigmas[i]
-    }
-
-    /// img2img: с какого шага начинать при силе `denoise` ∈ (0, 1] (как
-    /// `get_timesteps` у diffusers-пайплайнов img2img).
-    pub fn start_index(&self, denoise: f32) -> usize {
-        let n = self.num_steps() as f64;
-        let init = (n * denoise.clamp(0.0, 1.0) as f64).min(n);
-        ((n - init).max(0.0) as usize).min(self.num_steps())
     }
 
     /// `σ·noise + (1 − σ)·x0` при sigma шага `i` (в F32).
@@ -99,5 +107,24 @@ mod tests {
             assert!((s.sigma(i) - e).abs() < 1e-6, "{i}: {} vs {e}", s.sigma(i));
         }
         assert_eq!(s.num_steps(), 4);
+    }
+
+    #[test]
+    fn img2img_schedule_starts_at_strength_time() {
+        let full = Flux2Scheduler::new(4, 4096);
+        let same = Flux2Scheduler::with_strength(4, 4096, 1.0);
+        for i in 0..=4 {
+            assert_eq!(full.sigma(i), same.sigma(i));
+        }
+        let s = Flux2Scheduler::with_strength(4, 4096, 0.6);
+        assert_eq!(s.num_steps(), 4);
+        let em = empirical_mu(4096, 4).exp();
+        let want = (em / (em + (1.0 / 0.6f32 as f64 - 1.0))) as f32;
+        assert!((s.sigma(0) - want).abs() < 1e-6, "{} vs {want}", s.sigma(0));
+        assert!(s.sigma(0) < 1.0);
+        for i in 0..4 {
+            assert!(s.sigma(i + 1) < s.sigma(i));
+        }
+        assert_eq!(s.sigma(4), 0.0);
     }
 }

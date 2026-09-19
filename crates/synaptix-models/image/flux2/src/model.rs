@@ -119,7 +119,8 @@ pub struct SampleParams {
     /// klein его не использует.
     pub guidance: f32,
     pub seed: u64,
-    /// Доля шума для img2img (с `init`): 1.0 — с чистого шума.
+    /// Сила img2img (с `init`): время начала денойза до сдвига расписания
+    /// (см. `Flux2Scheduler::with_strength`); 1.0 — с чистого шума.
     pub denoise: f32,
 }
 
@@ -351,9 +352,14 @@ impl Flux2Model {
         };
         let noise = pack(&noise)?; // [1, seq, 128] F32
 
-        let sched = Flux2Scheduler::new(p.steps.max(1), seq);
+        // img2img: все шаги с времени denoise (см. `Flux2Scheduler::with_strength`).
+        let sched = match init {
+            Some(_) => Flux2Scheduler::with_strength(p.steps.max(1), seq, p.denoise),
+            None => Flux2Scheduler::new(p.steps.max(1), seq),
+        };
         let n = sched.num_steps();
-        let (start, mut latents) = match init {
+        let start = 0;
+        let mut latents = match init {
             Some(x0) => {
                 let d = x0.dims();
                 if d != [1, ch, h, w] {
@@ -362,14 +368,13 @@ impl Flux2Model {
                          (ожидается [1, {ch}, {h}, {w}])"
                     )));
                 }
-                let start = sched.start_index(p.denoise);
-                if start >= n {
+                if p.denoise <= 0.0 {
                     return Ok(x0.to_dtype(DType::F32)?.to_device(Device::Cpu)?);
                 }
                 let x0 = pack(&x0.to_device(dev)?.to_dtype(DType::F32)?)?;
-                (start, sched.scale_noise(&x0, &noise, start)?)
+                sched.scale_noise(&x0, &noise, 0)?
             }
-            None => (0, noise),
+            None => noise,
         };
 
         // Координаты: текст (0,0,0,l), латент (0,y,x,0), референсы (10j,y,x,0).
