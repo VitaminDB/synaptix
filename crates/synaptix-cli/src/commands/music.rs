@@ -51,6 +51,8 @@ pub struct MusicArgs {
     pub keyscale: String,
     pub timesig: String,
     pub norm: String,
+    /// >1 — прогоны подряд с резидентным кэшем компонентов.
+    pub repeat: u32,
 }
 
 pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -180,13 +182,27 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         norm_mode,
         on_stage: None,
     };
-    let t0 = std::time::Instant::now();
-    let (samples, sr, _latent) = generate_music(
-        &paths, &args.caption, &args.lyrics, duration_sec, dev, compute, dit_quant, enc_quant, &opts, &copts, args.use_cot, &edit, &extras, None,
-    )?;
-    let dur = samples.len() as f32 / sr as f32;
-    let infer = t0.elapsed().as_secs_f32();
-    eprintln!("synaptix music: {dur:.1}s audio in {infer:.1}s (RTF={:.3})", infer / dur.max(1e-6));
+    // --repeat: резидентный кэш LM/TE/DiT/VAE переживает прогоны — так
+    // работают ноды synthos с «Держать в памяти».
+    let mut cache = (args.repeat > 1).then(synaptix_music_acestep::pipeline::MusicComponentCache::default);
+    let mut result = None;
+    for round in 0..args.repeat.max(1) {
+        let copts = CodesGenOptions { seed: copts.seed + round as u64, ..copts.clone() };
+        let t0 = std::time::Instant::now();
+        let (samples, sr, _latent) = generate_music(
+            &paths, &args.caption, &args.lyrics, duration_sec, dev, compute, dit_quant, enc_quant, &opts, &copts, args.use_cot, &edit, &extras, cache.as_mut(),
+        )?;
+        let dur = samples.len() as f32 / sr as f32;
+        let infer = t0.elapsed().as_secs_f32();
+        eprintln!(
+            "synaptix music: прогон {}/{}: {dur:.1}s audio in {infer:.1}s (RTF={:.3})",
+            round + 1,
+            args.repeat.max(1),
+            infer / dur.max(1e-6)
+        );
+        result = Some((samples, sr));
+    }
+    let (samples, sr) = result.expect("хотя бы один прогон");
     write_wav_mono_f32(&args.output, &samples, sr)?;
     eprintln!("synaptix music: wrote {}", args.output.display());
     Ok(())

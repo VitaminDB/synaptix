@@ -427,6 +427,10 @@ enum Commands {
         /// Нормализация выхода: peak | rms | off.
         #[arg(long, default_value = "peak")]
         norm: String,
+        /// Прогонов подряд с резидентным кэшем компонентов (как «Держать в
+        /// памяти» у нод synthos); seed растёт на единицу, пишется последний.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
     /// Генерация изображения по тексту (SDXL txt2img): PROMPT → PNG.
     Imagine {
@@ -835,13 +839,13 @@ fn main() -> ExitCode {
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
             quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
             repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
-            edit_source_lyric, no_ar, bpm, keyscale, timesig, norm,
+            edit_source_lyric, no_ar, bpm, keyscale, timesig, norm, repeat,
         } => music::run(music::MusicArgs {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
             quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
             repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
-            edit_source_lyric, use_ar: !no_ar, bpm, keyscale, timesig, norm,
+            edit_source_lyric, use_ar: !no_ar, bpm, keyscale, timesig, norm, repeat,
         }),
         Commands::Imagine {
             model, prompt, output, negative, steps, cfg, height, width, seed, device, compute_dtype,
