@@ -11,7 +11,7 @@ compiled at runtime via NVRTC, with no PyTorch, no libtorch, and no Python runti
 
 An alternative to the Python ML stack. Everything from the tensor API and CUDA kernels up to
 full model ports, a tokenizer, an inference engine with paged KV-caches, and a training stack
-is written in Rust: ~232k lines, 73 `.cu` kernel files, 1 800+ tests. Correctness is held to
+is written in Rust: ~245k lines, 73 `.cu` kernel files, 2 000+ tests. Correctness is held to
 bit-exact parity with PyTorch and NeMo reference implementations, per row rather than by a
 global cosine similarity that hides local errors.
 
@@ -26,6 +26,7 @@ synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant nvfp4
 synaptix chat model.syn --context 32768          # interactive, prefix-KV across turns
 synaptix bench model.syn --n-tokens 128          # prefill / decode throughput
 
+synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2
 synaptix video ltx.syn "a paper boat in the rain" -o clip.mp4 --gemma ./gemma-3-12b
 synaptix music "lofi piano, rain" -o track.wav --models ./syn_models --duration auto
 synaptix speak voxcpm.syn "Hello there" -o out.wav --reference voice.wav
@@ -41,8 +42,8 @@ Native ports, each validated against its upstream reference:
 |---|---|
 | **LLM** | Qwen3 (dense + MoE), Qwen3-Next hybrids (GatedDeltaNet + full attention, `qwen3_5/3_6/3_8`), Qwen4Exp (125B MoE: sparse-attention indexer, gated residuals, PLE n-grams, MTP head), Llama, Gemma-3, Gemma-4 26B A4B, Muse Glimmer 30B |
 | **Vision-language** | Qwen3-VL tower (images and video, 3D M-RoPE), Gemma-4 vision tower, Muse Glimmer |
-| **Image** | FLUX.1, SDXL, Depth Anything V2 |
-| **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio) |
+| **Image** | FLUX.1, FLUX.2 (dev, klein 4B / 9B), Qwen-Image and Qwen-Image-Edit (2509 / 2511: edit an image, or compose up to four references), SDXL (txt2img and img2img), Depth Anything V2 |
+| **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio; image / video / audio references — Ref2VA) |
 | **Speech** | Whisper, GigaAM (ASR), Sortformer (diarization) |
 | **Text-to-speech** | VoxCPM, OmniVoice, VibeVoice (long-form, multi-speaker) |
 | **Music** | ACE-Step (generate, cover, edit, extend, extract, repaint) |
@@ -62,6 +63,13 @@ Native ports, each validated against its upstream reference:
   host, so a model larger than VRAM still runs (at a documented cost in tokens/s).
 - **Prefix-KV sessions** — the KV of a conversation survives between turns for every
   architecture, including prompts that carry images, and can be parked in host RAM.
+- **Everything runs on a 7 GB card.** Not "the small models": a 125B MoE chat model, a
+  27B hybrid, Gemma-4, FLUX.1 and FLUX.2, MiniMax-H3, LTX-2.3, ACE-Step with its 4B LM,
+  VibeVoice — each was measured with a ballast process holding all but 7 GB of VRAM.
+  Blocks that do not fit stream from pinned host RAM, or straight from the mmapped `.syn`
+  bundle when RAM is short; embedding tables and heads stay on the host. The cost is
+  bandwidth, and it is written down: FLUX.2 klein 1024² in 2–3 s, FLUX.1-dev 20 steps in
+  13 s, a 27B hybrid at 1–2 tok/s with 7 of 64 blocks resident.
 
 ## Performance
 
@@ -72,6 +80,17 @@ Measured on an RTX 5090 Laptop (24 GB), 93 GB system RAM:
 | Gemma-4 26B A4B | 10 100 tok/s @ 4k | 210 tok/s | CUDA-graph decode capturing the MoE, fused per-layer kernels |
 | Qwen3.8-27B hybrid | 1 450 tok/s @ 3.3k | 47 tok/s | MTP speculative decode |
 | Qwen3.8-Flash-Next 125B MoE | 1 650 tok/s @ 260k | 17–22 tok/s | 262k context on 24 GB; experts stream at ~39 GB/s |
+
+Diffusion on the same card, 1024² (all weights resident):
+
+| Model | Steps | Time | Peak VRAM |
+|---|---|---|---|
+| SDXL | 30 | 6.5 s | 8.8 GB |
+| Qwen-Image-Edit-2511, MXFP8 | 40 | 188 s | 17.8 GB |
+| Qwen-Image-Edit-2511, NVFP4 | 40 | 155 s | 13.2 GB |
+
+The 7 GB numbers quoted above are a different regime: most of the model is streamed, and
+the memory section says what stays resident.
 
 Those are not starting points: Gemma-4 decode went 35 → 210 tok/s and prefill 957 → 10 100
 tok/s over a week of kernel work (fused layer kernels, no memset on hot outputs, quantized
