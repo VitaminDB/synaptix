@@ -70,6 +70,9 @@ impl Reranker for BgeRerankerAdapter {
 }
 
 pub fn load_reranker(cfg: RerankerConfig) -> Result<Box<dyn Reranker + Send + Sync>, String> {
+    // Идемпотентно: приложение обычно регистрирует ядра на старте, тесты и CLI — нет.
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
     let dtype = compute_to_dtype(cfg.dtype);
     // Каталог = распакованный HF-снапшот; файл = .syn-бандл.
     let mut inner = if cfg.model_path.is_dir() {

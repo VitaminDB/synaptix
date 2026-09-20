@@ -1,6 +1,6 @@
 //! Embedding-фасад для KB. Нативный BGE-M3 (XLM-RoBERTa dense). `load_embedder`
-//! грузит распакованный HF-снапшот и возвращает `Box<dyn Embedder>`; encode →
-//! CLS-pool + L2-norm нативно (dim 1024).
+//! грузит `.syn`-бандл (файл) или распакованный HF-снапшот (каталог) и
+//! возвращает `Box<dyn Embedder>`; encode → CLS-pool + L2-norm нативно (dim 1024).
 
 use std::path::PathBuf;
 
@@ -87,8 +87,16 @@ impl Embedder for BgeEmbedder {
 }
 
 pub fn load_embedder(cfg: EmbedderConfig) -> Result<Box<dyn Embedder + Send + Sync>, String> {
+    // Идемпотентно: приложение обычно регистрирует ядра на старте, тесты и CLI — нет.
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
     let dtype = compute_to_syn(cfg.dtype);
-    let model = BgeM3::from_unpacked(&cfg.model_path, &cfg.device, dtype)
-        .map_err(|e| format!("BGE-M3 load ({}): {e}", cfg.model_path.display()))?;
+    // Каталог = распакованный HF-снапшот; файл = .syn-бандл.
+    let model = if cfg.model_path.is_dir() {
+        BgeM3::from_unpacked(&cfg.model_path, &cfg.device, dtype)
+    } else {
+        BgeM3::from_syn(&cfg.model_path, &cfg.device, dtype)
+    }
+    .map_err(|e| format!("BGE-M3 load ({}): {e}", cfg.model_path.display()))?;
     Ok(Box::new(BgeEmbedder { model, batch_size: cfg.batch_size }))
 }
