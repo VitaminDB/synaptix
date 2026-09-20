@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
-    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd,
+    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, song,
     speak,
     train, transcribe, video,
 };
@@ -307,6 +307,70 @@ enum Commands {
         /// Детерминированный прогон без шума (для сверки с эталоном).
         #[arg(long, default_value_t = false)]
         zero_noise: bool,
+    },
+    /// Песня целиком (YuE2): стиль и лирика → партитура → музыка → WAV 48 кГц стерео.
+    Song {
+        /// Теги стиля: язык, жанр, инструменты, характер вокала.
+        style: String,
+        #[arg(short, long, default_value = "song.wav")]
+        output: PathBuf,
+        /// Лирика (с разметкой вида [verse] / [chorus]).
+        #[arg(long, default_value = "")]
+        lyrics: String,
+        /// Лирика из файла (сильнее --lyrics).
+        #[arg(long)]
+        lyrics_file: Option<PathBuf>,
+        /// Каталог с бандлами YuE2 (yue2-3b.syn, yue2-vae.syn).
+        #[arg(long, default_value = "storage/syn_models")]
+        models: PathBuf,
+        /// Override пути костяка (.syn).
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Override пути декодера (.syn).
+        #[arg(long)]
+        vae: Option<PathBuf>,
+        /// Партитура: full (мелодия с аккордами) | melody (только мелодия) | off.
+        #[arg(long, default_value = "full")]
+        cot: String,
+        /// Готовая партитура ABC из файла вместо сгенерированной.
+        #[arg(long)]
+        abc_file: Option<PathBuf>,
+        /// Куда сохранить партитуру.
+        #[arg(long)]
+        save_abc: Option<PathBuf>,
+        #[arg(long, default_value_t = 831001)]
+        seed: u64,
+        /// CFG (по умолчанию 1.0, у режима off — 1.01).
+        #[arg(long)]
+        cfg: Option<f32>,
+        /// Шагов решателя flow matching.
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        /// Потолок семантических токенов: 25 на секунду музыки.
+        #[arg(long)]
+        max_tokens: Option<usize>,
+        #[arg(long)]
+        temperature: Option<f32>,
+        #[arg(long)]
+        top_p: Option<f32>,
+        #[arg(long)]
+        top_k: Option<usize>,
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
+        #[arg(long, default_value = "cuda:0")]
+        device: String,
+        /// Тип вычислений костяка: bf16 (эталон) | f32.
+        #[arg(long)]
+        compute_dtype: Option<String>,
+        /// Квант весов костяка: nvfp4 | mxfp8.
+        #[arg(long)]
+        quant: Option<String>,
+        /// Тип вычислений декодера: f32 (эталон) | bf16.
+        #[arg(long)]
+        vae_dtype: Option<String>,
+        /// Кадров в ядре тайла декодера (меньше — меньше памяти).
+        #[arg(long, default_value_t = 1024)]
+        vae_core_frames: usize,
     },
     /// Генерация музыки по тексту (ACE-Step v1.5): CAPTION → WAV (48 кГц).
     Music {
@@ -833,6 +897,15 @@ fn main() -> ExitCode {
         } => podcast::run(podcast::PodcastArgs {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
             max_length_times, zero_noise,
+        }),
+        Commands::Song {
+            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, save_abc, seed,
+            cfg, steps, max_tokens, temperature, top_p, top_k, repetition_penalty, device,
+            compute_dtype, quant, vae_dtype, vae_core_frames,
+        } => song::run(song::SongArgs {
+            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, save_abc, seed,
+            cfg, steps, max_tokens, temperature, top_p, top_k, repetition_penalty, device,
+            compute_dtype, quant, vae_dtype, vae_core_frames,
         }),
         Commands::Music {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,

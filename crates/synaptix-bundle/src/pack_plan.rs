@@ -905,6 +905,19 @@ fn guess_purpose(
         }
     }
 
+    // YuE2 подписан как `YuE2ForCausalLM`, но песни — не текст: без этой
+    // проверки бандл получал назначение «text-generation», и в каталогах
+    // моделей он лежал бы среди чат-LLM.
+    let model_type = config
+        .and_then(|v| v.get("model_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match model_type {
+        "yue2" => return ("music".to_string(), Guess::ConfigJson),
+        "yue2_vae" => return ("vae".to_string(), Guess::ConfigJson),
+        _ => {}
+    }
+
     let architectures: Vec<String> = config
         .and_then(|v| v.get("architectures"))
         .and_then(|a| a.as_array())

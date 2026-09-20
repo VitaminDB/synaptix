@@ -73,6 +73,7 @@ members = [
     "crates/synaptix-models/tts/tacotron2",
     "crates/synaptix-models/tts/bark",
     "crates/synaptix-models/music/acestep",
+    "crates/synaptix-models/music/yue2",
     "crates/synaptix-models/music/musicgen",
     "crates/synaptix-models/music/stable_audio",
     "crates/synaptix-models/music/audioldm",
@@ -209,6 +210,10 @@ crossterm = "0.28"
 tempfile = "3.10"
 aho-corasick = "1.1"
 regex = "1.10"
+# Разбиение текста перед BPE в токенизаторе YuE2 (паттерн Qwen с lookahead
+# `\s+(?!\S)` — обычный `regex` его не умеет).
+fancy-regex = "0.16"
+unicode-normalization = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false }
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 
@@ -258,6 +263,7 @@ synaptix-video-ltx23  = { path = "crates/synaptix-models/video/ltx23" }
 synaptix-video-minimax-h3 = { path = "crates/synaptix-models/video/minimax_h3" }
 synaptix-tts-voxcpm   = { path = "crates/synaptix-models/tts/voxcpm" }
 synaptix-music-acestep = { path = "crates/synaptix-models/music/acestep" }
+synaptix-music-yue2   = { path = "crates/synaptix-models/music/yue2" }
 synaptix-llm-gemma3   = { path = "crates/synaptix-models/llm/gemma3" }
 synaptix-llm-gemma4   = { path = "crates/synaptix-models/llm/gemma4" }
 synaptix-llm-llama    = { path = "crates/synaptix-models/llm/llama" }

@@ -57,6 +57,38 @@ pub fn read_wav_mono_f32(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
     Ok((mono, sr))
 }
 
+/// Записать чередующиеся отсчёты (L, R, L, R…) как многоканальный float-WAV.
+/// Длина обязана делиться на число каналов — иначе последний кадр неполный, и
+/// молча дописывать тишину было бы подменой данных.
+pub fn write_wav_interleaved_f32(
+    path: impl AsRef<Path>,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()> {
+    if channels == 0 {
+        return Err(AudioError::invalid_arg("write_wav: нулевое число каналов"));
+    }
+    if samples.len() % channels as usize != 0 {
+        return Err(AudioError::invalid_arg(format!(
+            "write_wav: {} отсчётов не делятся на {channels} каналов",
+            samples.len()
+        )));
+    }
+    let spec = WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path.as_ref(), spec).map_err(AudioError::from)?;
+    for &s in samples {
+        writer.write_sample(s).map_err(AudioError::from)?;
+    }
+    writer.finalize().map_err(AudioError::from)?;
+    Ok(())
+}
+
 pub fn write_wav_mono_f32(path: impl AsRef<Path>, samples: &[f32], sample_rate: u32) -> Result<()> {
     let spec = WavSpec {
         channels: 1,

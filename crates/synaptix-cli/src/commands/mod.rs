@@ -12,6 +12,7 @@ pub mod music;
 pub mod podcast;
 pub mod quantize;
 pub mod run;
+pub mod song;
 pub mod speak;
 pub mod train;
 pub mod transcribe;

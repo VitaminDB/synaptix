@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-music-yue2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "YuE2 — AR–NAR Mixture-of-Transformers song generation (score → semantic tokens → acoustic latents → 48 kHz stereo)."
+
+# Фичи cuda нет: GPU — дефолт synaptix, устройство выбирается в рантайме
+# (как у synaptix-music-acestep).
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-audio = { workspace = true }
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-infer     = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-bundle    = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+fancy-regex        = { workspace = true }
+unicode-normalization = { workspace = true }
