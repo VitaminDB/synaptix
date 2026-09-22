@@ -70,8 +70,9 @@ impl Qwen3Pipeline {
         let weights = Qwen3Weights::load(&dir, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         let config = weights.config.clone();
-        let tokenizer_path = dir.join("tokenizer.json");
-        let tokenizer = HfTokenizer::from_file(&tokenizer_path)
+        let tok_bytes = synaptix_io::weights::read_model_file(&dir, "tokenizer.json")
+            .ok_or_else(|| PipelineError::Load("tokenizer.json: нет файла".into()))?;
+        let tokenizer = HfTokenizer::from_bytes(&tok_bytes)
             .map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
         let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();

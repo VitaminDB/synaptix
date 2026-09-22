@@ -15,6 +15,7 @@ documents = ["dep:pulldown-cmark", "dep:htmd", "dep:pdf-extract", "dep:ignore"]
 
 [dependencies]
 synaptix-core   = { workspace = true }
+synaptix-gguf   = { workspace = true }
 synaptix-bundle = { workspace = true }
 thiserror       = { workspace = true }
 serde           = { workspace = true }

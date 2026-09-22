@@ -229,6 +229,27 @@ impl QuantWeight {
         self.packed.lock().unwrap().clone()
     }
 
+    /// Вторая ручка на те же упакованные данные (Arc'ы разделяются, копий в
+    /// памяти нет). Нужна связанной голове `lm_head`, когда эмбеддинг уже
+    /// упакован (GGUF, бандл с квантованным `embed_tokens`): gather и
+    /// проекция читают один и тот же блоб. Перемешанная копия у каждой ручки
+    /// своя (`ensure_shuffled`).
+    pub fn share(&self) -> Result<Self> {
+        let packed = self
+            .packed_arc()
+            .ok_or(SynaptixError::Unsupported("QuantWeight::share: упакованные данные уже освобождены"))?;
+        Ok(Self {
+            packed: Mutex::new(Some(packed)),
+            scales: self.scales.clone(),
+            dtype: self.dtype,
+            n: self.n,
+            k: self.k,
+            device: self.device,
+            shuffled: OnceCell::new(),
+            expert_pool: std::sync::atomic::AtomicBool::new(self.expert_pool.load(std::sync::atomic::Ordering::Relaxed)),
+        })
+    }
+
     pub fn release_packed(&self) {
         *self.packed.lock().unwrap() = None;
     }
@@ -251,11 +272,6 @@ impl QuantWeight {
         use crate::tensor::layout::Layout;
         use crate::tensor::shape::Shape;
 
-        if self.dtype != DType::MXFP8 {
-            return Err(SynaptixError::Unsupported(
-                "QuantWeight::embed_gather: поддержан только MXFP8",
-            ));
-        }
         let packed = self.packed_arc().ok_or(SynaptixError::Unsupported(
             "QuantWeight::embed_gather: packed освобождён",
         ))?;
@@ -266,6 +282,25 @@ impl QuantWeight {
         let mut storage =
             backend.alloc_uninit(DType::F16.bytes_for_numel(n * self.k), self.device)?;
         let stream = Stream::default_for(self.device)?;
+        if matches!(self.dtype, DType::Sq { .. } | DType::Ggml(_)) {
+            // Одноблобный формат (GGUF / SQ): одно ядро читает строки
+            // таблицы по индексам и деквантует их в F16 `[n, k]`.
+            backend.block_gather_dequant(
+                &packed,
+                self.dtype,
+                (&ids_c.storage, &ids_c.layout),
+                (&mut storage, &out_layout),
+                self.n,
+                self.k,
+                &stream,
+            )?;
+            return Ok(Tensor::from_parts(Arc::new(storage), out_layout));
+        }
+        if self.dtype != DType::MXFP8 {
+            return Err(SynaptixError::Unsupported(
+                "QuantWeight::embed_gather: поддержаны MXFP8 и одноблобные форматы",
+            ));
+        }
         backend.embed_gather_mxfp8(
             &packed,
             self.scales(),

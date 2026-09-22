@@ -667,6 +667,23 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("block_dequant не поддержан этим backend"))
     }
 
+    /// Gather строк упакованной таблицы одноблобного формата (`DType::Sq`/
+    /// `DType::Ggml`) `[vocab, k]` по индексам `ids` (U32, `[n]`) с
+    /// деквантом в `out` `[n, k]` (F16/BF16 по `out.1.dtype()`). Индекс вне
+    /// таблицы — строка нулей. Путь эмбеддингов GGUF-моделей.
+    fn block_gather_dequant(
+        &self,
+        _table: &Storage,
+        _dtype: DType,
+        _ids: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _vocab: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("block_gather_dequant не поддержан этим backend"))
+    }
+
     /// Батч GEMV по квантованным весам любого формата с плотной активацией
     /// (портируемый путь MoE): `out[e, n] = x[x_rows[e], k] · W_e[n, k]ᵀ`.
     /// `x` — `[rows, k]` подряд в dtype выхода (F16/BF16), `w_scales[e]` —

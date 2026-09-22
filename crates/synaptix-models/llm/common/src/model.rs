@@ -164,6 +164,10 @@ pub struct FullAttn {
     /// Gemma-4): своей матрицы V в чекпойнте нет.
     v_proj: Option<QLinear>,
     o_proj: QLinear,
+    /// Смещения проекций q/k/v (`attention_bias`, Qwen2/2.5): `[N]` в compute.
+    q_bias: Option<Tensor>,
+    k_bias: Option<Tensor>,
+    v_bias: Option<Tensor>,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
     /// RMS-норма поверх V без обучаемого веса (Gemma-4). Хранится вектором
@@ -265,6 +269,9 @@ impl FullAttn {
             q_norm: ot(&self.q_norm)?,
             k_norm: ot(&self.k_norm)?,
             v_norm: ot(&self.v_norm)?,
+            q_bias: ot(&self.q_bias)?,
+            k_bias: ot(&self.k_bias)?,
+            v_bias: ot(&self.v_bias)?,
             num_heads: self.num_heads,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
@@ -1075,7 +1082,14 @@ impl DecoderModel {
         // lm_head: при tie_word_embeddings = embed (Dense, не квантуем — embed нужен
         // для gather). Иначе грузим lm_head.weight и квантуем по `lm_head_dtype`
         // (NVFP4 [vocab,hidden] %64==0 → GEMV; экономит 2.5GB→0.7GB чтения/токен).
-        let lm_head = if cfg.tie_word_embeddings {
+        let lm_head = if cfg.tie_word_embeddings && embed_dense.is_none() && embed_quant.is_some() {
+            // Эмбеддинг уже упакован (GGUF / бандл с квантованным
+            // `embed_tokens`): голова — та же ручка на тот же блоб, ни копии,
+            // ни повторного кванта. Форма [vocab, hidden] у него и так «как у
+            // проекции».
+            let q = embed_quant.as_ref().unwrap().share().map_err(|e| ModelError::Build(e.to_string()))?;
+            QLinear::Quant(q)
+        } else if cfg.tie_word_embeddings {
             // Голова связана с эмбеддингом, но КВАНТОВАТЬ её всё равно стоит:
             // плотная BF16-голова на словаре 262k — это 1.5 ГБ чтения на
             // КАЖДЫЙ токен декода (у Gemma-4 это была седьмая часть шага).
@@ -1133,6 +1147,13 @@ impl DecoderModel {
                             .and_then(|t| t.to_dtype(compute))
                             .map_err(|e| ModelError::Load(e.to_string()))
                     };
+                    let bias = |name: &str| -> Result<Option<Tensor>, ModelError> {
+                        let k = key(name);
+                        if !weights.contains(&k) {
+                            return Ok(None);
+                        }
+                        weights.tensor(&k, b_dev, compute).map(Some)
+                    };
                     Mixer::Full(FullAttn {
                         q_proj: qlin(&key("self_attn.q_proj.weight"), attn_w)?,
                         k_proj: qlin(&key("self_attn.k_proj.weight"), attn_w)?,
@@ -1142,6 +1163,9 @@ impl DecoderModel {
                             Some(qlin(&key("self_attn.v_proj.weight"), attn_w)?)
                         },
                         o_proj: qlin(&key("self_attn.o_proj.weight"), attn_w)?,
+                        q_bias: bias("self_attn.q_proj.bias")?,
+                        k_bias: bias("self_attn.k_proj.bias")?,
+                        v_bias: bias("self_attn.v_proj.bias")?,
                         q_norm: if cfg.qk_norm { Some(norm(&key("self_attn.q_norm.weight"))?) } else { None },
                         k_norm: if cfg.qk_norm { Some(norm(&key("self_attn.k_norm.weight"))?) } else { None },
                         v_norm: if cfg.ext.as_ref().is_some_and(|e| e.v_rms_norm) { Some(ones(hd)?) } else { None },
@@ -1693,6 +1717,10 @@ impl DecoderModel {
                     .and_then(|t| t.reshape(vec![input_ids.numel()]))
                     .coerr()?;
                 let emb = q.embed_gather(&flat).coerr()?;
+                // Gather кванта отдаёт F16; при BF16-счёте (GGUF на sm_80+,
+                // Gemma) приводим к рабочему типу — иначе KV-append видит
+                // разные типы.
+                let emb = if emb.dtype() != self.dtype { emb.to_dtype(self.dtype).coerr()? } else { emb };
                 dims.push(self.config.hidden_size);
                 emb.reshape(dims).coerr()
             }
@@ -1708,7 +1736,10 @@ impl DecoderModel {
             return self.gather_host(table, ids_flat);
         }
         match (&self.embed_q, &self.embed) {
-            (Some(q), _) => q.embed_gather(ids_flat).coerr(),
+            (Some(q), _) => {
+                let emb = q.embed_gather(ids_flat).coerr()?;
+                if emb.dtype() != self.dtype { emb.to_dtype(self.dtype).coerr() } else { Ok(emb) }
+            }
             (None, Some(t)) => t.embed_gather(ids_flat).coerr(),
             (None, None) => Err(ModelError::Build("embed отсутствует".into())),
         }
@@ -2808,7 +2839,7 @@ impl FullAttn {
         };
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
 
-        let qg = prof(device, "attn_qproj", || self.q_proj.forward(h))?;
+        let qg = add_bias(prof(device, "attn_qproj", || self.q_proj.forward(h))?, &self.q_bias)?;
         let (q, gate) = if self.attn_output_gate {
             let qg = qg.reshape(vec![batch, s, nh, 2 * hd]).coerr()?;
             let q = qg.narrow(3, 0, hd).coerr()?.contiguous().coerr()?;
@@ -2818,13 +2849,13 @@ impl FullAttn {
             (qg.reshape(vec![batch, s, nh, hd]).coerr()?, None)
         };
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let k = prof(device, "attn_kproj", || self.k_proj.forward(h))?.reshape(vec![batch, s, nkv, hd]).coerr()?
+        let k = add_bias(prof(device, "attn_kproj", || self.k_proj.forward(h))?, &self.k_bias)?.reshape(vec![batch, s, nkv, hd]).coerr()?
             .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         // `attention_k_eq_v`: значения — тот же выход `k_proj`, снятый ДО
         // Q/K-нормы и RoPE (в HF `value_states` держит ссылку на дорезанный
         // тензор, а `key_states` переприсваивается).
         let v = match &self.v_proj {
-            Some(vp) => prof(device, "attn_vproj", || vp.forward(h))?
+            Some(vp) => add_bias(prof(device, "attn_vproj", || vp.forward(h))?, &self.v_bias)?
                 .reshape(vec![batch, s, nkv, hd]).coerr()?
                 .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
             None => k.clone(),
@@ -3107,7 +3138,7 @@ impl FullAttn {
         // q/k/v берут один `h` → квантуем 1× и переиспользуем во всех трёх.
         let act = quant_act_shared(h, self.q_proj.quant_dtype());
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
-        let qg = proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?;
+        let qg = add_bias(proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?, &self.q_bias)?;
         let (q, gate) = if self.attn_output_gate {
             let qg = qg.reshape(vec![b, 1, nh, 2 * hd]).coerr()?;
             let q = qg.narrow(3, 0, hd).coerr()?.contiguous().coerr()?;
@@ -3117,11 +3148,11 @@ impl FullAttn {
             (qg.reshape(vec![b, 1, nh, hd]).coerr()?, None)
         };
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let k = proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?
+        let k = add_bias(proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?, &self.k_bias)?
             .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         // `attention_k_eq_v`: значения — выход `k_proj` ДО Q/K-нормы и RoPE.
         let v = match self.v_proj.as_ref() {
-            Some(vp) => proj_shared(vp, h, &act, dev, "attn_vproj")?
+            Some(vp) => add_bias(proj_shared(vp, h, &act, dev, "attn_vproj")?, &self.v_bias)?
                 .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
             None => k.clone(),
         };
@@ -3314,7 +3345,7 @@ impl FullAttn {
         let dev = h.device();
         // q/k/v шарят prequant из эпилога нормы (раньше квантовали h ТРИЖДЫ).
         let act = pq.cloned();
-        let qg = proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?;
+        let qg = add_bias(proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?, &self.q_bias)?;
         let (q, gate) = if self.attn_output_gate {
             let qg = qg.reshape(vec![1, t, nh, 2 * hd]).coerr()?;
             let q = qg.narrow(3, 0, hd).coerr()?.contiguous().coerr()?;
@@ -3324,14 +3355,14 @@ impl FullAttn {
             (qg.reshape(vec![1, t, nh, hd]).coerr()?, None)
         };
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let k = proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?
+        let k = add_bias(proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?, &self.k_bias)?
             .reshape(vec![1, t, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let Some(v_proj) = self.v_proj.as_ref() else {
             return Err(ModelError::Forward(
                 "device-путь не поддерживает слои с V=K (attention_k_eq_v)".into(),
             ));
         };
-        let v = proj_shared(v_proj, h, &act, dev, "attn_vproj")?
+        let v = add_bias(proj_shared(v_proj, h, &act, dev, "attn_vproj")?, &self.v_bias)?
             .reshape(vec![1, t, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let q = apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps)?;
         let k = apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps)?;
@@ -3805,6 +3836,14 @@ fn apply_opt_norm(x: &Tensor, w: Option<&Tensor>, eps: f32) -> Result<Tensor, Mo
     match w {
         Some(w) => rms_norm(x, w, eps).coerr(),
         None => Ok(x.clone()),
+    }
+}
+
+/// `t + bias` по последней оси (смещения q/k/v-проекций); без bias — как есть.
+fn add_bias(t: Tensor, bias: &Option<Tensor>) -> Result<Tensor, ModelError> {
+    match bias {
+        Some(b) => t.broadcast_add(b).map_err(|e| ModelError::Forward(format!("attn bias: {e}"))),
+        None => Ok(t),
     }
 }
 

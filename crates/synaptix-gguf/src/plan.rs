@@ -2,7 +2,10 @@ use synaptix_bundle::StDtype;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutDtype {
-
+    /// Квантованные тензоры — как есть (блоб `.qpacked` + манифест
+    /// `ggml:<тип>`), плавающие — своим типом. Умолчание конвертации.
+    Keep,
+    /// Квантованные → F16, плавающие — своим типом (прежнее `auto`).
     Auto,
     F16,
     BF16,
@@ -10,13 +13,18 @@ pub enum OutDtype {
 }
 
 impl OutDtype {
+    /// Оставить ли квантованный тензор в блоках ggml.
+    pub fn keeps_quant(self, src: crate::ggml::GgmlType) -> bool {
+        self == OutDtype::Keep && src.is_weight_format()
+    }
+
     pub fn resolve(self, src: crate::ggml::GgmlType) -> StDtype {
         use crate::ggml::GgmlType as G;
         match self {
             OutDtype::F16 => StDtype::F16,
             OutDtype::BF16 => StDtype::BF16,
             OutDtype::F32 => StDtype::F32,
-            OutDtype::Auto => match src {
+            OutDtype::Auto | OutDtype::Keep => match src {
                 G::F32 => StDtype::F32,
                 G::F16 => StDtype::F16,
                 G::BF16 => StDtype::BF16,
@@ -58,19 +66,24 @@ pub enum Producer {
         block: usize,
         map: Vec<u32>,
     },
+
+    /// Стопка экспертов `[E, ΣNᵢ, K]`: срез `e` — строки среза `e` каждой из
+    /// частей `[E, Nᵢ, K]` подряд (`ffn_gate_exps` + `ffn_up_exps` →
+    /// `experts.gate_up_proj`). Строки не режутся, квант блоков сохраняется.
+    StackConcat { parts: Vec<String> },
 }
 
 impl Producer {
     pub fn sources(&self) -> &[String] {
         match self {
-            Producer::Interleave { parts, .. } => parts,
+            Producer::Interleave { parts, .. } | Producer::StackConcat { parts } => parts,
             _ => std::slice::from_ref(self.first()),
         }
     }
     fn first(&self) -> &String {
         match self {
             Producer::Direct(s) => s,
-            Producer::Interleave { parts, .. } => &parts[0],
+            Producer::Interleave { parts, .. } | Producer::StackConcat { parts } => &parts[0],
             Producer::PermuteRows { src, .. } => src,
             Producer::PermuteCols { src, .. } => src,
         }

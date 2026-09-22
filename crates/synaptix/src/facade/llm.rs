@@ -1578,10 +1578,15 @@ impl LlmTokenizer {
                     enable_thinking,
                     effort,
                 );
-                if let Some(t) = tools {
-                    if !t.is_empty() {
+                // Как `apply_chat_template` в transformers: `tools` определён
+                // всегда, без инструментов — `none`. Шаблон Llama-3.2 проверяет
+                // `tools is not none`, а у неопределённой переменной это
+                // истина — модель получала инструкцию «ответь JSON-вызовом».
+                match tools {
+                    Some(t) if !t.is_empty() => {
                         opts = opts.with_var("tools", serde_json::Value::Array(t.to_vec()));
                     }
+                    _ => opts = opts.with_var("tools", serde_json::Value::Null),
                 }
                 tmpl.render(&msgs, &opts).map_err(|e| LlmError(e.to_string()))
             }

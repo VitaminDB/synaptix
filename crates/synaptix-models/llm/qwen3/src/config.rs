@@ -6,6 +6,8 @@ use synaptix_llm_common::{Activation, DecoderConfig, LayerKind, NormGain, RopeSp
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Qwen3Config {
+    /// `qwen3` (q/k-нормы) или `qwen2` (без них, с bias у q/k/v).
+    pub model_type: String,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -28,6 +30,7 @@ pub struct Qwen3Config {
 impl Default for Qwen3Config {
     fn default() -> Self {
         Self {
+            model_type: "qwen3".into(),
             vocab_size: 151936,
             hidden_size: 2048,
             intermediate_size: 6144,
@@ -54,8 +57,13 @@ impl Qwen3Config {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
             .map_err(|e| ConfigError::Io(format!("read {}: {e}", path.display())))?;
-        let cfg: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| ConfigError::Parse(format!("parse {}: {e}", path.display())))?;
+        Self::from_hf_json_slice(&bytes)
+            .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))
+    }
+
+    pub fn from_hf_json_slice(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let cfg: Self = serde_json::from_slice(bytes)
+            .map_err(|e| ConfigError::Parse(format!("parse config.json: {e}")))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -101,7 +109,7 @@ impl Qwen3Config {
             activation: Activation::Silu,
             sandwich_norms: false,
             post_norm_eps: None,
-            qk_norm: true,
+            qk_norm: self.model_type != "qwen2",
             attn_output_gate: false,
             attn_scale: 1.0 / (self.head_dim as f32).sqrt(),
             embed_scale: None,

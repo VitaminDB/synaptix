@@ -966,7 +966,10 @@ pub fn quant_linear_generic(
         return Err(SynaptixError::Unsupported("quant_linear_generic: у NVFP4/MXFP8 нет масштабов"));
     }
 
-    if m_us <= GEMV_MAX_M {
+    // `SYN_BLOCKQ_GEMV=0` — отладочный обход GEMV: и малые M идут через
+    // деквант полосами + GEMM (сверка одного пути с другим).
+    let gemv_ok = std::env::var("SYN_BLOCKQ_GEMV").map(|v| v != "0").unwrap_or(true);
+    if m_us <= GEMV_MAX_M && gemv_ok {
         let gk = if bf16 { BlockqGemvKernels::for_context_bf16(ctx)? } else { BlockqGemvKernels::for_context(ctx)? };
         let mut out_v = out_u8.as_view_mut();
         return blockq_gemv(&gk, stream, dtype, &packed.as_view(), &scales.as_view(), &x_u8.as_view(), &mut out_v, n, k, m, k, n);

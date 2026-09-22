@@ -42,6 +42,8 @@ pub struct ConvertReport {
     pub files: Vec<String>,
     pub payload_bytes: u64,
     pub output: PathBuf,
+    /// Сколько тензоров осталось блоками ggml (`OutDtype::Keep`).
+    pub kept_quant: usize,
 }
 
 pub fn default_bundle_id(model: &Path) -> String {
@@ -103,6 +105,7 @@ pub fn convert_to_syn(
 
     let mut components = Vec::new();
     let mut payload_bytes = 0u64;
+    let mut manifest = synaptix_bundle::QuantManifest::new();
     for comp in &plan.components {
         let stream = GgufTensorStream::new(sources.clone(), comp, opts.dtype)?;
         payload_bytes += stream
@@ -110,6 +113,9 @@ pub fn convert_to_syn(
             .iter()
             .map(|t| t.nbytes())
             .sum::<u64>();
+        for (name, entry) in &stream.quant_manifest().tensors {
+            manifest.tensors.insert(name.clone(), entry.clone());
+        }
         components.push((comp.name.clone(), comp.tensors.len()));
         builder = builder
             .component(comp.name.clone(), "")
@@ -117,6 +123,15 @@ pub fn convert_to_syn(
     }
 
     let mut files = Vec::new();
+    if !manifest.is_empty() {
+        // Кванты остались блоками: читатель обязан понимать `syn-quant-v1`.
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| GgufError::Bundle(format!("quant_manifest.json: {e}")))?;
+        files.push(synaptix_bundle::quant_layout::MANIFEST_NAME.to_string());
+        builder = builder
+            .require_capability(synaptix_bundle::CAP_QUANT_WEIGHTS)
+            .add_file_bytes(synaptix_bundle::quant_layout::MANIFEST_NAME, bytes, FileTag::Inference)?;
+    }
     for f in &plan.files {
         files.push(f.path.clone());
         builder = builder.add_file_bytes(&f.path, f.bytes.clone(), FileTag::Inference)?;
@@ -144,6 +159,7 @@ pub fn convert_to_syn(
         files,
         payload_bytes,
         output: out.to_path_buf(),
+        kept_quant: manifest.tensors.len(),
     })
 }
 

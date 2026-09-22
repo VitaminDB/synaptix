@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use safetensors::SafeTensors;
 use synaptix_bundle::quant_layout::QuantManifest;
 use synaptix_bundle::Bundle;
+use synaptix_gguf::{is_gguf_file, GgufSource};
 use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 
@@ -37,8 +38,14 @@ struct TensorIndex {
     prefix: Option<String>,
 }
 
+/// Загрузчик весов из файла-модели: `.syn`-бандла или `.gguf` (llama.cpp).
+/// Для GGUF тензоры отдаются под HF-именами через план маппера
+/// (`synaptix_gguf::GgufSource`), квантованные — блоками ggml как
+/// [`QuantWeight`]; синтезированные `config.json`/`tokenizer.json` — через
+/// [`Self::read_file`]. Потребителю всё равно, какой формат под капотом.
 pub struct SynBundleLoader {
-    bundle: Arc<Bundle>,
+    bundle: Option<Arc<Bundle>>,
+    gguf: Option<Arc<GgufSource>>,
     component: Option<String>,
     default_device: Device,
     index: OnceLock<TensorIndex>,
@@ -47,16 +54,86 @@ pub struct SynBundleLoader {
     quant: OnceLock<Option<QuantManifest>>,
 }
 
+/// Файл GGUF (по расширению или сигнатуре).
+pub fn is_gguf_model(path: &Path) -> bool {
+    is_gguf_file(path)
+}
+
+/// Файл-модель, который умеет открыть [`SynBundleLoader`]: `.syn` или `.gguf`.
+pub fn is_model_file(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    let ext = path.extension().and_then(|s| s.to_str()).map(|e| e.to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("syn") | Some("gguf")) || is_gguf_file(path)
+}
+
+/// Вспомогательный файл модели (`config.json`, `tokenizer.json`, …) из
+/// HF-каталога, `.syn`-бандла или `.gguf` (у GGUF — синтезированный планом).
+pub fn read_model_file(path: &Path, name: &str) -> Option<Vec<u8>> {
+    if path.is_dir() {
+        return std::fs::read(path.join(name)).ok();
+    }
+    if is_gguf_file(path) {
+        let src = GgufSource::open(path).ok()?;
+        return src.file(name).map(|b| b.to_vec());
+    }
+    let bundle = Bundle::open(path).ok()?;
+    bundle.read_file(name).ok().map(|c| c.into_owned())
+}
+
 impl SynBundleLoader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if is_gguf_file(path) {
+            let src = GgufSource::open(path).map_err(|e| IoError::Bundle(format!("gguf {}: {e}", path.display())))?;
+            return Ok(Self {
+                bundle: None,
+                gguf: Some(Arc::new(src)),
+                component: None,
+                default_device: Device::Cpu,
+                index: OnceLock::new(),
+                quant: OnceLock::new(),
+            });
+        }
         let bundle = Bundle::open(path).map_err(|e| IoError::Bundle(e.to_string()))?;
         Ok(Self {
-            bundle: Arc::new(bundle),
+            bundle: Some(Arc::new(bundle)),
+            gguf: None,
             component: None,
             default_device: Device::Cpu,
             index: OnceLock::new(),
             quant: OnceLock::new(),
         })
+    }
+
+    /// Открыть уже разобранный GGUF-источник (переиспользовать план).
+    pub fn from_gguf(src: Arc<GgufSource>) -> Self {
+        Self {
+            bundle: None,
+            gguf: Some(src),
+            component: None,
+            default_device: Device::Cpu,
+            index: OnceLock::new(),
+            quant: OnceLock::new(),
+        }
+    }
+
+    /// Источник GGUF, если загрузчик открыт над `.gguf`.
+    pub fn gguf(&self) -> Option<&Arc<GgufSource>> {
+        self.gguf.as_ref()
+    }
+
+    fn syn(&self) -> Result<&Arc<Bundle>> {
+        self.bundle.as_ref().ok_or_else(|| IoError::Bundle("не .syn-бандл".into()))
+    }
+
+    /// Вспомогательный файл модели (`config.json`, `tokenizer.json`, …).
+    pub fn read_file(&self, name: &str) -> Option<Vec<u8>> {
+        if let Some(g) = &self.gguf {
+            return g.file(name).map(|b| b.to_vec());
+        }
+        self.bundle.as_ref()?.read_file(name).ok().map(|c| c.into_owned())
     }
 
     pub fn with_component(mut self, name: impl Into<String>) -> Self {
@@ -70,14 +147,15 @@ impl SynBundleLoader {
     }
 
     fn st_bytes(&self) -> Result<(&[u8], Option<String>)> {
+        let bundle = self.syn()?;
         match &self.component {
             Some(comp) => {
-                let (bytes, prefix) = self.bundle.tensors_slice_for(comp)
+                let (bytes, prefix) = bundle.tensors_slice_for(comp)
                     .map_err(|e| IoError::Bundle(e.to_string()))?;
                 Ok((bytes, prefix))
             }
             None => {
-                let bytes = self.bundle.tensors_slice()
+                let bytes = bundle.tensors_slice()
                     .map_err(|e| IoError::Bundle(e.to_string()))?;
                 Ok((bytes, None))
             }
@@ -122,13 +200,26 @@ impl SynBundleLoader {
     }
 
     fn load_internal(&self, name: &str, device: Device, want_dtype: Option<DType>) -> Result<Tensor> {
+        if let Some(g) = &self.gguf {
+            let want = want_dtype.unwrap_or(match g.ggml_type(name) {
+                Some(t) if !t.is_quantized() && t != synaptix_core::quant::GgmlType::F32 => DType::F16,
+                _ => DType::F32,
+            });
+            return g.load_to(name, device, want).map_err(|e| IoError::Bundle(e.to_string()));
+        }
         let (bytes, _) = self.st_bytes()?;
         let idx = self.index()?;
 
         let key = Self::resolve_key(name, &idx.prefix);
-        let meta = idx.by_name.get(&key)
-            .or_else(|| idx.by_name.get(name))
-            .ok_or_else(|| IoError::Safetensors(format!("tensor not found: {name}")))?;
+        let Some(meta) = idx.by_name.get(&key).or_else(|| idx.by_name.get(name)) else {
+            // Плотной копии нет, но вес лежит блоками одноблобного формата
+            // (`.qpacked` из GGUF-конверсии Keep или SQ): деквантуем на
+            // хосте, как это делает прямое чтение `.gguf`.
+            if let Some(t) = self.dequant_block_entry(name, device, want_dtype)? {
+                return Ok(t);
+            }
+            return Err(IoError::Safetensors(format!("tensor not found: {name}")));
+        };
 
         let src_dtype = meta.dtype
             .ok_or_else(|| IoError::Safetensors(format!("unsupported dtype for {name}")))?;
@@ -145,10 +236,42 @@ impl SynBundleLoader {
 
 /// Квантованные веса из бандла, собранного с `syn-quant-v1`.
 impl SynBundleLoader {
+    /// Плотный тензор из одноблобного квант-веса (`DType::Sq`/`DType::Ggml`):
+    /// `None` — такого веса в манифесте нет или формат не одноблобный.
+    fn dequant_block_entry(&self, name: &str, device: Device, want_dtype: Option<DType>) -> Result<Option<Tensor>> {
+        let Some((key, entry)) = self.quant_entry(name) else { return Ok(None) };
+        let Some(kind) = entry.kind() else { return Ok(None) };
+        let dtype = kind.dtype();
+        if !matches!(dtype, DType::Sq { .. } | DType::Ggml(_)) {
+            return Ok(None);
+        }
+        let Some((slices, n, k)) = entry.dims() else { return Ok(None) };
+        let (packed, _) = self
+            .quant_blob_slices(&key)
+            .ok_or_else(|| IoError::Bundle(format!("`{key}`: нет блоба кванта")))??;
+        let rb = synaptix_core::quant::block_row_bytes(dtype, k)
+            .ok_or_else(|| IoError::Bundle(format!("`{key}`: K={k} не кратен блоку формата")))?;
+        if packed.len() < slices * n * rb {
+            return Err(IoError::Bundle(format!("`{key}`: блоб короче {slices}×{n}×{rb}")));
+        }
+        let mut out = vec![0f32; slices * n * k];
+        for r in 0..slices * n {
+            synaptix_core::quant::dequant_row_f32(dtype, &packed[r * rb..(r + 1) * rb], k, &mut out[r * k..(r + 1) * k])
+                .map_err(IoError::Core)?;
+        }
+        let t = Tensor::from_vec(out, entry.shape.clone(), Device::Cpu).map_err(IoError::Core)?;
+        let t = match want_dtype {
+            Some(d) if d != DType::F32 => t.to_dtype(d).map_err(IoError::Core)?,
+            _ => t,
+        };
+        Ok(Some(if device == Device::Cpu { t } else { t.to_device(device).map_err(IoError::Core)? }))
+    }
+
     /// Манифест квантования; `None` — бандл обычный.
     pub fn quant_manifest(&self) -> Option<&QuantManifest> {
+        let bundle = self.bundle.as_ref()?;
         self.quant
-            .get_or_init(|| QuantManifest::read_from(&self.bundle))
+            .get_or_init(|| QuantManifest::read_from(bundle))
             .as_ref()
     }
 
@@ -160,6 +283,16 @@ impl SynBundleLoader {
     /// `Some(Err(_))` — квантован, но прочитать не вышло: молча свалиться на
     /// плотный путь нельзя, плотной копии в бандле уже нет.
     pub fn load_quant(&self, name: &str, device: Device) -> Option<Result<QuantWeight>> {
+        if let Some(g) = &self.gguf {
+            // `SYN_GGUF_DENSE=1` — отладочный обход: блоки ggml не отдаются,
+            // модель читает веса плотно (`load_to`) и квантует на лету сама.
+            if let Ok(v) = std::env::var("SYN_GGUF_DENSE") {
+                if v == "1" || v.split(',').any(|pat| !pat.is_empty() && name.contains(pat)) {
+                    return None;
+                }
+            }
+            return g.load_quant(name, device).map(|r| r.map_err(|e| IoError::Bundle(e.to_string())));
+        }
         let (key, entry) = self.quant_entry(name)?;
         let slices = match entry.dims() {
             Some((s, _, _)) => s,
@@ -189,6 +322,9 @@ impl SynBundleLoader {
     /// Каждый эксперт получает собственные буферы: писатель кладёт срезы
     /// подряд, а ядрам нужен непрерывный `packed`, начинающийся с нуля.
     pub fn load_quant_stack(&self, name: &str, device: Device) -> Option<Result<Vec<QuantWeight>>> {
+        if let Some(g) = &self.gguf {
+            return g.load_quant_stack(name, device).map(|r| r.map_err(|e| IoError::Bundle(e.to_string())));
+        }
         let (key, entry) = self.quant_entry(name)?;
         let slices = match entry.slices() {
             Some(s) => s,
@@ -217,6 +353,9 @@ impl SynBundleLoader {
         expert: usize,
         device: Device,
     ) -> Option<Result<QuantWeight>> {
+        if let Some(g) = &self.gguf {
+            return g.load_quant_expert(name, expert, device).map(|r| r.map_err(|e| IoError::Bundle(e.to_string())));
+        }
         let (key, _) = self.quant_entry(name)?;
         Some(self.build_quant_slice(&key, expert, device))
     }
@@ -226,8 +365,15 @@ impl SynBundleLoader {
     /// зеркалировать стопку в pinned-RAM по диапазону адресов: подкачка
     /// эксперта попадает в зеркало по указателю среза.
     pub fn quant_blob_slices(&self, name: &str) -> Option<Result<(&[u8], &[u8])>> {
-        let (key, _) = self.quant_entry(name)?;
+        if let Some(g) = &self.gguf {
+            // У одноблобных форматов масштабов нет; собранные копией веса
+            // (перестановки, стопки из частей) зеркалом не адресуются.
+            return g.quant_blob_slice(name).map(|r| r.map(|b| (b, &b[..0])).map_err(|e| IoError::Bundle(e.to_string())));
+        }
+        let (key, entry) = self.quant_entry(name)?;
         let manifest = self.quant_manifest()?;
+        // У одноблобных форматов (`sq*`, `ggml:*`) блоба `.qscales` нет.
+        let has_scales = entry.kind().is_none_or(|k| k.has_scales());
         let r = (|| -> Result<(&[u8], &[u8])> {
             let (bytes, _) = self.st_bytes()?;
             let idx = self.index()?;
@@ -238,13 +384,18 @@ impl SynBundleLoader {
                     .ok_or_else(|| IoError::Bundle(format!("`{blob}`: блоб не найден в бандле")))?;
                 Ok(&bytes[meta.off..meta.off + meta.len])
             };
-            Ok((take(&manifest.packed_name(&key))?, take(&manifest.scales_name(&key))?))
+            let packed = take(&manifest.packed_name(&key))?;
+            let scales = if has_scales { take(&manifest.scales_name(&key))? } else { &packed[..0] };
+            Ok((packed, scales))
         })();
         Some(r)
     }
 
     /// Формат кванта веса (`None` — не квантован или формат неизвестен).
     pub fn quant_kind(&self, name: &str) -> Option<synaptix_bundle::inspect::QuantKind> {
+        if let Some(g) = &self.gguf {
+            return g.quant_kind(name).map(synaptix_bundle::inspect::QuantKind::Ggml);
+        }
         let (_, entry) = self.quant_entry(name)?;
         entry.kind()
     }
@@ -252,6 +403,9 @@ impl SynBundleLoader {
     /// Форма квантованного веса: `(число матриц, N, K)`. `None` — вес в
     /// бандле не квантован.
     pub fn quant_dims(&self, name: &str) -> Option<(usize, usize, usize)> {
+        if let Some(g) = &self.gguf {
+            return g.quant_dims(name);
+        }
         let (_, entry) = self.quant_entry(name)?;
         entry.dims()
     }
@@ -366,7 +520,20 @@ impl WeightLoader for SynBundleLoader {
     }
 
     fn names(&self) -> Vec<&str> {
+        if let Some(g) = &self.gguf {
+            return g.names();
+        }
         let Ok(idx) = self.index() else { return Vec::new(); };
         idx.names.iter().map(|s| s.as_str()).collect()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        if let Some(g) = &self.gguf {
+            return g.contains(name);
+        }
+        self.index().map(|idx| {
+            let key = Self::resolve_key(name, &idx.prefix);
+            idx.by_name.contains_key(&key) || idx.by_name.contains_key(name)
+        }).unwrap_or(false)
     }
 }

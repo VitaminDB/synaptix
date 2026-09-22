@@ -2761,6 +2761,64 @@ impl Backend for CudaBackend {
         crate::elementwise::blockq::blockq_dequant(&kernels, &stream, dtype, src, dst, n as u32, k as u32)
     }
 
+    fn block_gather_dequant(
+        &self,
+        table: &Storage,
+        dtype: DType,
+        ids: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        vocab: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (ids_st, ids_lo) = ids;
+        let (out_st, out_lo) = out;
+        if ids_lo.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("block_gather_dequant: ids должны быть U32"));
+        }
+        if !ids_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let (ctx, stream) = ctx_stream_of(table, "block_gather_dequant")?;
+        let src = table
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("block_gather_dequant: таблица не на карте"))?
+            .slice();
+        let kernels = match out_lo.dtype() {
+            DType::F16 => crate::elementwise::blockq::BlockqDequantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::blockq::BlockqDequantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("block_gather_dequant: выход только F16/BF16")),
+        };
+        let n_ids = ids_lo.numel();
+        let ids_buf = ids_st
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("block_gather_dequant: ids не на карте"))?;
+        let ids_off = ids_lo.byte_offset();
+        let ids_view = unsafe {
+            ids_buf
+                .slice()
+                .slice(ids_off..ids_off + n_ids * 4)
+                .transmute::<u32>(n_ids)
+                .ok_or_else(|| SynaptixError::Cuda("block_gather_dequant: transmute ids".into()))?
+        };
+        let dst = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("block_gather_dequant: out не на карте"))?
+            .slice_mut();
+        let mut dst_v = dst.as_view_mut();
+        crate::elementwise::blockq::blockq_gather_dequant(
+            &kernels,
+            &stream,
+            dtype,
+            &src.as_view(),
+            &ids_view,
+            &mut dst_v,
+            n_ids as u32,
+            vocab as u32,
+            k as u32,
+        )
+    }
+
     fn quant_gemv_batched(
         &self,
         w_packed: &[&Storage],

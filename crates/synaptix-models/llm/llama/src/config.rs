@@ -100,8 +100,13 @@ impl LlamaConfig {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
             .map_err(|e| ConfigError::Io(format!("read {}: {e}", path.display())))?;
-        let mut cfg: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| ConfigError::Parse(format!("parse {}: {e}", path.display())))?;
+        Self::from_hf_json_slice(&bytes)
+            .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))
+    }
+
+    pub fn from_hf_json_slice(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mut cfg: Self = serde_json::from_slice(bytes)
+            .map_err(|e| ConfigError::Parse(format!("parse config.json: {e}")))?;
         if cfg.head_dim == 0 {
             cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads.max(1);
         }

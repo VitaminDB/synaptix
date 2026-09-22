@@ -845,7 +845,10 @@ mod tests {
             eot: None,
             add_bos: None,
             add_eos: None,
+            add_space_prefix: None,
             chat_template: None,
+            chat_templates: Vec::new(),
+            scores: Vec::new(),
         };
         let bytes = config_json(&s, None, &vocab).unwrap();
         let d: J = serde_json::from_slice(&bytes).unwrap();

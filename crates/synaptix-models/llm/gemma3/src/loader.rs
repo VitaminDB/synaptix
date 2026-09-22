@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use synaptix_bundle::Bundle;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::SafetensorsLoader;
+use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
 
 use crate::config::Gemma3Config;
@@ -24,9 +24,23 @@ const LM_PREFIX: &str = "language_model.";
 /// Ленивый держатель весов: mmap-загрузчик + конфиг, БЕЗ материализации тензоров.
 /// Каждый вес читается из mmap по требованию ([`tensor`](Self::tensor)) сразу на
 /// целевое устройство — модель квантует на лету повесно, не держа bulk F16 в RAM.
+enum Source {
+    Files(SafetensorsLoader),
+    Model(SynBundleLoader),
+}
+
+impl Source {
+    fn loader(&self) -> &dyn WeightLoader {
+        match self {
+            Source::Files(l) => l,
+            Source::Model(l) => l,
+        }
+    }
+}
+
 pub struct GemmaWeights {
     pub config: Gemma3Config,
-    loader: SafetensorsLoader,
+    source: Source,
     prefix: &'static str,
     pub device: Device,
     pub dtype: DType,
@@ -40,27 +54,23 @@ impl GemmaWeights {
     /// шарды слиты в один tensors-чанк, а `config.json` лежит файловым чанком.
     pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
         let path = path.as_ref();
-        let (config, loader) = if is_bundle(path) {
-            let bundle = Arc::new(
-                Bundle::open(path)
-                    .map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?,
-            );
-            let cfg_bytes = bundle
-                .read_file("config.json")
-                .map_err(|e| LoadError::Config(format!("{}:config.json: {e}", path.display())))?;
+        let (config, source) = if is_bundle(path) {
+            let cfg_bytes = read_aux(path, "config.json")?;
             let config = Gemma3Config::from_hf_json_slice(&cfg_bytes, "config.json")
                 .map_err(|e| LoadError::Config(e.to_string()))?;
-            let loader = SafetensorsLoader::from_bundle(bundle, None)
-                .map_err(|e| LoadError::Io(e.to_string()))?;
-            (config, loader)
+            let loader = SynBundleLoader::open(path)
+                .map_err(|e| LoadError::Io(e.to_string()))?
+                .with_device(device);
+            (config, Source::Model(loader))
         } else {
             let config = Gemma3Config::from_hf_json(path.join("config.json"))
                 .map_err(|e| LoadError::Config(e.to_string()))?;
             let shards = resolve_shards(path)?;
             let loader = SafetensorsLoader::open_sharded(&shards)
                 .map_err(|e| LoadError::Io(e.to_string()))?;
-            (config, loader)
+            (config, Source::Files(loader))
         };
+        let loader = source.loader();
         let prefix = if loader.names().iter().any(|n| n.starts_with(LM_PREFIX)) {
             LM_PREFIX
         } else {
@@ -69,20 +79,25 @@ impl GemmaWeights {
         if !loader.contains(&format!("{prefix}model.embed_tokens.weight")) {
             return Err(LoadError::MissingKey("model.embed_tokens.weight".into()));
         }
-        Ok(Self { config, loader, prefix, device, dtype })
+        Ok(Self { config, source, prefix, device, dtype })
     }
 
     /// Лениво читает один вес из mmap на `device` в `dtype` (копируется в RAM только
     /// он). `key` — стандартное `model.*` имя; префикс `language_model.` добавляется.
     pub fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, LoadError> {
         let full = format!("{}{}", self.prefix, key);
-        self.loader
+        self.source
+            .loader()
             .load_to(&full, device, dtype)
             .map_err(|e| LoadError::Io(format!("load '{full}': {e}")))
     }
 
     pub fn contains(&self, key: &str) -> bool {
-        self.loader.contains(&format!("{}{}", self.prefix, key))
+        let full = format!("{}{}", self.prefix, key);
+        match &self.source {
+            Source::Files(l) => l.contains(&full),
+            Source::Model(l) => l.contains(&full) || l.quant_dims(&full).is_some(),
+        }
     }
 }
 
@@ -100,28 +115,29 @@ impl synaptix_llm_common::WeightSource for GemmaWeights {
     fn contains(&self, key: &str) -> bool {
         GemmaWeights::contains(self, key)
     }
-}
 
-/// `.syn`-бандл (файл) или HF-каталог — различаем по расширению.
-pub fn is_bundle(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("syn"))
-}
-
-/// Прочитать вспомогательный файл модели (`tokenizer.json`, …) из каталога
-/// или из `.syn`-бандла — вызывающему не нужно знать, что за раскладка.
-pub fn read_aux(path: &Path, rel: &str) -> Result<Vec<u8>, LoadError> {
-    if is_bundle(path) {
-        let bundle =
-            Bundle::open(path).map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?;
-        return bundle
-            .read_file(rel)
-            .map(|c| c.into_owned())
-            .map_err(|e| LoadError::Io(format!("{}:{rel}: {e}", path.display())));
+    fn quant(
+        &self,
+        key: &str,
+        device: Device,
+    ) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, synaptix_llm_common::ModelError>> {
+        let Source::Model(l) = &self.source else { return None };
+        let full = format!("{}{}", self.prefix, key);
+        l.load_quant(&full, device)
+            .map(|r| r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
-    let p = path.join(rel);
-    std::fs::read(&p).map_err(|e| LoadError::Io(format!("read {}: {e}", p.display())))
+}
+
+/// Файл-модель (`.syn`-бандл или `.gguf`) или HF-каталог.
+pub fn is_bundle(path: &Path) -> bool {
+    synaptix_io::weights::is_model_file(path)
+}
+
+/// Прочитать вспомогательный файл модели (`tokenizer.json`, …) из каталога,
+/// `.syn`-бандла или `.gguf` — вызывающему не нужно знать, что за раскладка.
+pub fn read_aux(path: &Path, rel: &str) -> Result<Vec<u8>, LoadError> {
+    synaptix_io::weights::read_model_file(path, rel)
+        .ok_or_else(|| LoadError::Io(format!("{}:{rel}: нет файла", path.display())))
 }
 
 fn resolve_shards(dir: &Path) -> Result<Vec<PathBuf>, LoadError> {

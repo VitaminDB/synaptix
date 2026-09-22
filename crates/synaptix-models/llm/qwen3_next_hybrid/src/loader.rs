@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use synaptix_bundle::Bundle;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -22,21 +21,17 @@ pub struct HybridWeights {
 impl HybridWeights {
     pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
         let path = path.as_ref();
-        let bundle = Bundle::open(path).map_err(|e| LoadError::Io(e.to_string()))?;
-        let config_bytes = bundle
-            .read_file("config.json")
-            .map_err(|e| LoadError::Io(format!("read config.json: {e}")))?;
-        let config =
-            HybridConfig::from_hf_bytes(&config_bytes).map_err(|e| LoadError::Config(e.to_string()))?;
-        let tokenizer_json = bundle
-            .read_file("tokenizer.json")
-            .map_err(|e| LoadError::Io(format!("read tokenizer.json: {e}")))?
-            .into_owned();
-        drop(bundle);
-
         let loader = SynBundleLoader::open(path)
             .map_err(|e| LoadError::Io(e.to_string()))?
             .with_device(device);
+        let config_bytes = loader
+            .read_file("config.json")
+            .ok_or_else(|| LoadError::Io("read config.json: нет файла".into()))?;
+        let config =
+            HybridConfig::from_hf_bytes(&config_bytes).map_err(|e| LoadError::Config(e.to_string()))?;
+        let tokenizer_json = loader
+            .read_file("tokenizer.json")
+            .ok_or_else(|| LoadError::Io("read tokenizer.json: нет файла".into()))?;
         Ok(Self { config, loader, tokenizer_json, device, dtype })
     }
 

@@ -41,11 +41,14 @@ fn convert_gguf_to_syn(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Err
     use synaptix_gguf::{convert_to_syn, ConvertOptions, OutDtype};
 
     let dtype = match args.dtype.to_ascii_lowercase().as_str() {
-        "auto" => OutDtype::Auto,
+        // `auto`/`keep`: квантованные тензоры остаются блоками ggml (манифест
+        // `ggml:<тип>`), плавающие — своим типом; `f16` и прочие — деквант.
+        "auto" | "keep" => OutDtype::Keep,
+        "dequant" => OutDtype::Auto,
         "f16" | "fp16" | "half" => OutDtype::F16,
         "bf16" => OutDtype::BF16,
         "f32" | "fp32" => OutDtype::F32,
-        other => return Err(format!("неизвестный --dtype `{other}` (auto|f16|bf16|f32)").into()),
+        other => return Err(format!("неизвестный --dtype `{other}` (keep|dequant|f16|bf16|f32)").into()),
     };
 
     let opts = ConvertOptions {
@@ -107,6 +110,9 @@ fn convert_gguf_to_syn(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Err
     }
     println!("  files:      {}", report.files.join(", "));
     println!("  payload:    {:.2} ГБ", report.payload_bytes as f64 / 1e9);
+    if report.kept_quant > 0 {
+        println!("  кванты:     {} тензоров оставлены блоками ggml (quant_manifest.json)", report.kept_quant);
+    }
     Ok(())
 }
 

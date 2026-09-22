@@ -6,6 +6,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::SafetensorsLoader;
+use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
 
 use crate::config::Qwen3Config;
@@ -18,15 +19,29 @@ struct ShardIndex {
 pub struct Qwen3Weights {
     pub config: Qwen3Config,
     pub tensors: HashMap<String, Tensor>,
+    /// Ленивый источник — `.syn`-бандл или `.gguf`: тензоры читаются по
+    /// требованию, квантованные отдаются как есть.
+    pub model: Option<SynBundleLoader>,
     pub device: Device,
     pub dtype: DType,
 }
 
 impl Qwen3Weights {
     /// Загружает все веса из директории HF (с `config.json` и
-    /// `model.safetensors.index.json` либо одиночным `model.safetensors`).
+    /// `model.safetensors.index.json` либо одиночным `model.safetensors`),
+    /// либо лениво открывает файл-модель (`.syn`, `.gguf`).
     pub fn load(dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
         let dir = dir.as_ref();
+        if synaptix_io::weights::is_model_file(dir) {
+            let loader = SynBundleLoader::open(dir)
+                .map_err(|e| LoadError::Io(e.to_string()))?
+                .with_device(device);
+            let cfg = loader
+                .read_file("config.json")
+                .ok_or_else(|| LoadError::Config("config.json: нет файла".into()))?;
+            let config = Qwen3Config::from_hf_json_slice(&cfg).map_err(|e| LoadError::Config(e.to_string()))?;
+            return Ok(Self { config, tensors: HashMap::new(), model: Some(loader), device, dtype });
+        }
         let config = Qwen3Config::from_hf_json(dir.join("config.json"))
             .map_err(|e| LoadError::Config(e.to_string()))?;
 
@@ -43,7 +58,7 @@ impl Qwen3Weights {
                 .map_err(|e| LoadError::Io(format!("load '{name}': {e}")))?;
             tensors.insert(name, t);
         }
-        Ok(Self { config, tensors, device, dtype })
+        Ok(Self { config, tensors, model: None, device, dtype })
     }
 
     pub fn get(&self, name: &str) -> Result<&Tensor, LoadError> {
@@ -65,9 +80,14 @@ impl synaptix_llm_common::WeightSource for Qwen3Weights {
     fn tensor(
         &self,
         key: &str,
-        _device: Device,
+        device: Device,
         dtype: DType,
     ) -> Result<Tensor, synaptix_llm_common::ModelError> {
+        if let Some(m) = &self.model {
+            return m
+                .load_to(key, device, dtype)
+                .map_err(|e| synaptix_llm_common::ModelError::Load(format!("load '{key}': {e}")));
+        }
         let t = self
             .get(key)
             .map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string()))?;
@@ -80,7 +100,20 @@ impl synaptix_llm_common::WeightSource for Qwen3Weights {
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.tensors.contains_key(key)
+        match &self.model {
+            Some(m) => m.contains(key) || m.quant_dims(key).is_some(),
+            None => self.tensors.contains_key(key),
+        }
+    }
+
+    fn quant(
+        &self,
+        key: &str,
+        device: Device,
+    ) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, synaptix_llm_common::ModelError>> {
+        let m = self.model.as_ref()?;
+        m.load_quant(key, device)
+            .map(|r| r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
 }
 

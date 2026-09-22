@@ -8,7 +8,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use synaptix_bundle::Bundle;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::quant::QuantWeight;
@@ -44,20 +43,14 @@ pub struct Gemma4Weights {
 
 /// `.syn`-бандл (файл) или HF-каталог — различаем по расширению.
 pub fn is_bundle(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("syn"))
+    synaptix_io::weights::is_model_file(path)
 }
 
-/// Вспомогательный файл модели из каталога или из бандла.
+/// Вспомогательный файл модели из каталога, бандла или GGUF.
 pub fn read_aux(path: &Path, rel: &str) -> Result<Vec<u8>, LoadError> {
     if is_bundle(path) {
-        let bundle =
-            Bundle::open(path).map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?;
-        return bundle
-            .read_file(rel)
-            .map(|c| c.into_owned())
-            .map_err(|e| LoadError::Io(format!("{}:{rel}: {e}", path.display())));
+        return synaptix_io::weights::read_model_file(path, rel)
+            .ok_or_else(|| LoadError::Io(format!("{}:{rel}: нет файла", path.display())));
     }
     let p = path.join(rel);
     std::fs::read(&p).map_err(|e| LoadError::Io(format!("read {}: {e}", p.display())))
@@ -102,27 +95,21 @@ impl Gemma4Weights {
     }
 
     fn open_bundle(path: &Path, device: Device, dtype: DType) -> Result<Self, LoadError> {
-        let bundle = Bundle::open(path).map_err(|e| LoadError::Io(e.to_string()))?;
-        let config_bytes = bundle
-            .read_file("config.json")
-            .map_err(|e| LoadError::Io(format!("config.json: {e}")))?;
-        let mut config = Gemma4Config::from_hf_bytes(&config_bytes)
-            .map_err(|e| LoadError::Config(e.to_string()))?;
-        if let Ok(gen) = bundle.read_file("generation_config.json") {
-            config.merge_generation_config(&gen);
-        }
-        let tokenizer_json = bundle
-            .read_file("tokenizer.json")
-            .map(|c| c.into_owned())
-            .unwrap_or_default();
-        let chat_template = bundle
-            .read_file("chat_template.jinja")
-            .ok()
-            .and_then(|c| String::from_utf8(c.into_owned()).ok());
-        drop(bundle);
         let loader = SynBundleLoader::open(path)
             .map_err(|e| LoadError::Io(e.to_string()))?
             .with_device(device);
+        let config_bytes = loader
+            .read_file("config.json")
+            .ok_or_else(|| LoadError::Io("config.json: нет файла".into()))?;
+        let mut config = Gemma4Config::from_hf_bytes(&config_bytes)
+            .map_err(|e| LoadError::Config(e.to_string()))?;
+        if let Some(gen) = loader.read_file("generation_config.json") {
+            config.merge_generation_config(&gen);
+        }
+        let tokenizer_json = loader.read_file("tokenizer.json").unwrap_or_default();
+        let chat_template = loader
+            .read_file("chat_template.jinja")
+            .and_then(|c| String::from_utf8(c).ok());
         let source = Source::Bundle(loader);
         let text_prefix = source_contains(&source, &format!("{LM_PREFIX}.embed_tokens.weight"));
         Ok(Self {

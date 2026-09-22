@@ -15,6 +15,7 @@ default = []
 synaptix-core         = { workspace = true }
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+synaptix-io = { workspace = true }
 synaptix-nn           = { workspace = true }
 synaptix-ops          = { workspace = true }
 synaptix-infer        = { workspace = true }

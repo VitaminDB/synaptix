@@ -6,14 +6,11 @@ use std::path::Path;
 
 use synaptix_bundle::Bundle;
 
-/// Читает файл из HF-каталога (директория) или из `.syn`-бандла (файл).
+
+/// Читает файл из HF-каталога, `.syn`-бандла или `.gguf` (у GGUF файлы
+/// `config.json`/`tokenizer.json`/… синтезирует маппер).
 pub fn read_model_file(model: &Path, name: &str) -> Option<Vec<u8>> {
-    if model.is_dir() {
-        std::fs::read(model.join(name)).ok()
-    } else {
-        let bundle = Bundle::open(model).ok()?;
-        bundle.read_file(name).ok().map(|c| c.into_owned())
-    }
+    synaptix_io::weights::read_model_file(model, name)
 }
 
 /// `model_type` из config.json. None, если файла/поля нет.
@@ -27,7 +24,7 @@ pub fn model_type(path: &Path) -> Option<String> {
 
 /// `arch` из метаданных `.syn`-бандла (fallback). None для HF-каталога/пустого.
 fn bundle_arch(path: &Path) -> Option<String> {
-    if path.is_dir() {
+    if path.is_dir() || synaptix_io::weights::is_gguf_model(path) {
         return None;
     }
     let b = Bundle::open(path).ok()?;

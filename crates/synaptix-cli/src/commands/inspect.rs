@@ -13,7 +13,7 @@ pub fn run(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     match ext {
         "syn" => inspect_syn(&args.file, args.verbose, args.filter.as_deref()),
         "safetensors" => inspect_safetensors(&args.file, args.verbose, args.filter.as_deref()),
-        "gguf" => Err("GGUF не поддерживается synaptix; используйте `.syn` или конвертируйте через llama.cpp tools".into()),
+        "gguf" => inspect_gguf(&args.file, args.verbose, args.filter.as_deref()),
         _ => Err(format!("unknown format: {ext}").into()),
     }
 }
@@ -92,3 +92,70 @@ fn inspect_safetensors(path: &Path, verbose: bool, filter: Option<&str>) -> Resu
     Ok(())
 }
 
+
+/// GGUF: метаданные, типы тензоров и что из этого движок исполняет напрямую.
+fn inspect_gguf(path: &Path, verbose: bool, filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "gguf"))]
+    {
+        let _ = (path, verbose, filter);
+        return Err("поддержка GGUF выключена: пересоберите с `--features gguf`".into());
+    }
+    #[cfg(feature = "gguf")]
+    {
+        use std::collections::BTreeMap;
+        let f = synaptix_gguf::GgufFile::open(path)?;
+        println!("=== GGUF: {} ===", path.display());
+        println!("  version:      {}", f.version);
+        println!("  architecture: {}", f.architecture().unwrap_or("?"));
+        println!("  tensors:      {}", f.tensors().len());
+        let mut by_type: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+        for t in f.tensors() {
+            let e = by_type.entry(t.ty.name()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += t.byte_len() as u64;
+        }
+        println!("  by type:");
+        for (ty, (n, bytes)) in &by_type {
+            println!("    {ty:<8} {n:>5} тензоров  {:.2} ГБ", *bytes as f64 / 1e9);
+        }
+        let mmproj = None::<&synaptix_gguf::GgufFile>;
+        match synaptix_gguf::arch::build_plan(&f, mmproj, "inspect") {
+            Ok(plan) => {
+                let cfg: serde_json::Value = plan
+                    .files
+                    .iter()
+                    .find(|x| x.path == "config.json")
+                    .and_then(|x| serde_json::from_slice(&x.bytes).ok())
+                    .unwrap_or_default();
+                println!("  engine:       model_type={} (маппер {})", cfg["model_type"].as_str().unwrap_or("?"), plan.arch);
+                println!("  hf tensors:   {}", plan.tensor_count());
+                println!("  files:        {}", plan.files.iter().map(|x| x.path.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            Err(e) => println!("  engine:       не исполняется напрямую — {e}"),
+        }
+        println!("  metadata:");
+        let mut keys: Vec<&String> = f.metadata.keys().collect();
+        keys.sort();
+        for k in keys {
+            if !matches_filter(k, filter) {
+                continue;
+            }
+            let v = &f.metadata[k];
+            let shown = match v {
+                synaptix_gguf::Value::Array(a) if a.len() > 8 && !verbose => format!("<{} items>", a.len()),
+                synaptix_gguf::Value::String(s) if s.len() > 120 && !verbose => format!("{:?}…", &s[..s.char_indices().nth(120).map(|(i, _)| i).unwrap_or(s.len())]),
+                other => format!("{other:?}"),
+            };
+            println!("    {k} = {shown}");
+        }
+        if verbose {
+            println!("  tensors:");
+            for t in f.tensors() {
+                if matches_filter(&t.name, filter) {
+                    println!("    {:<48} {:<8} {:?}", t.name, t.ty.name(), t.hf_shape());
+                }
+            }
+        }
+        Ok(())
+    }
+}

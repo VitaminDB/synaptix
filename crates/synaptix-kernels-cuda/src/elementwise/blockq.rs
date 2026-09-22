@@ -17,6 +17,9 @@ use crate::kernels::compile::{compile_module_with_opts, load_fn};
 pub struct BlockqDequantKernels {
     _module: Arc<CudaModule>,
     fns: HashMap<&'static str, CudaFunction>,
+    /// `deqg_<suffix>` — gather строк таблицы по индексам с деквантом
+    /// (только одноблобные форматы).
+    gather_fns: HashMap<&'static str, CudaFunction>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<BlockqDequantKernels>)>>> = OnceLock::new();
@@ -134,11 +137,15 @@ impl BlockqDequantKernels {
         let src = module_source();
         let module = compile_module_with_opts(ctx, &src, tag, opts, None)?;
         let mut fns = HashMap::new();
+        let mut gather_fns = HashMap::new();
         for suf in SUFFIXES.iter().chain(DEQ_ONLY_SUFFIXES) {
             let name = format!("deq_{suf}");
             fns.insert(*suf, load_fn(&module, &name)?);
+            if !matches!(*suf, "nvfp4_syn" | "mxfp8_syn") {
+                gather_fns.insert(*suf, load_fn(&module, &format!("deqg_{suf}"))?);
+            }
         }
-        let new = Arc::new(Self { _module: module, fns });
+        let new = Arc::new(Self { _module: module, fns, gather_fns });
         cache.lock().unwrap().push((key, new.clone()));
         Ok(new)
     }
@@ -147,6 +154,52 @@ impl BlockqDequantKernels {
         let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_dequant: формат не квантованный вес"))?;
         self.fns.get(suf).ok_or(SynaptixError::Unsupported("blockq_dequant: нет точки входа"))
     }
+
+    fn gather_func(&self, dtype: DType) -> Result<&CudaFunction> {
+        let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_gather_dequant: формат не квантованный вес"))?;
+        self.gather_fns.get(suf).ok_or(SynaptixError::Unsupported("blockq_gather_dequant: только одноблобные форматы"))
+    }
+}
+
+/// Gather эмбеддингов из упакованной таблицы `[vocab, k]` одноблобного
+/// формата: `out[i, :] = dequant(table[ids[i], :])`, `out` — `[n_ids, k]` в
+/// типе модуля. Индекс ≥ `vocab` даёт строку нулей.
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gather_dequant(
+    kernels: &BlockqDequantKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    table: &CudaView<'_, u8>,
+    ids: &CudaView<'_, u32>,
+    out: &mut CudaViewMut<'_, u8>,
+    n_ids: u32,
+    vocab: u32,
+    k: u32,
+) -> Result<()> {
+    let rb = row_bytes(dtype, k as usize)? as u32;
+    if table.len() < vocab as usize * rb as usize {
+        return Err(SynaptixError::Unsupported("blockq_gather_dequant: таблица короче vocab × row_bytes"));
+    }
+    if ids.len() < n_ids as usize {
+        return Err(SynaptixError::Unsupported("blockq_gather_dequant: ids короче n_ids"));
+    }
+    if out.len() < n_ids as usize * k as usize * 2 {
+        return Err(SynaptixError::Unsupported("blockq_gather_dequant: out короче n_ids × k"));
+    }
+    if n_ids == 0 {
+        return Ok(());
+    }
+    let f = kernels.gather_func(dtype)?;
+    let total = n_ids * (k / 32);
+    let block = 256u32;
+    let grid = total.div_ceil(block).max(1);
+    let mut bld = stream.launch_builder(f);
+    bld.arg(table).arg(ids).arg(&mut *out).arg(&n_ids).arg(&vocab).arg(&k).arg(&rb);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gather_dequant {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
 }
 
 /// Проверка формы и байт на строку. `k` кратен 32 и блоку формата.

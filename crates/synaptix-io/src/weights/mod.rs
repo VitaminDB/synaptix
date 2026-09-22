@@ -2,6 +2,7 @@ pub mod pinned_loader;
 pub mod safetensors;
 pub mod streaming_loader;
 pub mod syn_bundle;
+pub use syn_bundle::{is_gguf_model, is_model_file, read_model_file};
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use crate::error::Result;
