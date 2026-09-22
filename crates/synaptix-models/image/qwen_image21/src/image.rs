@@ -80,9 +80,12 @@ impl RgbaImage {
     /// генераций альфа шумит в 244…255, у прозрачных фон уходит в 0.
     pub const OPAQUE_ALPHA: u8 = 204;
 
-    /// Есть ли настоящая прозрачность (альфа ниже [`Self::OPAQUE_ALPHA`]).
+    /// Есть ли настоящая прозрачность: альфа ниже [`Self::OPAQUE_ALPHA`] хотя
+    /// бы у 0,1 % пикселей (единичные выбросы у непрозрачных генераций — не в
+    /// счёт).
     pub fn has_transparency(&self) -> bool {
-        self.data.chunks_exact(4).any(|p| p[3] < Self::OPAQUE_ALPHA)
+        let low = self.data.chunks_exact(4).filter(|p| p[3] < Self::OPAQUE_ALPHA).count();
+        low * 1000 > self.width * self.height
     }
 
     /// `[4, H, W]` F32 в [0, 1] на CPU (для VAE: `preprocess` → `2x − 1` делает
@@ -272,6 +275,13 @@ mod tests {
         assert!(img.has_transparency());
         let noisy = RgbaImage::new(1, 2, vec![1, 2, 3, 250, 4, 5, 6, 255]).unwrap();
         assert!(noisy.has_alpha() && !noisy.has_transparency());
+        // Один выброс на 2000 пикселей — ещё не прозрачность, 3 — уже да.
+        let mut d = vec![255u8; 2000 * 4];
+        d[3] = 100;
+        assert!(!RgbaImage::new(50, 40, d.clone()).unwrap().has_transparency());
+        d[7] = 100;
+        d[11] = 100;
+        assert!(RgbaImage::new(50, 40, d).unwrap().has_transparency());
         let rgb = t.narrow(0, 0, 3).unwrap().contiguous().unwrap();
         assert!(!RgbaImage::from_tensor(&rgb).unwrap().has_alpha());
     }
