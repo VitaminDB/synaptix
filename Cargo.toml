@@ -89,6 +89,7 @@ members = [
     "crates/synaptix-models/image/flux",
     "crates/synaptix-models/image/flux2",
     "crates/synaptix-models/image/qwen_image",
+    "crates/synaptix-models/image/qwen_image21",
     "crates/synaptix-models/image/pixart_sigma",
     "crates/synaptix-models/image/hidream",
     "crates/synaptix-models/image/sana",
@@ -259,6 +260,7 @@ synaptix-depth-anything = { path = "crates/synaptix-models/image/depth_anything"
 synaptix-image-flux   = { path = "crates/synaptix-models/image/flux" }
 synaptix-image-flux2  = { path = "crates/synaptix-models/image/flux2" }
 synaptix-image-qwen   = { path = "crates/synaptix-models/image/qwen_image" }
+synaptix-image-qwen21 = { path = "crates/synaptix-models/image/qwen_image21" }
 synaptix-video-ltx23  = { path = "crates/synaptix-models/video/ltx23" }
 synaptix-video-minimax-h3 = { path = "crates/synaptix-models/video/minimax_h3" }
 synaptix-tts-voxcpm   = { path = "crates/synaptix-models/tts/voxcpm" }

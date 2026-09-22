@@ -1,5 +1,6 @@
 //! `synaptix imagine <model_dir> <prompt> -o out.png` — txt2img через нативный
-//! SDXL (CLIP×2 + UNet2DConditionModel + AutoencoderKL).
+//! SDXL (CLIP×2 + UNet2DConditionModel + AutoencoderKL); по `model_index.json`
+//! переключается на FLUX.1, FLUX.2 и Qwen-Image 2.1 (`--image` — референсы).
 
 use std::path::PathBuf;
 
@@ -22,6 +23,10 @@ pub struct ImagineArgs {
     pub compute_dtype: Option<String>,
     pub quant: Option<String>,
     pub storage_dtype: Option<String>,
+    /// Референсы Qwen-Image 2.1.
+    pub image: Vec<PathBuf>,
+    /// `output_resolution` Qwen-Image 2.1.
+    pub resolution: usize,
 }
 
 /// `model_index.json` каталога diffusers или `.syn`-бандла.
@@ -41,6 +46,9 @@ pub fn run(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("model dir not found: {}", args.model.display()).into());
     }
     let index = model_index(&args.model);
+    if index.contains("QwenImage21") {
+        return run_qwen21(args);
+    }
     // `Flux2Pipeline`/`Flux2KleinPipeline` — другая архитектура, чем FLUX.1.
     if index.contains("Flux2") {
         return run_flux2(args);
@@ -230,6 +238,78 @@ fn run_flux2(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "synaptix imagine [FLUX.2]: saved {} ({:.1}s)",
         args.output.display(),
+        t0.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+/// Qwen-Image 2.1: картинка по тексту, правка по референсам (`--image`, до 10)
+/// и RGBA (PNG с альфой, если модель её нарисовала). Энкодер Qwen3-VL — BF16,
+/// DiT — `--quant nvfp4|mxfp8` или плотный BF16; `--cfg` > 1 с непустым
+/// `--negative` включает true CFG (по умолчанию модель идёт без него).
+fn run_qwen21(args: ImagineArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_core::device::Device;
+    use synaptix_image_qwen21::{QwenImage21Model, RgbaImage, SampleParams};
+
+    let dev = device::resolve(&args.device);
+    let want = args.quant.as_deref().or(args.storage_dtype.as_deref()).unwrap_or("none");
+    let quant = match want.to_lowercase().as_str() {
+        "none" | "bf16" | "f16" | "f32" => DType::BF16,
+        "nvfp4" => DType::NVFP4,
+        "mxfp8" | "fp8" => DType::MXFP8,
+        other => return Err(format!("неизвестный --quant/--storage-dtype: {other} (none|nvfp4|mxfp8)").into()),
+    };
+    let t0 = std::time::Instant::now();
+    let m = QwenImage21Model::open(&args.model, dev, DType::BF16, quant)?;
+    let mut images = Vec::with_capacity(args.image.len());
+    for p in &args.image {
+        let t = synaptix_io::image::png::load_image_rgba(p, Device::Cpu)?;
+        images.push(RgbaImage::from_tensor(&t)?);
+    }
+    let sizes: Vec<(usize, usize)> = images.iter().map(|i| (i.width, i.height)).collect();
+    let (width, height) = if args.width == 0 || args.height == 0 {
+        QwenImage21Model::default_size(&sizes, args.resolution)
+    } else {
+        (args.width, args.height)
+    };
+    let steps = if args.steps == 0 { synaptix_image_qwen21::model::DEFAULT_STEPS } else { args.steps };
+    let cfg_on = args.guidance_scale > 1.0 && !args.negative.is_empty();
+    eprintln!(
+        "synaptix imagine [Qwen-Image 2.1]: {} | {}×{} | {} steps | cfg {} | seed {} | референсов {} | quant={quant:?} {dev:?}",
+        args.model.display(),
+        width,
+        height,
+        steps,
+        if cfg_on { args.guidance_scale.to_string() } else { "выкл".into() },
+        args.seed,
+        images.len(),
+    );
+    let negative = cfg_on.then_some(args.negative.as_str());
+    let cond = m.encode_prompt(&args.prompt, negative, &images, args.resolution)?;
+    let refs = if images.is_empty() { None } else { Some(m.encode_references(&images, args.resolution)?) };
+    let ref_tokens = refs.as_ref().map(|r| r.num_tokens()).unwrap_or(0);
+    let txt = cond.embeds.dims()[1].max(cond.negative.as_ref().map(|n| n.0.dims()[1]).unwrap_or(0));
+    let t = m.load_transformer(QwenImage21Model::tokens_for(width, height, ref_tokens, txt))?;
+    let p = SampleParams { width, height, steps, cfg: args.guidance_scale, seed: args.seed, kv_cache: true };
+    let bar = indicatif::ProgressBar::new(p.steps as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("  {bar:40} {pos}/{len} steps [{elapsed_precise}]").unwrap(),
+    );
+    let lat = m.sample(&t, &cond, refs.as_ref(), &p, &mut |i, _| {
+        bar.set_position(i as u64);
+        true
+    })?;
+    bar.finish_and_clear();
+    drop(t);
+    let image = m.decode(&lat)?;
+    // Без настоящей прозрачности (альфа лишь шумит у 255) — обычный RGB PNG.
+    let transparent = RgbaImage::from_tensor(&image)?.has_transparency();
+    let out = if transparent { image } else { image.narrow(0, 0, 3)?.contiguous()? };
+    synaptix_io::image::save_image(&out, &args.output)?;
+    eprintln!(
+        "synaptix imagine [Qwen-Image 2.1]: saved {}{} ({:.1}s)",
+        args.output.display(),
+        if transparent { " (RGBA)" } else { "" },
         t0.elapsed().as_secs_f32()
     );
     Ok(())

@@ -26,7 +26,7 @@ synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant nvfp4
 synaptix chat model.syn --context 32768          # interactive, prefix-KV across turns
 synaptix bench model.syn --n-tokens 128          # prefill / decode throughput
 
-synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2
+synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2, Qwen-Image 2.1
 synaptix video ltx.syn "a paper boat in the rain" -o clip.mp4 --gemma ./gemma-3-12b
 synaptix music "lofi piano, rain" -o track.wav --models ./syn_models --duration auto
 synaptix speak voxcpm.syn "Hello there" -o out.wav --reference voice.wav
@@ -42,7 +42,7 @@ Native ports, each validated against its upstream reference:
 |---|---|
 | **LLM** | Qwen3 (dense + MoE), Qwen3-Next hybrids (GatedDeltaNet + full attention, `qwen3_5/3_6/3_8`), Qwen4Exp (125B MoE: sparse-attention indexer, gated residuals, PLE n-grams, MTP head), Llama, Gemma-3, Gemma-4 26B A4B, Muse Glimmer 30B |
 | **Vision-language** | Qwen3-VL tower (images and video, 3D M-RoPE), Gemma-4 vision tower, Muse Glimmer |
-| **Image** | FLUX.1, FLUX.2 (dev, klein 4B / 9B), Qwen-Image and Qwen-Image-Edit (2509 / 2511: edit an image, or compose up to four references), SDXL (txt2img and img2img), Depth Anything V2 |
+| **Image** | FLUX.1, FLUX.2 (dev, klein 4B / 9B), Qwen-Image 2.1 (text-to-image, editing by up to ten references, transparent RGBA), Qwen-Image and Qwen-Image-Edit (2509 / 2511: edit an image, or compose up to four references), SDXL (txt2img and img2img), Depth Anything V2 |
 | **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio; image / video / audio references — Ref2VA) |
 | **Speech** | Whisper, GigaAM (ASR), Sortformer (diarization) |
 | **Text-to-speech** | VoxCPM, OmniVoice, VibeVoice (long-form, multi-speaker) |
@@ -86,6 +86,9 @@ Diffusion on the same card, 1024² (all weights resident):
 | Model | Steps | Time | Peak VRAM |
 |---|---|---|---|
 | SDXL | 30 | 6.5 s | 8.8 GB |
+| Qwen-Image 2.1, MXFP8 | 40 | 30 s | 13.6 GB |
+| Qwen-Image 2.1, NVFP4 | 40 | 23 s | 9.3 GB |
+| Qwen-Image 2.1 2048², MXFP8 | 40 | 172 s | 23.2 GB |
 | Qwen-Image-Edit-2511, MXFP8 | 40 | 188 s | 17.8 GB |
 | Qwen-Image-Edit-2511, NVFP4 | 40 | 155 s | 13.2 GB |
 

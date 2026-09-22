@@ -1,0 +1,28 @@
+[package]
+name = "synaptix-image-qwen21"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen-Image 2.1: картинка по тексту, правка по референсам и RGBA — единая модель Qwen, нативно на synaptix."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-diffusion = { workspace = true }
+synaptix-image-qwen = { workspace = true }
+thiserror          = { workspace = true }
+serde_json         = { workspace = true }
+half               = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-io = { workspace = true, features = ["image"] }

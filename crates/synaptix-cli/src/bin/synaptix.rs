@@ -531,6 +531,13 @@ enum Commands {
         /// Алиас --quant (storage-dtype: nvfp4 | mxfp8 | none).
         #[arg(long)]
         storage_dtype: Option<String>,
+        /// Референсы для правки (Qwen-Image 2.1, до 10; в промпте — <image1>, <image2>…).
+        #[arg(long)]
+        image: Vec<PathBuf>,
+        /// Qwen-Image 2.1: `output_resolution` — сторона ~площади референсов и
+        /// выхода при `--width 0 --height 0` (размер с последнего референса).
+        #[arg(long, default_value_t = 1024)]
+        resolution: usize,
     },
     /// Генерация видео (+аудио) LTX-2.3 по текстовому промпту (живой Gemma).
     Video {
@@ -922,7 +929,7 @@ fn main() -> ExitCode {
         }),
         Commands::Imagine {
             model, prompt, output, negative, steps, cfg, height, width, seed, device, compute_dtype,
-            quant, storage_dtype,
+            quant, storage_dtype, image, resolution,
         } => imagine::run(imagine::ImagineArgs {
             model,
             prompt,
@@ -937,6 +944,8 @@ fn main() -> ExitCode {
             compute_dtype,
             quant,
             storage_dtype,
+            image,
+            resolution,
         }),
         Commands::Video {
             model, prompt, output, gemma, frames, duration, width, height, fps, no_audio,
