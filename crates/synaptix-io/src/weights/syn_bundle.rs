@@ -303,7 +303,8 @@ impl SynBundleLoader {
             Ok(&bytes[meta.off..meta.off + meta.len])
         };
         let packed_all = take(&manifest.packed_name(key))?;
-        let scales_all = take(&manifest.scales_name(key))?;
+        // У одноблобных форматов блоба масштабов нет.
+        let scales_all: &[u8] = if kind.has_scales() { take(&manifest.scales_name(key))? } else { &[] };
 
         // Размеры сверяем с манифестом: расхождение означает, что бандл
         // собран другой версией раскладки, и молча считать по нему нельзя.
@@ -322,10 +323,12 @@ impl SynBundleLoader {
         let packed_bytes = &packed_all[slice * packed_step..(slice + 1) * packed_step];
         let scales_bytes = &scales_all[slice * scales_step..(slice + 1) * scales_step];
 
-        let dtype = match kind {
-            synaptix_bundle::inspect::QuantKind::Nvfp4 => DType::NVFP4,
-            synaptix_bundle::inspect::QuantKind::Mxfp8 => DType::MXFP8,
-        };
+        let dtype = kind.dtype();
+        if !kind.has_scales() {
+            let packed = Tensor::from_raw_slice(packed_bytes, vec![packed_bytes.len()], DType::U8, device)
+                .map_err(IoError::Core)?;
+            return QuantWeight::new_block(packed.storage_arc(), dtype, n, k).map_err(IoError::Core);
+        }
         let scales = Tensor::from_raw_slice(scales_bytes, vec![scales_bytes.len()], DType::U8, device)
             .map_err(IoError::Core)?;
         // Pinned-зеркало стопки уже в перемешанной раскладке GEMV/GEMM: одна DMA

@@ -298,7 +298,8 @@ impl GgufFile {
             for _ in 0..nd {
                 dims.push(c.u64()?);
             }
-            let ty = GgmlType::from_u32(c.u32()?)?;
+            let ty_id = c.u32()?;
+            let ty = GgmlType::from_u32(ty_id).ok_or(GgufError::BadTensorType(ty_id))?;
             let offset = c.u64()?;
             by_name.insert(name.clone(), tensors.len());
             tensors.push(TensorInfo {

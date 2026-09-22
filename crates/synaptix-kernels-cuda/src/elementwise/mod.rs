@@ -1,6 +1,7 @@
 //! Elementwise CUDA kernels.
 
 pub mod activations;
+pub mod blockq;
 pub mod kv_append;
 pub mod logit_cap;
 pub mod mxfp8_kv;

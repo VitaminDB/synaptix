@@ -2725,6 +2725,33 @@ impl Backend for CudaBackend {
         )
     }
 
+
+    fn block_dequant(
+        &self,
+        packed: &Storage,
+        dtype: DType,
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (out_st, out_lo) = out;
+        let (ctx, stream) = ctx_stream_of(packed, "block_dequant")?;
+        let src = packed
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("block_dequant: packed не на карте"))?
+            .slice();
+        let kernels = match out_lo.dtype() {
+            DType::F16 => crate::elementwise::blockq::BlockqDequantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::blockq::BlockqDequantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("block_dequant: выход только F16/BF16")),
+        };
+        let dst = out_st
+            .as_cuda_mut()
+            .ok_or(SynaptixError::Unsupported("block_dequant: out не на карте"))?
+            .slice_mut();
+        crate::elementwise::blockq::blockq_dequant(&kernels, &stream, dtype, src, dst, n as u32, k as u32)
+    }
     fn flash_attention_window(
         &self,
         q: (&Storage, &Layout),

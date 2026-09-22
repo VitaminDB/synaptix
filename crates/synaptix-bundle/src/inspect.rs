@@ -102,6 +102,42 @@ pub enum QuantKind {
     /// Байт на вес + масштаб на каждые 32 элемента строки. Требует
     /// `K % 32 == 0`.
     Mxfp8,
+    /// Собственный блочный формат `bits ∈ 1..=8`, один блоб (шкалы внутри
+    /// супер-блока 256). Требует `K % 32 == 0`. См. `synaptix_core::quant::sq`.
+    Sq(u8),
+    /// Тип ggml (файл llama.cpp), один блоб байт в байт как в GGUF. Требует
+    /// `K` кратно блоку типа. Только исполнение, энкодера нет.
+    Ggml(synaptix_core::quant::GgmlType),
+}
+
+impl QuantKind {
+    /// Тип элементов движка для этого формата.
+    pub fn dtype(self) -> synaptix_core::dtype::DType {
+        use synaptix_core::dtype::DType;
+        match self {
+            QuantKind::Nvfp4 => DType::NVFP4,
+            QuantKind::Mxfp8 => DType::MXFP8,
+            QuantKind::Sq(bits) => DType::Sq { bits },
+            QuantKind::Ggml(t) => DType::Ggml(t),
+        }
+    }
+
+    pub fn from_dtype(dtype: synaptix_core::dtype::DType) -> Option<Self> {
+        use synaptix_core::dtype::DType;
+        match dtype {
+            DType::NVFP4 => Some(QuantKind::Nvfp4),
+            DType::MXFP8 => Some(QuantKind::Mxfp8),
+            DType::Sq { bits } => Some(QuantKind::Sq(bits)),
+            DType::Ggml(t) => Some(QuantKind::Ggml(t)),
+            _ => None,
+        }
+    }
+
+    /// Формат хранит масштабы отдельным блобом `.qscales` (NVFP4/MXFP8);
+    /// одноблобные — нет.
+    pub fn has_scales(self) -> bool {
+        matches!(self, QuantKind::Nvfp4 | QuantKind::Mxfp8)
+    }
 }
 
 /// Сколько займёт тензор после квантования. `None` — форма не подходит, вес
@@ -142,6 +178,10 @@ pub fn quantized_bytes(shape: &[usize], kind: QuantKind) -> Option<u64> {
             }
             Some(stack * (n * k + n * (k / 32)))
         }
+        QuantKind::Sq(_) | QuantKind::Ggml(_) => {
+            let rb = synaptix_core::quant::block_row_bytes(kind.dtype(), k as usize)? as u64;
+            Some(stack * n * rb)
+        }
     }
 }
 
@@ -166,12 +206,15 @@ impl SizeEstimate {
             .saturating_add(quantized_bytes(&t.shape, QuantKind::Mxfp8).unwrap_or(t.bytes));
     }
 
-    /// Размер при выбранном формате; `None` — без кванта.
+    /// Размер при выбранном формате; `None` — без кванта. Одноблобные форматы
+    /// (SQ/ggml) сводка пока не накапливает — для них честный ответ считается
+    /// по тензорам через [`quantized_bytes`]; здесь возвращается `dense`.
     pub fn for_kind(&self, kind: Option<QuantKind>) -> u64 {
         match kind {
             None => self.dense,
             Some(QuantKind::Nvfp4) => self.nvfp4,
             Some(QuantKind::Mxfp8) => self.mxfp8,
+            Some(QuantKind::Sq(_)) | Some(QuantKind::Ggml(_)) => self.dense,
         }
     }
 }

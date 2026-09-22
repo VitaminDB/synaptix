@@ -652,6 +652,21 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("mxfp8_dequant не поддержан этим backend"))
     }
 
+    /// Деквант одноблобного веса (`DType::Sq`/`DType::Ggml`) `[n, k]` в
+    /// `out` (F16 или BF16 по `out.1.dtype()`): `packed` — `n·row_bytes`
+    /// байт подряд. Бит в бит с `synaptix_core::quant::dequant_row_f32`.
+    fn block_dequant(
+        &self,
+        _packed: &Storage,
+        _dtype: DType,
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("block_dequant не поддержан этим backend"))
+    }
+
     /// Двунаправленный sliding-window flash (band ±window). Default Unsupported
     /// → caller fallback (наивная маска).
     #[allow(clippy::too_many_arguments)]

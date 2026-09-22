@@ -38,20 +38,14 @@ pub const SCALES_SUFFIX: &str = ".qscales";
 /// Текущая версия раскладки.
 pub const VERSION: u32 = 1;
 
-/// Машинный ключ формата, как он лежит в манифесте.
-pub fn format_key(kind: QuantKind) -> &'static str {
-    match kind {
-        QuantKind::Nvfp4 => "nvfp4",
-        QuantKind::Mxfp8 => "mxfp8",
-    }
+/// Машинный ключ формата, как он лежит в манифесте: `nvfp4`, `mxfp8`,
+/// `sq4`…, `ggml:q4_k`… (см. `synaptix_core::quant::format_key`).
+pub fn format_key(kind: QuantKind) -> String {
+    synaptix_core::quant::format_key(kind.dtype()).unwrap_or_default()
 }
 
 pub fn format_from_key(s: &str) -> Option<QuantKind> {
-    match s {
-        "nvfp4" => Some(QuantKind::Nvfp4),
-        "mxfp8" => Some(QuantKind::Mxfp8),
-        _ => None,
-    }
+    synaptix_core::quant::format_from_key(s).and_then(QuantKind::from_dtype)
 }
 
 /// Описание одного квантованного тензора.
@@ -79,17 +73,22 @@ impl QuantEntry {
         }
     }
 
-    /// Сколько байт занимают упакованные веса (без масштабов).
+    /// Сколько байт занимают упакованные веса (без масштабов). У одноблобных
+    /// форматов это весь тензор.
     pub fn packed_bytes(&self) -> Option<u64> {
         let (slices, n, k) = self.dims()?;
         let last = match self.kind()? {
             QuantKind::Nvfp4 => k / 2,
             QuantKind::Mxfp8 => k,
+            kind @ (QuantKind::Sq(_) | QuantKind::Ggml(_)) => {
+                synaptix_core::quant::block_row_bytes(kind.dtype(), k)?
+            }
         };
         Some(slices as u64 * n as u64 * last as u64)
     }
 
-    /// Сколько байт занимают масштабы.
+    /// Сколько байт занимают масштабы (0 у одноблобных форматов — блоба
+    /// `.qscales` у них нет).
     pub fn scales_bytes(&self) -> Option<u64> {
         let total = crate::inspect::quantized_bytes(&self.shape, self.kind()?)?;
         Some(total - self.packed_bytes()?)
@@ -203,6 +202,22 @@ mod tests {
         let e = entry(vec![128, 256], "int4");
         assert_eq!(e.kind(), None);
         assert_eq!(e.packed_bytes(), None);
+    }
+
+    #[test]
+    fn block_formats_are_single_blob() {
+        let e = entry(vec![128, 512], "sq4");
+        assert_eq!(e.kind(), Some(QuantKind::Sq(4)));
+        assert_eq!(e.packed_bytes(), Some(128 * 2 * 148));
+        assert_eq!(e.scales_bytes(), Some(0));
+        let g = entry(vec![4, 128, 512], "ggml:q4_k");
+        assert_eq!(g.kind(), Some(QuantKind::Ggml(synaptix_core::quant::GgmlType::Q4K)));
+        assert_eq!(g.packed_bytes(), Some(4 * 128 * 2 * 144));
+        assert_eq!(g.packed_bytes_per_slice(), Some(128 * 2 * 144));
+        assert_eq!(format_key(QuantKind::Sq(2)), "sq2");
+        assert_eq!(format_from_key("ggml:iq2_xxs"), Some(QuantKind::Ggml(synaptix_core::quant::GgmlType::Iq2Xxs)));
+        // K не кратен блоку — размер не считается.
+        assert_eq!(entry(vec![128, 500], "ggml:q4_k").packed_bytes(), None);
     }
 
     #[test]

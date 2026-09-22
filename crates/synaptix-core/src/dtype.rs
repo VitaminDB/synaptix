@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::quant::GgmlType;
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DType {
@@ -8,13 +10,22 @@ pub enum DType {
     F16,
     BF16,
 
+    /// E2M1 + E4M3-шкала на 16, шкалы отдельным тензором (тайл-мажорно).
     NVFP4,
+    /// E4M3 + E8M0-шкала на 32, шкалы отдельным тензором.
     MXFP8,
 
     U8,
     U32,
     I32,
     I64,
+
+    /// Собственный блочный формат `bits ∈ 1..=8`, один блоб — см.
+    /// [`crate::quant::sq`].
+    Sq { bits: u8 },
+    /// Блочный тип ggml (файлы llama.cpp), один блоб байт в байт как в GGUF —
+    /// см. [`crate::quant::ggml`]. Только для исполнения, энкодеров нет.
+    Ggml(GgmlType),
 }
 
 impl DType {
@@ -30,6 +41,9 @@ impl DType {
             DType::U32 => 32,
             DType::I32 => 32,
             DType::I64 => 64,
+            DType::Sq { bits } => bits as usize,
+            // Средняя оценка: шкалы размазаны по блоку.
+            DType::Ggml(t) => t.bits_per_weight_x8() / 8,
         }
     }
 
@@ -38,7 +52,13 @@ impl DType {
     }
 
     pub const fn is_quantized(self) -> bool {
-        matches!(self, DType::NVFP4 | DType::MXFP8)
+        matches!(self, DType::NVFP4 | DType::MXFP8 | DType::Sq { .. } | DType::Ggml(_))
+    }
+
+    /// Формат «один блоб»: шкалы лежат внутри блока, отдельного тензора
+    /// масштабов нет (SQ и типы ggml). NVFP4/MXFP8 — нет.
+    pub const fn is_block_quant(self) -> bool {
+        matches!(self, DType::Sq { .. } | DType::Ggml(_))
     }
 
     pub const fn is_integer(self) -> bool {
@@ -46,7 +66,12 @@ impl DType {
     }
 
     pub const fn is_sub_byte(self) -> bool {
-        matches!(self, DType::NVFP4)
+        match self {
+            DType::NVFP4 => true,
+            DType::Sq { bits } => bits < 8,
+            DType::Ggml(t) => t.block_bytes() * 8 < t.block_elems() * 8,
+            _ => false,
+        }
     }
 
     pub fn bytes_for_numel(self, numel: usize) -> usize {
@@ -57,6 +82,9 @@ impl DType {
                 let block_bytes = 8 + 1;
                 numel.div_ceil(block_elems) * block_bytes
             }
+            // Одна строка из `numel` значений: хвостовой блок — целиком.
+            DType::Sq { bits } => crate::quant::sq::row_bytes(bits, numel),
+            DType::Ggml(t) => t.bytes_for(numel),
             _ => (numel * bits).div_ceil(8),
         }
     }
@@ -114,6 +142,19 @@ mod tests {
     fn bytes_for_numel_quantized() {
         assert_eq!(DType::NVFP4.bytes_for_numel(16), 9);
         assert_eq!(DType::MXFP8.bytes_for_numel(32), 32);
+        assert_eq!(DType::Sq { bits: 4 }.bytes_for_numel(256), 148);
+        assert_eq!(DType::Ggml(GgmlType::Q4K).bytes_for_numel(512), 288);
+    }
+
+    #[test]
+    fn block_quant_classification() {
+        assert!(DType::Sq { bits: 2 }.is_quantized() && DType::Sq { bits: 2 }.is_block_quant());
+        assert!(DType::Ggml(GgmlType::Q8_0).is_block_quant());
+        assert!(!DType::NVFP4.is_block_quant() && !DType::MXFP8.is_block_quant());
+        assert!(DType::Sq { bits: 3 }.is_sub_byte() && !DType::Sq { bits: 8 }.is_sub_byte());
+        assert!(DType::Ggml(GgmlType::Q4_0).is_sub_byte() && !DType::Ggml(GgmlType::Q8_0).is_sub_byte());
+        assert_eq!(DType::Sq { bits: 5 }.size_in_bits(), 5);
+        assert_eq!(DType::Ggml(GgmlType::Q4K).size_in_bits(), 4);
     }
 
     #[test]

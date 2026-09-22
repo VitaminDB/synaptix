@@ -85,11 +85,18 @@ pub(crate) fn dtype_tag(dt: DType) -> u32 {
         DType::I64 => 13,
         DType::NVFP4 => 21,
         DType::MXFP8 => 22,
+        // Одноблобные форматы: 100 + bits для SQ, 200 + id ggml.
+        DType::Sq { bits } => 100 + bits as u32,
+        DType::Ggml(t) => 200 + t as u32,
     }
 }
 
 pub(crate) fn tag_to_dtype(tag: u32) -> Result<DType> {
     match tag {
+        101..=108 => Ok(DType::Sq { bits: (tag - 100) as u8 }),
+        200..=299 => synaptix_core::quant::GgmlType::from_u32(tag - 200)
+            .map(DType::Ggml)
+            .ok_or_else(|| DebugError::Other(format!("unknown ggml dtype tag {tag}"))),
         0 => Ok(DType::F32),
         1 => Ok(DType::F64),
         2 => Ok(DType::F16),

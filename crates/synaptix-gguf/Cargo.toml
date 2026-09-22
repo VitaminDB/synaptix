@@ -8,6 +8,7 @@ description = "GGUF v3 reader, ggml block dequantisation and GGUF → .syn repac
 
 [dependencies]
 synaptix-bundle = { workspace = true }
+synaptix-core = { workspace = true }
 memmap2.workspace = true
 half.workspace = true
 serde.workspace = true

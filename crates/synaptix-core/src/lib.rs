@@ -7,5 +7,6 @@ pub mod error;
 pub mod grad;
 pub mod memory;
 pub mod precision;
+pub mod quant;
 pub mod stream;
 pub mod tensor;

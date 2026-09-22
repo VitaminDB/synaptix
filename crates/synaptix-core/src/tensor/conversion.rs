@@ -95,6 +95,7 @@ mod size_helper {
             DType::F16 | DType::BF16 => 2,
             DType::U8 | DType::MXFP8 => 1,
             DType::NVFP4 => 1,
+            DType::Sq { .. } | DType::Ggml(_) => 1,
         }
     }
 }

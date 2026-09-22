@@ -34,4 +34,6 @@ ffmpeg-next     = { workspace = true, optional = true }
 [dev-dependencies]
 synaptix-test-utils  = { workspace = true }
 synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+half                 = { workspace = true }
 tempfile             = { workspace = true }

@@ -132,6 +132,16 @@ fn portable_kernels_build_for_every_target() {
 }
 
 #[test]
+fn blockq_dequant_builds_for_every_target() {
+    // Таблицы + ядра склеиваются Rust-стороной (см. elementwise/blockq.rs).
+    let src = synaptix_kernels_cuda::elementwise::blockq::module_source();
+    for arch in ARCHES {
+        compile_ptx_only(&src, "blockq_dequant.cu", synaptix_kernels_cuda::elementwise::blockq::MODULE_OPTS, arch)
+            .unwrap_or_else(|e| panic!("blockq_dequant.cu @ {arch}: {e}"));
+    }
+}
+
+#[test]
 fn blackwell_kernels_need_sm120a() {
     for (tag, src) in BLACKWELL_ONLY {
         compile(src, tag, "sm_120a").unwrap_or_else(|e| panic!("{tag} @ sm_120a: {e}"));

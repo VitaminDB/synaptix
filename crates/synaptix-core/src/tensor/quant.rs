@@ -10,7 +10,10 @@ use crate::tensor::storage::Storage;
 
 pub struct QuantWeight {
     packed: Mutex<Option<Arc<Storage>>>,
-    scales: Arc<Storage>,
+    /// Отдельный тензор масштабов — только у NVFP4/MXFP8. У одноблобных
+    /// форматов (`DType::Sq`, `DType::Ggml`) шкалы лежат внутри блоков и
+    /// здесь `None`.
+    scales: Option<Arc<Storage>>,
     dtype: DType,
     n: usize,
     k: usize,
@@ -31,9 +34,9 @@ impl QuantWeight {
         n: usize,
         k: usize,
     ) -> Result<Self> {
-        if !dtype.is_quantized() {
+        if !matches!(dtype, DType::NVFP4 | DType::MXFP8) {
             return Err(SynaptixError::Unsupported(
-                "QuantWeight: dtype должен быть quantized (NVFP4/MXFP8/...)",
+                "QuantWeight::new: с отдельными масштабами только NVFP4/MXFP8; одноблобные — new_block",
             ));
         }
         if packed.device() != scales.device() {
@@ -45,7 +48,7 @@ impl QuantWeight {
         let device = packed.device();
         Ok(Self {
             packed: Mutex::new(Some(packed)),
-            scales,
+            scales: Some(scales),
             dtype,
             n,
             k,
@@ -53,6 +56,75 @@ impl QuantWeight {
             shuffled: OnceCell::new(),
             expert_pool: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Одноблобный вес `[n, k]` (`DType::Sq`/`DType::Ggml`): `packed` —
+    /// `n · row_bytes` байт подряд, байт в байт как в файле. Шкалы внутри
+    /// блоков, отдельного тензора нет.
+    pub fn new_block(packed: Arc<Storage>, dtype: DType, n: usize, k: usize) -> Result<Self> {
+        if !dtype.is_block_quant() {
+            return Err(SynaptixError::Unsupported(
+                "QuantWeight::new_block: dtype должен быть одноблобным (Sq/Ggml)",
+            ));
+        }
+        let rb = crate::quant::block_row_bytes(dtype, k)
+            .ok_or(SynaptixError::Unsupported("QuantWeight::new_block: K не кратен блоку формата"))?;
+        if packed.byte_len() != n * rb {
+            return Err(SynaptixError::Unsupported(
+                "QuantWeight::new_block: размер блоба не равен n · row_bytes",
+            ));
+        }
+        let device = packed.device();
+        Ok(Self {
+            packed: Mutex::new(Some(packed)),
+            scales: None,
+            dtype,
+            n,
+            k,
+            device,
+            shuffled: OnceCell::new(),
+            expert_pool: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Байт на строку `[k]` одноблобного веса.
+    pub fn block_row_bytes(&self) -> Option<usize> {
+        crate::quant::block_row_bytes(self.dtype, self.k)
+    }
+
+    /// Деквант в плотный тензор `[n, k]` типа `out_dt` (F16/BF16) на устройстве
+    /// веса. Одноблобные форматы — через `Backend::block_dequant`; MXFP8 —
+    /// через `mxfp8_dequant` (только F16). NVFP4 здесь не деквантуется:
+    /// у него нет пути с `Backend` (см. `linear_quant` в CUDA).
+    pub fn dequantize(&self, out_dt: DType) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        if !matches!(out_dt, DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("QuantWeight::dequantize: out_dt только F16/BF16"));
+        }
+        let packed = self
+            .packed_arc()
+            .ok_or(SynaptixError::Unsupported("QuantWeight::dequantize: packed освобождён"))?;
+        let backend = registry::backend_for(self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        let out_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), out_dt);
+        let mut out = backend.alloc_uninit(out_dt.bytes_for_numel(self.n * self.k), self.device)?;
+        match self.dtype {
+            DType::Sq { .. } | DType::Ggml(_) => {
+                backend.block_dequant(&packed, self.dtype, (&mut out, &out_layout), self.n, self.k, &stream)?;
+            }
+            DType::MXFP8 if out_dt == DType::F16 => {
+                let scales = self.scales();
+                let p_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), DType::U8);
+                let s_layout = Layout::contiguous(Shape::new(vec![self.n, self.k / 32]), DType::U8);
+                backend.mxfp8_dequant((&packed, &p_layout), (scales, &s_layout), (&mut out, &out_layout), &stream)?;
+            }
+            _ => return Err(SynaptixError::Unsupported("QuantWeight::dequantize: формат без пути деквантования")),
+        }
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
     }
 
     /// Перемешанная раскладка NVFP4-веса (`[n, k/2]` байт) на хосте — та же,
@@ -91,9 +163,9 @@ impl QuantWeight {
         n: usize,
         k: usize,
     ) -> Result<Self> {
-        if !dtype.is_quantized() {
+        if dtype != DType::NVFP4 {
             return Err(SynaptixError::Unsupported(
-                "QuantWeight: dtype должен быть quantized (NVFP4/MXFP8/...)",
+                "QuantWeight::from_shuffled: перемешанная раскладка есть только у NVFP4",
             ));
         }
         if shuffled.device() != scales.device() {
@@ -107,7 +179,7 @@ impl QuantWeight {
         let _ = cell.set(shuffled);
         Ok(Self {
             packed: Mutex::new(None),
-            scales,
+            scales: Some(scales),
             dtype,
             n,
             k,
@@ -121,7 +193,10 @@ impl QuantWeight {
     /// Адрес весов на устройстве — по масштабам: они есть у любой схемы и
     /// живут рядом с `packed`, в том же slab'е арены экспертов.
     pub fn device_address(&self) -> Option<u64> {
-        self.scales.device_address()
+        match &self.scales {
+            Some(s) => s.device_address(),
+            None => self.packed_arc().and_then(|p| p.device_address()),
+        }
     }
 
     pub fn mark_expert_pool(&self) {
@@ -158,8 +233,16 @@ impl QuantWeight {
         *self.packed.lock().unwrap() = None;
     }
 
+    /// Тензор масштабов NVFP4/MXFP8. У одноблобных форматов масштабов нет —
+    /// вызывать только в ветках `NVFP4`/`MXFP8` (см. [`Self::scales_opt`]).
     pub fn scales(&self) -> &Storage {
-        &self.scales
+        self.scales
+            .as_deref()
+            .expect("QuantWeight::scales: у одноблобного формата нет отдельных масштабов")
+    }
+
+    pub fn scales_opt(&self) -> Option<&Storage> {
+        self.scales.as_deref()
     }
 
     pub fn embed_gather(&self, ids: &Tensor) -> Result<Tensor> {
@@ -185,7 +268,7 @@ impl QuantWeight {
         let stream = Stream::default_for(self.device)?;
         backend.embed_gather_mxfp8(
             &packed,
-            &self.scales,
+            self.scales(),
             (&ids_c.storage, &ids_c.layout),
             (&mut storage, &out_layout),
             self.n,
@@ -231,13 +314,19 @@ impl QuantWeight {
                 Ok(Arc::new(crate::tensor::conversion::storage_to_device(s, dev)?))
             }
         };
-        let scales = moved(&self.scales)?;
-        let out = match (self.packed_arc(), self.shuffled.get()) {
-            (Some(packed), _) => Self::new(moved(&packed)?, scales, self.dtype, self.n, self.k)?,
-            (None, Some(shuffled)) => {
+        let scales = self.scales.as_ref().map(moved).transpose()?;
+        let out = match (self.packed_arc(), self.shuffled.get(), scales) {
+            (Some(packed), _, Some(scales)) => Self::new(moved(&packed)?, scales, self.dtype, self.n, self.k)?,
+            (Some(packed), _, None) => Self::new_block(moved(&packed)?, self.dtype, self.n, self.k)?,
+            (None, Some(shuffled), Some(scales)) => {
                 Self::from_shuffled(moved(shuffled)?, scales, self.dtype, self.n, self.k)?
             }
-            (None, None) => {
+            (None, Some(_), None) => {
+                return Err(SynaptixError::Unsupported(
+                    "QuantWeight::to_device: перемешанная копия без масштабов",
+                ));
+            }
+            (None, None, _) => {
                 return Err(SynaptixError::Unsupported(
                     "QuantWeight::to_device: у веса нет ни packed, ни shuffled",
                 ));
@@ -327,7 +416,7 @@ impl QuantWeight {
                 return Err(SynaptixError::Unsupported("gemm_grouped: нет перемешанной копии"));
             };
             w_shuf.push(shuf);
-            w_scales.push(&w.scales);
+            w_scales.push(w.scales());
         }
         let out_layout = Layout::contiguous(Shape::new(vec![rows_total, n]), out_dt);
         let backend = registry::backend_for(device)?;
@@ -376,7 +465,7 @@ impl QuantWeight {
                 return Err(SynaptixError::Unsupported("gemv_batched: нет перемешанной копии"));
             };
             w_shuf.push(shuf);
-            w_scales.push(&w.scales);
+            w_scales.push(w.scales());
         }
         let x_packed: Vec<&Storage> = acts.iter().map(|(p, _)| &p.storage as &Storage).collect();
         let x_scales: Vec<&Storage> = acts.iter().map(|(_, s)| &s.storage as &Storage).collect();
@@ -403,7 +492,7 @@ impl QuantWeight {
     /// таблица [`ExpertTable`].
     pub fn shuffled_addr(&self) -> Option<(u64, u64)> {
         let shuf = self.shuffled()?;
-        Some((storage_addr(shuf)?, storage_addr(&self.scales)?))
+        Some((storage_addr(shuf)?, storage_addr(self.scales_opt()?)?))
     }
 
     pub fn shuffled(&self) -> Option<&Storage> {
