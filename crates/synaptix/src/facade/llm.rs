@@ -189,6 +189,11 @@ pub struct QuantPolicy {
     pub ssm_state_dtype: KvDtypePolicy,
     pub conv_state_dtype: KvDtypePolicy,
     pub preset_name: String,
+    /// Перекодировать уже квантованный источник (NVFP4/MXFP8-бандл, блоки
+    /// ggml из `.gguf`) в форматы политики при загрузке (двойной квант).
+    /// Плотные источники квантуются в них и без этого флага. См.
+    /// `synaptix_io::weights::transcode`.
+    pub transcode: bool,
 }
 
 impl QuantPolicy {
@@ -204,6 +209,7 @@ impl QuantPolicy {
             ssm_state_dtype: KvDtypePolicy::F32,
             conv_state_dtype: KvDtypePolicy::F16,
             preset_name: "quality".to_string(),
+            transcode: false,
         }
     }
 
@@ -219,6 +225,7 @@ impl QuantPolicy {
             ssm_state_dtype: KvDtypePolicy::F32,
             conv_state_dtype: KvDtypePolicy::F16,
             preset_name: "balance".to_string(),
+            transcode: false,
         }
     }
 
@@ -234,6 +241,28 @@ impl QuantPolicy {
             ssm_state_dtype: KvDtypePolicy::F32,
             conv_state_dtype: KvDtypePolicy::F16,
             preset_name: "vram_saver".to_string(),
+            transcode: false,
+        }
+    }
+
+    /// Что во что перекодировать по этой политике: квантованные роли →
+    /// их формат. Эмбеддинг перекодируется только в форматы, у которых есть
+    /// gather (MXFP8, SQ); NVFP4-таблица читается ядром лишь после
+    /// собственного кванта модели.
+    pub fn transcode_spec(&self) -> synaptix_io::weights::transcode::TranscodeSpec {
+        let q = |d: DType| d.is_quantized().then_some(d);
+        let embed = match self.embed_storage {
+            d @ (DType::MXFP8 | DType::Sq { .. }) => Some(d),
+            _ => None,
+        };
+        synaptix_io::weights::transcode::TranscodeSpec {
+            attn: self.attn_storage.and_then(q).or_else(|| q(self.weights_storage)),
+            mlp: q(self.weights_storage),
+            experts: q(self.weights_storage),
+            lm_head: q(self.lm_head_storage),
+            embed,
+            requant: true,
+            quantize_dense: false,
         }
     }
 
@@ -249,6 +278,7 @@ impl QuantPolicy {
         let mut p = match self.weights_storage {
             DType::NVFP4 => PrecisionConfig::nvfp4(),
             DType::MXFP8 => PrecisionConfig::mxfp8(),
+            DType::Sq { bits } => PrecisionConfig::sq(bits),
             _ => PrecisionConfig::dense(self.compute),
         };
         // Рабочий dtype — из политики: у квант-пресетов он по умолчанию F16,
@@ -298,6 +328,37 @@ pub struct OptimalProfile {
 /// работы. У Muse-Glimmer и гибрида наоборот: DFlash/MTP на greedy-пути
 /// ничего не меняют в ответе и заметно ускоряют.
 pub fn optimal_profile(path: &Path) -> OptimalProfile {
+    let caps = super::device::cuda_caps(0).ok();
+    optimal_profile_for(path, caps.as_deref())
+}
+
+/// Выверенные настройки под архитектуру бандла и возможности карты.
+///
+/// Без FP4-MMA (всё ниже Blackwell) NVFP4 в политике заменяется на SQ4:
+/// плотный источник квантуется в переносимый формат тем же объёмом (4,625
+/// против 4,25 бит на вес), а исполняется ядрами этапа 2 без деквантования
+/// «на каждый вызов». Уже квантованный NVFP4-бандл остаётся как есть
+/// (портируемый путь его читает), перекодировка — по флагу `transcode`.
+/// MXFP8 у внимания Gemma не трогается: восемь бит там ради качества, а
+/// без fp8-MMA он тоже исполним. `caps = None` (карты нет) — как на
+/// Blackwell: политика описывает намерение, не устройство.
+pub fn optimal_profile_for(path: &Path, caps: Option<&synaptix_kernels_cuda::caps::DeviceCaps>) -> OptimalProfile {
+    let mut p = optimal_profile_blackwell(path);
+    if let Some(c) = caps {
+        if !c.fp4_mma() {
+            let portable = |d: DType| if d == DType::NVFP4 { DType::Sq { bits: 4 } } else { d };
+            p.policy.weights_storage = portable(p.policy.weights_storage);
+            p.policy.attn_storage = p.policy.attn_storage.map(portable);
+            p.policy.lm_head_storage = portable(p.policy.lm_head_storage);
+            // NVFP4-таблицы эмбеддинга у не-Blackwell нет чем читать —
+            // SQ4-таблица идёт тем же gather'ом, что и блоки GGUF.
+            p.policy.embed_storage = portable(p.policy.embed_storage);
+        }
+    }
+    p
+}
+
+fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
     use crate::facade::arch::LlmArch;
     let arch = crate::facade::arch::detect_llm_arch(path).ok();
     let mut policy = QuantPolicy::balance();
@@ -375,7 +436,7 @@ pub fn build_precision(
 ) -> Result<PrecisionConfig, String> {
     let quant = quant.unwrap_or("none").to_ascii_lowercase();
     let preset = PrecisionConfig::from_preset(&quant)
-        .ok_or_else(|| format!("unknown quant '{quant}' (none|nvfp4|fp8|mxfp8)"))?;
+        .ok_or_else(|| format!("unknown quant '{quant}' (none|nvfp4|fp8|mxfp8|sq1…sq8)"))?;
 
     let compute = match compute_dtype {
         Some(s) => parse_dtype(s).ok_or_else(|| format!("bad compute-dtype '{s}'"))?,
@@ -2612,7 +2673,46 @@ pub fn load_llm_with_policy(
     // деградирует в «решето» и упирается в OOM при неизменном живом объёме
     // (см. `synaptix_core::device::cuda::activations_pool`).
     let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(*device);
+    // Перекодировка квантованного источника в форматы политики: заявка
+    // живёт до конца загрузки, её видят все открытия этого пути.
+    let _transcode = (policy.transcode && !path.is_dir() && device.is_cuda()).then(|| {
+        synaptix_io::weights::transcode::request(
+            path,
+            synaptix_io::weights::transcode::Request {
+                spec: policy.transcode_spec(),
+                device: *device,
+                placement: synaptix_io::weights::transcode::Placement::Auto,
+                progress: transcode_progress(),
+            },
+        )
+    });
     load_llm(path, *device, precision, max_seq)
+}
+
+static TRANSCODE_PROGRESS: Mutex<Option<synaptix_io::weights::transcode::Progress>> = Mutex::new(None);
+
+/// Колбэк прогресса перекодировки при загрузке (`(готово, всего, имя)`);
+/// приложение ставит его до `load_llm_with_policy`.
+pub fn set_transcode_progress(cb: Option<synaptix_io::weights::transcode::Progress>) {
+    *TRANSCODE_PROGRESS.lock().unwrap() = cb;
+}
+
+fn transcode_progress() -> Option<synaptix_io::weights::transcode::Progress> {
+    TRANSCODE_PROGRESS.lock().unwrap().clone()
+}
+
+/// Полный бандл с перекодированными весами (CLI `synaptix quantize`,
+/// мастер synthos): см. `synaptix_io::weights::transcode::write_bundle`.
+pub fn transcode_bundle(
+    src: &Path,
+    out: &Path,
+    spec: &synaptix_io::weights::transcode::TranscodeSpec,
+    device: Device,
+    progress: Option<synaptix_io::weights::transcode::Progress>,
+) -> Result<synaptix_io::weights::transcode::TranscodeReport, LlmError> {
+    ensure_kernels_registered();
+    let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+    synaptix_io::weights::transcode::write_bundle(src, out, spec, device, progress).map_err(|e| LlmError(e.to_string()))
 }
 
 // ── Рантайм-сеттеры (no-op: нативный synaptix управляет иначе) ───────────────

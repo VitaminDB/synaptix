@@ -55,12 +55,28 @@ impl PrecisionConfig {
         }
     }
 
+    /// SQ`bits` (портируемый одноблобный квант, любая карта sm_80+): attn/mlp
+    /// и голова в SQ, эмбеддинг F16, счёт F16.
+    pub fn sq(bits: u8) -> Self {
+        Self {
+            compute: DType::F16,
+            attn_w: DType::Sq { bits },
+            mlp_w: DType::Sq { bits },
+            lm_head: DType::Sq { bits },
+            embed: DType::F16,
+            kv: DType::F16,
+        }
+    }
+
     pub fn from_preset(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "none" | "" => Some(Self::default()),
             "nvfp4" => Some(Self::nvfp4()),
             "fp8" | "mxfp8" => Some(Self::mxfp8()),
-            _ => None,
+            other => match parse_dtype(other) {
+                Some(DType::Sq { bits }) => Some(Self::sq(bits)),
+                _ => None,
+            },
         }
     }
 
@@ -92,7 +108,26 @@ pub fn parse_dtype(s: &str) -> Option<DType> {
         "f16" => Some(DType::F16),
         "fp8" | "mxfp8" => Some(DType::MXFP8),
         "nvfp4" => Some(DType::NVFP4),
-        _ => None,
+        // `sq4`, `sq2`, …: одноблобный формат движка на 1..=8 бит.
+        other => other
+            .strip_prefix("sq")
+            .and_then(|b| b.parse::<u8>().ok())
+            .filter(|b| (1..=8).contains(b))
+            .map(|bits| DType::Sq { bits }),
+    }
+}
+
+/// Имя формата для CLI/конфигов, обратное [`parse_dtype`].
+pub fn dtype_name(dt: DType) -> String {
+    match dt {
+        DType::F32 => "f32".into(),
+        DType::F16 => "f16".into(),
+        DType::BF16 => "bf16".into(),
+        DType::NVFP4 => "nvfp4".into(),
+        DType::MXFP8 => "mxfp8".into(),
+        DType::Sq { bits } => format!("sq{bits}"),
+        DType::Ggml(t) => format!("ggml:{}", t.name().to_ascii_lowercase()),
+        other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
 

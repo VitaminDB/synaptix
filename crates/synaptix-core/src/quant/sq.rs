@@ -105,15 +105,145 @@ pub fn dequant_row(bits: u8, src: &[u8], k: usize, dst: &mut [f32]) -> Result<()
     Ok(())
 }
 
+/// Число кандидатов шкалы при подборе: `qmax + (-1 + 0.1·i)`, i = 0..=20 —
+/// как `make_qkx2_quants` в ggml (rmin −1, rdelta 0.1, nstep 20).
+pub const SEARCH_STEPS: usize = 21;
+
+/// Подбор шкалы и минимума под-блока из 32 значений по MSE: min/max даёт
+/// RTN-кандидата, затем `SEARCH_STEPS` шкал вокруг него; для каждой
+/// значения квантуются, а (шкала, минимум) пересчитываются методом
+/// наименьших квадратов (`x ≈ a·q + b`, `b ≤ 0`). Возвращает `(scale, m)`
+/// с `w = scale·q − m`, `m ≥ 0`.
+///
+/// Порядок операций — строго последовательный по i = 0..32 и без слитого
+/// умножения-сложения: ядро `sq_quant.cu` (--fmad=false) повторяет его
+/// бит в бит.
+pub fn fit_sub_block(v: &[f32], qmax: f32) -> (f32, f32) {
+    debug_assert_eq!(v.len(), SUB_BLOCK);
+    let mut mn = v[0];
+    let mut mx = v[0];
+    for &t in v {
+        mn = mn.min(t);
+        mx = mx.max(t);
+    }
+    let mn = mn.min(0.0);
+    if mx <= mn {
+        return (0.0, 0.0);
+    }
+    // RTN-кандидат.
+    let s0 = (mx - mn) / qmax;
+    let m0 = -mn;
+    let mut best_err = 0f32;
+    for &t in v {
+        let q = ((t + m0) / s0).round().clamp(0.0, qmax);
+        let diff = s0 * q - m0 - t;
+        best_err += diff * diff;
+    }
+    let mut best = (s0, m0);
+    for is in 0..SEARCH_STEPS {
+        let s = (mx - mn) / (qmax + (-1.0 + 0.1 * is as f32));
+        if !(s > 0.0) {
+            continue;
+        }
+        let mut sum_l = 0f32;
+        let mut sum_l2 = 0f32;
+        let mut sum_x = 0f32;
+        let mut sum_xl = 0f32;
+        for &t in v {
+            let l = ((t - mn) / s).round().clamp(0.0, qmax);
+            sum_l += l;
+            sum_l2 += l * l;
+            sum_x += t;
+            sum_xl += t * l;
+        }
+        let n = SUB_BLOCK as f32;
+        let det = n * sum_l2 - sum_l * sum_l;
+        let (a, b) = if det > 0.0 {
+            let a = (n * sum_xl - sum_x * sum_l) / det;
+            let b = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            if b > 0.0 {
+                // Минимум обязан быть ≤ 0: пересчёт шкалы без сдвига.
+                (if sum_l2 > 0.0 { sum_xl / sum_l2 } else { 0.0 }, 0.0)
+            } else {
+                (a, b)
+            }
+        } else if sum_l2 > 0.0 {
+            (sum_xl / sum_l2, 0.0)
+        } else {
+            continue;
+        };
+        if !(a > 0.0) {
+            continue;
+        }
+        let mut err = 0f32;
+        for &t in v {
+            let l = ((t - mn) / s).round().clamp(0.0, qmax);
+            let diff = a * l + b - t;
+            err += diff * diff;
+        }
+        if err < best_err {
+            best_err = err;
+            best = (a, -b);
+        }
+    }
+    best
+}
+
 /// Эталонный энкодер одного супер-блока: `x.len() <= 256` (хвост дополняется
-/// нулями), `out.len() == super_block_bytes(bits)`.
+/// нулями), `out.len() == super_block_bytes(bits)`. Шкалы под-блоков — из
+/// [`fit_sub_block`]; затем они квантуются в u8 относительно `d`/`dmin`
+/// супер-блока, и значения квантуются уже квантованными шкалами.
 pub fn quant_super_block(bits: u8, x: &[f32], out: &mut [u8]) {
     let b = bits as usize;
     let qmax = ((1u32 << b) - 1) as f32;
     let mut vals = [0f32; SUPER_BLOCK];
     vals[..x.len()].copy_from_slice(x);
 
-    // Под-блочные шкалы и минимумы (минимум ≥ 0, как у Q4_K).
+    let mut scale = [0f32; SUBS];
+    let mut min = [0f32; SUBS];
+    for s in 0..SUBS {
+        let (sc, mi) = fit_sub_block(&vals[s * SUB_BLOCK..(s + 1) * SUB_BLOCK], qmax);
+        scale[s] = sc;
+        min[s] = mi;
+    }
+    let smax = scale.iter().cloned().fold(0f32, f32::max);
+    let mmax = min.iter().cloned().fold(0f32, f32::max);
+    let d16 = f16::from_f32(smax / 255.0);
+    let dmin16 = f16::from_f32(mmax / 255.0);
+    let d = d16.to_f32();
+    let dmin = dmin16.to_f32();
+    out.fill(0);
+    out[0..2].copy_from_slice(&d16.to_le_bytes());
+    out[2..4].copy_from_slice(&dmin16.to_le_bytes());
+    for s in 0..SUBS {
+        let sc = if d > 0.0 { (scale[s] / d).round().clamp(0.0, 255.0) as u8 } else { 0 };
+        let mi = if dmin > 0.0 { (min[s] / dmin).round().clamp(0.0, 255.0) as u8 } else { 0 };
+        out[4 + s] = sc;
+        out[12 + s] = mi;
+        let dl = d * sc as f32;
+        let ml = dmin * mi as f32;
+        let mut planes = [0u32; 8];
+        for i in 0..SUB_BLOCK {
+            let t = vals[s * SUB_BLOCK + i];
+            let q = if dl > 0.0 { ((t + ml) / dl).round().clamp(0.0, qmax) as u32 } else { 0 };
+            for (j, p) in planes.iter_mut().enumerate().take(b) {
+                *p |= ((q >> j) & 1) << i;
+            }
+        }
+        let base = HEADER_BYTES + s * b * 4;
+        for (j, p) in planes.iter().enumerate().take(b) {
+            out[base + j * 4..base + j * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+    }
+}
+
+/// RTN-энкодер супер-блока без подбора (min/max): эталон для сравнения
+/// качества и старый формат записи — раскладка та же.
+pub fn quant_super_block_rtn(bits: u8, x: &[f32], out: &mut [u8]) {
+    let b = bits as usize;
+    let qmax = ((1u32 << b) - 1) as f32;
+    let mut vals = [0f32; SUPER_BLOCK];
+    vals[..x.len()].copy_from_slice(x);
     let mut scale = [0f32; SUBS];
     let mut min = [0f32; SUBS];
     for s in 0..SUBS {
@@ -252,6 +382,35 @@ mod tests {
         }
         // 8 бит на диапазоне ±1: ошибка на уровне шага 2/255.
         assert!(prev < 1e-4, "mse@8bit = {prev}");
+    }
+
+    #[test]
+    fn search_is_no_worse_than_rtn() {
+        let x = det(11, 64 * 256);
+        // Тяжёлые хвосты: несколько выбросов на блок — здесь подбор шкалы
+        // и выигрывает у min/max.
+        let x: Vec<f32> = x.iter().enumerate().map(|(i, v)| if i % 37 == 0 { v * 4.0 } else { *v }).collect();
+        for bits in [2u8, 3, 4, 5, 6, 8] {
+            let (mut e_fit, mut e_rtn) = (0f64, 0f64);
+            for blk in x.chunks(256) {
+                let mut a = vec![0u8; super_block_bytes(bits)];
+                let mut b = vec![0u8; super_block_bytes(bits)];
+                quant_super_block(bits, blk, &mut a);
+                quant_super_block_rtn(bits, blk, &mut b);
+                let mut ya = [0f32; 256];
+                let mut yb = [0f32; 256];
+                dequant_super_block(bits, &a, &mut ya);
+                dequant_super_block(bits, &b, &mut yb);
+                for i in 0..256 {
+                    e_fit += ((ya[i] - blk[i]) as f64).powi(2);
+                    e_rtn += ((yb[i] - blk[i]) as f64).powi(2);
+                }
+            }
+            assert!(e_fit <= e_rtn * 1.001, "bits={bits}: подбор {e_fit} хуже RTN {e_rtn}");
+            if bits <= 4 {
+                assert!(e_fit < e_rtn * 0.9, "bits={bits}: подбор {e_fit} не даёт выигрыша над RTN {e_rtn}");
+            }
+        }
     }
 
     #[test]

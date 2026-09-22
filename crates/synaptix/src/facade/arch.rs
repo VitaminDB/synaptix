@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use synaptix_bundle::Bundle;
+use synaptix_io::WeightLoader as _;
 
 
 /// Читает файл из HF-каталога, `.syn`-бандла или `.gguf` (у GGUF файлы
@@ -20,6 +21,28 @@ pub fn model_type(path: &Path) -> Option<String> {
     v.get("model_type")
         .and_then(|x| x.as_str())
         .map(str::to_string)
+}
+
+/// Квант-форматы весов файла модели: `(формат, число тензоров)` по
+/// убыванию числа; пусто у плотного бандла и HF-каталога. Для панели
+/// моделей и предупреждения о двойном кванте при перекодировке.
+pub fn bundle_quant_formats(path: &Path) -> Vec<(String, usize)> {
+    if path.is_dir() || !synaptix_io::weights::is_model_file(path) {
+        return Vec::new();
+    }
+    let Ok(l) = synaptix_io::SynBundleLoader::open(path) else { return Vec::new() };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for name in l.names() {
+        if name.ends_with(".qpacked") || name.ends_with(".qscales") {
+            continue;
+        }
+        if let Some(kind) = l.quant_kind(name) {
+            *counts.entry(synaptix_bundle::quant_layout::format_key(kind)).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
 }
 
 /// `arch` из метаданных `.syn`-бандла (fallback). None для HF-каталога/пустого.

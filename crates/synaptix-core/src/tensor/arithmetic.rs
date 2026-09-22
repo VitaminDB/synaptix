@@ -1,9 +1,10 @@
 use crate::backend::{BinaryOp, UnaryOp};
+use crate::dtype::DType;
 use crate::error::Result;
 use crate::tensor::Tensor;
 use crate::tensor::ops::{
     run_binary, run_linear_quant, run_matmul, run_quantize_mxfp8,
-    run_quantize_nvfp4, run_unary,
+    run_quantize_nvfp4, run_quantize_sq, run_unary,
 };
 use crate::tensor::quant::QuantWeight;
 
@@ -25,6 +26,17 @@ impl Tensor {
     pub fn linear_quant(&self, weight: &QuantWeight) -> Result<Self> { run_linear_quant(self, weight) }
     pub fn quantize_to_nvfp4(&self) -> Result<QuantWeight> { run_quantize_nvfp4(self) }
     pub fn quantize_to_mxfp8(&self) -> Result<QuantWeight> { run_quantize_mxfp8(self) }
+    /// Квант в SQ`bits` (1..=8 бит, супер-блоки по 256): F16/BF16 `[n, k]`.
+    pub fn quantize_to_sq(&self, bits: u8) -> Result<QuantWeight> { run_quantize_sq(self, bits) }
+    /// Квант в формат по `dtype`: NVFP4, MXFP8 или SQ; иначе `Unsupported`.
+    pub fn quantize_to(&self, dtype: DType) -> Result<QuantWeight> {
+        match dtype {
+            DType::NVFP4 => self.quantize_to_nvfp4(),
+            DType::MXFP8 => self.quantize_to_mxfp8(),
+            DType::Sq { bits } => self.quantize_to_sq(bits),
+            _ => Err(crate::error::SynaptixError::Unsupported("quantize_to: формат не квантованный вес (NVFP4/MXFP8/SQ)")),
+        }
+    }
 
     pub fn neg(&self) -> Result<Self> { run_unary(self, UnaryOp::Neg) }
     pub fn abs(&self) -> Result<Self> { run_unary(self, UnaryOp::Abs) }

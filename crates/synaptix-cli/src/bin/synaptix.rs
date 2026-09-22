@@ -222,7 +222,31 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         batch_size: usize,
     },
-    Quantize,
+    /// Квантование/перекодировка модели в `.syn`: плотные матрицы и уже
+    /// квантованные веса (`.syn` NVFP4/MXFP8/SQ, `.gguf` ggml) → формат
+    /// `--format` (nvfp4 | mxfp8 | sq1…sq8). Веса считаются на карте по
+    /// одному, остальные тензоры и файлы копируются как есть.
+    Quantize {
+        input: PathBuf,
+        output: PathBuf,
+        /// Формат attn/mlp/экспертов/головы: nvfp4 | mxfp8 | sq1…sq8.
+        #[arg(long, default_value = "sq4")]
+        format: String,
+        /// Формат проекций внимания, если отличается (например mxfp8).
+        #[arg(long)]
+        attn: Option<String>,
+        /// Формат lm_head (`none` — оставить как есть).
+        #[arg(long)]
+        lm_head: Option<String>,
+        /// Формат эмбеддинга (`none` — как есть; допустимы mxfp8 и sqN).
+        #[arg(long)]
+        embed: Option<String>,
+        /// Не перекодировать уже квантованные веса (только плотные).
+        #[arg(long, default_value_t = false)]
+        keep_quant: bool,
+        #[arg(long, default_value = "cuda:0")]
+        device: String,
+    },
     /// Транскрибация аудио (Whisper ASR): WAV → текст.
     Transcribe {
         model: PathBuf,
@@ -936,7 +960,9 @@ fn main() -> ExitCode {
                 model, data, output, lora_r, lora_alpha, lr, epochs, batch_size,
             })
         }
-        Commands::Quantize => quantize::run(),
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device })
+        }
         Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps } => {
             transcribe::run(transcribe::TranscribeArgs {
                 model,

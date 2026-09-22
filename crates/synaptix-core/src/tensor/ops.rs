@@ -522,6 +522,28 @@ pub(crate) fn run_quantize_mxfp8(w: &Tensor) -> Result<QuantWeight> {
     QuantWeight::new(Arc::new(packed), Arc::new(scales), DType::MXFP8, n, k)
 }
 
+/// SQ`bits`: вес `[n, k]` F16/BF16 (`k % 32 == 0`) → одноблобный
+/// [`QuantWeight`] (`DType::Sq`). Считается на устройстве веса.
+pub(crate) fn run_quantize_sq(w: &Tensor, bits: u8) -> Result<QuantWeight> {
+    crate::quant::sq::check_bits(bits)?;
+    if !matches!(w.dtype(), DType::F16 | DType::BF16) {
+        return Err(SynaptixError::Unsupported("quantize_to_sq: вес должен быть F16 или BF16"));
+    }
+    if w.rank() != 2 {
+        return Err(SynaptixError::RankMismatch { expected: 2, got: w.rank() });
+    }
+    let n = w.dims()[0];
+    let k = w.dims()[1];
+    if k % 32 != 0 {
+        return Err(SynaptixError::Unsupported("quantize_to_sq: K должно быть кратно 32"));
+    }
+    let w_contig = w.contiguous_view()?;
+    let backend = registry::backend_for(w.device())?;
+    let stream = Stream::default_for(w.device())?;
+    let packed = backend.quantize_sq((&w_contig.storage, &w_contig.layout), bits, n, k, &stream)?;
+    QuantWeight::new_block(Arc::new(packed), DType::Sq { bits }, n, k)
+}
+
 #[allow(dead_code)]
 const REDUCE_STAGE_MIN: usize = 1 << 16;
 

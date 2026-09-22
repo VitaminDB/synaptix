@@ -94,8 +94,8 @@ impl QuantWeight {
 
     /// Деквант в плотный тензор `[n, k]` типа `out_dt` (F16/BF16) на устройстве
     /// веса. Одноблобные форматы — через `Backend::block_dequant`; MXFP8 —
-    /// через `mxfp8_dequant` (только F16). NVFP4 здесь не деквантуется:
-    /// у него нет пути с `Backend` (см. `linear_quant` в CUDA).
+    /// через `mxfp8_dequant` (только F16); NVFP4 — через `nvfp4_dequant`
+    /// (линейный packed, до перемешивания). Путь перекодировки форматов.
     pub fn dequantize(&self, out_dt: DType) -> Result<Tensor> {
         use crate::backend::registry;
         use crate::stream::Stream;
@@ -121,6 +121,9 @@ impl QuantWeight {
                 let p_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), DType::MXFP8);
                 let s_layout = Layout::contiguous(Shape::new(vec![self.n, self.k / 32]), DType::U8);
                 backend.mxfp8_dequant((&packed, &p_layout), (scales, &s_layout), (&mut out, &out_layout), &stream)?;
+            }
+            DType::NVFP4 => {
+                backend.nvfp4_dequant(&packed, self.scales(), (&mut out, &out_layout), self.n, self.k, &stream)?;
             }
             _ => return Err(SynaptixError::Unsupported("QuantWeight::dequantize: формат без пути деквантования")),
         }

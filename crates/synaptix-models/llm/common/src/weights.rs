@@ -54,7 +54,7 @@ pub enum QLinear {
 
 impl QLinear {
     /// `quant_dtype` задаёт схему кванта веса: NVFP4 (требует N%64==0,K%64==0),
-    /// MXFP8 (требует K%32==0), либо любой неквантованный dtype → плотный Linear
+    /// MXFP8 (требует K%32==0), SQ1…SQ8 (K%32==0), либо любой неквантованный dtype → плотный Linear
     /// (вес кастуется в `compute`). Если форма не подходит под выбранную схему —
     /// тихий fallback в Dense (тот же путь, что был у NVFP4 с неподходящими N/K).
     pub fn build(weight: Tensor, quant_dtype: DType, compute: DType) -> Result<Self, ModelError> {
@@ -70,6 +70,11 @@ impl QLinear {
                 weight
                     .quantize_to_mxfp8()
                     .map_err(|e| ModelError::Build(format!("quantize_to_mxfp8: {e}")))?,
+            ),
+            DType::Sq { bits } if k % 32 == 0 => Some(
+                weight
+                    .quantize_to_sq(bits)
+                    .map_err(|e| ModelError::Build(format!("quantize_to_sq{bits}: {e}")))?,
             ),
             _ => None,
         };

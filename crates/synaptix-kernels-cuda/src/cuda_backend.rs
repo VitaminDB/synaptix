@@ -872,6 +872,70 @@ impl Backend for CudaBackend {
         Ok((packed_st, scales_st))
     }
 
+    fn quantize_sq(
+        &self,
+        w: (&Storage, &Layout),
+        bits: u8,
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<Storage> {
+        let (w_st, w_lo) = w;
+        if !w_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let (ctx, stream) = ctx_stream_of(w_st, "quantize_sq")?;
+        let ord = w_st.as_cuda().map(|b| b.ordinal()).unwrap_or(0);
+        let kernels = match w_lo.dtype() {
+            DType::F16 => crate::elementwise::sq_quant::SqQuantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::sq_quant::SqQuantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("quantize_sq: вход только F16/BF16")),
+        };
+        let bytes = n * synaptix_core::quant::sq::row_bytes(bits, k);
+        let mut out = stream
+            .alloc_zeros::<u8>(bytes)
+            .map_err(|e| SynaptixError::Cuda(format!("quantize_sq: alloc: {e:?}")))?;
+        let src = w_st.as_cuda().ok_or(SynaptixError::Unsupported("quantize_sq: w non-cuda"))?.slice();
+        let off = w_lo.byte_offset();
+        let src_v = src.slice(off..off + n * k * 2);
+        let mut out_v = out.as_view_mut();
+        crate::elementwise::sq_quant::sq_quant(&kernels, &stream, &src_v, &mut out_v, bits, n as u32, k as u32)?;
+        Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
+    }
+
+    fn nvfp4_dequant(
+        &self,
+        packed: &Storage,
+        scales: &Storage,
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (out_st, out_lo) = out;
+        let (ctx, stream) = ctx_stream_of(packed, "nvfp4_dequant")?;
+        let kernels = match out_lo.dtype() {
+            DType::F16 => crate::elementwise::blockq::BlockqDequantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::blockq::BlockqDequantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("nvfp4_dequant: выход только F16/BF16")),
+        };
+        let p = packed.as_cuda().ok_or(SynaptixError::Unsupported("nvfp4_dequant: packed не на карте"))?.slice();
+        let s = scales.as_cuda().ok_or(SynaptixError::Unsupported("nvfp4_dequant: scales не на карте"))?.slice();
+        let dst = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("nvfp4_dequant: out не на карте"))?.slice_mut();
+        let mut dst_v = dst.as_view_mut();
+        crate::elementwise::blockq::blockq_dequant_band_syn(
+            &kernels,
+            &stream,
+            DType::NVFP4,
+            &p.as_view(),
+            &s.as_view(),
+            &mut dst_v,
+            n as u32,
+            k as u32,
+            0,
+        )
+    }
+
     fn linear(
         &self,
         x: (&Storage, &Layout),

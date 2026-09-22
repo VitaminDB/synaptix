@@ -1046,19 +1046,28 @@ impl DecoderModel {
             (Some(_), _) | (None, true) => None,
             (None, false) => Some(weights.tensor("model.embed_tokens.weight", device, compute)?),
         };
+        // SQ-таблица: gather читает её тем же ядром, что и блоки GGUF, а
+        // связанная голова делит с ней блоб (`share`) — потому tied не помеха.
+        let embed_sq = matches!(embed_dtype, DType::Sq { .. })
+            && !embed_on_host
+            && matches!(device, Device::Cuda(_))
+            && cfg.hidden_size % 32 == 0;
         let embed_quant = if let Some(q) = prequant_embed {
             Some(q)
-        } else if embed_dtype == DType::MXFP8
-            && !embed_on_host
-            && !cfg.tie_word_embeddings
-            && matches!(device, Device::Cuda(_))
-            && cfg.hidden_size % 32 == 0
+        } else if embed_sq
+            || (embed_dtype == DType::MXFP8
+                && !embed_on_host
+                && !cfg.tie_word_embeddings
+                && matches!(device, Device::Cuda(_))
+                && cfg.hidden_size % 32 == 0)
         {
-            let q = embed_dense
-                .as_ref()
-                .unwrap()
-                .quantize_to_mxfp8()
-                .map_err(|e| ModelError::Build(format!("quantize embed to mxfp8: {e}")))?;
+            let dense = embed_dense.as_ref().unwrap();
+            let q = if embed_sq {
+                dense.quantize_to(embed_dtype)
+            } else {
+                dense.quantize_to_mxfp8()
+            }
+            .map_err(|e| ModelError::Build(format!("quantize embed to {embed_dtype:?}: {e}")))?;
             embed_dense = None;
             if let Device::Cuda(o) = device {
                 let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);

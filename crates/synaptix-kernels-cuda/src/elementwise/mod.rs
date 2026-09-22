@@ -7,3 +7,4 @@ pub mod logit_cap;
 pub mod mxfp8_kv;
 pub mod quant;
 pub mod rope;
+pub mod sq_quant;

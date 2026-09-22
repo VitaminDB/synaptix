@@ -193,6 +193,11 @@ pub struct SizeEstimate {
     pub dense: u64,
     pub nvfp4: u64,
     pub mxfp8: u64,
+    /// Супер-блоков SQ (по 256 вдоль K, хвост — целиком) у тензоров, которые
+    /// SQ возьмёт (`K % 32 == 0`): размер при SQ`b` = `sq_blocks × (20 + 32·b)`.
+    pub sq_blocks: u64,
+    /// Байты тензоров, которые SQ не возьмёт (остаются плотными).
+    pub sq_rest: u64,
 }
 
 impl SizeEstimate {
@@ -204,17 +209,28 @@ impl SizeEstimate {
         self.mxfp8 = self
             .mxfp8
             .saturating_add(quantized_bytes(&t.shape, QuantKind::Mxfp8).unwrap_or(t.bytes));
+        match quantized_bytes(&t.shape, QuantKind::Sq(4)) {
+            Some(_) => {
+                let (rows, k) = match t.shape.as_slice() {
+                    [n, k] => (*n as u64, *k as u64),
+                    [e, n, k] => ((*e * *n) as u64, *k as u64),
+                    _ => (0, 0),
+                };
+                self.sq_blocks = self.sq_blocks.saturating_add(rows * k.div_ceil(256));
+            }
+            None => self.sq_rest = self.sq_rest.saturating_add(t.bytes),
+        }
     }
 
-    /// Размер при выбранном формате; `None` — без кванта. Одноблобные форматы
-    /// (SQ/ggml) сводка пока не накапливает — для них честный ответ считается
-    /// по тензорам через [`quantized_bytes`]; здесь возвращается `dense`.
+    /// Размер при выбранном формате; `None` — без кванта. Типы ggml сводка
+    /// не оценивает (энкодеров нет) — возвращается `dense`.
     pub fn for_kind(&self, kind: Option<QuantKind>) -> u64 {
         match kind {
             None => self.dense,
             Some(QuantKind::Nvfp4) => self.nvfp4,
             Some(QuantKind::Mxfp8) => self.mxfp8,
-            Some(QuantKind::Sq(_)) | Some(QuantKind::Ggml(_)) => self.dense,
+            Some(QuantKind::Sq(b)) => self.sq_rest.saturating_add(self.sq_blocks.saturating_mul(20 + 32 * b as u64)),
+            Some(QuantKind::Ggml(_)) => self.dense,
         }
     }
 }

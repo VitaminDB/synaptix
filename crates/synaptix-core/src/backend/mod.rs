@@ -199,6 +199,35 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// SQ (`DType::Sq { bits }`): вес `[n,k]` F16 или BF16 → один блоб
+    /// супер-блоков (`synaptix_core::quant::sq`), бит в бит с CPU-эталоном
+    /// `quantize_matrix`. Default — `Unsupported`.
+    fn quantize_sq(
+        &self,
+        _w: (&Storage, &Layout),
+        _bits: u8,
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<Storage> {
+        Err(SynaptixError::Unsupported("quantize_sq не поддержан этим backend"))
+    }
+
+    /// Деквант NVFP4 движка (линейный packed `[n, k/2]` + тайл-мажорные
+    /// E4M3-шкалы) в `out` `[n, k]` F16/BF16 — путь перекодировки в другой
+    /// формат. Default — `Unsupported`.
+    fn nvfp4_dequant(
+        &self,
+        _packed: &Storage,
+        _scales: &Storage,
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_dequant не поддержан этим backend"))
+    }
+
     /// Плотный Linear: `out[M,N] = x[M,K] @ w[N,K]ᵀ`, где `w` — обычный тензор в
     /// натуральном [out, in] layout (как веса `nn::Linear`). Backend МОЖЕТ
     /// реализовать быстрый специализированный путь (например CUDA GEMV для M=1

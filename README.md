@@ -21,8 +21,10 @@ global cosine similarity that hides local errors.
 cargo build --release -p synaptix-cli
 
 synaptix inspect model.syn                       # layout of a bundle
-synaptix convert model.gguf model.syn            # GGUF / safetensors → .syn
-synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant nvfp4
+synaptix convert model.gguf model.syn            # GGUF / safetensors → .syn (ggml blocks kept as is)
+synaptix quantize model.syn model-sq4.syn --format sq4   # re-encode any weights (dense, NVFP4, ggml) into SQ4
+synaptix run model.gguf "Explain NVFP4" --max-tokens 256   # .gguf loads directly
+synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant sq4
 synaptix chat model.syn --context 32768          # interactive, prefix-KV across turns
 synaptix bench model.syn --n-tokens 128          # prefill / decode throughput
 synaptix devices                                 # compute capability, NVRTC target, block-scale MMA / TMA
@@ -55,10 +57,16 @@ Native ports, each validated against its upstream reference:
 - **NVFP4 (4-bit) and MXFP8 (8-bit)** with block scaling, through `mma.sync` tensor-core
   instructions on Blackwell (sm_120). Quantization can be applied while packing a `.syn`
   bundle, so the on-disk model is the deployed model.
+- **SQ1…SQ8 — a portable block format** (super-blocks of 256, bit-plane packing, `b + 0.625`
+  bits per weight) with a GPU encoder that searches the scale by MSE, bit-exact with its CPU
+  reference. **GGUF runs directly**: llama/qwen2/qwen3/gemma3/gemma4 files load as they are,
+  with all 27 ggml block types executed by the same portable kernels.
 - **Any sm_80+ card.** Kernels are JIT-compiled for the card's compute capability
   (`synaptix devices` shows the target). Without Blackwell block-scale MMA, NVFP4 and
-  MXFP8 weights run through a dequantize-to-f16 path; `SYN_FORCE_ARCH=sm_80` compiles
-  everything for an older target to exercise that path on a newer card.
+  MXFP8 weights run through in-register dequant GEMV / banded dequant + GEMM; a quantized
+  bundle can also be **transcoded on load** (NVFP4 → SQ4, ggml → SQ, in RAM or a disk cache)
+  by the loading policy. `SYN_FORCE_ARCH=sm_80` compiles everything for an older target to
+  exercise that path on a newer card.
 - **KV-cache in MXFP8 by default** (per-layer: sliding-window layers stay unquantized), with
   block-table attention kernels that read the quantized cache directly.
 - **MoE offload** — experts live in pinned host RAM and stream to the card on demand, with an
