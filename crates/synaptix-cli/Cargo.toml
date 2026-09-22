@@ -33,6 +33,7 @@ synaptix-tts-voxcpm   = { workspace = true }
 synaptix-tts-vibevoice = { workspace = true }
 synaptix-music-acestep = { workspace = true }
 synaptix-music-yue2   = { workspace = true }
+synaptix-music-sheetsage2 = { workspace = true }
 synaptix-audio        = { workspace = true }
 synaptix-depth-anything = { workspace = true }
 synaptix-llm-gemma3   = { workspace = true }

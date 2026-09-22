@@ -169,6 +169,43 @@ impl BundleEditor {
         Ok(())
     }
 
+    /// Добавить (или заменить) тензорный компонент — отдельный чанк
+    /// `tensors:<component>` с готовым safetensors-payload'ом, — и отметить
+    /// компонент в `bundle_meta.components` (без префикса: имена тензоров в
+    /// своём чанке не пересекаются с чужими). Так в существующий бандл
+    /// докладывается вторая модель, не трогая основных весов.
+    pub fn add_tensors_component(&mut self, component: &str, payload: Vec<u8>) -> Result<()> {
+        if component.is_empty() || component == "main" {
+            return Err(Error::InvalidPath {
+                path: component.to_string(),
+                reason: "component name must be non-empty and not `main`",
+            });
+        }
+        let name = format!("tensors:{component}");
+        if let Some(id) = self
+            .bundle
+            .cdir()
+            .entries
+            .iter()
+            .rev()
+            .find(|e| {
+                e.is_alive()
+                    && matches!(e.kind_typed(), ChunkType::Tensors)
+                    && !self.pending_tombstones.contains(&e.id)
+                    && self.effective_name(e) == name
+            })
+            .map(|e| e.id)
+        {
+            self.pending_tombstones.insert(id);
+        }
+        self.pending_chunks.retain(|p| !(p.name == name && matches!(p.kind, ChunkType::Tensors)));
+        self.pending_chunks.push(PendingChunk { name, kind: ChunkType::Tensors, payload, tag: None });
+        let mut meta = self.meta().clone();
+        meta.components.insert(component.to_string(), String::new());
+        self.pending_meta = Some(meta);
+        Ok(())
+    }
+
     /// Tombstone the chunk that currently holds `bundle_path`.
     pub fn remove_file(&mut self, bundle_path: &str) -> Result<()> {
         let name = syn_path::normalize(bundle_path)?;
@@ -450,17 +487,24 @@ pub fn compact(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
         builder = builder.with_sha256(true);
     }
 
-    // Stage the tensors stream to a sibling temp so the builder can validate it
-    // as plain safetensors at pack time.
-    let tmp_tensors = dst.with_extension("tensors.tmp");
-    let mut tmp_written = false;
+    // Stage each tensors chunk to its own sibling temp so the builder can
+    // validate it as plain safetensors at pack time. A multi-component bundle
+    // (`tensors:main` + `tensors:<component>`) keeps every chunk under its own
+    // name — one shared temp would leave only the last chunk, renamed to main.
+    let mut tmps: Vec<std::path::PathBuf> = Vec::new();
     for e in b.cdir().entries.iter().filter(|e| e.is_alive()) {
         match e.kind_typed() {
             ChunkType::Tensors => {
+                let tmp = dst.with_extension(format!("tensors{}.tmp", tmps.len()));
                 let bytes = b.read_raw_chunk(e)?;
-                std::fs::write(&tmp_tensors, &*bytes)?;
-                builder = builder.add_tensors_from_safetensors(&tmp_tensors);
-                tmp_written = true;
+                std::fs::write(&tmp, &*bytes)?;
+                builder = match e.name.strip_prefix("tensors:") {
+                    Some(component) if component != "main" => {
+                        builder.add_safetensors_component(component, vec![tmp.clone()], None)
+                    }
+                    _ => builder.add_tensors_from_safetensors(&tmp),
+                };
+                tmps.push(tmp);
             }
             ChunkType::File => {
                 let bytes = b.read_file(&e.name)?;
@@ -470,11 +514,12 @@ pub fn compact(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
             _ => {}
         }
     }
-    if !tmp_written {
-        let _ = std::fs::remove_file(&tmp_tensors);
+    if tmps.is_empty() {
         return Err(Error::TensorsChunkMissing);
     }
-    builder.write(dst)?;
-    let _ = std::fs::remove_file(&tmp_tensors);
-    Ok(())
+    let result = builder.write(dst);
+    for tmp in &tmps {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }

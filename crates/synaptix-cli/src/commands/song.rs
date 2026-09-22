@@ -26,6 +26,10 @@ pub struct SongArgs {
     pub cot: String,
     /// Готовая партитура ABC вместо сгенерированной.
     pub abc_file: Option<PathBuf>,
+    /// Кавер записи: SheetSage2 из того же бандла → мелодия → `cot = melody`.
+    pub cover: Option<PathBuf>,
+    /// Какие мелодии записи взять в кавер.
+    pub cover_voices: String,
     pub seed: u64,
     pub cfg: Option<f32>,
     pub steps: usize,
@@ -85,15 +89,33 @@ pub fn run(args: SongArgs) -> Result<(), Box<dyn std::error::Error>> {
         })?,
     };
 
-    let cot = Cot::parse(&args.cot).ok_or("--cot ожидает full | melody | off")?;
+    let mut cot = Cot::parse(&args.cot).ok_or("--cot ожидает full | melody | off")?;
     let lyrics = match &args.lyrics_file {
         Some(p) => std::fs::read_to_string(p)?,
         None => args.lyrics.clone(),
     };
-    let abc = match &args.abc_file {
+    let mut abc = match &args.abc_file {
         Some(p) => Some(std::fs::read_to_string(p)?),
         None => None,
     };
+    if let Some(source) = &args.cover {
+        // Мелодия без аккордов — аккомпанемент подстраивается под новый стиль.
+        // SheetSage2 выгружается до загрузки YuE2: двум моделям ни к чему
+        // делить карту.
+        let options = synaptix_music_sheetsage2::TranscribeOptions {
+            melody_only: true,
+            voices: crate::commands::sheet::parse_voices(&args.cover_voices)?,
+            ..Default::default()
+        };
+        let compute = parse_dtype(args.compute_dtype.as_deref(), DType::BF16);
+        let result = crate::commands::sheet::transcribe_file(&model, source, &args.device, compute, &options)?;
+        let score = result
+            .abc
+            .ok_or_else(|| format!("мелодия записи не собрана: {}", result.abc_error.unwrap_or_default()))?;
+        eprintln!("[yue2] кавер: мелодия записи ({} тактов), cot = melody", result.export.measures);
+        abc = Some(score);
+        cot = Cot::Melody;
+    }
 
     let mut generation = GenerationConfig::default();
     generation.ode_steps = args.steps;

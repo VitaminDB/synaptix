@@ -915,6 +915,10 @@ fn guess_purpose(
     match model_type {
         "yue2" => return ("music".to_string(), Guess::ConfigJson),
         "yue2_vae" => return ("vae".to_string(), Guess::ConfigJson),
+        // SheetSage2 расшифровывает запись в партитуру, MERT2 — её энкодер
+        // представлений; по `architectures` первый выглядел бы seq2seq-текстом.
+        "sheetsage2" => return ("transcribe".to_string(), Guess::ConfigJson),
+        "mert2" => return ("embed".to_string(), Guess::ConfigJson),
         _ => {}
     }
 

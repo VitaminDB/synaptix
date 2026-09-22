@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
-    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, song,
+    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, sheet, song,
     speak,
     train, transcribe, video,
 };
@@ -335,6 +335,13 @@ enum Commands {
         /// Готовая партитура ABC из файла вместо сгенерированной.
         #[arg(long)]
         abc_file: Option<PathBuf>,
+        /// Кавер: запись → мелодия (SheetSage2 из того же бандла) → песня с
+        /// `cot = melody`. Сильнее --abc-file.
+        #[arg(long)]
+        cover: Option<PathBuf>,
+        /// Какие мелодии записи взять в кавер: both | vocal | ins.
+        #[arg(long, default_value = "both")]
+        cover_voices: String,
         /// Куда сохранить партитуру.
         #[arg(long)]
         save_abc: Option<PathBuf>,
@@ -371,6 +378,50 @@ enum Commands {
         /// Кадров в ядре тайла декодера (меньше — меньше памяти).
         #[arg(long, default_value_t = 1024)]
         vae_core_frames: usize,
+    },
+    /// Запись → партитура ABC (SheetSage2): мелодия вокала и инструмента,
+    /// аккорды, размер, тональность и секции. По умолчанию — без аккордов, как
+    /// план кавера для YuE2.
+    Sheet {
+        /// Запись (любой формат, который читает ffmpeg; без ffmpeg — WAV).
+        audio: PathBuf,
+        #[arg(short, long, default_value = "score.abc")]
+        output: PathBuf,
+        /// Каталог с бандлами (SheetSage2 лежит компонентом в yue2-3b.syn).
+        #[arg(long, default_value = "storage/syn_models")]
+        models: PathBuf,
+        /// Бандл с компонентом sheetsage2.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// С аккордами (полная партитура).
+        #[arg(long, default_value_t = false)]
+        full: bool,
+        /// Какие мелодии оставить: both | vocal | ins.
+        #[arg(long, default_value = "both")]
+        voices: String,
+        /// Взять только первые N секунд.
+        #[arg(long)]
+        max_seconds: Option<f64>,
+        #[arg(long, default_value = "cuda:0")]
+        device: String,
+        /// bf16 (эталонный режим релиза) | f32.
+        #[arg(long)]
+        compute_dtype: Option<String>,
+        /// Сохранить токены окон в JSON (для сверки с релизом).
+        #[arg(long)]
+        tokens_json: Option<PathBuf>,
+    },
+    /// Упаковать релиз SheetSage2 (+ MERT-v2-FullSong) компонентом в бандл.
+    SheetPack {
+        /// Каталог релиза SheetSage2 (config.json, model.safetensors).
+        #[arg(long)]
+        sheetsage: PathBuf,
+        /// Каталог MERT-v2-FullSong (нужен релизу-адаптеру).
+        #[arg(long)]
+        mert: Option<PathBuf>,
+        /// Бандл, в который дописать компонент (обычно yue2-3b.syn).
+        #[arg(long)]
+        into: PathBuf,
     },
     /// Генерация музыки по тексту (ACE-Step v1.5): CAPTION → WAV (48 кГц).
     Music {
@@ -906,14 +957,24 @@ fn main() -> ExitCode {
             max_length_times, zero_noise,
         }),
         Commands::Song {
-            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, save_abc, seed,
-            cfg, steps, max_tokens, temperature, top_p, top_k, repetition_penalty, device,
-            compute_dtype, quant, vae_dtype, vae_core_frames,
+            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,
+            cover_voices, save_abc, seed, cfg, steps, max_tokens, temperature, top_p, top_k,
+            repetition_penalty, device, compute_dtype, quant, vae_dtype, vae_core_frames,
         } => song::run(song::SongArgs {
-            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, save_abc, seed,
-            cfg, steps, max_tokens, temperature, top_p, top_k, repetition_penalty, device,
-            compute_dtype, quant, vae_dtype, vae_core_frames,
+            style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,
+            cover_voices, save_abc, seed, cfg, steps, max_tokens, temperature, top_p, top_k,
+            repetition_penalty, device, compute_dtype, quant, vae_dtype, vae_core_frames,
         }),
+        Commands::Sheet {
+            audio, output, models, model, full, voices, max_seconds, device, compute_dtype,
+            tokens_json,
+        } => sheet::run(sheet::SheetArgs {
+            audio, output, models, model, full, voices, max_seconds, device, compute_dtype,
+            tokens_json,
+        }),
+        Commands::SheetPack { sheetsage, mert, into } => {
+            sheet::run_pack(sheet::SheetPackArgs { sheetsage, mert, into })
+        }
         Commands::Music {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,

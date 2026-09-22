@@ -1,0 +1,25 @@
+[package]
+name = "synaptix-music-sheetsage2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SheetSage2 — транскрипция записи в партитуру (MERT2-энкодер + событийный декодер → ABC)."
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+
+[dependencies]
+synaptix-core   = { workspace = true }
+synaptix-ops    = { workspace = true }
+synaptix-io     = { workspace = true }
+synaptix-bundle = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = { workspace = true }
+rustfft         = { workspace = true }
+sha2            = { workspace = true }
+half            = { workspace = true }
+safetensors     = { workspace = true }
+memmap2         = { workspace = true }
+rubato          = { workspace = true }

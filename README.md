@@ -46,7 +46,7 @@ Native ports, each validated against its upstream reference:
 | **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio; image / video / audio references — Ref2VA) |
 | **Speech** | Whisper, GigaAM (ASR), Sortformer (diarization) |
 | **Text-to-speech** | VoxCPM, OmniVoice, VibeVoice (long-form, multi-speaker) |
-| **Music** | ACE-Step (generate, cover, edit, extend, extract, repaint) |
+| **Music** | YuE2 (song from style and lyrics through an editable ABC score; covers of a recording), SheetSage2 (recording → lead sheet in ABC: melody, chords, beats, key, sections), ACE-Step (generate, cover, edit, extend, extract, repaint) |
 | **Embeddings / rerank** | BGE-M3, BGE-reranker-v2-m3 |
 
 ## Quantization and memory

@@ -193,3 +193,66 @@ fn remove_pending_add_drops_it() {
     assert!(b.read_file("scratch.txt").is_err());
     let _ = std::fs::remove_dir_all(&work);
 }
+
+fn tensors_payload(name: &str, values: &[f32]) -> Vec<u8> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut tensors: HashMap<&str, TensorView<'_>> = HashMap::new();
+    tensors.insert(name, TensorView::new(Dtype::F32, vec![values.len()], &bytes).unwrap());
+    safetensors::serialize(&tensors, None).unwrap()
+}
+
+fn read_named(b: &Bundle, component: &str, tensor: &str) -> Vec<f32> {
+    let st = safetensors::SafeTensors::deserialize(b.tensors_slice_named(component).unwrap()).unwrap();
+    st.tensor(tensor)
+        .unwrap()
+        .data()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Вторая модель докладывается в готовый бандл своим чанком: основные веса не
+/// трогаются, компонент виден в метаданных, повтор заменяет прежний чанк.
+#[test]
+fn add_tensors_component_keeps_main_weights() {
+    let work = tempdir("synaptix_edit_component");
+    let path = make_bundle(&work, "model");
+
+    let mut ed = BundleEditor::open(&path).unwrap();
+    ed.add_tensors_component("extra", tensors_payload("x", &[5.0, 6.0])).unwrap();
+    assert!(ed.add_tensors_component("main", Vec::new()).is_err(), "main — имя основного чанка");
+    ed.commit().unwrap();
+
+    let b = Bundle::open(&path).unwrap();
+    assert_eq!(read_layer_weight(&b), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(read_named(&b, "extra", "x"), vec![5.0, 6.0]);
+    assert_eq!(b.meta().components.get("extra").map(String::as_str), Some(""));
+    b.verify_full().unwrap();
+
+    let mut ed = BundleEditor::open(&path).unwrap();
+    ed.add_tensors_component("extra", tensors_payload("x", &[7.0])).unwrap();
+    ed.commit().unwrap();
+    let b = Bundle::open(&path).unwrap();
+    assert_eq!(read_named(&b, "extra", "x"), vec![7.0]);
+    assert_eq!(read_layer_weight(&b), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+/// `compact` многокомпонентного бандла: каждый тензорный чанк остаётся под
+/// своим именем (раньше все шли через один временный файл, и выживал только
+/// последний — под именем main).
+#[test]
+fn compact_keeps_every_tensors_component() {
+    let work = tempdir("synaptix_edit_compact_components");
+    let path = make_bundle(&work, "model");
+    let mut ed = BundleEditor::open(&path).unwrap();
+    ed.add_tensors_component("extra", tensors_payload("x", &[5.0, 6.0])).unwrap();
+    ed.commit().unwrap();
+
+    let out = work.join("compacted.syn");
+    compact(&path, &out).unwrap();
+    let b = Bundle::open(&out).unwrap();
+    assert_eq!(read_layer_weight(&b), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(read_named(&b, "extra", "x"), vec![5.0, 6.0]);
+    assert!(b.meta().components.contains_key("extra"));
+    b.verify_full().unwrap();
+}
