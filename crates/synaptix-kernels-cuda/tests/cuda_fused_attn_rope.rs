@@ -263,18 +263,30 @@ fn run(
 
 #[test]
 fn attn_rope_small_full_rotary() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 2, 1, 64, 128, 64);
 }
 
 #[test]
 fn attn_rope_qwen3_1p7b_like() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 16, 8, 128, 2048, 128);
 }
 
 #[test]
 fn attn_rope_partial_rotary() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 4, 2, 128, 1024, 64);
 }

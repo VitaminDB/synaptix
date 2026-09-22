@@ -1676,6 +1676,12 @@ GEMM_TN_ENTRY_B256(__half, gemm_f16tn_swz_b256s4, 4, true, false)
 GEMM_TN_ENTRY_PART_HYB(__half, gemm_f16tn_part_b256s4, 4, 4, 2, 4, 8, 1)
 
 // ===================== TMA+mbarrier (порт mxfp8-rot) =====================
+// Только под цель с архитектурно-специфичным PTX (sm_90a/sm_100a/sm_120a):
+// setmaxnreg, cp.async.bulk.tensor, mbarrier.try_wait. Под sm_80…sm_89 и под
+// «плоскую» sm_120 (SYN_FORCE_ARCH=sm_120) секция выключена, Rust-сторона
+// грузит эти ядра через `.ok()` и остаётся на cp.async-семействе выше.
+// SYN_CC / SYN_ARCH_A задаёт `kernels::compile` из `DeviceCaps`.
+#if SYN_ARCH_A && SYN_CC >= 90
 // bf16/f16 TMA+mbarrier GEMM малых M — порт рецепта mxfp8-rot/nvfp4 (sm_120a):
 // TMA shared::cta (НЕ cluster: C7506 глушит setmaxnreg) + mbarrier-конвейер +
 // fused-producer(tid 0) + ротация пар k16-блоков (байтовая геометрия идентична
@@ -2011,3 +2017,4 @@ BT_ENTRY_D(__half, gn_f16_tma_64x128_s3d, 64, 128, 2, 2, 3)
 BT_ENTRY_D(__half, gn_f16_tma_64x128_s4d, 64, 128, 2, 2, 4)
 BT_ENTRY_D(__half, gn_f16_tma_128x64_s3d, 128, 64, 2, 2, 3)
 BT_ENTRY_D(__half, gn_f16_tma_128x64_s4d, 128, 64, 2, 2, 4)
+#endif // SYN_ARCH_A && SYN_CC >= 90

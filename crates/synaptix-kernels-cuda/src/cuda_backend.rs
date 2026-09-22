@@ -27,6 +27,19 @@ fn nvfp4_weight_only() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("SYNAPTIX_NVFP4_WO").as_deref(), Ok("1")))
 }
 
+/// Квант-формат `dtype` исполняется на карте буфера `st` нативно (тензорными
+/// ядрами)? Иначе `Unsupported(what)`: производители пред-квантованных
+/// активаций и перемешанных копий возвращают его, и модель идёт обычным
+/// путём `forward` → `linear_quant` → деквант-обход.
+fn require_quant_native(st: &Storage, dtype: DType, what: &'static str) -> Result<()> {
+    let buf = st.as_cuda().ok_or(SynaptixError::Unsupported(what))?;
+    if crate::caps::DeviceCaps::for_context(buf.device()).quant_native(dtype) {
+        Ok(())
+    } else {
+        Err(SynaptixError::Unsupported(what))
+    }
+}
+
 fn stream_is_capturing(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> bool {
     matches!(
         stream.capture_status(),
@@ -133,6 +146,15 @@ fn act_mul_quant_nvfp4_cuda(
 impl Backend for CudaBackend {
     fn device_kind(&self) -> Device {
         Device::Cuda(0)
+    }
+
+    fn quant_native(&self, dtype: DType, device: Device) -> bool {
+        match device {
+            Device::Cuda(ord) => crate::caps::DeviceCaps::for_ordinal(ord)
+                .map(|c| c.quant_native(dtype))
+                .unwrap_or(false),
+            _ => false,
+        }
     }
 
     fn alloc_zeros(&self, n_bytes: usize, device: Device) -> Result<Storage> {
@@ -524,9 +546,19 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("linear_quant: out non-cuda"))?;
 
         let bf16 = x_lo.dtype() == DType::BF16;
+        let caps = crate::caps::DeviceCaps::for_context(&ctx);
         match w.dtype() {
             DType::NVFP4 => {
-                if !bf16 && nvfp4_weight_only() {
+                // Без FP4 MMA (карта ниже Blackwell / SYN_FORCE_ARCH) — путь
+                // «деквант W → f16 → плотный GEMM». BF16-активацию он не
+                // берёт: `Unsupported` → QLinear::forward идёт через F16.
+                // Этап 2 плана заменит его ядром W4A16 с деквантом в плитке.
+                if bf16 && !caps.fp4_mma() {
+                    return Err(SynaptixError::Unsupported(
+                        "linear_quant NVFP4: без FP4 MMA активация только F16",
+                    ));
+                }
+                if !bf16 && (nvfp4_weight_only() || !caps.fp4_mma()) {
                     use half::f16;
                     let nn = w.n();
                     if k % 16 != 0 {
@@ -1135,6 +1167,7 @@ impl Backend for CudaBackend {
         k: usize,
         _stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::NVFP4, "nvfp4_quantize_act: карта без FP4 MMA")?;
         let (x_st, x_lo) = x;
         if !x_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
@@ -1181,6 +1214,7 @@ impl Backend for CudaBackend {
         inv_pre: f32,
         stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::NVFP4, "silu_mul_quant_nvfp4: карта без FP4 MMA")?;
         act_mul_quant_nvfp4_cuda(x, packed_out, scales_out, m, k, inv_pre, 0, stream)
     }
 
@@ -1194,6 +1228,7 @@ impl Backend for CudaBackend {
         inv_pre: f32,
         stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::NVFP4, "gelu_tanh_mul_quant_nvfp4: карта без FP4 MMA")?;
         act_mul_quant_nvfp4_cuda(x, packed_out, scales_out, m, k, inv_pre, 1, stream)
     }
 
@@ -1212,6 +1247,7 @@ impl Backend for CudaBackend {
         mod_div: usize,
         _stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::NVFP4, "rms_mod_quant_nvfp4: карта без FP4 MMA")?;
         let kind = match kind {
             0 => crate::fused::rms_mod_quant::NormQuantKind::RmsMod,
             1 => crate::fused::rms_mod_quant::NormQuantKind::LnMod,
@@ -4357,6 +4393,7 @@ impl Backend for CudaBackend {
         _stream: &Stream,
     ) -> Result<()> {
         use crate::fused::llm_decode::{self as ld, TopkArgs};
+        require_quant_native(gate.0, DType::NVFP4, "dec_geglu_quant_nvfp4: карта без FP4 MMA")?;
         let (ctx, stream) = ctx_stream_of(gate.0, "dec_geglu_quant_nvfp4")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
         let bf16 = match dtype {

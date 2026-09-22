@@ -134,36 +134,60 @@ fn run(
 
 #[test]
 fn shuf_64x64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 64, 64, "64x64", 0.99);
 }
 
 #[test]
 fn shuf_256x256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 256, 256, "256x256", 0.99);
 }
 
 #[test]
 fn shuf_5120x5120() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 5120, 5120, "qkv", 0.99);
 }
 
 #[test]
 fn shuf_27648x5120() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 27648, 5120, "ffn_gate", 0.99);
 }
 
 #[test]
 fn shuf_5120x27648() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 5120, 27648, "ffn_down", 0.99);
 }
 
 #[test]
 fn shuf_lm_head_248320x5120() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 248320, 5120, "lm_head", 0.99);
 }

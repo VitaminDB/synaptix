@@ -228,7 +228,7 @@ impl BestGemmBf16Kernels {
         }
         let module = {
             let src = include_str!("gemm_bf16.cu");
-            compile_module_with_opts(ctx, src, "gemm_bf16.cu", &[], Some("sm_120a"))?
+            compile_module_with_opts(ctx, src, "gemm_bf16.cu", &[], None)?
         };
         let (fns, parts) = load_tn_set(&module, "gemm_bf16")?;
         let (f16_fns, f16_parts) = load_tn_set(&module, "gemm_f16tn")?;

@@ -8,7 +8,7 @@ use half::f16;
 use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::kernels::compile::{compile_module_req, load_fn};
 use crate::wsalloc::WsAlloc;
 
 // КОРРЕКТНОЕ MXFP8 GEMM (sm_120a), порт gau-nernst/learn-cuda 09a_block_scaled_mm_sm120 v1:
@@ -80,7 +80,7 @@ impl GemmMxFp8Kernels {
             }
         }
         let src = include_str!("gemm_mxfp8.cu");
-        let module = compile_module_with_opts(ctx, src, "gemm_mxfp8.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_req(ctx, src, "gemm_mxfp8.cu", &[], crate::caps::Feature::Mxfp8Mma)?;
         let f = load_fn(&module, "gn_mxfp8_128x128")?;
         f.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,

@@ -6,6 +6,7 @@
 
 pub mod arch;
 pub mod asr;
+pub mod device;
 pub mod diarization;
 pub mod embedding;
 pub mod llm;

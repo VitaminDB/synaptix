@@ -33,6 +33,10 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn gemm_mxfp8_linear_device_vs_cpu() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     synaptix_kernels_cuda::ensure_registered();
     let Some(ctx) = synaptix_core::device::cuda::get(0).ok() else {
         return;

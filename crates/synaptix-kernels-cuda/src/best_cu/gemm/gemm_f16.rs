@@ -113,7 +113,7 @@ impl GemmF16Kernels {
             }
         }
         let src = include_str!("gemm_f16.cu");
-        let module = compile_module_with_opts(ctx, src, "gemm_f16.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, "gemm_f16.cu", &[], None)?;
         let (fns, part) = load_nn_set(&module, "gemm_wmma_f16")?;
         let (bf16_fns, bf16_part) = load_nn_set(&module, "gemm_wmma_bf16")?;
         let new = Arc::new(Self {

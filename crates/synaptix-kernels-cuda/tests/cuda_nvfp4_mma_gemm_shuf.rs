@@ -212,6 +212,10 @@ fn run(
 
 #[test]
 fn gemm_shuf_64x64_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -227,18 +231,30 @@ fn gemm_shuf_64x64_b16() {
 
 #[test]
 fn gemm_shuf_128x128_b32() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 128, 128, 32, Variant::A, "128x128_b32", 0.99);
 }
 
 #[test]
 fn gemm_shuf_256x256_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 256, 256, 64, Variant::A, "256x256_b64", 0.99);
 }
 
 #[test]
 fn gemm_shuf_qwen_attn_qkv_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -254,6 +270,10 @@ fn gemm_shuf_qwen_attn_qkv_b16() {
 
 #[test]
 fn gemm_shuf_qwen_attn_qkv_b256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -269,6 +289,10 @@ fn gemm_shuf_qwen_attn_qkv_b256() {
 
 #[test]
 fn gemm_shuf_qwen_ffn_gate_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -284,6 +308,10 @@ fn gemm_shuf_qwen_ffn_gate_b16() {
 
 #[test]
 fn gemm_shuf_qwen_ffn_down_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -301,6 +329,10 @@ fn gemm_shuf_qwen_ffn_down_b16() {
 
 #[test]
 fn gemm_shuf_n8_64x64_b8() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -316,6 +348,10 @@ fn gemm_shuf_n8_64x64_b8() {
 
 #[test]
 fn gemm_shuf_n8_128x128_b32() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -331,6 +367,10 @@ fn gemm_shuf_n8_128x128_b32() {
 
 #[test]
 fn gemm_shuf_n8_256x256_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -346,6 +386,10 @@ fn gemm_shuf_n8_256x256_b64() {
 
 #[test]
 fn gemm_shuf_n8_qwen_attn_qkv_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -361,6 +405,10 @@ fn gemm_shuf_n8_qwen_attn_qkv_b16() {
 
 #[test]
 fn gemm_shuf_n8_qwen_attn_qkv_b256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -376,6 +424,10 @@ fn gemm_shuf_n8_qwen_attn_qkv_b256() {
 
 #[test]
 fn gemm_shuf_n8_qwen_ffn_gate_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -391,6 +443,10 @@ fn gemm_shuf_n8_qwen_ffn_gate_b16() {
 
 #[test]
 fn gemm_shuf_n8_qwen_ffn_down_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -408,6 +464,10 @@ fn gemm_shuf_n8_qwen_ffn_down_b16() {
 
 #[test]
 fn gemm_shuf_2d_128x128_b32() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -423,6 +483,10 @@ fn gemm_shuf_2d_128x128_b32() {
 
 #[test]
 fn gemm_shuf_2d_256x256_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -438,6 +502,10 @@ fn gemm_shuf_2d_256x256_b64() {
 
 #[test]
 fn gemm_shuf_2d_qwen_attn_qkv_b16() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -453,6 +521,10 @@ fn gemm_shuf_2d_qwen_attn_qkv_b16() {
 
 #[test]
 fn gemm_shuf_2d_qwen_attn_qkv_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -468,6 +540,10 @@ fn gemm_shuf_2d_qwen_attn_qkv_b64() {
 
 #[test]
 fn gemm_shuf_2d_qwen_attn_qkv_b256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -483,6 +559,10 @@ fn gemm_shuf_2d_qwen_attn_qkv_b256() {
 
 #[test]
 fn gemm_shuf_2d_qwen_ffn_gate_b32() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -498,6 +578,10 @@ fn gemm_shuf_2d_qwen_ffn_gate_b32() {
 
 #[test]
 fn gemm_shuf_2d_qwen_ffn_down_b32() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -515,6 +599,10 @@ fn gemm_shuf_2d_qwen_ffn_down_b32() {
 
 #[test]
 fn gemm_shuf_2dr_128x128_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -530,6 +618,10 @@ fn gemm_shuf_2dr_128x128_b64() {
 
 #[test]
 fn gemm_shuf_2dr_qwen_attn_qkv_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -545,6 +637,10 @@ fn gemm_shuf_2dr_qwen_attn_qkv_b64() {
 
 #[test]
 fn gemm_shuf_2dr_qwen_attn_qkv_b256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -560,6 +656,10 @@ fn gemm_shuf_2dr_qwen_attn_qkv_b256() {
 
 #[test]
 fn gemm_shuf_2dr_qwen_ffn_gate_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -575,6 +675,10 @@ fn gemm_shuf_2dr_qwen_ffn_gate_b64() {
 
 #[test]
 fn gemm_shuf_2dr_qwen_ffn_down_b64() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(
         &ctx,
@@ -658,6 +762,10 @@ fn run_plan_y(
 
 #[test]
 fn diag_perrow_a_vs_n8_vs_2dr_m256() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     let (n, k, batch) = (5120u32, 5120u32, 256u32);
 
@@ -778,6 +886,10 @@ fn diag_perrow_a_vs_n8_vs_2dr_m256() {
 // повреждает строки. M=256 N=5120 K=5120 (M%128==0, N%128==0, K%128==0).
 #[test]
 fn full_perrow_vs_dense() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     let (n, k, batch) = (5120u32, 5120u32, 256u32);
     let q = Nvfp4QuantKernels::for_context(&ctx).expect("quant");

@@ -61,7 +61,7 @@ impl FlashMxfp8SplitqKernels {
     fn build(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
         let src = include_str!("../cu/fused/attention/flash_mxfp8_splitq.cu");
         let module =
-            compile_module_with_opts(ctx, src, "flash_mxfp8_splitq.cu", &[], Some("sm_120a"))?;
+            compile_module_with_opts(ctx, src, "flash_mxfp8_splitq.cu", &[], None)?;
         Ok(Arc::new(Self {
             f16_hd128: load_fn(&module, "flash_mxfp8_splitq_f16_hd128")?,
             f16_hd256: load_fn(&module, "flash_mxfp8_splitq_f16_hd256")?,

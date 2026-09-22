@@ -11,7 +11,7 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use cudarc::driver::sys::CUtensorMapSwizzle;
 
-use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::kernels::compile::{compile_module_req, load_fn};
 use crate::tma::{make_tma_desc_2d_u8_swz, make_tma_desc_3d_u8, TmaDesc};
 
 // Кэш TMA-дескрипторов (bf16-урок: encode+htod на КАЖДЫЙ вызов = H2D-копия,
@@ -159,7 +159,7 @@ impl Nvfp4MmaGemmShufKernels {
             }
         }
         let src = include_str!("gemm_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
+        let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Fp4Mma)?;
         let w4 = load_fn(&module, "nvfp4_mma_gemm_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_mma_gemm_shuf_f16_w8")?;
         let n8_w4 = load_fn(&module, "nvfp4_mma_gemm_shuf_n8_f16_w4")?;
@@ -1164,7 +1164,7 @@ impl GemmNvfp4FullKernels {
             }
         }
         let src = include_str!("gemm_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
+        let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Fp4Mma)?;
         let mut fns = Vec::new();
         for cfg in Nvfp4FullCfg::ALL {
             let f = load_fn(&module, cfg.fname)?;

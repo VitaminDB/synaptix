@@ -72,7 +72,7 @@ impl Nvfp4QuantKernels {
             }
         }
         let src = include_str!("../cu/elementwise/nvfp4_quant.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, None)?;
         let new = Arc::new(Self {
             quantize_f16_to_nvfp4: load_fn(&module, "quantize_f16_to_nvfp4")?,
             quantize_f16_to_nvfp4_fast: load_fn(&module, "quantize_f16_to_nvfp4_fast")?,
@@ -345,7 +345,7 @@ impl Mxfp8QuantKernels {
             }
         }
         let src = include_str!("../cu/elementwise/mxfp8_quant.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, None)?;
         let new = Arc::new(Self {
             quant_natural: load_fn(&module, "mxfp8_quant_natural")?,
             quant_natural_fast: load_fn(&module, "mxfp8_quant_natural_fast")?,

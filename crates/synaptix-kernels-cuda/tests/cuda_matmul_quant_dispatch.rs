@@ -353,6 +353,10 @@ fn dispatch_coop_m16_n96() {
 /// Байты не меняются → результат после круга обязан совпасть побитово.
 #[test]
 fn quant_weight_roundtrip_after_shuffled() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     let q = Nvfp4QuantKernels::for_context(&ctx).expect("compile nvfp4_quant");
     let (n, k, m) = (256_u32, 256_u32, 1_u32);

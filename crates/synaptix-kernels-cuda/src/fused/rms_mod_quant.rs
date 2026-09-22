@@ -70,7 +70,7 @@ impl RmsModQuantKernels {
             }
         }
         let src = include_str!("../cu/fused/norm/rms_mod_quant.cu");
-        let module = compile_module_with_opts(ctx, src, "rms_mod_quant.cu", &[], Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, "rms_mod_quant.cu", &[], None)?;
         let new = Arc::new(Self {
             f16: load_fn(&module, "rms_mod_quant_nvfp4_f16")?,
             bf16: load_fn(&module, "rms_mod_quant_nvfp4_bf16")?,

@@ -32,7 +32,7 @@ impl GemmF32Kernels {
             }
         }
         let src = include_str!("gemm_f32.cu");
-        let module = compile_module_with_opts(ctx, src, "gemm_f32.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, "gemm_f32.cu", &[], None)?;
         let nn = load_fn(&module, "gemm_f32_nn")?;
         let new = Arc::new(Self {
             nn,

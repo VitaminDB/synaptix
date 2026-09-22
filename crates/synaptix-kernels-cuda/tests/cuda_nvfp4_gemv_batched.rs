@@ -31,6 +31,10 @@ fn cuda_ready() -> bool {
 
 #[test]
 fn batched_matches_one_by_one() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if !cuda_ready() {
         eprintln!("CUDA-устройств нет — пропуск");
         return;
@@ -95,6 +99,10 @@ fn batched_matches_one_by_one() {
 /// строки в tile-раскладке масштабов.
 #[test]
 fn batched_reads_its_own_row_of_shared_activation() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if !cuda_ready() {
         return;
     }
@@ -152,6 +160,10 @@ fn batched_reads_its_own_row_of_shared_activation() {
 
 #[test]
 fn batch_without_shuffled_copy_is_refused() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if !cuda_ready() {
         return;
     }

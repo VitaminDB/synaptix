@@ -1861,7 +1861,12 @@ impl MoeFfn {
             for w in [e.gate_up.quant_weight(), e.down.quant_weight()] {
                 match w {
                     Some(w) if w.dtype() == DType::NVFP4 => {
-                        if w.shuffled().is_none() && w.ensure_shuffled().is_err() {
+                        // `ensure_shuffled` — no-op без FP4 MMA (копия так и
+                        // остаётся `None`), поэтому проверяем результат, а не
+                        // только ошибку.
+                        if w.shuffled().is_none()
+                            && (w.ensure_shuffled().is_err() || w.shuffled().is_none())
+                        {
                             ready = false;
                         }
                     }

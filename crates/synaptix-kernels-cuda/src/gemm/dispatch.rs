@@ -605,7 +605,13 @@ pub fn mxfp8_linear_tiled_n(
         return Ok(false);
     }
     let k_us = k as usize;
-    let gk = GemmMxFp8Kernels::for_context(ctx)?;
+    // Без block-scale MMA (карта ниже Blackwell или SYN_FORCE_ARCH) tiled-ядра
+    // нет — вызывающий уходит в деквант-фолбэк.
+    let gk = match GemmMxFp8Kernels::for_context(ctx) {
+        Ok(gk) => gk,
+        Err(SynaptixError::Unsupported(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
 
     // W: натуральные packed [n,k] + натуральные scales [n,K/32] НАПРЯМУЮ (без permute).
     let packed_arc = w
@@ -842,8 +848,11 @@ pub fn mxfp8_linear_dequant_fallback(
         )));
     }
 
-    // Голова доступна, только если tiled-ядро вообще применимо по K.
-    let n_head = if tiled_shape_ok(128, k) { n - n % 128 } else { 0 };
+    // Голова доступна, только если tiled-ядро вообще применимо по K — и
+    // есть block-scale MMA; без него (карта ниже Blackwell, SYN_FORCE_ARCH)
+    // весь вес идёт деквантом полосами.
+    let has_mma = crate::caps::DeviceCaps::for_context(ctx).mxfp8_mma();
+    let n_head = if has_mma && tiled_shape_ok(128, k) { n - n % 128 } else { 0 };
     let rest = n - n_head;
     let chunk = if rest == 0 {
         0

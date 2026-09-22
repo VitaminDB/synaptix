@@ -14,7 +14,7 @@ use half::f16;
 use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::kernels::compile::{compile_module_req, load_fn};
 
 pub struct Nvfp4SwigluShufKernels {
     _module: Arc<CudaModule>,
@@ -44,7 +44,7 @@ impl Nvfp4SwigluShufKernels {
         }
         let src = include_str!("../cu/fused/mlp/nvfp4_swiglu_shuf.cu");
         let module =
-            compile_module_with_opts(ctx, src, "nvfp4_swiglu_shuf.cu", &[], Some("sm_120a"))?;
+            compile_module_req(ctx, src, "nvfp4_swiglu_shuf.cu", &[], crate::caps::Feature::Fp4Mma)?;
         let w4 = load_fn(&module, "nvfp4_swiglu_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_swiglu_shuf_f16_w8")?;
         for f in [&w4, &w8] {

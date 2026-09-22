@@ -52,3 +52,19 @@ pub fn resolve_attn(cli: Option<&str>) {
         eprintln!("synaptix: attention-backend = {}", mode.as_str());
     }
 }
+
+/// `synaptix devices`: по строке на карту — что умеет и под что компилируются
+/// ядра. С `SYN_FORCE_ARCH` показывает принудительную цель.
+pub fn list() {
+    let n = synaptix::facade::device::cuda_device_count();
+    if n == 0 {
+        println!("CUDA-карт не найдено");
+        return;
+    }
+    for ord in 0..n {
+        match synaptix::facade::device::cuda_caps(ord) {
+            Ok(c) => println!("cuda:{ord}  {}", c.summary()),
+            Err(e) => println!("cuda:{ord}  недоступна: {e}"),
+        }
+    }
+}

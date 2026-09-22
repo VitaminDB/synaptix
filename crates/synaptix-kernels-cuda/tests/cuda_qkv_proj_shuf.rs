@@ -126,12 +126,20 @@ fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, n_q: u32, n_k: u32, n_v
 
 #[test]
 fn qkv_w4_small() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 128, 64, 64, 128);
 }
 
 #[test]
 fn qkv_w4_qwen3_1p7b() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     // Qwen3 1.7B: heads_q=14×128=1792 (not /64), use 16×128=2048; KV=8×128=1024; K=2048
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 2048, 1024, 1024, 2048);
@@ -139,6 +147,10 @@ fn qkv_w4_qwen3_1p7b() {
 
 #[test]
 fn qkv_w8_qwen3_4096() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 4096, 1024, 1024, 4096);
 }

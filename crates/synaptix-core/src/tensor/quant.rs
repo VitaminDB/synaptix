@@ -265,10 +265,17 @@ impl QuantWeight {
         if self.shuffled.get().is_some() {
             return Ok(());
         }
+        let backend = registry::backend_for(self.device)?;
+        // Перемешанная раскладка нужна только FP4-MMA ядрам; без них вес
+        // читает деквант-обход из линейного `packed` — копию не строим и
+        // исходник не освобождаем. `shuffled()` остаётся `None`, батчевые
+        // пути MoE это проверяют.
+        if !backend.quant_native(DType::NVFP4, self.device) {
+            return Ok(());
+        }
         let packed = self
             .packed_arc()
             .ok_or(SynaptixError::Unsupported("ensure_shuffled: packed освобождён"))?;
-        let backend = registry::backend_for(self.device)?;
         let stream = Stream::default_for(self.device)?;
         let bytes = DType::NVFP4.bytes_for_numel(self.n * self.k);
         // Перемешанная копия — это вес, а не активация: в общем пуле она дробит

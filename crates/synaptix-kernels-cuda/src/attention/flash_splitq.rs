@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::kernels::compile::{compile_module_with_opts, load_fn, compile_module_req};
 
 const BM: u32 = 64;
 const BN: u32 = 32;
@@ -79,7 +79,7 @@ impl FlashSplitQKernels {
             }
         }
         let src = include_str!("../cu/fused/attention/flash_splitq.cu");
-        let module = compile_module_with_opts(ctx, src, "flash_splitq.cu", &[], Some("sm_80"))?;
+        let module = compile_module_with_opts(ctx, src, "flash_splitq.cu", &[], None)?;
         let f16_hd64 = load_fn(&module, "flash_splitq_f16_hd64")?;
         let f16_hd128 = load_fn(&module, "flash_splitq_f16_hd128")?;
         let f16_hd256 = load_fn(&module, "flash_splitq_f16_hd256")?;
@@ -290,7 +290,7 @@ impl FlashSplitQ6Kernels {
             return Ok(k.clone());
         }
         let src = include_str!("../cu/fused/attention/flash_splitq6.cu");
-        let module = compile_module_with_opts(ctx, src, "flash_splitq6.cu", &[], Some("sm_90"))?;
+        let module = compile_module_req(ctx, src, "flash_splitq6.cu", &[], crate::caps::Feature::Sm90)?;
         let f16_hd128 = load_fn(&module, "flash_splitq6_f16_hd128")?;
         let bf16_hd128 = load_fn(&module, "flash_splitq6_bf16_hd128")?;
         let f16_hd128_bshd = load_fn(&module, "flash_splitq6_f16_hd128_bshd")?;

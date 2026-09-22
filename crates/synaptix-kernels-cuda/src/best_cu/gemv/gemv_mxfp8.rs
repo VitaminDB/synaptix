@@ -55,7 +55,7 @@ impl GemvMxfp8Kernels {
             }
         }
         let src = include_str!("gemv_mxfp8.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, name, opts, None)?;
         let gemv = load_fn(&module, "gemv_mxfp8_e4m3")?;
         let grouped = load_fn(&module, "gemv_mxfp8_e4m3_grouped")?;
         let new = Arc::new(Self {

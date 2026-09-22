@@ -25,6 +25,7 @@ synaptix convert model.gguf model.syn            # GGUF / safetensors → .syn
 synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant nvfp4
 synaptix chat model.syn --context 32768          # interactive, prefix-KV across turns
 synaptix bench model.syn --n-tokens 128          # prefill / decode throughput
+synaptix devices                                 # compute capability, NVRTC target, block-scale MMA / TMA
 
 synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2, Qwen-Image 2.1
 synaptix video ltx.syn "a paper boat in the rain" -o clip.mp4 --gemma ./gemma-3-12b
@@ -54,6 +55,10 @@ Native ports, each validated against its upstream reference:
 - **NVFP4 (4-bit) and MXFP8 (8-bit)** with block scaling, through `mma.sync` tensor-core
   instructions on Blackwell (sm_120). Quantization can be applied while packing a `.syn`
   bundle, so the on-disk model is the deployed model.
+- **Any sm_80+ card.** Kernels are JIT-compiled for the card's compute capability
+  (`synaptix devices` shows the target). Without Blackwell block-scale MMA, NVFP4 and
+  MXFP8 weights run through a dequantize-to-f16 path; `SYN_FORCE_ARCH=sm_80` compiles
+  everything for an older target to exercise that path on a newer card.
 - **KV-cache in MXFP8 by default** (per-layer: sliding-window layers stay unquantized), with
   block-table attention kernels that read the quantized cache directly.
 - **MoE offload** — experts live in pinned host RAM and stream to the card on demand, with an

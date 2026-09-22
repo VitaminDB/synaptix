@@ -17,6 +17,7 @@ parking_lot   = { workspace = true }
 once_cell     = { workspace = true }
 thiserror     = { workspace = true }
 cudarc        = { workspace = true }
+tracing       = { workspace = true }
 
 [dev-dependencies]
 synaptix-autograd = { workspace = true }

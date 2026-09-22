@@ -131,12 +131,20 @@ fn run(
 
 #[test]
 fn swiglu_w4_small() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 256, 128, "small", 0.99);
 }
 
 #[test]
 fn swiglu_w8_qwen3_1p7b_ffn() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     // Qwen3 1.7B: hidden=2048, intermediate≈6144 — round to 6144 (×128).
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 6144, 2048, "qwen3_1p7b", 0.99);
@@ -144,6 +152,10 @@ fn swiglu_w8_qwen3_1p7b_ffn() {
 
 #[test]
 fn swiglu_w8_qwen3_27648x5120() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 27648, 5120, "qwen3_27648x5120", 0.99);
 }

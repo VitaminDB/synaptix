@@ -11,12 +11,30 @@ pub fn set_cuda_include(path: Option<String>) {
     *CUDA_INCLUDE.write().unwrap() = path;
 }
 
+/// Компиляция под цель карты (см. [`crate::caps::DeviceCaps`]): `sm_120a` на
+/// Blackwell, `sm_80` на Ampere, а с `SYN_FORCE_ARCH` — под указанную цель.
 pub fn compile_module(
     ctx: &Arc<CudaContext>,
     src: &str,
     tag: &'static str,
 ) -> Result<Arc<CudaModule>> {
-    compile_module_with_opts(ctx, src, tag, &[], Some("sm_80"))
+    compile_module_with_opts(ctx, src, tag, &[], None)
+}
+
+/// Как [`compile_module_with_opts`] под цель карты, но сначала проверяет,
+/// что карта (или принудительная цель) имеет возможность `need`; иначе —
+/// `Unsupported` с понятным сообщением вместо лога NVRTC. Так гейтятся
+/// модули, целиком написанные на block-scale MMA (NVFP4/MXFP8 GEMM/GEMV,
+/// fused NVFP4-проекции) и на TMA.
+pub fn compile_module_req(
+    ctx: &Arc<CudaContext>,
+    src: &str,
+    tag: &'static str,
+    extra_options: &[&str],
+    need: crate::caps::Feature,
+) -> Result<Arc<CudaModule>> {
+    crate::caps::DeviceCaps::for_context(ctx).require(need)?;
+    compile_module_with_opts(ctx, src, tag, extra_options, None)
 }
 
 // ── Дисковый кэш NVRTC (source→PTX) ─────────────────────────────────────────
@@ -114,6 +132,10 @@ fn cache_write(path: &Path, key: &[u8], ptx: &str) {
     }
 }
 
+/// `arch = None` — цель карты из [`crate::caps::DeviceCaps`] (с учётом
+/// `SYN_FORCE_ARCH`); `Some(..)` — явная цель (тесты матрицы архитектур).
+/// В опции всегда добавляются `-DSYN_CC=…` и `-DSYN_ARCH_A=…` под выбранную
+/// цель, чтобы `.cu` мог гейтить ветки препроцессором.
 pub fn compile_module_with_opts(
     ctx: &Arc<CudaContext>,
     src: &str,
@@ -121,6 +143,65 @@ pub fn compile_module_with_opts(
     extra_options: &[&str],
     arch: Option<&'static str>,
 ) -> Result<Arc<CudaModule>> {
+    let mut options: Vec<String> = extra_options.iter().map(|s| (*s).to_string()).collect();
+    let arch_s = match arch {
+        Some(a) => {
+            options.extend(defines_for(a, tag)?);
+            a
+        }
+        None => {
+            let caps = crate::caps::DeviceCaps::for_context(ctx);
+            options.extend(caps.defines());
+            caps.arch
+        }
+    };
+    let (ptx, cached) = compile_to_ptx(src, tag, options.clone(), arch_s, true)?;
+    match ctx.load_module(ptx) {
+        Ok(m) => Ok(m),
+        // Битый/несовместимый PTX из кэша — перекомпилируем и перезапишем.
+        Err(_) if cached => {
+            let (ptx, _) = compile_to_ptx(src, tag, options, arch_s, false)?;
+            ctx.load_module(ptx)
+                .map_err(|e| SynaptixError::Cuda(format!("load_module {tag}: {e:?}")))
+        }
+        Err(e) => Err(SynaptixError::Cuda(format!("load_module {tag}: {e:?}"))),
+    }
+}
+
+/// Только NVRTC, без загрузки в контекст: для матрицы архитектур в тестах
+/// (PTX под `sm_90a` на карте sm_120 не загрузить, а собрать — можно).
+/// Возвращает текст PTX.
+pub fn compile_ptx_only(
+    src: &str,
+    tag: &'static str,
+    extra_options: &[&str],
+    arch: &'static str,
+) -> Result<String> {
+    let mut options: Vec<String> = extra_options.iter().map(|s| (*s).to_string()).collect();
+    options.extend(defines_for(arch, tag)?);
+    Ok(compile_to_ptx(src, tag, options, arch, true)?.0.to_src())
+}
+
+/// `-DSYN_CC=…`/`-DSYN_ARCH_A=…` под явную цель.
+fn defines_for(arch: &str, tag: &str) -> Result<[String; 2]> {
+    let (cc, accel) = crate::caps::parse_force_arch(arch)
+        .ok_or_else(|| SynaptixError::Cuda(format!("nvrtc {tag}: цель '{arch}' не разобрана")))?;
+    let accel = accel && cc >= (9, 0);
+    Ok([
+        format!("-DSYN_CC={}", cc.0 * 10 + cc.1),
+        format!("-DSYN_ARCH_A={}", u8::from(accel)),
+    ])
+}
+
+/// `(PTX, взят из кэша)`. `allow_cache = false` — принудительная
+/// перекомпиляция с перезаписью кэша.
+fn compile_to_ptx(
+    src: &str,
+    tag: &'static str,
+    mut options: Vec<String>,
+    arch_s: &'static str,
+    allow_cache: bool,
+) -> Result<(Ptx, bool)> {
     let mut include_paths = Vec::new();
     if let Some(p) = CUDA_INCLUDE.read().unwrap().clone() {
         include_paths.push(p);
@@ -134,9 +215,7 @@ pub fn compile_module_with_opts(
             include_paths.push((*candidate).to_string());
         }
     }
-    let mut options: Vec<String> = extra_options.iter().map(|s| (*s).to_string()).collect();
     options.push("-lineinfo".to_string());
-    let arch_s = arch.unwrap_or("sm_80");
 
     let (cache_path, key) = if cache_enabled() {
         let key = cache_key(src, &options, arch_s);
@@ -146,12 +225,11 @@ pub fn compile_module_with_opts(
         (None, None)
     };
 
-    if let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref()) {
-        if let Some(ptx_src) = cache_read(path, key) {
-            if let Ok(module) = ctx.load_module(Ptx::from_src(ptx_src)) {
-                return Ok(module);
+    if allow_cache {
+        if let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref()) {
+            if let Some(ptx_src) = cache_read(path, key) {
+                return Ok((Ptx::from_src(ptx_src), true));
             }
-            // Битый/несовместимый PTX — падаем в обычную компиляцию и перезапишем.
         }
     }
 
@@ -166,15 +244,12 @@ pub fn compile_module_with_opts(
             CompileError::CompileError { log, .. } => log.to_string_lossy().to_string(),
             other => format!("{other:?}"),
         };
-        SynaptixError::Cuda(format!("nvrtc {tag}: {log_str}"))
+        SynaptixError::Cuda(format!("nvrtc {tag} [{arch_s}]: {log_str}"))
     })?;
     if let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref()) {
         cache_write(path, key, &ptx.to_src());
     }
-    let module = ctx
-        .load_module(ptx)
-        .map_err(|e| SynaptixError::Cuda(format!("load_module {tag}: {e:?}")))?;
-    Ok(module)
+    Ok((ptx, false))
 }
 
 pub fn load_fn(module: &Arc<CudaModule>, name: &str) -> Result<CudaFunction> {

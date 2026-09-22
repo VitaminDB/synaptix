@@ -196,6 +196,11 @@ impl Qwen4ExpWeights {
         use synaptix_core::device::cuda::MirrorRange;
         let Source::Bundle(l) = &self.source else { return Vec::new() };
         let mut out = Vec::with_capacity(self.config.num_hidden_layers * 4);
+        // Без FP4 MMA перемешанная раскладка не нужна: ядра-обходы читают
+        // линейный packed, зеркало хранит байты как в файле.
+        let nvfp4_native = synaptix_core::backend::registry::backend_for(self.device)
+            .map(|b| b.quant_native(DType::NVFP4, self.device))
+            .unwrap_or(false);
         for layer in 0..self.config.num_hidden_layers {
             for name in ["gate_up_proj", "down_proj"] {
                 let key = self.resolve(&format!("{LM_PREFIX}.layers.{layer}.mlp.experts.{name}"));
@@ -203,7 +208,11 @@ impl Qwen4ExpWeights {
                 // NVFP4-стопка: зеркало хранит матрицы перемешанными — как их
                 // читают ядра; иные форматы — байт в байт.
                 let repack = match (l.quant_kind(&key), l.quant_dims(&key)) {
-                    (Some(synaptix_bundle::inspect::QuantKind::Nvfp4), Some((_, n, k))) => Some((n, k)),
+                    (Some(synaptix_bundle::inspect::QuantKind::Nvfp4), Some((_, n, k)))
+                        if nvfp4_native =>
+                    {
+                        Some((n, k))
+                    }
                     _ => None,
                 };
                 // Диапазоны режем на куски ≤64 МБ (целое число матриц):

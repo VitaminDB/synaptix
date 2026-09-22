@@ -45,7 +45,7 @@ impl TopkKernels {
             }
         }
         let src = include_str!("../cu/reduction/topk.cu");
-        let module = compile_module_with_opts(ctx, src, "topk.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, "topk.cu", &[], None)?;
         let f32 = load_fn(&module, "topk_f32")?;
         let f16 = load_fn(&module, "topk_f16")?;
         let bf16 = load_fn(&module, "topk_bf16")?;

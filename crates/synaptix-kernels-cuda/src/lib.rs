@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod best_cu;
+pub mod caps;
 pub mod comm;
 pub mod conv;
 pub mod cuda_backend;

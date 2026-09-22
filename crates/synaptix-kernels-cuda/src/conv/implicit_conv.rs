@@ -70,7 +70,7 @@ impl ImplicitConvKernels {
             }
         }
         let src = include_str!("../cu/conv/implicit_conv.cu");
-        let module = compile_module_with_opts(ctx, src, "implicit_conv.cu", &[], Some("sm_120a"))?;
+        let module = compile_module_with_opts(ctx, src, "implicit_conv.cu", &[], None)?;
         let (bf16, bf16_part) = load_set(&module, "implicit_conv_bf16")?;
         let (f16, f16_part) = load_set(&module, "implicit_conv_f16")?;
         let new = Arc::new(Self {

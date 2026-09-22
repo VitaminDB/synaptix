@@ -78,7 +78,7 @@ impl FlashDecodeMxfp8V2Kernels {
     fn build(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
         let src = include_str!("../cu/fused/attention/flash_decode_mxfp8_v2.cu");
         let module =
-            compile_module_with_opts(ctx, src, "flash_decode_mxfp8_v2.cu", &[], Some("sm_120a"))?;
+            compile_module_with_opts(ctx, src, "flash_decode_mxfp8_v2.cu", &[], None)?;
         let load3 = |t: &str, g: u32, d: u32, dev: bool| -> Result<CudaFunction> {
             let suffix = if dev { "_dev" } else { "" };
             load_fn(&module, &format!("fd2_{t}_g{g}_d{d}{suffix}"))

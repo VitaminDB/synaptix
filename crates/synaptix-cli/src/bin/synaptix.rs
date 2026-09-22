@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
-    bench, chat, convert, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, sheet, song,
+    bench, chat, convert, device, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, sheet, song,
     speak,
     train, transcribe, video,
 };
@@ -18,6 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// CUDA-карты: compute capability, цель NVRTC, block-scale MMA/TMA.
+    Devices,
     Inspect {
         file: PathBuf,
         #[arg(short, long)]
@@ -833,6 +835,10 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let res: Result<(), Box<dyn std::error::Error>> = match cli.command {
+        Commands::Devices => {
+            device::list();
+            Ok(())
+        }
         Commands::Inspect { file, verbose, filter } => {
             inspect::run(inspect::InspectArgs { file, verbose, filter })
         }

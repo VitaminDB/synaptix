@@ -39,8 +39,7 @@ impl MmaGemvKernels {
             }
         }
         let src = include_str!("mma_gemv.cu");
-        // FP8 PTX cvt.f16x2.e4m3x2 требует sm_89+. F16/BF16/F32 GEMV — обычные.
-        let module = compile_module_with_opts(ctx, src, "mma_gemv.cu", &[], Some("sm_89"))?;
+        let module = compile_module_with_opts(ctx, src, "mma_gemv.cu", &[], None)?;
         let gemv_f16 = load_fn(&module, "mma_gemv_f16")?;
         let gemv_bf16 = load_fn(&module, "mma_gemv_bf16")?;
         let gemv_f32 = load_fn(&module, "mma_gemv_f32")?;

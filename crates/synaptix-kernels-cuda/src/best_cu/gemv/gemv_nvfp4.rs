@@ -10,7 +10,7 @@ use half::f16;
 use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::kernels::compile::{compile_module_with_opts, load_fn};
+use crate::kernels::compile::{compile_module_req, load_fn};
 
 pub struct Nvfp4MmaGemvShufKernels {
     _module: Arc<CudaModule>,
@@ -81,7 +81,7 @@ impl Nvfp4MmaGemvShufKernels {
             }
         }
         let src = include_str!("gemv_nvfp4.cu");
-        let module = compile_module_with_opts(ctx, src, name, opts, Some("sm_120a"))?;
+        let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Fp4Mma)?;
         let repack = load_fn(&module, "nvfp4_w_repack")?;
         let w4 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w4")?;
         let w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8")?;

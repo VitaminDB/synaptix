@@ -161,6 +161,15 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// Исполняет ли backend квант-формат `dtype` нативно — тензорными ядрами
+    /// на устройстве `device` (NVFP4/MXFP8 — block-scale MMA Blackwell).
+    /// `false` — веса в этом формате считаются обходом «деквант → плотный
+    /// GEMM»: пред-квантованные пары активаций, перемешанные копии NVFP4 и
+    /// таблицы экспертов не нужны и не строятся. Default `false`.
+    fn quant_native(&self, _dtype: DType, _device: Device) -> bool {
+        false
+    }
+
     /// Квантование плотного веса `w[N,K]` (F16) в NVFP4: возвращает `(packed,
     /// scales)` storages (E2M1 4-бит + E4M3 block scale, tile-major layout) для
     /// последующего `linear_quant`. One-time на загрузке. Default `Unsupported`.

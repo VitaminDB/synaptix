@@ -83,6 +83,10 @@ fn case_ln(b: usize, t: usize, k: usize, dt: DType) {
 
 #[test]
 fn ln_mod_quant_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -120,6 +124,10 @@ fn case_w(m: usize, k: usize, dt: DType, qwen: bool) {
 
 #[test]
 fn rms_w_quant_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -133,6 +141,10 @@ fn rms_w_quant_bitexact() {
 
 #[test]
 fn rms_mod_quant_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -236,6 +248,10 @@ fn case_w_mx(m: usize, k: usize, dt: DType, qwen: bool) {
 
 #[test]
 fn rms_mod_quant_mxfp8_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -248,6 +264,10 @@ fn rms_mod_quant_mxfp8_bitexact() {
 
 #[test]
 fn ln_mod_quant_mxfp8_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -260,6 +280,10 @@ fn ln_mod_quant_mxfp8_bitexact() {
 
 #[test]
 fn rms_w_quant_mxfp8_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -275,6 +299,10 @@ fn rms_w_quant_mxfp8_bitexact() {
 // бит-в-бит (тот же квант + тот же rot-GEMM).
 #[test]
 fn linear_quant_prequant_mxfp8_bitexact() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -299,6 +327,10 @@ fn linear_quant_prequant_mxfp8_bitexact() {
 
 #[test]
 fn rms_mod_quant_bench() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err() {
         return;
     }
@@ -347,6 +379,10 @@ fn rms_mod_quant_bench() {
 /// (запускается только с SYN_NVFP4_E2M1_THRESHOLD=1).
 #[test]
 fn e2m1_threshold_divergence() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
     if synaptix_core::device::cuda::get(0).is_err()
         || std::env::var("SYN_NVFP4_E2M1_THRESHOLD").as_deref() != Ok("1")
     {
