@@ -908,3 +908,103 @@ pub fn mxfp8_linear_dequant_fallback(
         Ok(())
     })
 }
+
+/// Портируемый квантованный linear для любого формата веса на любой карте
+/// sm_80+ (без block-scale MMA): `out[m, n] = x[m, k] · W[n, k]ᵀ`, активация
+/// и выход F16 (`bf16 = false`) или BF16.
+///
+/// * `m ≤ 8` — GEMV с деквантом в регистрах (`blockq_gemv`), вес читается
+///   один раз, полоса на варп;
+/// * иначе — деквант полосами строк веса в f16/bf16 (бюджет
+///   `SYN_MXFP8_DEQ_MB`, общий скретч с MXFP8-фолбэком) и плотный cp.async
+///   GEMM (`best_gemm_*_linear_u8`); куски сшиваются в `out` pitched-копиями.
+///   Пик памяти — `m·chunk·2 + chunk·K·2` вместо `N·K·2`.
+///
+/// Это путь этапа 2 плана: деквант в плитке mainloop'а GEMM — следующая
+/// оптимизация, здесь важна корректность на всех форматах и картах.
+pub fn quant_linear_generic(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    x_u8: &CudaSlice<u8>,
+    out_u8: &mut CudaSlice<u8>,
+    w: &QuantWeight,
+    m: u32,
+    bf16: bool,
+) -> Result<()> {
+    use crate::best_cu::gemm::gemm_bf16::{
+        best_gemm_bf16_linear_u8, best_gemm_f16tn_linear_u8, copy_2d_bytes, BestGemmBf16Kernels,
+    };
+    use crate::elementwise::blockq::{
+        blockq_dequant_band_syn, blockq_dequant_raw, blockq_gemv, BlockqDequantKernels, BlockqGemvKernels,
+        GEMV_MAX_M,
+    };
+
+    let dtype = w.dtype();
+    let n = w.n() as u32;
+    let k = w.k() as u32;
+    let (m_us, n_us, k_us) = (m as usize, n as usize, k as usize);
+    if k % 32 != 0 {
+        return Err(SynaptixError::Unsupported("quant_linear_generic: K должно быть кратно 32"));
+    }
+    let packed_arc = w
+        .packed_arc()
+        .ok_or(SynaptixError::Unsupported("quant_linear_generic: packed W освобождён (перемешанная копия без FP4 MMA не читается)"))?;
+    let packed = packed_arc
+        .as_cuda()
+        .ok_or(SynaptixError::Unsupported("quant_linear_generic: packed non-cuda"))?
+        .slice();
+    let scales_st = w.scales_opt();
+    let scales = match scales_st {
+        Some(s) => s
+            .as_cuda()
+            .ok_or(SynaptixError::Unsupported("quant_linear_generic: scales non-cuda"))?
+            .slice(),
+        None => packed,
+    };
+    let is_syn = matches!(dtype, DType::NVFP4 | DType::MXFP8);
+    if is_syn && scales_st.is_none() {
+        return Err(SynaptixError::Unsupported("quant_linear_generic: у NVFP4/MXFP8 нет масштабов"));
+    }
+
+    if m_us <= GEMV_MAX_M {
+        let gk = if bf16 { BlockqGemvKernels::for_context_bf16(ctx)? } else { BlockqGemvKernels::for_context(ctx)? };
+        let mut out_v = out_u8.as_view_mut();
+        return blockq_gemv(&gk, stream, dtype, &packed.as_view(), &scales.as_view(), &x_u8.as_view(), &mut out_v, n, k, m, k, n);
+    }
+
+    // Префилл: деквант полосами + плотный GEMM.
+    let dk = if bf16 { BlockqDequantKernels::for_context_bf16(ctx)? } else { BlockqDequantKernels::for_context(ctx)? };
+    let bk = BestGemmBf16Kernels::for_context(ctx)?;
+    let row_bytes = k_us * 2;
+    let chunk = ((mxfp8_deq_budget_bytes() / row_bytes.max(1)).max(1) as u32).min(n);
+    let w_need = chunk as usize * row_bytes;
+    let y_need = m_us * chunk as usize * 2;
+    let blob_rb = if is_syn { 0 } else {
+        synaptix_core::quant::block_row_bytes(dtype, k_us)
+            .ok_or(SynaptixError::Unsupported("quant_linear_generic: K не кратен блоку формата"))?
+    };
+    with_mxfp8_deq_scratch(stream, ctx.ordinal(), w_need, y_need, |w_deq, y| {
+        let mut n0 = 0u32;
+        while n0 < n {
+            let cn = chunk.min(n - n0);
+            let (o, cn_us) = (n0 as usize, cn as usize);
+            {
+                let mut wv = w_deq.as_view_mut();
+                if is_syn {
+                    blockq_dequant_band_syn(&dk, stream, dtype, &packed.as_view(), &scales.as_view(), &mut wv, cn, k, n0)?;
+                } else {
+                    let band = packed.slice(o * blob_rb..(o + cn_us) * blob_rb);
+                    blockq_dequant_raw(&dk, stream, dtype, &band, &mut wv, cn, k)?;
+                }
+            }
+            if bf16 {
+                best_gemm_bf16_linear_u8(&bk, stream, w_deq, x_u8, y, cn, k, m, None, None)?;
+            } else {
+                best_gemm_f16tn_linear_u8(&bk, stream, w_deq, x_u8, y, cn, k, m, None, None)?;
+            }
+            copy_2d_bytes(stream, y, out_u8, m, cn_us * 2, cn_us * 2, n_us * 2, o * 2)?;
+            n0 += cn;
+        }
+        Ok(())
+    })
+}

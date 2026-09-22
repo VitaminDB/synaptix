@@ -118,7 +118,7 @@ impl QuantWeight {
             }
             DType::MXFP8 if out_dt == DType::F16 => {
                 let scales = self.scales();
-                let p_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), DType::U8);
+                let p_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), DType::MXFP8);
                 let s_layout = Layout::contiguous(Shape::new(vec![self.n, self.k / 32]), DType::U8);
                 backend.mxfp8_dequant((&packed, &p_layout), (scales, &s_layout), (&mut out, &out_layout), &stream)?;
             }
@@ -486,6 +486,57 @@ impl QuantWeight {
             &stream,
         )?;
         Ok(Tensor::from_parts(std::sync::Arc::new(storage), out_layout))
+    }
+
+    /// Батч GEMV любого квант-формата с плотной активацией: `out[e] = W_e ·
+    /// x[rows[e]]`, `x` — `[r, k]` (F16/BF16, contiguous), выход `[E, n]` в
+    /// dtype `x`. Портируемый путь MoE (без перемешанных копий и
+    /// пред-квантованных активаций); веса одной формы и формата.
+    pub fn gemv_batched_dense(weights: &[&QuantWeight], x: &Tensor, rows: &[usize]) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        if weights.is_empty() || weights.len() != rows.len() {
+            return Err(SynaptixError::Unsupported("gemv_batched_dense: пустой или неровный батч"));
+        }
+        let first = weights[0];
+        let (n, k, device, dtype) = (first.n, first.k, first.device, first.dtype);
+        if x.rank() != 2 || x.dims()[1] != k || !x.is_contiguous() || x.device() != device {
+            return Err(SynaptixError::Unsupported("gemv_batched_dense: активация не [r, k] contiguous на устройстве веса"));
+        }
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("gemv_batched_dense: активация только F16/BF16"));
+        }
+        if rows.iter().any(|r| *r >= x.dims()[0]) {
+            return Err(SynaptixError::Unsupported("gemv_batched_dense: строка активации вне буфера"));
+        }
+        let mut packed: Vec<Arc<Storage>> = Vec::with_capacity(weights.len());
+        for w in weights {
+            if w.n != n || w.k != k || w.device != device || w.dtype != dtype {
+                return Err(SynaptixError::Unsupported("gemv_batched_dense: разнородные веса"));
+            }
+            packed.push(w.packed_arc().ok_or(SynaptixError::Unsupported("gemv_batched_dense: packed освобождён"))?);
+        }
+        let w_packed: Vec<&Storage> = packed.iter().map(|p| p.as_ref()).collect();
+        let w_scales: Vec<Option<&Storage>> = weights.iter().map(|w| w.scales_opt()).collect();
+        let out_layout = Layout::contiguous(Shape::new(vec![weights.len(), n]), x.dtype());
+        let backend = registry::backend_for(device)?;
+        let mut storage = backend.alloc_uninit(x.dtype().bytes_for_numel(weights.len() * n), device)?;
+        let stream = Stream::default_for(device)?;
+        backend.quant_gemv_batched(
+            &w_packed,
+            &w_scales,
+            dtype,
+            &x.storage,
+            rows,
+            (&mut storage, &out_layout),
+            n,
+            k,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
     /// Адрес перемешанной копии и её масштабов на карте — из них строится

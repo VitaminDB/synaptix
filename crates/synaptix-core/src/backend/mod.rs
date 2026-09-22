@@ -667,6 +667,26 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("block_dequant не поддержан этим backend"))
     }
 
+    /// Батч GEMV по квантованным весам любого формата с плотной активацией
+    /// (портируемый путь MoE): `out[e, n] = x[x_rows[e], k] · W_e[n, k]ᵀ`.
+    /// `x` — `[rows, k]` подряд в dtype выхода (F16/BF16), `w_scales[e]` —
+    /// масштабы NVFP4/MXFP8 или `None` у одноблобных.
+    #[allow(clippy::too_many_arguments)]
+    fn quant_gemv_batched(
+        &self,
+        _w_packed: &[&Storage],
+        _w_scales: &[Option<&Storage>],
+        _dtype: DType,
+        _x: &Storage,
+        _x_rows: &[usize],
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("quant_gemv_batched не поддержан этим backend"))
+    }
+
     /// Двунаправленный sliding-window flash (band ±window). Default Unsupported
     /// → caller fallback (наивная маска).
     #[allow(clippy::too_many_arguments)]

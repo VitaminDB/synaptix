@@ -547,18 +547,24 @@ impl Backend for CudaBackend {
 
         let bf16 = x_lo.dtype() == DType::BF16;
         let caps = crate::caps::DeviceCaps::for_context(&ctx);
+        // Нативные block-scale MMA ядра — только на Blackwell и только у
+        // NVFP4/MXFP8; всё остальное (одноблобные форматы везде, NVFP4/MXFP8
+        // без FP4 MMA) идёт портируемым путём: GEMV с деквантом в регистрах
+        // на M ≤ 8, деквант полосами + плотный GEMM на префилле.
+        if !caps.quant_native(w.dtype()) || w.dtype().is_block_quant() {
+            return crate::gemm::dispatch::quant_linear_generic(
+                &ctx,
+                &stream,
+                x_buf.slice(),
+                out_buf.slice_mut(),
+                w,
+                m,
+                bf16,
+            );
+        }
         match w.dtype() {
             DType::NVFP4 => {
-                // Без FP4 MMA (карта ниже Blackwell / SYN_FORCE_ARCH) — путь
-                // «деквант W → f16 → плотный GEMM». BF16-активацию он не
-                // берёт: `Unsupported` → QLinear::forward идёт через F16.
-                // Этап 2 плана заменит его ядром W4A16 с деквантом в плитке.
-                if bf16 && !caps.fp4_mma() {
-                    return Err(SynaptixError::Unsupported(
-                        "linear_quant NVFP4: без FP4 MMA активация только F16",
-                    ));
-                }
-                if !bf16 && (nvfp4_weight_only() || !caps.fp4_mma()) {
+                if !bf16 && nvfp4_weight_only() {
                     use half::f16;
                     let nn = w.n();
                     if k % 16 != 0 {
@@ -1332,6 +1338,7 @@ impl Backend for CudaBackend {
         mod_div: usize,
         _stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::MXFP8, "rms_mod_quant_mxfp8: карта без MXFP8 MMA")?;
         let kind = match kind {
             0 => crate::fused::rms_mod_quant::NormQuantKind::RmsMod,
             1 => crate::fused::rms_mod_quant::NormQuantKind::LnMod,
@@ -1410,6 +1417,7 @@ impl Backend for CudaBackend {
         k: usize,
         _stream: &Stream,
     ) -> Result<()> {
+        require_quant_native(x.0, DType::MXFP8, "mxfp8_quantize_act: карта без MXFP8 MMA")?;
         let (x_st, x_lo) = x;
         if !x_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
@@ -2751,6 +2759,70 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("block_dequant: out не на карте"))?
             .slice_mut();
         crate::elementwise::blockq::blockq_dequant(&kernels, &stream, dtype, src, dst, n as u32, k as u32)
+    }
+
+    fn quant_gemv_batched(
+        &self,
+        w_packed: &[&Storage],
+        w_scales: &[Option<&Storage>],
+        dtype: DType,
+        x: &Storage,
+        x_rows: &[usize],
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let (out_st, out_lo) = out;
+        let experts = w_packed.len();
+        if experts == 0 {
+            return Ok(());
+        }
+        if w_scales.len() != experts || x_rows.len() != experts {
+            return Err(SynaptixError::Unsupported("quant_gemv_batched: неровный батч"));
+        }
+        let bf16 = match out_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("quant_gemv_batched: out только F16/BF16")),
+        };
+        let (ctx, stream) = ctx_stream_of(w_packed[0], "quant_gemv_batched")?;
+        let kernels = if bf16 {
+            crate::elementwise::blockq::BlockqGemvKernels::for_context_bf16(&ctx)?
+        } else {
+            crate::elementwise::blockq::BlockqGemvKernels::for_context(&ctx)?
+        };
+        let addr = |st: &Storage, what: &'static str| -> Result<u64> {
+            let buf = st.as_cuda().ok_or(SynaptixError::Unsupported(what))?;
+            let (ptr, _g) = buf.slice().device_ptr(&stream);
+            Ok(ptr)
+        };
+        let mut wp = Vec::with_capacity(experts);
+        let mut sp = Vec::with_capacity(experts);
+        for (w, s) in w_packed.iter().zip(w_scales) {
+            let a = addr(w, "quant_gemv_batched: вес не на карте")?;
+            wp.push(a);
+            sp.push(match s {
+                Some(s) => addr(s, "quant_gemv_batched: масштабы не на карте")?,
+                None => a,
+            });
+        }
+        let x_base = addr(x, "quant_gemv_batched: активация не на карте")?;
+        let xp: Vec<u64> = x_rows.iter().map(|r| x_base + (r * k * 2) as u64).collect();
+        let out_base = {
+            let buf = out_st.as_cuda().ok_or(SynaptixError::Unsupported("quant_gemv_batched: out не на карте"))?;
+            let (ptr, _g) = buf.slice().device_ptr(&stream);
+            ptr
+        };
+        let op: Vec<u64> = (0..experts).map(|e| out_base + (e * n * 2) as u64).collect();
+        let tab = |v: &[u64]| -> Result<cudarc::driver::CudaSlice<u64>> {
+            stream.clone_htod(v).map_err(|e| SynaptixError::Cuda(format!("quant_gemv_batched: таблица: {e:?}")))
+        };
+        let (dw, ds, dx, dout) = (tab(&wp)?, tab(&sp)?, tab(&xp)?, tab(&op)?);
+        crate::elementwise::blockq::blockq_gemv_batched(
+            &kernels, &stream, dtype, &dw, &ds, &dx, &dout, experts as u32, n as u32, k as u32,
+        )
     }
     fn flash_attention_window(
         &self,

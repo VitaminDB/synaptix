@@ -1610,6 +1610,15 @@ impl MoeFfn {
         if std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
+        // Групповой GEMM и пред-квантованные активации — только на FP4 MMA;
+        // без него (карта ниже Blackwell) префилл идёт по экспертам обычным
+        // `forward` → портируемый `linear_quant`.
+        let nvfp4_native = synaptix_core::backend::registry::backend_for(self.device)
+            .map(|b| b.quant_native(DType::NVFP4, self.device))
+            .unwrap_or(false);
+        if !nvfp4_native {
+            return Ok(None);
+        }
 
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
@@ -1874,12 +1883,69 @@ impl MoeFfn {
                 }
             }
         }
-        if !ready {
-            if let Some(cache) = &self.cache {
-                cache.note_batch(false);
+        let parts = if ready {
+            let Some(parts) = self.batched_pairs_nvfp4(x, &picked, pairs, k)? else {
+                if let Some(cache) = &self.cache {
+                    cache.note_batch(false);
+                }
+                return Ok(None);
+            };
+            parts
+        } else {
+            // Без перемешанных NVFP4-копий (карта без FP4 MMA, одноблобные
+            // форматы SQ/ggml): портируемый батч — GEMV с деквантом в
+            // регистрах по плотной активации, swiglu между ними.
+            let Some(parts) = self.batched_pairs_generic(x, &picked, pairs, k)? else {
+                if let Some(cache) = &self.cache {
+                    cache.note_batch(false);
+                }
+                return Ok(None);
+            };
+            parts
+        };
+
+        let scale: Vec<f32> = pairs.iter().map(|p| weights[*p]).collect();
+        if pairs.len() == t * k {
+            let w32 = Tensor::from_vec::<_, f32>(scale.clone(), vec![pairs.len()], self.device)
+                .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
+            match parts.weighted_rows_sum_fused(&w32, t, k) {
+                Ok(s) => return Ok(Some(s)),
+                Err(SynError::Unsupported(_)) | Err(SynError::NonContiguous) => {}
+                Err(e) => return Err(ModelError::Forward(format!("MoE: сумма по экспертам: {e}"))),
             }
-            return Ok(None);
         }
+        let scale = Tensor::from_vec::<_, f32>(scale, vec![pairs.len(), 1], self.device)
+            .and_then(|s| s.to_dtype(parts.dtype()))
+            .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
+        let scaled = parts
+            .broadcast_mul(&scale)
+            .map_err(|e| ModelError::Forward(format!("MoE: взвешивание: {e}")))?;
+        // Слагаемые пары ложатся на свой токен: при одном токене это просто
+        // сумма всех строк, иначе пары идут полными группами по k.
+        let summed = if t == 1 {
+            scaled
+                .sum([0usize])
+                .and_then(|m| m.reshape((1, self.cfg.hidden_size)))
+                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+        } else {
+            scaled
+                .reshape((t, k, self.cfg.hidden_size))
+                .and_then(|m| m.sum([1usize]))
+                .and_then(|m| m.reshape((t, self.cfg.hidden_size)))
+                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+        };
+        Ok(Some(summed))
+    }
+
+    /// Нативный батч NVFP4 (Blackwell): пред-квантованная активация, батчевый
+    /// GEMV по перемешанным копиям, фьюз swiglu → квант, второй батч.
+    fn batched_pairs_nvfp4(
+        &self,
+        x: &Tensor,
+        picked: &[&Expert],
+        pairs: &[usize],
+        k: usize,
+    ) -> Result<Option<Tensor>, ModelError> {
 
         let xf = if x.dtype() == DType::F16 { x.clone() } else { to_f16(x)? };
         let Ok((packed_x, scales_x)) = xf.nvfp4_quantize_act() else {
@@ -1916,38 +1982,54 @@ impl MoeFfn {
         let Ok(parts) = QuantWeight::gemv_batched(&down, &acts, &rows) else {
             return Ok(None);
         };
+        Ok(Some(parts))
+    }
 
-        let scale: Vec<f32> = pairs.iter().map(|p| weights[*p]).collect();
-        if pairs.len() == t * k {
-            let w32 = Tensor::from_vec::<_, f32>(scale.clone(), vec![pairs.len()], self.device)
-                .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
-            match parts.weighted_rows_sum_fused(&w32, t, k) {
-                Ok(s) => return Ok(Some(s)),
-                Err(SynError::Unsupported(_)) | Err(SynError::NonContiguous) => {}
-                Err(e) => return Err(ModelError::Forward(format!("MoE: сумма по экспертам: {e}"))),
+    /// Портируемый батч (любой квант-формат, любая карта sm_80+): два
+    /// батчевых GEMV с плотной активацией (F16/BF16) и swiglu между ними.
+    /// `None` — веса не квантованы или разнородны.
+    fn batched_pairs_generic(
+        &self,
+        x: &Tensor,
+        picked: &[&Expert],
+        pairs: &[usize],
+        k: usize,
+    ) -> Result<Option<Tensor>, ModelError> {
+        let mut gate_up: Vec<&QuantWeight> = Vec::with_capacity(picked.len());
+        let mut down: Vec<&QuantWeight> = Vec::with_capacity(picked.len());
+        for e in picked {
+            match (e.gate_up.quant_weight(), e.down.quant_weight()) {
+                (Some(g), Some(d)) => {
+                    gate_up.push(g);
+                    down.push(d);
+                }
+                _ => return Ok(None),
             }
         }
-        let scale = Tensor::from_vec::<_, f32>(scale, vec![pairs.len(), 1], self.device)
-            .and_then(|s| s.to_dtype(parts.dtype()))
-            .map_err(|e| ModelError::Forward(format!("MoE: веса роутера: {e}")))?;
-        let scaled = parts
-            .broadcast_mul(&scale)
-            .map_err(|e| ModelError::Forward(format!("MoE: взвешивание: {e}")))?;
-        // Слагаемые пары ложатся на свой токен: при одном токене это просто
-        // сумма всех строк, иначе пары идут полными группами по k.
-        let summed = if t == 1 {
-            scaled
-                .sum([0usize])
-                .and_then(|m| m.reshape((1, self.cfg.hidden_size)))
-                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+        let xa = if matches!(x.dtype(), DType::F16 | DType::BF16) { x.clone() } else { to_f16(x)? };
+        let xa = if xa.is_contiguous() {
+            xa
         } else {
-            scaled
-                .reshape((t, k, self.cfg.hidden_size))
-                .and_then(|m| m.sum([1usize]))
-                .and_then(|m| m.reshape((t, self.cfg.hidden_size)))
-                .map_err(|e| ModelError::Forward(format!("MoE: сумма по экспертам: {e}")))?
+            xa.contiguous().map_err(|e| ModelError::Forward(e.to_string()))?
         };
-        Ok(Some(summed))
+        let rows: Vec<usize> = pairs.iter().map(|p| p / k).collect();
+        let gu = match QuantWeight::gemv_batched_dense(&gate_up, &xa, &rows) {
+            Ok(t) => t,
+            Err(SynError::Unsupported(_)) => return Ok(None),
+            Err(e) => return Err(ModelError::Forward(format!("MoE: батч gate_up: {e}"))),
+        };
+        let h = self.swiglu(&gu)?;
+        let h = if h.is_contiguous() {
+            h
+        } else {
+            h.contiguous().map_err(|e| ModelError::Forward(e.to_string()))?
+        };
+        let rows: Vec<usize> = (0..picked.len()).collect();
+        match QuantWeight::gemv_batched_dense(&down, &h, &rows) {
+            Ok(t) => Ok(Some(t)),
+            Err(SynError::Unsupported(_)) => Ok(None),
+            Err(e) => Err(ModelError::Forward(format!("MoE: батч down: {e}"))),
+        }
     }
 
     /// Поднять на устройство всех экспертов чанка, которых там ещё нет.

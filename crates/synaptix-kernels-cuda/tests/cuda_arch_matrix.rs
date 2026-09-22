@@ -138,6 +138,11 @@ fn blockq_dequant_builds_for_every_target() {
     for arch in ARCHES {
         compile_ptx_only(&src, "blockq_dequant.cu", synaptix_kernels_cuda::elementwise::blockq::MODULE_OPTS, arch)
             .unwrap_or_else(|e| panic!("blockq_dequant.cu @ {arch}: {e}"));
+        let gsrc = synaptix_kernels_cuda::elementwise::blockq::gemv_module_source();
+        compile_ptx_only(&gsrc, "blockq_gemv.cu", &[], arch)
+            .unwrap_or_else(|e| panic!("blockq_gemv.cu @ {arch}: {e}"));
+        compile_ptx_only(&gsrc, "blockq_gemv_bf16.cu", &["-DSYN_ACT_BF16"], arch)
+            .unwrap_or_else(|e| panic!("blockq_gemv_bf16.cu @ {arch}: {e}"));
     }
 }
 
