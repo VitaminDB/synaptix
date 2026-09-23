@@ -168,6 +168,7 @@ pub fn denoise(
     }
 
     for i in 0..opts.steps {
+        crate::check_cancel()?;
         let tc = t[i];
         let v = if cfg {
             let x2 = Tensor::cat(&[&x, &x], 0)?;
@@ -218,6 +219,7 @@ fn denoise_repaint(
         (None, None)
     };
     for i in 0..opts.steps {
+        crate::check_cancel()?;
         let tc = t[i];
         let v = if cfg {
             let x2 = Tensor::cat(&[&x, &x], 0)?;
@@ -321,6 +323,7 @@ fn denoise_sdedit(
         (None, None)
     };
     for i in start_idx..opts.steps {
+        crate::check_cancel()?;
         let tc = t[i];
         let v = if cfg {
             let x2 = Tensor::cat(&[&x, &x], 0)?;
@@ -387,6 +390,7 @@ fn denoise_graph(
     graph.upload().map_err(|e| AceError::Other(format!("dit graph upload: {e}")))?;
 
     for i in 0..steps {
+        crate::check_cancel()?;
         let (h_i, _) = dit.proj_in_h(&Tensor::cat(&[&x, &x], 0)?, ctx2)?;
         h_buf.copy_from(&h_i)?;
         let (temb_i, tproj_i) = dit.compute_temb(t[i], t[i], device)?;
@@ -704,10 +708,14 @@ pub fn generate_music(
     let cfg = DitConfig::xl_base();
     let seed = codes_opts.seed;
     let enc_compute = compute;
-    let stage = |s: MusicStage, p: &std::path::Path| {
+    // Между стадиями — тоже точка отмены: загрузка следующего компонента
+    // идёт секунды, и Stop не должен её дожидаться.
+    let stage = |s: MusicStage, p: &std::path::Path| -> Result<(), AceError> {
+        crate::check_cancel()?;
         if let Some(h) = &extras.on_stage {
             (h.0)(s, p);
         }
+        Ok(())
     };
 
     if let Some(c) = cache.as_deref_mut() {
@@ -782,7 +790,7 @@ pub fn generate_music(
                     &mut lm_owned
                 }
             };
-            stage(MusicStage::Lm, paths.lm);
+            stage(MusicStage::Lm, paths.lm)?;
             let lm_tok = AceTokenizer::from_bytes(&read_bundle_file(paths.lm, "tokenizer.json")?)?;
             let t_ar = std::time::Instant::now();
             // Малая карта: LM стримит блоки — на время AR часть возвращается на
@@ -841,7 +849,7 @@ pub fn generate_music(
                 &te_owned
             }
         };
-        stage(MusicStage::TextEncoder, paths.text_encoder);
+        stage(MusicStage::TextEncoder, paths.text_encoder)?;
         let tok = HfTokenizer::from_bytes(&read_bundle_file(paths.text_encoder, "tokenizer.json")?)
             .map_err(|e| AceError::Load(e.to_string()))?;
         let enc_ids = |s: &str| -> Result<Tensor, AceError> {
@@ -939,7 +947,7 @@ pub fn generate_music(
                 &dit_owned
             }
         };
-        stage(MusicStage::Dit, paths.dit);
+        stage(MusicStage::Dit, paths.dit)?;
         let x0 = {
             let base = Tensor::randn_seeded(vec![1usize, t_frames, 64], seed, Device::Cpu)?;
             let mixed = if matches!(edit.mode, EditMode::Retake) && edit.retake_variance > 0.0 {
@@ -999,7 +1007,7 @@ pub fn generate_music(
             &vae_owned
         }
     };
-    stage(MusicStage::Vae, paths.vae);
+    stage(MusicStage::Vae, paths.vae)?;
     let latent_ncl = latent.transpose(1, 2)?.contiguous()?;
     let audio = vae.decode_tiled(&latent_ncl, 500, 32)?;
     let ch0 = audio.narrow(1, 0, 1)?.contiguous()?;

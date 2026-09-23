@@ -104,6 +104,7 @@ pub fn generate_codes(
     }
 
     while codes.len() < target {
+        crate::check_cancel()?;
         let tok_id = base as u32 + *codes.last().unwrap();
         let nxt = Tensor::from_vec(vec![tok_id], vec![1usize, 1usize], device)?;
         logits = lm.forward(&nxt, &mut kv)?;
@@ -200,6 +201,7 @@ fn decode_codes_graph(
     codes.push(code1);
 
     while codes.len() < target {
+        crate::check_cancel()?;
         let last = *codes.last().unwrap();
         let pos_c = (lc + codes.len() - 1) as u32;
         state_c.update(base as u32 + last, pos_c).map_err(|e| AceError::Other(e.to_string()))?;
@@ -305,6 +307,7 @@ fn decode_codes_graph_batched(
     codes.push(code1);
 
     while codes.len() < target {
+        crate::check_cancel()?;
         let last = *codes.last().unwrap();
         let tok = base as u32 + last;
         let pos_c = (lc + codes.len() - 1) as u32;
@@ -419,6 +422,7 @@ pub fn generate_phase1(
     let mut sampler = TokenSampler::new(&gcfg, &ids);
     let mut gen: Vec<u32> = Vec::with_capacity(max_tokens);
     for _ in 0..max_tokens {
+        crate::check_cancel()?;
         let tok_id = sampler.sample(&logits).map_err(|e| AceError::Other(e.to_string()))?;
         gen.push(tok_id);
         if Some(tok_id) == think_end || tok_id == tok.eos() {
