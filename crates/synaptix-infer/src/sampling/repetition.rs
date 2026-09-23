@@ -29,9 +29,14 @@ impl LogitProcessor for RepetitionPenaltyProcessor {
         if self.penalty == 1.0 {
             return Ok(());
         }
+        // Один раз на уникальный токен окна, как в llama.cpp/HF. Раньше штраф
+        // применялся на КАЖДОЕ вхождение (`penalty^k`): кавычка, встреченная
+        // в JSON аргументов 20 раз, при 1.05 теряла логит в 2,6 раза, и
+        // вызовы инструментов ломались.
+        let mut seen = std::collections::HashSet::new();
         for &token_id in window(&ctx.input_ids, self.last_n) {
             let idx = token_id as usize;
-            if idx < logits.len() {
+            if idx < logits.len() && seen.insert(idx) {
                 if logits[idx] > 0.0 {
                     logits[idx] /= self.penalty;
                 } else {
@@ -82,6 +87,14 @@ mod tests {
 
     fn ctx(ids: &[u32]) -> ProcessorContext {
         ProcessorContext { input_ids: ids.to_vec(), step: 0, batch_idx: 0 }
+    }
+
+    #[test]
+    fn repetition_applies_once_per_unique_token() {
+        let mut p = RepetitionPenaltyProcessor { penalty: 2.0, last_n: 0 };
+        let mut logits = vec![8.0, 8.0];
+        p.process(&mut logits, &ctx(&[0, 0, 0, 0])).unwrap();
+        assert_eq!(logits, vec![4.0, 8.0], "20 кавычек не должны делить логит на 2^20");
     }
 
     #[test]

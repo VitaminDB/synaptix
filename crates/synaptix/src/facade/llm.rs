@@ -1923,7 +1923,10 @@ impl<'a> LlmGeneration<'a> {
                 };
                 // У Muse точка возврата — весь промпт: linear-слоёв нет, а
                 // attention-кэш усекается по `seq_len` (в пределах ring-окна).
-                *sess_ids = ids;
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                *sess_ids = if res.is_ok() { ids } else { Vec::new() };
                 session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
@@ -1952,7 +1955,10 @@ impl<'a> LlmGeneration<'a> {
                     p.generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
                         .map(|_| ())
                 };
-                session.ids = prompt_ids.to_vec();
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
                 session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
@@ -1985,7 +1991,10 @@ impl<'a> LlmGeneration<'a> {
                 let res = p
                     .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
                     .map(|_| ());
-                session.ids = prompt_ids.to_vec();
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2004,7 +2013,10 @@ impl<'a> LlmGeneration<'a> {
                 let res = p
                     .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
                     .map(|_| ());
-                session.ids = prompt_ids.to_vec();
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2026,7 +2038,10 @@ impl<'a> LlmGeneration<'a> {
                 let res = p
                     .generate_streaming_resume(&mut session.kv, &ids, cfg, &mut sink)
                     .map(|_| ());
-                session.ids = ids;
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                session.ids = if res.is_ok() { ids } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2171,8 +2186,16 @@ impl<'a> LlmGeneration<'a> {
                     .generate_with_media_resume(&mut session.kv, &ids, &refs, cfg, &mut sink)
                     .map(|_| ());
                 // У Muse точка возврата — весь промпт (см. текстовый путь).
-                session.ids = ids;
-                session.remember_media(&refs);
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                if res.is_ok() {
+                    session.ids = ids;
+                    session.remember_media(&refs);
+                } else {
+                    session.ids.clear();
+                    session.media.clear();
+                }
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2193,8 +2216,16 @@ impl<'a> LlmGeneration<'a> {
                 let res = p
                     .generate_media_resume(&mut session.kv, prompt_ids, &inputs, cfg, &mut sink)
                     .map(|_| ());
-                session.ids = prompt_ids.to_vec();
-                session.remember_media(&pairs);
+                // Точка возврата — только после успешного хода: при ошибке посреди
+                // префилла KV дописан не до конца, и следующий ход, решив, что
+                // промпт в кэше, читал бы недописанные строки.
+                if res.is_ok() {
+                    session.ids = prompt_ids.to_vec();
+                    session.remember_media(&pairs);
+                } else {
+                    session.ids.clear();
+                    session.media.clear();
+                }
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),

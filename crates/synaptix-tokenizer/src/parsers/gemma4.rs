@@ -371,7 +371,23 @@ impl ArgParser {
                     self.pos += 1;
                     continue;
                 }
-                _ => items.push(self.value()),
+                // Скобки не сошлись (`[1}`): `}` закрывает и массив. Без этой
+                // ветки `bare()` ничего не съедал, позиция стояла, и цикл
+                // бесконечно добавлял `Null` — поток генерации висел, память
+                // росла без предела.
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {
+                    let at = self.pos;
+                    items.push(self.value());
+                    if self.pos == at {
+                        // Страховка от любого другого символа, который
+                        // `value()` не двигает.
+                        self.pos += 1;
+                    }
+                }
             }
         }
         Value::Array(items)
@@ -442,6 +458,17 @@ impl ArgParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Несогласованные скобки в массиве не вешают разбор.
+    #[test]
+    fn mismatched_brackets_in_array_terminate() {
+        for body in ["call:x{a:[1}", "call:x{a:[}", "call:x{a:[1,}", "call:x{a:[[}}"] {
+            let call = parse_call(body);
+            assert!(call.is_some(), "{body}");
+        }
+        let call = parse_call("call:x{a:[1},b:2}").unwrap();
+        assert_eq!(call.arguments["a"], json!([1]));
+    }
     use serde_json::json;
 
     const IDS: Gemma4Ids = Gemma4Ids {
