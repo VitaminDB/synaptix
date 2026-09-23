@@ -32,6 +32,11 @@ impl PinnedBuf {
         }
         let layout = std::alloc::Layout::from_size_align(allocated, 64).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        // Нехватка памяти — стандартная реакция Rust, а не нулевой указатель,
+        // по которому `as_slice` дальше читал бы.
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         Self { ptr, len, is_cuda_pinned: false }
     }
 
@@ -46,6 +51,11 @@ impl PinnedBuf {
         }
         let layout = std::alloc::Layout::from_size_align(allocated, 64).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        // Нехватка памяти — стандартная реакция Rust, а не нулевой указатель,
+        // по которому `as_slice` дальше читал бы.
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         Self { ptr, len, is_cuda_pinned: false }
     }
 

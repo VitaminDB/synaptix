@@ -298,6 +298,12 @@ pub fn generate_streaming_resume(
     let logits = last_logits.expect("prompt non-empty checked above");
 
     let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+    // Потолок 0 — только префилл (например, прогрев кэша): раньше первый
+    // токен сэмплировался и отдавался всё равно.
+    if cfg.max_new_tokens == 0 {
+        let stats = GenerationStats { prompt_tokens: prompt_len, new_tokens: 0, prefill_ms, decode_ms: 0 };
+        return Ok((out, stats));
+    }
     let first = sampler.sample(&logits)?;
     out.push(first);
     let mut cancelled = !sink.on_token(first);

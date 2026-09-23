@@ -34,9 +34,13 @@ impl Prompt {
         let msgs = to_messages(messages);
         match &self.template {
             Some(t) => {
+                // `tools` — всегда определён, как в transformers и фасаде:
+                // у неопределённой переменной `tools is not none` истинно, и
+                // Llama-3.x получала инструкцию «ответь JSON-вызовом».
                 let opts = RenderOptions::new()
                     .with_generation_prompt(generation_prompt)
-                    .with_var("enable_thinking", Json::Bool(self.enable_thinking));
+                    .with_var("enable_thinking", Json::Bool(self.enable_thinking))
+                    .with_var("tools", Json::Null);
                 t.render(&msgs, &opts).map_err(|e| e.to_string())
             }
             None => Ok(fallback_render(&msgs, generation_prompt)),

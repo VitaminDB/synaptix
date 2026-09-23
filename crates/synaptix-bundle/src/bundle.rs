@@ -43,6 +43,15 @@ impl std::fmt::Debug for Bundle {
     }
 }
 
+/// Первые 4 байта хеша для сообщения об ошибке; хеш из битого файла может
+/// быть короче — тогда дополняем нулями, а не паникуем срезом.
+fn crc_prefix(hash: &[u8]) -> u32 {
+    let mut b = [0u8; 4];
+    let n = hash.len().min(4);
+    b[..n].copy_from_slice(&hash[..n]);
+    u32::from_be_bytes(b)
+}
+
 impl Bundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if usize::BITS < 64 {
@@ -371,8 +380,8 @@ impl Bundle {
                 if got.as_bytes().as_slice() != stored.as_slice() {
                     return Err(Error::ChunkCrcMismatch {
                         id: e.id,
-                        expected: u32::from_be_bytes(stored[0..4].try_into().unwrap()),
-                        got: u32::from_be_bytes(got.as_bytes()[0..4].try_into().unwrap()),
+                        expected: crc_prefix(&stored),
+                        got: crc_prefix(got.as_bytes()),
                     });
                 }
             }
@@ -411,8 +420,8 @@ impl Bundle {
                 if got.as_slice() != stored.as_slice() {
                     return Err(Error::ChunkCrcMismatch {
                         id: e.id,
-                        expected: u32::from_be_bytes(stored[0..4].try_into().unwrap()),
-                        got: u32::from_be_bytes(got[0..4].try_into().unwrap()),
+                        expected: crc_prefix(&stored),
+                        got: crc_prefix(&got),
                     });
                 }
             }
