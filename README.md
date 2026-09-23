@@ -7,6 +7,12 @@
 A native Rust engine for running and training neural networks — hand-written CUDA kernels
 compiled at runtime via NVRTC, with no PyTorch, no libtorch, and no Python runtime.
 
+Runs on any NVIDIA GPU from **sm_80 (Ampere)** up: kernels are JIT-compiled for the card,
+with native NVFP4 / MXFP8 block-scale tensor-core paths on **Blackwell (sm_120+)** and
+portable kernels everywhere else. Models load from single-file `.syn` bundles — quantized
+to NVFP4, MXFP8, SQ1…SQ8 or kept dense, per layer group — or **directly from GGUF**, with
+all 27 ggml block types executed as they are.
+
 ## What it is
 
 An alternative to the Python ML stack. Everything from the tensor API and CUDA kernels up to
@@ -160,8 +166,10 @@ scripts under `scripts/reference/`.
 
 ## Platforms
 
-CUDA (primary) and CPU. The compile baseline is sm_80 (Ampere); native NVFP4 `mma.sync`
-requires sm_120 (Blackwell).
+CUDA (primary) and CPU. Any sm_80+ card (Ampere, Ada, Hopper, Blackwell): NVRTC targets the
+card's own compute capability. Native NVFP4 / MXFP8 block-scale `mma.sync` requires sm_120+
+(Blackwell); on older cards the same weights run through dequantizing kernels, or are
+transcoded to SQ on load. SQ and ggml formats use the same portable kernels on every card.
 
 ## Status
 
