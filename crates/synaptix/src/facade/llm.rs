@@ -947,18 +947,18 @@ impl LlmKvSession {
                     0
                 }
             }
-            // Граница обязана лежать в ring-окне sliding-слоёв: всё, что ниже
-            // их `start`, декод прошлого хода уже вытеснил.
+            // Окно sliding-слоёв от границы обязано лежать в кольце: всё, что
+            // ниже их `start`, декод прошлого хода уже вытеснил.
             SessionKind::Muse { .. } => {
-                if n >= self.kv.ring_start_max() {
+                if self.kv.ring_resumable_at(n) {
                     n
                 } else {
                     0
                 }
             }
-            // Без ring-окон `ring_start_max` — ноль, и граница всегда годится.
+            // Без повёрнутых колец граница всегда годится.
             SessionKind::Plain => {
-                if n >= self.kv.ring_start_max() {
+                if self.kv.ring_resumable_at(n) {
                     n
                 } else {
                     0

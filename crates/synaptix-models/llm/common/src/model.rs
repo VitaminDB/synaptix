@@ -479,6 +479,10 @@ pub struct KvCacheLayer {
     pub k_scale: Option<Tensor>,
     pub v_scale: Option<Tensor>,
     pub start: usize,
+    /// Окно sliding-слоя, запомненное при повороте кольца (`start > 0`):
+    /// после него у слоя есть только ключи с `start`, и продолжить с
+    /// позиции `n` можно, лишь если окно `[n+1-w, n)` не ниже `start`.
+    pub window: usize,
 }
 
 pub const RING_SLACK: usize = 2048;
@@ -621,6 +625,19 @@ impl KvCache {
     /// Самое дальнее начало ring-окна среди full-attention слоёв: ниже этой
     /// позиции префикс уже вытеснен, и продолжать с неё нельзя (для
     /// sliding-слоёв кэш держит только последние W токенов).
+    /// Можно ли продолжить с позиции `n` (кэш усечён до `n` токенов): новым
+    /// токенам sliding-слоя нужны ключи `[n+1-w, n)`, а после поворота
+    /// кольца они есть только с `start`. Сравнение с одним `start` (как в
+    /// [`Self::ring_start_max`]) пропускало случай, когда окно уходит ниже
+    /// `start`: внимание молча урезалось, и ход с кэшем расходился с ходом
+    /// без кэша.
+    pub fn ring_resumable_at(&self, n: usize) -> bool {
+        self.layers.iter().all(|l| match l {
+            LayerCache::Full(f) if f.start > 0 => f.start + f.window.saturating_sub(1) <= n,
+            _ => true,
+        })
+    }
+
     pub fn ring_start_max(&self) -> usize {
         self.layers
             .iter()
@@ -1832,7 +1849,7 @@ impl DecoderModel {
                     } else {
                         (None, None)
                     };
-                    LayerCache::Full(KvCacheLayer { k, v, k_scale, v_scale, start: 0 })
+                    LayerCache::Full(KvCacheLayer { k, v, k_scale, v_scale, start: 0, window: 0 })
                 }
                 LayerKind::Linear => {
                     let lin = c.linear.as_ref().unwrap();
@@ -2267,6 +2284,7 @@ impl DecoderModel {
                     kvl.v.kv_append_inplace(&tv, 0).coerr()?;
                 }
                 kvl.start = lo_global;
+                kvl.window = w;
             }
             start = kvl.start;
         }
@@ -2936,6 +2954,7 @@ impl FullAttn {
                     kv.v.kv_append_inplace(&tv, 0).coerr()?;
                 }
                 kv.start = lo_global;
+                kv.window = w;
                 local_past = past - kv.start;
             }
             kv.k.kv_append_inplace(&k, local_past).coerr()?;

@@ -972,13 +972,14 @@ impl HybridPipeline {
                 .and_then(|x| x.flatten_all())
                 .and_then(|x| x.to_vec1::<f32>())
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let mut best = 0usize;
-            for (i, x) in v.iter().enumerate() {
-                if *x > v[best] {
-                    best = i;
-                }
-            }
-            Ok(best as u32)
+            // NaN не выигрывает и не «залипает» в первой позиции: раньше
+            // `v[0] = NaN` делал ответом токен 0 при любых логитах.
+            v.iter()
+                .enumerate()
+                .filter(|(_, x)| !x.is_nan())
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i as u32)
+                .ok_or_else(|| PipelineError::Forward("все логиты NaN".into()))
         };
 
         let t0 = std::time::Instant::now();
