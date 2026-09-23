@@ -45,7 +45,7 @@ impl TextShape {
             )))?;
         let head_dim = f
             .opt_usize(&k("attention.key_length"))
-            .unwrap_or_else(|| f.usize_of(&k("embedding_length")).unwrap_or(0) / f.usize_of(&k("attention.head_count")).unwrap_or(1));
+            .unwrap_or_else(|| f.usize_of(&k("embedding_length")).unwrap_or(0) / f.usize_of(&k("attention.head_count")).unwrap_or(1).max(1));
         let num_attention_heads = f.usize_of(&k("attention.head_count"))?;
         let vocab_size = f
             .get("tokenizer.ggml.tokens")

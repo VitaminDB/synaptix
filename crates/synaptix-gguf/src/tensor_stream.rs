@@ -121,7 +121,7 @@ pub(crate) fn quant_blob<'a>(
             let mut out = Vec::with_capacity(map.len() * rb);
             for r in map {
                 let o = *r as usize * rb;
-                out.extend_from_slice(&all[o..o + rb]);
+                out.extend_from_slice(span(all, o, rb, src)?);
             }
             Ok(Cow::Owned(out))
         }
@@ -131,13 +131,19 @@ pub(crate) fn quant_blob<'a>(
             let bb = ty.block_bytes();
             let src_rb = row_elems / be * bb;
             let blk_bytes = block / be * bb;
+            if src_rb == 0 || blk_bytes == 0 {
+                return Err(GgufError::BadTensor {
+                    name: m.hf_name.clone(),
+                    reason: format!("строка {row_elems} / блок {block} короче блока кванта {be}"),
+                });
+            }
             let rows = all.len() / src_rb;
             let mut out = Vec::with_capacity(rows * map.len() * blk_bytes);
             for r in 0..rows {
                 let base = r * src_rb;
                 for c in map {
                     let o = base + *c as usize * blk_bytes;
-                    out.extend_from_slice(&all[o..o + blk_bytes]);
+                    out.extend_from_slice(span(all, o, blk_bytes, src)?);
                 }
             }
             Ok(Cow::Owned(out))
@@ -149,12 +155,24 @@ pub(crate) fn quant_blob<'a>(
                 let shape = info.hf_shape();
                 let per = shape[1] * rb;
                 let all = bytes_of(files, p)?;
-                out.extend_from_slice(&all[slice * per..(slice + 1) * per]);
+                out.extend_from_slice(span(all, slice * per, per, p)?);
             }
             Ok(Cow::Owned(out))
         }
         Producer::Interleave { .. } => Err(GgufError::BadTensor { name: m.hf_name.clone(), reason: "interleave не отдаётся блоками".into() }),
     }
+}
+
+/// Срез `[off..off+len]` с проверкой: карта перестановки и размеры строк
+/// берутся из метаданных GGUF, и у битого файла выводили за буфер — паника
+/// роняла приложение вместо ошибки открытия.
+fn span<'a, T>(buf: &'a [T], off: usize, len: usize, name: &str) -> Result<&'a [T]> {
+    off.checked_add(len)
+        .and_then(|end| buf.get(off..end))
+        .ok_or_else(|| GgufError::BadTensor {
+            name: name.to_string(),
+            reason: format!("срез [{off}..+{len}] за границей буфера ({} элементов)", buf.len()),
+        })
 }
 
 impl GgufTensorStream {
@@ -396,7 +414,7 @@ impl GgufTensorStream {
                 let mut out = Vec::new();
                 for r in map {
                     let off = *r as usize * row_elems;
-                    encode(item.out, &buf[off..off + row_elems], &mut out);
+                    encode(item.out, span(&buf, off, *row_elems, src)?, &mut out);
                     w.write_all(&out)?;
                 }
                 Ok(())
@@ -415,8 +433,13 @@ impl GgufTensorStream {
                     let base = r * row_elems;
                     for (j, c) in map.iter().enumerate() {
                         let src_off = base + *c as usize * block;
-                        row[j * block..(j + 1) * block]
-                            .copy_from_slice(&buf[src_off..src_off + block]);
+                        let dst = row
+                            .get_mut(j * block..(j + 1) * block)
+                            .ok_or_else(|| GgufError::BadTensor {
+                                name: src.clone(),
+                                reason: "карта столбцов шире строки".into(),
+                            })?;
+                        dst.copy_from_slice(span(&buf, src_off, *block, src)?);
                     }
                     encode(item.out, &row, &mut out);
                     w.write_all(&out)?;
@@ -571,7 +594,7 @@ pub(crate) fn materialize_f32(
             let mut out = Vec::with_capacity(map.len() * row_elems);
             for r in map {
                 let off = *r as usize * row_elems;
-                out.extend_from_slice(&buf[off..off + row_elems]);
+                out.extend_from_slice(span(&buf, off, *row_elems, src)?);
             }
             Ok(out)
         }
@@ -583,7 +606,7 @@ pub(crate) fn materialize_f32(
                 let base = r * row_elems;
                 for c in map {
                     let so = base + *c as usize * block;
-                    out.extend_from_slice(&buf[so..so + block]);
+                    out.extend_from_slice(span(&buf, so, *block, src)?);
                 }
             }
             Ok(out)

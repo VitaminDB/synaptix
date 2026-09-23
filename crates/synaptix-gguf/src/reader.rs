@@ -6,6 +6,10 @@ use crate::ggml::GgmlType;
 
 pub const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
+/// ggml: не больше 4 измерений у тензора.
+const MAX_DIMS: usize = 4;
+/// Потолок `general.alignment` — защита от мусора в битом файле.
+const MAX_ALIGNMENT: u64 = 1 << 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -177,7 +181,9 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.o + n > self.b.len() {
+        // Длины берутся из файла: у битого `o + n` переполнялось, проверка
+        // проходила, и срез ниже паниковал.
+        if self.o.checked_add(n).is_none_or(|end| end > self.b.len()) {
             return Err(GgufError::Truncated {
                 at: self.o,
                 need: n,
@@ -194,8 +200,20 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.o)
+    }
+    fn len_u64(&mut self) -> Result<usize> {
+        let at = self.o;
+        let n = self.u64()?;
+        usize::try_from(n).map_err(|_| GgufError::Truncated {
+            at,
+            need: usize::MAX,
+            have: self.remaining(),
+        })
+    }
     fn string(&mut self) -> Result<String> {
-        let n = self.u64()? as usize;
+        let n = self.len_u64()?;
         Ok(String::from_utf8(self.take(n)?.to_vec())?)
     }
     fn value(&mut self, ty: u32) -> Result<Value> {
@@ -218,10 +236,13 @@ impl<'a> Cursor<'a> {
     }
     fn array(&mut self) -> Result<Array> {
         let et = self.u32()?;
-        let n = self.u64()? as usize;
+        let n = self.len_u64()?;
+        let at = self.o;
+        let remaining = self.remaining();
+        let too_long = move || GgufError::Truncated { at, need: usize::MAX, have: remaining };
         macro_rules! fixed {
             ($v:ident, $w:expr, $conv:expr) => {{
-                let raw = self.take(n * $w)?;
+                let raw = self.take(n.checked_mul($w).ok_or_else(too_long)?)?;
                 Array::$v(raw.chunks_exact($w).map($conv).collect())
             }};
         }
@@ -235,7 +256,10 @@ impl<'a> Cursor<'a> {
             6 => fixed!(F32, 4, |c| f32::from_le_bytes(c.try_into().unwrap())),
             7 => Array::Bool(self.take(n)?.iter().map(|b| *b != 0).collect()),
             8 => {
-                let mut v = Vec::with_capacity(n);
+                // Ёмкость — не больше, чем строк может поместиться в остаток
+                // файла (у каждой 8 байт длины): `n` из битого файла иначе
+                // выделял бы терабайты и ронял процесс.
+                let mut v = Vec::with_capacity(n.min(self.remaining() / 8));
                 for _ in 0..n {
                     v.push(self.string()?);
                 }
@@ -278,8 +302,8 @@ impl GgufFile {
         if version != 2 && version != 3 {
             return Err(GgufError::BadVersion(version));
         }
-        let n_tensors = c.u64()? as usize;
-        let n_kv = c.u64()? as usize;
+        let n_tensors = c.len_u64()?;
+        let n_kv = c.len_u64()?;
 
         let mut metadata = BTreeMap::new();
         for _ in 0..n_kv {
@@ -289,11 +313,20 @@ impl GgufFile {
             metadata.insert(key, val);
         }
 
-        let mut tensors = Vec::with_capacity(n_tensors);
+        // Описание тензора — минимум 24 байта (имя, nd, тип, оффсет).
+        let mut tensors = Vec::with_capacity(n_tensors.min(c.remaining() / 24));
         let mut by_name = BTreeMap::new();
         for _ in 0..n_tensors {
             let name = c.string()?;
             let nd = c.u32()? as usize;
+            // ggml: от 1 до 4 измерений. Ноль ронял `hf_shape()[0]` в
+            // конвертере, огромное число — аллокацию.
+            if nd == 0 || nd > MAX_DIMS {
+                return Err(GgufError::BadTensor {
+                    name,
+                    reason: format!("{nd} измерений (ожидалось 1..={MAX_DIMS})"),
+                });
+            }
             let mut dims = Vec::with_capacity(nd);
             for _ in 0..nd {
                 dims.push(c.u64()?);
@@ -315,7 +348,38 @@ impl GgufFile {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_ALIGNMENT)
             .max(1);
+        if !alignment.is_power_of_two() || alignment > MAX_ALIGNMENT {
+            return Err(GgufError::WrongKeyType {
+                key: "general.alignment".into(),
+                expected: "степень двойки ≤ 65536",
+                actual: "другое число",
+            });
+        }
         let data_start = (c.o as u64).div_ceil(alignment) * alignment;
+        // Размеры и оффсеты тензоров — из файла: проверяем здесь с
+        // переполнением, чтобы `elem_count`/`byte_len`/`tensor_bytes` дальше
+        // считали по заведомо разумным числам.
+        let data_len = (mmap.len() as u64).saturating_sub(data_start);
+        for t in &tensors {
+            let bad = |reason: String| GgufError::BadTensor { name: t.name.clone(), reason };
+            let elems = t
+                .dims
+                .iter()
+                .try_fold(1u64, |acc, d| acc.checked_mul(*d))
+                .ok_or_else(|| bad("число элементов переполняет u64".into()))?;
+            // Самый плотный тип — меньше 2 бит на элемент.
+            if elems > data_len.saturating_mul(8) {
+                return Err(bad(format!("{elems} элементов не помещаются в файл")));
+            }
+            let len = t.ty.bytes_for(elems as usize) as u64;
+            if t.offset.checked_add(len).is_none_or(|end| end > data_len) {
+                return Err(GgufError::Truncated {
+                    at: data_start.saturating_add(t.offset) as usize,
+                    need: len as usize,
+                    have: data_len.saturating_sub(t.offset) as usize,
+                });
+            }
+        }
 
         Ok(Self {
             path,
@@ -341,9 +405,9 @@ impl GgufFile {
     }
 
     pub fn tensor_bytes(&self, t: &TensorInfo) -> Result<&[u8]> {
-        let start = self.data_start + t.offset as usize;
+        let start = self.data_start.saturating_add(t.offset as usize);
         let len = t.byte_len();
-        if start + len > self.mmap.len() {
+        if start.checked_add(len).is_none_or(|end| end > self.mmap.len()) {
             return Err(GgufError::Truncated {
                 at: start,
                 need: len,
@@ -514,11 +578,37 @@ mod tests {
         let mut bytes = synth_gguf();
         bytes.truncate(bytes.len() - 16);
         let f = write_tmp(&bytes);
-        let g = GgufFile::open(f.path()).unwrap();
-        let t = g.tensor("blk.0.attn_q.weight").unwrap();
+        // Обрезанные данные тензора видны уже при открытии.
         assert!(matches!(
-            g.tensor_bytes(t),
+            GgufFile::open(f.path()),
             Err(GgufError::Truncated { .. })
         ));
+    }
+
+    /// Битые длины и размеры из файла дают ошибку, а не панику/аллокацию.
+    #[test]
+    fn rejects_garbage_sizes() {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&u64::MAX.to_le_bytes()); // n_tensors
+        head.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+        head.extend_from_slice(&u64::MAX.to_le_bytes()); // длина ключа
+        let f = write_tmp(&head);
+        assert!(GgufFile::open(f.path()).is_err());
+
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&0u64.to_le_bytes());
+        head.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"tokenizer.ggml.tokens";
+        head.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        head.extend_from_slice(key);
+        head.extend_from_slice(&9u32.to_le_bytes()); // массив
+        head.extend_from_slice(&6u32.to_le_bytes()); // f32
+        head.extend_from_slice(&(1u64 << 62).to_le_bytes()); // n * 4 переполняется
+        let f = write_tmp(&head);
+        assert!(GgufFile::open(f.path()).is_err());
     }
 }

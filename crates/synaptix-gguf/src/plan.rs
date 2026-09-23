@@ -91,7 +91,9 @@ impl Producer {
 }
 
 pub fn value_head_map(num_value_heads: usize, num_key_heads: usize) -> Vec<u32> {
-    let group = num_value_heads / num_key_heads.max(1);
+    // `max(1)`: при голов ключей больше, чем голов значений (битые
+    // метаданные), `group` был нулём, и `j % group` делил на ноль.
+    let group = (num_value_heads / num_key_heads.max(1)).max(1);
     (0..num_value_heads)
         .map(|j| ((j % group) * num_key_heads + j / group) as u32)
         .collect()
