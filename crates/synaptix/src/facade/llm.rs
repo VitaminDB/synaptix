@@ -1724,6 +1724,7 @@ impl<'a> LlmGeneration<'a> {
             tokenizer,
             on_token,
             acc: Vec::new(),
+            inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
         };
@@ -1789,6 +1790,7 @@ impl<'a> LlmGeneration<'a> {
             tokenizer,
             on_token,
             acc: Vec::new(),
+            inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
         };
@@ -2095,6 +2097,7 @@ impl<'a> LlmGeneration<'a> {
             tokenizer,
             on_token,
             acc: Vec::new(),
+            inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
         };
@@ -2277,6 +2280,7 @@ impl<'a> LlmGeneration<'a> {
             tokenizer,
             on_token,
             acc: Vec::new(),
+            inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
         };
@@ -2410,6 +2414,8 @@ struct DeltaSink<'t, 's, F: FnMut(u32, &str) -> bool> {
     tokenizer: &'t LlmTokenizer,
     on_token: F,
     acc: Vec<u32>,
+    inc: IncrementalDecode,
+    /// Всё, что ушло наружу (для стоп-строк).
     decoded: String,
     stop_sequences: &'s [String],
 }
@@ -2417,17 +2423,21 @@ struct DeltaSink<'t, 's, F: FnMut(u32, &str) -> bool> {
 impl<'t, 's, F: FnMut(u32, &str) -> bool> StreamSink for DeltaSink<'t, 's, F> {
     fn on_token(&mut self, token_id: u32) -> bool {
         self.acc.push(token_id);
-        let full = match self.tokenizer.decode(&self.acc) {
-            Ok(s) => s,
-            Err(_) => return true,
-        };
-        let delta = stream_delta(full, &mut self.decoded);
+        let tokenizer = self.tokenizer;
+        let delta = self.inc.step(&self.acc, |ids| tokenizer.decode(ids).ok());
+        self.decoded.push_str(&delta);
 
         if !(self.on_token)(token_id, &delta) {
             return false;
         }
+        // Стоп-строка может оказаться не в самом конце: BPE склеивает её
+        // хвост со следующими символами (`</tool_call>` + `\n` одним
+        // токеном), и `ends_with` её пропускал. Ищем в окне «свежая дельта +
+        // длина стопа».
         for stop in self.stop_sequences {
-            if self.decoded.ends_with(stop.as_str()) {
+            let from = self.decoded.len().saturating_sub(delta.len() + stop.len());
+            let from = self.decoded.floor_char_boundary(from);
+            if self.decoded[from..].contains(stop.as_str()) {
                 return false;
             }
         }
@@ -2435,34 +2445,50 @@ impl<'t, 's, F: FnMut(u32, &str) -> bool> StreamSink for DeltaSink<'t, 's, F> {
     }
 }
 
-/// Дельта стрима: `full` — декод ВСЕХ накопленных токенов, `decoded` — что уже
-/// ушло наружу.
+/// Инкрементальный детокенайзер — как `DecodeStream` в HF tokenizers.
+/// Раньше на каждый токен декодировался весь ответ (O(n²): на ответах в
+/// 10–16k токенов это заметно съедало ток/с). Здесь декодируется окно
+/// `[prefix_offset..]` и вычитается декод `[prefix_offset..read_offset)`:
+/// оба с одной и той же стартовой позиции, поэтому SentencePiece-правила
+/// начала строки (срезанный ведущий пробел) у них совпадают.
 ///
 /// Байтовый BPE режет многобайтовые символы (эмодзи, CJK) на несколько
 /// токенов, и декод частичной последовательности ставит в хвост U+FFFD «�».
-/// Раньше этот «�» уходил дельтой в UI, а на следующем токене
-/// `full.starts_with(decoded)` не сходился («😀» ≠ «�») и настоящий символ
-/// молча терялся — в чате эмодзи просто пропадали. Поэтому недописанный хвост
-/// придерживаем: `decoded` не двигается, дельта пустая, символ уйдёт целиком
-/// со следующим токеном.
-fn stream_delta(full: String, decoded: &mut String) -> String {
-    if full.ends_with('\u{FFFD}') {
-        return String::new();
+/// Такой хвост придерживается: дельта пустая, окно не сдвигается, символ
+/// уйдёт целиком со следующим токеном.
+#[derive(Default)]
+struct IncrementalDecode {
+    prefix_offset: usize,
+    read_offset: usize,
+}
+
+impl IncrementalDecode {
+    fn step(&mut self, acc: &[u32], decode: impl Fn(&[u32]) -> Option<String>) -> String {
+        let (Some(prefix), Some(text)) = (
+            decode(&acc[self.prefix_offset..self.read_offset]),
+            decode(&acc[self.prefix_offset..]),
+        ) else {
+            return String::new();
+        };
+        if text.ends_with('\u{FFFD}') || text.len() <= prefix.len() {
+            return String::new();
+        }
+        let delta = if text.starts_with(prefix.as_str()) {
+            text[prefix.len()..].to_string()
+        } else {
+            // Декод окна «переписал» префикс (нормализация токенайзера) —
+            // дельту не выдумываем, просто сдвигаем окно.
+            String::new()
+        };
+        self.prefix_offset = self.read_offset;
+        self.read_offset = acc.len();
+        delta
     }
-    let delta = if full.len() >= decoded.len() && full.starts_with(decoded.as_str()) {
-        full[decoded.len()..].to_string()
-    } else {
-        // Ресинк: декод «переписал» уже показанный текст (смена нормализации
-        // токенайзера и т. п.) — дельту не выдумываем, просто догоняем.
-        String::new()
-    };
-    *decoded = full;
-    delta
 }
 
 #[cfg(test)]
 mod stream_delta_tests {
-    use super::stream_delta;
+    use super::IncrementalDecode;
 
     /// HF-каталог из одного config.json — `optimal_profile` читает только его.
     fn model_dir(model_type: &str) -> std::path::PathBuf {
@@ -2496,43 +2522,85 @@ mod stream_delta_tests {
         }
     }
 
-    /// Прогоняет последовательность decode-снапшотов через stream_delta.
-    fn run(fulls: &[&str]) -> (Vec<String>, String) {
-        let mut decoded = String::new();
-        let deltas = fulls
-            .iter()
-            .map(|f| stream_delta(f.to_string(), &mut decoded))
+    /// Токены — байтовые куски; декод — склейка с заменой битого UTF-8 на
+    /// «�», как у байтового BPE.
+    fn run(tokens: &[&[u8]]) -> (Vec<String>, String) {
+        let vocab: Vec<Vec<u8>> = tokens.iter().map(|t| t.to_vec()).collect();
+        let decode = |ids: &[u32]| {
+            let bytes: Vec<u8> = ids.iter().flat_map(|&i| vocab[i as usize].clone()).collect();
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let mut inc = IncrementalDecode::default();
+        let mut acc = Vec::new();
+        let mut out = String::new();
+        let deltas = (0..tokens.len() as u32)
+            .map(|i| {
+                acc.push(i);
+                let d = inc.step(&acc, decode);
+                out.push_str(&d);
+                d
+            })
             .collect();
-        (deltas, decoded)
+        (deltas, out)
     }
 
     #[test]
     fn plain_text_streams_as_diffs() {
-        let (deltas, decoded) = run(&["При", "Привет", "Привет!"]);
+        let (deltas, text) = run(&["При".as_bytes(), "вет".as_bytes(), b"!"]);
         assert_eq!(deltas, vec!["При", "вет", "!"]);
-        assert_eq!(decoded, "Привет!");
+        assert_eq!(text, "Привет!");
     }
 
     #[test]
     fn split_emoji_is_held_back_then_emitted_whole() {
-        // Эмодзи разрезан BPE: decode частичной последовательности даёт «�».
-        let (deltas, decoded) = run(&["Привет ", "Привет \u{FFFD}", "Привет 😀"]);
+        let e = "😀".as_bytes();
+        let (deltas, text) = run(&["Привет ".as_bytes(), &e[..2], &e[2..]]);
         assert_eq!(deltas, vec!["Привет ", "", "😀"]);
-        assert_eq!(decoded, "Привет 😀");
+        assert_eq!(text, "Привет 😀");
     }
 
     #[test]
     fn multi_token_emoji_with_double_replacement() {
-        // 4-байтовый эмодзи может ехать три токена: «��» в хвосте оба раза.
-        let (deltas, _) = run(&["ок ", "ок \u{FFFD}", "ок \u{FFFD}\u{FFFD}", "ок 🎉"]);
+        let e = "🎉".as_bytes();
+        let (deltas, text) = run(&["ок ".as_bytes(), &e[..1], &e[1..2], &e[2..]]);
         assert_eq!(deltas, vec!["ок ", "", "", "🎉"]);
+        assert_eq!(text, "ок 🎉");
+    }
+
+    /// На настоящих токенайзерах (байтовый BPE Qwen, SentencePiece Gemma и
+    /// Muse) склейка дельт равна полному декоду. Гейт — наличие бандлов.
+    #[test]
+    fn incremental_matches_full_decode_on_real_tokenizers() {
+        use synaptix_tokenizer::{HfTokenizer, Tokenizer};
+        let text = "Привет, мир! Hello   world — 🎉🥐 日本語のテキスト.\n\n```rust\nfn main() {}\n```\n  отступ, «кавычки» ,запятая";
+        for name in ["qwen3.8-27b.syn", "gemma-4-26b-a4b-it.syn", "muse-glimmer-30b.syn", "ltx-gemma-3-12b-qat.syn"] {
+            let bundle = std::path::Path::new("/run/media/storage/syn_models").join(name);
+            let Some(bytes) = crate::facade::arch::read_model_file(&bundle, "tokenizer.json") else {
+                eprintln!("{name}: нет бандла — скип");
+                continue;
+            };
+            let tok = HfTokenizer::from_bytes(&bytes).expect("tokenizer.json");
+            let ids = tok.encode(text, false).expect("encode").ids.clone();
+            let full = tok.decode(&ids, true).expect("decode");
+            let mut inc = IncrementalDecode::default();
+            let mut out = String::new();
+            for n in 1..=ids.len() {
+                out.push_str(&inc.step(&ids[..n], |w| tok.decode(w, true).ok()));
+            }
+            assert_eq!(out, full, "{name}");
+        }
     }
 
     #[test]
-    fn resync_after_rewrite_does_not_invent_delta() {
-        let (deltas, decoded) = run(&["abc", "xyz"]);
-        assert_eq!(deltas, vec!["abc", ""]);
-        assert_eq!(decoded, "xyz");
+    fn long_stream_equals_full_decode() {
+        let pieces: Vec<Vec<u8>> = "Съешь же ещё этих мягких французских булок 🥐, да выпей чаю."
+            .as_bytes()
+            .chunks(3)
+            .map(|c| c.to_vec())
+            .collect();
+        let refs: Vec<&[u8]> = pieces.iter().map(|p| p.as_slice()).collect();
+        let (_, text) = run(&refs);
+        assert_eq!(text, "Съешь же ещё этих мягких французских булок 🥐, да выпей чаю.");
     }
 }
 
