@@ -93,5 +93,16 @@ fn gguf_models_answer_capital_of_france() {
         .expect("generate chat");
         eprintln!("  chat → {out:?}");
         assert!(lax || out.contains("Paris") || out.contains("Париж"), "{}: чат → {out:?}", path.display());
+
+        // 3. Шаблон с инструментами — так зовёт чат synthos. Llama-3.x пишет
+        // их через `tojson(indent=4)` (кварг), раньше рендер падал.
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {}}}
+        });
+        let with_tools = tokenizer
+            .apply_chat_template_ex_tools(&msgs, true, false, Some(&[tool]))
+            .unwrap_or_else(|e| panic!("{}: шаблон с tools: {e}", path.display()));
+        assert!(with_tools.contains("get_weather"), "{}: tools не попали в промпт", path.display());
     }
 }

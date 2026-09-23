@@ -1,4 +1,4 @@
-use minijinja::value::{Value, ValueKind};
+use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Environment, Error as MjError, ErrorKind};
 
 pub fn register_all(env: &mut Environment<'_>) {
@@ -179,7 +179,18 @@ fn fn_len(v: Value) -> Result<usize, MjError> {
     })
 }
 
-fn filt_tojson(v: Value, indent: Option<usize>) -> Result<String, MjError> {
+// HF-шаблоны зовут и `tojson(4)`, и `tojson(indent=4)` (Llama 3.x); кварги в
+// minijinja приходят отдельной картой, поэтому indent берём из обоих мест.
+fn filt_tojson(v: Value, indent: Option<Value>, kwargs: Kwargs) -> Result<String, MjError> {
+    let kw_indent: Option<Value> = kwargs.get("indent")?;
+    let _ = kwargs.get::<Option<Value>>("ensure_ascii")?;
+    let _ = kwargs.get::<Option<Value>>("sort_keys")?;
+    kwargs.assert_all_used()?;
+    let indent = match indent.or(kw_indent) {
+        None => None,
+        Some(i) if i.is_none() || i.is_undefined() => None,
+        Some(i) => Some(usize::try_from(i)?),
+    };
     let out = match indent {
         Some(n) if n > 0 => {
             let spaces = " ".repeat(n);

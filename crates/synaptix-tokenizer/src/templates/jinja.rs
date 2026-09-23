@@ -94,4 +94,13 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("oops"), "expected `oops` in error, got {msg}");
     }
+
+    #[test]
+    fn pycompat_tojson_indent_kwarg() {
+        // Llama 3.x: `{{ t | tojson(indent=4) }}` при переданных tools.
+        let env = JinjaEnv::new();
+        let src = "{% for t in tools %}{{ t | tojson(indent=4) }}|{{ t | tojson(2) }}|{{ t | tojson }}{% endfor %}";
+        let out = env.render(src, context! { tools => vec![context! { name => "f" }] }).unwrap();
+        assert_eq!(out, "{\n    \"name\": \"f\"\n}|{\n  \"name\": \"f\"\n}|{\"name\": \"f\"}");
+    }
 }
