@@ -11,6 +11,16 @@ use synaptix_tokenizer::HfTokenizer;
 
 const TOKENIZER_DIR: &str = "models/Qwen/Qwen3-1.7B";
 
+/// Эталонный токенайзер лежит вне репозитория: без него тест пропускается,
+/// как остальные тесты на реальных моделях, а не падает.
+fn model_missing() -> bool {
+    let missing = !PathBuf::from(TOKENIZER_DIR).join("tokenizer.json").is_file();
+    if missing {
+        eprintln!("нет {TOKENIZER_DIR} — пропуск");
+    }
+    missing
+}
+
 fn load_tokenizer() -> HfTokenizer {
     let path = PathBuf::from(TOKENIZER_DIR).join("tokenizer.json");
     HfTokenizer::from_file(&path)
@@ -61,6 +71,9 @@ fn messages_from_json(arr: &[JsonValue]) -> Vec<Message> {
 
 #[test]
 fn t10_1_encode_decode() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let cases = load_json("encode_decode");
     for case in cases.as_array().unwrap() {
@@ -81,6 +94,9 @@ fn t10_1_encode_decode() {
 
 #[test]
 fn t10_2_batch_encode() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let data = load_json("batch_encode");
     let texts: Vec<String> = data["texts"]
@@ -122,6 +138,9 @@ fn t10_2_batch_encode() {
 
 #[test]
 fn t10_3_chat_template() {
+    if model_missing() {
+        return;
+    }
     let tmpl = load_chat_template();
     let data = load_json("chat_template");
     let messages = messages_from_json(data["messages"].as_array().unwrap());
@@ -135,6 +154,9 @@ fn t10_3_chat_template() {
 
 #[test]
 fn t10_4_tools_template() {
+    if model_missing() {
+        return;
+    }
     let tmpl = load_chat_template();
     let data = load_json("tools_template");
     let messages = messages_from_json(data["messages"].as_array().unwrap());
@@ -153,6 +175,9 @@ fn t10_4_tools_template() {
 
 #[test]
 fn t10_5_special_tokens() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let data = load_json("special_tokens");
     let eos = data["eos_token"].as_str().unwrap();
@@ -168,6 +193,9 @@ fn t10_5_special_tokens() {
 
 #[test]
 fn t10_6_long_text() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let data = load_json("long_text");
     let total_len = data["len"].as_u64().unwrap() as usize;
@@ -193,6 +221,9 @@ fn t10_6_long_text() {
 
 #[test]
 fn t10_7_unicode_edge() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let cases = load_json("unicode_edge");
     for case in cases.as_array().unwrap() {
@@ -213,6 +244,9 @@ fn t10_7_unicode_edge() {
 
 #[test]
 fn t10_8_streaming_detok() {
+    if model_missing() {
+        return;
+    }
     let tok = load_tokenizer();
     let data = load_json("streaming_detok");
     let steps = data["steps"].as_array().unwrap();

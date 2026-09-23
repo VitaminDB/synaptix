@@ -24,8 +24,13 @@ impl JinjaEnv {
         // видела не тот префикс, а перерендеренная история с ним расходилась —
         // префикс-KV не переиспользовался ни на одном ходу.
         env.set_keep_trailing_newline(false);
-        env.set_trim_blocks(false);
-        env.set_lstrip_blocks(false);
+        // И как `ImmutableSandboxedEnvironment(trim_blocks=True,
+        // lstrip_blocks=True)` в transformers: у шаблонов без `{%-`/`-%}`
+        // иначе в промпт попадали лишние `\n` и отступы блочных тегов.
+        // Шаблоны всех моделей в syn_models (23.09) рендерятся одинаково в
+        // обоих режимах — поправка для будущих.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         pycompat::register_all(&mut env);
         Self { inner: Arc::new(EnvCell { env }) }
     }
