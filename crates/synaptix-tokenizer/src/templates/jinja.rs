@@ -18,7 +18,12 @@ struct EnvCell {
 impl JinjaEnv {
     pub fn new() -> Self {
         let mut env = Environment::new();
-        env.set_keep_trailing_newline(true);
+        // Как jinja2 в transformers: один завершающий `\n` исходника шаблона
+        // срезается. Иначе у Llama-3.x (шаблон из GGUF кончается `{%- endif %}\n`)
+        // промпт хода получал лишний `\n` после заголовка ассистента, модель
+        // видела не тот префикс, а перерендеренная история с ним расходилась —
+        // префикс-KV не переиспользовался ни на одном ходу.
+        env.set_keep_trailing_newline(false);
         env.set_trim_blocks(false);
         env.set_lstrip_blocks(false);
         pycompat::register_all(&mut env);
@@ -102,5 +107,12 @@ mod tests {
         let src = "{% for t in tools %}{{ t | tojson(indent=4) }}|{{ t | tojson(2) }}|{{ t | tojson }}{% endfor %}";
         let out = env.render(src, context! { tools => vec![context! { name => "f" }] }).unwrap();
         assert_eq!(out, "{\n    \"name\": \"f\"\n}|{\n  \"name\": \"f\"\n}|{\"name\": \"f\"}");
+    }
+
+    #[test]
+    fn trailing_newline_of_template_is_dropped() {
+        let env = JinjaEnv::new();
+        let src = "{%- if add_generation_prompt %}{{ 'assistant\n\n' }}{%- endif %}\n";
+        assert_eq!(env.render(src, context! { add_generation_prompt => true }).unwrap(), "assistant\n\n");
     }
 }
