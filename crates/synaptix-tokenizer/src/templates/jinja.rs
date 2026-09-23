@@ -101,6 +101,16 @@ mod tests {
     }
 
     #[test]
+    fn pycompat_python_string_method_args() {
+        // Qwen3: `.split('</think>')[-1].lstrip('\n')` на ходах ассистента в
+        // истории — раньше strip-семейство не принимало аргумент.
+        let env = JinjaEnv::new();
+        let src = "{{ c.split('</think>')[-1].lstrip('\\n') }}|{{ c.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') }}|{{ '--x--'.strip('-') }}|{{ '  y '.strip() }}|{{ 'a,b,c'.split(',', 1) | join(';') }}|{{ ' p  q r '.split(none, 1) | join(';') }}|{{ 'aaa'.replace('a', 'b', 2) }}|{{ 'aaa'.replace('a', 'b') }}";
+        let out = env.render(src, context! { c => "<think>\nhm\n</think>\n\nhello" }).unwrap();
+        assert_eq!(out, "hello|hm|x|y|a;b,c|p;q r |bba|bbb");
+    }
+
+    #[test]
     fn pycompat_tojson_indent_kwarg() {
         // Llama 3.x: `{{ t | tojson(indent=4) }}` при переданных tools.
         let env = JinjaEnv::new();

@@ -61,28 +61,53 @@ fn filt_endswith(s: Value, suffix: Value) -> Result<bool, MjError> {
     fn_endswith(s, suffix)
 }
 
-fn fn_strip(s: Value) -> Result<String, MjError> {
-    Ok(as_str_required(&s, "strip")?.trim().to_owned())
+// Как str.strip/lstrip/rstrip в Python: без аргумента (или с None) — пробельные
+// символы, со строкой — любой из её символов. Qwen3 зовёт `.rstrip('\n')` на
+// ходах ассистента в истории; без второго аргумента рендер падал «too many
+// arguments», как только в чате появлялся первый ответ.
+fn strip_chars(v: &Value, what: &str, chars: Option<Value>) -> Result<(String, Option<String>), MjError> {
+    let s = as_str_required(v, what)?;
+    let chars = match chars {
+        Some(c) if !c.is_none() && !c.is_undefined() => Some(as_str_required(&c, what)?),
+        _ => None,
+    };
+    Ok((s, chars))
 }
 
-fn filt_strip(s: Value) -> Result<String, MjError> {
-    fn_strip(s)
+fn fn_strip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    let (s, chars) = strip_chars(&s, "strip", chars)?;
+    Ok(match chars {
+        Some(c) => s.trim_matches(|ch| c.contains(ch)).to_owned(),
+        None => s.trim().to_owned(),
+    })
 }
 
-fn fn_lstrip(s: Value) -> Result<String, MjError> {
-    Ok(as_str_required(&s, "lstrip")?.trim_start().to_owned())
+fn filt_strip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    fn_strip(s, chars)
 }
 
-fn filt_lstrip(s: Value) -> Result<String, MjError> {
-    fn_lstrip(s)
+fn fn_lstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    let (s, chars) = strip_chars(&s, "lstrip", chars)?;
+    Ok(match chars {
+        Some(c) => s.trim_start_matches(|ch| c.contains(ch)).to_owned(),
+        None => s.trim_start().to_owned(),
+    })
 }
 
-fn fn_rstrip(s: Value) -> Result<String, MjError> {
-    Ok(as_str_required(&s, "rstrip")?.trim_end().to_owned())
+fn filt_lstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    fn_lstrip(s, chars)
 }
 
-fn filt_rstrip(s: Value) -> Result<String, MjError> {
-    fn_rstrip(s)
+fn fn_rstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    let (s, chars) = strip_chars(&s, "rstrip", chars)?;
+    Ok(match chars {
+        Some(c) => s.trim_end_matches(|ch| c.contains(ch)).to_owned(),
+        None => s.trim_end().to_owned(),
+    })
+}
+
+fn filt_rstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
+    fn_rstrip(s, chars)
 }
 
 fn fn_lower(s: Value) -> Result<String, MjError> {
@@ -93,28 +118,52 @@ fn fn_upper(s: Value) -> Result<String, MjError> {
     Ok(as_str_required(&s, "upper")?.to_uppercase())
 }
 
-fn fn_split(s: Value, sep: Option<Value>) -> Result<Vec<String>, MjError> {
+// str.split(sep=None, maxsplit=-1) и str.replace(old, new, count=-1).
+fn fn_split(s: Value, sep: Option<Value>, maxsplit: Option<i64>) -> Result<Vec<String>, MjError> {
     let s = as_str_required(&s, "split")?;
-    Ok(match sep {
-        Some(v) => {
-            let sep = as_str_required(&v, "split.sep")?;
-            s.split(&sep).map(|x| x.to_owned()).collect()
+    let max = maxsplit.filter(|&n| n >= 0).map(|n| n as usize);
+    let sep = match sep {
+        Some(v) if !v.is_none() && !v.is_undefined() => Some(as_str_required(&v, "split.sep")?),
+        _ => None,
+    };
+    Ok(match (sep, max) {
+        (Some(sep), Some(n)) => s.splitn(n + 1, sep.as_str()).map(|x| x.to_owned()).collect(),
+        (Some(sep), None) => s.split(sep.as_str()).map(|x| x.to_owned()).collect(),
+        (None, None) => s.split_whitespace().map(|x| x.to_owned()).collect(),
+        (None, Some(n)) => {
+            // Python: после n разрезов остаток идёт целиком, без ведущих пробелов.
+            let mut out = Vec::new();
+            let mut rest = s.trim_start();
+            while !rest.is_empty() {
+                if out.len() == n {
+                    out.push(rest.to_owned());
+                    break;
+                }
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                out.push(rest[..end].to_owned());
+                rest = rest[end..].trim_start();
+            }
+            out
         }
-        None => s.split_whitespace().map(|x| x.to_owned()).collect(),
     })
 }
 
-fn filt_split(s: Value, sep: Option<Value>) -> Result<Vec<String>, MjError> {
-    fn_split(s, sep)
+fn filt_split(s: Value, sep: Option<Value>, maxsplit: Option<i64>) -> Result<Vec<String>, MjError> {
+    fn_split(s, sep, maxsplit)
 }
 
-fn fn_replace(s: Value, old: Value, new: Value) -> Result<String, MjError> {
-    Ok(as_str_required(&s, "replace")?
-        .replace(&as_str_required(&old, "replace.old")?, &as_str_required(&new, "replace.new")?))
+fn fn_replace(s: Value, old: Value, new: Value, count: Option<i64>) -> Result<String, MjError> {
+    let s = as_str_required(&s, "replace")?;
+    let old = as_str_required(&old, "replace.old")?;
+    let new = as_str_required(&new, "replace.new")?;
+    Ok(match count.filter(|&n| n >= 0) {
+        Some(n) => s.replacen(&old, &new, n as usize),
+        None => s.replace(&old, &new),
+    })
 }
 
-fn filt_replace(s: Value, old: Value, new: Value) -> Result<String, MjError> {
-    fn_replace(s, old, new)
+fn filt_replace(s: Value, old: Value, new: Value, count: Option<i64>) -> Result<String, MjError> {
+    fn_replace(s, old, new, count)
 }
 
 fn fn_items(v: Value) -> Result<Vec<Value>, MjError> {
