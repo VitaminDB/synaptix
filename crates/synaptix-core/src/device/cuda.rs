@@ -194,10 +194,22 @@ mod inner {
 
     /// RAII-гард зеркала (host-stream offload): включает кэш, Drop освобождает
     /// pinned-копии (~размер квант-весов, LTX mxfp8 ≈ 24GB).
+    ///
+    /// Гардов может быть несколько (DiT LTX и MoE-эксперты в одном процессе):
+    /// зеркало живёт, пока жив хоть один. Раньше `Drop` любого выключал его
+    /// и для остальных — тихая деградация до staging-копий.
     pub struct PinMirrorGuard;
+
+    /// Сколько живых [`PinMirrorGuard`].
+    static PIN_MIRROR_USERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     impl PinMirrorGuard {
         pub fn new() -> Self {
-            *PIN_MIRROR.write() = Some(std::collections::HashMap::new());
+            let mut w = PIN_MIRROR.write();
+            PIN_MIRROR_USERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if w.is_none() {
+                *w = Some(std::collections::HashMap::new());
+            }
             Self
         }
     }
@@ -208,7 +220,19 @@ mod inner {
     }
     impl Drop for PinMirrorGuard {
         fn drop(&mut self) {
-            *PIN_MIRROR.write() = None;
+            // H2D из зеркала асинхронны: до освобождения pinned-копий копии
+            // в полёте должны завершиться, иначе DMA читает отданную память.
+            synchronize_initialized();
+            let mut w = PIN_MIRROR.write();
+            let left = PIN_MIRROR_USERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
+            if left == 0 {
+                *w = None;
+            } else if let Some(map) = w.as_mut() {
+                // Ключ зеркала — адрес CPU-буфера уходящего владельца: после
+                // его Drop этот адрес может достаться чужим весам. Чистим всю
+                // карту — оставшиеся владельцы перезеркалят лениво.
+                map.clear();
+            }
         }
     }
 
@@ -1173,6 +1197,9 @@ mod inner {
             for w in self.workers.drain(..) {
                 let _ = w.join();
             }
+            // Асинхронные H2D из кэша должны завершиться до освобождения
+            // pinned-буферов (кэш уходит вместе с последним Arc ниже).
+            synchronize_initialized();
             // Снимаем только СВОЙ кэш: гард другой модели (LTX/Gemma рядом с
             // Qwen4Exp) мог уже занять слот, и обнулять его чужим Drop'ом нельзя.
             let mut slot = OFFLOAD_PIN_CACHE.write();
@@ -1585,6 +1612,15 @@ mod inner {
     /// порядке СВОЕГО стрима: тензоры из creation.rs (cat/zeros) живут на
     /// alloc_stream — sync только default оставляет их frees pending, trim
     /// пула их не видит (ложные OOM «after trim» при свободной памяти).
+    /// [`synchronize_all`] на каждом уже созданном устройстве — перед
+    /// освобождением pinned-памяти, из которой могли идти асинхронные копии.
+    pub fn synchronize_initialized() {
+        let ordinals: Vec<usize> = REGISTRY.read().keys().copied().collect();
+        for ord in ordinals {
+            let _ = synchronize_all(ord);
+        }
+    }
+
     pub fn synchronize_all(ordinal: usize) -> Result<()> {
         let ds = default_stream(ordinal)?;
         ds.synchronize()
