@@ -107,3 +107,41 @@ fn gguf_models_answer_capital_of_france() {
         eprintln!("  tools в промпте: {}", with_tools.contains("get_weather"));
     }
 }
+
+/// Stop во время префилла: флаг прерывания опрашивается до первого чанка,
+/// генерация отвечает ошибкой `INTERRUPTED`, `on_token` не зовётся ни разу, а
+/// следующая генерация на той же модели идёт как обычно.
+#[test]
+fn gguf_prefill_interrupt() {
+    let Some(path) = models().into_iter().next() else {
+        eprintln!("нет эталонных GGUF — пропуск");
+        return;
+    };
+    if synaptix_core::device::cuda::get(0).is_err() {
+        eprintln!("нет CUDA — пропуск");
+        return;
+    }
+    let (model, tokenizer) = load_llm_with_policy(&path, QuantPolicy::quality(), &Device::Cuda(0))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let ids = tokenizer.encode(&"The capital of France is Paris. ".repeat(40)).expect("encode");
+    let mut g = LlmGeneration::new(&model, opts(4));
+    g.set_interrupt(|| true);
+    let mut tokens = 0;
+    let err = g
+        .generate_streaming(&ids, &tokenizer, |_, _| {
+            tokens += 1;
+            true
+        })
+        .expect_err("прерванный префилл — ошибка");
+    assert!(err.to_string().contains(synaptix_llm_common::INTERRUPTED), "{err}");
+    assert_eq!(tokens, 0);
+
+    let mut g = LlmGeneration::new(&model, opts(4));
+    let mut out = String::new();
+    g.generate_streaming(&ids, &tokenizer, |_, d| {
+        out.push_str(d);
+        true
+    })
+    .expect("генерация после прерывания");
+    assert!(!out.is_empty());
+}

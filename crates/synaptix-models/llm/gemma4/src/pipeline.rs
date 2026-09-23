@@ -403,6 +403,11 @@ impl Gemma4Pipeline {
         let mut last_hidden = None;
         let mut off = prefix;
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Model(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let step = chunk.min(l - off);
             let part = hidden
                 .narrow(1, off - prefix, step)
@@ -632,6 +637,11 @@ impl Gemma4Pipeline {
         let mut logits_opt: Option<Tensor> = None;
         let mut off = 0usize;
         while off < suffix.len() {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Model(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let end = (off + chunk).min(suffix.len());
             let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Model(e.to_string()))?;

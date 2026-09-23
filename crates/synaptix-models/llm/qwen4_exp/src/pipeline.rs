@@ -908,6 +908,11 @@ impl Qwen4ExpPipeline {
                 let mut last = None;
                 let mut offset = reuse;
                 while offset < prompt_ids.len() {
+                    // Stop посреди длинного префилла: между чанками, а не только
+                    // после первого токена (на 100k+ токенов префилл идёт минутами).
+                    if sink.interrupted() {
+                        return Err(ModelError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+                    }
                     let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
                     let chunk = &prompt_ids[offset..offset + take];
                     let slice = media_for_chunk(prompt_ids, media, offset, take)?;

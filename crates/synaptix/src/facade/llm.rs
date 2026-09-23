@@ -1677,11 +1677,20 @@ pub struct LlmGeneration<'a> {
     opts: GenerationOptions,
     stop_sequences: Vec<String>,
     stop_tokens: Vec<u32>,
+    interrupt: Option<Box<dyn Fn() -> bool + 'a>>,
 }
 
 impl<'a> LlmGeneration<'a> {
     pub fn new(model: &'a Llm, opts: GenerationOptions) -> Self {
-        Self { model, opts, stop_sequences: Vec::new(), stop_tokens: Vec::new() }
+        Self { model, opts, stop_sequences: Vec::new(), stop_tokens: Vec::new(), interrupt: None }
+    }
+
+    /// Флаг прерывания, который движок опрашивает между чанками префилла
+    /// (до первого токена `on_token` не зовётся, и Stop иначе ждал конца
+    /// префилла). Прерванный префилл — ошибка с текстом
+    /// [`synaptix_llm_common::INTERRUPTED`].
+    pub fn set_interrupt(&mut self, interrupted: impl Fn() -> bool + 'a) {
+        self.interrupt = Some(Box::new(interrupted));
     }
 
     pub fn add_stop_sequence(&mut self, seq: &str) {
@@ -1727,6 +1736,7 @@ impl<'a> LlmGeneration<'a> {
             inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
+            interrupt: self.interrupt.as_deref(),
         };
 
         let pipeline = self
@@ -1793,6 +1803,7 @@ impl<'a> LlmGeneration<'a> {
             inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
+            interrupt: self.interrupt.as_deref(),
         };
 
         match &*pipeline {
@@ -2100,6 +2111,7 @@ impl<'a> LlmGeneration<'a> {
             inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
+            interrupt: self.interrupt.as_deref(),
         };
         match &*pipeline {
             LlmPipeline::Qwen4Exp(p) => {
@@ -2283,6 +2295,7 @@ impl<'a> LlmGeneration<'a> {
             inc: IncrementalDecode::default(),
             decoded: String::new(),
             stop_sequences: &self.stop_sequences,
+            interrupt: self.interrupt.as_deref(),
         };
 
         let pipeline = self
@@ -2418,9 +2431,14 @@ struct DeltaSink<'t, 's, F: FnMut(u32, &str) -> bool> {
     /// Всё, что ушло наружу (для стоп-строк).
     decoded: String,
     stop_sequences: &'s [String],
+    interrupt: Option<&'s dyn Fn() -> bool>,
 }
 
 impl<'t, 's, F: FnMut(u32, &str) -> bool> StreamSink for DeltaSink<'t, 's, F> {
+    fn interrupted(&mut self) -> bool {
+        self.interrupt.is_some_and(|f| f())
+    }
+
     fn on_token(&mut self, token_id: u32) -> bool {
         self.acc.push(token_id);
         let tokenizer = self.tokenizer;

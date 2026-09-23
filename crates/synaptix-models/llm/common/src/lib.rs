@@ -13,7 +13,7 @@ pub use config::{
 };
 pub use generate::{
     eos_set, generate, generate_streaming, generate_streaming_resume, GenerationConfig,
-    GenerationStats, StreamSink, TokenSampler,
+    GenerationStats, StreamSink, TokenSampler, INTERRUPTED,
 };
 pub use model::{
     DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,

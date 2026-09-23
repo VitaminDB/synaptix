@@ -770,6 +770,11 @@ impl HybridPipeline {
         let mut off = prefix;
         let mut last_hidden = None;
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let mut end = (off + chunk).min(l);
             if snap_at > off && end > snap_at {
                 end = snap_at;
@@ -1006,6 +1011,11 @@ impl HybridPipeline {
         };
         trace_prefill_mem(device, off, l);
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let mut end = (off + chunk).min(l);
             if snap_at > off && end > snap_at {
                 end = snap_at;
@@ -1456,6 +1466,11 @@ impl HybridPipeline {
         let mut logits_opt = None;
         let mut off = 0usize;
         while off < suffix.len() {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let end = (off + chunk).min(suffix.len());
             let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;

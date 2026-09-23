@@ -66,7 +66,19 @@ pub struct GenerationStats {
 
 pub trait StreamSink {
     fn on_token(&mut self, token_id: u32) -> bool;
+
+    /// Прервать ли генерацию прямо сейчас. Опрашивается между чанками
+    /// префилла — там, где `on_token` ещё не звался ни разу; префилл на
+    /// сотни тысяч токенов иначе не останавливался до первого токена.
+    /// Прерванный префилл — ошибка с текстом [`INTERRUPTED`]: KV дописан не
+    /// до конца, и вызывающий не должен считать промпт посчитанным.
+    fn interrupted(&mut self) -> bool {
+        false
+    }
 }
+
+/// Текст ошибки прерванного префилла (см. [`StreamSink::interrupted`]).
+pub const INTERRUPTED: &str = "генерация прервана во время префилла";
 
 impl<F: FnMut(u32) -> bool> StreamSink for F {
     fn on_token(&mut self, token_id: u32) -> bool {
@@ -269,6 +281,11 @@ pub fn generate_streaming_resume(
     let mut last_logits: Option<Tensor> = None;
     let mut off = prefix;
     while off < prompt_len {
+        // Stop посреди длинного префилла: между чанками, а не только
+        // после первого токена (на 100k+ токенов префилл идёт минутами).
+        if sink.interrupted() {
+            return Err(ModelError::Forward(INTERRUPTED.into()));
+        }
         let end = (off + chunk).min(prompt_len);
         let slice = &prompt_ids[off..end];
         let t = Tensor::from_vec(slice.to_vec(), vec![1usize, slice.len()], device)

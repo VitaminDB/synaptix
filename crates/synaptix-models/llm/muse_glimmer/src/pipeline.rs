@@ -580,6 +580,11 @@ impl MusePipeline {
         let mut off = prefix;
         let mut last_hidden = None;
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let step = chunk.min(l - off);
             let part = emb
                 .narrow(1, off - prefix, step)
@@ -847,6 +852,11 @@ impl MusePipeline {
         let mut tap_chunks: Vec<Vec<Tensor>> = vec![Vec::new(); taps.len()];
         let ctx_pos0 = prefix;
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let end = (off + chunk).min(l);
             let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
@@ -1099,6 +1109,11 @@ impl MusePipeline {
         let mut off = prefix;
         let mut logits_opt = None;
         while off < l {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let end = (off + chunk).min(l);
             let part = Tensor::from_vec(prompt[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
@@ -1269,6 +1284,11 @@ impl MusePipeline {
         let mut logits_opt = None;
         let mut off = 0usize;
         while off < suffix.len() {
+            // Stop посреди длинного префилла: между чанками, а не только
+            // после первого токена (на 100k+ токенов префилл идёт минутами).
+            if sink.interrupted() {
+                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+            }
             let end = (off + chunk).min(suffix.len());
             let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
