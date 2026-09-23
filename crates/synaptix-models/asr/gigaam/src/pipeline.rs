@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use synaptix_audio::resample_linear;
+use synaptix_audio::resample;
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 
 use crate::config::GigaAmConfig;
@@ -74,7 +74,7 @@ impl GigaAm {
             pcm
         } else {
             resampled =
-                resample_linear(pcm, sample_rate, SR).map_err(|e| GigaAmError::Audio(e.to_string()))?;
+                resample(pcm, sample_rate, SR).map_err(|e| GigaAmError::Audio(e.to_string()))?;
             &resampled
         };
         let mel = self.mel_tensor(audio)?;

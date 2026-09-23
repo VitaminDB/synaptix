@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use synaptix_asr_gigaam::GigaAm;
 use synaptix_asr_whisper::{Task, WhisperPipeline};
-use synaptix_audio::resample_linear;
+use synaptix_audio::resample;
 use synaptix_core::dtype::DType;
 
 pub use synaptix_core::device::Device;
@@ -125,7 +125,7 @@ impl Transcriber {
                     pcm
                 } else {
                     resampled =
-                        resample_linear(pcm, sample_rate, WHISPER_SR).map_err(|e| e.to_string())?;
+                        resample(pcm, sample_rate, WHISPER_SR).map_err(|e| e.to_string())?;
                     &resampled
                 };
                 let lang = language.or(self.language.as_deref());

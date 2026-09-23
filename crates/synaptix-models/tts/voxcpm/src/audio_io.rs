@@ -1,5 +1,5 @@
 use synaptix_audio::io::read_wav_mono_f32;
-use synaptix_audio::resample::resample_linear;
+use synaptix_audio::resample::resample;
 
 use crate::VoxError;
 
@@ -14,7 +14,7 @@ pub fn load_resampled(path: &str, target_sr: usize) -> Result<Vec<f32>, VoxError
     if sr as usize == target_sr {
         Ok(samples)
     } else {
-        resample_linear(&samples, sr, target_sr as u32).map_err(|e| VoxError::Audio(e.to_string()))
+        resample(&samples, sr, target_sr as u32).map_err(|e| VoxError::Audio(e.to_string()))
     }
 }
 

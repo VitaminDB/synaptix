@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use synaptix_audio::io::{read_wav_mono_f32, write_wav_mono_f32};
-use synaptix_audio::resample::resample_linear;
+use synaptix_audio::resample::resample;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 
@@ -82,7 +82,7 @@ impl VoiceSample {
         if self.sample_rate == target {
             return Ok(self.samples.clone());
         }
-        resample_linear(&self.samples, self.sample_rate, target)
+        resample(&self.samples, self.sample_rate, target)
             .map_err(|e| VibeVoiceError::Audio(e.to_string()))
     }
 }

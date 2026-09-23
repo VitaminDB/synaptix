@@ -14,7 +14,7 @@ pub use error::{AudioError, Result};
 pub use io::{read_wav_mono_f32, write_wav_mono_f32};
 pub use mel::{log_mel_spectrogram, mel_filterbank, MelConfig, MelNorm, MelScale};
 pub use mfcc::{mfcc, MfccConfig};
-pub use resample::resample_linear;
+pub use resample::{resample, resample_linear};
 pub use stft::{istft, stft, PadMode, StftConfig};
 pub use streaming::chunker::AudioChunker;
 pub use streaming::lcp_delta::LcpDelta;

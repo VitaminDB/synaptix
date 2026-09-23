@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use synaptix_audio::{read_wav_mono_f32, resample_linear};
+use synaptix_audio::{read_wav_mono_f32, resample};
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::tokenizer::Tokenizer;
@@ -89,7 +89,7 @@ impl WhisperPipeline {
         if sr == SR {
             Ok(samples)
         } else {
-            resample_linear(&samples, sr, SR).map_err(|e| WhisperError::Audio(e.to_string()))
+            resample(&samples, sr, SR).map_err(|e| WhisperError::Audio(e.to_string()))
         }
     }
 

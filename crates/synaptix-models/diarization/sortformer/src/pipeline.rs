@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use synaptix_audio::resample_linear;
+use synaptix_audio::resample;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 
@@ -45,7 +45,7 @@ impl SortformerPipeline {
         if sample_rate == self.target_sr {
             Ok(samples.to_vec())
         } else {
-            resample_linear(samples, sample_rate, self.target_sr)
+            resample(samples, sample_rate, self.target_sr)
                 .map_err(|e| SortformerError::Audio(e.to_string()))
         }
     }
