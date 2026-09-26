@@ -1255,122 +1255,13 @@ impl MusePipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        use synaptix_core::grad::no_grad;
-        use synaptix_infer::graph_capture::GraphCapturer;
-        use synaptix_infer::InferError;
-
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("empty prompt".into()));
         }
-        let device = self.model.device;
-        let ord = match device {
-            Device::Cuda(o) => o,
-            _ => return Err(PipelineError::Forward("generate_with_graph требует CUDA".into())),
-        };
-        let l = prompt_ids.len();
         let cfg = self.prepare_cfg(gen_cfg);
-        let eos = synaptix_llm_common::generate::eos_set(&cfg);
-        let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&cfg, prompt_ids);
-        let prefix = kv.seq_len.min(l.saturating_sub(1));
-        kv.seq_len = prefix;
-
-        let suffix = &prompt_ids[prefix..];
-        let chunk = cfg.prefill_batch.max(1);
-        let t0 = std::time::Instant::now();
-        let mut logits_opt = None;
-        let mut off = 0usize;
-        while off < suffix.len() {
-            // Stop посреди длинного префилла: между чанками, а не только
-            // после первого токена (на 100k+ токенов префилл идёт минутами).
-            if sink.interrupted() {
-                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
-            }
-            let end = (off + chunk).min(suffix.len());
-            let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let lg = no_grad(|| self.model.forward(&part, kv))
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            logits_opt = Some(lg);
-            off = end;
-        }
-        let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill suffix".into()))?;
-        let prefill_ms = t0.elapsed().as_millis();
-
-        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
-        let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
-        out.push(tok0);
-        let mut cancelled = !sink.on_token(tok0);
-
-        let mut state = self
-            .model
-            .make_decode_state()
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let start0 = self
-            .model
-            .ring_prepare_decode(kv, l)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        state
-            .update_ring(tok0, l as u32, start0 as u32)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)
-            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
-
-        let mut capturer = GraphCapturer::new(3);
-        let graph = {
-            let model = &self.model;
-            let state_ref = &mut state;
-            let kv_ref = &mut *kv;
-            no_grad(|| {
-                capturer.capture_with(&stream, |_s| {
-                    model
-                        .forward_decode_dev(state_ref, kv_ref)
-                        .map_err(|e| InferError::Other(e.to_string()))
-                })
-            })
-        }
-        .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
-        let _ = graph.upload();
-
-        let dec_t0 = std::time::Instant::now();
-        while !cancelled && out.len() < cfg.max_new_tokens {
-            let last = *out.last().unwrap();
-            if eos.contains(&last) {
-                break;
-            }
-            let pos = l + out.len() - 1;
-            if pos >= kv.max_seq {
-                break;
-            }
-            let start = self
-                .model
-                .ring_prepare_decode(kv, pos)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            state
-                .update_ring(last, pos as u32, start as u32)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            graph
-                .launch()
-                .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
-            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok);
-            cancelled = !sink.on_token(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
-        let new_tokens = out.len();
-
-        Ok((
-            out,
-            GenerationStats {
-                prompt_tokens: l,
-                new_tokens,
-                prefill_ms,
-                decode_ms,
-            },
-        ))
+        // Общий цикл держит захваченный граф в `kv` между ходами.
+        synaptix_llm_common::generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 }
 

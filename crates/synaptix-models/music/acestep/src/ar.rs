@@ -239,7 +239,7 @@ fn merge_kv2(
             _ => return Err(AceError::Other("batched AR decode: non-full layer cache".into())),
         }
     }
-    Ok(KvCache { layers, seq_len: a.seq_len.max(b.seq_len), max_seq: a.max_seq })
+    Ok(KvCache { layers, seq_len: a.seq_len.max(b.seq_len), max_seq: a.max_seq, decode_graph: Default::default() })
 }
 
 fn sample_code_batched(

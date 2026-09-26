@@ -466,6 +466,10 @@ pub struct DecoderModel {
     /// стримятся по одному во время forward'а с префетчем следующего.
     /// Равно числу блоков — вся модель резидентна (обычный путь).
     resident_blocks: usize,
+    /// Уникальный номер экземпляра модели и поколение её весов (растёт при
+    /// переносе блоков) — ключ годности захваченных графов.
+    instance_id: u64,
+    weights_gen: u64,
     /// MoE, не влезшая на карту: эксперты живут в RAM, на карту едут
     /// выбранные роутером — через этот общий кэш. Блоки (внимание, плотный
     /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
@@ -496,6 +500,51 @@ pub struct KvCache {
     pub layers: Vec<LayerCache>,
     pub seq_len: usize,
     pub max_seq: usize,
+    /// Захваченный CUDA-граф шага декода над ЭТИМ кэшем (он ссылается на его
+    /// буферы) — живёт между ходами чата, чтобы не захватывать заново
+    /// (см. [`crate::generate::generate_graph_streaming_resume`]).
+    pub decode_graph: DecodeGraphSlot,
+}
+
+/// Граф шага декода вместе с его device-состоянием (позиция, токен, логиты):
+/// граф пишет и читает именно эти буферы. `weights_key` — какие веса он видел
+/// ([`DecoderModel::graph_weights_key`]); сменились — граф негоден.
+pub struct CachedDecodeGraph {
+    pub graph: std::sync::Arc<cudarc::driver::CudaGraph>,
+    pub state: DecodeState,
+    pub weights_key: (u64, u64),
+}
+
+/// Слот графа в [`KvCache`].
+#[derive(Default)]
+pub struct DecodeGraphSlot(Option<CachedDecodeGraph>);
+
+// SAFETY: объекты графа CUDA не синхронизированы внутри и требуют лишь
+// внешней сериализации вызовов. Слот доступен только через `&mut KvCache`
+// (запуск — из цикла генерации, владеющего кэшем), параллельных вызовов нет.
+unsafe impl Send for DecodeGraphSlot {}
+unsafe impl Sync for DecodeGraphSlot {}
+
+impl DecodeGraphSlot {
+    /// Забрать граф, если он снят с тех же весов.
+    pub fn take_valid(&mut self, key: (u64, u64)) -> Option<CachedDecodeGraph> {
+        match self.0.take() {
+            Some(g) if g.weights_key == key => Some(g),
+            _ => None,
+        }
+    }
+
+    pub fn put(&mut self, g: CachedDecodeGraph) {
+        self.0 = Some(g);
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 fn deep_copy(src: &Tensor) -> Result<Tensor, ModelError> {
@@ -675,6 +724,8 @@ impl KvCache {
     /// несовпадении устройств, это осознанно: молча считать по пустому
     /// буферу хуже, чем громко отказать.
     pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        // Буферы переезжают — захваченный граф ссылался бы на старые адреса.
+        self.decode_graph.clear();
         let mut moved = 0;
         for l in self.layers.iter_mut() {
             match l {
@@ -706,6 +757,7 @@ impl KvCache {
 
     /// Обратный переезд: [`Self::park_to_host`] наоборот.
     pub fn unpark_to(&mut self, device: Device) -> Result<usize, ModelError> {
+        self.decode_graph.clear();
         let mut moved = 0;
         for l in self.layers.iter_mut() {
             let LayerCache::Full(f) = l else { continue };
@@ -1388,6 +1440,11 @@ impl DecoderModel {
             rope_capacity,
             embed_scale: cfg.embed_scale,
             resident_blocks: if b_dev != device { 0 } else { n_blocks },
+            instance_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            weights_gen: 0,
             expert_cache,
         })
     }
@@ -1420,7 +1477,15 @@ impl DecoderModel {
     ///
     /// Возвращает, сколько блоков в итоге резидентно: если перевозка упёрлась
     /// в память, останавливаемся на достигнутом, а не роняем загрузку.
+    /// Ключ годности захваченного графа: тот же экземпляр модели и те же
+    /// адреса весов.
+    pub fn graph_weights_key(&self) -> (u64, u64) {
+        (self.instance_id, self.weights_gen)
+    }
+
     pub fn set_block_residency(&mut self, resident: usize) -> usize {
+        // Блоки переезжают — адреса весов в захваченных графах устаревают.
+        self.weights_gen += 1;
         let want = resident.min(self.blocks.len());
         let dev = self.device;
         // Сначала выселяем лишние — так освобождается место под въезд.
@@ -1860,7 +1925,7 @@ impl DecoderModel {
             };
             layers.push(lc);
         }
-        Ok(KvCache { layers, seq_len: 0, max_seq })
+        Ok(KvCache { layers, seq_len: 0, max_seq, decode_graph: DecodeGraphSlot::default() })
     }
 
     pub fn forward(&self, input_ids: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {

@@ -17,6 +17,7 @@ pub use generate::{
     GenerationStats, StreamSink, TokenSampler, INTERRUPTED,
 };
 pub use model::{
+    CachedDecodeGraph, DecodeGraphSlot,
     DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
 };
 pub use moe::{MoeConfig, MoeFfn};

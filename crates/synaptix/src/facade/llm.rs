@@ -1297,7 +1297,7 @@ impl Llm {
                 // делать поле опциональным ради одной архитектуры.
                 let session = p.new_session(ctx).map_err(|e| LlmError(e.to_string()))?;
                 Ok(Some(LlmKvSession {
-                    kv: LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx },
+                    kv: LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx, decode_graph: Default::default() },
                     ids: Vec::new(),
                     ctx_tokens: ctx,
                     kind: SessionKind::Qwen4Exp(Box::new(session)),

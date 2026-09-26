@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
-use synaptix_core::tensor::Tensor;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 

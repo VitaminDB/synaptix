@@ -413,31 +413,50 @@ pub fn generate_graph_streaming_resume(
     }
 
     model.fit_expert_cache(1);
-    let mut state = model.make_decode_state()?;
-    // Кольцевой KV sliding-слоёв: окно сдвигает хост ДО запуска графа, в граф
-    // уходят уже device-резидентные позиция и длина кольца.
-    let start0 = model.ring_prepare_decode(kv, prompt_len)?;
-    state.update_ring(tok0, prompt_len as u32, start0 as u32)?;
     let stream = synaptix_core::device::cuda::default_stream(ord)
         .map_err(|e| ModelError::Forward(format!("stream: {e}")))?;
     let dec_t0 = Instant::now();
-    // Прогрев (3 прогона) и захват идемпотентны: все пишут слот L тем же tok0.
-    let mut capturer = GraphCapturer::new(3);
-    let graph = {
-        let state_ref = &mut state;
-        let kv_ref = &mut *kv;
-        no_grad(|| {
-            capturer.capture_with(&stream, |_s| {
-                model
-                    .forward_decode_dev(state_ref, kv_ref)
-                    .map_err(|e| InferError::Other(e.to_string()))
-            })
-        })
-    }
-    .map_err(|e| ModelError::Forward(format!("graph capture: {e}")))?;
-    let _ = graph.upload();
+    // Кольцевой KV sliding-слоёв: окно сдвигает хост ДО запуска графа, в граф
+    // уходят уже device-резидентные позиция и длина кольца.
+    let start0 = model.ring_prepare_decode(kv, prompt_len)?;
+    let key = model.graph_weights_key();
+    // Граф прошлого хода над этим же кэшем и теми же весами — только реплей:
+    // прогрев и захват стоят 0.1–0.4 с на ход, на коротких ответах агента
+    // дороже самого декода.
+    let (graph, mut state) = match kv.decode_graph.take_valid(key) {
+        Some(c) => {
+            let mut state = c.state;
+            state.update_ring(tok0, prompt_len as u32, start0 as u32)?;
+            c.graph
+                .launch()
+                .map_err(|e| ModelError::Forward(format!("graph launch: {e:?}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| ModelError::Forward(format!("sync post-launch: {e:?}")))?;
+            (c.graph, state)
+        }
+        None => {
+            let mut state = model.make_decode_state()?;
+            state.update_ring(tok0, prompt_len as u32, start0 as u32)?;
+            // Прогрев (3 прогона) и захват идемпотентны: все пишут слот L тем же tok0.
+            let mut capturer = GraphCapturer::new(3);
+            let graph = {
+                let state_ref = &mut state;
+                let kv_ref = &mut *kv;
+                no_grad(|| {
+                    capturer.capture_with(&stream, |_s| {
+                        model
+                            .forward_decode_dev(state_ref, kv_ref)
+                            .map_err(|e| InferError::Other(e.to_string()))
+                    })
+                })
+            }
+            .map_err(|e| ModelError::Forward(format!("graph capture: {e}")))?;
+            let _ = graph.upload();
+            (graph, state)
+        }
+    };
 
-    // Захваченный шаг уже посчитал логиты следующего токена (вход tok0 @ L).
     let tok1 = sampler.sample(&state.logits)?;
     out.push(tok1);
     cancelled = !sink.on_token(tok1);
@@ -465,6 +484,7 @@ pub fn generate_graph_streaming_resume(
         cancelled = !sink.on_token(tok);
     }
     let stats = finish(&out, kv, dec_t0.elapsed().as_millis());
+    kv.decode_graph.put(crate::model::CachedDecodeGraph { graph, state, weights_key: key });
     Ok((out, stats))
 }
 

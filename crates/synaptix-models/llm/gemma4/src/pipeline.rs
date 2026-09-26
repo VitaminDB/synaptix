@@ -604,129 +604,18 @@ impl Gemma4Pipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        use synaptix_infer::graph_capture::GraphCapturer;
-        use synaptix_infer::InferError;
-
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("пустой промпт".into()));
         }
-        let cfg = self.cfg_with_eos(gen_cfg);
-        let eos = generate::eos_set(&cfg);
-        let mut sampler = generate::TokenSampler::new(&cfg, prompt_ids);
-        let device = self.model.device;
-        let Device::Cuda(ord) = device else {
-            return Err(PipelineError::Model("графовый декод требует CUDA".into()));
-        };
-        let l = prompt_ids.len();
-        let prefix = kv.seq_len.min(l.saturating_sub(1));
-        kv.seq_len = prefix;
-
-        // Префилл идёт обычным путём: он упирается в счёт, а не в запуски ядер,
-        // и захватывать его смысла нет.
-        let suffix = &prompt_ids[prefix..];
-        // Чанк — как можно длиннее: MoE считает экспертов групповым GEMM, и
-        // его цена на слой почти не зависит от числа токенов в чанке; предел
-        // ставит кольцевой KV sliding-слоёв (2048 у Gemma-4).
-        let ring_cap = self.model.max_prefill_chunk().unwrap_or(usize::MAX);
-        let chunk = if cfg.prefill_batch > 0 { cfg.prefill_batch } else { 2048 }.min(ring_cap);
-        let t0 = std::time::Instant::now();
-        let mut logits_opt: Option<Tensor> = None;
-        let mut off = 0usize;
-        while off < suffix.len() {
-            // Stop посреди длинного префилла: между чанками, а не только
-            // после первого токена (на 100k+ токенов префилл идёт минутами).
-            if sink.interrupted() {
-                return Err(PipelineError::Model(synaptix_llm_common::INTERRUPTED.into()));
-            }
-            let end = (off + chunk).min(suffix.len());
-            let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
-                .map_err(|e| PipelineError::Model(e.to_string()))?;
-            let lg = no_grad(|| self.model.forward(&part, kv))
-                .map_err(|e| PipelineError::Model(e.to_string()))?;
-            logits_opt = Some(lg);
-            off = end;
+        let mut cfg = self.cfg_with_eos(gen_cfg);
+        // Чанк префилла — как можно длиннее: MoE считает экспертов групповым
+        // GEMM, цена слоя почти не зависит от числа токенов; предел ставит
+        // кольцевой KV sliding-слоёв (общий цикл режет по нему сам).
+        if cfg.prefill_batch == 0 {
+            cfg.prefill_batch = 2048;
         }
-        let logits = logits_opt.ok_or_else(|| PipelineError::Model("пустой хвост промпта".into()))?;
-        let prefill_ms = t0.elapsed().as_millis();
-
-        let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
-        let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
-        out.push(tok0);
-        let mut cancelled = !sink.on_token(tok0);
-
-        let mut state = self
-            .model
-            .make_decode_state()
-            .map_err(|e| PipelineError::Model(e.to_string()))?;
-        // Кольцевой KV sliding-слоёв: сдвиг окна делает хост ДО запуска графа,
-        // а в граф уходят уже device-резидентные позиция и длина.
-        let start0 = self
-            .model
-            .ring_prepare_decode(kv, l)
-            .map_err(|e| PipelineError::Model(e.to_string()))?;
-        state
-            .update_ring(tok0, l as u32, start0 as u32)
-            .map_err(|e| PipelineError::Model(e.to_string()))?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)
-            .map_err(|e| PipelineError::Model(format!("stream: {e}")))?;
-
-        let mut capturer = GraphCapturer::new(3);
-        let graph = {
-            let model = &self.model;
-            let state_ref = &mut state;
-            let kv_ref = &mut *kv;
-            no_grad(|| {
-                capturer.capture_with(&stream, |_s| {
-                    model
-                        .forward_decode_dev(state_ref, kv_ref)
-                        .map_err(|e| InferError::Other(e.to_string()))
-                })
-            })
-        }
-        .map_err(|e| PipelineError::Model(format!("захват графа: {e}")))?;
-        let _ = graph.upload();
-
-        let dec_t0 = std::time::Instant::now();
-        // Шаг захвата уже посчитал логиты для следующего токена.
-        if !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&tok0) {
-            let tok1 = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok1);
-            cancelled = !sink.on_token(tok1);
-        }
-        while !cancelled && out.len() < cfg.max_new_tokens {
-            let last = *out.last().unwrap();
-            if eos.contains(&last) {
-                break;
-            }
-            let pos = l + out.len() - 1;
-            if pos >= kv.max_seq {
-                break;
-            }
-            let start = self
-                .model
-                .ring_prepare_decode(kv, pos)
-                .map_err(|e| PipelineError::Model(e.to_string()))?;
-            state
-                .update_ring(last, pos as u32, start as u32)
-                .map_err(|e| PipelineError::Model(e.to_string()))?;
-            graph
-                .launch()
-                .map_err(|e| PipelineError::Model(format!("запуск графа: {e:?}")))?;
-            // Запись логитов графом не отслеживается событиями — без барьера
-            // выгрузка на хост в сэмплере обогнала бы граф.
-            stream
-                .synchronize()
-                .map_err(|e| PipelineError::Model(format!("sync после запуска: {e:?}")))?;
-            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok);
-            cancelled = !sink.on_token(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
-        let new_tokens = out.len();
-        Ok((
-            out,
-            GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms },
-        ))
+        // Общий цикл держит захваченный граф в `kv` между ходами.
+        generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map_err(|e| PipelineError::Model(e.to_string()))
     }
 }

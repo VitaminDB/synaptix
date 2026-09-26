@@ -17,6 +17,7 @@ synaptix-infer     = { workspace = true }
 rayon              = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
+cudarc             = { workspace = true }
 
 [dev-dependencies]
 serde_json            = { workspace = true }
