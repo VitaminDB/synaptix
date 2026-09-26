@@ -2793,11 +2793,11 @@ static TRANSCODE_PROGRESS: Mutex<Option<synaptix_io::weights::transcode::Progres
 /// Колбэк прогресса перекодировки при загрузке (`(готово, всего, имя)`);
 /// приложение ставит его до `load_llm_with_policy`.
 pub fn set_transcode_progress(cb: Option<synaptix_io::weights::transcode::Progress>) {
-    *TRANSCODE_PROGRESS.lock().unwrap() = cb;
+    *TRANSCODE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = cb;
 }
 
 fn transcode_progress() -> Option<synaptix_io::weights::transcode::Progress> {
-    TRANSCODE_PROGRESS.lock().unwrap().clone()
+    TRANSCODE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Полный бандл с перекодированными весами (CLI `synaptix quantize`,
