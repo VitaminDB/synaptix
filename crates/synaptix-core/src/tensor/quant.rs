@@ -683,6 +683,67 @@ impl ExpertTable {
         Some(Self { w_table, s_table, n, k, count, device, dense: Some(dtype), _keep: keep })
     }
 
+    /// Групповой GEMM портируемой таблицы (префилл MoE): `x` — `[R, K]`
+    /// F16/BF16, строки отсортированы по экспертам, `segments` — `(эксперт,
+    /// начало, конец)`. Выход `[R, N]` в dtype `x`; строки вне сегментов не
+    /// пишутся.
+    pub fn gemm_grouped_dense(&self, x: &Tensor, segments: &[(u32, u32, u32)]) -> Result<Tensor> {
+        self.gemm_grouped_dense_rows(x, None, segments)
+    }
+
+    /// Как [`Self::gemm_grouped_dense`], но строка `r` берётся из
+    /// `x[rows[r]]` (`rows` — U32 `[R]` на карте): сбор строк токенов по
+    /// парам прямо в загрузке тайла, без копии `[R, K]`.
+    pub fn gemm_grouped_dense_rows(
+        &self,
+        x: &Tensor,
+        rows: Option<&Tensor>,
+        segments: &[(u32, u32, u32)],
+    ) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        let Some(dtype) = self.dense else {
+            return Err(SynaptixError::Unsupported("gemm_grouped_dense: таблица NVFP4"));
+        };
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) || x.rank() != 2 || x.dims()[1] != self.k {
+            return Err(SynaptixError::Unsupported("gemm_grouped_dense: активация [R, K] F16/BF16"));
+        }
+        let rows_c = match rows {
+            Some(t) if t.dtype() != DType::U32 => {
+                return Err(SynaptixError::Unsupported("gemm_grouped_dense: индексы строк U32"));
+            }
+            Some(t) if t.is_contiguous() => Some(t.clone()),
+            Some(t) => Some(t.contiguous()?),
+            None => None,
+        };
+        let r = rows_c.as_ref().map_or(x.dims()[0], |t| t.numel());
+        if segments.iter().any(|(_, _, t)| *t as usize > r) {
+            return Err(SynaptixError::Unsupported("gemm_grouped_dense: сегмент за концом активации"));
+        }
+        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![r, self.n]), x.dtype());
+        let backend = registry::backend_for(self.device)?;
+        let mut storage = backend.alloc_uninit(x.dtype().bytes_for_numel(r * self.n), self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        backend.quant_gemm_grouped(
+            &self.w_table.storage,
+            &self.s_table.storage,
+            dtype,
+            segments,
+            &x_c.storage,
+            rows_c.as_ref().map(|t| &*t.storage),
+            (&mut storage, &out_layout),
+            self.n,
+            self.k,
+            self.count,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    }
+
     /// Портируемая ли таблица (активация плотная, а не NVFP4-пара).
     pub fn is_dense(&self) -> bool {
         self.dense.is_some()

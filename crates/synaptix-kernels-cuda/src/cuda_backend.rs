@@ -4372,6 +4372,75 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn quant_gemm_grouped(
+        &self,
+        w_table: &Storage,
+        s_table: &Storage,
+        dtype: DType,
+        segments: &[(u32, u32, u32)],
+        x: &Storage,
+        x_rows: Option<&Storage>,
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        experts: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (out_st, out_lo) = out;
+        let r_total = segments.iter().map(|s| s.2 as usize).max().unwrap_or(0);
+        let bf16 = match out_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("quant_gemm_grouped: out только F16/BF16")),
+        };
+        if segments.iter().any(|(e, s, t)| *e as usize >= experts || s > t) {
+            return Err(SynaptixError::Unsupported("quant_gemm_grouped: сегмент вне таблицы"));
+        }
+        let tiles = crate::elementwise::blockq::grouped_tiles(segments);
+        if tiles.is_empty() {
+            return Ok(());
+        }
+        let err = |what: &'static str| SynaptixError::Unsupported(what);
+        let wt = w_table.as_cuda().ok_or(err("quant_gemm_grouped: таблица не на карте"))?;
+        let ctx = wt.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(wt.ordinal())?;
+        let kernel = crate::elementwise::blockq::GroupedGemmKernel::for_context(&ctx, dtype, bf16)?;
+        let st = s_table.as_cuda().ok_or(err("quant_gemm_grouped: масштабы таблицы не на карте"))?;
+        let xb = x.as_cuda().ok_or(err("quant_gemm_grouped: активация не на карте"))?;
+        let ob = out_st.as_cuda_mut().ok_or(err("quant_gemm_grouped: out не на карте"))?;
+        let wt_view = unsafe { wt.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("quant_gemm_grouped: transmute таблицы".into()))?;
+        let st_view = unsafe { st.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("quant_gemm_grouped: transmute масштабов".into()))?;
+        let dev_tiles = stream
+            .clone_htod(&tiles)
+            .map_err(|e| SynaptixError::Cuda(format!("quant_gemm_grouped: тайлы: {e:?}")))?;
+        let rows_view = match x_rows {
+            Some(r) => {
+                let rb = r.as_cuda().ok_or(err("quant_gemm_grouped: индексы строк не на карте"))?;
+                Some(
+                    unsafe { rb.slice().transmute::<u32>(r_total) }
+                        .ok_or_else(|| SynaptixError::Cuda("quant_gemm_grouped: transmute индексов".into()))?,
+                )
+            }
+            None => None,
+        };
+        crate::elementwise::blockq::blockq_gemm_grouped(
+            &kernel,
+            &stream,
+            dtype,
+            &wt_view,
+            &st_view,
+            &dev_tiles,
+            (tiles.len() / 4) as u32,
+            &xb.slice().slice(..),
+            rows_view.as_ref(),
+            &mut ob.slice_mut().slice_mut(..),
+            n as u32,
+            k as u32,
+        )
+    }
+
     fn quant_gemv_indexed(
         &self,
         w_table: &Storage,

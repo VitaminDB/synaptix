@@ -1489,6 +1489,9 @@ impl MoeFfn {
         if let Some(out) = self.forward_chunk_segmented(x, &experts, &weights)? {
             return Ok(out);
         }
+        if let Some(out) = self.forward_chunk_grouped_dense(x, &experts, &weights)? {
+            return Ok(out);
+        }
 
         // Пары (токен, слот), сгруппированные по эксперту: каждый эксперт
         // получает один GEMM вместо GEMV на токен.
@@ -1552,6 +1555,21 @@ impl MoeFfn {
                 .map_err(|e| ModelError::Forward(format!("MoE: сборка экспертов: {e}")))
         })?;
 
+        self.mix_back(stacked, &order, &weights, t, x)
+    }
+
+    /// Хвост префилла MoE: вес роутера на пару, строки на места, сумма по
+    /// k слотам, shared-эксперт. `stacked[j]` — выход пары `order[j]`.
+    fn mix_back(
+        &self,
+        stacked: Tensor,
+        order: &[u32],
+        weights: &[f32],
+        t: usize,
+        x: &Tensor,
+    ) -> Result<Tensor, ModelError> {
+        use crate::profile::stage;
+        let k = self.cfg.num_experts_per_tok;
         // Вес пары применяется до возврата строк на места.
         let scale: Vec<f32> = order.iter().map(|p| weights[*p as usize]).collect();
         let scale = Tensor::from_vec::<_, f32>(scale, vec![t * k, 1], self.device)
@@ -1587,6 +1605,58 @@ impl MoeFfn {
             }
             None => Ok(mixed),
         }
+    }
+
+    /// Префилл по портируемой таблице экспертов (карты без FP4 MMA, любой
+    /// квант-формат): строки пар сортируются по эксперту, gate_up и down —
+    /// по одному групповому GEMM на слой с деквантом веса в smem. Прежний
+    /// путь — цикл по экспертам, у каждого деквант в глобальную память и свой
+    /// GEMM. `None` — таблицы нет или она NVFP4.
+    fn forward_chunk_grouped_dense(
+        &self,
+        x: &Tensor,
+        experts: &[u32],
+        weights: &[f32],
+    ) -> Result<Option<Tensor>, ModelError> {
+        use crate::profile::stage;
+        let Some((gate_up, down)) = &self.dev_tables else { return Ok(None) };
+        if !gate_up.is_dense()
+            || !down.is_dense()
+            || self.cfg.skip_below > 0.0
+            || !matches!(x.dtype(), DType::F16 | DType::BF16)
+            || moe_grouped_dense_off()
+        {
+            return Ok(None);
+        }
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE групповой GEMM: {e}"));
+        let mut order: Vec<u32> = (0..(t * k) as u32).collect();
+        order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
+        let mut segments: Vec<(u32, u32, u32)> = Vec::new();
+        let mut pos = 0usize;
+        while pos < order.len() {
+            let e = experts[order[pos] as usize];
+            let mut end = pos + 1;
+            while end < order.len() && experts[order[end] as usize] == e {
+                end += 1;
+            }
+            segments.push((e, pos as u32, end as u32));
+            pos = end;
+        }
+        // Строки токенов собираются самим ядром по индексам — без копии
+        // активации на каждую пару.
+        let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
+        let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
+            .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
+        let xc = if x.is_contiguous() { x.clone() } else { x.contiguous().map_err(ferr)? };
+        let gu = stage("moe:gg_gate_up", || gate_up.gemm_grouped_dense_rows(&xc, Some(&row_idx), &segments))
+            .map_err(ferr)?;
+        let h = self.swiglu(&gu)?;
+        let h = if h.is_contiguous() { h } else { h.contiguous().map_err(ferr)? };
+        let parts = stage("moe:gg_down", || down.gemm_grouped_dense(&h, &segments)).map_err(ferr)?;
+        let parts = if parts.dtype() == self.compute { parts } else { self.to_compute(parts)? };
+        self.mix_back(parts, &order, weights, t, x).map(Some)
     }
 
     /// Префилл по резидентным NVFP4-экспертам без оффлоада: строки каждого
@@ -2426,6 +2496,13 @@ mod tests {
 }
 
 /// `SYN_MOE_SEGMENTED=0` — читается один раз (проверка на каждом MoE-слое).
+/// `SYN_MOE_GROUPED_DENSE=0` — префилл портируемой таблицы прежним циклом
+/// по экспертам (A/B и отладка).
+fn moe_grouped_dense_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_MOE_GROUPED_DENSE").as_deref() == Ok("0"))
+}
+
 fn moe_segmented_off() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0"))

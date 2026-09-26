@@ -493,3 +493,115 @@ pub fn blockq_gemv_indexed(
     }
     Ok(())
 }
+
+// ─────────────────────────── групповой GEMM экспертов ───────────────────────────
+
+pub const GG_BM: usize = 64;
+const GG_BN: u32 = 64;
+const GG_THREADS: u32 = 128;
+
+/// Ядро группового GEMM под формат веса и тип активации. Модуль собирается на
+/// один формат (NVRTC на все три десятка форматов с mma-телом — секунды),
+/// строка инстанцирования берётся из списка GEMV-ядер того же формата.
+pub struct GroupedGemmKernel {
+    _module: Arc<CudaModule>,
+    func: CudaFunction,
+}
+
+type GgKey = (usize, &'static str, bool);
+static GG_CACHE: OnceLock<Mutex<Vec<(GgKey, Arc<GroupedGemmKernel>)>>> = OnceLock::new();
+
+/// `GG_BLOB(gg, FN, BB, SPB)` / `GG_SYN(gg, FN)` для суффикса — из строки
+/// `GEMV_BLOB(gemv_<suf>, …)` / `GEMV_SYN(gemv_<suf>, …)` исходника GEMV.
+fn gg_instantiation(suf: &str) -> Option<String> {
+    let src = include_str!("../cu/elementwise/blockq_gemv.cu");
+    for (from, to) in [("GEMV_BLOB(", "GG_BLOB("), ("GEMV_SYN(", "GG_SYN(")] {
+        let head = format!("{from}gemv_{suf},");
+        if let Some(line) = src.lines().find(|l| l.trim_start().starts_with(&head)) {
+            let rest = &line.trim_start()[head.len()..];
+            return Some(format!("{to}gg,{rest}\n"));
+        }
+    }
+    None
+}
+
+impl GroupedGemmKernel {
+    pub fn for_context(ctx: &Arc<CudaContext>, dtype: DType, bf16: bool) -> Result<Arc<Self>> {
+        let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("grouped_gemm: формат не квантованный вес"))?;
+        let key = (Arc::as_ptr(ctx) as usize, suf, bf16);
+        let cache = GG_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        if let Some((_, k)) = cache.lock().unwrap().iter().find(|(k, _)| *k == key) {
+            return Ok(k.clone());
+        }
+        let inst = gg_instantiation(suf).ok_or(SynaptixError::Unsupported("grouped_gemm: нет ядра для формата"))?;
+        let src = format!(
+            "{}\n{}\n{}\n{}",
+            include_str!("../cu/elementwise/ggml_tables.cuh"),
+            include_str!("../cu/elementwise/blockq_decode.cuh"),
+            include_str!("../cu/elementwise/blockq_gemm_grouped.cu"),
+            inst
+        );
+        let opts: &[&str] = if bf16 { &["-DSYN_ACT_BF16"] } else { &[] };
+        let module = compile_module_with_opts(ctx, &src, "blockq_gemm_grouped.cu", opts, None)?;
+        let func = load_fn(&module, "gg")?;
+        let new = Arc::new(Self { _module: module, func });
+        cache.lock().unwrap().push((key, new.clone()));
+        Ok(new)
+    }
+}
+
+/// Тайлы строк: `(эксперт, начало, конец)` по `GG_BM` строк из сегментов
+/// `(эксперт, начало, конец)`; пустые сегменты пропускаются.
+pub fn grouped_tiles(segments: &[(u32, u32, u32)]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for &(e, s, t) in segments {
+        let mut r = s;
+        while r < t {
+            let end = (r + GG_BM as u32).min(t);
+            out.extend_from_slice(&[e, r, end, 0]);
+            r = end;
+        }
+    }
+    out
+}
+
+/// `Y[r] = X[src(r)] · W_{e(r)}ᵀ` по тайлам (`[e, r0, r1, 0]` на тайл, u32
+/// на карте); `src(r) = x_rows[r]` или `r`. `x`/`y` — байты f16/bf16
+/// `[·, K]` / `[R, N]`, `K % 32 == 0`, `N` чётное.
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gemm_grouped(
+    kernel: &GroupedGemmKernel,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    w_table: &CudaView<'_, u64>,
+    s_table: &CudaView<'_, u64>,
+    tiles: &CudaSlice<u32>,
+    n_tiles: u32,
+    x: &CudaView<'_, u8>,
+    x_rows: Option<&CudaView<'_, u32>>,
+    y: &mut CudaViewMut<'_, u8>,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    if k % 32 != 0 || n % 2 != 0 {
+        return Err(SynaptixError::Unsupported("grouped_gemm: K кратно 32, N чётное"));
+    }
+    let rb = gemv_row_bytes(dtype, k as usize)?;
+    if n_tiles == 0 || n == 0 {
+        return Ok(());
+    }
+    let grid = n.div_ceil(GG_BN);
+    let mut bld = stream.launch_builder(&kernel.func);
+    let null_rows: u64 = 0;
+    bld.arg(w_table).arg(s_table).arg(tiles).arg(x);
+    match x_rows {
+        Some(r) => bld.arg(r),
+        None => bld.arg(&null_rows),
+    };
+    bld.arg(&mut *y).arg(&n).arg(&k).arg(&rb);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, n_tiles, 1), block_dim: (GG_THREADS, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemm_grouped {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
+}

@@ -1047,6 +1047,30 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("quant_gemv_indexed не поддержан этим backend"))
     }
 
+    /// Групповой GEMM экспертов (префилл MoE без FP4 MMA): строки `x`
+    /// (`[R, k]`, F16/BF16, подряд) разбиты на сегменты `(эксперт, начало,
+    /// конец)`, строки сегмента умножаются на вес своего эксперта из таблиц
+    /// `w_table`/`s_table` (I64-адреса, как у [`Self::quant_gemv_indexed`]).
+    /// `x_rows` (U32 `[R]`) — строка `r` берётся из `x[x_rows[r]]` (сбор
+    /// строк токенов без копии). Выход `[R, n]` в dtype `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn quant_gemm_grouped(
+        &self,
+        _w_table: &Storage,
+        _s_table: &Storage,
+        _dtype: DType,
+        _segments: &[(u32, u32, u32)],
+        _x: &Storage,
+        _x_rows: Option<&Storage>,
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _experts: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("quant_gemm_grouped не поддержан этим backend"))
+    }
+
     // ── Слитые ядра шага декода (T = 1) ─────────────────────────────────
     //
     // Все буферы contiguous с нулевым смещением, если не сказано иное; пары
