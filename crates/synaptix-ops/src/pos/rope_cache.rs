@@ -44,6 +44,21 @@ impl RopeCache {
         scaled_freqs: &[f32],
         device: Device,
     ) -> Result<Self> {
+        Self::with_scaled_freqs_mscale(head_dim, max_seq, theta_base, scaled_freqs, 1.0, device)
+    }
+
+    /// Как [`Self::with_scaled_freqs`], но cos/sin умножены на `mscale`
+    /// (YaRN `attention_factor`: в transformers он множит cos и sin, то есть
+    /// только повёрнутые измерения — при частичном RoPE в `attn_scale` его не
+    /// свернуть).
+    pub fn with_scaled_freqs_mscale(
+        head_dim: usize,
+        max_seq: usize,
+        theta_base: f32,
+        scaled_freqs: &[f32],
+        mscale: f32,
+        device: Device,
+    ) -> Result<Self> {
         if head_dim == 0 || head_dim % 2 != 0 {
             return Err(SynaptixError::Unsupported("RopeCache: head_dim must be > 0 and even"));
         }
@@ -60,8 +75,8 @@ impl RopeCache {
         for t in 0..max_seq {
             for i in 0..half {
                 let angle = (t as f32) * scaled_freqs[i];
-                cos[t * half + i] = angle.cos();
-                sin[t * half + i] = angle.sin();
+                cos[t * half + i] = angle.cos() * mscale;
+                sin[t * half + i] = angle.sin() * mscale;
             }
         }
         let cos_t = Tensor::from_vec(cos, (max_seq, half), device)?;

@@ -18,6 +18,10 @@ struct RopeParameters {
     /// Интерливинг осей по частотам (`T H W T H W …`), а не подряд блоками.
     #[serde(default)]
     mrope_interleaved: bool,
+    /// `rope_type`/`factor`/`original_max_position_embeddings`/… — YaRN и
+    /// прочее масштабирование (у бандлов Qwen3.6/3.8 — `default`).
+    #[serde(flatten)]
+    scaling: common::rope_scaling::RopeScaling,
 }
 
 /// Раскладка M-RoPE (см. `crate::mrope`).
@@ -112,6 +116,7 @@ impl Default for TextConfigRaw {
                 rope_theta: default_rope_theta(),
                 mrope_section: None,
                 mrope_interleaved: false,
+                scaling: Default::default(),
             },
         }
     }
@@ -151,13 +156,33 @@ pub struct HybridConfig {
     /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
     /// (у text-only сборок и старых конфигов).
     pub mrope: Option<MropeSpec>,
+    /// Масштабирование RoPE из `rope_parameters` (`None` — `default`).
+    pub rope_scaling: Option<common::rope_scaling::RopeScaling>,
 }
 
 impl HybridConfig {
+    /// RoPE с учётом `rope_scaling` (частоты rotary-части и множитель cos/sin).
+    fn scaled_rope(&self) -> common::rope_scaling::ScaledRope {
+        common::rope_scaling::resolve(
+            self.rope_scaling.as_ref(),
+            self.rope_theta,
+            self.rotary_dim(),
+            self.max_position_embeddings,
+        )
+    }
+
+    /// Множитель cos/sin (YaRN `attention_factor`); 1.0 без масштабирования.
+    pub fn rope_mscale(&self) -> f32 {
+        self.scaled_rope().attn_factor
+    }
+
     /// Обратные частоты rotary-части — ровно те, что кладёт в таблицы
     /// `RopeCache::new` (та же f32-арифметика), чтобы M-RoPE-таблицы,
     /// собранные на host, для текста совпадали с обычным путём.
     pub fn rope_inv_freqs(&self) -> Vec<f32> {
+        if let Some(f) = self.scaled_rope().freqs {
+            return f;
+        }
         let rd = self.rotary_dim();
         (0..rd / 2)
             .map(|i| self.rope_theta.powf(-(2.0 * i as f32) / (rd as f32)))
@@ -246,6 +271,11 @@ impl HybridConfig {
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,
+            rope_scaling: {
+                let rs = &raw.rope_parameters.scaling;
+                let kind = rs.rope_type.to_ascii_lowercase();
+                (!kind.is_empty() && kind != "default").then(|| rs.clone())
+            },
         };
         cfg.validate()?;
         Ok(cfg)
@@ -298,7 +328,7 @@ impl HybridConfig {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             head_dim: self.head_dim,
-            max_position_embeddings: self.max_position_embeddings,
+            max_position_embeddings: self.scaled_rope().max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             norm_gain: common::NormGain::OnePlus,
             activation: common::Activation::Silu,
@@ -311,10 +341,14 @@ impl HybridConfig {
             embed_rms_norm: false,
             logit_scale: None,
             logit_softcap: None,
-            rope_global: common::RopeSpec {
-                theta: self.rope_theta,
-                rotary_dim: self.rotary_dim(),
-                scaled_freqs: None,
+            rope_global: {
+                let rope = self.scaled_rope();
+                common::RopeSpec {
+                    theta: self.rope_theta,
+                    rotary_dim: self.rotary_dim(),
+                    scaled_freqs: rope.freqs,
+                    mscale: rope.attn_factor,
+                }
             },
             rope_local: None,
             sliding_window: None,
@@ -451,6 +485,36 @@ mod tests {
         assert_eq!(cfg.rope_inv_freqs().len(), 32);
         let plain = HybridConfig::from_hf_bytes(br#"{"model_type": "qwen3_5"}"#).unwrap();
         assert_eq!(plain.mrope, None);
+    }
+
+    #[test]
+    fn yarn_in_rope_parameters_is_applied() {
+        // Бандлы Qwen3.6/3.8 несут `default` — RoPE не меняется бит в бит.
+        let plain = HybridConfig::from_hf_bytes(
+            br#"{"model_type": "qwen3_5", "head_dim": 256, "partial_rotary_factor": 0.25,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10000000}}"#,
+        )
+        .unwrap();
+        assert!(plain.rope_scaling.is_none());
+        let dc = plain.to_decoder_config();
+        assert!(dc.rope_global.scaled_freqs.is_none());
+        assert_eq!(dc.rope_global.mscale, 1.0);
+        // YaRN ×4 (расширение до 1M): частоты rotary-части и множитель cos/sin
+        // — только у повёрнутых измерений, поэтому не в attn_scale.
+        let yarn = HybridConfig::from_hf_bytes(
+            br#"{"model_type": "qwen3_5", "head_dim": 256, "partial_rotary_factor": 0.25,
+                "max_position_embeddings": 1048576,
+                "rope_parameters": {"rope_type": "yarn", "factor": 4.0, "rope_theta": 10000000,
+                    "original_max_position_embeddings": 262144}}"#,
+        )
+        .unwrap();
+        let dc = yarn.to_decoder_config();
+        let f = dc.rope_global.scaled_freqs.clone().unwrap();
+        assert_eq!(f.len(), 32);
+        assert_eq!(f, yarn.rope_inv_freqs());
+        assert!((dc.rope_global.mscale - 1.138_629_4).abs() < 1e-6);
+        assert_eq!(dc.attn_scale, plain.to_decoder_config().attn_scale);
+        assert!(f[31] < plain.rope_inv_freqs()[31], "низкие частоты поделены на factor");
     }
 
     #[test]

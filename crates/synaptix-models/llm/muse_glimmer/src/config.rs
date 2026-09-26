@@ -378,11 +378,12 @@ impl MuseConfig {
             embed_rms_norm: true,
             logit_scale: Some(self.output_multiplier),
             logit_softcap: Some(self.final_logit_softcapping),
-            rope_global: common::RopeSpec { theta: 0.0, rotary_dim: 0, scaled_freqs: None },
+            rope_global: common::RopeSpec { theta: 0.0, rotary_dim: 0, scaled_freqs: None, mscale: 1.0 },
             rope_local: Some(common::RopeSpec {
                 theta: self.rope_theta,
                 rotary_dim: self.head_dim,
                 scaled_freqs: None,
+                mscale: 1.0,
             }),
             sliding_window: Some(self.sliding_window),
             sliding_window_pattern: FULL_ATTENTION_INTERVAL,

@@ -81,7 +81,7 @@ fn qwen3_embedding_config() -> DecoderConfig {
         embed_rms_norm: false,
         logit_scale: None,
         logit_softcap: None,
-        rope_global: RopeSpec { theta: 1_000_000.0, rotary_dim: head_dim, scaled_freqs: None },
+        rope_global: RopeSpec { theta: 1_000_000.0, rotary_dim: head_dim, scaled_freqs: None, mscale: 1.0 },
         rope_local: None,
         sliding_window: None,
         sliding_window_pattern: 0,

@@ -704,7 +704,12 @@ impl HybridPipeline {
                     .collect();
                 let positions = mrope::positions_3d(prompt_ids, &runs).map_err(PipelineError::Forward)?;
                 let inv = self.config.rope_inv_freqs();
-                let (cos, sin) = mrope::rope_tables(&positions.pos, &inv, &spec.section, spec.interleaved);
+                let (mut cos, mut sin) = mrope::rope_tables(&positions.pos, &inv, &spec.section, spec.interleaved);
+                // YaRN `attention_factor` — как у обычных таблиц RoPE.
+                let ms = self.config.rope_mscale();
+                if ms != 1.0 {
+                    cos.iter_mut().chain(sin.iter_mut()).for_each(|x| *x *= ms);
+                }
                 let half = inv.len();
                 let l = prompt_ids.len();
                 let cos = Tensor::from_vec(cos, vec![l, half], self.model.device)

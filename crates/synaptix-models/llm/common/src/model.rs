@@ -1411,7 +1411,7 @@ impl DecoderModel {
                     .map_err(|e| ModelError::Build(e.to_string()));
             }
             match &spec.scaled_freqs {
-                Some(freqs) => RopeCache::with_scaled_freqs(spec.rotary_dim, rope_capacity, spec.theta, freqs, device),
+                Some(freqs) => RopeCache::with_scaled_freqs_mscale(spec.rotary_dim, rope_capacity, spec.theta, freqs, spec.mscale, device),
                 None => RopeCache::new(spec.rotary_dim, rope_capacity, spec.theta, device),
             }
             .map_err(|e| ModelError::Build(e.to_string()))

@@ -168,11 +168,13 @@ impl Gemma3Config {
                 theta: self.rope_theta,
                 rotary_dim: self.head_dim,
                 scaled_freqs: Some(self.global_rope_freqs()),
+                mscale: 1.0,
             },
             rope_local: Some(RopeSpec {
                 theta: self.rope_local_base_freq,
                 rotary_dim: self.head_dim,
                 scaled_freqs: None,
+                mscale: 1.0,
             }),
             sliding_window: Some(self.sliding_window),
             sliding_window_pattern: self.sliding_window_pattern,

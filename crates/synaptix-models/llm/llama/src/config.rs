@@ -157,6 +157,7 @@ impl LlamaConfig {
                 theta: self.rope_theta,
                 rotary_dim: self.head_dim,
                 scaled_freqs: rope.freqs,
+                mscale: 1.0,
             },
             rope_local: None,
             sliding_window: None,

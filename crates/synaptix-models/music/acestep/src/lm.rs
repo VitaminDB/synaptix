@@ -76,6 +76,7 @@ pub fn to_decoder_config(cfg: &LmConfig) -> DecoderConfig {
             theta: cfg.rope_theta,
             rotary_dim: cfg.head_dim,
             scaled_freqs: None,
+            mscale: 1.0,
         },
         rope_local: None,
         sliding_window: None,

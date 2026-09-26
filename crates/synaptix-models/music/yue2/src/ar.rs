@@ -103,7 +103,7 @@ fn to_decoder_config(cfg: &Yue2Config) -> DecoderConfig {
         embed_rms_norm: false,
         logit_scale: None,
         logit_softcap: None,
-        rope_global: RopeSpec { theta: cfg.rope_theta, rotary_dim: cfg.head_dim, scaled_freqs: None },
+        rope_global: RopeSpec { theta: cfg.rope_theta, rotary_dim: cfg.head_dim, scaled_freqs: None, mscale: 1.0 },
         rope_local: None,
         sliding_window: None,
         sliding_window_pattern: 0,

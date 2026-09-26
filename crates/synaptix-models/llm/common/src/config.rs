@@ -21,6 +21,8 @@ pub struct RopeSpec {
     pub theta: f32,
     pub rotary_dim: usize,
     pub scaled_freqs: Option<Vec<f32>>,
+    /// Множитель cos/sin (YaRN `attention_factor`); 1.0 — без него.
+    pub mscale: f32,
 }
 
 #[derive(Debug, Clone)]
