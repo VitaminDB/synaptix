@@ -295,3 +295,35 @@ fn continue_k(a: &[f32], b: &[f32], rows: usize, k: usize, kq: usize) -> (Vec<f3
     let cut = |m: &[f32]| (0..rows).flat_map(|r| m[r * k..r * k + kq].to_vec()).collect::<Vec<f32>>();
     (cut(a), cut(b))
 }
+
+/// Замер портируемого GEMV (M = 1) на большом весе: ГБ/с по байтам веса.
+/// `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn blockq_gemv_bandwidth_bench() {
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    let (n, k) = (16384usize, 8192usize);
+    for fmt in [DType::NVFP4, DType::MXFP8, DType::Sq { bits: 4 }] {
+        let w = Tensor::from_vec(noise(3, n * k), vec![n, k], dev)
+            .and_then(|t| t.to_dtype(DType::F16))
+            .and_then(|t| t.quantize_to(fmt))
+            .unwrap();
+        let bytes = w.packed_arc().unwrap().byte_len() + w.scales_opt().map_or(0, |s| s.byte_len());
+        let x = Tensor::from_vec(noise(4, k), vec![1, k], dev).and_then(|t| t.to_dtype(DType::BF16)).unwrap();
+        let sync = || synaptix_core::stream::Stream::default_for(dev).unwrap().sync().unwrap();
+        let run = || {
+            Tensor::dec_gemv_grouped_dense(&[&w], &x).unwrap();
+        };
+        run();
+        sync();
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            run();
+        }
+        sync();
+        let t = t0.elapsed().as_secs_f64() / 20.0;
+        println!("{fmt:?}: {:.1} мкс, {:.0} ГБ/с", t * 1e6, bytes as f64 / t / 1e9);
+    }
+}

@@ -289,8 +289,8 @@ __device__ __forceinline__ void norm_into(
 //
 //   y      = post_w ? bf16(norm(attn_out)·post_w) : attn_out
 //   hidden = bf16(y + hidden_in)                     → hidden_out
-//   a      = bf16(norm(hidden)·w_a)  → NVFP4-пара    (вход плотного MLP)
-//   b      = bf16(norm(hidden)·w_b)  → NVFP4-пара    (вход экспертов)
+//   a      = bf16(norm(hidden)·w_a)  → NVFP4-пара или bf16 (вход плотного MLP)
+//   b      = bf16(norm(hidden)·w_b)  → NVFP4-пара или bf16 (вход экспертов)
 //   c      = bf16(norm(hidden)·w_c)  → bf16          (вход роутера)
 //
 // Любой из выходов a/b/c можно выключить нулевым указателем веса. Один блок;
@@ -301,7 +301,9 @@ extern "C" __global__ void dec_attn_tail_bf16(
     const bf16_t* __restrict__ hidden_in,
     bf16_t* __restrict__ hidden_out,
     const bf16_t* __restrict__ w_a, unsigned char* __restrict__ a_packed, unsigned char* __restrict__ a_scales,
+    bf16_t* __restrict__ a_bf16,
     const bf16_t* __restrict__ w_b, unsigned char* __restrict__ b_packed, unsigned char* __restrict__ b_scales,
+    bf16_t* __restrict__ b_bf16,
     const bf16_t* __restrict__ w_c, bf16_t* __restrict__ c_out,
     int h, float eps_post, float eps, int sf_inner_dim)
 {
@@ -345,7 +347,14 @@ extern "C" __global__ void dec_attn_tail_bf16(
     sq = block_sum(sq, red);
     float rms = rsqrtf(sq / (float)h + eps);
 
-    if (w_a) {
+    if (w_a && a_bf16) {
+        // Ada и ниже: bf16-вход GEMV вместо NVFP4-пары.
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            int t = tid + i * bs;
+            if (t < h) stf(a_bf16 + t, wa[i] * xv[i] * rms);
+        }
+    } else if (w_a) {
         #pragma unroll
         for (int i = 0; i < DEC_MAXE; ++i) {
             int t = tid + i * bs;
@@ -355,7 +364,14 @@ extern "C" __global__ void dec_attn_tail_bf16(
         dq_nvfp4_row(s_y, h, a_packed, a_scales, 0, sf_inner_dim);
         __syncthreads();
     }
-    if (w_b) {
+    if (w_b && b_bf16) {
+        // Ada и ниже: bf16-вход GEMV вместо NVFP4-пары.
+        #pragma unroll
+        for (int i = 0; i < DEC_MAXE; ++i) {
+            int t = tid + i * bs;
+            if (t < h) stf(b_bf16 + t, wb[i] * xv[i] * rms);
+        }
+    } else if (w_b) {
         #pragma unroll
         for (int i = 0; i < DEC_MAXE; ++i) {
             int t = tid + i * bs;
@@ -617,6 +633,70 @@ extern "C" __global__ void dec_geglu_quant_nvfp4_bf16(
 {
     geglu_topk_kernel<bf16_t>(gate, up, stride, packed, scales, rows, inter, sf_inner_dim,
                               logits, pes, out_idx, out_w, acc_zero, r_e, r_k, r_h);
+}
+
+// ── gelu_tanh(gate) · up → строка T (путь без FP4 MMA) ───────────────────
+//
+// Те же округления, что у geglu_quant_impl, но выход — `out[rows, inter]` в T
+// (вход портируемого GEMV). Последний блок грида при r_e > 0 — top-k роутера.
+template <typename T>
+__device__ __forceinline__ void geglu_plain_kernel(
+    const T* gate, const T* up, long long stride, T* out, int rows, int inter,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    if (r_e > 0 && blockIdx.x == gridDim.x - 1) {
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        if (warp == 0) {
+            router_topk_warp(logits, pes, out_idx, out_w, r_e, r_k, lane);
+        } else if (acc_zero) {
+            for (int t = threadIdx.x - 32; t < r_h; t += blockDim.x - 32) acc_zero[t] = 0.f;
+        }
+        return;
+    }
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * inter) return;
+    int row = (int)(i / inter), col = (int)(i % inter);
+    const T* gp = gate + (long long)row * stride + col;
+    float a = rnd_t(gp, gelu_tanh_f(ldf(gp)));
+    stf(out + i, a * ldf(up + (long long)row * stride + col));
+}
+
+extern "C" __global__ void dec_geglu_f16(
+    const __half* gate, const __half* up, long long stride, __half* out, int rows, int inter,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    geglu_plain_kernel<__half>(gate, up, stride, out, rows, inter, logits, pes, out_idx, out_w, acc_zero, r_e, r_k, r_h);
+}
+
+extern "C" __global__ void dec_geglu_bf16(
+    const bf16_t* gate, const bf16_t* up, long long stride, bf16_t* out, int rows, int inter,
+    const float* logits, const float* pes, unsigned int* out_idx, float* out_w, float* acc_zero,
+    int r_e, int r_k, int r_h)
+{
+    geglu_plain_kernel<bf16_t>(gate, up, stride, out, rows, inter, logits, pes, out_idx, out_w, acc_zero, r_e, r_k, r_h);
+}
+
+// ── Логиты роутера MoE: f32-вес [E, H] × bf16-строка → f32 [E] ───────────
+//
+// Варп на эксперта, float4-чтение веса. Путь без FP4 MMA (у натива логиты —
+// хвостовые блоки группового GEMV).
+extern "C" __global__ void dec_router_logits_bf16(
+    const float* __restrict__ w, const bf16_t* __restrict__ x, float* __restrict__ out, int e, int h)
+{
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= e) return;
+    const float* wr = w + (size_t)row * h;
+    float acc = 0.f;
+    for (int c = lane * 4; c < h; c += 128) {
+        float4 wv = *reinterpret_cast<const float4*>(wr + c);
+        acc += wv.x * ldf(x + c) + wv.y * ldf(x + c + 1) + wv.z * ldf(x + c + 2) + wv.w * ldf(x + c + 3);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+    if (lane == 0) out[row] = acc;
 }
 
 // ── Подготовка внимания: нормы голов + RoPE + запись в KV ───────────────

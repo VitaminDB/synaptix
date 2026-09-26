@@ -310,6 +310,132 @@ impl Tensor {
         ))
     }
 
+    /// `gelu_tanh(gate)·up` → строки `[rows, inter]` в типе gate (путь без
+    /// FP4 MMA: вход портируемого GEMV). Аргументы и top-k — как у
+    /// [`Self::dec_geglu_quant_nvfp4`].
+    #[allow(clippy::type_complexity)]
+    pub fn dec_geglu(
+        gate: (&Tensor, usize),
+        up: (&Tensor, usize),
+        stride: usize,
+        rows: usize,
+        inter: usize,
+        topk: Option<(&Tensor, Option<&Tensor>, usize, usize)>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor, Tensor)>)> {
+        let (g, go) = gate;
+        let (u, uo) = up;
+        let dt = g.dtype();
+        if u.dtype() != dt || !matches!(dt, DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Unsupported("dec_geglu: gate/up F16|BF16 одного типа"));
+        }
+        if !g.is_contiguous() || !u.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let esz = dt.size_in_bits() / 8;
+        let dev = g.device();
+        let backend = registry::backend_for(dev)?;
+        let mut out = alloc(backend, dev, dt.bytes_for_numel(rows * inter))?;
+        let mut tk_bufs = match topk {
+            Some((logits, pes, k, h)) => {
+                let e = logits.numel();
+                if logits.dtype() != DType::F32 || !logits.is_contiguous() {
+                    return Err(SynaptixError::Unsupported("dec_geglu: логиты F32[e]"));
+                }
+                if let Some(p) = pes {
+                    if p.numel() != e || p.dtype() != DType::F32 || !p.is_contiguous() {
+                        return Err(SynaptixError::Unsupported("dec_geglu: per_expert_scale F32[e]"));
+                    }
+                }
+                Some((alloc(backend, dev, k * 4)?, alloc(backend, dev, k * 4)?, alloc(backend, dev, h * 4)?, e, k, h))
+            }
+            None => None,
+        };
+        {
+            let stream = Stream::default_for(dev)?;
+            let tk = match (&topk, &mut tk_bufs) {
+                (Some((logits, pes, _, _)), Some((idx, w, acc, e, k, h))) => Some(DecTopk {
+                    logits: &logits.storage,
+                    pes: pes.map(|t| &*t.storage),
+                    idx,
+                    w,
+                    acc,
+                    e: *e,
+                    k: *k,
+                    h: *h,
+                }),
+                _ => None,
+            };
+            backend.dec_geglu(
+                (&g.storage, g.layout.byte_offset() + go * esz),
+                (&u.storage, u.layout.byte_offset() + uo * esz),
+                stride,
+                dt,
+                &mut out,
+                rows,
+                inter,
+                tk,
+                &stream,
+            )?;
+        }
+        let tk_out = tk_bufs.map(|(idx, w, acc, _, k, h)| {
+            (
+                Tensor::from_parts(Arc::new(idx), Layout::contiguous(Shape::new(vec![k]), DType::U32)),
+                Tensor::from_parts(Arc::new(w), Layout::contiguous(Shape::new(vec![k]), DType::F32)),
+                Tensor::from_parts(Arc::new(acc), Layout::contiguous(Shape::new(vec![h]), DType::F32)),
+            )
+        });
+        Ok((Tensor::from_parts(Arc::new(out), Layout::contiguous(Shape::new(vec![rows, inter]), dt)), tk_out))
+    }
+
+    /// Логиты роутера MoE: `self` — bf16-строка `[.., H]`, `w` — F32 `[E, H]`.
+    /// Возвращает F32 `[E]`.
+    pub fn dec_router_logits(&self, w: &Tensor) -> Result<Tensor> {
+        let h = *self.dims().last().ok_or(SynaptixError::Unsupported("dec_router_logits: scalar"))?;
+        if self.layout.numel() != h || self.dtype() != DType::BF16 {
+            return Err(SynaptixError::Unsupported("dec_router_logits: одна bf16-строка"));
+        }
+        if w.dtype() != DType::F32 || w.rank() != 2 || w.dims()[1] != h || !w.is_contiguous() || w.layout.byte_offset() != 0 {
+            return Err(SynaptixError::Unsupported("dec_router_logits: вес F32 [E, H] подряд"));
+        }
+        let e = w.dims()[0];
+        let dev = self.device();
+        let backend = registry::backend_for(dev)?;
+        let x = row_tensor(self, "router_in")?;
+        let mut out = alloc(backend, dev, e * 4)?;
+        let stream = Stream::default_for(dev)?;
+        backend.dec_router_logits(&w.storage, (&x.storage, x.layout.byte_offset()), &mut out, e, h, &stream)?;
+        Ok(Tensor::from_parts(Arc::new(out), Layout::contiguous(Shape::new(vec![e]), DType::F32)))
+    }
+
+    /// Групповой GEMV по квантованным весам одного формата и одного K над
+    /// плотной строкой `x` (F16|BF16, `[.., K]`): выход `[1, ΣN]` в типе `x`,
+    /// строки весов подряд. Путь декода без FP4 MMA (q|k|v, gate|up).
+    pub fn dec_gemv_grouped_dense(weights: &[&QuantWeight], x: &Tensor) -> Result<Tensor> {
+        let first = weights.first().ok_or(SynaptixError::Unsupported("dec_gemv_grouped_dense: пусто"))?;
+        let (k, dtype) = (first.k(), first.dtype());
+        if weights.len() > 4 || weights.iter().any(|w| w.k() != k || w.dtype() != dtype) {
+            return Err(SynaptixError::Unsupported("dec_gemv_grouped_dense: до четырёх весов одного формата и K"));
+        }
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) || x.layout.numel() != k {
+            return Err(SynaptixError::Unsupported("dec_gemv_grouped_dense: одна строка F16|BF16 длины K"));
+        }
+        let packed: Vec<Arc<Storage>> = weights
+            .iter()
+            .map(|w| w.packed_arc().ok_or(SynaptixError::Unsupported("dec_gemv_grouped_dense: packed освобождён")))
+            .collect::<Result<_>>()?;
+        let groups: Vec<(&Storage, Option<&Storage>, usize)> =
+            weights.iter().zip(&packed).map(|(w, p)| (p.as_ref(), w.scales_opt(), w.n())).collect();
+        let n: usize = weights.iter().map(|w| w.n()).sum();
+        let dev = x.device();
+        let backend = registry::backend_for(dev)?;
+        let xr = row_tensor(x, "x")?;
+        let out_layout = Layout::contiguous(Shape::new(vec![1usize, n]), x.dtype());
+        let mut out = alloc(backend, dev, x.dtype().bytes_for_numel(n))?;
+        let stream = Stream::default_for(dev)?;
+        backend.quant_gemv_grouped(&groups, dtype, k, (&xr.storage, xr.layout.byte_offset()), (&mut out, &out_layout), &stream)?;
+        Ok(Tensor::from_parts(Arc::new(out), out_layout))
+    }
+
     /// Нормы голов + RoPE + запись K/V в кэш. `q`/`k`/`v` — (тензор bf16,
     /// смещение в элементах) со строками голов подряд; кэши — `[1, nkv,
     /// max_seq, hd]`. Возвращает `q` после нормы и RoPE `[1, nh, 1, hd]`.

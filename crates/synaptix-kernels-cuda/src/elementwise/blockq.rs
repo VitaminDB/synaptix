@@ -302,6 +302,8 @@ pub struct BlockqGemvKernels {
     fns: HashMap<&'static str, CudaFunction>,
     batched: HashMap<&'static str, CudaFunction>,
     indexed: HashMap<&'static str, CudaFunction>,
+    grouped: HashMap<&'static str, CudaFunction>,
+    indexed_acc: HashMap<&'static str, CudaFunction>,
 }
 
 static GEMV_CACHE: OnceLock<Mutex<Vec<(usize, Arc<BlockqGemvKernels>)>>> = OnceLock::new();
@@ -309,6 +311,17 @@ static GEMV_CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<BlockqGemvKernels>)>>> = 
 
 const GEMV_WARPS: u32 = 4;
 const GEMV_THREADS: u32 = GEMV_WARPS * 32;
+
+/// Лейнов на строку GEMV по K: 32 при K ≥ 2048 (замер: у K = 2816 16 лейнов
+/// не быстрее), у узких K — 16 или 8, и варп считает 2–4 строки, а не
+/// простаивает (эксперты down Gemma-4, K = 704: 22 → 17 мкс).
+fn gemv_lpr(k: u32) -> u32 {
+    match k / 32 {
+        s if s >= 64 => 32,
+        s if s >= 32 => 16,
+        _ => 8,
+    }
+}
 pub const GEMV_MAX_M: usize = 8;
 /// Опции модуля GEMV (порядок операций здесь не контракт, FMA разрешён).
 pub const GEMV_MODULE_OPTS: &[&str] = &[];
@@ -347,12 +360,16 @@ impl BlockqGemvKernels {
         let mut fns = HashMap::new();
         let mut batched = HashMap::new();
         let mut indexed = HashMap::new();
+        let mut grouped = HashMap::new();
+        let mut indexed_acc = HashMap::new();
         for suf in SUFFIXES.iter().chain(["nvfp4_syn", "mxfp8_syn"].iter()) {
             fns.insert(*suf, load_fn(&module, &format!("gemv_{suf}"))?);
             batched.insert(*suf, load_fn(&module, &format!("gemv_{suf}_batched"))?);
             indexed.insert(*suf, load_fn(&module, &format!("gemv_{suf}_indexed"))?);
+            grouped.insert(*suf, load_fn(&module, &format!("gemv_{suf}_grouped"))?);
+            indexed_acc.insert(*suf, load_fn(&module, &format!("gemv_{suf}_indexed_acc"))?);
         }
-        let new = Arc::new(Self { _module: module, fns, batched, indexed });
+        let new = Arc::new(Self { _module: module, fns, batched, indexed, grouped, indexed_acc });
         cache.lock().unwrap().push((key, new.clone()));
         Ok(new)
     }
@@ -365,6 +382,15 @@ impl BlockqGemvKernels {
     fn func_batched(&self, dtype: DType) -> Result<&CudaFunction> {
         let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_gemv: формат не квантованный вес"))?;
         self.batched.get(suf).ok_or(SynaptixError::Unsupported("blockq_gemv: нет батчевого ядра"))
+    }
+
+    fn func_by(&self, map: &'static str, dtype: DType) -> Result<&CudaFunction> {
+        let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_gemv: формат не квантованный вес"))?;
+        let m = match map {
+            "grouped" => &self.grouped,
+            _ => &self.indexed_acc,
+        };
+        m.get(suf).ok_or(SynaptixError::Unsupported("blockq_gemv: нет ядра для формата"))
     }
 
     fn func_indexed(&self, dtype: DType) -> Result<&CudaFunction> {
@@ -415,10 +441,11 @@ pub fn blockq_gemv(
         return Ok(());
     }
     let f = kernels.func(dtype)?;
-    let grid = n.div_ceil(GEMV_WARPS);
+    let lpr = gemv_lpr(k);
+    let grid = n.div_ceil(GEMV_WARPS * (32 / lpr));
     let mi = m as i32;
     let mut bld = stream.launch_builder(f);
-    bld.arg(w).arg(sw).arg(x).arg(&mut *out).arg(&n).arg(&k).arg(&mi).arg(&x_stride).arg(&out_stride).arg(&rb);
+    bld.arg(w).arg(sw).arg(x).arg(&mut *out).arg(&n).arg(&k).arg(&mi).arg(&x_stride).arg(&out_stride).arg(&rb).arg(&lpr);
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv {dtype:?}: {e:?}")))?;
@@ -447,9 +474,10 @@ pub fn blockq_gemv_batched(
         return Ok(());
     }
     let f = kernels.func_batched(dtype)?;
-    let grid = n.div_ceil(GEMV_WARPS);
+    let lpr = gemv_lpr(k);
+    let grid = n.div_ceil(GEMV_WARPS * (32 / lpr));
     let mut bld = stream.launch_builder(f);
-    bld.arg(w_ptrs).arg(sw_ptrs).arg(x_ptrs).arg(out_ptrs).arg(&n).arg(&k).arg(&rb);
+    bld.arg(w_ptrs).arg(sw_ptrs).arg(x_ptrs).arg(out_ptrs).arg(&n).arg(&k).arg(&rb).arg(&lpr);
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, experts, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_batched {dtype:?}: {e:?}")))?;
@@ -483,10 +511,11 @@ pub fn blockq_gemv_indexed(
         return Ok(());
     }
     let f = kernels.func_indexed(dtype)?;
-    let grid = n.div_ceil(GEMV_WARPS);
+    let lpr = gemv_lpr(k);
+    let grid = n.div_ceil(GEMV_WARPS * (32 / lpr));
     let rpp: i32 = rows_per_pair as i32;
     let mut bld = stream.launch_builder(f);
-    bld.arg(w_table).arg(sw_table).arg(idx).arg(x).arg(&mut *out).arg(&n).arg(&k).arg(&rb).arg(&experts).arg(&rpp);
+    bld.arg(w_table).arg(sw_table).arg(idx).arg(x).arg(&mut *out).arg(&n).arg(&k).arg(&rb).arg(&experts).arg(&rpp).arg(&lpr);
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, pairs, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_indexed {dtype:?}: {e:?}")))?;
@@ -720,6 +749,94 @@ pub fn blockq_gemm_grouped_fp8(
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, n_tiles, 1), block_dim: (GG8_THREADS, 1, 1), shared_mem_bytes: gg8_smem(kernel.bm) })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemm_grouped_fp8 {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Одна группа [`blockq_gemv_grouped`]: адреса блоба веса и масштабов (у
+/// одноблобных — тот же адрес), строк `n`.
+#[derive(Clone, Copy, Default)]
+pub struct GemvGroupPtr {
+    pub w: u64,
+    pub s: u64,
+    pub n: u32,
+}
+
+/// До четырёх весов одного формата и одного K над одной строкой `x`: выход —
+/// строки групп подряд (`[ΣN]`). Шаг декода: q|k|v или gate|up одним запуском.
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gemv_grouped(
+    kernels: &BlockqGemvKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    groups: &[GemvGroupPtr],
+    x: u64,
+    out: u64,
+    k: u32,
+) -> Result<()> {
+    if groups.is_empty() || groups.len() > 4 {
+        return Err(SynaptixError::Unsupported("blockq_gemv_grouped: 1..=4 группы"));
+    }
+    let rb = gemv_row_bytes(dtype, k as usize)?;
+    let mut g = [GemvGroupPtr::default(); 4];
+    g[..groups.len()].copy_from_slice(groups);
+    let total: u32 = groups.iter().map(|g| g.n).sum();
+    if total == 0 {
+        return Ok(());
+    }
+    // Начала групп 1..3; отсутствующие группы — за концом (строк в них нет).
+    let mut c = [total; 3];
+    let mut acc = 0u32;
+    for (i, gr) in groups.iter().enumerate().take(3) {
+        acc += gr.n;
+        c[i] = acc;
+    }
+    let f = kernels.func_by("grouped", dtype)?;
+    let lpr = gemv_lpr(k);
+    let grid = total.div_ceil(GEMV_WARPS * (32 / lpr));
+    let mut bld = stream.launch_builder(f);
+    bld.arg(&g[0].w).arg(&g[1].w).arg(&g[2].w).arg(&g[3].w);
+    bld.arg(&g[0].s).arg(&g[1].s).arg(&g[2].s).arg(&g[3].s);
+    bld.arg(&c[0]).arg(&c[1]).arg(&c[2]).arg(&x).arg(&out).arg(&total).arg(&k).arg(&rb).arg(&lpr);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_grouped {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Индексный батч экспертов с накоплением: `acc[N] += Σ_p pw[p] · W_{idx[p]} · x[r_p]`
+/// (f32, атомарно). `acc` обнуляет вызывающий (у декода — ядро top-k роутера).
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gemv_indexed_acc(
+    kernels: &BlockqGemvKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    w_table: u64,
+    s_table: u64,
+    idx: u64,
+    pw: u64,
+    x: u64,
+    acc: u64,
+    experts: u32,
+    pairs: u32,
+    n: u32,
+    k: u32,
+    rows_per_pair: bool,
+) -> Result<()> {
+    let rb = gemv_row_bytes(dtype, k as usize)?;
+    if n == 0 || pairs == 0 {
+        return Ok(());
+    }
+    let f = kernels.func_by("indexed_acc", dtype)?;
+    let lpr = gemv_lpr(k);
+    let grid = n.div_ceil(GEMV_WARPS * (32 / lpr));
+    let rpp: i32 = rows_per_pair as i32;
+    let mut bld = stream.launch_builder(f);
+    bld.arg(&w_table).arg(&s_table).arg(&idx).arg(&pw).arg(&x).arg(&acc).arg(&n).arg(&k).arg(&rb).arg(&experts).arg(&rpp).arg(&lpr);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, pairs, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_indexed_acc {dtype:?}: {e:?}")))?;
     }
     Ok(())
 }

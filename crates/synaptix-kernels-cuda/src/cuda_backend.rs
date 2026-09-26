@@ -4671,35 +4671,36 @@ impl Backend for CudaBackend {
         use crate::fused::llm_decode::{self as ld, Nvfp4Out};
         let (ctx, stream) = ctx_stream_of(attn_out, "dec_attn_tail")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        // Выходы по позиции: 0 → a, 1 → b (NVFP4-пара или bf16), 2 → c (bf16).
         let mut a = Nvfp4Out::default();
         let mut b = Nvfp4Out::default();
         let (mut w_c, mut c_out) = (0u64, 0u64);
-        let mut n4 = 0;
-        for spec in outs.iter_mut() {
+        if outs.len() > 3 {
+            return Err(SynaptixError::Unsupported("dec_attn_tail: до трёх выходов"));
+        }
+        for (i, spec) in outs.iter_mut().enumerate() {
             let w = dptr(spec.weight, 0, "dec_attn_tail: вес")?;
-            match &mut spec.out {
-                DecNormOut::Bf16(o) => {
-                    if w_c != 0 {
-                        return Err(SynaptixError::Unsupported("dec_attn_tail: один bf16-выход"));
-                    }
-                    w_c = w;
-                    c_out = dptr(o, 0, "dec_attn_tail: bf16-выход")?;
-                }
-                DecNormOut::Nvfp4 { packed, scales } => {
-                    let o = Nvfp4Out {
-                        w,
-                        packed: dptr(packed, 0, "dec_attn_tail: packed")?,
-                        scales: dptr(scales, 0, "dec_attn_tail: scales")?,
-                    };
-                    match n4 {
-                        0 => a = o,
-                        1 => b = o,
-                        _ => return Err(SynaptixError::Unsupported("dec_attn_tail: до двух NVFP4-выходов")),
-                    }
-                    n4 += 1;
-                }
+            let slot = match &mut spec.out {
+                DecNormOut::Bf16(o) => Nvfp4Out { w, bf16: dptr(o, 0, "dec_attn_tail: bf16-выход")?, ..Default::default() },
+                DecNormOut::Nvfp4 { packed, scales } => Nvfp4Out {
+                    w,
+                    packed: dptr(packed, 0, "dec_attn_tail: packed")?,
+                    scales: dptr(scales, 0, "dec_attn_tail: scales")?,
+                    bf16: 0,
+                },
                 DecNormOut::Mxfp8 { .. } => {
                     return Err(SynaptixError::Unsupported("dec_attn_tail: MXFP8-выход не поддержан"))
+                }
+            };
+            match i {
+                0 => a = slot,
+                1 => b = slot,
+                _ => {
+                    if slot.bf16 == 0 {
+                        return Err(SynaptixError::Unsupported("dec_attn_tail: третий выход только bf16"));
+                    }
+                    w_c = slot.w;
+                    c_out = slot.bf16;
                 }
             }
         }
@@ -4818,6 +4819,165 @@ impl Backend for CudaBackend {
             rows as u32,
             inter as u32,
             ta,
+        )
+    }
+
+    fn dec_geglu(
+        &self,
+        gate: (&Storage, usize),
+        up: (&Storage, usize),
+        stride: usize,
+        dtype: DType,
+        out: &mut Storage,
+        rows: usize,
+        inter: usize,
+        topk: Option<synaptix_core::backend::DecTopk<'_>>,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode::{self as ld, TopkArgs};
+        let (ctx, stream) = ctx_stream_of(gate.0, "dec_geglu")?;
+        let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let bf16 = match dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_geglu: dtype F16|BF16")),
+        };
+        let ta = match topk {
+            Some(t) => TopkArgs {
+                logits: dptr(t.logits, 0, "dec_geglu: logits")?,
+                pes: dptr_opt(t.pes, "dec_geglu: pes")?,
+                idx: dptr(t.idx, 0, "dec_geglu: idx")?,
+                w: dptr(t.w, 0, "dec_geglu: w")?,
+                acc_zero: dptr(t.acc, 0, "dec_geglu: acc")?,
+                e: t.e as u32,
+                k: t.k as u32,
+                h: t.h as u32,
+            },
+            None => TopkArgs::default(),
+        };
+        ld::geglu_plain(
+            &k,
+            &stream,
+            bf16,
+            dptr(gate.0, gate.1, "dec_geglu: gate")?,
+            dptr(up.0, up.1, "dec_geglu: up")?,
+            stride as u64,
+            dptr(out, 0, "dec_geglu: out")?,
+            rows as u32,
+            inter as u32,
+            ta,
+        )
+    }
+
+    fn dec_router_logits(
+        &self,
+        w: &Storage,
+        x: (&Storage, usize),
+        out: &mut Storage,
+        e: usize,
+        h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::fused::llm_decode as ld;
+        let (ctx, stream) = ctx_stream_of(w, "dec_router_logits")?;
+        let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        ld::router_logits(
+            &k,
+            &stream,
+            dptr(w, 0, "dec_router_logits: w")?,
+            dptr(x.0, x.1, "dec_router_logits: x")?,
+            dptr(out, 0, "dec_router_logits: out")?,
+            e as u32,
+            h as u32,
+        )
+    }
+
+    fn quant_gemv_grouped(
+        &self,
+        groups: &[(&Storage, Option<&Storage>, usize)],
+        dtype: DType,
+        k: usize,
+        x: (&Storage, usize),
+        out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::elementwise::blockq::{self as bq, GemvGroupPtr};
+        let (out_st, out_lo) = out;
+        let bf16 = match out_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("quant_gemv_grouped: out только F16/BF16")),
+        };
+        let first = groups.first().ok_or(SynaptixError::Unsupported("quant_gemv_grouped: пусто"))?;
+        let (ctx, stream) = ctx_stream_of(first.0, "quant_gemv_grouped")?;
+        let kernels = if bf16 {
+            bq::BlockqGemvKernels::for_context_bf16(&ctx)?
+        } else {
+            bq::BlockqGemvKernels::for_context(&ctx)?
+        };
+        let mut ptrs = Vec::with_capacity(groups.len());
+        for (w, sc, n) in groups {
+            let wp = dptr(w, 0, "quant_gemv_grouped: вес")?;
+            let sp = match sc {
+                Some(s) => dptr(s, 0, "quant_gemv_grouped: масштабы")?,
+                None => wp,
+            };
+            ptrs.push(GemvGroupPtr { w: wp, s: sp, n: *n as u32 });
+        }
+        bq::blockq_gemv_grouped(
+            &kernels,
+            &stream,
+            dtype,
+            &ptrs,
+            dptr(x.0, x.1, "quant_gemv_grouped: x")?,
+            dptr(out_st, 0, "quant_gemv_grouped: out")?,
+            k as u32,
+        )
+    }
+
+    fn quant_gemv_indexed_acc(
+        &self,
+        w_table: &Storage,
+        s_table: &Storage,
+        dtype: DType,
+        idx: &Storage,
+        pw: &Storage,
+        x: (&Storage, DType),
+        acc: &mut Storage,
+        n: usize,
+        k: usize,
+        experts: usize,
+        pairs: usize,
+        rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        use crate::elementwise::blockq as bq;
+        let bf16 = match x.1 {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("quant_gemv_indexed_acc: x только F16/BF16")),
+        };
+        let (ctx, stream) = ctx_stream_of(w_table, "quant_gemv_indexed_acc")?;
+        let kernels = if bf16 {
+            bq::BlockqGemvKernels::for_context_bf16(&ctx)?
+        } else {
+            bq::BlockqGemvKernels::for_context(&ctx)?
+        };
+        bq::blockq_gemv_indexed_acc(
+            &kernels,
+            &stream,
+            dtype,
+            dptr(w_table, 0, "quant_gemv_indexed_acc: таблица")?,
+            dptr(s_table, 0, "quant_gemv_indexed_acc: масштабы")?,
+            dptr(idx, 0, "quant_gemv_indexed_acc: idx")?,
+            dptr(pw, 0, "quant_gemv_indexed_acc: веса пар")?,
+            dptr(x.0, 0, "quant_gemv_indexed_acc: x")?,
+            dptr(acc, 0, "quant_gemv_indexed_acc: acc")?,
+            experts as u32,
+            pairs as u32,
+            n as u32,
+            k as u32,
+            rows_per_pair,
         )
     }
 

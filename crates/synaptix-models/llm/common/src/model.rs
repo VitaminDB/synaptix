@@ -2501,10 +2501,19 @@ impl DecoderModel {
         for idx in 0..nb {
             let blk = &self.blocks[idx];
             let cache_bf16 = matches!(&kv.layers[idx], LayerCache::Full(l) if l.k.dtype() == DType::BF16 && l.v.dtype() == DType::BF16);
-            if b == 1 && cache_bf16 && self.fused_block_ok(blk) {
+            let dense = !self.fused_block_ok(blk) && self.fused_block_dense_ok(blk);
+            if b == 1 && cache_bf16 && (dense || self.fused_block_ok(blk)) {
                 let next_blk = if idx + 1 < nb { Some(&self.blocks[idx + 1]) } else { None };
-                let (new_hidden, next_h, next_pair) =
-                    self.forward_block_fused(blk, next_blk, &h, h_pair.take(), &hidden, &mut kv.layers[idx], state)?;
+                let (new_hidden, next_h, next_pair) = self.forward_block_fused(
+                    blk,
+                    next_blk,
+                    &h,
+                    h_pair.take(),
+                    &hidden,
+                    &mut kv.layers[idx],
+                    state,
+                    dense,
+                )?;
                 hidden = new_hidden;
                 if let Some(nh) = next_h {
                     h = nh;
@@ -2617,6 +2626,11 @@ impl DecoderModel {
         if self.dtype != DType::BF16 {
             return false;
         }
+        // Групповые GEMV и geglu+квант этого пути — на FP4 MMA; без неё
+        // (Ada и ниже) — `fused_block_dense_ok`.
+        if !self.native_fp4() {
+            return false;
+        }
         if fused_decode_disabled() {
             return false;
         }
@@ -2652,6 +2666,53 @@ impl DecoderModel {
         self.config.hidden_size % 32 == 0
     }
 
+    /// Есть ли у карты модели FP4 MMA (Blackwell) — условие нативного
+    /// слитого слоя.
+    fn native_fp4(&self) -> bool {
+        synaptix_core::backend::registry::backend_for(self.device)
+            .map(|b| b.quant_native(DType::NVFP4, self.device))
+            .unwrap_or(false)
+    }
+
+    /// Годится ли блок для слитого пути без FP4 MMA (Ada и ниже): те же
+    /// ядра хвостов и подготовки внимания, но активации — bf16-строки, а
+    /// GEMV — портируемые (любой квант-формат весов): групповой q|k|v и
+    /// gate|up, индексные эксперты с f32-суммой.
+    fn fused_block_dense_ok(&self, blk: &Block) -> bool {
+        if self.dtype != DType::BF16 || fused_decode_disabled() || self.native_fp4() {
+            return false;
+        }
+        let Mixer::Full(fa) = &blk.mixer else { return false };
+        let Some(fmt) = fa.q_proj.quant_dtype() else { return false };
+        if fa.k_proj.quant_dtype() != Some(fmt) || fa.o_proj.quant_dtype().is_none() {
+            return false;
+        }
+        if let Some(v) = &fa.v_proj {
+            if v.quant_dtype() != Some(fmt) {
+                return false;
+            }
+        }
+        if fa.attn_output_gate || fa.head_dim % 32 != 0 || fa.head_dim > 1024 {
+            return false;
+        }
+        let (g, u) = (blk.mlp.gate_proj.quant_weight(), blk.mlp.up_proj.quant_weight());
+        let (Some(g), Some(u)) = (g, u) else { return false };
+        if blk.mlp.activation != Activation::GeluTanh
+            || g.dtype() != u.dtype()
+            || g.n() != u.n()
+            || g.n() % 32 != 0
+            || blk.mlp.down_proj.quant_weight().is_none()
+        {
+            return false;
+        }
+        if let Some(m) = &blk.moe {
+            if !m.ffn.fused_dense_ready() {
+                return false;
+            }
+        }
+        self.config.hidden_size % 32 == 0
+    }
+
     /// Слой декода слитыми ядрами (см. `llm_decode.cu`): внимание —
     /// групповой GEMV q/k/v, нормы голов + RoPE + запись KV одним ядром,
     /// flash, `o_proj`; хвост после внимания с квант-эпилогами; плотный MLP —
@@ -2670,8 +2731,12 @@ impl DecoderModel {
         hidden: &Tensor,
         cache: &mut LayerCache,
         state: &mut DecodeState,
+        dense: bool,
     ) -> Result<(Tensor, Option<Tensor>, Option<(Tensor, Tensor)>), ModelError> {
         use synaptix_core::tensor::decode_fused::{DecOut, DecOutFmt};
+        if dense {
+            return self.forward_block_fused_dense(blk, next_blk, h, hidden, cache, state);
+        }
         let dev = self.device;
         let hsz = self.config.hidden_size;
         let Mixer::Full(fa) = &blk.mixer else {
@@ -2692,7 +2757,7 @@ impl DecoderModel {
                 .coerr()?
             }
         };
-        let attn_out = fa.forward_decode_fused(&pair, cache, state)?; // [1, nh·hd]
+        let attn_out = fa.forward_decode_fused(FusedIn::Pair(&pair), cache, state)?; // [1, nh·hd]
 
         // Хвост после внимания: residual + нормы входов MLP, экспертов, роутера.
         let mut outs: Vec<(&Tensor, DecOutFmt)> = vec![(&blk.pre_mlp_norm, DecOutFmt::Nvfp4)];
@@ -2783,6 +2848,104 @@ impl DecoderModel {
             None => None,
         };
         Ok((hidden3, next_h, next_mx))
+    }
+
+    /// Слитый слой без FP4 MMA (Ada и ниже), по устройству как
+    /// [`Self::forward_block_fused`], но все активации — bf16-строки:
+    /// групповой GEMV q|k|v, подготовка внимания, flash, `o_proj`; хвост
+    /// внимания с bf16-выходами (MLP, эксперты, роутер); gate|up одним
+    /// GEMV, логиты роутера, geglu + top-k, down; эксперты тремя ядрами; хвост
+    /// FFN с нормой следующего слоя. ~14 ядер на слой против ~47.
+    fn forward_block_fused_dense(
+        &self,
+        blk: &Block,
+        next_blk: Option<&Block>,
+        h: &Tensor,
+        hidden: &Tensor,
+        cache: &mut LayerCache,
+        state: &mut DecodeState,
+    ) -> Result<(Tensor, Option<Tensor>, Option<(Tensor, Tensor)>), ModelError> {
+        use synaptix_core::tensor::decode_fused::{DecOut, DecOutFmt};
+        let dev = self.device;
+        let hsz = self.config.hidden_size;
+        let Mixer::Full(fa) = &blk.mixer else {
+            return Err(ModelError::Forward("forward_block_fused_dense: не полное внимание".into()));
+        };
+        let hidden_row = hidden.reshape(vec![1usize, hsz]).coerr()?;
+        let h_row = h.reshape(vec![1usize, hsz]).coerr()?;
+        let attn_out = fa.forward_decode_fused(FusedIn::Dense(&h_row), cache, state)?;
+
+        let mut outs: Vec<(&Tensor, DecOutFmt)> = vec![(&blk.pre_mlp_norm, DecOutFmt::Bf16)];
+        if let Some(m) = &blk.moe {
+            outs.push((&m.pre_norm, DecOutFmt::Bf16));
+            outs.push((&m.router_norm, DecOutFmt::Bf16));
+        }
+        let (hidden2, tails) = prof(dev, "attn_tail", || {
+            attn_out.dec_attn_tail(blk.post_attn_norm.as_ref(), &hidden_row, &outs, blk.post_eps, blk.rms_eps)
+        })
+        .coerr()?;
+        let bf = |o: &DecOut| match o {
+            DecOut::Bf16(t) => t.clone(),
+            DecOut::Quant(..) => unreachable!("dense: все выходы bf16"),
+        };
+        let mlp_in = bf(&tails[0]);
+
+        let gate = blk.mlp.gate_proj.quant_weight().expect("gate quant");
+        let up = blk.mlp.up_proj.quant_weight().expect("up quant");
+        let inter = gate.n();
+        let gu = prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped_dense(&[gate, up], &mlp_in)).coerr()?;
+        let logits = match &blk.moe {
+            Some(m) => {
+                let rin = bf(&tails[2]);
+                Some(prof(dev, "moe_router", || rin.dec_router_logits(m.ffn.router_weight())).coerr()?)
+            }
+            None => None,
+        };
+        let topk_req = match (&blk.moe, &logits) {
+            (Some(m), Some(lg)) => Some((lg, m.ffn.per_expert_scale_dev(), m.ffn.top_k(), hsz)),
+            _ => None,
+        };
+        let (act, topk) = prof(dev, "mlp_act", || {
+            Tensor::dec_geglu((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
+        })
+        .coerr()?;
+        let down = blk.mlp.down_proj.quant_weight().expect("down quant");
+        let dense = prof(dev, "mlp_down", || Tensor::dec_gemv_grouped_dense(&[down], &act)).coerr()?;
+
+        let moe_acc = match (&blk.moe, topk) {
+            (Some(m), Some((idx, w, mut acc))) => {
+                let ein = bf(&tails[1]);
+                prof(dev, "moe_dev", || m.ffn.forward_experts_fused_dense(&ein, &idx, &w, &mut acc))?;
+                Some(acc)
+            }
+            _ => None,
+        };
+
+        let next = next_blk.map(|nb| (&nb.pre_attn_norm, true, false));
+        let (moe_w_dense, moe_w_moe) = match &blk.moe {
+            Some(m) => (Some(&m.post_dense), Some(&m.post_moe)),
+            None => (None, None),
+        };
+        let (hidden3, next_h, _) = prof(dev, "ffn_tail", || {
+            dense.dec_ffn_tail(
+                moe_acc.as_ref(),
+                &hidden2,
+                moe_w_dense,
+                moe_w_moe,
+                blk.post_mlp_norm.as_ref(),
+                blk.layer_scalar.unwrap_or(1.0),
+                next,
+                blk.post_eps,
+                blk.rms_eps,
+            )
+        })
+        .coerr()?;
+        let hidden3 = hidden3.reshape(vec![1usize, 1, hsz]).coerr()?;
+        let next_h = match next_h {
+            Some(t) => Some(t.reshape(vec![1usize, 1, hsz]).coerr()?),
+            None => None,
+        };
+        Ok((hidden3, next_h, None))
     }
 
     /// Аллоцирует [`PrefillState`] для фиксированного `chunk_size`. Все буферы
@@ -3342,7 +3505,7 @@ impl FullAttn {
     /// `o_proj`. Возвращает выход `o_proj` `[1, nh·hd]` (bf16).
     fn forward_decode_fused(
         &self,
-        pair: &(Tensor, Tensor),
+        input: FusedIn<'_>,
         cache: &mut LayerCache,
         state: &DecodeState,
     ) -> Result<Tensor, ModelError> {
@@ -3350,7 +3513,10 @@ impl FullAttn {
             LayerCache::Full(k) => k,
             LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
-        let dev = pair.0.device();
+        let dev = match input {
+            FusedIn::Pair(p) => p.0.device(),
+            FusedIn::Dense(x) => x.device(),
+        };
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let q_w = self.q_proj.quant_weight().ok_or_else(|| missing("q_proj quant"))?;
         let k_w = self.k_proj.quant_weight().ok_or_else(|| missing("k_proj quant"))?;
@@ -3362,7 +3528,14 @@ impl FullAttn {
         if let Some(v) = v_w {
             groups.push(v);
         }
-        let (qkv, _) = prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16, None)).coerr()?;
+        let qkv = match input {
+            FusedIn::Pair(pair) => {
+                prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16, None))
+                    .coerr()?
+                    .0
+            }
+            FusedIn::Dense(x) => prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped_dense(&groups, x)).coerr()?,
+        };
         let (rope_cos, rope_sin) = match (self.sliding_window, &state.rope_cos_local, &state.rope_sin_local) {
             (Some(_), Some(c), Some(s)) => (c, s),
             _ => (&state.rope_cos, &state.rope_sin),
@@ -3397,7 +3570,9 @@ impl FullAttn {
         // global-слоёв — у них KV-голов мало, а контекст длинный. Его merge
         // сразу квантует строку в MXFP8 — вход o_proj без отдельного ядра.
         let gqa = Tensor::dec_flash_gqa_supported(dev, hd, nh / nkv.max(1));
-        let o_mx = self.o_proj.quant_dtype() == Some(DType::MXFP8);
+        // Квант-выход merge в MXFP8 кормит нативный GEMV o_proj; у плотного
+        // входа (Ada) o_proj — портируемый GEMV над bf16.
+        let o_mx = matches!(input, FusedIn::Pair(_)) && self.o_proj.quant_dtype() == Some(DType::MXFP8);
         if gqa {
             let (tkv, window, splits) = match self.sliding_window {
                 Some(w) => (&state.ring_len_dev, Some(w), 8),
@@ -3854,6 +4029,14 @@ fn small_batch_on() -> bool {
 
 /// Слитый device-путь декода можно выключить (`SYN_FUSED_DECODE=0`) — для
 /// A/B-сравнений с прежней цепочкой ядер.
+/// Вход внимания слитого слоя: квант-пара (натив, FP4/MXFP8 MMA) или
+/// bf16-строка (портируемый путь).
+#[derive(Clone, Copy)]
+enum FusedIn<'a> {
+    Pair(&'a (Tensor, Tensor)),
+    Dense(&'a Tensor),
+}
+
 fn fused_decode_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("SYN_FUSED_DECODE").as_deref() == Ok("0"))

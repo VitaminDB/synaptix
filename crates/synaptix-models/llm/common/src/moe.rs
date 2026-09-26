@@ -1166,6 +1166,39 @@ impl MoeFfn {
             && self.dev_tables.as_ref().is_some_and(|(g, d)| !g.is_dense() && !d.is_dense())
     }
 
+    /// Годен ли слитый путь без FP4 MMA ([`Self::forward_experts_fused_dense`]):
+    /// портируемые таблицы экспертов и gelu_tanh.
+    pub fn fused_dense_ready(&self) -> bool {
+        self.dev_path_ready()
+            && self.cfg.activation == Activation::GeluTanh
+            && self.dev_tables.as_ref().is_some_and(|(g, d)| g.is_dense() && d.is_dense())
+    }
+
+    /// Эксперты слитого декода на картах без FP4 MMA, тремя ядрами:
+    /// индексный GEMV gate|up над bf16-строкой, geglu (bf16), индексный GEMV
+    /// down с взвешенной f32-суммой в `acc`. Как [`Self::forward_experts_fused`],
+    /// но вход — плотная строка `[1, H]`, а не NVFP4-пара.
+    pub fn forward_experts_fused_dense(
+        &self,
+        x: &Tensor,
+        idx: &Tensor,
+        w: &Tensor,
+        acc: &mut Tensor,
+    ) -> Result<(), ModelError> {
+        let Some((gate_up, down)) = &self.dev_tables else {
+            return Err(ModelError::Forward("MoE: device-путь не готов".into()));
+        };
+        if !gate_up.is_dense() || !down.is_dense() || self.cfg.activation != Activation::GeluTanh {
+            return Err(ModelError::Forward("MoE: плотный слитый путь — портируемые таблицы и gelu_tanh".into()));
+        }
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE слитый путь (bf16): {e}"));
+        let k = self.cfg.num_experts_per_tok;
+        let i = self.cfg.moe_intermediate_size;
+        let gu = gate_up.gemv_indexed_dense(idx, x, false).map_err(ferr)?;
+        let (h, _) = Tensor::dec_geglu((&gu, 0), (&gu, i), 2 * i, k, i, None).map_err(ferr)?;
+        down.gemv_indexed_dense_acc(idx, &h, true, w, acc).map_err(ferr)
+    }
+
     /// Вес роутера F32 `[E, H]` — для счёта логитов чужим запуском (хвост
     /// группового GEMV плотного MLP в слитом декоде).
     pub fn router_weight(&self) -> &Tensor {

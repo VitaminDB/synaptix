@@ -129,11 +129,16 @@ impl GemmaPipeline {
             let heads_dim = dcfg.num_attention_heads * dcfg.head_dim;
             let kv_dim = dcfg.num_key_value_heads * dcfg.head_dim;
             let esz = (precision.compute.size_in_bits() / 8).max(1) as f64;
+            // SQ и типы ggml — по размеру строки блока (раньше считались как
+            // плотные: MLP в SQ4 оценивался вчетверо тяжелее, и на картах без
+            // FP4 MMA 12B уходила в host-stream блоков — 1,8 ток/с).
             let bytes_per = |dt: DType| -> f64 {
                 match dt {
                     DType::NVFP4 => 0.5625,
                     DType::MXFP8 => 1.03125,
-                    _ => esz,
+                    _ => synaptix_core::quant::block_row_bytes(dt, 256)
+                        .map(|b| b as f64 / 256.0)
+                        .unwrap_or(esz),
                 }
             };
             let attn = (2 * h * heads_dim + 2 * h * kv_dim) as f64 * bytes_per(precision.attn_w);

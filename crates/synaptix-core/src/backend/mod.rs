@@ -1144,6 +1144,77 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("dec_geglu_quant_nvfp4 не поддержан этим backend"))
     }
 
+    /// `gelu_tanh(gate)·up` → строки `out[rows, inter]` в `dtype` (путь без
+    /// FP4 MMA); `topk` — тем же запуском top-k роутера, как у
+    /// [`Self::dec_geglu_quant_nvfp4`].
+    #[allow(clippy::too_many_arguments)]
+    fn dec_geglu(
+        &self,
+        _gate: (&Storage, usize),
+        _up: (&Storage, usize),
+        _stride: usize,
+        _dtype: DType,
+        _out: &mut Storage,
+        _rows: usize,
+        _inter: usize,
+        _topk: Option<DecTopk<'_>>,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_geglu не поддержан этим backend"))
+    }
+
+    /// Логиты роутера MoE: f32 `w[e, h]` × bf16 `x[h]` (байтовое смещение) →
+    /// f32 `out[e]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dec_router_logits(
+        &self,
+        _w: &Storage,
+        _x: (&Storage, usize),
+        _out: &mut Storage,
+        _e: usize,
+        _h: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("dec_router_logits не поддержан этим backend"))
+    }
+
+    /// Групповой GEMV по квантованным весам (до четырёх, один формат и один
+    /// `k`) над одной строкой `x` (F16|BF16, байтовое смещение): выход —
+    /// строки групп подряд. `groups` — `(packed, scales, n)`.
+    fn quant_gemv_grouped(
+        &self,
+        _groups: &[(&Storage, Option<&Storage>, usize)],
+        _dtype: DType,
+        _k: usize,
+        _x: (&Storage, usize),
+        _out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("quant_gemv_grouped не поддержан этим backend"))
+    }
+
+    /// Индексный GEMV экспертов с накоплением: `acc[n] += Σ_p pw[p] ·
+    /// W_{idx[p]} · x[r_p]` (f32, `acc` обнулён заранее).
+    #[allow(clippy::too_many_arguments)]
+    fn quant_gemv_indexed_acc(
+        &self,
+        _w_table: &Storage,
+        _s_table: &Storage,
+        _dtype: DType,
+        _idx: &Storage,
+        _pw: &Storage,
+        _x: (&Storage, DType),
+        _acc: &mut Storage,
+        _n: usize,
+        _k: usize,
+        _experts: usize,
+        _pairs: usize,
+        _rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("quant_gemv_indexed_acc не поддержан этим backend"))
+    }
+
     /// Нормы голов q/k(/v) + RoPE q/k + запись k/v в кэш `[nkv, max_seq, hd]`
     /// на позицию `kv_pos` (U32[1] на карте). `v = None` — V берётся из сырого
     /// K (`attention_k_eq_v`). `cos`/`sin` — `[cap, rotary_dim]`, позиция RoPE —

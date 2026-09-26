@@ -19,6 +19,9 @@ pub struct LlmDecodeKernels {
     geglu_f16: CudaFunction,
     geglu_bf16: CudaFunction,
     attn_prep: CudaFunction,
+    geglu_plain_f16: CudaFunction,
+    geglu_plain_bf16: CudaFunction,
+    router_logits: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<LlmDecodeKernels>)>>> = OnceLock::new();
@@ -43,6 +46,9 @@ impl LlmDecodeKernels {
             geglu_f16: load_fn(&module, "dec_geglu_quant_nvfp4_f16")?,
             geglu_bf16: load_fn(&module, "dec_geglu_quant_nvfp4_bf16")?,
             attn_prep: load_fn(&module, "dec_attn_prep_bf16")?,
+            geglu_plain_f16: load_fn(&module, "dec_geglu_f16")?,
+            geglu_plain_bf16: load_fn(&module, "dec_geglu_bf16")?,
+            router_logits: load_fn(&module, "dec_router_logits_bf16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -68,6 +74,8 @@ pub struct Nvfp4Out {
     pub w: u64,
     pub packed: u64,
     pub scales: u64,
+    /// bf16-выход вместо пары (карты без FP4 MMA); `packed`/`scales` тогда 0.
+    pub bf16: u64,
 }
 
 /// Хвост после внимания, см. `dec_attn_tail_bf16`.
@@ -108,9 +116,11 @@ pub fn attn_tail(
         .arg(&a.w)
         .arg(&a.packed)
         .arg(&a.scales)
+        .arg(&a.bf16)
         .arg(&b.w)
         .arg(&b.packed)
         .arg(&b.scales)
+        .arg(&b.bf16)
         .arg(&w_c)
         .arg(&c_out)
         .arg(&hi)
@@ -302,4 +312,63 @@ pub fn attn_prep(
         .arg(&hdi)
         .arg(&eps);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_attn_prep", e)).map(|_| ())
+}
+
+/// `gelu_tanh(gate)·up` → строка T `[rows, inter]` (путь без FP4 MMA), тем же
+/// запуском — top-k роутера (`topk.e > 0`), см. `dec_geglu_bf16`.
+#[allow(clippy::too_many_arguments)]
+pub fn geglu_plain(
+    k: &LlmDecodeKernels,
+    stream: &Arc<CudaStream>,
+    bf16: bool,
+    gate: u64,
+    up: u64,
+    stride: u64,
+    out: u64,
+    rows: u32,
+    inter: u32,
+    topk: TopkArgs,
+) -> Result<()> {
+    if topk.e > 1024 || topk.k > 32 {
+        return Err(SynaptixError::Cuda(format!("geglu_plain: top-k e={} ≤ 1024, k={} ≤ 32", topk.e, topk.k)));
+    }
+    let n = rows * inter;
+    let block = 256u32;
+    let extra = u32::from(topk.e > 0);
+    if n == 0 && extra == 0 {
+        return Ok(());
+    }
+    let cfg = LaunchConfig { grid_dim: (n.div_ceil(block) + extra, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+    let (ri, ii, stride_i) = (rows as i32, inter as i32, stride as i64);
+    let (te, tk, th) = (topk.e as i32, topk.k as i32, topk.h as i32);
+    let f = if bf16 { &k.geglu_plain_bf16 } else { &k.geglu_plain_f16 };
+    let mut bld = stream.launch_builder(f);
+    bld.arg(&gate)
+        .arg(&up)
+        .arg(&stride_i)
+        .arg(&out)
+        .arg(&ri)
+        .arg(&ii)
+        .arg(&topk.logits)
+        .arg(&topk.pes)
+        .arg(&topk.idx)
+        .arg(&topk.w)
+        .arg(&topk.acc_zero)
+        .arg(&te)
+        .arg(&tk)
+        .arg(&th);
+    unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_geglu", e)).map(|_| ())
+}
+
+/// Логиты роутера: f32 `w[e, h]` × bf16 `x[h]` → f32 `out[e]`.
+pub fn router_logits(k: &LlmDecodeKernels, stream: &Arc<CudaStream>, w: u64, x: u64, out: u64, e: u32, h: u32) -> Result<()> {
+    if h % 4 != 0 {
+        return Err(SynaptixError::Cuda(format!("router_logits: H={h} кратно 4")));
+    }
+    let warps = 8u32;
+    let cfg = LaunchConfig { grid_dim: (e.div_ceil(warps), 1, 1), block_dim: (warps * 32, 1, 1), shared_mem_bytes: 0 };
+    let (ei, hi) = (e as i32, h as i32);
+    let mut bld = stream.launch_builder(&k.router_logits);
+    bld.arg(&w).arg(&x).arg(&out).arg(&ei).arg(&hi);
+    unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_router_logits", e)).map(|_| ())
 }

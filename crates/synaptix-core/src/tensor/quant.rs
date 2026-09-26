@@ -748,6 +748,61 @@ impl ExpertTable {
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
+    /// Индексный GEMV портируемой таблицы с накоплением: `acc[N] += Σ_p
+    /// w[p] · W_{idx[p]} · x[r_p]` (f32; `acc` обнулён заранее — у декода это
+    /// делает ядро top-k роутера). `x` — `[r, K]` F16|BF16, `r_p = p` при
+    /// `rows_per_pair`, иначе 0.
+    pub fn gemv_indexed_dense_acc(
+        &self,
+        idx: &Tensor,
+        x: &Tensor,
+        rows_per_pair: bool,
+        w: &Tensor,
+        acc: &mut Tensor,
+    ) -> Result<()> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+
+        let Some(dtype) = self.dense else {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense_acc: таблица NVFP4"));
+        };
+        let pairs = idx.numel();
+        if idx.dtype() != DType::U32 || w.dtype() != DType::F32 || w.numel() != pairs {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense_acc: idx U32[k], w F32[k]"));
+        }
+        if acc.dtype() != DType::F32 || acc.numel() != self.n || !acc.is_contiguous() {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense_acc: acc F32[N] подряд"));
+        }
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) || x.dims().last() != Some(&self.k) {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense_acc: активация [r, K] F16/BF16"));
+        }
+        if rows_per_pair && x.numel() / self.k < pairs {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense_acc: строк активации меньше пар"));
+        }
+        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let idx_c = if idx.is_contiguous() { idx.clone() } else { idx.contiguous()? };
+        let w_c = if w.is_contiguous() { w.clone() } else { w.contiguous()? };
+        let backend = registry::backend_for(self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        let acc_st = Arc::get_mut(&mut acc.storage)
+            .ok_or(SynaptixError::Unsupported("gemv_indexed_dense_acc: acc разделён"))?;
+        backend.quant_gemv_indexed_acc(
+            &self.w_table.storage,
+            &self.s_table.storage,
+            dtype,
+            &idx_c.storage,
+            &w_c.storage,
+            (&x_c.storage, x_c.dtype()),
+            acc_st,
+            self.n,
+            self.k,
+            self.count,
+            pairs,
+            rows_per_pair,
+            &stream,
+        )
+    }
+
     /// Портируемая ли таблица (активация плотная, а не NVFP4-пара).
     pub fn is_dense(&self) -> bool {
         self.dense.is_some()
