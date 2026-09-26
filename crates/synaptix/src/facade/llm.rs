@@ -1957,7 +1957,7 @@ impl<'a> LlmGeneration<'a> {
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
-                *sess_ids = if res.is_ok() { ids } else { Vec::new() };
+                *sess_ids = if res.is_ok() { kv_ids(&ids, &sink.acc, kv.seq_len) } else { Vec::new() };
                 session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
@@ -1989,7 +1989,7 @@ impl<'a> LlmGeneration<'a> {
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
-                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
+                session.ids = if res.is_ok() { kv_ids(prompt_ids, &sink.acc, session.kv.seq_len) } else { Vec::new() };
                 session.media.clear();
                 match res {
                     Ok(()) => Ok(reuse),
@@ -2027,7 +2027,7 @@ impl<'a> LlmGeneration<'a> {
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
-                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
+                session.ids = if res.is_ok() { kv_ids(prompt_ids, &sink.acc, session.kv.seq_len) } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2052,7 +2052,7 @@ impl<'a> LlmGeneration<'a> {
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
-                session.ids = if res.is_ok() { prompt_ids.to_vec() } else { Vec::new() };
+                session.ids = if res.is_ok() { kv_ids(prompt_ids, &sink.acc, session.kv.seq_len) } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2080,7 +2080,7 @@ impl<'a> LlmGeneration<'a> {
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
-                session.ids = if res.is_ok() { ids } else { Vec::new() };
+                session.ids = if res.is_ok() { kv_ids(&ids, &sink.acc, session.kv.seq_len) } else { Vec::new() };
                 match res {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
@@ -2449,6 +2449,19 @@ fn concat_media(media: &[&MediaEmbedding], kind: MediaKind) -> Result<Option<Ten
 /// На каждый токен: накапливает id, декодит весь буфер, диффит против прежнего
 /// decoded → дельта. Зовёт `on_token(id, delta)`; `false` → отмена. Накопленный
 /// текст сверяется со стоп-строками (`</tool_call>` и т.п.) — совпадение → стоп.
+/// Точка возврата после хода: промпт и сгенерированные токены — ровно те, что
+/// легли в кэш (`kv_len`; последний выданный токен кэш ещё не видел). Если
+/// шаблон повторяет ответ в истории дословно (Llama, Gemma-3), следующий ход
+/// не префиллит его заново; если нет — общий префикс оборвётся раньше
+/// (`LlmKvSession::reusable`), ничего не ломая.
+fn kv_ids(prompt: &[u32], generated: &[u32], kv_len: usize) -> Vec<u32> {
+    let mut v = Vec::with_capacity(prompt.len() + generated.len());
+    v.extend_from_slice(prompt);
+    v.extend_from_slice(generated);
+    v.truncate(kv_len);
+    v
+}
+
 struct DeltaSink<'t, 's, F: FnMut(u32, &str) -> bool> {
     tokenizer: &'t LlmTokenizer,
     on_token: F,
