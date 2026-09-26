@@ -7,8 +7,7 @@
 // attention восстанавливает x = dec_e4m3(byte)·2^(sbyte-127), per-32-block.
 // Параллельно FP8 E4M3 (fp8_kv.cu): точнее (scale на 32 элемента, не на всю строку).
 //
-// Один блок = одна (b,kv,token)-строка. Каждый thread владеет 32-блоками (blk=tid,
-// stride bs): локальный amax по своим 32 contiguous-элементам → E8M0-байт → 32 E4M3.
+// Один блок = одна (b,kv,token)-строка, варп = один 32-блок (см. mxkv_append_row).
 // Шаблон по типу src (bf16/f16): compute=F16 при квант-весах → K/V проекции F16.
 
 __device__ __forceinline__ float mxkv_to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
@@ -43,6 +42,11 @@ __device__ __forceinline__ unsigned char mxkv_fp8_encode_e4m3(float x) {
 }
 
 // Квантизация одной (b,kv,token)-строки в slot `pos`: per-32-block amax→E8M0→E4M3.
+// Варп на 32-блок, поток на элемент: amax — редукцией `__shfl_xor` внутри
+// варпа. Раньше каждый поток сам проходил свой 32-блок последовательно — при
+// hd=128 на строку работали 4 потока из 128, и на декоде (строк = nkv) append
+// стоил ~6.5 мкс против 0.8 у плотного. Формула кодирования та же — байты и
+// масштабы совпадают бит в бит. Требует hd % 32 == 0 и bs % 32 == 0.
 template <typename T>
 __device__ __forceinline__ void mxkv_append_row(
     const T* __restrict__ src, unsigned char* __restrict__ dst,
@@ -50,27 +54,22 @@ __device__ __forceinline__ void mxkv_append_row(
     unsigned int b, unsigned int kv, unsigned int t, unsigned int nkv,
     unsigned int T_new, unsigned int hd, unsigned int max_seq, unsigned int pos,
     int tid, int bs) {
-    unsigned int nb = hd / 32u;
     size_t src_base = (((size_t)b * nkv + kv) * T_new + t) * hd;
     size_t dst_base = (((size_t)b * nkv + kv) * max_seq + pos) * hd;
-    size_t sc_base  = (((size_t)b * nkv + kv) * max_seq + pos) * nb;
-    for (unsigned int blk = tid; blk < nb; blk += bs) {
-        size_t boff = (size_t)blk * 32u;
-        float amax = 0.0f;
+    size_t sc_base  = (((size_t)b * nkv + kv) * max_seq + pos) * (hd / 32u);
+    for (unsigned int e = tid; e < hd; e += bs) {
+        float x = mxkv_to_f(src[src_base + e]);
+        float amax = fabsf(x);
 #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            amax = fmaxf(amax, fabsf(mxkv_to_f(src[src_base + boff + i])));
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         }
         unsigned amax_exp_bits = __float_as_uint(amax) & 0x7F800000u;
         float scale_f = __uint_as_float(amax_exp_bits) / 256.0f;
         unsigned char sbyte = (unsigned char)(__float_as_uint(scale_f) >> 23);
         float sv = fmaxf(__uint_as_float(((unsigned)sbyte) << 23), 1e-12f);
-#pragma unroll
-        for (int i = 0; i < 32; i++) {
-            float x = mxkv_to_f(src[src_base + boff + i]) / sv;
-            dst[dst_base + boff + i] = mxkv_fp8_encode_e4m3(x);
-        }
-        scale_dst[sc_base + blk] = sbyte;
+        dst[dst_base + e] = mxkv_fp8_encode_e4m3(x / sv);
+        if ((e & 31u) == 0u) scale_dst[sc_base + e / 32u] = sbyte;
     }
 }
 
