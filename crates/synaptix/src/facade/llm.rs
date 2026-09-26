@@ -136,24 +136,6 @@ impl TiedEmbeddingsMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FlashAttnMode {
-    Off,
-    #[default]
-    Fa4,
-}
-
-impl FromStr for FlashAttnMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "fa4" => Ok(Self::Fa4),
-            other => Err(format!("неизвестный FlashAttnMode: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LayerSyncMode {
     #[default]
     Auto,
@@ -2856,7 +2838,6 @@ pub fn dflash_enabled() -> bool {
     DFLASH_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn set_flash_attn_mode(_mode: FlashAttnMode) {}
 static GRAPH_DECODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_graph_decode_enabled(on: bool) {
@@ -2866,8 +2847,6 @@ pub fn set_graph_decode_enabled(on: bool) {
 pub fn graph_decode_enabled() -> bool {
     GRAPH_DECODE.load(std::sync::atomic::Ordering::Relaxed)
 }
-pub fn set_la_prep_fused_disabled(_off: bool) {}
-pub fn set_gdr_fused_disabled(_off: bool) {}
 static PREFILL_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_prefill_chunk_size(size: usize) {
