@@ -2146,12 +2146,12 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("cuda flash: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
 
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let out_buf = out_st
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("cuda flash: out non-cuda"))?;
@@ -3014,11 +3014,11 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("flash_window: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let out_buf = out_st
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("flash_window: out non-cuda"))?;
@@ -3445,14 +3445,14 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("flash_window_dev: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let tc_buf = tc_st
             .as_cuda()
             .ok_or(SynaptixError::Unsupported("flash_window_dev: t_cache non-cuda"))?;
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let out_buf = out_st
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("flash_window_dev: out non-cuda"))?;
@@ -3569,7 +3569,7 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("cuda flash_dev: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let tc_buf = tc_st.as_cuda().ok_or(SynaptixError::Unsupported(
             "cuda flash_dev: t_cache non-cuda",
@@ -3582,9 +3582,9 @@ impl Backend for CudaBackend {
                 .transmute::<u32>(1)
                 .ok_or_else(|| SynaptixError::Cuda("flash_dev: transmute t_cache".into()))?
         };
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let out_buf = out_st
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("cuda flash_dev: out non-cuda"))?;
@@ -3710,11 +3710,11 @@ impl Backend for CudaBackend {
             ))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let tc_buf = tc_st.as_cuda().ok_or(SynaptixError::Unsupported(
             "cuda flash_prefill_dev: t_cache non-cuda",
         ))?;
@@ -3953,7 +3953,7 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8 dev: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let tc_buf = tc_st
             .as_cuda()
@@ -3966,9 +3966,9 @@ impl Backend for CudaBackend {
                 .transmute::<u32>(1)
                 .ok_or_else(|| SynaptixError::Cuda("flash mxfp8 dev: transmute t_cache".into()))?
         };
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let ks_buf = ks_st
             .as_cuda()
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8 dev: k_scale non-cuda"))?;
@@ -5177,12 +5177,12 @@ impl Backend for CudaBackend {
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8: q non-cuda"))?
             .device()
             .clone();
-        let ord = q_st.as_cuda().unwrap().ordinal();
+        let ord = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
 
-        let q_buf = q_st.as_cuda().unwrap();
-        let k_buf = k_st.as_cuda().unwrap();
-        let v_buf = v_st.as_cuda().unwrap();
+        let q_buf = q_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let k_buf = k_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
+        let v_buf = v_st.as_cuda().ok_or(SynaptixError::Unsupported("cuda: вход не на CUDA"))?;
         let ks_buf = ks_st
             .as_cuda()
             .ok_or(SynaptixError::Unsupported("cuda flash mxfp8: k_scale non-cuda"))?;
