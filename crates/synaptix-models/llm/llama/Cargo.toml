@@ -15,7 +15,6 @@ synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-tokenizer = { workspace = true }
-synaptix-config    = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-infer     = { workspace = true }
 thiserror          = { workspace = true }

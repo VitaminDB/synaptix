@@ -1,1 +1,0 @@
-//! Load из .syn / safetensors.

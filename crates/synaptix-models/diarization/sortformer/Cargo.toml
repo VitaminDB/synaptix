@@ -14,7 +14,6 @@ synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-bundle    = { workspace = true }
-synaptix-config    = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-audio     = { workspace = true }
 thiserror          = { workspace = true }
