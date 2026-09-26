@@ -616,6 +616,12 @@ pub struct ExpertTable {
     k: usize,
     count: usize,
     device: Device,
+    /// `None` — NVFP4 по перемешанным копиям с квантованной активацией
+    /// (FP4 MMA); `Some(dtype)` — портируемая таблица: исходные блобы любого
+    /// квант-формата и плотная F16/BF16-активация.
+    dense: Option<DType>,
+    /// Портируемой таблице — держит блобы, чьи адреса в ней записаны.
+    _keep: Vec<Arc<Storage>>,
 }
 
 impl ExpertTable {
@@ -640,7 +646,91 @@ impl ExpertTable {
         let count = weights.len();
         let w_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
         let s_table = Tensor::from_vec::<_, i64>(sc, vec![count], device).ok()?;
-        Some(Self { w_table, s_table, n, k, count, device })
+        Some(Self { w_table, s_table, n, k, count, device, dense: None, _keep: Vec::new() })
+    }
+
+    /// Портируемая таблица: веса любого квант-формата, который умеет
+    /// `quant_gemv_indexed` (SQ, типы ggml, NVFP4/MXFP8 движка), считаются по
+    /// исходным блобам с плотной активацией. Путь графового декода MoE на
+    /// картах без FP4 MMA. `None` — формы/форматы разные или вес не на карте.
+    pub fn build_dense(weights: &[&QuantWeight]) -> Option<Self> {
+        let first = weights.first()?;
+        if !first.device.is_cuda() || first.k % 32 != 0 {
+            return None;
+        }
+        let (n, k, device, dtype) = (first.n, first.k, first.device, first.dtype);
+        let mut w = Vec::with_capacity(weights.len());
+        let mut sc = Vec::with_capacity(weights.len());
+        let mut keep = Vec::with_capacity(weights.len());
+        for it in weights {
+            if it.n != n || it.k != k || it.device != device || it.dtype != dtype {
+                return None;
+            }
+            let packed = it.packed_arc()?;
+            let wa = storage_addr(&packed)?;
+            let sa = match it.scales_opt() {
+                Some(s) => storage_addr(s)?,
+                None if matches!(dtype, DType::NVFP4 | DType::MXFP8) => return None,
+                None => wa,
+            };
+            w.push(wa as i64);
+            sc.push(sa as i64);
+            keep.push(packed);
+        }
+        let count = weights.len();
+        let w_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
+        let s_table = Tensor::from_vec::<_, i64>(sc, vec![count], device).ok()?;
+        Some(Self { w_table, s_table, n, k, count, device, dense: Some(dtype), _keep: keep })
+    }
+
+    /// Портируемая ли таблица (активация плотная, а не NVFP4-пара).
+    pub fn is_dense(&self) -> bool {
+        self.dense.is_some()
+    }
+
+    /// `out[p] = W[idx[p]] · x[r_p]` портируемой таблицы: `x` — `[r, K]`
+    /// F16/BF16, `r_p = p` при `rows_per_pair`, иначе 0. Выход в dtype `x`.
+    pub fn gemv_indexed_dense(&self, idx: &Tensor, x: &Tensor, rows_per_pair: bool) -> Result<Tensor> {
+        use crate::backend::registry;
+        use crate::stream::Stream;
+        use crate::tensor::layout::Layout;
+        use crate::tensor::shape::Shape;
+
+        let Some(dtype) = self.dense else {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense: таблица NVFP4, нужен gemv_indexed"));
+        };
+        if idx.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense: idx должен быть U32"));
+        }
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) || x.dims().last() != Some(&self.k) {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense: активация [r, K] F16/BF16"));
+        }
+        let pairs = idx.numel();
+        let x_rows = x.numel() / self.k;
+        if rows_per_pair && x_rows < pairs {
+            return Err(SynaptixError::Unsupported("gemv_indexed_dense: строк активации меньше пар"));
+        }
+        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let idx_c = if idx.is_contiguous() { idx.clone() } else { idx.contiguous()? };
+        let out_layout = Layout::contiguous(Shape::new(vec![pairs, self.n]), x.dtype());
+        let backend = registry::backend_for(self.device)?;
+        let mut storage = backend.alloc_uninit(x.dtype().bytes_for_numel(pairs * self.n), self.device)?;
+        let stream = Stream::default_for(self.device)?;
+        backend.quant_gemv_indexed(
+            &self.w_table.storage,
+            &self.s_table.storage,
+            dtype,
+            (&idx_c.storage, &idx_c.layout),
+            &x_c.storage,
+            (&mut storage, &out_layout),
+            self.n,
+            self.k,
+            self.count,
+            pairs,
+            rows_per_pair,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(storage), out_layout))
     }
 
     pub fn n(&self) -> usize {
@@ -681,6 +771,9 @@ impl ExpertTable {
         scales: &Tensor,
         rows_per_pair: bool,
     ) -> Result<Tensor> {
+        if self.is_dense() {
+            return Err(SynaptixError::Unsupported("gemv_indexed: портируемая таблица, нужен gemv_indexed_dense"));
+        }
         use crate::backend::registry;
         use crate::stream::Stream;
         use crate::tensor::layout::Layout;

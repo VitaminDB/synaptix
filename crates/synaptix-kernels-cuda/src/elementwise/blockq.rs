@@ -301,6 +301,7 @@ pub struct BlockqGemvKernels {
     _module: Arc<CudaModule>,
     fns: HashMap<&'static str, CudaFunction>,
     batched: HashMap<&'static str, CudaFunction>,
+    indexed: HashMap<&'static str, CudaFunction>,
 }
 
 static GEMV_CACHE: OnceLock<Mutex<Vec<(usize, Arc<BlockqGemvKernels>)>>> = OnceLock::new();
@@ -345,11 +346,13 @@ impl BlockqGemvKernels {
         let module = compile_module_with_opts(ctx, &src, tag, opts, None)?;
         let mut fns = HashMap::new();
         let mut batched = HashMap::new();
+        let mut indexed = HashMap::new();
         for suf in SUFFIXES.iter().chain(["nvfp4_syn", "mxfp8_syn"].iter()) {
             fns.insert(*suf, load_fn(&module, &format!("gemv_{suf}"))?);
             batched.insert(*suf, load_fn(&module, &format!("gemv_{suf}_batched"))?);
+            indexed.insert(*suf, load_fn(&module, &format!("gemv_{suf}_indexed"))?);
         }
-        let new = Arc::new(Self { _module: module, fns, batched });
+        let new = Arc::new(Self { _module: module, fns, batched, indexed });
         cache.lock().unwrap().push((key, new.clone()));
         Ok(new)
     }
@@ -362,6 +365,11 @@ impl BlockqGemvKernels {
     fn func_batched(&self, dtype: DType) -> Result<&CudaFunction> {
         let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_gemv: формат не квантованный вес"))?;
         self.batched.get(suf).ok_or(SynaptixError::Unsupported("blockq_gemv: нет батчевого ядра"))
+    }
+
+    fn func_indexed(&self, dtype: DType) -> Result<&CudaFunction> {
+        let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("blockq_gemv: формат не квантованный вес"))?;
+        self.indexed.get(suf).ok_or(SynaptixError::Unsupported("blockq_gemv: нет индексного ядра"))
     }
 }
 
@@ -445,6 +453,43 @@ pub fn blockq_gemv_batched(
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, experts, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_batched {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Индексный батч экспертов: `out[p, N] = x[r_p, K] · W_{idx[p]}[N, K]ᵀ`, где
+/// `idx` — U32 НА КАРТЕ, а `w_table`/`sw_table` — u64-адреса весов и масштабов
+/// всех экспертов. `r_p = p` при `rows_per_pair`, иначе 0. Ни одной выгрузки
+/// на хост: вызов захватывается CUDA-графом. `idx[p] ≥ experts` — строка
+/// выхода не пишется.
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gemv_indexed(
+    kernels: &BlockqGemvKernels,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    w_table: &CudaView<'_, u64>,
+    sw_table: &CudaView<'_, u64>,
+    idx: &CudaView<'_, u32>,
+    x: &CudaView<'_, u8>,
+    out: &mut CudaViewMut<'_, u8>,
+    experts: u32,
+    pairs: u32,
+    n: u32,
+    k: u32,
+    rows_per_pair: bool,
+) -> Result<()> {
+    let rb = gemv_row_bytes(dtype, k as usize)?;
+    if n == 0 || pairs == 0 {
+        return Ok(());
+    }
+    let f = kernels.func_indexed(dtype)?;
+    let grid = n.div_ceil(GEMV_WARPS);
+    let rpp: i32 = rows_per_pair as i32;
+    let mut bld = stream.launch_builder(f);
+    bld.arg(w_table).arg(sw_table).arg(idx).arg(x).arg(&mut *out).arg(&n).arg(&k).arg(&rb).arg(&experts).arg(&rpp);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, pairs, 1), block_dim: (GEMV_THREADS, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemv_indexed {dtype:?}: {e:?}")))?;
     }
     Ok(())
 }

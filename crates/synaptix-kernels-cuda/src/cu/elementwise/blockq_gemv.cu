@@ -9,6 +9,9 @@
 //
 // Батчевый вариант (эксперты MoE): таблицы указателей на карте, blockIdx.y —
 // эксперт, у каждого своя строка активации и строка выхода, M = 1.
+// Индексный (`_indexed`): blockIdx.y — пара, эксперт пары берётся из idx НА
+// КАРТЕ по таблице адресов — выбор не проходит через хост, поэтому вызов
+// захватывается CUDA-графом (декод MoE на картах без FP4 MMA).
 #ifdef SYN_ACT_BF16
 #include <cuda_bf16.h>
 typedef __nv_bfloat16 act_t;
@@ -65,6 +68,23 @@ __device__ __forceinline__ float dot32(const float *y, const act_t *x) {
         for (int m = 0; m < M; ++m) out[(size_t)m * out_stride + row] = to_act(acc[m]);    \
     }
 
+
+#define GEMV_INDEXED_HEAD                                                                         \
+        const unsigned p = blockIdx.y;                                                            \
+        const unsigned e = idx[p];                                                                \
+        if (e >= experts) return;                                                                 \
+        const act_t *x = xb + (rows_per_pair ? (size_t)p * K : 0);                                \
+        act_t *out = ob + (size_t)p * N;                                                          \
+        const int M = 1;                                                                          \
+        const unsigned x_stride = 0, out_stride = 0;                                              \
+        const unsigned row = blockIdx.x * GEMV_WARPS + (threadIdx.x >> 5);                        \
+        if (row >= N) return;
+
+#define GEMV_INDEXED_ARGS                                                                         \
+        const unsigned long long *__restrict__ w_table, const unsigned long long *__restrict__ sw_table, \
+        const unsigned *__restrict__ idx, const act_t *__restrict__ xb, act_t *__restrict__ ob,   \
+        unsigned N, unsigned K, unsigned row_bytes, unsigned experts, int rows_per_pair
+
 // Одноблобные форматы: BB байт на блок, SUBS_PER_BLK под-блоков в блоке.
 #define GEMV_BLOB(NAME, FN, BB, SUBS_PER_BLK)                                                      \
     extern "C" __global__ void NAME(const uint8_t *__restrict__ w, const uint8_t *__restrict__ sw, \
@@ -99,6 +119,15 @@ __device__ __forceinline__ float dot32(const float *y, const act_t *x) {
             (void)r;                                                                              \
             FN(wrow + (size_t)(s / SUBS_PER_BLK) * (BB), (int)(s % SUBS_PER_BLK), y);             \
         }))                                                                                       \
+    } \
+    extern "C" __global__ void NAME##_indexed(GEMV_INDEXED_ARGS) {                                \
+        GEMV_INDEXED_HEAD                                                                         \
+        (void)sw_table;                                                                           \
+        const uint8_t *wrow = (const uint8_t *)w_table[e] + (size_t)row * row_bytes;              \
+        GEMV_BODY(([&](unsigned r, unsigned s, float *y) {                                        \
+            (void)r;                                                                              \
+            FN(wrow + (size_t)(s / SUBS_PER_BLK) * (BB), (int)(s % SUBS_PER_BLK), y);             \
+        }))                                                                                       \
     }
 
 // NVFP4/MXFP8 движка: декодер сам считает адрес по (row, K, s).
@@ -126,6 +155,13 @@ __device__ __forceinline__ float dot32(const float *y, const act_t *x) {
         const unsigned x_stride = 0, out_stride = 0;                                              \
         const unsigned row = blockIdx.x * GEMV_WARPS + (threadIdx.x >> 5);                        \
         if (row >= N) return;                                                                     \
+        GEMV_BODY(([&](unsigned r, unsigned s, float *y) { FN(w, sw, r, K, s, y); }))             \
+    }                                                                                             \
+    extern "C" __global__ void NAME##_indexed(GEMV_INDEXED_ARGS) {                                \
+        GEMV_INDEXED_HEAD                                                                         \
+        (void)row_bytes;                                                                          \
+        const uint8_t *w = (const uint8_t *)w_table[e];                                           \
+        const uint8_t *sw = (const uint8_t *)sw_table[e];                                         \
         GEMV_BODY(([&](unsigned r, unsigned s, float *y) { FN(w, sw, r, K, s, y); }))             \
     }
 

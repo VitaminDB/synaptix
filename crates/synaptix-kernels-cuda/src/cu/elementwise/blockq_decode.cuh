@@ -34,6 +34,12 @@ __device__ __forceinline__ float sgn(uint8_t signs, int j) {
 }
 
 // ---------------------------------------------------------------- SQ<bits>
+// Биты 0..7 байта → нибблы 0..7 слова (бит i → бит 4i): три маскированных сдвига.
+__device__ __forceinline__ uint32_t spread8_nib(uint32_t b) {
+    b = (b | (b << 12)) & 0x000F000Fu;
+    b = (b | (b << 6)) & 0x03030303u;
+    return (b | (b << 3)) & 0x11111111u;
+}
 template <int BITS>
 __device__ __forceinline__ void deq_sq(const uint8_t *blk, int s, float *y) {
     float d = rd_f16(blk, 0);
@@ -41,14 +47,38 @@ __device__ __forceinline__ void deq_sq(const uint8_t *blk, int s, float *y) {
     float dl = d * (float)blk[4 + s];
     float ml = dmin * (float)blk[12 + s];
     uint32_t planes[8];
+    const uint8_t *pp = blk + 20 + s * BITS * 4;
+    // Блоб из 148/…/276-байтных блоков выровнен на 4 (размер блока кратен 4),
+    // проверка — на случай среза с нечётным смещением.
+    if ((reinterpret_cast<unsigned long long>(pp) & 3ull) == 0) {
 #pragma unroll
-    for (int j = 0; j < BITS; ++j) planes[j] = rd_u32(blk, 20 + s * BITS * 4 + j * 4);
+        for (int j = 0; j < BITS; ++j) planes[j] = reinterpret_cast<const uint32_t *>(pp)[j];
+    } else {
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        uint32_t q = 0;
+        for (int j = 0; j < BITS; ++j) planes[j] = rd_u32(pp, j * 4);
+    }
+    if (BITS <= 4) {
+        // Плоскости → нибблы по 8 значений за раз (≈3 оп. на вес вместо 3·BITS),
+        // ниббл → float через магию 2²³ (точно: целое < 16).
 #pragma unroll
-        for (int j = 0; j < BITS; ++j) q |= ((planes[j] >> i) & 1u) << j;
-        y[i] = dl * (float)q - ml;
+        for (int g = 0; g < 4; ++g) {
+            uint32_t qn = 0;
+#pragma unroll
+            for (int j = 0; j < BITS; ++j) qn |= spread8_nib((planes[j] >> (8 * g)) & 0xFFu) << j;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float q = __uint_as_float(0x4B000000u | ((qn >> (4 * e)) & 0xFu)) - 8388608.0f;
+                y[g * 8 + e] = dl * q - ml;
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            uint32_t q = 0;
+#pragma unroll
+            for (int j = 0; j < BITS; ++j) q |= ((planes[j] >> i) & 1u) << j;
+            y[i] = dl * (float)q - ml;
+        }
     }
 }
 
@@ -426,23 +456,19 @@ __device__ __forceinline__ void deq_tq2_0(const uint8_t *b, int s, float *y) {
 // ---------------------------------------------------------------- NVFP4/MXFP8 движка
 // NVFP4 synaptix: packed [N, K/2] линейно (младший ниббл — чётный индекс),
 // шкалы E4M3 тайл-мажорно (см. nvfp4_quant.cu: tile_scale_offset).
+// E4M3 → f32 без ветвлений: байт раскладывается в биты f16 (экспонента
+// сдвинута на 15 − 7 = 8, субнормали f16 покрывают субнормали E4M3), затем
+// ×2⁸. NaN (S.1111.111) отдельно — в весах его не бывает, но декод честный.
 __device__ __forceinline__ float syn_decode_e4m3(uint8_t byte) {
-    bool sign = (byte & 0x80) != 0;
-    int exp_bits = (byte >> 3) & 0x0F;
-    int mantissa = byte & 0x07;
-    if (exp_bits == 15 && mantissa == 7) return __int_as_float(0x7FC00000);
-    float val;
-    if (exp_bits == 0) {
-        val = mantissa * 0.001953125f;
-    } else {
-        val = (1.0f + mantissa * 0.125f) * exp2f((float)(exp_bits - 7));
-    }
-    return sign ? -val : val;
+    if ((byte & 0x7F) == 0x7F) return __int_as_float(0x7FC00000);
+    const unsigned short hb = (unsigned short)(((byte & 0x80u) << 8) | ((byte & 0x7Fu) << 7));
+    return __half2float(__ushort_as_half(hb)) * 256.0f;
 }
+// E2M1 → f32: удвоенные модули {0,1,2,3,4,6,8,12} — нибблы одной константы;
+// локальный массив-таблица уходил в local memory и тормозил GEMV в разы.
 __device__ __forceinline__ float syn_decode_e2m1(uint8_t nib) {
-    const float mags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    float mag = mags[nib & 7];
-    return (nib & 8) ? -mag : mag;
+    const float mag = (float)((0xC8643210u >> ((nib & 7u) * 4u)) & 0xFu) * 0.5f;
+    return __int_as_float(__float_as_int(mag) | ((unsigned)(nib & 8u) << 28));
 }
 __device__ __forceinline__ unsigned syn_nvfp4_scale_off(unsigned outer, unsigned block_col, unsigned sf_inner_dim) {
     unsigned tile_row = outer >> 7, tile_col = block_col >> 2;
@@ -451,16 +477,20 @@ __device__ __forceinline__ unsigned syn_nvfp4_scale_off(unsigned outer, unsigned
     return tile_base + (local_outer & 31u) * 16u + (local_outer >> 5) * 4u + local_inner;
 }
 /// Под-блок `s` (32 значения = два блока по 16) строки `row` веса [N, K].
+/// 16 байт веса одной векторной загрузкой (адрес кратен 16: K кратно 32).
 __device__ __forceinline__ void deq_nvfp4_syn(const uint8_t *packed, const uint8_t *scales, unsigned row,
                                               unsigned K, unsigned s, float *y) {
     unsigned sf_inner = ((K + 63u) / 64u) * 4u;
-    const uint8_t *p = packed + ((size_t)row * K + (size_t)s * 32u) / 2u;
+    const uint4 v = *reinterpret_cast<const uint4 *>(packed + ((size_t)row * K + (size_t)s * 32u) / 2u);
+    const unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
     for (int h = 0; h < 2; ++h) {
         float sc = syn_decode_e4m3(scales[syn_nvfp4_scale_off(row, s * 2u + h, sf_inner)]);
-        for (int j = 0; j < 8; ++j) {
-            uint8_t b = p[h * 8 + j];
-            y[h * 16 + 2 * j] = syn_decode_e2m1(b & 0x0F) * sc;
-            y[h * 16 + 2 * j + 1] = syn_decode_e2m1(b >> 4) * sc;
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            unsigned w = words[h * 2 + q];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) y[h * 16 + q * 8 + j] = syn_decode_e2m1((w >> (4 * j)) & 0xFu) * sc;
         }
     }
 }
@@ -468,7 +498,38 @@ __device__ __forceinline__ void deq_nvfp4_syn(const uint8_t *packed, const uint8
 __device__ __forceinline__ float syn_e4m3_to_f32(uint8_t byte) { return syn_decode_e4m3(byte); }
 __device__ __forceinline__ void deq_mxfp8_syn(const uint8_t *packed, const uint8_t *scales, unsigned row,
                                               unsigned K, unsigned s, float *y) {
-    float sc = __uint_as_float((unsigned)scales[(size_t)row * (K / 32u) + s] << 23);
-    const uint8_t *p = packed + (size_t)row * K + (size_t)s * 32u;
-    for (int j = 0; j < 32; ++j) y[j] = syn_e4m3_to_f32(p[j]) * sc;
+    // E8M0 × 2⁸ (сдвиг экспоненты E4M3 → f16) одним множителем.
+    const float sc_raw = __uint_as_float((unsigned)scales[(size_t)row * (K / 32u) + s] << 23);
+    const float sc = sc_raw * 256.0f;
+    (void)sc;
+    (void)sc_raw;
+    const uint4 *p = reinterpret_cast<const uint4 *>(packed + (size_t)row * K + (size_t)s * 32u);
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        const uint4 v = p[q];
+        const unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            unsigned w = words[t];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            // Ada+: аппаратный cvt пары E4M3 → f16x2 (масштаб без ×2⁸).
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                unsigned h2;
+                unsigned short pair = (unsigned short)(w >> (16 * j));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(pair));
+                float2 f = __half22float2(*reinterpret_cast<__half2 *>(&h2));
+                y[q * 16 + t * 4 + 2 * j] = f.x * sc_raw;
+                y[q * 16 + t * 4 + 2 * j + 1] = f.y * sc_raw;
+            }
+#else
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                unsigned b = (w >> (8 * j)) & 0xFFu;
+                unsigned short hb = (unsigned short)(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7));
+                y[q * 16 + t * 4 + j] = __half2float(__ushort_as_half(hb)) * sc;
+            }
+#endif
+        }
+    }
 }

@@ -459,6 +459,9 @@ impl ExpertTable {
         rows_per_pair: bool,
         dtype: DType,
     ) -> Result<Tensor> {
+        if self.is_dense() {
+            return Err(SynaptixError::Unsupported("gemv_indexed_rows: портируемая таблица, нужен gemv_indexed_dense"));
+        }
         let pairs = idx.numel();
         let dev = self.device();
         let backend = registry::backend_for(dev)?;
@@ -496,6 +499,9 @@ impl ExpertTable {
         wts: &Tensor,
         acc: &mut Tensor,
     ) -> Result<()> {
+        if self.is_dense() {
+            return Err(SynaptixError::Unsupported("gemv_indexed_accumulate: портируемая таблица, нужен gemv_indexed_dense"));
+        }
         let pairs = idx.numel();
         if wts.numel() != pairs || wts.dtype() != DType::F32 {
             return Err(SynaptixError::Unsupported("gemv_indexed_accumulate: wts — F32[pairs]"));

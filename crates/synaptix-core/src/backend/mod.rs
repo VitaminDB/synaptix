@@ -1023,6 +1023,30 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("nvfp4_gemv_indexed не поддержан этим backend"))
     }
 
+    /// Индексный GEMV по квантованным весам любого формата с плотной
+    /// активацией (F16/BF16 по `out`): `out[p] = W[idx[p]] · x[r_p]`, `r_p = p`
+    /// при `rows_per_pair`, иначе 0. `w_table`/`s_table` — I64-адреса весов и
+    /// масштабов (у одноблобных — адрес веса). Путь графового декода MoE на
+    /// картах без FP4 MMA.
+    #[allow(clippy::too_many_arguments)]
+    fn quant_gemv_indexed(
+        &self,
+        _w_table: &Storage,
+        _s_table: &Storage,
+        _dtype: DType,
+        _idx: (&Storage, &Layout),
+        _x: &Storage,
+        _out: (&mut Storage, &Layout),
+        _n: usize,
+        _k: usize,
+        _experts: usize,
+        _pairs: usize,
+        _rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("quant_gemv_indexed не поддержан этим backend"))
+    }
+
     // ── Слитые ядра шага декода (T = 1) ─────────────────────────────────
     //
     // Все буферы contiguous с нулевым смещением, если не сказано иное; пары

@@ -1122,7 +1122,19 @@ impl MoeFfn {
         if gate_up.len() != all.len() || down.len() != all.len() {
             return;
         }
-        let (Some(gu), Some(dn)) = (ExpertTable::build(&gate_up), ExpertTable::build(&down)) else {
+        // NVFP4 по перемешанным копиям — только с FP4 MMA (Blackwell). Иначе
+        // портируемая таблица: любой квант-формат, плотная активация.
+        let nvfp4_native = synaptix_core::backend::registry::backend_for(self.device)
+            .map(|b| b.quant_native(DType::NVFP4, self.device))
+            .unwrap_or(false);
+        let native = if nvfp4_native {
+            ExpertTable::build(&gate_up).zip(ExpertTable::build(&down))
+        } else {
+            None
+        };
+        let Some((gu, dn)) = native
+            .or_else(|| ExpertTable::build_dense(&gate_up).zip(ExpertTable::build_dense(&down)))
+        else {
             return;
         };
         // Таблицей `[E, 1]`, а не вектором: выбор идёт `embed_gather`'ом —
@@ -1149,7 +1161,9 @@ impl MoeFfn {
     /// нужно [`Self::dev_path_ready`], плюс gelu_tanh-активация — только её
     /// умеет ядро geglu+квант.
     pub fn fused_ready(&self) -> bool {
-        self.dev_path_ready() && self.cfg.activation == Activation::GeluTanh
+        self.dev_path_ready()
+            && self.cfg.activation == Activation::GeluTanh
+            && self.dev_tables.as_ref().is_some_and(|(g, d)| !g.is_dense() && !d.is_dense())
     }
 
     /// Вес роутера F32 `[E, H]` — для счёта логитов чужим запуском (хвост
@@ -1239,12 +1253,22 @@ impl MoeFfn {
         }
 
         // Эксперты: два пакетных GEMV с выбором веса по device-индексу.
-        let (px, sx) = x.nvfp4_quantize_act().map_err(ferr)?;
-        let gu = gate_up.gemv_indexed(&idx_flat, &px, &sx, false).map_err(ferr)?;
+        let gu = if gate_up.is_dense() {
+            let xa = if matches!(x.dtype(), DType::F16 | DType::BF16) { x.clone() } else { to_f16(x)? };
+            gate_up.gemv_indexed_dense(&idx_flat, &xa, false).map_err(ferr)?
+        } else {
+            let (px, sx) = x.nvfp4_quantize_act().map_err(ferr)?;
+            gate_up.gemv_indexed(&idx_flat, &px, &sx, false).map_err(ferr)?
+        };
         let h = self.swiglu(&gu)?;
-        let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
-        let (ph, sh) = h.nvfp4_quantize_act().map_err(ferr)?;
-        let parts = down.gemv_indexed(&idx_flat, &ph, &sh, true).map_err(ferr)?;
+        let parts = if down.is_dense() {
+            let h = if matches!(h.dtype(), DType::F16 | DType::BF16) { h } else { to_f16(&h)? };
+            down.gemv_indexed_dense(&idx_flat, &h, true).map_err(ferr)?
+        } else {
+            let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
+            let (ph, sh) = h.nvfp4_quantize_act().map_err(ferr)?;
+            down.gemv_indexed(&idx_flat, &ph, &sh, true).map_err(ferr)?
+        };
 
         // Взвешивание и сумма по k — тоже на карте.
         let wcol = w

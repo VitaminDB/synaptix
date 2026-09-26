@@ -9,6 +9,26 @@ typedef __half out_t;
 __device__ __forceinline__ out_t to_out(float v) { return __float2half_rn(v); }
 #endif
 
+// 32 значения подряд: четырьмя 16-байтными записями, если адрес выровнен
+// (всегда, кроме среза с нечётным смещением). Поэлементные 2-байтные записи
+// с шагом 64 байта между лейнами били запись в 32 транзакции на инструкцию —
+// деквант экспертов в префилле упирался в неё.
+__device__ __forceinline__ void store32(out_t *o, const float *y) {
+    if ((reinterpret_cast<unsigned long long>(o) & 15ull) == 0) {
+        uint4 *o4 = reinterpret_cast<uint4 *>(o);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            out_t h[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) h[i] = to_out(y[q * 8 + i]);
+            o4[q] = *reinterpret_cast<const uint4 *>(h);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) o[i] = to_out(y[i]);
+    }
+}
+
 // ---------------------------------------------------------------- точки входа
 // src: [rows][row_bytes], out: [rows][k]; поток = под-блок из 32 значений.
 #define DEQ_ENTRY(NAME, FN, BB, SUBS_PER_BLK)                                                    \
@@ -23,7 +43,7 @@ __device__ __forceinline__ out_t to_out(float v) { return __float2half_rn(v); }
         float y[32];                                                                           \
         FN(blk, (int)(s % SUBS_PER_BLK), y);                                                   \
         out_t *o = out + (size_t)row * k + (size_t)s * 32;                                     \
-        _Pragma("unroll") for (int i = 0; i < 32; ++i) o[i] = to_out(y[i]);                    \
+        store32(o, y);                                                                         \
     }
 
 // Gather эмбеддингов: строки таблицы [vocab][row_bytes] по индексам ids[n_ids]
@@ -47,7 +67,7 @@ __device__ __forceinline__ out_t to_out(float v) { return __float2half_rn(v); }
         const uint8_t *blk = src + (size_t)row * row_bytes + (size_t)(s / SUBS_PER_BLK) * (BB);\
         float y[32];                                                                           \
         FN(blk, (int)(s % SUBS_PER_BLK), y);                                                   \
-        _Pragma("unroll") for (int i = 0; i < 32; ++i) o[i] = to_out(y[i]);                    \
+        store32(o, y);                                                                         \
     }
 
 DEQ_ENTRY(deq_sq1, deq_sq<1>, 52, 8)
@@ -137,7 +157,7 @@ DEQG_ENTRY(deqg_tq2_0, deq_tq2_0, 66, 8)
         float y[32];                                                                           \
         FN(w, sw, row + row_off, k, s, y);                                                     \
         out_t *o = out + (size_t)row * k + (size_t)s * 32;                                     \
-        _Pragma("unroll") for (int i = 0; i < 32; ++i) o[i] = to_out(y[i]);                    \
+        store32(o, y);                                                                         \
     }
 DEQ_ENTRY_SYN(deq_nvfp4_syn, deq_nvfp4_syn)
 DEQ_ENTRY_SYN(deq_mxfp8_syn, deq_mxfp8_syn)

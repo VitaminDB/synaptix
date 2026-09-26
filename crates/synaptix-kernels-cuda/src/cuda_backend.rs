@@ -4370,6 +4370,70 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn quant_gemv_indexed(
+        &self,
+        w_table: &Storage,
+        s_table: &Storage,
+        dtype: DType,
+        idx: (&Storage, &Layout),
+        x: &Storage,
+        out: (&mut Storage, &Layout),
+        n: usize,
+        k: usize,
+        experts: usize,
+        pairs: usize,
+        rows_per_pair: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (idx_st, idx_lo) = idx;
+        let (out_st, out_lo) = out;
+        if idx_lo.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("quant_gemv_indexed: idx должен быть U32"));
+        }
+        let bf16 = match out_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("quant_gemv_indexed: out только F16/BF16")),
+        };
+        if pairs == 0 {
+            return Ok(());
+        }
+        let err = |what: &'static str| SynaptixError::Unsupported(what);
+        let wt = w_table.as_cuda().ok_or(err("quant_gemv_indexed: таблица не на карте"))?;
+        let ctx = wt.device().clone();
+        let stream = synaptix_core::device::cuda::default_stream(wt.ordinal())?;
+        let kernels = if bf16 {
+            crate::elementwise::blockq::BlockqGemvKernels::for_context_bf16(&ctx)?
+        } else {
+            crate::elementwise::blockq::BlockqGemvKernels::for_context(&ctx)?
+        };
+        let st = s_table.as_cuda().ok_or(err("quant_gemv_indexed: масштабы таблицы не на карте"))?;
+        let ib = idx_st.as_cuda().ok_or(err("quant_gemv_indexed: idx не на карте"))?;
+        let xb = x.as_cuda().ok_or(err("quant_gemv_indexed: активация не на карте"))?;
+        let ob = out_st.as_cuda_mut().ok_or(err("quant_gemv_indexed: out не на карте"))?;
+        let wt_view = unsafe { wt.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("quant_gemv_indexed: transmute таблицы".into()))?;
+        let st_view = unsafe { st.slice().transmute::<u64>(experts) }
+            .ok_or_else(|| SynaptixError::Cuda("quant_gemv_indexed: transmute масштабов".into()))?;
+        let idx_view = unsafe { ib.slice().transmute::<u32>(pairs) }
+            .ok_or_else(|| SynaptixError::Cuda("quant_gemv_indexed: transmute idx".into()))?;
+        crate::elementwise::blockq::blockq_gemv_indexed(
+            &kernels,
+            &stream,
+            dtype,
+            &wt_view,
+            &st_view,
+            &idx_view,
+            &xb.slice().slice(..),
+            &mut ob.slice_mut().slice_mut(..),
+            experts as u32,
+            pairs as u32,
+            n as u32,
+            k as u32,
+            rows_per_pair,
+        )
+    }
+
     fn nvfp4_gemv_indexed(
         &self,
         w_table: &Storage,

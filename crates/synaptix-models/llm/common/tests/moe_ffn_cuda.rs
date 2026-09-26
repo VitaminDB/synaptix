@@ -309,6 +309,17 @@ fn chunking_keeps_the_answer_within_quant_noise() {
 /// тут — это молча испорченный ответ в графовом декоде.
 #[test]
 fn dev_path_matches_host_path() {
+    dev_path_case(DType::NVFP4, 1e-3);
+}
+
+/// Портируемая таблица (карты без FP4 MMA и форматы кроме NVFP4): активация
+/// плотная, host-путь может квантовать её сам — допуск шире.
+#[test]
+fn dev_path_dense_table_matches_host_path() {
+    dev_path_case(DType::MXFP8, 0.03);
+}
+
+fn dev_path_case(quant: DType, tol: f32) {
     if !setup() {
         return;
     }
@@ -320,8 +331,8 @@ fn dev_path_matches_host_path() {
     c.per_expert_scale = Some((0..E).map(|e| 0.7 + 0.1 * e as f32).collect());
 
     let w = weights();
-    let moe = MoeFfn::load(&w, "mlp", c, device, compute, DType::NVFP4).expect("сборка MoE");
-    assert!(moe.dev_path_ready(), "device-путь не собрался");
+    let moe = MoeFfn::load(&w, "mlp", c, device, compute, quant).expect("сборка MoE");
+    assert!(moe.dev_path_ready(), "device-путь не собрался ({quant:?})");
 
     let x = noise(42, H);
     let xt = Tensor::from_vec::<_, f32>(x, vec![1usize, H], device)
@@ -346,6 +357,6 @@ fn dev_path_matches_host_path() {
         den += x * x;
     }
     let rel = (num / den.max(1e-12)).sqrt();
-    eprintln!("[moe dev] отн. L2 = {rel:.6}; host[..4]={:?} dev[..4]={:?}", &a[..4], &b[..4]);
-    assert!(rel < 1e-3, "device-путь разошёлся с host-путём: {rel}");
+    eprintln!("[moe dev {quant:?}] отн. L2 = {rel:.6}; host[..4]={:?} dev[..4]={:?}", &a[..4], &b[..4]);
+    assert!(rel < tol, "device-путь ({quant:?}) разошёлся с host-путём: {rel}");
 }
