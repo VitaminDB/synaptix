@@ -2,7 +2,7 @@
 //!
 //! Алгоритм (порт официального NVIDIA NeMo postprocess):
 //! binarize(thr) → median_smooth → per-speaker contiguous intervals (confidence=avg prob)
-//! → merge gaps<merge_gap_s → drop<min_segment_s → arrival-time re-id. TODO: реализовать.
+//! → merge gaps<merge_gap_s → drop<min_segment_s → arrival-time re-id.
 
 use serde::{Deserialize, Serialize};
 

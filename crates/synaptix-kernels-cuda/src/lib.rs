@@ -4,7 +4,6 @@ pub mod caps;
 pub mod comm;
 pub mod conv;
 pub mod cuda_backend;
-pub mod cuda_graph;
 pub mod elementwise;
 pub mod embed;
 pub mod fused;
@@ -15,7 +14,6 @@ pub mod ptx;
 pub mod reduction;
 pub mod scan;
 pub mod ssm;
-pub mod stream_pool;
 pub mod tma;
 pub mod wsalloc;
 

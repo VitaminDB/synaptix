@@ -20,7 +20,7 @@ pub enum GgufError {
     #[error("неизвестный ggml-тип тензора: {0}")]
     BadTensorType(u32),
 
-    #[error("ggml-тип {0} пока не поддержан деквантизацией (нужны таблицы-решётки IQ)")]
+    #[error("ggml-тип {0} не поддержан деквантизацией")]
     UnsupportedQuant(&'static str),
 
     #[error("метаданные: ключ `{0}` отсутствует")]
