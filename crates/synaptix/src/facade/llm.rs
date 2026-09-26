@@ -946,30 +946,38 @@ impl LlmKvSession {
     /// всегда считается заново: из него берутся логиты первого шага.
     pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
         let n = self.ids.len();
-        if n == 0 || prompt_ids.len() <= n || prompt_ids[..n] != self.ids[..] {
+        if n == 0 {
             return 0;
         }
+        // Общий префикс прошлого и нового промпта, но не весь новый: хоть один
+        // токен префилл должен посчитать, чтобы получить логиты.
+        let lcp = self
+            .ids
+            .iter()
+            .zip(prompt_ids)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(prompt_ids.len().saturating_sub(1));
         match &self.kind {
+            // Состояние linear-слоёв назад не откатить — нужен весь снимок.
             SessionKind::Hybrid { snap, .. } => {
-                if snap.is_some() {
+                if snap.is_some() && lcp == n {
                     n
                 } else {
                     0
                 }
             }
-            // Окно sliding-слоёв от границы обязано лежать в кольце: всё, что
-            // ниже их `start`, декод прошлого хода уже вытеснил.
-            SessionKind::Muse { .. } => {
-                if self.kv.ring_resumable_at(n) {
-                    n
-                } else {
-                    0
-                }
-            }
-            // Без повёрнутых колец граница всегда годится.
-            SessionKind::Plain => {
-                if self.kv.ring_resumable_at(n) {
-                    n
+            // Attention-кэш усекается по `seq_len` на любой позиции — берём
+            // общий префикс, даже если прошлый промпт не вошёл целиком. Так
+            // бывает почти всегда: шаблон Qwen3/Gemma-4 открывает ответ пустым
+            // блоком размышлений (`<think>\n\n</think>`, `<|channel>thought`),
+            // а в истории эта реплика рендерится без него — раньше из-за
+            // четырёх токенов хвоста выбрасывался весь кэш. Окно sliding-слоёв
+            // от границы обязано лежать в кольце: всё, что ниже их `start`,
+            // декод прошлого хода уже вытеснил.
+            SessionKind::Muse { .. } | SessionKind::Plain => {
+                if lcp > 0 && self.kv.ring_resumable_at(lcp) {
+                    lcp
                 } else {
                     0
                 }

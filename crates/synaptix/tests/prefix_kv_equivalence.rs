@@ -604,3 +604,78 @@ fn prefix_kv_bundle_matches_full_prefill() {
         "кэшированный ход разошёлся с полным префиллом с токена {diff:?}"
     );
 }
+
+/// Настоящий чат: второй промпт рендерит шаблон, а не склейка токенов. У
+/// Qwen3/Gemma-4 промпт генерации кончается пустым блоком размышлений, которого
+/// в истории нет, — прошлый промпт не префикс нового, и до 26.09.2026 кэш
+/// выбрасывался целиком («из кэша 0»). Теперь берётся общий префикс.
+///
+/// `SYN_PREFIX_KV_BUNDLE=<модель> cargo test -p synaptix --release --test
+/// prefix_kv_equivalence prefix_kv_reuses_common_prefix_of_real_chat -- --nocapture`
+#[test]
+fn prefix_kv_reuses_common_prefix_of_real_chat() {
+    use synaptix::facade::llm::{optimal_profile, Message};
+    let Ok(path) = std::env::var("SYN_PREFIX_KV_BUNDLE") else {
+        return;
+    };
+    reclaim_vram();
+    let mut policy = optimal_profile(Path::new(&path)).policy;
+    if std::env::var("SYN_PREFIX_KV_KV_DTYPE").ok().as_deref() == Some("bf16") {
+        policy.kv_dtype = synaptix::facade::llm::KvDtypePolicy::BF16;
+    }
+    let (model, tok) = load_llm_with_policy(Path::new(&path), policy, &Device::Cuda(0)).expect("load");
+    let ctx = 4096usize;
+    let max_new = 24usize;
+    let eos = tok.eos_ids().to_vec();
+    // Системный промпт длиннее чанка GDN-скана (64): у гибрида точка
+    // возврата ставится на кратной ему границе.
+    let sys = "Answer in one short sentence. ".repeat(24);
+    let msgs1 = vec![Message::system(sys), Message::user("What is TCP?")];
+    let ids1 = tok.encode(&tok.apply_chat_template_ex_tools(&msgs1, true, false, None).unwrap()).unwrap();
+    let mut session = model.new_kv_session(ctx, max_new).unwrap().expect("префикс-KV");
+    let mut t1 = String::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos.clone());
+        r.generate_streaming_cached(&mut session, &ids1, &tok, |_, s| {
+            t1.push_str(s);
+            true
+        })
+        .unwrap();
+    }
+    let mut msgs2 = msgs1.clone();
+    msgs2.push(Message::assistant(t1.trim()));
+    msgs2.push(Message::user("And UDP?"));
+    let ids2 = tok.encode(&tok.apply_chat_template_ex_tools(&msgs2, true, false, None).unwrap()).unwrap();
+    let mut cached2 = Vec::new();
+    let reused = {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos.clone());
+        r.generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+            cached2.push(id);
+            true
+        })
+        .unwrap()
+    };
+    let mut fresh2 = Vec::new();
+    {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.set_stop_tokens(eos);
+        r.generate_streaming(&ids2, &tok, |id, _| {
+            fresh2.push(id);
+            true
+        })
+        .unwrap();
+    }
+    let lcp = ids1.iter().zip(&ids2).take_while(|(a, b)| a == b).count();
+    let diff = cached2.iter().zip(&fresh2).position(|(x, y)| x != y);
+    eprintln!(
+        "промпт 1: {} ток, промпт 2: {} ток, общий префикс {lcp}, из кэша {reused}; расхождение с полным префиллом: {diff:?}",
+        ids1.len(),
+        ids2.len()
+    );
+    // Гибрид возвращается на границу чанка скана (кратную 64), остальные —
+    // на общий префикс.
+    assert!(reused + 64 >= lcp && reused > 0, "из кэша {reused} при общем префиксе {lcp}");
+    assert!(diff.map_or(true, |d| d >= 4), "кэшированный ход разошёлся с полным с токена {diff:?}");
+}
