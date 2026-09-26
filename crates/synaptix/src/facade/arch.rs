@@ -75,7 +75,25 @@ pub fn config_max_seq(path: &Path) -> Option<usize> {
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
     };
-    v.get("text_config").and_then(field).or_else(|| field(&v))
+    let v = v.get("text_config").filter(|t| field(t).is_some()).unwrap_or(&v);
+    let max = field(v)?;
+    // Тип `rope_scaling`, который движок не применяет, — ёмкость по исходному
+    // контексту (см. `synaptix_llm_common::rope_scaling::resolve`).
+    let cap = v
+        .get("rope_scaling")
+        .filter(|rs| {
+            let kind = rs
+                .get("rope_type")
+                .or_else(|| rs.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            !matches!(kind.as_str(), "" | "default" | "linear" | "llama3" | "yarn")
+        })
+        .and_then(|rs| rs.get("original_max_position_embeddings"))
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize);
+    Some(cap.map_or(max, |c| c.min(max)))
 }
 
 /// LLM-архитектура — определяет, какой pipeline грузить.

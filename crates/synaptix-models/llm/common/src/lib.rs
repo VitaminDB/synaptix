@@ -4,6 +4,7 @@ pub mod model;
 pub mod mrope;
 pub mod moe;
 pub mod profile;
+pub mod rope_scaling;
 pub mod mtp;
 pub mod weights;
 

@@ -16,7 +16,9 @@ synaptix-nn        = { workspace = true }
 synaptix-infer     = { workspace = true }
 rayon              = { workspace = true }
 thiserror          = { workspace = true }
+serde              = { workspace = true }
 
 [dev-dependencies]
+serde_json            = { workspace = true }
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }

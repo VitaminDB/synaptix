@@ -3,21 +3,8 @@ use std::path::Path;
 use serde::Deserialize;
 use synaptix_llm_common::{Activation, DecoderConfig, LayerKind, NormGain, RopeSpec};
 
-/// `rope_scaling` секция HF-конфига. Поддерживается тип `llama3` (частотная
-/// коррекция по low/high-freq порогам); прочие типы (`linear`/`dynamic`/null)
-/// → обычный RoPE на `rope_theta` (см. [`LlamaConfig::scaled_rope_freqs`]).
-#[derive(Debug, Clone, Deserialize)]
-pub struct RopeScaling {
-    pub rope_type: String,
-    #[serde(default)]
-    pub factor: f32,
-    #[serde(default)]
-    pub low_freq_factor: Option<f32>,
-    #[serde(default)]
-    pub high_freq_factor: Option<f32>,
-    #[serde(default)]
-    pub original_max_position_embeddings: Option<usize>,
-}
+pub use synaptix_llm_common::rope_scaling::RopeScaling;
+use synaptix_llm_common::rope_scaling::{self, ScaledRope};
 
 /// MLX/HF `quantization` секция. Наличие → веса проекций хранятся как affine
 /// int`bits` (group `group_size`, scale+bias на группу) и дектвантятся при
@@ -144,6 +131,7 @@ impl LlamaConfig {
     }
 
     pub fn to_decoder_config(&self) -> DecoderConfig {
+        let rope = self.scaled_rope();
         DecoderConfig {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
@@ -152,7 +140,7 @@ impl LlamaConfig {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             head_dim: self.head_dim,
-            max_position_embeddings: self.max_position_embeddings,
+            max_position_embeddings: rope.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             norm_gain: NormGain::Plain,
             activation: Activation::Silu,
@@ -160,7 +148,7 @@ impl LlamaConfig {
             post_norm_eps: None,
             qk_norm: false,
             attn_output_gate: false,
-            attn_scale: 1.0 / (self.head_dim as f32).sqrt(),
+            attn_scale: rope.attn_scale_mul() / (self.head_dim as f32).sqrt(),
             embed_scale: None,
             embed_rms_norm: false,
             logit_scale: None,
@@ -168,7 +156,7 @@ impl LlamaConfig {
             rope_global: RopeSpec {
                 theta: self.rope_theta,
                 rotary_dim: self.head_dim,
-                scaled_freqs: self.scaled_rope_freqs(),
+                scaled_freqs: rope.freqs,
             },
             rope_local: None,
             sliding_window: None,
@@ -198,46 +186,15 @@ impl LlamaConfig {
         self.eos_token_id.as_ref().map(|e| e.ids()).unwrap_or_default()
     }
 
-    /// Частоты RoPE с поправкой `llama3` (если задан соответствующий
-    /// `rope_scaling`). `None` → обычный RoPE на `rope_theta` (caller строит кэш
-    /// через `RopeCache::new`). `Some(freqs)` длины `head_dim/2` → через
-    /// `RopeCache::with_scaled_freqs`.
-    ///
-    /// Формула повторяет `transformers._compute_llama3_parameters`: высокочастотные
-    /// (короткая длина волны) остаются как есть, низкочастотные делятся на `factor`,
-    /// средние — гладко интерполируются.
-    pub fn scaled_rope_freqs(&self) -> Option<Vec<f32>> {
-        let rs = self.rope_scaling.as_ref()?;
-        if rs.rope_type.to_ascii_lowercase() != "llama3" {
-            return None;
-        }
-        let factor = rs.factor as f64;
-        let low_ff = rs.low_freq_factor.unwrap_or(1.0) as f64;
-        let high_ff = rs.high_freq_factor.unwrap_or(4.0) as f64;
-        let orig_ctx = rs.original_max_position_embeddings.unwrap_or(8192) as f64;
-        let theta = self.rope_theta as f64;
-        let head_dim = self.head_dim;
-        let half = head_dim / 2;
-
-        let low_freq_wavelen = orig_ctx / low_ff;
-        let high_freq_wavelen = orig_ctx / high_ff;
-        let two_pi = 2.0 * std::f64::consts::PI;
-
-        let mut out = Vec::with_capacity(half);
-        for i in 0..half {
-            let inv_freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
-            let wavelen = two_pi / inv_freq;
-            let f = if wavelen < high_freq_wavelen {
-                inv_freq
-            } else if wavelen > low_freq_wavelen {
-                inv_freq / factor
-            } else {
-                let smooth = (orig_ctx / wavelen - low_ff) / (high_ff - low_ff);
-                (1.0 - smooth) * inv_freq / factor + smooth * inv_freq
-            };
-            out.push(f as f32);
-        }
-        Some(out)
+    /// RoPE с учётом `rope_scaling` (`llama3`/`linear`/`yarn`; прочие типы —
+    /// обычный RoPE с ёмкостью `original_max_position_embeddings`).
+    pub fn scaled_rope(&self) -> ScaledRope {
+        rope_scaling::resolve(
+            self.rope_scaling.as_ref(),
+            self.rope_theta,
+            self.head_dim,
+            self.max_position_embeddings,
+        )
     }
 }
 
@@ -301,7 +258,7 @@ mod tests {
         assert_eq!(cfg.eos_ids(), vec![128001, 128008, 128009]);
         assert_eq!(cfg.quantization.unwrap().bits, 4);
         assert_eq!(cfg.quantization.unwrap().group_size, 64);
-        let freqs = cfg.scaled_rope_freqs().expect("llama3 scaling");
+        let freqs = cfg.scaled_rope().freqs.expect("llama3 scaling");
         assert_eq!(freqs.len(), 32);
         // Высокочастотная компонента (i=0, inv_freq=1.0) не масштабируется.
         assert!((freqs[0] - 1.0).abs() < 1e-6);

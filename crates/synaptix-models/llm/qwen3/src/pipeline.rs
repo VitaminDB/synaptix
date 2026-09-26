@@ -74,8 +74,8 @@ impl Qwen3Pipeline {
             .ok_or_else(|| PipelineError::Load("tokenizer.json: нет файла".into()))?;
         let tokenizer = HfTokenizer::from_bytes(&tok_bytes)
             .map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
-        let rope_capacity = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
+        let rope_capacity = max_seq.unwrap_or(dcfg.max_position_embeddings);
         let model = DecoderModel::build_auto(
             &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, rope_capacity,
         )

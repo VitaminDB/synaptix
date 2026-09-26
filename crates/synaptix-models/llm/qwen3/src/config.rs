@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use synaptix_llm_common::rope_scaling::{self, RopeScaling, ScaledRope};
 use synaptix_llm_common::{Activation, DecoderConfig, LayerKind, NormGain, RopeSpec};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +19,9 @@ pub struct Qwen3Config {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// `linear`/`yarn` (GGUF-конвертер и длинный контекст Qwen3 по
+    /// инструкции модели); см. [`rope_scaling::resolve`].
+    pub rope_scaling: Option<RopeScaling>,
     pub hidden_act: String,
     pub attention_bias: bool,
     pub bos_token_id: Option<u32>,
@@ -41,6 +45,7 @@ impl Default for Qwen3Config {
             max_position_embeddings: 40960,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             hidden_act: "silu".into(),
             attention_bias: false,
             bos_token_id: Some(151643),
@@ -94,7 +99,17 @@ impl Qwen3Config {
         Ok(())
     }
 
+    pub fn scaled_rope(&self) -> ScaledRope {
+        rope_scaling::resolve(
+            self.rope_scaling.as_ref(),
+            self.rope_theta,
+            self.head_dim,
+            self.max_position_embeddings,
+        )
+    }
+
     pub fn to_decoder_config(&self) -> DecoderConfig {
+        let rope = self.scaled_rope();
         DecoderConfig {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
@@ -103,7 +118,7 @@ impl Qwen3Config {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             head_dim: self.head_dim,
-            max_position_embeddings: self.max_position_embeddings,
+            max_position_embeddings: rope.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             norm_gain: NormGain::Plain,
             activation: Activation::Silu,
@@ -111,7 +126,7 @@ impl Qwen3Config {
             post_norm_eps: None,
             qk_norm: self.model_type != "qwen2",
             attn_output_gate: false,
-            attn_scale: 1.0 / (self.head_dim as f32).sqrt(),
+            attn_scale: rope.attn_scale_mul() / (self.head_dim as f32).sqrt(),
             embed_scale: None,
             embed_rms_norm: false,
             logit_scale: None,
@@ -119,7 +134,7 @@ impl Qwen3Config {
             rope_global: RopeSpec {
                 theta: self.rope_theta,
                 rotary_dim: self.head_dim,
-                scaled_freqs: None,
+                scaled_freqs: rope.freqs,
             },
             rope_local: None,
             sliding_window: None,
@@ -172,6 +187,22 @@ mod tests {
         assert_eq!(cfg.group_size(), 2);
         assert!(cfg.tie_word_embeddings);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn yarn_rope_scaling_applied() {
+        let json = r#"{"head_dim": 128, "max_position_embeddings": 131072,
+            "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                             "original_max_position_embeddings": 32768}}"#;
+        let cfg: Qwen3Config = serde_json::from_str(json).unwrap();
+        let dc = cfg.to_decoder_config();
+        assert_eq!(dc.max_position_embeddings, 131072);
+        assert!(dc.rope_global.scaled_freqs.is_some());
+        let plain = 1.0 / (128f32).sqrt();
+        assert!((dc.attn_scale / plain - 1.138_629_4f32.powi(2)).abs() < 1e-5);
+        let dc0 = Qwen3Config::default().to_decoder_config();
+        assert!(dc0.rope_global.scaled_freqs.is_none());
+        assert_eq!(dc0.attn_scale, plain);
     }
 
     #[test]
