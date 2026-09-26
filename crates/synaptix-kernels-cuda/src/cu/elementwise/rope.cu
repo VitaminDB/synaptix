@@ -13,8 +13,9 @@
 //     out[d] = x[d]  (pass-through)
 //
 // Grid: (B * H * T, 1, 1); block: (head_dim, 1, 1). head_dim ≤ 1024.
-// `start_pos_ptr` — device-resident u32 (shared broadcast'ом). Совместимо с
-// CUDA graph replay.
+// `start_pos_ptr` — device-resident u32[pos_count]: одна позиция на весь батч
+// (pos_count = 1) или своя на каждую строку батча (pos_count = B). Совместимо
+// с CUDA graph replay.
 
 __device__ __forceinline__ float load_x(const __half* p) { return __half2float(*p); }
 __device__ __forceinline__ float load_x(const __nv_bfloat16* p) { return __bfloat162float(*p); }
@@ -35,7 +36,8 @@ __device__ __forceinline__ void rope_apply_impl(
     unsigned int H,
     unsigned int T_seq,
     unsigned int head_dim,
-    unsigned int rotary_dim
+    unsigned int rotary_dim,
+    unsigned int pos_count
 ) {
     unsigned int row = blockIdx.x;
     unsigned int d   = threadIdx.x;
@@ -45,8 +47,9 @@ __device__ __forceinline__ void rope_apply_impl(
     // Per-row start position: start_pos_ptr is [B] (batch-1 passes [1] → b=0
     // reads the same scalar, single-sequence decode unchanged). Enables a
     // batch-2 CFG decode where cond/uncond sit at different absolute positions.
+    // Одна позиция на батч читалась бы за концом буфера при B > 1.
     unsigned int b = row / (H * T_seq);
-    unsigned int pos = start_pos_ptr[b] + t;
+    unsigned int pos = start_pos_ptr[b < pos_count ? b : 0] + t;
 
     size_t base = (size_t)row * head_dim;
 
@@ -79,10 +82,11 @@ extern "C" __global__ void rope_apply_partial_f16(
     unsigned int H,
     unsigned int T_seq,
     unsigned int head_dim,
-    unsigned int rotary_dim
+    unsigned int rotary_dim,
+    unsigned int pos_count
 ) {
     rope_apply_impl<__half>(x, out, cos_table, sin_table, start_pos_ptr,
-                            B, H, T_seq, head_dim, rotary_dim);
+                            B, H, T_seq, head_dim, rotary_dim, pos_count);
 }
 
 extern "C" __global__ void rope_apply_partial_bf16(
@@ -95,10 +99,11 @@ extern "C" __global__ void rope_apply_partial_bf16(
     unsigned int H,
     unsigned int T_seq,
     unsigned int head_dim,
-    unsigned int rotary_dim
+    unsigned int rotary_dim,
+    unsigned int pos_count
 ) {
     rope_apply_impl<__nv_bfloat16>(x, out, cos_table, sin_table, start_pos_ptr,
-                                   B, H, T_seq, head_dim, rotary_dim);
+                                   B, H, T_seq, head_dim, rotary_dim, pos_count);
 }
 
 extern "C" __global__ void rope_apply_partial_f32(
@@ -111,10 +116,11 @@ extern "C" __global__ void rope_apply_partial_f32(
     unsigned int H,
     unsigned int T_seq,
     unsigned int head_dim,
-    unsigned int rotary_dim
+    unsigned int rotary_dim,
+    unsigned int pos_count
 ) {
     rope_apply_impl<float>(x, out, cos_table, sin_table, start_pos_ptr,
-                           B, H, T_seq, head_dim, rotary_dim);
+                           B, H, T_seq, head_dim, rotary_dim, pos_count);
 }
 
 // ── Split (GPT-NeoX) RoPE, точная копия synaptix-ops apply_rope(Split) ──────

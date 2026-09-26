@@ -110,6 +110,7 @@ pub fn apply_partial<T: DeviceRepr>(
         block_dim: (head_dim, 1, 1),
         shared_mem_bytes: 0,
     };
+    let pos_count = start_pos_dev.len() as u32;
     let mut bld = stream.launch_builder(func);
     bld.arg(x)
         .arg(&mut *out)
@@ -120,7 +121,8 @@ pub fn apply_partial<T: DeviceRepr>(
         .arg(&h)
         .arg(&t)
         .arg(&head_dim)
-        .arg(&rotary_dim);
+        .arg(&rotary_dim)
+        .arg(&pos_count);
     unsafe {
         bld.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch rope_apply: {e:?}")))?;
@@ -528,6 +530,7 @@ pub fn apply_partial_u8_dev(
     };
     let esz = (dtype.size_in_bits() / 8) as usize;
     let xn = (b as usize) * (h as usize) * (t as usize) * (head_dim as usize);
+    let pos_count = start_pos_dev.len() as u32;
     let cfg = LaunchConfig {
         grid_dim: (b * h * t, 1, 1),
         block_dim: (head_dim, 1, 1),
@@ -565,7 +568,8 @@ pub fn apply_partial_u8_dev(
                 .arg(&h)
                 .arg(&t)
                 .arg(&head_dim)
-                .arg(&rotary_dim);
+                .arg(&rotary_dim)
+                .arg(&pos_count);
             unsafe {
                 bld.launch(cfg)
                     .map_err(|e| SynaptixError::Cuda(format!("launch rope_apply u8_dev: {e:?}")))?;

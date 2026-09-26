@@ -1,9 +1,10 @@
-//! MXFP8-KV prefill v2 (sm_120a): схема flash_splitq (FA-2 split-Q,
+//! MXFP8-KV prefill v2 (sm_80+): схема flash_splitq (FA-2 split-Q,
 //! mma.sync.m16n8k16, online softmax в регистрах) с деквант-fill E4M3+E8M0 →
 //! T прямо в smem аппаратным cvt (см. `flash_mxfp8_splitq.cu`). Заменяет
 //! структурно медленный `flash_mxfp8_prefill` (BM=16, серийный softmax).
 //!
-//! Модуль sm_120a: на старых архитектурах загрузка падает,
+//! cvt E4M3 → f16 аппаратный с sm_89 (Ada), на sm_80/86 NVRTC эмулирует его
+//! (проверено `SYN_FORCE_ARCH=sm_89/sm_86`). Если модуль всё же не собрался,
 //! [`FlashMxfp8SplitqKernels::try_for_context`] возвращает `None`, диспетчер
 //! остаётся на WMMA-пути. Ограничения: HD ∈ {128,256}, q/out — F16/BF16,
 //! k/v-байты выровнены на 16 (uint4-загрузки).
@@ -32,7 +33,7 @@ pub struct FlashMxfp8SplitqKernels {
     _module: Arc<CudaModule>,
 }
 
-/// Кэш по контексту; `None` — компиляция/загрузка не удалась (не sm_120a).
+/// Кэш по контексту; `None` — компиляция/загрузка не удалась (модуль не собрался под карту).
 static CACHE: OnceLock<Mutex<Vec<(usize, Option<Arc<FlashMxfp8SplitqKernels>>)>>> =
     OnceLock::new();
 
@@ -86,7 +87,7 @@ impl FlashMxfp8SplitqKernels {
     }
 }
 
-/// Пригодность формы/типов (без учёта наличия sm_120a-модуля).
+/// Пригодность формы/типов (без учёта того, собрался ли модуль).
 pub fn splitq_shape_ok(d: u32, q_dtype: DType, k_off: usize, v_off: usize) -> bool {
     (d == 128 || d == 256)
         && matches!(q_dtype, DType::F16 | DType::BF16)

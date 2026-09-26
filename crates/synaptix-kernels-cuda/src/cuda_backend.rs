@@ -3256,12 +3256,14 @@ impl Backend for CudaBackend {
         let ord = x_buf.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let kernels = crate::elementwise::rope::RopeKernels::for_context(&ctx)?;
+        // Одна позиция на батч или своя на строку батча (CFG-декод).
         let sp_off = sp_lo.byte_offset();
+        let n_pos = sp_lo.numel().clamp(1, b.max(1));
         let sp_view = unsafe {
             sp_buf
                 .slice()
-                .slice(sp_off..sp_off + 4)
-                .transmute::<u32>(1)
+                .slice(sp_off..sp_off + 4 * n_pos)
+                .transmute::<u32>(n_pos)
                 .ok_or_else(|| SynaptixError::Cuda("rope_apply_dev: transmute start_pos".into()))?
         };
         crate::elementwise::rope::apply_partial_u8_dev(

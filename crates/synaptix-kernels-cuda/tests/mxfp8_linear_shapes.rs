@@ -2,16 +2,28 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 
+fn noise(seed: u64, len: usize) -> Vec<f32> {
+    let mut st = seed;
+    (0..len)
+        .map(|_| {
+            st = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.5
+        })
+        .collect()
+}
+
 fn check(n: usize, k: usize, m: usize) -> f32 {
     let dev = Device::Cuda(0);
-    let mut w = vec![0f32; n * k];
-    for (i, x) in w.iter_mut().enumerate() {
-        *x = (((i * 31) % 199) as f32 / 199.0 - 0.5) * 0.5;
-    }
-    let mut a = vec![0f32; m * k];
-    for (i, x) in a.iter_mut().enumerate() {
-        *x = (((i * 17) % 173) as f32 / 173.0 - 0.5) * 0.5;
-    }
+    // Псевдослучайные значения. Периодические ряды ((i·31) mod 199 …) почти
+    // гасили друг друга в скалярном произведении (rms выхода ~1/300 от
+    // ‖a‖·‖w‖), и относительная L2 раздувалась до 0.18 при верном ядре — ровно
+    // столько же даёт numpy-эмуляция MXFP8 на тех же данных.
+    let w = noise(0x5EED_0001, n * k);
+    let a = noise(0x5EED_0002, m * k);
     let wt = Tensor::from_vec(w, vec![n, k], dev)
         .unwrap()
         .to_dtype(DType::F16)

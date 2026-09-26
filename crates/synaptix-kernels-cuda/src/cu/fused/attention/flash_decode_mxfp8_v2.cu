@@ -1,7 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-// MXFP8-KV flash-decode v2 (sm_120a): GQA-групповое split-K ядро для малых Tq
+// MXFP8-KV flash-decode v2 (sm_80+; cvt E4M3 аппаратный с sm_89): GQA-групповое split-K ядро для малых Tq
 // (decode Tq=1, MTP-verify Tq=2..8). Отличия от скалярного flash_decode.cu:
 //
 //   • один блок = (bi, h_kv, subgroup, ti, split): GROUP query-голов одной
