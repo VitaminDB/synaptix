@@ -104,7 +104,7 @@ fn chat_llm_on_small_card() {
     };
 
     let opt = optimal_profile(&path);
-    set_graph_decode_enabled(opt.graph_decode);
+    set_graph_decode_enabled(opt.graph_decode && std::env::var_os("LLM_NO_GRAPH").is_none());
     set_mtp_enabled(opt.speculation);
     set_dflash_enabled(opt.speculation);
     let t0 = Instant::now();
