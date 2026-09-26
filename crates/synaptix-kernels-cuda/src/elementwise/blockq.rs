@@ -550,14 +550,15 @@ impl GroupedGemmKernel {
     }
 }
 
-/// Тайлы строк: `(эксперт, начало, конец)` по `GG_BM` строк из сегментов
+/// Тайлы строк: `(эксперт, начало, конец)` по `bm` строк (`GG_BM` у BF16-ядра,
+/// `GG8_BM` у FP8) из сегментов
 /// `(эксперт, начало, конец)`; пустые сегменты пропускаются.
-pub fn grouped_tiles(segments: &[(u32, u32, u32)]) -> Vec<u32> {
+pub fn grouped_tiles(segments: &[(u32, u32, u32)], bm: usize) -> Vec<u32> {
     let mut out = Vec::new();
     for &(e, s, t) in segments {
         let mut r = s;
         while r < t {
-            let end = (r + GG_BM as u32).min(t);
+            let end = (r + bm as u32).min(t);
             out.extend_from_slice(&[e, r, end, 0]);
             r = end;
         }
@@ -602,6 +603,123 @@ pub fn blockq_gemm_grouped(
     unsafe {
         bld.launch(LaunchConfig { grid_dim: (grid, n_tiles, 1), block_dim: (GG_THREADS, 1, 1), shared_mem_bytes: 0 })
             .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemm_grouped {dtype:?}: {e:?}")))?;
+    }
+    Ok(())
+}
+
+// ──────────────────── групповой GEMM экспертов на FP8 MMA (sm_89+) ────────────────────
+
+/// Ядро FP8-варианта под формат веса и тип выхода (см. blockq_gemm_grouped_fp8.cu).
+pub struct GroupedGemmFp8Kernel {
+    _module: Arc<CudaModule>,
+    func: CudaFunction,
+    bm: usize,
+}
+
+/// Высота тайла FP8-ядра по сегментам: 128 (вдвое меньше перечитываний веса)
+/// или 64, когда сегменты мелкие (хвостовой чанк префилла, редкие эксперты) и
+/// половина тайла 128 простаивала бы.
+pub fn gg8_bm(segments: &[(u32, u32, u32)]) -> usize {
+    let (rows, segs) = segments
+        .iter()
+        .filter(|s| s.2 > s.1)
+        .fold((0u64, 0u64), |(r, n), s| (r + (s.2 - s.1) as u64, n + 1));
+    if segs > 0 && rows / segs >= 96 { 128 } else { 64 }
+}
+
+/// Динамическая smem FP8-ядра — `G8_SMEM_BYTES` из .cu: 3 стадии × (A по `bm`
+/// строк + B по 128, × 80 байт) + масштабы.
+fn gg8_smem(bm: usize) -> u32 {
+    (3 * (bm * 80 + 128 * 80) + 3 * (bm + 128) * 2 * 4) as u32
+}
+const GG8_BN: u32 = 128;
+const GG8_THREADS: u32 = 256;
+
+type Gg8Key = (usize, &'static str, bool, usize);
+static GG8_CACHE: OnceLock<Mutex<Vec<(Gg8Key, Arc<GroupedGemmFp8Kernel>)>>> = OnceLock::new();
+
+fn gg8_instantiation(suf: &str) -> Option<String> {
+    if suf == "mxfp8_syn" {
+        return Some("GG8_MX(gg8)\n".into());
+    }
+    gg_instantiation(suf).map(|s| s.replacen("GG_BLOB(gg,", "GG8_BLOB(gg8,", 1).replacen("GG_SYN(gg,", "GG8_SYN(gg8,", 1))
+}
+
+impl GroupedGemmFp8Kernel {
+    pub fn for_context(ctx: &Arc<CudaContext>, dtype: DType, bf16: bool, bm: usize) -> Result<Arc<Self>> {
+        crate::caps::DeviceCaps::for_context(ctx).require(crate::caps::Feature::Fp8Mma)?;
+        if bm != 64 && bm != 128 {
+            return Err(SynaptixError::Unsupported("grouped_gemm_fp8: высота тайла 64 или 128"));
+        }
+        let suf = entry_suffix(dtype).ok_or(SynaptixError::Unsupported("grouped_gemm_fp8: формат не квантованный вес"))?;
+        let key = (Arc::as_ptr(ctx) as usize, suf, bf16, bm);
+        let cache = GG8_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        if let Some((_, k)) = cache.lock().unwrap().iter().find(|(k, _)| *k == key) {
+            return Ok(k.clone());
+        }
+        let inst = gg8_instantiation(suf).ok_or(SynaptixError::Unsupported("grouped_gemm_fp8: нет ядра для формата"))?;
+        let src = format!(
+            "{}\n{}\n{}\n{}",
+            include_str!("../cu/elementwise/ggml_tables.cuh"),
+            include_str!("../cu/elementwise/blockq_decode.cuh"),
+            include_str!("../cu/elementwise/blockq_gemm_grouped_fp8.cu"),
+            inst
+        );
+        let bm_def = format!("-DG8_BM={bm}");
+        let mut opts: Vec<&str> = vec![&bm_def];
+        if bf16 {
+            opts.push("-DSYN_ACT_BF16");
+        }
+        let module = compile_module_with_opts(ctx, &src, "blockq_gemm_grouped_fp8.cu", &opts, None)?;
+        let func = load_fn(&module, "gg8")?;
+        func.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            gg8_smem(bm) as i32,
+        )
+        .map_err(|e| SynaptixError::Cuda(format!("grouped_gemm_fp8: лимит smem: {e:?}")))?;
+        let new = Arc::new(Self { _module: module, func, bm });
+        cache.lock().unwrap().push((key, new.clone()));
+        Ok(new)
+    }
+}
+
+/// FP8-вариант [`blockq_gemm_grouped`]: `xq`/`xs` — активация в MXFP8
+/// (natural: байты `[·, K]`, E8M0 `[·, K/32]`).
+#[allow(clippy::too_many_arguments)]
+pub fn blockq_gemm_grouped_fp8(
+    kernel: &GroupedGemmFp8Kernel,
+    stream: &Arc<CudaStream>,
+    dtype: DType,
+    w_table: &CudaView<'_, u64>,
+    s_table: &CudaView<'_, u64>,
+    tiles: &CudaSlice<u32>,
+    n_tiles: u32,
+    xq: &CudaView<'_, u8>,
+    xs: &CudaView<'_, u8>,
+    x_rows: Option<&CudaView<'_, u32>>,
+    y: &mut CudaViewMut<'_, u8>,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    if k % 32 != 0 || n % 2 != 0 {
+        return Err(SynaptixError::Unsupported("grouped_gemm_fp8: K кратно 32, N чётное"));
+    }
+    let rb = gemv_row_bytes(dtype, k as usize)?;
+    if n_tiles == 0 || n == 0 {
+        return Ok(());
+    }
+    let grid = n.div_ceil(GG8_BN);
+    let mut bld = stream.launch_builder(&kernel.func);
+    let null_rows: u64 = 0;
+    bld.arg(w_table).arg(s_table).arg(tiles).arg(xq).arg(xs);
+    match x_rows {
+        Some(r) => bld.arg(r),
+        None => bld.arg(&null_rows),
+    };
+    bld.arg(&mut *y).arg(&n).arg(&k).arg(&rb);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, n_tiles, 1), block_dim: (GG8_THREADS, 1, 1), shared_mem_bytes: gg8_smem(kernel.bm) })
+            .map_err(|e| SynaptixError::Cuda(format!("launch blockq_gemm_grouped_fp8 {dtype:?}: {e:?}")))?;
     }
     Ok(())
 }

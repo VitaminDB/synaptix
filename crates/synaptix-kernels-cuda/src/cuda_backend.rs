@@ -4379,11 +4379,13 @@ impl Backend for CudaBackend {
         dtype: DType,
         segments: &[(u32, u32, u32)],
         x: &Storage,
+        x_len: usize,
         x_rows: Option<&Storage>,
         out: (&mut Storage, &Layout),
         n: usize,
         k: usize,
         experts: usize,
+        prefer_fp8: bool,
         _stream: &Stream,
     ) -> Result<()> {
         let (out_st, out_lo) = out;
@@ -4396,15 +4398,16 @@ impl Backend for CudaBackend {
         if segments.iter().any(|(e, s, t)| *e as usize >= experts || s > t) {
             return Err(SynaptixError::Unsupported("quant_gemm_grouped: сегмент вне таблицы"));
         }
-        let tiles = crate::elementwise::blockq::grouped_tiles(segments);
-        if tiles.is_empty() {
-            return Ok(());
-        }
         let err = |what: &'static str| SynaptixError::Unsupported(what);
         let wt = w_table.as_cuda().ok_or(err("quant_gemm_grouped: таблица не на карте"))?;
         let ctx = wt.device().clone();
         let stream = synaptix_core::device::cuda::default_stream(wt.ordinal())?;
-        let kernel = crate::elementwise::blockq::GroupedGemmKernel::for_context(&ctx, dtype, bf16)?;
+        let fp8 = prefer_fp8 && crate::caps::DeviceCaps::for_context(&ctx).fp8_mma();
+        let bm = if fp8 { crate::elementwise::blockq::gg8_bm(segments) } else { crate::elementwise::blockq::GG_BM };
+        let tiles = crate::elementwise::blockq::grouped_tiles(segments, bm);
+        if tiles.is_empty() {
+            return Ok(());
+        }
         let st = s_table.as_cuda().ok_or(err("quant_gemm_grouped: масштабы таблицы не на карте"))?;
         let xb = x.as_cuda().ok_or(err("quant_gemm_grouped: активация не на карте"))?;
         let ob = out_st.as_cuda_mut().ok_or(err("quant_gemm_grouped: out не на карте"))?;
@@ -4425,6 +4428,39 @@ impl Backend for CudaBackend {
             }
             None => None,
         };
+        if fp8 {
+            // Активация — в MXFP8 один раз на строку x (до сбора по парам).
+            let kernel = crate::elementwise::blockq::GroupedGemmFp8Kernel::for_context(&ctx, dtype, bf16, bm)?;
+            let qk = if bf16 {
+                crate::elementwise::quant::Mxfp8QuantKernels::for_context_bf16(&ctx)?
+            } else {
+                crate::elementwise::quant::Mxfp8QuantKernels::for_context(&ctx)?
+            };
+            let n_el = x_len * k;
+            let x_view = unsafe { xb.slice().transmute::<half::f16>(n_el) }
+                .ok_or_else(|| SynaptixError::Cuda("quant_gemm_grouped: transmute x".into()))?;
+            let mut xq = unsafe { stream.alloc::<u8>(n_el.max(1)) }
+                .map_err(|e| SynaptixError::Cuda(format!("quant_gemm_grouped: буфер кванта: {e:?}")))?;
+            let mut xs = unsafe { stream.alloc::<u8>((n_el / 32).max(1)) }
+                .map_err(|e| SynaptixError::Cuda(format!("quant_gemm_grouped: буфер масштабов: {e:?}")))?;
+            crate::elementwise::quant::mxfp8_quant_natural(&qk, &stream, &x_view, &mut xq, &mut xs, x_len as u32, k as u32)?;
+            return crate::elementwise::blockq::blockq_gemm_grouped_fp8(
+                &kernel,
+                &stream,
+                dtype,
+                &wt_view,
+                &st_view,
+                &dev_tiles,
+                (tiles.len() / 4) as u32,
+                &xq.slice(..),
+                &xs.slice(..),
+                rows_view.as_ref(),
+                &mut ob.slice_mut().slice_mut(..),
+                n as u32,
+                k as u32,
+            );
+        }
+        let kernel = crate::elementwise::blockq::GroupedGemmKernel::for_context(&ctx, dtype, bf16)?;
         crate::elementwise::blockq::blockq_gemm_grouped(
             &kernel,
             &stream,

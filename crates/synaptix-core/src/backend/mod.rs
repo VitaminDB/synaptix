@@ -1052,7 +1052,9 @@ pub trait Backend: Send + Sync + 'static {
     /// конец)`, строки сегмента умножаются на вес своего эксперта из таблиц
     /// `w_table`/`s_table` (I64-адреса, как у [`Self::quant_gemv_indexed`]).
     /// `x_rows` (U32 `[R]`) — строка `r` берётся из `x[x_rows[r]]` (сбор
-    /// строк токенов без копии). Выход `[R, n]` в dtype `x`.
+    /// строк токенов без копии). `x_len` — строк в `x`. `prefer_fp8` — считать
+    /// на FP8 MMA (активация и вес в MXFP8, блочные масштабы в f32-сумме),
+    /// если карта умеет (sm_89+); иначе BF16/F16 MMA. Выход `[R, n]` в dtype `x`.
     #[allow(clippy::too_many_arguments)]
     fn quant_gemm_grouped(
         &self,
@@ -1061,11 +1063,13 @@ pub trait Backend: Send + Sync + 'static {
         _dtype: DType,
         _segments: &[(u32, u32, u32)],
         _x: &Storage,
+        _x_len: usize,
         _x_rows: Option<&Storage>,
         _out: (&mut Storage, &Layout),
         _n: usize,
         _k: usize,
         _experts: usize,
+        _prefer_fp8: bool,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("quant_gemm_grouped не поддержан этим backend"))

@@ -688,17 +688,19 @@ impl ExpertTable {
     /// начало, конец)`. Выход `[R, N]` в dtype `x`; строки вне сегментов не
     /// пишутся.
     pub fn gemm_grouped_dense(&self, x: &Tensor, segments: &[(u32, u32, u32)]) -> Result<Tensor> {
-        self.gemm_grouped_dense_rows(x, None, segments)
+        self.gemm_grouped_dense_rows(x, None, segments, false)
     }
 
     /// Как [`Self::gemm_grouped_dense`], но строка `r` берётся из
     /// `x[rows[r]]` (`rows` — U32 `[R]` на карте): сбор строк токенов по
-    /// парам прямо в загрузке тайла, без копии `[R, K]`.
+    /// парам прямо в загрузке тайла, без копии `[R, K]`. `prefer_fp8` — FP8
+    /// MMA с MXFP8-активацией там, где карта умеет (sm_89+).
     pub fn gemm_grouped_dense_rows(
         &self,
         x: &Tensor,
         rows: Option<&Tensor>,
         segments: &[(u32, u32, u32)],
+        prefer_fp8: bool,
     ) -> Result<Tensor> {
         use crate::backend::registry;
         use crate::stream::Stream;
@@ -734,11 +736,13 @@ impl ExpertTable {
             dtype,
             segments,
             &x_c.storage,
+            x_c.dims()[0],
             rows_c.as_ref().map(|t| &*t.storage),
             (&mut storage, &out_layout),
             self.n,
             self.k,
             self.count,
+            prefer_fp8,
             &stream,
         )?;
         Ok(Tensor::from_parts(Arc::new(storage), out_layout))

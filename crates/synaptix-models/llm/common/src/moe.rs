@@ -1650,11 +1650,13 @@ impl MoeFfn {
         let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device)
             .map_err(|e| ModelError::Forward(format!("MoE: индексы строк: {e}")))?;
         let xc = if x.is_contiguous() { x.clone() } else { x.contiguous().map_err(ferr)? };
-        let gu = stage("moe:gg_gate_up", || gate_up.gemm_grouped_dense_rows(&xc, Some(&row_idx), &segments))
+        // FP8 MMA (sm_89+): активация в MXFP8, как у нативного пути Blackwell.
+        let fp8 = !moe_fp8_off();
+        let gu = stage("moe:gg_gate_up", || gate_up.gemm_grouped_dense_rows(&xc, Some(&row_idx), &segments, fp8))
             .map_err(ferr)?;
         let h = self.swiglu(&gu)?;
         let h = if h.is_contiguous() { h } else { h.contiguous().map_err(ferr)? };
-        let parts = stage("moe:gg_down", || down.gemm_grouped_dense(&h, &segments)).map_err(ferr)?;
+        let parts = stage("moe:gg_down", || down.gemm_grouped_dense_rows(&h, None, &segments, fp8)).map_err(ferr)?;
         let parts = if parts.dtype() == self.compute { parts } else { self.to_compute(parts)? };
         self.mix_back(parts, &order, weights, t, x).map(Some)
     }
@@ -2501,6 +2503,13 @@ mod tests {
 fn moe_grouped_dense_off() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SYN_MOE_GROUPED_DENSE").as_deref() == Ok("0"))
+}
+
+/// `SYN_MOE_FP8=0` — групповой GEMM портируемой таблицы на BF16/F16 MMA даже
+/// там, где есть FP8 MMA (A/B точности и скорости).
+fn moe_fp8_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_MOE_FP8").as_deref() == Ok("0"))
 }
 
 fn moe_segmented_off() -> bool {
