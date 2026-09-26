@@ -1633,7 +1633,7 @@ impl MtpProf {
         }
         let total: f64 = self.acc.values().map(|(t, _)| t).sum();
         let mut lines: Vec<_> = self.acc.iter().collect();
-        lines.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        lines.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
         eprintln!("=== MTP loop breakdown (synced, {total:.1} ms) ===");
         for (k, (t, c)) in lines {
             eprintln!(

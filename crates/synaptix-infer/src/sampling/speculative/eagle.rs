@@ -112,7 +112,7 @@ mod tests {
             let (argmax, _) = row
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap();
             assert_eq!(argmax as u32, expected);
             let max_l = row[argmax as usize];

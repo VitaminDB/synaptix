@@ -904,7 +904,7 @@ impl MusePipeline {
                     v[r * vocab..(r + 1) * vocab]
                         .iter()
                         .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
                 })
@@ -1094,7 +1094,7 @@ impl MusePipeline {
                     let row = &v[r * vocab..(r + 1) * vocab];
                     row.iter()
                         .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
                 })
@@ -1173,7 +1173,7 @@ impl MusePipeline {
                     let row = &v[r * vocab..(r + 1) * vocab];
                     row.iter()
                         .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
                 })

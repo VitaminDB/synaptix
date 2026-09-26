@@ -119,7 +119,7 @@ pub fn frames_to_segments(
 
     // merge gaps < merge_gap_s внутри одного спикера.
     segs.sort_by(|a, b| {
-        a.speaker.cmp(&b.speaker).then(a.start_s.partial_cmp(&b.start_s).unwrap())
+        a.speaker.cmp(&b.speaker).then(a.start_s.total_cmp(&b.start_s))
     });
     let mut merged: Vec<DiarizeSegment> = Vec::new();
     for seg in segs {
@@ -145,14 +145,14 @@ pub fn frames_to_segments(
             order.push((s.speaker, s.start_s));
         }
     }
-    order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
     let remap = |old: u8| order.iter().position(|(sp, _)| *sp == old).unwrap_or(0) as u8;
     for s in &mut merged {
         s.speaker = remap(s.speaker);
     }
 
     merged.sort_by(|a, b| {
-        a.start_s.partial_cmp(&b.start_s).unwrap().then(a.speaker.cmp(&b.speaker))
+        a.start_s.total_cmp(&b.start_s).then(a.speaker.cmp(&b.speaker))
     });
     merged
 }
