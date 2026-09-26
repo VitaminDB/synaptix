@@ -2342,6 +2342,28 @@ impl DecoderModel {
     /// Готова ли модель к графовому декоду: профиль конфига плюс веса —
     /// MoE-ветка обязана уметь считаться целиком на карте (иначе внутри шага
     /// будет выгрузка на хост, а под захватом графа она нелегальна).
+    /// Годится ли модель для общего графового декода
+    /// ([`crate::generate::generate_graph_streaming_resume`]): device-путь
+    /// шага готов, счёт F16/BF16, нет linear-слоёв (их состояние гибрид
+    /// синхронизирует сам — у него свой графовый цикл). Квантованный KV,
+    /// MXFP8-голова и MXFP8-эмбеддинги графу не мешают: append/чтение KV и
+    /// gather эмбеддинга берут позицию и токен из device-буферов.
+    pub fn graph_decode_supported(&self) -> bool {
+        let no = |why: String| {
+            if trace_graph() {
+                eprintln!("[GRAPH_NO] {why}");
+            }
+            false
+        };
+        if !matches!(self.dtype, DType::F16 | DType::BF16) {
+            return no(format!("счёт {:?}", self.dtype));
+        }
+        if self.blocks.iter().any(|b| matches!(b.mixer, Mixer::Linear(_))) {
+            return no("linear-слои (у гибрида свой графовый цикл)".into());
+        }
+        self.graph_decode_ready()
+    }
+
     pub fn graph_decode_ready(&self) -> bool {
         let trace = trace_graph();
         let no = |why: &str| {
@@ -2715,11 +2737,6 @@ impl DecoderModel {
         if chunk_size == 0 {
             return Err(ModelError::Shape("make_prefill_state: chunk_size > 0".into()));
         }
-        if self.kv_dtype == DType::MXFP8 {
-            return Err(ModelError::Forward(
-                "make_prefill_state: FP8-KV не поддержан dev-путём".into(),
-            ));
-        }
         let dev = self.device;
         let input = Tensor::from_vec(vec![0u32; chunk_size], vec![1usize, chunk_size], dev).coerr()?;
         let pos_start = Tensor::from_vec(vec![0u32], vec![1usize], dev).coerr()?;
@@ -2760,9 +2777,6 @@ impl DecoderModel {
             return Err(ModelError::Forward(
                 "forward_prefill_dev: профиль не поддержан (sandwich/sliding/local-rope/hybrid)".into(),
             ));
-        }
-        if self.kv_dtype == DType::MXFP8 {
-            return Err(ModelError::Forward("forward_prefill_dev: FP8-KV не поддержан dev-путём".into()));
         }
         let chunk = state.chunk_size;
         let ids_flat = state.input.reshape(vec![chunk]).coerr()?;
@@ -3397,14 +3411,27 @@ impl FullAttn {
         let q = q.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_start, self.rotary_dim).coerr()?;
         let k = k.rope_apply_dev(&state.rope_cos, &state.rope_sin, &state.pos_start, self.rotary_dim).coerr()?;
 
-        kvl.k.kv_append_dev(&k, &state.pos_start).coerr()?;
-        kvl.v.kv_append_dev(&v, &state.pos_start).coerr()?;
-        // Prefill (Tq>1) → FA-4 device-resident-Tkv (Q-тайлы по BM=16, WMMA m16n8k16).
-        // `flash_attention_dev` (= flash_decode_split) — decode-only: split по KV, без
-        // Q-тайлинга → ~4× медленнее на Tq=256. Здесь нужен именно prefill-вариант.
-        let attn = q
-            .flash_attention_prefill_dev(&kvl.k, &kvl.v, &state.tcache_dev, self.attn_scale, true)
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let attn = if kvl.k.dtype() == DType::MXFP8 {
+            // Квантованный KV (MTP-verify гибрида, чанк 2..8): квант-append
+            // по device-позиции и flash-ядро MXFP8 с device-длиной — v2 для
+            // Tq ≤ 8, скалярный split-K для длиннее.
+            let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kvl;
+            let (Some(ksc), Some(vsc)) = (ksc.as_mut(), vsc.as_mut()) else {
+                return Err(ModelError::Forward("MXFP8-KV без масштабов".into()));
+            };
+            kc.kv_append_quant_mxfp8_dev(ksc, &k, &state.pos_start).coerr()?;
+            vc.kv_append_quant_mxfp8_dev(vsc, &v, &state.pos_start).coerr()?;
+            q.flash_attention_mxfp8kv_dev(kc, vc, ksc, vsc, &state.tcache_dev, self.attn_scale, true)
+                .map_err(|e| ModelError::Forward(e.to_string()))?
+        } else {
+            kvl.k.kv_append_dev(&k, &state.pos_start).coerr()?;
+            kvl.v.kv_append_dev(&v, &state.pos_start).coerr()?;
+            // Prefill (Tq>1) → FA-4 device-resident-Tkv (Q-тайлы по BM=16, WMMA m16n8k16).
+            // `flash_attention_dev` (= flash_decode_split) — decode-only: split по KV, без
+            // Q-тайлинга → ~4× медленнее на Tq=256. Здесь нужен именно prefill-вариант.
+            q.flash_attention_prefill_dev(&kvl.k, &kvl.v, &state.tcache_dev, self.attn_scale, true)
+                .map_err(|e| ModelError::Forward(e.to_string()))?
+        };
         let attn = attn.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
         let attn = match gate {
             Some(g) => attn.mul(&g.sigmoid().coerr()?).coerr()?,

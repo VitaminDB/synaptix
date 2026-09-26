@@ -1226,15 +1226,11 @@ impl MusePipeline {
         Ok(stats)
     }
 
+    /// MXFP8-KV, -голова и -эмбеддинги графу не мешают (позиция и токен шага
+    /// в device-буферах); частичный оффлоад мешает — адреса весов меняются
+    /// каждый ход (`graph_decode_ready`).
     pub fn graph_decode_supported(&self) -> bool {
-        matches!(self.model.device, Device::Cuda(_))
-            && matches!(self.model.dtype, DType::F16 | DType::BF16)
-            && self.model.kv_dtype != DType::MXFP8
-            && !self.model.has_mxfp8_head_or_embed()
-            // Частичный оффлоад: адреса весов меняются каждый ход, граф их
-            // захватить не может.
-            && self.model.blocks_all_resident()
-            && !self.model.embed_on_host()
+        self.model.graph_decode_supported()
     }
 
     pub fn generate_with_graph_streaming(

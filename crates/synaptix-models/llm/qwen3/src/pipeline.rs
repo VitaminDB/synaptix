@@ -158,13 +158,14 @@ impl Qwen3Pipeline {
         Ok((text, stats))
     }
 
-    /// CUDA-graph decode (P6.3): тело single-token forward'а захватывается в один
-    /// `CudaGraph` и реплеится на каждом шаге — устраняет launch-overhead десятков
-    /// мелких ядер/токен (главный лимит decode, см. session 12 Phase 2). Prefill —
-    /// обычный батч-forward; затем warmup-шаги (праймят pool/кеши), capture одного
-    /// `forward_decode_dev`, и replay-loop (обновить device-буферы → launch → dtoh
-    /// logits → host-sample). Greedy совпадает с [`Self::generate`] (с точностью до
-    /// F16-rope-таблиц). Требует CUDA-устройство и не-FP8 KV.
+    /// Годится ли модель для графового декода (см.
+    /// [`synaptix_llm_common::DecoderModel::graph_decode_supported`]).
+    pub fn graph_decode_supported(&self) -> bool {
+        self.model.graph_decode_supported()
+    }
+
+    /// CUDA-graph decode: шаг захватывается в граф и реплеится — без
+    /// launch-overhead десятков мелких ядер на токен. Работает и с MXFP8-KV.
     pub fn generate_with_graph(
         &self,
         prompt_ids: &[u32],
@@ -188,8 +189,8 @@ impl Qwen3Pipeline {
         self.generate_with_graph_resume(&mut kv, prompt_ids, gen_cfg, sink)
     }
 
-    /// Как [`Self::generate_with_graph_streaming`], но prefill стартует с `kv.seq_len`
-    /// (prefix-KV-кэш) — `kv` переиспользуется между ходами чата.
+    /// Как [`Self::generate_with_graph_streaming`], но префилл стартует с
+    /// `kv.seq_len` (префикс-KV) — `kv` переиспользуется между ходами чата.
     pub fn generate_with_graph_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -197,128 +198,9 @@ impl Qwen3Pipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        use synaptix_core::grad::no_grad;
-        use synaptix_infer::graph_capture::GraphCapturer;
-        use synaptix_infer::InferError;
-
-        if prompt_ids.is_empty() {
-            return Err(PipelineError::Tokenize("empty prompt".into()));
-        }
         let gen_cfg = self.cfg_with_eos(gen_cfg);
-        let eos = synaptix_llm_common::generate::eos_set(&gen_cfg);
-        let mut sampler = synaptix_llm_common::generate::TokenSampler::new(&gen_cfg, prompt_ids);
-        let device = self.model.device;
-        let ord = match device {
-            Device::Cuda(o) => o,
-            _ => return Err(PipelineError::Forward("generate_with_graph requires CUDA device".into())),
-        };
-        let l = prompt_ids.len();
-        let prefix = kv.seq_len.min(l.saturating_sub(1));
-        kv.seq_len = prefix;
-
-        // Prefill хвоста prompt_ids[prefix..] чанками — ограничивает пик памяти
-        // активаций/attn на длинном промпте (KV переносится между чанками в `kv`).
-        // Каждый chunk идёт через `model.forward` (FA-prefill: FA-4 на sm_120,
-        // Q-тайлы 16-64 ток × тензор-коры). Per-chunk host-loop одноразовый и не
-        // оправдывает CUDA-graph capture (device-резидентный replay на chunk=256
-        // оказался ~4× медленнее baseline forward + ~400 мс capture-overhead).
-        let suffix = &prompt_ids[prefix..];
-        let chunk = if gen_cfg.prefill_batch > 0 { gen_cfg.prefill_batch } else { 256 };
-        let t0 = std::time::Instant::now();
-        let mut logits_opt: Option<Tensor> = None;
-        let mut off = 0usize;
-        while off < suffix.len() {
-            // Stop посреди длинного префилла: между чанками, а не только
-            // после первого токена (на 100k+ токенов префилл идёт минутами).
-            if sink.interrupted() {
-                return Err(PipelineError::Forward(synaptix_llm_common::INTERRUPTED.into()));
-            }
-            let end = (off + chunk).min(suffix.len());
-            let part = Tensor::from_vec(suffix[off..end].to_vec(), vec![1usize, end - off], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let lg = no_grad(|| self.model.forward(&part, kv))
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            logits_opt = Some(lg);
-            off = end;
-        }
-        let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill suffix".into()))?;
-        let prefill_ms = t0.elapsed().as_millis();
-
-        let mut out: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-        let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
-        out.push(tok0);
-        let mut cancelled = !sink.on_token(tok0);
-
-        // DecodeState: вход = tok0, позиция = L (warmup/capture идемпотентны на slot L).
-        let mut state = self
-            .model
-            .make_decode_state()
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        state.update(tok0, l as u32).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)
-            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
-        let mut capturer = GraphCapturer::new(3);
-
-        let dec_t0 = std::time::Instant::now();
-        let graph = {
-            let model = &self.model;
-            let state_ref = &mut state;
-            let kv_ref = &mut *kv;
-            no_grad(|| {
-                capturer.capture_with(&stream, |_s| {
-                    model
-                        .forward_decode_dev(state_ref, kv_ref)
-                        .map_err(|e| InferError::Other(e.to_string()))
-                })
-            })
-        }
-        .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
-        let _ = graph.upload();
-
-        // Capture-шаг уже посчитал logits для предсказания out[1] (вход tok0 @ pos L).
-        if !cancelled && out.len() < gen_cfg.max_new_tokens && !eos.contains(&tok0) {
-            let tok1 = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok1);
-            cancelled = !sink.on_token(tok1);
-        }
-        // Replay loop: обрабатываем out[len-1] на позиции L+len-1, получаем следующий.
-        while !cancelled && out.len() < gen_cfg.max_new_tokens {
-            let last = *out.last().unwrap();
-            if eos.contains(&last) {
-                break;
-            }
-            let pos = (l + out.len() - 1) as u32;
-            if (pos as usize) >= kv.max_seq {
-                break;
-            }
-            // update (htod) и launch — на одном stream'е (default_stream), порядок
-            // гарантирован → pre-launch sync не нужен. post-launch sync обязателен:
-            // запись logits графом НЕ event-tracked (capture с выкл. tracking), поэтому
-            // host-dtoh в sample обогнал бы граф без явного барьера.
-            state.update(last, pos).map_err(|e| PipelineError::Forward(e.to_string()))?;
-            graph
-                .launch()
-                .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
-            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok);
-            cancelled = !sink.on_token(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-
-        // Host-реконсиляция длины KV: записаны slots [0, L + out.len() - 1)
-        // (prompt + все токены кроме последнего, ещё не обработанного).
-        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
-
-        let stats = GenerationStats {
-            prompt_tokens: l,
-            new_tokens: out.len(),
-            prefill_ms,
-            decode_ms,
-        };
-        Ok((out, stats))
+        synaptix_llm_common::generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &gen_cfg, sink)
+            .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 }
 

@@ -359,6 +359,48 @@ impl GemmaPipeline {
             .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 
+    /// Годится ли модель для графового декода (sliding-слои идут через
+    /// ring-KV, позиция кольца — в device-буферах шага).
+    pub fn graph_decode_supported(&self) -> bool {
+        self.model.graph_decode_supported()
+    }
+
+    /// Как [`Self::generate_streaming`], но шаг декода — CUDA-граф.
+    pub fn generate_with_graph_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let prompt = self.maybe_prepend_bos(prompt_ids);
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt.len() + gen_cfg.max_new_tokens);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_graph_resume(&mut kv, &prompt, gen_cfg, sink)
+    }
+
+    /// Как [`Self::generate_streaming_resume`], но шаг декода — CUDA-граф.
+    pub fn generate_with_graph_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+
     pub fn generate_text(
         &self,
         prompt: &str,

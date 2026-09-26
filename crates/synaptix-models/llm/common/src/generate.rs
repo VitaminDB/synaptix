@@ -333,6 +333,153 @@ pub fn generate_streaming_resume(
     Ok((out, stats))
 }
 
+/// Как [`generate_streaming_resume`], но шаг декода захватывается CUDA-графом
+/// и дальше только реплеится: десятки мелких запусков ядер на токен
+/// сливаются в один. Префилл — обычный чанками. Позиция и токен шага живут в
+/// device-буферах [`crate::model::DecodeState`], поэтому граф годится и для
+/// квантованного (MXFP8) KV: append и flash-декод читают длину оттуда же, а
+/// число сплитов считается от ёмкости кэша, не от текущей длины.
+///
+/// Требует [`DecoderModel::graph_decode_supported`]; иначе — ошибка, и
+/// вызывающий идёт обычным путём.
+pub fn generate_graph_streaming_resume(
+    model: &DecoderModel,
+    kv: &mut KvCache,
+    prompt_ids: &[u32],
+    cfg: &GenerationConfig,
+    sink: &mut dyn StreamSink,
+) -> Result<(Vec<u32>, GenerationStats), ModelError> {
+    use synaptix_core::device::Device;
+    use synaptix_infer::graph_capture::GraphCapturer;
+    use synaptix_infer::InferError;
+
+    if prompt_ids.is_empty() {
+        return Err(ModelError::Forward("empty prompt".into()));
+    }
+    let ord = match model.device {
+        Device::Cuda(o) => o,
+        _ => return Err(ModelError::Forward("graph decode: нужна CUDA".into())),
+    };
+    if !model.graph_decode_supported() {
+        return Err(ModelError::Forward("graph decode: профиль модели не поддержан".into()));
+    }
+    let device = model.device;
+    let prompt_len = prompt_ids.len();
+    let prefix = kv.seq_len.min(prompt_len.saturating_sub(1));
+    kv.seq_len = prefix;
+
+    let eos = eos_set(cfg);
+    let mut sampler = TokenSampler::new(cfg, prompt_ids);
+    let chunk = if cfg.prefill_batch == 0 { prompt_len } else { cfg.prefill_batch.max(1) };
+    let chunk = match model.max_prefill_chunk() {
+        Some(cap) => chunk.min(cap),
+        None => chunk,
+    };
+    model.fit_expert_cache(chunk.min(prompt_len - prefix));
+    let t0 = Instant::now();
+    let mut last_logits: Option<Tensor> = None;
+    let mut off = prefix;
+    while off < prompt_len {
+        if sink.interrupted() {
+            return Err(ModelError::Forward(INTERRUPTED.into()));
+        }
+        let end = (off + chunk).min(prompt_len);
+        let slice = &prompt_ids[off..end];
+        let t = Tensor::from_vec(slice.to_vec(), vec![1usize, slice.len()], device)
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        last_logits = Some(no_grad(|| model.forward(&t, &mut *kv))?);
+        off = end;
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+    let logits = last_logits.expect("prompt non-empty checked above");
+
+    let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+    if cfg.max_new_tokens == 0 {
+        let stats = GenerationStats { prompt_tokens: prompt_len, new_tokens: 0, prefill_ms, decode_ms: 0 };
+        return Ok((out, stats));
+    }
+    let tok0 = sampler.sample(&logits)?;
+    out.push(tok0);
+    let mut cancelled = !sink.on_token(tok0);
+    let finish = |out: &Vec<u32>, kv: &mut KvCache, decode_ms: u128| {
+        // Записаны позиции [0, L + out.len() - 1): промпт и все токены, кроме
+        // последнего — его ещё никто не обработал.
+        kv.seq_len = (prompt_len + out.len() - 1).min(kv.max_seq);
+        GenerationStats { prompt_tokens: prompt_len, new_tokens: out.len(), prefill_ms, decode_ms }
+    };
+    if cancelled || out.len() >= cfg.max_new_tokens || eos.contains(&tok0) {
+        let stats = finish(&out, kv, 0);
+        return Ok((out, stats));
+    }
+
+    model.fit_expert_cache(1);
+    let mut state = model.make_decode_state()?;
+    // Кольцевой KV sliding-слоёв: окно сдвигает хост ДО запуска графа, в граф
+    // уходят уже device-резидентные позиция и длина кольца.
+    let start0 = model.ring_prepare_decode(kv, prompt_len)?;
+    state.update_ring(tok0, prompt_len as u32, start0 as u32)?;
+    let stream = synaptix_core::device::cuda::default_stream(ord)
+        .map_err(|e| ModelError::Forward(format!("stream: {e}")))?;
+    let dec_t0 = Instant::now();
+    // Прогрев (3 прогона) и захват идемпотентны: все пишут слот L тем же tok0.
+    let mut capturer = GraphCapturer::new(3);
+    let graph = {
+        let state_ref = &mut state;
+        let kv_ref = &mut *kv;
+        no_grad(|| {
+            capturer.capture_with(&stream, |_s| {
+                model
+                    .forward_decode_dev(state_ref, kv_ref)
+                    .map_err(|e| InferError::Other(e.to_string()))
+            })
+        })
+    }
+    .map_err(|e| ModelError::Forward(format!("graph capture: {e}")))?;
+    let _ = graph.upload();
+
+    // Захваченный шаг уже посчитал логиты следующего токена (вход tok0 @ L).
+    let tok1 = sampler.sample(&state.logits)?;
+    out.push(tok1);
+    cancelled = !sink.on_token(tok1);
+    while !cancelled && out.len() < cfg.max_new_tokens {
+        let last = *out.last().unwrap();
+        if eos.contains(&last) {
+            break;
+        }
+        let pos = (prompt_len + out.len() - 1) as u32;
+        if (pos as usize) >= kv.max_seq {
+            break;
+        }
+        let start = model.ring_prepare_decode(kv, pos as usize)?;
+        state.update_ring(last, pos, start as u32)?;
+        graph
+            .launch()
+            .map_err(|e| ModelError::Forward(format!("graph launch: {e:?}")))?;
+        // Запись логитов графом не отслеживается событиями — без барьера
+        // чтение на хост обогнало бы реплей.
+        stream
+            .synchronize()
+            .map_err(|e| ModelError::Forward(format!("sync post-launch: {e:?}")))?;
+        let tok = sampler.sample(&state.logits)?;
+        out.push(tok);
+        cancelled = !sink.on_token(tok);
+    }
+    let stats = finish(&out, kv, dec_t0.elapsed().as_millis());
+    Ok((out, stats))
+}
+
+/// [`generate_graph_streaming_resume`] со свежим кэшем.
+pub fn generate_graph_streaming(
+    model: &DecoderModel,
+    prompt_ids: &[u32],
+    cfg: &GenerationConfig,
+    sink: &mut dyn StreamSink,
+) -> Result<(Vec<u32>, GenerationStats), ModelError> {
+    let kv_max = cfg.max_seq.unwrap_or(prompt_ids.len() + cfg.max_new_tokens);
+    let mut kv = model.make_kv_cache(1, kv_max)?;
+    generate_graph_streaming_resume(model, &mut kv, prompt_ids, cfg, sink)
+}
+
 fn build_logit_pipeline(cfg: &GenerationConfig) -> LogitPipeline {
     let mut p = LogitPipeline::new();
     if cfg.repetition_penalty != 1.0 {

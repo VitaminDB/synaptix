@@ -574,15 +574,11 @@ impl Gemma4Pipeline {
     ///
     /// Про KV спрашиваем не политику, а ФАКТ: у Gemma-4 квантованный кэш не
     /// достаётся ни одному слою (sliding отсекает окно, global — голова 512),
-    /// поэтому профиль с `kv = mxfp8` графу не мешает. Голова в MXFP8 тоже не
-    /// мешает: её скретчи прогреваются тремя прогонами до захвата. А вот
-    /// MXFP8-таблица эмбеддингов ходит своим ядром — с ней граф не берём.
+    /// поэтому профиль с `kv = mxfp8` графу не мешает. Голова и таблица
+    /// эмбеддингов в MXFP8 тоже: скретчи головы прогреваются до захвата, а
+    /// gather читает токен из device-буфера шага.
     pub fn graph_decode_supported(&self) -> bool {
-        matches!(self.model.device, Device::Cuda(_))
-            && matches!(self.model.dtype, DType::F16 | DType::BF16)
-            && self.model.kv_all_dense()
-            && !self.model.has_mxfp8_embed()
-            && self.model.graph_decode_ready()
+        self.model.graph_decode_supported()
     }
 
     pub fn generate_with_graph_streaming(

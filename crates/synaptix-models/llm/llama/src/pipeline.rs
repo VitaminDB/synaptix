@@ -251,105 +251,60 @@ impl LlamaPipeline {
         Ok((text, stats))
     }
 
-    /// CUDA-graph decode (зеркально qwen3): тело single-token forward'а
-    /// захватывается в `CudaGraph` и реплеится — устраняет launch-overhead. Prefill —
-    /// обычный батч-forward. Требует CUDA-устройство и не-FP8 KV.
+    /// CUDA-graph decode: шаг захватывается и реплеится (общий цикл
+    /// `generate_graph_streaming_resume`, в т.ч. с MXFP8-KV).
     pub fn generate_with_graph(
         &self,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        use synaptix_core::grad::no_grad;
-        use synaptix_infer::graph_capture::GraphCapturer;
-        use synaptix_infer::InferError;
-
-        if prompt_ids.is_empty() {
-            return Err(PipelineError::Tokenize("empty prompt".into()));
-        }
-        let eos = self.eos_set(gen_cfg.eos_token_id);
-        let device = self.model.device;
-        let ord = match device {
-            Device::Cuda(o) => o,
-            _ => return Err(PipelineError::Forward("generate_with_graph requires CUDA device".into())),
+        let cfg = synaptix_llm_common::GenerationConfig {
+            max_new_tokens: gen_cfg.max_new_tokens,
+            temperature: gen_cfg.temperature,
+            seed: gen_cfg.seed,
+            eos_token_id: gen_cfg.eos_token_id,
+            max_seq: gen_cfg.max_seq,
+            ..Default::default()
         };
-        let l = prompt_ids.len();
-        let kv_max = gen_cfg.max_seq.unwrap_or(l + gen_cfg.max_new_tokens);
+        let mut noop = |_: u32| true;
+        self.generate_with_graph_streaming(prompt_ids, cfg, &mut noop)
+    }
+
+    /// Годится ли модель для графового декода.
+    pub fn graph_decode_supported(&self) -> bool {
+        self.model.graph_decode_supported()
+    }
+
+    /// Графовый декод со свежим кэшем.
+    pub fn generate_with_graph_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
         let mut kv = self
             .model
             .make_kv_cache(1, kv_max)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let mut rng_state = gen_cfg.seed;
+        self.generate_with_graph_resume(&mut kv, prompt_ids, gen_cfg, sink)
+    }
 
-        let prompt_tensor = Tensor::from_vec(prompt_ids.to_vec(), vec![1usize, l], device)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let t0 = std::time::Instant::now();
-        let logits = no_grad(|| self.model.forward(&prompt_tensor, &mut kv))
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let prefill_ms = t0.elapsed().as_millis();
-
-        let mut out: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-        let tok0 = sample_logits(&logits, gen_cfg.temperature, &mut rng_state)?;
-        out.push(tok0);
-
-        let mut state = self
-            .model
-            .make_decode_state()
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        state.update(tok0, l as u32).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)
-            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
-        let mut capturer = GraphCapturer::new(3);
-
-        let dec_t0 = std::time::Instant::now();
-        let graph = {
-            let model = &self.model;
-            let state_ref = &mut state;
-            let kv_ref = &mut kv;
-            no_grad(|| {
-                capturer.capture_with(&stream, |_s| {
-                    model
-                        .forward_decode_dev(state_ref, kv_ref)
-                        .map_err(|e| InferError::Other(e.to_string()))
-                })
-            })
+    /// Как [`Self::generate_streaming_resume`], но шаг декода — CUDA-граф.
+    pub fn generate_with_graph_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
         }
-        .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
-        let _ = graph.upload();
-
-        if out.len() < gen_cfg.max_new_tokens && !eos.contains(&tok0) {
-            let tok1 = sample_logits(&state.logits, gen_cfg.temperature, &mut rng_state)?;
-            out.push(tok1);
-        }
-        while out.len() < gen_cfg.max_new_tokens {
-            let last = *out.last().unwrap();
-            if eos.contains(&last) {
-                break;
-            }
-            let pos = (l + out.len() - 1) as u32;
-            if (pos as usize) >= kv.max_seq {
-                break;
-            }
-            state.update(last, pos).map_err(|e| PipelineError::Forward(e.to_string()))?;
-            graph
-                .launch()
-                .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
-            let tok = sample_logits(&state.logits, gen_cfg.temperature, &mut rng_state)?;
-            out.push(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-
-        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
-
-        let stats = GenerationStats {
-            prompt_tokens: l,
-            new_tokens: out.len(),
-            prefill_ms,
-            decode_ms,
-        };
-        Ok((out, stats))
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 }
 

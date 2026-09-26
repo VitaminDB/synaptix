@@ -300,8 +300,8 @@ pub struct OptimalProfile {
 /// два блока из 64 и потерял 32 → 20 ток/с, хотя при 33 КБ/ток тот же ход
 /// влезал с запасом в семь блоков. Послойно движок сам оставляет плотный
 /// кэш там, где квантованный читать нечем (sliding-слои, head_dim не кратен
-/// 32 — см. `DecoderModel::layer_kv_mxfp8`), а CUDA-графы при квантованном
-/// кэше пайплайны не захватывают (`graph_decode_supported`).
+/// 32 — см. `DecoderModel::layer_kv_mxfp8`). CUDA-граф декода квантованный
+/// кэш не выключает (`generate_graph_streaming_resume`).
 ///
 /// У Qwen4Exp квантованный KV ещё и быстрее: ядро по таблице блоков читает
 /// его напрямую, отчего QSA на длинном промпте почти на треть быстрее.
@@ -383,11 +383,18 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
         policy.kv_dtype = KvDtypePolicy::BF16;
     }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
-    // Графовый декод у Gemma-4: шаг захватывается целиком, включая MoE —
-    // роутер, top-k и выбор экспертов считаются на карте. Даёт около +15 % к
-    // декоду (97 против 85 ток/с на 5090 Laptop). У остальных архитектур он
-    // по-прежнему выключен: там его гасит квантованный KV.
-    let graph_decode = matches!(arch, Some(LlmArch::Gemma4));
+    // Графовый декод: шаг захватывается целиком, квантованный KV, MXFP8-голова
+    // и -эмбеддинги ему не мешают (позиция и токен шага в device-буферах).
+    // Замеры 26.09.2026 на 5090 Laptop, MXFP8-KV: Gemma-4 +83 % (108 → 199
+    // ток/с), Qwen3-0.6B +4…7 %, Gemma-3-1B +5 %, Llama-3.2-1B +1 %,
+    // Muse-Glimmer 0 %. Но граф захватывается заново на каждом ходу (Gemma-4
+    // ~360 мс, Qwen3-0.6B ~100 мс), поэтому по умолчанию он там, где выигрыш
+    // это окупает; Llama/Muse — по тумблеру в настройках модели. Гибриду
+    // обычный граф вреден (−3…5 %: его linear-ядра на device-пути медленнее)
+    // — у него свой MTP-граф, от этого флага не зависящий (+11 % на greedy).
+    // Пайплайн сам откажется там, где граф невозможен (частичный оффлоад, MoE
+    // без device-пути).
+    let graph_decode = matches!(arch, Some(LlmArch::Gemma4) | Some(LlmArch::Qwen3) | Some(LlmArch::Gemma3));
     OptimalProfile {
         policy,
         graph_decode,
@@ -730,10 +737,17 @@ impl LlmPipeline {
         sink: &mut dyn StreamSink,
     ) -> Result<(), LlmError> {
         match self {
-            LlmPipeline::Qwen3(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Qwen3(p) => {
+                if graph_decode_enabled() && p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             LlmPipeline::Qwen4Exp(p) => p
                 .generate_streaming(prompt_ids, cfg, sink)
                 .map(|_| ())
@@ -751,7 +765,7 @@ impl LlmPipeline {
                         .map(|_| ())
                         .map_err(|e| LlmError(e.to_string()));
                 }
-                if p.graph_decode_supported() {
+                if graph_decode_enabled() && p.graph_decode_supported() {
                     return p
                         .generate_with_graph_streaming(prompt_ids, cfg, sink)
                         .map(|_| ())
@@ -784,10 +798,17 @@ impl LlmPipeline {
             // сэмплером (до 11.09.2026 гоняли eager `generate` и прокручивали
             // id через sink, без top_k/top_p/штрафов). Тем же путём идёт и
             // ход с префикс-KV — чтобы ход с кэшем и без совпадали.
-            LlmPipeline::Llama(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Llama(p) => {
+                if graph_decode_enabled() && p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             // У Gemma-4 стрим нативный: общий декодер умеет token-by-token.
             // Шаг декода захватывается CUDA-графом, когда профиль позволяет:
             // MoE считается целиком на карте, поэтому выгрузок внутри шага нет.
@@ -802,10 +823,17 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
-            LlmPipeline::Gemma3(p) => p
-                .generate_streaming(prompt_ids, cfg, sink)
-                .map(|_| ())
-                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Gemma3(p) => {
+                if graph_decode_enabled() && p.graph_decode_supported() {
+                    return p
+                        .generate_with_graph_streaming(prompt_ids, cfg, sink)
+                        .map(|_| ())
+                        .map_err(|e| LlmError(e.to_string()));
+                }
+                p.generate_streaming(prompt_ids, cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
         }
     }
 }
@@ -1911,7 +1939,7 @@ impl<'a> LlmGeneration<'a> {
                     && matches!(p.model.device, synaptix_core::device::Device::Cuda(_))
                 {
                     p.generate_lookup_resume(kv, &ids, cfg, &mut sink).map(|_| ())
-                } else if p.graph_decode_supported() {
+                } else if graph_decode_enabled() && p.graph_decode_supported() {
                     p.generate_with_graph_resume(kv, &ids, cfg, &mut sink).map(|_| ())
                 } else {
                     p.generate_streaming_resume(kv, &ids, cfg, &mut sink).map(|_| ())
@@ -1981,11 +2009,13 @@ impl<'a> LlmGeneration<'a> {
                 } else {
                     session.reset_for_full();
                 }
-                // Путь декода — как в `generate_streaming`: обычный стрим
-                // общего декодера.
-                let res = p
-                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
-                    .map(|_| ());
+                // Путь декода — как в `generate_streaming`: граф, если можно.
+                let res = if graph_decode_enabled() && p.graph_decode_supported() {
+                    p.generate_with_graph_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                } else {
+                    p.generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                }
+                .map(|_| ());
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
@@ -2005,9 +2035,12 @@ impl<'a> LlmGeneration<'a> {
                 } else {
                     session.reset_for_full();
                 }
-                let res = p
-                    .generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
-                    .map(|_| ());
+                let res = if graph_decode_enabled() && p.graph_decode_supported() {
+                    p.generate_with_graph_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                } else {
+                    p.generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink)
+                }
+                .map(|_| ());
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.
@@ -2030,9 +2063,12 @@ impl<'a> LlmGeneration<'a> {
                 } else {
                     session.reset_for_full();
                 }
-                let res = p
-                    .generate_streaming_resume(&mut session.kv, &ids, cfg, &mut sink)
-                    .map(|_| ());
+                let res = if graph_decode_enabled() && p.graph_decode_supported() {
+                    p.generate_with_graph_resume(&mut session.kv, &ids, cfg, &mut sink)
+                } else {
+                    p.generate_streaming_resume(&mut session.kv, &ids, cfg, &mut sink)
+                }
+                .map(|_| ());
                 // Точка возврата — только после успешного хода: при ошибке посреди
                 // префилла KV дописан не до конца, и следующий ход, решив, что
                 // промпт в кэше, читал бы недописанные строки.

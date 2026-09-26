@@ -290,8 +290,8 @@ impl HybridPipeline {
     pub fn graph_decode_supported(&self) -> bool {
         matches!(self.model.device, Device::Cuda(_))
             && self.model.dtype == DType::F16
-            && self.model.kv_dtype != DType::MXFP8
-            && !self.model.has_mxfp8_head_or_embed()
+            // MXFP8-KV/голова/эмбеддинги графу не мешают: append, flash-декод
+            // и gather берут позицию и токен из device-буферов шага.
             // При частичном оффлоаде блоки приезжают с хоста каждый ход, и
             // адреса их весов меняются — захваченный граф ссылался бы на
             // освобождённую память.
@@ -300,16 +300,12 @@ impl HybridPipeline {
     }
 
     /// Захватывать ли MTP-шаг в CUDA-граф. Та же арифметика, что у
-    /// [`Self::graph_decode_supported`], без требования F16-compute. Граф
-    /// строится на `make_prefill_state`, а тот не умеет квантованный KV —
-    /// с MXFP8-кэшем (политика по умолчанию с 07.09.2026) попытка захвата
-    /// роняла бы ход ошибкой «FP8-KV не поддержан dev-путём» вместо того,
-    /// чтобы тихо идти обычным путём.
+    /// [`Self::graph_decode_supported`], без требования F16-compute.
+    /// Квантованный KV (политика по умолчанию с 07.09.2026) и MXFP8-голова
+    /// графу не мешают: `forward_prefill_dev` пишет и читает MXFP8-кэш по
+    /// device-позиции (+11 % к декоду qwen3.8-27b: 41 против 37 ток/с).
     fn mtp_graph_supported(&self) -> bool {
-        !self.model.has_mxfp8_head_or_embed()
-            && self.model.kv_dtype != DType::MXFP8
-            && self.model.blocks_all_resident()
-            && !self.model.embed_on_host()
+        self.model.blocks_all_resident() && !self.model.embed_on_host()
     }
 
 
