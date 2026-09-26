@@ -122,6 +122,66 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         "gemma4" | "gemma4_text" => LlmArch::Gemma4,
         "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,
         "qwen4_exp" | "qwen4_exp_text" => LlmArch::Qwen4Exp,
+        _ if has_moe_experts(path) => {
+            return Err(format!(
+                "{key}: MoE-вариант этой архитектуры движок пока не исполняет (плотный Qwen3-путь не знает экспертов)"
+            ))
+        }
         _ => LlmArch::Qwen3,
     })
+}
+
+/// Плотный путь Qwen3 молча загрузил бы MoE-модель (`qwen3_moe`, `qwen2_moe`,
+/// `mixtral`…) без экспертов и упал бы на весах или выдал мусор.
+fn has_moe_experts(path: &Path) -> bool {
+    let Some(bytes) = read_model_file(path, "config.json") else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let v = v.get("text_config").unwrap_or(&v);
+    ["num_experts", "num_local_experts", "n_routed_experts"]
+        .iter()
+        .any(|k| v.get(*k).and_then(|x| x.as_u64()).is_some_and(|n| n > 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_dir(tag: &str, config: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("synaptix-arch-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        dir
+    }
+
+    #[test]
+    fn moe_config_on_dense_path_is_refused() {
+        let moe = model_dir("moe", r#"{"model_type": "qwen3_moe", "num_experts": 128}"#);
+        assert!(detect_llm_arch(&moe).unwrap_err().contains("qwen3_moe"));
+        let dense = model_dir("dense", r#"{"model_type": "qwen3", "num_experts": 0}"#);
+        assert_eq!(detect_llm_arch(&dense).unwrap(), LlmArch::Qwen3);
+        let _ = std::fs::remove_dir_all(moe);
+        let _ = std::fs::remove_dir_all(dense);
+    }
+
+    #[test]
+    fn unknown_rope_scaling_caps_max_seq() {
+        let d = model_dir(
+            "rope",
+            r#"{"max_position_embeddings": 131072,
+                "rope_scaling": {"type": "longrope", "original_max_position_embeddings": 4096}}"#,
+        );
+        assert_eq!(config_max_seq(&d), Some(4096));
+        let y = model_dir(
+            "yarn",
+            r#"{"max_position_embeddings": 131072,
+                "rope_scaling": {"rope_type": "yarn", "original_max_position_embeddings": 32768}}"#,
+        );
+        assert_eq!(config_max_seq(&y), Some(131072));
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(y);
+    }
 }

@@ -14,9 +14,10 @@ use crate::error::{GgufError, Result};
 use crate::plan::ConversionPlan;
 use crate::reader::GgufFile;
 
-/// Архитектуры, для которых есть маппер. `qwen3moe` и `qwen3next` читаются и
-/// конвертируются, но движок их пока не исполняет (нет MoE-ветки Qwen).
-pub const SUPPORTED: &[&str] = &["llama", "qwen2", "qwen3", "qwen3moe", "qwen35", "gemma3", "gemma4"];
+/// Архитектуры, которые движок исполняет из GGUF. `qwen3moe` маппер
+/// конвертирует (`dense::build_plan`), но исполнять его нечем — плотный
+/// путь Qwen3 без MoE-ветки, фасад отказывает (`detect_llm_arch`).
+pub const SUPPORTED: &[&str] = &["llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4"];
 
 pub fn is_supported(arch: &str) -> bool {
     SUPPORTED.contains(&arch)
