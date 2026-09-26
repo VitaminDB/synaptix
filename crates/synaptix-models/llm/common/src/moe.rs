@@ -1607,7 +1607,7 @@ impl MoeFfn {
                 return Ok(None);
             }
         }
-        if std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0") {
+        if moe_segmented_off() {
             return Ok(None);
         }
         // Групповой GEMM и пред-квантованные активации — только на FP4 MMA;
@@ -2399,4 +2399,10 @@ mod tests {
         drop(cache);
         expert_arena::release_empty(0);
     }
+}
+
+/// `SYN_MOE_SEGMENTED=0` — читается один раз (проверка на каждом MoE-слое).
+fn moe_segmented_off() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0"))
 }

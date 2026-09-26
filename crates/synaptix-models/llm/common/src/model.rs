@@ -2343,7 +2343,7 @@ impl DecoderModel {
     /// MoE-ветка обязана уметь считаться целиком на карте (иначе внутри шага
     /// будет выгрузка на хост, а под захватом графа она нелегальна).
     pub fn graph_decode_ready(&self) -> bool {
-        let trace = std::env::var("SYN_TRACE_GRAPH").is_ok();
+        let trace = trace_graph();
         let no = |why: &str| {
             if trace {
                 eprintln!("[GRAPH_NO] {why}");
@@ -2986,7 +2986,7 @@ impl FullAttn {
                 match q.flash_attention_prefill_dev(&kv.k, &kv.v, &tc, self.attn_scale, true) {
                     Ok(a) => Some(a),
                     Err(e) => {
-                        if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                        if trace_prefill_mem() {
                             eprintln!("[FA4_PREFILL_SKIP] {e:?}");
                         }
                         match e {
@@ -3024,7 +3024,7 @@ impl FullAttn {
                         ) {
                             Ok(a) => Some(a),
                             Err(e @ (SynaptixError::Unsupported(_) | SynaptixError::NonContiguous)) => {
-                                if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                                if trace_prefill_mem() {
                                     eprintln!("[FA_WIN_PREFILL_SKIP] {e:?}");
                                 }
                                 None
@@ -3064,7 +3064,7 @@ impl FullAttn {
                 match r {
                     Ok(a) => Some(a),
                     Err(e @ (SynaptixError::Unsupported(_) | SynaptixError::NonContiguous)) => {
-                        if std::env::var("SYN_TRACE_DECODE").is_ok() {
+                        if trace_decode() {
                             eprintln!("[DEC_FALLBACK] hd={hd} nh={nh} nkv={nkv} sw={:?} len={local_len} kv={:?}: {e:?}", self.sliding_window, kv.k.dtype());
                         }
                         None
@@ -3103,7 +3103,7 @@ impl FullAttn {
             match flashed {
                 Some(a) => a,
                 None => {
-                    if std::env::var("SYN_TRACE_PREFILL_MEM").is_ok() {
+                    if trace_prefill_mem() {
                         eprintln!("[ATTN_FALLBACK] s={s} att_len={att_len} hd={hd} nh={nh} nkv={nkv} flash_eligible={flash_eligible} kv_dtype={kv_dtype:?} kv_buf={:?} sw={:?}", kv.k.dtype(), self.sliding_window);
                     }
                     let k_rep = repeat_kv(&k_total, group).coerr()?;
@@ -4062,4 +4062,26 @@ pub enum ModelError {
     Shape(String),
     #[error("model forward: {0}")]
     Forward(String),
+}
+
+/// Флаги трассировки читаются из окружения один раз: `env::var` берёт
+/// глобальную блокировку и аллоцирует, а эти проверки стоят в горячем пути
+/// префилла и декода.
+fn env_flag(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+fn trace_prefill_mem() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&F, "SYN_TRACE_PREFILL_MEM")
+}
+
+fn trace_decode() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&F, "SYN_TRACE_DECODE")
+}
+
+fn trace_graph() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&F, "SYN_TRACE_GRAPH")
 }

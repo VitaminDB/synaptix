@@ -968,7 +968,7 @@ pub fn quant_linear_generic(
 
     // `SYN_BLOCKQ_GEMV=0` — отладочный обход GEMV: и малые M идут через
     // деквант полосами + GEMM (сверка одного пути с другим).
-    let gemv_ok = std::env::var("SYN_BLOCKQ_GEMV").map(|v| v != "0").unwrap_or(true);
+    let gemv_ok = blockq_gemv_enabled();
     if m_us <= GEMV_MAX_M && gemv_ok {
         let gk = if bf16 { BlockqGemvKernels::for_context_bf16(ctx)? } else { BlockqGemvKernels::for_context(ctx)? };
         let mut out_v = out_u8.as_view_mut();
@@ -1010,4 +1010,10 @@ pub fn quant_linear_generic(
         }
         Ok(())
     })
+}
+
+/// `SYN_BLOCKQ_GEMV=0` — читается один раз (проверка на каждом квант-GEMV декода).
+fn blockq_gemv_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("SYN_BLOCKQ_GEMV").map(|v| v != "0").unwrap_or(true))
 }
