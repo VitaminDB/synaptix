@@ -136,3 +136,50 @@ fn full_bundle_is_standalone() {
     check_close(&base, &l, "model.layers.0.mlp.gate_proj.weight", dev, 0.02);
     eprintln!("{} тензоров, {:.2} → {:.2} ГБ за {:.1} с", report.tensors, report.bytes_before as f64 / 1e9, report.bytes_after as f64 / 1e9, report.seconds);
 }
+
+/// Плотный бандл из одной MLP-матрицы 64×256.
+fn tiny_dense_bundle(dir: &std::path::Path) -> PathBuf {
+    use safetensors::tensor::{Dtype, TensorView};
+    let vals: Vec<u8> = (0..64 * 256)
+        .flat_map(|i| (((i * 37) % 101) as f32 / 50.0 - 1.0).to_le_bytes())
+        .collect();
+    let mut t = std::collections::HashMap::new();
+    t.insert("model.layers.0.mlp.down_proj.weight", TensorView::new(Dtype::F32, vec![64, 256], &vals).unwrap());
+    let st = dir.join("model.safetensors");
+    std::fs::write(&st, safetensors::serialize(&t, None).unwrap()).unwrap();
+    let out = dir.join("tiny.syn");
+    synaptix_bundle::BundleBuilder::new("tiny", "1.0.0").add_tensors_from_safetensors(&st).write(&out).unwrap();
+    out
+}
+
+/// Обрубок под именем кэша (прерванная запись старой версии) не валит
+/// загрузку: кэш пересобирается. Матрица крошечная — на карте только
+/// CUDA-контекст (CPU-бэкенд квантовать не умеет).
+#[test]
+fn broken_disk_cache_is_rebuilt() {
+    if synaptix_core::device::cuda::get(0).is_err() {
+        eprintln!("нет CUDA — пропуск");
+        return;
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let work = tempfile::tempdir().unwrap();
+    let src = tiny_dense_bundle(work.path());
+    let dev = Device::Cuda(0);
+    let spec = TranscodeSpec { quantize_dense: true, ..TranscodeSpec::uniform(DType::Sq { bits: 4 }) };
+    std::env::set_var("SYN_TRANSCODE_CACHE", work.path().join("cache"));
+    let q = "model.layers.0.mlp.down_proj.weight";
+    let mut first = SynBundleLoader::open(&src).unwrap();
+    let r1 = first.transcode(&src, spec.clone(), dev, Placement::Disk, None).unwrap();
+    assert_eq!((r1.placement, r1.tensors), ("disk", 1));
+    let cache = r1.cache_path.clone().unwrap();
+    assert!(!cache.with_extension("syn.part").exists(), "временный файл остался");
+    let len = std::fs::metadata(&cache).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&cache).unwrap().set_len(len / 3).unwrap();
+    let mut again = SynBundleLoader::open(&src).unwrap();
+    let r2 = again.transcode(&src, spec, dev, Placement::Disk, None).unwrap();
+    assert_eq!(r2.placement, "disk", "битый кэш должен пересобраться");
+    assert_eq!(std::fs::metadata(&cache).unwrap().len(), len);
+    assert_eq!(again.quant_kind(q), Some(QuantKind::Sq(4)));
+    std::env::remove_var("SYN_TRANSCODE_CACHE");
+}

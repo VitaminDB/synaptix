@@ -213,7 +213,7 @@ pub struct RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        let mut r = registry().lock().unwrap();
+        let mut r = registry().lock().unwrap_or_else(|e| e.into_inner());
         r.requests.remove(&self.path);
         let prefix = format!("{}\u{1}", self.path.display());
         r.overlays.retain(|k, _| !k.starts_with(&prefix));
@@ -224,12 +224,12 @@ impl Drop for RequestGuard {
 /// получат оверлей по `spec`.
 pub fn request(path: &Path, req: Request) -> RequestGuard {
     let path = canon(path);
-    registry().lock().unwrap().requests.insert(path.clone(), req);
+    registry().lock().unwrap_or_else(|e| e.into_inner()).requests.insert(path.clone(), req);
     RequestGuard { path }
 }
 
 pub(crate) fn request_for(path: &Path) -> Option<Request> {
-    let r = registry().lock().unwrap();
+    let r = registry().lock().unwrap_or_else(|e| e.into_inner());
     if r.requests.is_empty() {
         return None;
     }
@@ -482,7 +482,7 @@ impl TensorStream for TranscodeStream {
 pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Request, shared: bool) -> Result<Arc<Overlay>> {
     let key = overlay_cache_key(src_path, &req.spec);
     if shared {
-        if let Some(ov) = registry().lock().unwrap().overlays.get(&key) {
+        if let Some(ov) = registry().lock().unwrap_or_else(|e| e.into_inner()).overlays.get(&key) {
             return Ok(ov.clone());
         }
     }
@@ -543,16 +543,17 @@ pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Req
         }
     } else {
         let path = cache_path_for(src_path, &req.spec);
-        if path.is_file() {
-            placement_str = "disk-cached";
-        } else {
-            placement_str = "disk";
-            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| IoError::Bundle(format!("кэш перекодировки: {e}")))?;
+        // Сборка пишет во временный файл и переименовывает: прерванная
+        // запись (закрыли приложение, кончился диск) не оставляет под
+        // именем кэша обрубок, который потом не открывается.
+        let build = || -> Result<()> {
+            std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).map_err(|e| IoError::Bundle(format!("кэш перекодировки: {e}")))?;
             let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| IoError::Bundle(e.to_string()))?;
             let own = SynBundleLoader::open_plain(src_path)?;
             let stream = TranscodeStream::new(own, items.clone(), req.device, &manifest, req.progress.clone());
             let id = loader.bundle_id().unwrap_or_else(|| "model".into());
-            BundleBuilder::new(format!("{id}-transcoded"), "1.0.0")
+            let tmp = path.with_extension("syn.part");
+            let written = BundleBuilder::new(format!("{id}-transcoded"), "1.0.0")
                 .arch("transcode-cache")
                 .purpose("transcode-cache")
                 .require_capability(CAP_QUANT_WEIGHTS)
@@ -560,33 +561,61 @@ pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Req
                 .add_tensor_stream("main", Box::new(stream))
                 .add_file_bytes(MANIFEST_NAME, bytes, FileTag::Inference)
                 .map_err(|e| IoError::Bundle(e.to_string()))?
-                .write(&path)
-                .map_err(|e| IoError::Bundle(format!("кэш перекодировки {}: {e}", path.display())))?;
-        }
-        let bundle = Arc::new(Bundle::open(&path).map_err(|e| IoError::Bundle(format!("кэш {}: {e}", path.display())))?);
-        let all = bundle.tensors_slice().map_err(|e| IoError::Bundle(e.to_string()))?;
-        let st = safetensors::SafeTensors::deserialize(all).map_err(|e| IoError::Safetensors(e.to_string()))?;
-        let base = all.as_ptr() as usize;
-        let locate = |name: &str| -> Result<(usize, usize)> {
-            let tv = st.tensor(name).map_err(|e| IoError::Bundle(format!("кэш перекодировки: `{name}`: {e}")))?;
-            let d = tv.data();
-            Ok((d.as_ptr() as usize - base, d.len()))
+                .write(&tmp)
+                .map_err(|e| IoError::Bundle(format!("кэш перекодировки {}: {e}", tmp.display())));
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            written?;
+            std::fs::rename(&tmp, &path).map_err(|e| IoError::Bundle(format!("кэш перекодировки {}: {e}", path.display())))
         };
-        for it in &items {
-            let entry = entry_for(it);
-            let kind = entry.kind().unwrap();
-            let (po, pl) = locate(&manifest.packed_name(&it.name))?;
-            let (so, sl) = if kind.has_scales() { locate(&manifest.scales_name(&it.name))? } else { (0, 0) };
-            entries.insert(
-                it.name.clone(),
-                OverlayEntry {
-                    entry,
-                    packed: Blob::Mapped { bundle: bundle.clone(), off: po, len: pl },
-                    scales: Blob::Mapped { bundle: bundle.clone(), off: so, len: sl },
-                    from: it.current.map(|k| format_key(k)).unwrap_or_else(|| "dense".into()),
-                },
-            );
-        }
+        let open = || -> Result<BTreeMap<String, OverlayEntry>> {
+            let bundle = Arc::new(Bundle::open(&path).map_err(|e| IoError::Bundle(format!("кэш {}: {e}", path.display())))?);
+            let all = bundle.tensors_slice().map_err(|e| IoError::Bundle(e.to_string()))?;
+            let st = safetensors::SafeTensors::deserialize(all).map_err(|e| IoError::Safetensors(e.to_string()))?;
+            let base = all.as_ptr() as usize;
+            let locate = |name: &str| -> Result<(usize, usize)> {
+                let tv = st.tensor(name).map_err(|e| IoError::Bundle(format!("кэш перекодировки: `{name}`: {e}")))?;
+                let d = tv.data();
+                Ok((d.as_ptr() as usize - base, d.len()))
+            };
+            let mut entries = BTreeMap::new();
+            for it in &items {
+                let entry = entry_for(it);
+                let kind = entry.kind().unwrap();
+                let (po, pl) = locate(&manifest.packed_name(&it.name))?;
+                let (so, sl) = if kind.has_scales() { locate(&manifest.scales_name(&it.name))? } else { (0, 0) };
+                entries.insert(
+                    it.name.clone(),
+                    OverlayEntry {
+                        entry,
+                        packed: Blob::Mapped { bundle: bundle.clone(), off: po, len: pl },
+                        scales: Blob::Mapped { bundle: bundle.clone(), off: so, len: sl },
+                        from: it.current.map(|k| format_key(k)).unwrap_or_else(|| "dense".into()),
+                    },
+                );
+            }
+            Ok(entries)
+        };
+        entries = if path.is_file() {
+            placement_str = "disk-cached";
+            match open() {
+                Ok(e) => e,
+                Err(e) => {
+                    // Битый или чужой кэш (прерванная запись старой версии,
+                    // другой манифест) — пересобрать один раз.
+                    tracing::warn!("кэш перекодировки {} не открылся ({e}) — пересобираю", path.display());
+                    let _ = std::fs::remove_file(&path);
+                    placement_str = "disk";
+                    build()?;
+                    open()?
+                }
+            }
+        } else {
+            placement_str = "disk";
+            build()?;
+            open()?
+        };
         cache_path = Some(path);
     }
     let report = TranscodeReport {
@@ -600,7 +629,7 @@ pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Req
     tracing::info!("перекодировка готова за {:.1} с ({})", report.seconds, report.placement);
     let ov = Arc::new(Overlay { entries, report });
     if shared {
-        registry().lock().unwrap().overlays.insert(key, ov.clone());
+        registry().lock().unwrap_or_else(|e| e.into_inner()).overlays.insert(key, ov.clone());
     }
     Ok(ov)
 }
