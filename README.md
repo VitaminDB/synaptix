@@ -1,8 +1,8 @@
 # synaptix
 
-[![Donate via PayPal](https://img.shields.io/badge/donate-PayPal-0070ba?logo=paypal&logoColor=white)](https://paypal.me/vitamindbnfkz)
 [![Licence: MIT OR Apache-2.0](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)](#license)
 [![CUDA: NVRTC JIT](https://img.shields.io/badge/CUDA-NVRTC%20JIT-76b900?logo=nvidia&logoColor=white)](#building)
+[![Vibe-coded with Claude Code](https://img.shields.io/badge/vibe--coded-Claude%20Code-d97757)](#how-it-is-built)
 
 A native Rust engine for running and training neural networks — hand-written CUDA kernels
 compiled at runtime via NVRTC, with no PyTorch, no libtorch, and no Python runtime.
@@ -177,10 +177,12 @@ Young, single-author, and moving fast. The API is not stable; expect breaking ch
 
 ## How it is built
 
-One developer, with Claude (Anthropic) as a daily coding assistant. The architecture, the
-CUDA kernel work and every number in this README are mine — measured on my hardware, with
-the losses reported next to the wins. The assistant carries a large share of the typing,
-the test scaffolding and the refactors.
+This project is vibe-coded. Since spring 2026 I write all of my projects with [Claude
+Code](https://claude.com/claude-code): I decide what to build and how it fits together,
+describe each task, and review, run and measure the result on my own hardware — the model
+writes the code, the tests and most of the documentation. Every number in this README was
+measured on my machine, and correctness is checked against reference implementations layer by
+layer rather than taken on the model's word.
 
 ## Support
 
