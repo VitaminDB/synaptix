@@ -35,12 +35,23 @@ synaptix chat model.syn --context 32768          # interactive, prefix-KV across
 synaptix bench model.syn --n-tokens 128          # prefill / decode throughput
 synaptix devices                                 # compute capability, NVRTC target, block-scale MMA / TMA
 
-synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2, Qwen-Image 2.1
-synaptix video ltx.syn "a paper boat in the rain" -o clip.mp4 --gemma ./gemma-3-12b
+synaptix run gemma4.syn "What is on the picture?" --image cat.png --chat
+synaptix imagine sdxl.syn "a lighthouse at dusk" -o out.png   # SDXL, FLUX.1, FLUX.2, Qwen-Image (+Edit), Qwen-Image 2.1
+synaptix imagine flux2.syn "make it winter" --image photo.png  # reference editing; --init-image/--strength for img2img
+synaptix depth depth-anything-v2/ photo.png -o depth.png
+synaptix video ltx.syn "a paper boat in the rain" -o clip.mp4 --gemma ./gemma-3-12b --seed 7
+synaptix video ltx.syn "a singer on stage" --audio song.wav --upscaler up.syn   # audio→video
+synaptix h3 --model minimax-h3-fl2va.syn "waves at night" --first-frame shore.png
+synaptix song "pop, female vocal" --lyrics-file lyrics.txt --seconds 90 --save-latent l.safetensors
+synaptix song-decode l.safetensors --vae yue2-vae-legacy.syn -o song.wav
 synaptix music "lofi piano, rain" -o track.wav --models ./syn_models --duration auto
 synaptix speak voxcpm.syn "Hello there" -o out.wav --reference voice.wav
+synaptix speak omnivoice.syn "Привет" --instruct "female, low pitch" --language ru
 synaptix podcast vibevoice.syn "Speaker 1: hi\nSpeaker 2: hey" -o show.wav
-synaptix transcribe whisper.syn talk.mp3 --timestamps
+synaptix transcribe whisper.syn talk.mp3 --format srt -o talk.srt   # or gigaam.syn
+synaptix diarize sortformer.syn meeting.wav --format rttm
+synaptix embed bge-m3.syn "first text" "second text" -o vectors.json
+synaptix rerank bge-reranker.syn "query" "doc one" "doc two" --top-k 1
 ```
 
 ## What it runs
