@@ -219,6 +219,19 @@ impl OmniVoiceCodecWeights {
             .ok_or_else(|| OmniVoiceError::Load(format!("missing codec tensor '{name}'")))
     }
 
+    pub fn to_dtype(&self, dtype: DType) -> Result<Self, OmniVoiceError> {
+        let mut tensors = HashMap::with_capacity(self.tensors.len());
+        for (name, t) in &self.tensors {
+            let t = if matches!(t.dtype(), DType::F16 | DType::BF16 | DType::F32) && t.dtype() != dtype {
+                t.to_dtype(dtype).map_err(|e| OmniVoiceError::Load(format!("cast '{name}': {e}")))?
+            } else {
+                t.clone()
+            };
+            tensors.insert(name.clone(), t);
+        }
+        Ok(Self { tensors, device: self.device, dtype })
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }

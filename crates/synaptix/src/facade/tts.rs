@@ -16,7 +16,7 @@ pub mod core {
 
     impl Default for GenerationConfig {
         fn default() -> Self {
-            Self { num_step: 32, guidance_scale: 2.0, t_shift: 0.5, speed: 1.0, seed: 0 }
+            Self { num_step: 32, guidance_scale: 2.0, t_shift: 0.1, speed: 1.0, seed: 0 }
         }
     }
 
@@ -144,8 +144,9 @@ impl TtsPipeline {
                     .inner
                     .create_voice_clone_prompt(&p.audio_path, ref_text)
                     .map_err(map_err)?;
+                let lang = p.lang.as_deref().map(str::trim).filter(|l| !l.is_empty() && *l != "auto");
                 self.inner
-                    .generate_clone_styled(text, &vcp, speed, &gen)
+                    .synthesize(text, Some(&vcp), lang, None, speed, None, &gen)
                     .map_err(map_err)
             }
             GenerationMode::Design { instruct } => self

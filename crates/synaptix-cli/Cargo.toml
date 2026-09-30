@@ -23,6 +23,10 @@ synaptix-llm-qwen3-next-hybrid = { workspace = true }
 synaptix-llm-muse-glimmer = { workspace = true }
 synaptix-vlm-qwen3    = { workspace = true }
 synaptix-asr-whisper  = { workspace = true }
+synaptix-asr-gigaam   = { workspace = true }
+synaptix-tts-omnivoice = { workspace = true }
+synaptix-diarization-sortformer = { workspace = true }
+synaptix-embedding-bge-m3 = { workspace = true }
 synaptix-image-sdxl   = { workspace = true }
 synaptix-image-flux   = { workspace = true }
 synaptix-image-flux2  = { workspace = true }

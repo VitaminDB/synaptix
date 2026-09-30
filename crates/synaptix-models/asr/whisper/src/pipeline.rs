@@ -108,13 +108,26 @@ impl WhisperPipeline {
         let mut v = logits_to_f32(&logits)?;
         // Разрешаем только диапазон языковых токенов [sot+1 .. timestamp_begin).
         let lo = self.special.sot as usize + 1;
-        let hi = self.special.timestamp_begin as usize;
+        let hi = self.special.translate.min(self.special.transcribe) as usize;
         for (i, x) in v.iter_mut().enumerate() {
             if i < lo || i >= hi {
                 *x = f32::NEG_INFINITY;
             }
         }
         Ok(argmax(&v) as u32)
+    }
+
+    pub fn detect_language_code(&self, audio: &[f32]) -> Result<String> {
+        let mut seg = audio[..audio.len().min(N_SAMPLES)].to_vec();
+        seg.resize(N_SAMPLES, 0.0);
+        let mel = self.mel_tensor(&seg)?;
+        let enc = self.model.encoder.forward(&mel)?;
+        let id = self.detect_language(&enc)?;
+        let token = self
+            .tokenizer
+            .id_to_token(id)
+            .ok_or_else(|| WhisperError::Tokenizer(format!("нет токена языка {id}")))?;
+        Ok(token.trim_start_matches("<|").trim_end_matches("|>").to_string())
     }
 
     /// Токен-id одного 30-с сегмента (для сверки/CLI). `samples` дополняются/

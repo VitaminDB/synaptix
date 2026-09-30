@@ -22,6 +22,7 @@ pub struct PodcastArgs {
     pub seed: u64,
     pub max_length_times: f32,
     pub zero_noise: bool,
+    pub max_new_tokens: Option<usize>,
 }
 
 pub fn run(args: PodcastArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -72,8 +73,16 @@ pub fn run(args: PodcastArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_length_times: args.max_length_times,
         seed: args.seed,
         zero_noise: args.zero_noise,
-        ..GenerationConfig::default()
+        max_new_tokens: args.max_new_tokens,
     };
+    let speakers = script
+        .lines()
+        .filter_map(|l| l.strip_prefix("Speaker ").and_then(|r| r.split(':').next()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if voices.len() > speakers.max(1) {
+        eprintln!("synaptix podcast: голосов {} больше, чем спикеров в сценарии ({speakers}) — лишние не используются", voices.len());
+    }
 
     let t1 = std::time::Instant::now();
     let mut last_pct = 0usize;

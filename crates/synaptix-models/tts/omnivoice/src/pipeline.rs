@@ -144,6 +144,7 @@ impl OmniVoicePipeline {
         // rope-capacity с запасом: style+text (десятки) + ref + target (тысячи на
         // длинных текстах); 8192 покрывает типичные одно-чанковые генерации.
         let backbone = Backbone::build(&cfg, &lm, 8192)?;
+        let codec_w = if codec_w.dtype == DType::F32 { codec_w } else { codec_w.to_dtype(DType::F32)? };
         let codec = CodecDecoder::build(&higgs, &codec_w, cfg.num_audio_codebook)?;
         let codec_encoder = CodecEncoder::build(&higgs, &codec_w)?;
         // frame_rate = sample_rate / downsample_factor (HiggsAudioV2: 24000/320=75).
@@ -247,9 +248,43 @@ impl OmniVoicePipeline {
 
         // codec.decode → wav [samples].
         let wav = self.codec.decode(&codes)?;
-        wav.flatten_all()
+        wav.to_dtype(DType::F32)
+            .and_then(|w| w.flatten_all())
             .and_then(|w| w.to_vec1::<f32>())
             .map_err(err)
+    }
+
+    pub fn output_sample_rate(&self) -> usize {
+        self.sample_rate
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize(
+        &self,
+        text: &str,
+        prompt: Option<&VoiceClonePrompt>,
+        lang: Option<&str>,
+        instruct: Option<&str>,
+        speed: f64,
+        target_len: Option<usize>,
+        gen: &OmniVoiceGenerationConfig,
+    ) -> Result<Vec<f32>> {
+        let target_len = target_len.unwrap_or_else(|| match prompt {
+            Some(p) => self.estimate_target_tokens_clone(text, p, speed),
+            None => self.duration.estimate_target_tokens(text, None, None, speed),
+        });
+        let prepared = self.text.prepare_inference_inputs(
+            text,
+            target_len,
+            prompt.map(|p| p.ref_text.as_str()),
+            prompt.map(|p| &p.ref_audio_tokens),
+            lang,
+            instruct,
+            gen.denoise,
+        )?;
+        let codes = generate_iterative(&self.backbone, &prepared.input_ids, &prepared.audio_mask, target_len, gen)?;
+        let wav = self.codec.decode(&codes)?;
+        wav.to_dtype(DType::F32).and_then(|w| w.flatten_all()).and_then(|w| w.to_vec1::<f32>()).map_err(err)
     }
 
     /// Доступ к encode-пути нейро-кодека (ref-аудио → коды). Для гейтов/дебага.
@@ -355,7 +390,8 @@ impl OmniVoicePipeline {
 
         // codec.decode → wav.
         let wav = self.codec.decode(&codes)?;
-        wav.flatten_all()
+        wav.to_dtype(DType::F32)
+            .and_then(|w| w.flatten_all())
             .and_then(|w| w.to_vec1::<f32>())
             .map_err(err)
     }

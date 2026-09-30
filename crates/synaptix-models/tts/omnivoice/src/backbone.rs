@@ -211,7 +211,9 @@ impl Backbone {
         // a·mask + b·(1−mask) (broadcast_mul/affine/add — есть на CUDA). mask_f строим
         // из host-вектора mask_u8 через from_vec (U8→F32 cast на CUDA не поддержан).
         let mask_f_vec: Vec<f32> = mask_u8.iter().map(|&m| m as f32).collect();
-        let mask_f = Tensor::from_vec(mask_f_vec, vec![bsz, s, 1], self.device).map_err(err)?;
+        let mask_f = Tensor::from_vec(mask_f_vec, vec![bsz, s, 1], self.device)
+            .and_then(|m| m.to_dtype(audio_embeds.dtype()))
+            .map_err(err)?;
         let inv = mask_f.affine(-1.0, 1.0).map_err(err)?;
         let a = audio_embeds.broadcast_mul(&mask_f).map_err(err)?;
         let b = text_embeds.broadcast_mul(&inv).map_err(err)?;

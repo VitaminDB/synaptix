@@ -333,7 +333,7 @@ enum Commands {
         /// Задача: transcribe (default) | translate (→ английский).
         #[arg(long, default_value = "transcribe")]
         task: String,
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = "cuda")]
         device: String,
         /// Compute dtype: f32 (default) | f16 | bf16.
         #[arg(long)]
@@ -341,6 +341,68 @@ enum Commands {
         /// Выводить сегменты с временными метками вместо сплошного текста.
         #[arg(long, default_value_t = false)]
         timestamps: bool,
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | whisper | gigaam")]
+        engine: String,
+        #[arg(long, default_value = "text", help = "Формат вывода: text | srt | vtt | json")]
+        format: String,
+        #[arg(short, long, help = "Записать результат в файл")]
+        output: Option<PathBuf>,
+    },
+    /// Диаризация (Sortformer): кто и когда говорит.
+    Diarize {
+        model: PathBuf,
+        audio: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = "pretty", help = "pretty | json | rttm")]
+        format: String,
+        #[arg(long, help = "Порог активности спикера (0.5)")]
+        threshold: Option<f32>,
+        #[arg(long, help = "Минимальная длина сегмента, с (0.25)")]
+        min_segment: Option<f32>,
+        #[arg(long, help = "Склейка пауз короче N с (0.15)")]
+        merge_gap: Option<f32>,
+        #[arg(long, help = "Окно медианного сглаживания, кадров (3)")]
+        smoothing_frames: Option<usize>,
+        #[arg(long, default_value = "cuda")]
+        device: String,
+        #[arg(long)]
+        compute_dtype: Option<String>,
+    },
+    /// Эмбеддинги текстов (BGE-M3): dense, L2-нормированные, JSON.
+    Embed {
+        model: PathBuf,
+        texts: Vec<String>,
+        #[arg(long, help = "Файл с текстами построчно (- — stdin)")]
+        file: Option<PathBuf>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Потолок токенов на текст (512)")]
+        max_tokens: Option<usize>,
+        #[arg(long, default_value_t = 16)]
+        batch_size: usize,
+        #[arg(long, default_value = "cuda")]
+        device: String,
+        #[arg(long)]
+        compute_dtype: Option<String>,
+    },
+    /// Реранкинг документов под запрос (BGE-reranker).
+    Rerank {
+        model: PathBuf,
+        query: String,
+        docs: Vec<String>,
+        #[arg(long, help = "Файл с документами построчно (- — stdin)")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        top_k: Option<usize>,
+        #[arg(long, help = "Потолок токенов пары (512, не меньше 64)")]
+        max_tokens: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value = "cuda")]
+        device: String,
+        #[arg(long)]
+        compute_dtype: Option<String>,
     },
     /// Синтез речи (VoxCPM2 TTS): TEXT → WAV (48 кГц).
     Speak {
@@ -359,22 +421,44 @@ enum Commands {
         /// Транскрипт prompt-аудио (вместе с --prompt-wav).
         #[arg(long)]
         prompt_text: Option<String>,
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = "cuda")]
         device: String,
         /// Compute dtype: cpu→f32, cuda→bf16 по умолчанию; f32|f16|bf16.
         #[arg(long)]
         compute_dtype: Option<String>,
-        /// Classifier-free guidance.
-        #[arg(long, default_value_t = 2.0)]
-        cfg: f32,
-        /// Число шагов диффузии (CFM).
-        #[arg(long, default_value_t = 10)]
-        steps: usize,
+        /// Classifier-free guidance (2.0).
+        #[arg(long)]
+        cfg: Option<f32>,
+        /// Число шагов (VoxCPM 10, OmniVoice 32).
+        #[arg(long)]
+        steps: Option<usize>,
         #[arg(long, default_value_t = 1988)]
         seed: u64,
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice")]
+        engine: String,
+        #[arg(long, help = "VoxCPM: минимум шагов генерации (2)")]
+        min_len: Option<usize>,
+        #[arg(long, help = "VoxCPM: потолок длины = цель × ratio (6.0)")]
+        retry_ratio: Option<f32>,
+        #[arg(long, help = "VoxCPM: streaming prefix (4)")]
+        streaming_prefix_len: Option<usize>,
+        #[arg(long, help = "OmniVoice: язык (ru, en, …; auto)")]
+        language: Option<String>,
+        #[arg(long, help = "OmniVoice: описание голоса/стиля (voice design; с --reference — стиль клона)")]
+        instruct: Option<String>,
+        #[arg(long, default_value_t = 1.0, help = "OmniVoice: скорость речи")]
+        speed: f64,
+        #[arg(long, help = "OmniVoice: t_shift расписания (0.1)")]
+        t_shift: Option<f32>,
+        #[arg(long, help = "OmniVoice: layer penalty (5.0)")]
+        layer_penalty: Option<f32>,
+        #[arg(long, default_value_t = false, help = "OmniVoice: без <|denoise|> в клоне")]
+        no_denoise: bool,
+        #[arg(long, help = "OmniVoice: явная длина в аудио-токенах (75 на секунду)")]
+        target_tokens: Option<usize>,
     },
     /// Многоголосый длинный синтез (VibeVoice): SCRIPT → WAV (24 кГц).
     Podcast {
@@ -390,7 +474,7 @@ enum Commands {
         /// Аудио-референс голоса (wav|mp3|ogg|flac). Повторяется по одному на спикера.
         #[arg(long = "voice")]
         voices: Vec<PathBuf>,
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = "cuda")]
         device: String,
         /// Compute dtype: cpu→f32, cuda→bf16 по умолчанию; f32|f16|bf16.
         #[arg(long)]
@@ -409,6 +493,8 @@ enum Commands {
         /// Детерминированный прогон без шума (для сверки с эталоном).
         #[arg(long, default_value_t = false)]
         zero_noise: bool,
+        #[arg(long, help = "Жёсткий потолок новых токенов")]
+        max_new_tokens: Option<usize>,
     },
     /// Песня целиком (YuE2): стиль и лирика → партитура → музыка → WAV 48 кГц стерео.
     Song {
@@ -1181,7 +1267,7 @@ fn main() -> ExitCode {
         Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device } => {
             quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device })
         }
-        Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps } => {
+        Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps, engine, format, output } => {
             transcribe::run(transcribe::TranscribeArgs {
                 model,
                 audio,
@@ -1190,21 +1276,41 @@ fn main() -> ExitCode {
                 device,
                 compute_dtype,
                 timestamps,
+                engine,
+                format,
+                output,
+            })
+        }
+        Commands::Diarize {
+            model, audio, output, format, threshold, min_segment, merge_gap, smoothing_frames, device, compute_dtype,
+        } => synaptix_cli::commands::diarize::run(synaptix_cli::commands::diarize::DiarizeArgs {
+            model, audio, output, format, threshold, min_segment, merge_gap, smoothing_frames, device, compute_dtype,
+        }),
+        Commands::Embed { model, texts, file, output, max_tokens, batch_size, device, compute_dtype } => {
+            synaptix_cli::commands::embed::run_embed(synaptix_cli::commands::embed::EmbedArgs {
+                model, texts, file, output, max_tokens, batch_size, device, compute_dtype,
+            })
+        }
+        Commands::Rerank { model, query, docs, file, top_k, max_tokens, json, device, compute_dtype } => {
+            synaptix_cli::commands::embed::run_rerank(synaptix_cli::commands::embed::RerankArgs {
+                model, query, docs, file, top_k, max_tokens, json, device, compute_dtype,
             })
         }
         Commands::Speak {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,
-            cfg, steps, seed, max_len,
+            cfg, steps, seed, max_len, engine, min_len, retry_ratio, streaming_prefix_len, language,
+            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens,
         } => speak::run(speak::SpeakArgs {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,
-            cfg, steps, seed, max_len,
+            cfg, steps, seed, max_len, engine, min_len, retry_ratio, streaming_prefix_len, language,
+            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens,
         }),
         Commands::Podcast {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
-            max_length_times, zero_noise,
+            max_length_times, zero_noise, max_new_tokens,
         } => podcast::run(podcast::PodcastArgs {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
-            max_length_times, zero_noise,
+            max_length_times, zero_noise, max_new_tokens,
         }),
         Commands::Song {
             style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,
