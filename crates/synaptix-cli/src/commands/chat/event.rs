@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{App, Submit};
+use super::app::App;
 use super::engine::EngineHandle;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, engine: &EngineHandle) {
@@ -11,13 +11,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, engine: &EngineHandle) {
 
     match key.code {
         KeyCode::Enter => {
-            if app.generating {
+            if app.generating || app.busy_attach {
                 return;
             }
-            match app.submit() {
-                Submit::Generate { prompt, cfg } => engine.generate(prompt, cfg),
-                Submit::Reset => engine.reset(),
-                Submit::None => {}
+            if let Some(cmd) = app.submit() {
+                engine.send(cmd);
             }
         }
         KeyCode::Char(c) => {

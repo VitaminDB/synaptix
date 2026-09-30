@@ -65,9 +65,27 @@ enum Commands {
         /// Attention-backend: auto|flash-decode|fa2|fa4 (default auto).
         #[arg(long)]
         attn: Option<String>,
-        /// Compute dtype: f32|bf16|f16 (default bf16).
-        #[arg(long)]
+        /// Compute dtype: f32|bf16|f16 (алиас --compute-dtype).
+        #[arg(long, alias = "compute-dtype")]
         dtype: Option<String>,
+        #[arg(long, default_value_t = 1, help = "Замеров подряд (среднее)")]
+        repeat: usize,
+        #[arg(long, help = "Точность: без флагов — оптимальный профиль; none | nvfp4 | fp8 | mxfp8 | sq1…sq8")]
+        quant: Option<String>,
+        #[arg(long)]
+        storage_dtype: Option<String>,
+        #[arg(long)]
+        lm_head_dtype: Option<String>,
+        #[arg(long)]
+        embed_dtype: Option<String>,
+        #[arg(long)]
+        kv_dtype: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_graph: bool,
+        #[arg(long, default_value_t = false)]
+        no_spec: bool,
+        #[arg(long, default_value_t = 0)]
+        prefill_batch: usize,
     },
     Run {
         model: PathBuf,
@@ -78,8 +96,8 @@ enum Commands {
         prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
-        #[arg(long, default_value_t = 1.0)]
-        temperature: f32,
+        #[arg(long, help = "Temperature (без флага: 1.0; с --chat — из пресета модели)")]
+        temperature: Option<f32>,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         #[arg(long, default_value = "cuda")]
@@ -94,7 +112,7 @@ enum Commands {
         /// KV-кеш dtype: bf16 (default) | fp8/mxfp8 (MXFP8 block-scale, 256K-контекст).
         #[arg(long)]
         kv_dtype: Option<String>,
-        /// Пресет точности: none (default) | nvfp4 | fp8.
+        /// Точность: без флагов — оптимальный профиль движка под модель; none (dense) | nvfp4 | fp8 | mxfp8 | sq1…sq8.
         #[arg(long)]
         quant: Option<String>,
         /// Override compute (активаций): f16|bf16|f32.
@@ -117,7 +135,7 @@ enum Commands {
         /// Прогрев NVRTC JIT (prefill+1 токен) до замера — для честного бенча.
         #[arg(long, default_value_t = false)]
         warmup: bool,
-        /// Требовать MTP-декод на встроенной nextn-голове (greedy). Без флага
+        /// Требовать MTP-декод на встроенной nextn-голове (greedy и сэмплинг). Без флага
         /// MTP включается сам, когда доступен.
         #[arg(long, default_value_t = false)]
         mtp: bool,
@@ -136,39 +154,82 @@ enum Commands {
         /// Отключить DFlash-спекуляцию (Muse Glimmer).
         #[arg(long, default_value_t = false)]
         no_dflash: bool,
+        #[arg(long, default_value_t = false, help = "Muse Glimmer: без lookup-спекуляции на greedy")]
+        no_lookup: bool,
+        #[arg(long, help = "Пресет сэмплинга модели (с --chat; по умолчанию под режим размышлений)")]
+        preset: Option<String>,
+        #[arg(long, help = "Top-k (0 — выкл)")]
+        top_k: Option<usize>,
+        #[arg(long, help = "Top-p (1.0 — выкл)")]
+        top_p: Option<f32>,
+        #[arg(long, help = "Min-p (0 — выкл)")]
+        min_p: Option<f32>,
+        #[arg(long, help = "Repetition penalty (1.0 — выкл)")]
+        repetition_penalty: Option<f32>,
+        #[arg(long, help = "Окно repetition penalty (0 — весь контекст)")]
+        repeat_last_n: Option<usize>,
+        #[arg(long, help = "Presence penalty")]
+        presence_penalty: Option<f32>,
+        #[arg(long, help = "Frequency penalty")]
+        frequency_penalty: Option<f32>,
+        #[arg(long, default_value_t = 0, help = "Чанк префилла в токенах (0 — по умолчанию движка)")]
+        prefill_batch: usize,
+        #[arg(long, default_value_t = false, help = "Обернуть промпт chat-шаблоном модели (через фасад; сэмплинг — из пресета модели)")]
+        chat: bool,
+        #[arg(long, help = "Системный промпт (с --chat)")]
+        system: Option<String>,
+        #[arg(long, default_value_t = false, help = "Без размышлений (с --chat)")]
+        no_think: bool,
+        #[arg(long, help = "Глубина размышлений (с --chat): Qwen3.8 low|medium|xhigh, Muse low…xhigh")]
+        reasoning_effort: Option<String>,
+        #[arg(long, help = "Стоп-последовательность (повторяется; через фасад)")]
+        stop: Vec<String>,
+        #[arg(long, help = "Потолок vision-токенов на картинку")]
+        max_image_tokens: Option<usize>,
+        #[arg(long, help = "Синхронизация слоёв: auto | on | off")]
+        layer_sync: Option<String>,
+        #[arg(long, help = "Qwen4Exp: кэш экспертов на карте, ГБ (0 — все эксперты на устройстве)")]
+        expert_cache_gb: Option<f64>,
+        #[arg(long, help = "Qwen4Exp: зеркало весов в host-RAM, ГБ")]
+        host_mirror_gb: Option<f64>,
+        #[arg(long, default_value_t = false, help = "Qwen4Exp: спекулятивный декод")]
+        qwen4_spec: bool,
+        #[arg(long, default_value_t = false, help = "Qwen4Exp: таблица эмбеддингов в host-RAM")]
+        embed_host: bool,
     },
+    /// Интерактивный чат (TUI) через фасад: все LLM-архитектуры, картинки/видео, префикс-KV между ходами.
     Chat {
         model: PathBuf,
         #[arg(long)]
         system: Option<String>,
-        /// Потолок токенов ответа. 0 = без лимита (генерим до <|im_end|> или пока
-        /// не заполнится контекст). Ставь >0 только если хочешь жёсткий потолок.
+        /// Потолок токенов ответа. 0 = без лимита (до конца хода или контекста).
         #[arg(long, default_value_t = 0)]
         max_tokens: usize,
         /// Размер контекста: KV-буфер + RoPE capacity (multi-turn headroom).
         #[arg(long, default_value_t = 4096)]
         context: usize,
-        /// Batch size префила: промпт прогоняется кусками по N токенов.
-        /// 0 → весь промпт за один forward (single-shot).
+        /// Чанк префилла в токенах. 0 → по умолчанию движка.
         #[arg(long, default_value_t = 0)]
         prefill_batch: usize,
-        #[arg(long, default_value_t = 0.7)]
-        temperature: f32,
-        /// Top-k сэмплинг: оставить k наиболее вероятных токенов. 0 → выкл.
-        /// Default 40 (стандарт): ограничивает кандидатов → top-p/сэмпл по 40, а
-        /// не по всему словарю (248K) — убирает полную сортировку на токен.
-        #[arg(long, default_value_t = 40)]
-        top_k: usize,
-        /// Top-p (nucleus) сэмплинг. 1.0 → выкл.
-        #[arg(long, default_value_t = 1.0)]
-        top_p: f32,
-        /// Min-p сэмплинг: порог = min_p × p(max). 0.0 → выкл.
-        #[arg(long, default_value_t = 0.0)]
-        min_p: f32,
-        /// Repetition penalty (>1 штрафует повтор токенов). 1.0 → выкл.
-        #[arg(long, default_value_t = 1.0)]
-        repetition_penalty: f32,
-        /// Seed сэмплинга. 0 → засев от времени при запуске.
+        #[arg(long, help = "Пресет сэмплинга модели (thinking, instruct, recommended, …); по умолчанию — под режим размышлений")]
+        preset: Option<String>,
+        #[arg(long, help = "Temperature (по умолчанию из пресета модели)")]
+        temperature: Option<f32>,
+        #[arg(long, help = "Top-k (0 — выкл; по умолчанию из пресета)")]
+        top_k: Option<usize>,
+        #[arg(long, help = "Top-p (1.0 — выкл; по умолчанию из пресета)")]
+        top_p: Option<f32>,
+        #[arg(long, help = "Min-p (0 — выкл)")]
+        min_p: Option<f32>,
+        #[arg(long, help = "Repetition penalty (1.0 — выкл)")]
+        repetition_penalty: Option<f32>,
+        #[arg(long, help = "Окно repetition penalty в токенах (64; 0 — весь контекст)")]
+        repeat_last_n: Option<usize>,
+        #[arg(long, help = "Presence penalty")]
+        presence_penalty: Option<f32>,
+        #[arg(long, help = "Frequency penalty")]
+        frequency_penalty: Option<f32>,
+        /// Seed сэмплинга. 0 → засев от времени на каждый ход.
         #[arg(long, default_value_t = 0)]
         seed: u64,
         #[arg(long, default_value = "cuda")]
@@ -176,16 +237,16 @@ enum Commands {
         /// Attention-backend: auto|flash-decode|fa2|fa4 (default auto).
         #[arg(long)]
         attn: Option<String>,
-        /// Пресет точности: none (default) | nvfp4 | fp8.
+        /// Точность: без флагов — оптимальный профиль движка под модель; none | nvfp4 | fp8 | mxfp8 | sq1…sq8.
         #[arg(long)]
         quant: Option<String>,
-        /// KV-кеш dtype: bf16 (default) | fp8/mxfp8 (MXFP8 block-scale, 256K-контекст).
+        /// KV-кеш dtype: bf16 | f16 | f32 | mxfp8 (fp8).
         #[arg(long)]
         kv_dtype: Option<String>,
         /// Override compute (активаций): f16|bf16|f32.
         #[arg(long)]
         compute_dtype: Option<String>,
-        /// Override веса attn+mlp групп: bf16|f16|fp8|nvfp4.
+        /// Override веса attn+mlp групп: bf16|f16|fp8|nvfp4|sqN.
         #[arg(long)]
         storage_dtype: Option<String>,
         /// Override проекции в словарь (lm_head): bf16|f16|fp8|nvfp4.
@@ -194,10 +255,25 @@ enum Commands {
         /// Override таблицы эмбеддингов: bf16|f16|fp8.
         #[arg(long)]
         embed_dtype: Option<String>,
-        /// Отключить reasoning-режим (<think>): enable_thinking=false в
-        /// chat-template. Для reasoning-моделей (qwen3.6) ответ без размышлений.
+        /// Без размышлений (enable_thinking=false; у Muse — reasoning_strength=low). В чате: /think on|off.
         #[arg(long, default_value_t = false)]
         no_think: bool,
+        #[arg(long, help = "Глубина размышлений (Qwen3.8: low|medium|xhigh, Muse: low…xhigh). В чате: /effort")]
+        reasoning_effort: Option<String>,
+        #[arg(long, help = "Стоп-последовательность (повторяется)")]
+        stop: Vec<String>,
+        #[arg(long, help = "Картинка к первому сообщению (повторяется). В чате: /image <путь>")]
+        image: Vec<PathBuf>,
+        #[arg(long, help = "Видео к первому сообщению (повторяется). В чате: /video <путь>")]
+        video: Vec<PathBuf>,
+        #[arg(long, help = "Потолок vision-токенов на картинку (по умолчанию — из конфига модели)")]
+        max_image_tokens: Option<usize>,
+        #[arg(long, default_value_t = false, help = "Выключить CUDA-graph декода")]
+        no_graph: bool,
+        #[arg(long, default_value_t = false, help = "Выключить спекулятивный декод (MTP/DFlash)")]
+        no_spec: bool,
+        #[arg(long, help = "Синхронизация слоёв: auto | on | off")]
+        layer_sync: Option<String>,
     },
     Diff {
         file_a: PathBuf,
@@ -983,13 +1059,21 @@ fn main() -> ExitCode {
         } => convert::run(convert::ConvertArgs {
             input, output, format, arch, component, mmproj, dtype, tokenizer, id, sha256, blake3,
         }),
-        Commands::Bench { model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype } => {
-            bench::run(bench::BenchArgs { model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype })
-        }
+        Commands::Bench {
+            model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype, repeat, quant,
+            storage_dtype, lm_head_dtype, embed_dtype, kv_dtype, no_graph, no_spec, prefill_batch,
+        } => bench::run(bench::BenchArgs {
+            model, n_tokens, prompt_tokens, batch_size, warmup, repeat, device, attn, quant,
+            compute_dtype: dtype, storage_dtype, lm_head_dtype, embed_dtype, kv_dtype, no_graph, no_spec,
+            prefill_batch,
+        }),
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, mtp, no_mtp, no_graph_mtp, image, video, no_dflash,
+            warmup, mtp, no_mtp, no_graph_mtp, image, video, no_dflash, no_lookup, preset, top_k, top_p,
+            min_p, repetition_penalty, repeat_last_n, presence_penalty, frequency_penalty, prefill_batch,
+            chat, system, no_think, reasoning_effort, stop, max_image_tokens, layer_sync, expert_cache_gb,
+            host_mirror_gb, qwen4_spec, embed_host,
         } => {
             let prompt = match prompt_file {
                 Some(pf) => std::fs::read_to_string(&pf)
@@ -1000,7 +1084,7 @@ fn main() -> ExitCode {
                 model,
                 prompt,
                 max_tokens,
-                temperature,
+                temperature: temperature.unwrap_or(1.0),
                 seed,
                 device,
                 max_seq,
@@ -1019,40 +1103,54 @@ fn main() -> ExitCode {
                 video,
                 no_dflash,
                 warmup,
+                no_lookup,
+                sampling: synaptix_cli::commands::llm_facade::SamplingFlags {
+                    preset,
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    repetition_penalty,
+                    repeat_last_n,
+                    presence_penalty,
+                    frequency_penalty,
+                },
+                prefill_batch,
+                chat,
+                system,
+                no_think,
+                reasoning_effort,
+                stop,
+                max_image_tokens,
+                layer_sync,
+                expert_cache_gb,
+                host_mirror_gb,
+                qwen4_spec,
+                embed_host,
             })
         }
         Commands::Chat {
-            model,
-            system,
-            max_tokens,
-            context,
-            prefill_batch,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            repetition_penalty,
-            seed,
-            device,
-            attn,
-            quant,
-            kv_dtype,
-            compute_dtype,
-            storage_dtype,
-            lm_head_dtype,
-            embed_dtype,
-            no_think,
+            model, system, max_tokens, context, prefill_batch, preset, temperature, top_k, top_p, min_p,
+            repetition_penalty, repeat_last_n, presence_penalty, frequency_penalty, seed, device, attn,
+            quant, kv_dtype, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_think,
+            reasoning_effort, stop, image, video, max_image_tokens, no_graph, no_spec, layer_sync,
         } => chat::run(chat::ChatArgs {
             model,
             system,
             max_tokens,
             context,
             prefill_batch,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            repetition_penalty,
+            sampling: synaptix_cli::commands::llm_facade::SamplingFlags {
+                preset,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+                repeat_last_n,
+                presence_penalty,
+                frequency_penalty,
+            },
             seed,
             device,
             attn,
@@ -1063,6 +1161,14 @@ fn main() -> ExitCode {
             lm_head_dtype,
             embed_dtype,
             no_think,
+            reasoning_effort,
+            stop,
+            image,
+            video,
+            max_image_tokens,
+            no_graph,
+            no_spec,
+            layer_sync,
         }),
         Commands::Diff { file_a, file_b, atol, rtol } => {
             diff::run(diff::DiffArgs { file_a, file_b, atol, rtol })

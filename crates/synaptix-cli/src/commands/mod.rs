@@ -8,6 +8,7 @@ pub mod diff;
 pub mod h3;
 pub mod imagine;
 pub mod inspect;
+pub mod llm_facade;
 pub mod music;
 pub mod podcast;
 pub mod quantize;

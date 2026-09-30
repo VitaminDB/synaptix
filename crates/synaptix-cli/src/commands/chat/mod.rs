@@ -1,7 +1,6 @@
 mod app;
 mod engine;
 mod event;
-mod template;
 mod ui;
 
 use std::io;
@@ -16,17 +15,16 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
-use synaptix_llm_common::{GenerationConfig, GenerationStats, StreamSink};
-use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
-use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
-use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
-use synaptix_tokenizer::{SpecialTokens, Tokenizer as _};
+use synaptix::facade::arch::detect_llm_arch;
+use synaptix::facade::llm::{load_llm, MediaKind};
 
 use crate::commands::device::resolve as resolve_device;
-use crate::commands::run::{detect_arch, Arch};
+use crate::commands::llm_facade::{
+    generation_options, presets_of, resolve_precision, PrecisionFlags, RuntimeFlags, SamplingFlags,
+};
 
-use app::App;
-use engine::{EngineEvt, EngineHandle};
+use app::{App, Settings};
+use engine::{EngineCmd, EngineEvt, EngineHandle, EngineSetup};
 
 pub struct ChatArgs {
     pub model: PathBuf,
@@ -34,11 +32,7 @@ pub struct ChatArgs {
     pub max_tokens: usize,
     pub context: usize,
     pub prefill_batch: usize,
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub min_p: f32,
-    pub repetition_penalty: f32,
+    pub sampling: SamplingFlags,
     pub seed: u64,
     pub device: String,
     pub attn: Option<String>,
@@ -49,100 +43,14 @@ pub struct ChatArgs {
     pub lm_head_dtype: Option<String>,
     pub embed_dtype: Option<String>,
     pub no_think: bool,
-}
-
-pub enum ChatPipeline {
-    Qwen3(Qwen3Pipeline),
-    Hybrid(HybridPipeline),
-    MuseGlimmer(MusePipeline),
-}
-
-impl ChatPipeline {
-    pub fn encode(&self, s: &str) -> Result<Vec<u32>, String> {
-        match self {
-            ChatPipeline::Qwen3(p) => p.encode(s).map_err(|e| e.to_string()),
-            ChatPipeline::Hybrid(p) => p.encode(s).map_err(|e| e.to_string()),
-            ChatPipeline::MuseGlimmer(p) => p.encode(s).map_err(|e| e.to_string()),
-        }
-    }
-
-    pub fn decode(&self, ids: &[u32]) -> Result<String, String> {
-        match self {
-            ChatPipeline::Qwen3(p) => p.decode(ids).map_err(|e| e.to_string()),
-            ChatPipeline::Hybrid(p) => p.decode(ids).map_err(|e| e.to_string()),
-            ChatPipeline::MuseGlimmer(p) => p.decode(ids).map_err(|e| e.to_string()),
-        }
-    }
-
-    pub fn specials(&self) -> SpecialTokens {
-        match self {
-            ChatPipeline::Qwen3(p) => p.tokenizer.special_tokens().clone(),
-            ChatPipeline::Hybrid(p) => p.tokenizer.special_tokens().clone(),
-            ChatPipeline::MuseGlimmer(p) => p.tokenizer.special_tokens().clone(),
-        }
-    }
-
-    pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        match self {
-            ChatPipeline::Qwen3(p) => p.tokenizer.token_to_id(token),
-            ChatPipeline::Hybrid(p) => p.tokenizer.token_to_id(token),
-            ChatPipeline::MuseGlimmer(p) => p.tokenizer.token_to_id(token),
-        }
-    }
-
-    pub fn make_kv_cache(&self, max_seq: usize) -> Result<synaptix_llm_common::KvCache, String> {
-        match self {
-            ChatPipeline::Qwen3(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
-            ChatPipeline::Hybrid(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
-            ChatPipeline::MuseGlimmer(p) => p.model.make_kv_cache(1, max_seq).map_err(|e| e.to_string()),
-        }
-    }
-
-    /// Генерация с prefix-KV-кэшем: prefill стартует с `kv.seq_len`. На CUDA
-    /// использует graph-decode (hybrid требует F16), иначе обычный decode.
-    pub fn generate_resume(
-        &self,
-        kv: &mut synaptix_llm_common::KvCache,
-        ids: &[u32],
-        cfg: GenerationConfig,
-        sink: &mut dyn StreamSink,
-    ) -> Result<(Vec<u32>, GenerationStats), String> {
-        {
-            use synaptix_core::device::Device;
-            use synaptix_core::dtype::DType;
-            match self {
-                ChatPipeline::Qwen3(p) if matches!(p.model.device, Device::Cuda(_)) => {
-                    return p
-                        .generate_with_graph_resume(kv, ids, cfg, &mut *sink)
-                        .map_err(|e| e.to_string());
-                }
-                ChatPipeline::Hybrid(p)
-                    if matches!(p.model.device, Device::Cuda(_)) && p.model.dtype == DType::F16 =>
-                {
-                    return p
-                        .generate_with_graph_resume(kv, ids, cfg, &mut *sink)
-                        .map_err(|e| e.to_string());
-                }
-                ChatPipeline::MuseGlimmer(p) if p.graph_decode_supported() => {
-                    return p
-                        .generate_with_graph_resume(kv, ids, cfg, &mut *sink)
-                        .map_err(|e| e.to_string());
-                }
-                _ => {}
-            }
-        }
-        match self {
-            ChatPipeline::Qwen3(p) => {
-                p.generate_streaming_resume(kv, ids, cfg, sink).map_err(|e| e.to_string())
-            }
-            ChatPipeline::Hybrid(p) => {
-                p.generate_streaming_resume(kv, ids, cfg, sink).map_err(|e| e.to_string())
-            }
-            ChatPipeline::MuseGlimmer(p) => {
-                p.generate_streaming_resume(kv, ids, cfg, sink).map_err(|e| e.to_string())
-            }
-        }
-    }
+    pub reasoning_effort: Option<String>,
+    pub stop: Vec<String>,
+    pub image: Vec<PathBuf>,
+    pub video: Vec<PathBuf>,
+    pub max_image_tokens: Option<usize>,
+    pub no_graph: bool,
+    pub no_spec: bool,
+    pub layer_sync: Option<String>,
 }
 
 pub fn run(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -151,94 +59,84 @@ pub fn run(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.model.exists() {
         return Err(format!("model path not found: {}", args.model.display()).into());
     }
-    let precision = crate::commands::run::build_precision(
-        args.quant.as_deref(),
-        args.compute_dtype.as_deref(),
-        args.storage_dtype.as_deref(),
-        args.lm_head_dtype.as_deref(),
-        args.embed_dtype.as_deref(),
-        args.kv_dtype.as_deref(),
+    let arch = detect_llm_arch(&args.model)?;
+    let (precision, profile) = resolve_precision(
+        &args.model,
+        &PrecisionFlags {
+            quant: args.quant.as_deref(),
+            compute_dtype: args.compute_dtype.as_deref(),
+            storage_dtype: args.storage_dtype.as_deref(),
+            lm_head_dtype: args.lm_head_dtype.as_deref(),
+            embed_dtype: args.embed_dtype.as_deref(),
+            kv_dtype: args.kv_dtype.as_deref(),
+        },
+        &RuntimeFlags {
+            no_graph: args.no_graph,
+            no_spec: args.no_spec,
+            layer_sync: args.layer_sync.clone(),
+            prefill_batch: args.prefill_batch,
+        },
     )?;
-    let arch = detect_arch(&args.model)?;
     eprintln!(
-        "synaptix chat: loading {} (arch={arch:?}, compute={:?}, attn_w={:?}, kv={:?}, {:?})",
+        "synaptix chat: loading {} (arch={arch:?}, профиль {profile}: compute={:?}, attn_w={:?}, mlp_w={:?}, kv={:?}, {:?})",
         args.model.display(),
         precision.compute,
         precision.attn_w,
+        precision.mlp_w,
         precision.kv,
         device
     );
     let t0 = std::time::Instant::now();
-    let pipeline = match arch {
-        Arch::Qwen3 => ChatPipeline::Qwen3(
-            Qwen3Pipeline::load_with_precision(&args.model, device, precision, Some(args.context))
-                .map_err(|e| format!("load: {e}"))?,
-        ),
-        Arch::Hybrid => ChatPipeline::Hybrid(
-            HybridPipeline::load_with_precision(&args.model, device, precision, Some(args.context))
-                .map_err(|e| format!("load: {e}"))?,
-        ),
-        Arch::Qwen4Exp => {
-            return Err("chat пока без qwen4_exp: используйте `synaptix run`".into())
-        }
-        Arch::MuseGlimmer => ChatPipeline::MuseGlimmer(
-            MusePipeline::load_with_precision(&args.model, device, precision, Some(args.context))
-                .map_err(|e| format!("load: {e}"))?,
-        ),
-    };
+    let (llm, tok) = load_llm(&args.model, device, precision, Some(args.context))?;
     eprintln!("synaptix chat: loaded in {:.2}s", t0.elapsed().as_secs_f32());
-
-    let prompt = template::Prompt::load(&args.model, &pipeline, !args.no_think);
-    if !prompt.has_template() {
-        eprintln!("synaptix chat: chat-template не найден — простой формат <|im_start|>");
+    if let Some(levels) = tok.reasoning_levels() {
+        eprintln!("synaptix chat: глубина размышлений: {} (по умолчанию {})", levels.levels.join(" | "), levels.default);
     }
-    let mut cfg = build_gen_config(&args);
-    cfg.eos_token_ids = prompt.stop_ids();
-
-    let engine = EngineHandle::spawn(pipeline);
-    let mut app = App::new(
-        prompt,
-        args.system.clone(),
-        arch_label(arch).into(),
-        model_label(&args.model),
-        cfg,
+    let thinking = !args.no_think;
+    let max_new = if args.max_tokens == 0 { args.context } else { args.max_tokens };
+    let (opts, preset) =
+        generation_options(&args.model, &args.sampling, thinking, max_new, args.context, args.seed);
+    eprintln!(
+        "synaptix chat: пресет {preset} (доступно: {}) → t={} top_k={} top_p={} min_p={} rep={} presence={}",
+        presets_of(&args.model).join(", "),
+        opts.temperature,
+        opts.top_k,
+        opts.top_p,
+        opts.min_p,
+        opts.repeat_penalty,
+        opts.presence_penalty
     );
+
+    let attach: Vec<(PathBuf, MediaKind)> = args
+        .image
+        .iter()
+        .map(|p| (p.clone(), MediaKind::Image))
+        .chain(args.video.iter().map(|p| (p.clone(), MediaKind::Video)))
+        .collect();
+    if !attach.is_empty() && !llm.supports_media() {
+        return Err(format!("{arch:?}: модель не принимает картинки/видео").into());
+    }
+    let engine = EngineHandle::spawn(EngineSetup {
+        llm,
+        tok,
+        context: args.context,
+        stops: args.stop.clone(),
+        max_image_tokens: args.max_image_tokens,
+    });
+    let mut app = App::new(
+        args.system.clone(),
+        format!("{arch:?}"),
+        model_label(&args.model),
+        Settings { opts, thinking, effort: args.reasoning_effort.clone(), preset },
+    );
+    for (path, kind) in attach {
+        engine.send(EngineCmd::Attach { path, kind });
+        app.busy_attach = true;
+    }
 
     let res = run_ui(&mut app, &engine);
     engine.shutdown();
     res.map_err(Into::into)
-}
-
-fn build_gen_config(args: &ChatArgs) -> GenerationConfig {
-    GenerationConfig {
-        // 0 = без лимита: генерим до <|im_end|> / заполнения контекста (decode-loop
-        // и так стопается на eos и при pos >= max_seq). Иначе — жёсткий потолок.
-        max_new_tokens: if args.max_tokens == 0 { args.context } else { args.max_tokens },
-        temperature: args.temperature,
-        top_k: args.top_k,
-        top_p: args.top_p,
-        min_p: args.min_p,
-        repetition_penalty: args.repetition_penalty,
-        // Окно штрафа и presence/frequency у CLI-чата не настраиваются —
-        // дефолты сохраняют прежнее поведение (штраф по всему контексту).
-        repeat_last_n: 0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        seed: args.seed,
-        eos_token_id: None,
-        eos_token_ids: Vec::new(),
-        max_seq: Some(args.context),
-        prefill_batch: args.prefill_batch,
-    }
-}
-
-fn arch_label(arch: Arch) -> &'static str {
-    match arch {
-        Arch::Qwen3 => "qwen3",
-        Arch::Hybrid => "qwen3-next-hybrid",
-        Arch::MuseGlimmer => "muse-glimmer",
-        Arch::Qwen4Exp => "qwen4-exp",
-    }
 }
 
 fn model_label(path: &std::path::Path) -> String {
@@ -278,10 +176,9 @@ fn run_ui(app: &mut App, engine: &EngineHandle) -> io::Result<()> {
 
         while let Ok(evt) = engine.evt_rx.try_recv() {
             match evt {
-                EngineEvt::TokenDelta(s) => app.push_delta(&s),
-                EngineEvt::Done { stats, cached, ctx_used, ctx_max } => {
-                    app.finish(&stats, cached, ctx_used, ctx_max)
-                }
+                EngineEvt::Delta(part, s) => app.push_delta(part, &s),
+                EngineEvt::Attached { block, tokens, label } => app.attached(&block, tokens, &label),
+                EngineEvt::Done(stats) => app.finish(&stats),
                 EngineEvt::Error(e) => app.fail(&e),
             }
         }

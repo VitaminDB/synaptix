@@ -1,21 +1,43 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
-use synaptix_llm_common::{GenerationConfig, GenerationStats};
+use synaptix::facade::llm::{
+    GenerationOptions, Llm, LlmGeneration, LlmKvSession, LlmTokenizer, MediaEmbedding, MediaKind, Message,
+};
 
-use super::ChatPipeline;
+use crate::commands::llm_facade::{Part, Splitter};
+
+pub struct Turn {
+    pub messages: Vec<Message>,
+    pub opts: GenerationOptions,
+    pub thinking: bool,
+    pub effort: Option<String>,
+}
 
 pub enum EngineCmd {
-    Generate { prompt: String, cfg: GenerationConfig },
+    Generate(Box<Turn>),
+    Attach { path: PathBuf, kind: MediaKind },
     Reset,
     Shutdown,
 }
 
+pub struct TurnStats {
+    pub prompt_tokens: usize,
+    pub cached: usize,
+    pub new_tokens: usize,
+    pub prefill_ms: u128,
+    pub decode_ms: u128,
+    pub ctx_max: usize,
+}
+
 pub enum EngineEvt {
-    TokenDelta(String),
-    Done { stats: GenerationStats, cached: usize, ctx_used: usize, ctx_max: usize },
+    Delta(Part, String),
+    Attached { block: String, tokens: usize, label: String },
+    Done(TurnStats),
     Error(String),
 }
 
@@ -26,26 +48,32 @@ pub struct EngineHandle {
     join: Option<JoinHandle<()>>,
 }
 
+pub struct EngineSetup {
+    pub llm: Llm,
+    pub tok: LlmTokenizer,
+    pub context: usize,
+    pub stops: Vec<String>,
+    pub max_image_tokens: Option<usize>,
+}
+
 impl EngineHandle {
-    pub fn spawn(pipeline: ChatPipeline) -> Self {
+    pub fn spawn(setup: EngineSetup) -> Self {
         let (cmd_tx, cmd_rx) = channel::<EngineCmd>();
         let (evt_tx, evt_rx) = channel::<EngineEvt>();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = Arc::clone(&cancel);
         let join = std::thread::Builder::new()
             .name("synaptix-chat-engine".into())
-            .spawn(move || run_engine(pipeline, cmd_rx, evt_tx, cancel_thread))
+            .spawn(move || run_engine(setup, cmd_rx, evt_tx, cancel_thread))
             .expect("spawn chat engine thread");
         Self { cmd_tx, evt_rx, cancel, join: Some(join) }
     }
 
-    pub fn generate(&self, prompt: String, cfg: GenerationConfig) {
-        self.cancel.store(false, Ordering::Relaxed);
-        let _ = self.cmd_tx.send(EngineCmd::Generate { prompt, cfg });
-    }
-
-    pub fn reset(&self) {
-        let _ = self.cmd_tx.send(EngineCmd::Reset);
+    pub fn send(&self, cmd: EngineCmd) {
+        if matches!(cmd, EngineCmd::Generate(_)) {
+            self.cancel.store(false, Ordering::Relaxed);
+        }
+        let _ = self.cmd_tx.send(cmd);
     }
 
     pub fn cancel(&self) {
@@ -60,106 +88,106 @@ impl EngineHandle {
     }
 }
 
-fn run_engine(
-    pipeline: ChatPipeline,
-    cmd_rx: Receiver<EngineCmd>,
-    evt_tx: Sender<EngineEvt>,
-    cancel: Arc<AtomicBool>,
-) {
-    // Кэш между ходами ОТКЛЮЧЁН: каждый ход — свежий KV + полный prefill всего
-    // промпта (app шлёт полный jinja-рендер истории). Нет межходового состояния.
+fn run_engine(setup: EngineSetup, cmd_rx: Receiver<EngineCmd>, evt_tx: Sender<EngineEvt>, cancel: Arc<AtomicBool>) {
+    let EngineSetup { llm, tok, context, stops, max_image_tokens } = setup;
+    let mut session: Option<LlmKvSession> = llm.new_kv_session(context, context).ok().flatten();
+    let mut media: Vec<MediaEmbedding> = Vec::new();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            EngineCmd::Reset => {}
-            EngineCmd::Generate { prompt, cfg } => {
-                cancel.store(false, Ordering::Relaxed);
-                let ids = match pipeline.encode(&prompt) {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        let _ = evt_tx.send(EngineEvt::Error(e));
-                        continue;
-                    }
-                };
-                if ids.is_empty() {
-                    let _ = evt_tx.send(EngineEvt::Error("empty prompt".into()));
-                    continue;
+            EngineCmd::Shutdown => break,
+            EngineCmd::Reset => {
+                media.clear();
+                if let Some(s) = session.as_mut() {
+                    s.invalidate();
                 }
-                let max_seq = cfg.max_seq.unwrap_or(ids.len() + cfg.max_new_tokens);
-                let mut kv = match pipeline.make_kv_cache(max_seq) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        let _ = evt_tx.send(EngineEvt::Error(e));
-                        continue;
+            }
+            EngineCmd::Attach { path, kind } => {
+                let res = llm.ensure_media_tower().and_then(|ok| {
+                    if !ok {
+                        return Err("в бандле нет башни зрения".into());
                     }
-                };
-
-                let pipeline_ref = &pipeline;
-                let evt = evt_tx.clone();
-                let cancel_sink = Arc::clone(&cancel);
-                let mut detok = IncrementalDecoder::new();
-                let mut sink = move |tok: u32| -> bool {
-                    if let Some(delta) = detok.push(pipeline_ref, tok) {
-                        let _ = evt.send(EngineEvt::TokenDelta(delta));
+                    match kind {
+                        MediaKind::Image => llm.encode_image(&path, max_image_tokens),
+                        MediaKind::Video => llm.encode_video(&path),
                     }
-                    !cancel_sink.load(Ordering::Relaxed)
-                };
-                let res = pipeline.generate_resume(&mut kv, &ids, cfg, &mut sink);
-                drop(sink);
+                });
                 match res {
-                    Ok((_out, stats)) => {
-                        let _ = evt_tx.send(EngineEvt::Done {
-                            stats,
-                            cached: 0,
-                            ctx_used: kv.seq_len,
-                            ctx_max: kv.max_seq,
+                    Ok(m) => {
+                        let _ = evt_tx.send(EngineEvt::Attached {
+                            block: m.prompt_block.clone(),
+                            tokens: m.tokens,
+                            label: path.display().to_string(),
                         });
+                        media.push(m);
                     }
                     Err(e) => {
-                        let _ = evt_tx.send(EngineEvt::Error(e));
+                        let _ = evt_tx.send(EngineEvt::Error(format!("{}: {e}", path.display())));
                     }
                 }
             }
-            EngineCmd::Shutdown => break,
+            EngineCmd::Generate(turn) => {
+                let evt = match generate(&llm, &tok, session.as_mut(), &media, &stops, *turn, &evt_tx, &cancel) {
+                    Ok(stats) => EngineEvt::Done(TurnStats { ctx_max: context, ..stats }),
+                    Err(e) => EngineEvt::Error(e),
+                };
+                let _ = evt_tx.send(evt);
+            }
         }
     }
 }
 
-/// Инкрементальная детокенизация (vLLM-стиль): декодит только окно
-/// `ids[prefix_offset..]` (обычно 1-3 токена), а не всю последовательность
-/// каждый токен. Старая версия делала `decode(&ids)` по всему накопленному
-/// выводу → O(N) на токен = O(N²) за генерацию; на 27B это попадало ВНУТРЬ
-/// decode-цикла (sink.on_token меряется в decode_ms) и съедало tok/s в чате.
-struct IncrementalDecoder {
-    ids: Vec<u32>,
-    prefix_offset: usize,
-    read_offset: usize,
-}
-
-impl IncrementalDecoder {
-    fn new() -> Self {
-        Self { ids: Vec::new(), prefix_offset: 0, read_offset: 0 }
+#[allow(clippy::too_many_arguments)]
+fn generate(
+    llm: &Llm,
+    tok: &LlmTokenizer,
+    session: Option<&mut LlmKvSession>,
+    media: &[MediaEmbedding],
+    stops: &[String],
+    turn: Turn,
+    evt_tx: &Sender<EngineEvt>,
+    cancel: &AtomicBool,
+) -> Result<TurnStats, String> {
+    let prompt = tok
+        .apply_chat_template_reasoning(&turn.messages, true, turn.thinking, turn.effort.as_deref(), None)
+        .map_err(|e| format!("chat-template: {e}"))?;
+    let ids = tok.encode(&prompt).map_err(|e| e.to_string())?;
+    if ids.is_empty() {
+        return Err("пустой промпт".into());
     }
-
-    fn push(&mut self, pipeline: &ChatPipeline, tok: u32) -> Option<String> {
-        self.ids.push(tok);
-        // prefix_text — детокен окна без нового токена; new_text — с ним. Дельта =
-        // хвост new_text за длиной prefix_text. Окно [prefix_offset..] мало, т.к.
-        // BPE-merge/byte-fallback захватывают лишь несколько соседних токенов.
-        let prefix_text = if self.prefix_offset >= self.read_offset {
-            String::new()
-        } else {
-            pipeline.decode(&self.ids[self.prefix_offset..self.read_offset]).ok()?
-        };
-        let new_text = pipeline.decode(&self.ids[self.prefix_offset..]).ok()?;
-        if new_text.len() <= prefix_text.len() || new_text.ends_with('\u{FFFD}') {
-            return None; // незавершённый multi-byte символ / merge — ждём следующий токен
-        }
-        if !new_text.is_char_boundary(prefix_text.len()) {
-            return None;
-        }
-        let delta = new_text[prefix_text.len()..].to_string();
-        self.prefix_offset = self.read_offset;
-        self.read_offset = self.ids.len();
-        Some(delta)
+    let mut gen = LlmGeneration::new(llm, turn.opts);
+    gen.set_stop_tokens(tok.eos_ids().to_vec());
+    for s in stops {
+        gen.add_stop_sequence(s);
     }
+    gen.set_interrupt(|| cancel.load(Ordering::Relaxed));
+    let mut splitter = Splitter::new(tok, &prompt);
+    let started = Instant::now();
+    let mut first: Option<Instant> = None;
+    let mut new_tokens = 0usize;
+    let on_token = |id: u32, delta: &str| -> bool {
+        first.get_or_insert_with(Instant::now);
+        new_tokens += 1;
+        splitter.push(id, delta, &mut |part, text| {
+            let _ = evt_tx.send(EngineEvt::Delta(part, text.to_string()));
+        });
+        !cancel.load(Ordering::Relaxed)
+    };
+    let refs: Vec<&MediaEmbedding> = media.iter().collect();
+    let cached = match session {
+        Some(s) if refs.is_empty() => gen.generate_streaming_cached(s, &ids, tok, on_token),
+        Some(s) if llm.kv_session_media_ok() => gen.generate_streaming_cached_media(s, &ids, tok, &refs, on_token),
+        _ if !refs.is_empty() => gen.generate_streaming_media(&ids, tok, &refs, on_token).map(|_| 0),
+        _ => gen.generate_streaming(&ids, tok, on_token).map(|_| 0),
+    }
+    .map_err(|e| e.to_string())?;
+    let end = Instant::now();
+    let first = first.unwrap_or(end);
+    Ok(TurnStats {
+        prompt_tokens: ids.len(),
+        cached,
+        new_tokens,
+        prefill_ms: (first - started).as_millis(),
+        decode_ms: (end - first).as_millis(),
+        ctx_max: 0,
+    })
 }

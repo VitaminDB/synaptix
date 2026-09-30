@@ -50,7 +50,21 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
             format!("{label}:"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )));
-        if m.text.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+        for a in &m.attachments {
+            lines.push(Line::from(Span::styled(format!("[вложение: {a}]"), dim)));
+        }
+        if !m.reasoning.is_empty() {
+            for seg in m.reasoning.split('\n') {
+                lines.push(Line::from(Span::styled(seg.to_string(), dim)));
+            }
+        }
+        if !m.tool.is_empty() {
+            for seg in m.tool.split('\n') {
+                lines.push(Line::from(Span::styled(seg.to_string(), Style::default().fg(Color::Yellow))));
+            }
+        }
+        if m.text.is_empty() && m.reasoning.is_empty() {
             lines.push(Line::from(""));
         } else {
             for seg in m.text.split('\n') {
@@ -66,7 +80,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let title = if app.generating {
         " генерация… (Esc — отмена) "
     } else {
-        " сообщение (Enter — отправить, /reset, /quit) "
+        " сообщение (Enter — отправить; /image, /video, /think, /effort, /temp, /reset, /quit) "
     };
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
@@ -88,8 +102,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "•"
     };
     let text = format!(
-        " {spin} {} · {} · t={:.2} top_k={} top_p={:.2} · {}",
-        app.model_label, app.arch_label, app.cfg.temperature, app.cfg.top_k, app.cfg.top_p, app.status
+        " {spin} {} · {} · {} t={:.2} top_k={} top_p={:.2} think={} · {}",
+        app.model_label,
+        app.arch_label,
+        app.settings.preset,
+        app.settings.opts.temperature,
+        app.settings.opts.top_k,
+        app.settings.opts.top_p,
+        if app.settings.thinking { "on" } else { "off" },
+        app.status
     );
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(para, area);

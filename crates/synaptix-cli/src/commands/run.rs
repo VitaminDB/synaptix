@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use synaptix_core::device::Device;
-use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
 
 use crate::commands::device::resolve as resolve_device;
+use crate::commands::llm_facade::{
+    generation_options, resolve_precision, Part, PrecisionFlags, RuntimeFlags, SamplingFlags, Splitter,
+};
 
 pub struct RunArgs {
     pub model: PathBuf,
@@ -51,56 +53,55 @@ pub struct RunArgs {
     pub video: Option<PathBuf>,
     /// Запретить DFlash-спекуляцию (Muse Glimmer), даже если драфтер в бандле.
     pub no_dflash: bool,
+    pub no_lookup: bool,
+    pub sampling: SamplingFlags,
+    pub prefill_batch: usize,
+    pub chat: bool,
+    pub system: Option<String>,
+    pub no_think: bool,
+    pub reasoning_effort: Option<String>,
+    pub stop: Vec<String>,
+    pub max_image_tokens: Option<usize>,
+    pub layer_sync: Option<String>,
+    pub expert_cache_gb: Option<f64>,
+    pub host_mirror_gb: Option<f64>,
+    pub qwen4_spec: bool,
+    pub embed_host: bool,
 }
 
-/// `--kv-dtype` → DType KV-кеша. Делегирует в единый фасад.
-pub fn parse_kv_dtype(s: Option<&str>, compute: DType) -> DType {
-    synaptix::facade::llm::parse_kv_dtype(s, compute)
+fn base_cfg(args: &RunArgs) -> synaptix_llm_common::GenerationConfig {
+    let s = &args.sampling;
+    synaptix_llm_common::GenerationConfig {
+        top_k: s.top_k.unwrap_or(0),
+        top_p: s.top_p.unwrap_or(1.0),
+        min_p: s.min_p.unwrap_or(0.0),
+        repetition_penalty: s.repetition_penalty.unwrap_or(1.0),
+        repeat_last_n: s.repeat_last_n.unwrap_or(0),
+        presence_penalty: s.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: s.frequency_penalty.unwrap_or(0.0),
+        prefill_batch: args.prefill_batch,
+        ..Default::default()
+    }
 }
 
-/// Строит [`PrecisionConfig`] из CLI: пресет (`--quant`) → override compute →
-/// override весов (storage/lm-head/embed) → kv. Единый билдер из `synaptix::facade::llm`.
-pub fn build_precision(
-    quant: Option<&str>,
-    compute_dtype: Option<&str>,
-    storage_dtype: Option<&str>,
-    lm_head_dtype: Option<&str>,
-    embed_dtype: Option<&str>,
-    kv_dtype: Option<&str>,
-) -> Result<PrecisionConfig, String> {
-    synaptix::facade::llm::build_precision(
-        quant,
-        compute_dtype,
-        storage_dtype,
-        lm_head_dtype,
-        embed_dtype,
-        kv_dtype,
-    )
-}
-
-/// Архитектура модели — определяет, какой pipeline грузит CLI (run/chat
-/// поддерживают qwen3/hybrid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     Qwen3,
     Hybrid,
     MuseGlimmer,
     Qwen4Exp,
+    Facade(synaptix::facade::arch::LlmArch),
 }
 
-/// Детекция архитектуры через единый `synaptix::facade::arch`. Llama/Gemma3 в
-/// CLI run/chat не поддержаны (используйте synthos) — возвращают ошибку.
 pub fn detect_arch(path: &Path) -> Result<Arch, String> {
     use synaptix::facade::arch::{detect_llm_arch, LlmArch};
-    match detect_llm_arch(path)? {
-        LlmArch::Qwen3 => Ok(Arch::Qwen3),
-        LlmArch::Hybrid => Ok(Arch::Hybrid),
-        LlmArch::MuseGlimmer => Ok(Arch::MuseGlimmer),
-        LlmArch::Qwen4Exp => Ok(Arch::Qwen4Exp),
-        other => Err(format!(
-            "CLI run/chat поддерживает qwen3/hybrid/muse_glimmer; детектирован {other:?} — используйте synthos"
-        )),
-    }
+    Ok(match detect_llm_arch(path)? {
+        LlmArch::Qwen3 => Arch::Qwen3,
+        LlmArch::Hybrid => Arch::Hybrid,
+        LlmArch::MuseGlimmer => Arch::MuseGlimmer,
+        LlmArch::Qwen4Exp => Arch::Qwen4Exp,
+        other => Arch::Facade(other),
+    })
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -110,30 +111,164 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.model.exists() {
         return Err(format!("model path not found: {}", args.model.display()).into());
     }
-    let precision = build_precision(
-        args.quant.as_deref(),
-        args.compute_dtype.as_deref(),
-        args.storage_dtype.as_deref(),
-        args.lm_head_dtype.as_deref(),
-        args.embed_dtype.as_deref(),
-        args.kv_dtype.as_deref(),
+    let (precision, profile) = resolve_precision(
+        &args.model,
+        &PrecisionFlags {
+            quant: args.quant.as_deref(),
+            compute_dtype: args.compute_dtype.as_deref(),
+            storage_dtype: args.storage_dtype.as_deref(),
+            lm_head_dtype: args.lm_head_dtype.as_deref(),
+            embed_dtype: args.embed_dtype.as_deref(),
+            kv_dtype: args.kv_dtype.as_deref(),
+        },
+        &RuntimeFlags {
+            no_graph: !args.graph,
+            no_spec: args.no_mtp || args.no_dflash,
+            layer_sync: args.layer_sync.clone(),
+            prefill_batch: args.prefill_batch,
+        },
     )?;
     let arch = detect_arch(&args.model)?;
-    if args.video.is_some() && !matches!(arch, Arch::MuseGlimmer | Arch::Qwen4Exp) {
-        return Err("--video поддержан для muse_glimmer и qwen4_exp".into());
+    if let Some(gb) = args.expert_cache_gb {
+        std::env::set_var("SYN_QWEN4EXP_EXPERT_CACHE_GB", gb.to_string());
+    }
+    if let Some(gb) = args.host_mirror_gb {
+        std::env::set_var("SYN_QWEN4EXP_HOST_MIRROR_GB", gb.to_string());
+    }
+    if args.qwen4_spec {
+        std::env::set_var("SYN_QWEN4EXP_SPEC", "1");
+    }
+    if args.embed_host {
+        std::env::set_var("SYN_QWEN4EXP_EMBED_HOST", "1");
+    }
+    let facade = matches!(arch, Arch::Facade(_))
+        || args.chat
+        || !args.stop.is_empty()
+        || (args.image.is_some() && args.video.is_some())
+        || (arch == Arch::Hybrid && args.video.is_some());
+    if arch == Arch::Qwen3 && (args.image.is_some() || args.video.is_some()) {
+        return Err("qwen3 — текстовая модель: --image/--video не поддержаны".into());
     }
     eprintln!(
-        "synaptix run: loading model from {} (arch={arch:?}, compute={:?}, attn_w={:?}, mlp_w={:?}, lm_head={:?}, embed={:?}, kv={:?}, {:?})",
+        "synaptix run: loading model from {} (arch={arch:?}, профиль {profile}: compute={:?}, attn_w={:?}, mlp_w={:?}, lm_head={:?}, embed={:?}, kv={:?}, {:?}){}",
         args.model.display(),
         precision.compute, precision.attn_w, precision.mlp_w,
-        precision.lm_head, precision.embed, precision.kv, device
+        precision.lm_head, precision.embed, precision.kv, device,
+        if facade { " через фасад" } else { "" }
     );
+    if facade {
+        return run_facade(&args, device, precision);
+    }
     match arch {
         Arch::Qwen3 => run_qwen3(&args, device, precision),
         Arch::Hybrid => run_hybrid(&args, device, precision),
         Arch::MuseGlimmer => run_muse(&args, device, precision),
         Arch::Qwen4Exp => run_qwen4_exp(&args, device, precision),
+        Arch::Facade(_) => unreachable!(),
     }
+}
+
+fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix::facade::llm::{load_llm, LlmGeneration, Message};
+
+    let t0 = std::time::Instant::now();
+    let (llm, tok) = load_llm(&args.model, device, precision, args.max_seq)?;
+    eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    let mut media = Vec::new();
+    if (args.image.is_some() || args.video.is_some()) && !llm.ensure_media_tower()? {
+        return Err("в бандле нет башни зрения".into());
+    }
+    if let Some(p) = &args.image {
+        let m = llm.encode_image(p, args.max_image_tokens)?;
+        eprintln!("synaptix run: image {} → {} vision-токенов", p.display(), m.tokens);
+        media.push(m);
+    }
+    if let Some(p) = &args.video {
+        let m = llm.encode_video(p)?;
+        eprintln!("synaptix run: video {} → {} токенов", p.display(), m.tokens);
+        media.push(m);
+    }
+    let chat = args.chat || !media.is_empty();
+    let thinking = !args.no_think;
+    let prompt = if chat {
+        let blocks: String = media.iter().map(|m| m.prompt_block.as_str()).collect();
+        let mut msgs = Vec::new();
+        if let Some(sys) = &args.system {
+            msgs.push(Message::system(sys.clone()));
+        }
+        msgs.push(Message::user(format!("{blocks}{}", args.prompt)));
+        tok.apply_chat_template_reasoning(&msgs, true, thinking, args.reasoning_effort.as_deref(), None)?
+    } else {
+        args.prompt.clone()
+    };
+    let ids = tok.encode(&prompt)?;
+    eprintln!("synaptix run: prompt {} tokens", ids.len());
+    let mut sampling = args.sampling.clone();
+    if !chat {
+        sampling.temperature = sampling.temperature.or(Some(args.temperature));
+    }
+    let max_seq = args.max_seq.unwrap_or(ids.len() + args.max_tokens + 16);
+    let (opts, preset) = generation_options(&args.model, &sampling, thinking, args.max_tokens, max_seq, args.seed);
+    eprintln!(
+        "synaptix run: сэмплинг {preset}: t={} top_k={} top_p={} min_p={} rep={} presence={}",
+        opts.temperature, opts.top_k, opts.top_p, opts.min_p, opts.repeat_penalty, opts.presence_penalty
+    );
+    let refs: Vec<_> = media.iter().collect();
+    let run_once = |max_new: usize, print: bool| -> Result<(usize, u128, u128), Box<dyn std::error::Error>> {
+        let mut gen = LlmGeneration::new(&llm, synaptix::facade::llm::GenerationOptions { max_new_tokens: max_new, ..opts.clone() });
+        gen.set_stop_tokens(tok.eos_ids().to_vec());
+        for s in &args.stop {
+            gen.add_stop_sequence(s);
+        }
+        let mut splitter = Splitter::new(&tok, &prompt);
+        let started = std::time::Instant::now();
+        let mut first = None;
+        let mut n = 0usize;
+        let mut last_part = Part::Answer;
+        let on_token = |id: u32, delta: &str| -> bool {
+            first.get_or_insert_with(std::time::Instant::now);
+            n += 1;
+            if print {
+                use std::io::Write;
+                if chat {
+                    splitter.push(id, delta, &mut |part, text| {
+                        if part != last_part {
+                            eprintln!();
+                            last_part = part;
+                        }
+                        match part {
+                            Part::Answer => print!("{text}"),
+                            Part::Reasoning => eprint!("\x1b[2m{text}\x1b[0m"),
+                            Part::Tool => eprint!("\x1b[33m{text}\x1b[0m"),
+                        }
+                    });
+                } else {
+                    print!("{delta}");
+                }
+                let _ = std::io::stdout().flush();
+            }
+            true
+        };
+        if refs.is_empty() {
+            gen.generate_streaming(&ids, &tok, on_token)?;
+        } else {
+            gen.generate_streaming_media(&ids, &tok, &refs, on_token)?;
+        }
+        let end = std::time::Instant::now();
+        let first = first.unwrap_or(end);
+        Ok((n, (first - started).as_millis(), (end - first).as_millis()))
+    };
+    if args.warmup {
+        run_once(2, false)?;
+        eprintln!("synaptix run: warmup done");
+    }
+    if !chat {
+        print!("{}", args.prompt);
+    }
+    let (n, prefill_ms, decode_ms) = run_once(args.max_tokens, true)?;
+    println!();
+    print_stats(ids.len(), n, prefill_ms, decode_ms);
+    Ok(())
 }
 
 fn run_muse(
@@ -214,7 +349,7 @@ fn run_muse(
         temperature: args.temperature,
         seed: args.seed,
         max_seq: args.max_seq,
-        ..Default::default()
+        ..base_cfg(args)
     };
 
     let media = if let Some((_, emb)) = &image_embeds {
@@ -259,7 +394,7 @@ fn run_muse(
             dfs.acceptance() * 100.0
         );
         (ids, stats)
-    } else if args.temperature == 0.0 && !device.is_cpu() {
+    } else if args.temperature == 0.0 && !device.is_cpu() && !args.no_lookup {
         let mut noop = |_: u32| true;
         let (ids, stats, lk) = pipeline
             .generate_lookup_streaming(&prompt_ids, gen_cfg, &mut noop)
@@ -381,7 +516,7 @@ fn run_qwen4_exp(
         temperature: args.temperature,
         seed: args.seed,
         max_seq: args.max_seq,
-        ..Default::default()
+        ..base_cfg(args)
     };
     let (new_ids, stats) = match &media {
         None => pipeline.generate(&prompt_ids, gen_cfg).map_err(|e| format!("generate: {e}"))?,
@@ -443,7 +578,7 @@ fn run_qwen3(
 
     // MXFP8-KV поддержан dev/graph-путём (B3.6: device-pos append + device-Tkv
     // flash-decode) — квант-KV больше не отключает граф.
-    let graph_ok = args.graph && !device.is_cpu();
+    let graph_ok = args.graph && !device.is_cpu() && pipeline.graph_decode_supported();
 
     // --warmup — прогон одного prefill+1-токен до замера, чтобы NVRTC JIT
     // (~100ms, one-time) не загрязнял prefill_ms. Для честного warm-бенчмарка.
@@ -467,7 +602,7 @@ fn run_qwen3(
         seed: args.seed,
         eos_token_id: pipeline.config.eos_token_id,
         max_seq: args.max_seq,
-        ..Default::default()
+        ..base_cfg(args)
     };
 
     let use_graph = graph_ok;
@@ -498,8 +633,7 @@ fn run_hybrid(
 
     let compute = precision.compute;
     let t0 = std::time::Instant::now();
-    let greedy = args.temperature == 0.0;
-    let want_mtp = !args.no_mtp && (args.mtp || greedy) && args.image.is_none();
+    let want_mtp = !args.no_mtp && args.image.is_none();
     let pipeline = HybridPipeline::load_with_precision_mtp(
         &args.model, device, precision, args.max_seq, want_mtp,
     )
@@ -507,10 +641,7 @@ fn run_hybrid(
     if args.mtp && !pipeline.has_mtp() {
         return Err("MTP запрошен, но mtp.* нет в бандле (нужен MTP-вариант GGUF)".into());
     }
-    if args.mtp && !greedy {
-        return Err("MTP-декод реализован для greedy: укажите --temperature 0".into());
-    }
-    let use_mtp = pipeline.has_mtp() && greedy && !args.no_mtp;
+    let use_mtp = pipeline.has_mtp() && !args.no_mtp && args.image.is_none();
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
     let mut pipeline = pipeline;
@@ -555,7 +686,7 @@ fn run_hybrid(
             temperature: args.temperature,
             seed: args.seed,
             max_seq: args.max_seq,
-            ..Default::default()
+            ..base_cfg(args)
         };
         let mut noop = |_: u32| true;
         let t = std::time::Instant::now();
@@ -581,16 +712,13 @@ fn run_hybrid(
         temperature: args.temperature,
         seed: args.seed,
         max_seq: args.max_seq,
-        ..Default::default()
+        ..base_cfg(args)
     };
 
     if use_mtp {
         let mut noop = |_: u32| true;
         let t = std::time::Instant::now();
-        let graph_mtp = !args.no_graph_mtp && !device.is_cpu() && compute == DType::F16;
-        if !args.no_graph_mtp && !graph_mtp {
-            eprintln!("synaptix run: MTP-граф требует CUDA + compute=F16 → обычный MTP-путь");
-        }
+        let graph_mtp = !args.no_graph_mtp && !device.is_cpu();
         let res = if graph_mtp {
             pipeline.generate_mtp_with_graph(&prompt_ids, gen_cfg, &mut noop)
         } else {
@@ -626,11 +754,9 @@ fn run_hybrid(
     // CUDA-graph для гибрида требует compute=F16 (ядра linear-decode F16-нативные).
     // MXFP8-KV поддержан (B3.6) — квант-KV граф не отключает.
     let want_graph = args.graph && !device.is_cpu();
-    let use_graph = want_graph && compute == DType::F16;
+    let use_graph = want_graph && pipeline.graph_decode_supported();
     if want_graph && !use_graph {
-        eprintln!(
-            "synaptix run: CUDA-graph для hybrid требует compute=F16 (например --quant nvfp4); compute={compute:?} → обычный decode"
-        );
+        eprintln!("synaptix run: CUDA-graph недоступен (нужны compute=F16 и все блоки на карте) → обычный decode");
     }
 
     let (new_ids, stats) = if use_graph {
@@ -662,6 +788,10 @@ fn print_run_result(
 ) {
     print!("{prompt}{text}");
     println!();
+    print_stats(prompt_tokens, new_tokens, prefill_ms, decode_ms);
+}
+
+fn print_stats(prompt_tokens: usize, new_tokens: usize, prefill_ms: u128, decode_ms: u128) {
     let tot = prefill_ms + decode_ms;
     let prefill_tps = if prefill_ms > 0 {
         (prompt_tokens as f32) / (prefill_ms as f32 / 1000.0)

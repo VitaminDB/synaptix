@@ -406,10 +406,7 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
 /// `--kv-dtype` → DType KV-кеша. `fp8`/`mxfp8` → MXFP8 (Blackwell block-scale);
 /// иначе compute dtype.
 pub fn parse_kv_dtype(s: Option<&str>, compute: DType) -> DType {
-    match s.map(|x| x.to_ascii_lowercase()).as_deref() {
-        Some("fp8") | Some("mxfp8") => DType::MXFP8,
-        _ => compute,
-    }
+    s.and_then(KvDtypePolicy::from_name).map(KvDtypePolicy::to_dtype).unwrap_or(compute)
 }
 
 /// Строит [`PrecisionConfig`] из CLI-стиля: пресет (`quant`) → override compute →
