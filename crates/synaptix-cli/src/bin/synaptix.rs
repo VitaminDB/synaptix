@@ -643,46 +643,57 @@ enum Commands {
     },
     /// Генерация изображения по тексту (SDXL txt2img): PROMPT → PNG.
     Imagine {
-        /// HF-директория SDXL (text_encoder/, unet/, vae/, tokenizer/...).
+        /// Бандл .syn или каталог diffusers: SDXL, FLUX.1, FLUX.2, Qwen-Image (Edit/Edit-Plus), Qwen-Image 2.1.
         model: PathBuf,
         prompt: String,
         #[arg(short, long, default_value = "out.png")]
         output: PathBuf,
-        /// Негативный промпт (что НЕ должно быть на картинке).
-        #[arg(short = 'n', long, default_value = "")]
-        negative: String,
-        #[arg(long, default_value_t = 30)]
-        steps: usize,
-        /// Сила CFG (classifier-free guidance). SDXL-base: ~5-8.
-        #[arg(long, default_value_t = 5.0)]
-        cfg: f32,
-        #[arg(long, default_value_t = 1024)]
-        height: usize,
-        #[arg(long, default_value_t = 1024)]
-        width: usize,
+        #[arg(short = 'n', long, help = "Негатив: SDXL — CFG-негатив; Qwen-Image — true CFG (по умолчанию \" \"); Qwen-Image 2.1 — CFG при --cfg > 1")]
+        negative: Option<String>,
+        #[arg(long, help = "Шагов (0 или без флага — по модели: SDXL 30, FLUX.1 dev 28 / schnell 4, FLUX.2 по варианту, Qwen-Image 50/40, Qwen 2.1 40)")]
+        steps: Option<usize>,
+        #[arg(long, help = "CFG/guidance (по модели: SDXL 5.0, FLUX.1 3.5, FLUX.2 4.0 / klein 1.0, Qwen-Image 4.0, Qwen 2.1 1.0)")]
+        cfg: Option<f32>,
+        #[arg(long, help = "Высота (по умолчанию — с --init-image/референса или 1024)")]
+        height: Option<usize>,
+        #[arg(long, help = "Ширина (по умолчанию — с --init-image/референса или 1024)")]
+        width: Option<usize>,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// cpu | cuda. CUDA ~много быстрее (1024²×25 ≈ 20с bf16 vs часы CPU).
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = "cuda")]
         device: String,
-        /// Compute dtype: f16 | bf16 | f32. Дефолт: bf16 на CUDA, f32 на CPU.
-        /// VAE всегда F32 (f16/bf16 overflow).
-        #[arg(long)]
+        #[arg(long, help = "Активации FLUX.1: f16 | bf16 | f32 (по умолчанию bf16, f16 при кванте, f32 на CPU)")]
         compute_dtype: Option<String>,
-        /// Квант весов: nvfp4 | mxfp8 (как в LLM). Режет VRAM (FLUX 23GB→~6/12GB),
-        /// модель влезает резидентно на высоких разрешениях. Дефолт: none (dense).
-        #[arg(long)]
+        #[arg(long, help = "Квант весов DiT/UNet: none | nvfp4 | mxfp8")]
         quant: Option<String>,
-        /// Алиас --quant (storage-dtype: nvfp4 | mxfp8 | none).
-        #[arg(long)]
+        #[arg(long, help = "Алиас --quant")]
         storage_dtype: Option<String>,
-        /// Референсы для правки (Qwen-Image 2.1, до 10; в промпте — <image1>, <image2>…).
-        #[arg(long)]
+        #[arg(long, help = "Референсы: FLUX.2 (до 10), Qwen-Image Edit (1) / Edit-Plus (до 4), Qwen-Image 2.1 (до 10)")]
         image: Vec<PathBuf>,
-        /// Qwen-Image 2.1: `output_resolution` — сторона ~площади референсов и
-        /// выхода при `--width 0 --height 0` (размер с последнего референса).
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 1024, help = "Qwen-Image 2.1: output_resolution — сторона ~площади референсов и выхода")]
         resolution: usize,
+        #[arg(long, help = "img2img: исходная картинка (SDXL, FLUX.1, FLUX.2)")]
+        init_image: Option<PathBuf>,
+        #[arg(long, help = "img2img: сила, доля шума 0..1 (SDXL 0.6, FLUX 0.75)")]
+        strength: Option<f32>,
+        #[arg(long, default_value = "stretch", help = "Подгонка --init-image под размер: stretch | crop")]
+        fit: String,
+        #[arg(long, default_value = "auto", help = "Где держать DiT (FLUX.1, FLUX.2, Qwen-Image, Qwen 2.1): auto | resident | stream")]
+        memory: String,
+        #[arg(long, help = "FLUX.1: длина T5 (dev 512, schnell 256)")]
+        t5_len: Option<usize>,
+        #[arg(long, default_value_t = false, help = "Qwen-Image 2.1: не кэшировать K/V текста и референсов")]
+        no_kv_cache: bool,
+    },
+    /// Карта глубины Depth Anything V2: картинка → PNG (ближе — светлее).
+    Depth {
+        /// Каталог с model.safetensors Depth Anything V2.
+        model: PathBuf,
+        image: PathBuf,
+        #[arg(short, long, default_value = "depth.png")]
+        output: PathBuf,
+        #[arg(long, default_value = "cuda")]
+        device: String,
     },
     /// Генерация видео (+аудио) LTX-2.3 по текстовому промпту (живой Gemma).
     Video {
@@ -1103,7 +1114,8 @@ fn main() -> ExitCode {
         }),
         Commands::Imagine {
             model, prompt, output, negative, steps, cfg, height, width, seed, device, compute_dtype,
-            quant, storage_dtype, image, resolution,
+            quant, storage_dtype, image, resolution, init_image, strength, fit, memory, t5_len,
+            no_kv_cache,
         } => imagine::run(imagine::ImagineArgs {
             model,
             prompt,
@@ -1120,7 +1132,14 @@ fn main() -> ExitCode {
             storage_dtype,
             image,
             resolution,
+            init_image,
+            strength,
+            fit,
+            memory,
+            t5_len,
+            no_kv_cache,
         }),
+        Commands::Depth { model, image, output, device } => imagine::run_depth(&model, &image, &output, &device),
         Commands::Video {
             model, prompt, output, gemma, frames, duration, width, height, fps, no_audio,
             pipeline, list_pipelines, two_stage, upscaler, no_refine, lora, lora_strength,

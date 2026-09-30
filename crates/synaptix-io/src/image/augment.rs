@@ -64,6 +64,28 @@ pub fn resize_bilinear(tensor: &Tensor, new_h: usize, new_w: usize) -> Result<Te
         .map_err(IoError::Core)
 }
 
+pub fn fit_image(tensor: &Tensor, width: usize, height: usize, center_crop: bool) -> Result<Tensor> {
+    let dims = tensor.dims();
+    if dims.len() != 3 {
+        return Err(IoError::Image("fit expects [C, H, W]".into()));
+    }
+    let (h, w) = (dims[1], dims[2]);
+    if (h, w) == (height, width) {
+        return Ok(tensor.clone());
+    }
+    if !center_crop {
+        return resize_bilinear(tensor, height, width);
+    }
+    let scale = (width as f64 / w as f64).max(height as f64 / h as f64);
+    let rw = ((w as f64 * scale).round() as usize).max(width);
+    let rh = ((h as f64 * scale).round() as usize).max(height);
+    resize_bilinear(tensor, rh, rw)?
+        .narrow(1, (rh - height) / 2, height)
+        .and_then(|t| t.narrow(2, (rw - width) / 2, width))
+        .and_then(|t| t.contiguous())
+        .map_err(IoError::Core)
+}
+
 pub fn random_crop(tensor: &Tensor, crop_h: usize, crop_w: usize, seed: u64) -> Result<Tensor> {
     let dims = tensor.dims();
     if dims.len() != 3 {

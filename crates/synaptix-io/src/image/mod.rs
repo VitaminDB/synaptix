@@ -12,4 +12,4 @@ pub use canny::{canny_gray, canny_rgb};
 #[cfg(feature = "image")]
 pub use png::{load_image, save_image};
 #[cfg(feature = "image")]
-pub use augment::{normalize, resize_bilinear, random_crop, random_hflip};
+pub use augment::{fit_image, normalize, resize_bilinear, random_crop, random_hflip};
