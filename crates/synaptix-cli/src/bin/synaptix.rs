@@ -861,18 +861,18 @@ enum Commands {
     },
     /// MiniMax-H3 33B: текст/кадры → видео + синхронное стерео 32 кГц.
     H3 {
-        /// Каталог модели (корень MiniMax-H3 или сразу FL2VA/Ref2VA).
-        #[arg(long)]
+        /// Модель: .syn-бандл, корень MiniMax-H3 или сразу каталог FL2VA/Ref2VA.
+        #[arg(long, alias = "model")]
         model_dir: PathBuf,
         /// Текстовый промпт.
         #[arg(default_value = "")]
         prompt: String,
-        /// Негативный промпт (нужен при cfg > 1).
+        /// Негативный промпт; CFG (cfg > 1) работает только с ним.
         #[arg(long)]
         negative_prompt: Option<String>,
         #[arg(short, long, default_value = "h3.mp4")]
         output: PathBuf,
-        /// Каталог энкодера Qwen3-VL (по умолчанию <model_dir>/text_encoder).
+        /// Энкодер Qwen3-VL: .syn или каталог (по умолчанию — из модели).
         #[arg(long)]
         encoder: Option<PathBuf>,
         /// Первый кадр (fl2va).
@@ -909,6 +909,7 @@ enum Commands {
         /// CFG scale (0 = из пресета; 1.0 = без негатива, режим Turbo).
         #[arg(long, default_value_t = 0.0)]
         cfg_scale: f32,
+        /// Seed (без флага — случайный, печатается).
         #[arg(long)]
         seed: Option<u64>,
         /// LoRA-адаптер (Turbo LoRA для 4-8 шагов).
@@ -919,7 +920,7 @@ enum Commands {
         /// Квантование DiT: none|mxfp8|nvfp4 (дефолт nvfp4).
         #[arg(long)]
         quant_transformer: Option<String>,
-        /// Квантование энкодера: none|mxfp8|nvfp4 (дефолт mxfp8).
+        /// Квантование энкодера: none|mxfp8|nvfp4 (дефолт nvfp4).
         #[arg(long)]
         quant_encoder: Option<String>,
         /// Compute-dtype: bf16|f16 (дефолт bf16).
@@ -944,6 +945,26 @@ enum Commands {
         /// Сохранить рядом с mp4 отдельный wav.
         #[arg(long, default_value_t = false)]
         keep_wav: bool,
+        #[arg(long, default_value = "stretch", help = "Подгонка ключевых кадров под холст: stretch | crop")]
+        keyframe_fit: String,
+        #[arg(long, default_value = "res-multistep", help = "Сэмплер: res-multistep | euler")]
+        sampler: String,
+        #[arg(long, default_value_t = 0.0, help = "Rescale CFG (0 — выкл)")]
+        cfg_rescale: f32,
+        #[arg(long, default_value_t = 0, help = "Пропускать CFG каждые N шагов (0 — не пропускать)")]
+        guider_skip_steps: usize,
+        #[arg(long, help = "Сдвиг сигм видео (по умолчанию из конфига модели)")]
+        sigma_shift_video: Option<f64>,
+        #[arg(long, help = "Сдвиг сигм звука (по умолчанию из конфига модели)")]
+        sigma_shift_audio: Option<f64>,
+        #[arg(long, help = "Сторона тайла VAE-декода в пикселях (по умолчанию авто)")]
+        vae_tile: Option<usize>,
+        #[arg(long, value_delimiter = ',', help = "Номера --ref (с 1), у которых не брать звук видео")]
+        ref_mute: Vec<usize>,
+        #[arg(long, help = "av-restyle: исходное видео со звуком для частичного денойза")]
+        restyle: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.6, help = "av-restyle: доля перегенерации 0..1")]
+        restyle_strength: f32,
     },
 }
 
@@ -1177,12 +1198,16 @@ fn main() -> ExitCode {
             model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
             refs, ref_mute_video, ref_image_size, width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
             quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
-            list_pipelines, variant, device, prof, keep_wav,
+            list_pipelines, variant, device, prof, keep_wav, keyframe_fit, sampler, cfg_rescale,
+            guider_skip_steps, sigma_shift_video, sigma_shift_audio, vae_tile, ref_mute, restyle,
+            restyle_strength,
         } => h3::run(h3::H3Args {
             model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
             refs, ref_mute_video, ref_image_size, width, height, duration, frames, steps, cfg_scale, seed, lora, lora_strength,
             quant_transformer, quant_encoder, compute_dtype, memory_mode, pipeline,
-            list_pipelines, variant, device, prof, keep_wav,
+            list_pipelines, variant, device, prof, keep_wav, keyframe_fit, sampler, cfg_rescale,
+            guider_skip_steps, sigma_shift_video, sigma_shift_audio, vae_tile, ref_mute, restyle,
+            restyle_strength,
         }),
     };
     match res {

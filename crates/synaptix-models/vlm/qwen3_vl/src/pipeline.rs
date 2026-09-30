@@ -172,9 +172,20 @@ impl H3Encoder {
         images: &[(Tensor, ImageGrid)],
     ) -> Result<H3Conditioning, VisionError> {
         let tok = &self.tokenizer;
-        let encoded: EncodedPresentation = assemble(presentation, |s| {
-            tok.encode(s, false).map(|e| e.ids).unwrap_or_default()
+        let tok_error = std::cell::RefCell::new(None);
+        let encoded: EncodedPresentation = assemble(presentation, |s| match tok.encode(s, false) {
+            Ok(e) => e.ids,
+            Err(e) => {
+                tok_error.borrow_mut().get_or_insert_with(|| e.to_string());
+                Vec::new()
+            }
         });
+        if let Some(e) = tok_error.into_inner() {
+            return Err(VisionError::Forward(format!("токенизация промпта: {e}")));
+        }
+        if encoded.ids.is_empty() {
+            return Err(VisionError::Forward("пустой промпт: нечего кодировать".into()));
+        }
         if encoded.vision_grids.len() != images.len() {
             return Err(VisionError::Forward(format!(
                 "презентация ожидает {} vision-блоков, передано {}",
