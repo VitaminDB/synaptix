@@ -184,3 +184,55 @@ impl VaeConfig {
         self.downsampling_ratios.iter().product()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DitVariant {
+    Base,
+    Turbo,
+    Sft,
+    Unknown,
+}
+
+impl DitVariant {
+    pub fn detect(path: &std::path::Path) -> Self {
+        let from = |s: &str| {
+            let s = s.to_lowercase();
+            if s.contains("turbo") {
+                Some(Self::Turbo)
+            } else if s.contains("sft") {
+                Some(Self::Sft)
+            } else if s.contains("base") {
+                Some(Self::Base)
+            } else {
+                None
+            }
+        };
+        synaptix_bundle::Bundle::open(path)
+            .ok()
+            .and_then(|b| from(b.id()))
+            .or_else(|| path.file_name().and_then(|n| from(&n.to_string_lossy())))
+            .unwrap_or(Self::Unknown)
+    }
+
+    pub fn default_steps(self) -> usize {
+        match self {
+            Self::Turbo => 8,
+            Self::Base | Self::Unknown => 32,
+            Self::Sft => 50,
+        }
+    }
+
+    pub fn default_cfg(self) -> f32 {
+        match self {
+            Self::Turbo => 1.0,
+            Self::Base | Self::Sft | Self::Unknown => 7.0,
+        }
+    }
+
+    pub fn default_shift(self) -> f32 {
+        match self {
+            Self::Turbo | Self::Base => 3.0,
+            Self::Sft | Self::Unknown => 1.0,
+        }
+    }
+}

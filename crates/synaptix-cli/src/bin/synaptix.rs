@@ -368,6 +368,10 @@ enum Commands {
         /// Какие мелодии записи взять в кавер: both | vocal | ins.
         #[arg(long, default_value = "both")]
         cover_voices: String,
+        #[arg(long, default_value_t = false, help = "Кавер по полной партитуре записи (с аккордами, cot = full)")]
+        cover_full: bool,
+        #[arg(long, help = "Взять из записи для кавера только первые N секунд")]
+        cover_max_seconds: Option<f64>,
         /// Куда сохранить партитуру.
         #[arg(long)]
         save_abc: Option<PathBuf>,
@@ -382,14 +386,36 @@ enum Commands {
         /// Потолок семантических токенов: 25 на секунду музыки.
         #[arg(long)]
         max_tokens: Option<usize>,
-        #[arg(long)]
+        #[arg(long, help = "Длительность музыки в секундах (25 токенов на секунду; --max-tokens сильнее)")]
+        seconds: Option<f32>,
+        #[arg(long, help = "До этого числа семантических токенов конец музыки запрещён (200)")]
+        min_tokens: Option<usize>,
+        #[arg(long, help = "Температура фазы музыки (1.0)")]
         temperature: Option<f32>,
-        #[arg(long)]
+        #[arg(long, help = "Top-p фазы музыки (0.95)")]
         top_p: Option<f32>,
-        #[arg(long)]
+        #[arg(long, help = "Top-k фазы музыки (100)")]
         top_k: Option<usize>,
-        #[arg(long)]
+        #[arg(long, help = "Штраф повторов фазы музыки (1.2)")]
         repetition_penalty: Option<f32>,
+        #[arg(long, help = "Окно штрафа повторов фазы музыки, 1..100 (50)")]
+        penalty_window: Option<usize>,
+        #[arg(long, help = "Потолок токенов партитуры (4096)")]
+        abc_max_tokens: Option<usize>,
+        #[arg(long, help = "Минимум токенов партитуры (32)")]
+        abc_min_tokens: Option<usize>,
+        #[arg(long, help = "Температура фазы партитуры (0.7)")]
+        abc_temperature: Option<f32>,
+        #[arg(long, help = "Top-p фазы партитуры (0.9)")]
+        abc_top_p: Option<f32>,
+        #[arg(long, help = "Top-k фазы партитуры (30)")]
+        abc_top_k: Option<usize>,
+        #[arg(long, help = "Штраф повторов фазы партитуры (1.005)")]
+        abc_repetition_penalty: Option<f32>,
+        #[arg(long, help = "Окно штрафа повторов фазы партитуры, 1..100 (100)")]
+        abc_penalty_window: Option<usize>,
+        #[arg(long, help = "Окно модели для нарезки акустики на чанки (24576): меньше — меньше памяти, чаще швы")]
+        context: Option<usize>,
         #[arg(long, default_value = "cuda:0")]
         device: String,
         /// Тип вычислений костяка: bf16 (эталон) | f32.
@@ -404,6 +430,28 @@ enum Commands {
         /// Кадров в ядре тайла декодера (меньше — меньше памяти).
         #[arg(long, default_value_t = 1024)]
         vae_core_frames: usize,
+        #[arg(long, default_value_t = 16, help = "Кадров перекрытия тайлов декодера")]
+        vae_halo_frames: usize,
+        #[arg(long, help = "Сохранить акустические латенты (safetensors) для song-decode")]
+        save_latent: Option<PathBuf>,
+    },
+    /// Латенты YuE2 (song --save-latent) → WAV 48 кГц стерео другим декодером.
+    SongDecode {
+        latent: PathBuf,
+        #[arg(short, long, default_value = "song.wav")]
+        output: PathBuf,
+        #[arg(long, default_value = "storage/syn_models")]
+        models: PathBuf,
+        #[arg(long, help = "Бандл декодера (yue2-vae.syn | yue2-vae-legacy.syn)")]
+        vae: Option<PathBuf>,
+        #[arg(long, default_value = "cuda:0")]
+        device: String,
+        #[arg(long, help = "f32 (эталон) | bf16")]
+        vae_dtype: Option<String>,
+        #[arg(long, default_value_t = 1024)]
+        vae_core_frames: usize,
+        #[arg(long, default_value_t = 16)]
+        vae_halo_frames: usize,
     },
     /// Запись → партитура ABC (SheetSage2): мелодия вокала и инструмента,
     /// аккорды, размер, тональность и секции. По умолчанию — без аккордов, как
@@ -428,6 +476,10 @@ enum Commands {
         /// Взять только первые N секунд.
         #[arg(long)]
         max_seconds: Option<f64>,
+        #[arg(long, help = "Перекрытие окон транскрипции, с (200)")]
+        overlap_seconds: Option<f64>,
+        #[arg(long, help = "Заглядывание вперёд окна, с (100)")]
+        lookahead_seconds: Option<f64>,
         #[arg(long, default_value = "cuda:0")]
         device: String,
         /// bf16 (эталонный режим релиза) | f32.
@@ -476,16 +528,16 @@ enum Commands {
         /// Длительность: "auto" (Phase-1 CoT предсказывает сам) или число секунд.
         #[arg(long, default_value = "auto")]
         duration: String,
-        /// Число шагов диффузии (xl-base ~32).
-        #[arg(long, default_value_t = 32)]
-        steps: usize,
-        /// CFG диффузии (xl-base ~7; 1.0 = выкл CFG/APG).
-        #[arg(long, default_value_t = 7.0)]
-        cfg: f32,
-        /// Timestep shift (xl-base 3.0).
-        #[arg(long, default_value_t = 3.0)]
-        shift: f32,
-        #[arg(long, default_value_t = 42)]
+        /// Число шагов диффузии (по варианту DiT: turbo 8, base 32, sft 50).
+        #[arg(long)]
+        steps: Option<usize>,
+        /// CFG диффузии (turbo 1.0, base/sft 7.0; 1.0 = выкл CFG/APG).
+        #[arg(long)]
+        cfg: Option<f32>,
+        /// Timestep shift (turbo/base 3.0, sft 1.0).
+        #[arg(long)]
+        shift: Option<f32>,
+        #[arg(long, default_value_t = 42, help = "Seed (0 — случайный)")]
         seed: u64,
         /// AR-семплинг: temperature.
         #[arg(long, default_value_t = 0.85)]
@@ -519,7 +571,7 @@ enum Commands {
         /// retake: дисперсия вариации [0,1] (0 = обычный text2music; >0 включает retake-микс).
         #[arg(long, default_value_t = 0.0)]
         retake_variance: f32,
-        /// retake: seed второго шума, миксуемого при retake_variance>0.
+        /// retake: seed второго шума, миксуемого при retake_variance>0 (0 — случайный).
         #[arg(long, default_value_t = 1)]
         retake_seed: u64,
         /// Режим: text2music (default) | retake | repaint | extend | edit | extract | cover.
@@ -547,6 +599,8 @@ enum Commands {
         /// edit: верхняя граница окна расписания [0,1] (уровень ре-шума src).
         #[arg(long, default_value_t = 1.0)]
         edit_n_max: f32,
+        #[arg(long, default_value_t = 1, help = "edit: усреднить N прогонов source-ветки")]
+        edit_n_avg: usize,
         /// edit: исходный (старый) caption для source-ветки.
         #[arg(long, default_value = "")]
         edit_source_caption: String,
@@ -572,6 +626,20 @@ enum Commands {
         /// памяти» у нод synthos); seed растёт на единицу, пишется последний.
         #[arg(long, default_value_t = 1)]
         repeat: u32,
+        #[arg(long, default_value_t = false, help = "DCW-коррекция денойза в вейвлет-домене")]
+        dcw: bool,
+        #[arg(long, default_value = "double", help = "DCW: low | high | double | pix")]
+        dcw_mode: String,
+        #[arg(long, default_value = "think", help = "DCW-пресет масштабов: think (0.02/0.06) | no-think (0.05/0.02)")]
+        dcw_preset: String,
+        #[arg(long, help = "DCW: масштаб низких частот (сильнее пресета)")]
+        dcw_scaler: Option<f32>,
+        #[arg(long, help = "DCW: масштаб высоких частот (сильнее пресета)")]
+        dcw_high_scaler: Option<f32>,
+        #[arg(long, default_value_t = 2, help = "Каналов в WAV: 2 (стерео VAE) | 1 (левый канал)")]
+        channels: u16,
+        #[arg(long, help = "Сохранить латент DiT [1, 64, T] (safetensors)")]
+        save_latent: Option<PathBuf>,
     },
     /// Генерация изображения по тексту (SDXL txt2img): PROMPT → PNG.
     Imagine {
@@ -990,19 +1058,30 @@ fn main() -> ExitCode {
         }),
         Commands::Song {
             style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,
-            cover_voices, save_abc, seed, cfg, steps, max_tokens, temperature, top_p, top_k,
-            repetition_penalty, device, compute_dtype, quant, vae_dtype, vae_core_frames,
+            cover_voices, cover_full, cover_max_seconds, save_abc, seed, cfg, steps, max_tokens,
+            seconds, min_tokens, temperature, top_p, top_k, repetition_penalty, penalty_window,
+            abc_max_tokens, abc_min_tokens, abc_temperature, abc_top_p, abc_top_k,
+            abc_repetition_penalty, abc_penalty_window, context, device, compute_dtype, quant,
+            vae_dtype, vae_core_frames, vae_halo_frames, save_latent,
         } => song::run(song::SongArgs {
             style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,
-            cover_voices, save_abc, seed, cfg, steps, max_tokens, temperature, top_p, top_k,
-            repetition_penalty, device, compute_dtype, quant, vae_dtype, vae_core_frames,
+            cover_voices, cover_full, cover_max_seconds, save_abc, seed, cfg, steps, max_tokens,
+            seconds, min_tokens, temperature, top_p, top_k, repetition_penalty, penalty_window,
+            abc_max_tokens, abc_min_tokens, abc_temperature, abc_top_p, abc_top_k,
+            abc_repetition_penalty, abc_penalty_window, context, device, compute_dtype, quant,
+            vae_dtype, vae_core_frames, vae_halo_frames, save_latent,
+        }),
+        Commands::SongDecode {
+            latent, output, models, vae, device, vae_dtype, vae_core_frames, vae_halo_frames,
+        } => song::run_decode(song::SongDecodeArgs {
+            latent, output, models, vae, device, vae_dtype, vae_core_frames, vae_halo_frames,
         }),
         Commands::Sheet {
-            audio, output, models, model, full, voices, max_seconds, device, compute_dtype,
-            tokens_json,
+            audio, output, models, model, full, voices, max_seconds, overlap_seconds,
+            lookahead_seconds, device, compute_dtype, tokens_json,
         } => sheet::run(sheet::SheetArgs {
-            audio, output, models, model, full, voices, max_seconds, device, compute_dtype,
-            tokens_json,
+            audio, output, models, model, full, voices, max_seconds, overlap_seconds,
+            lookahead_seconds, device, compute_dtype, tokens_json,
         }),
         Commands::SheetPack { sheetsage, mert, into } => {
             sheet::run_pack(sheet::SheetPackArgs { sheetsage, mert, into })
@@ -1011,14 +1090,16 @@ fn main() -> ExitCode {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
             quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
-            repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
-            edit_source_lyric, no_ar, bpm, keyscale, timesig, norm, repeat,
+            repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_n_avg, edit_source_caption,
+            edit_source_lyric, no_ar, bpm, keyscale, timesig, norm, repeat, dcw, dcw_mode,
+            dcw_preset, dcw_scaler, dcw_high_scaler, channels, save_latent,
         } => music::run(music::MusicArgs {
             caption, output, lyrics, models, lm, text_encoder, dit, vae, duration, steps, cfg,
             shift, seed, temperature, top_p, top_k, min_p, lm_cfg, use_cot, device, compute_dtype,
             quant, quant_encoder, retake_variance, retake_seed, mode, track, src_audio, repaint_start,
-            repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_source_caption,
-            edit_source_lyric, use_ar: !no_ar, bpm, keyscale, timesig, norm, repeat,
+            repaint_end, repaint_strength, edit_n_min, edit_n_max, edit_n_avg, edit_source_caption,
+            edit_source_lyric, use_ar: !no_ar, bpm, keyscale, timesig, norm, repeat, dcw, dcw_mode,
+            dcw_preset, dcw_scaler, dcw_high_scaler, channels, save_latent,
         }),
         Commands::Imagine {
             model, prompt, output, negative, steps, cfg, height, width, seed, device, compute_dtype,

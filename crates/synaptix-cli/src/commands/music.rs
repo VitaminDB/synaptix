@@ -1,10 +1,14 @@
 use std::path::PathBuf;
 
-use synaptix_audio::io::{read_wav_stereo_f32, write_wav_mono_f32};
+use synaptix_audio::io::{read_wav_stereo_f32, write_wav_interleaved_f32, write_wav_mono_f32};
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_music_acestep::ar::CodesGenOptions;
-use synaptix_music_acestep::pipeline::{generate_music, EditMode, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions};
+use synaptix_music_acestep::dcw::{DcwCorrector, DcwMode};
+use synaptix_music_acestep::pipeline::{
+    apply_norm, generate_music, EditMode, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions,
+};
+use synaptix_music_acestep::DitVariant;
 use synaptix_music_acestep::text_encoder::TRACK_NAMES;
 use synaptix_music_acestep::vae::AceStepVae;
 
@@ -20,9 +24,9 @@ pub struct MusicArgs {
     pub dit: Option<PathBuf>,
     pub vae: Option<PathBuf>,
     pub duration: String,
-    pub steps: usize,
-    pub cfg: f32,
-    pub shift: f32,
+    pub steps: Option<usize>,
+    pub cfg: Option<f32>,
+    pub shift: Option<f32>,
     pub seed: u64,
     pub temperature: f32,
     pub top_p: f32,
@@ -44,6 +48,7 @@ pub struct MusicArgs {
     pub repaint_strength: f32,
     pub edit_n_min: f32,
     pub edit_n_max: f32,
+    pub edit_n_avg: usize,
     pub edit_source_caption: String,
     pub edit_source_lyric: String,
     pub use_ar: bool,
@@ -53,6 +58,42 @@ pub struct MusicArgs {
     pub norm: String,
     /// >1 — прогоны подряд с резидентным кэшем компонентов.
     pub repeat: u32,
+    pub dcw: bool,
+    pub dcw_mode: String,
+    pub dcw_preset: String,
+    pub dcw_scaler: Option<f32>,
+    pub dcw_high_scaler: Option<f32>,
+    pub channels: u16,
+    pub save_latent: Option<PathBuf>,
+}
+
+fn random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 ^ std::process::id() as u64)
+        .unwrap_or(1)
+        | 1
+}
+
+fn parse_dcw(args: &MusicArgs) -> Result<DcwCorrector, String> {
+    let mode = match args.dcw_mode.as_str() {
+        "low" => DcwMode::Low,
+        "high" => DcwMode::High,
+        "double" => DcwMode::Double,
+        "pix" => DcwMode::Pix,
+        o => return Err(format!("--dcw-mode: low | high | double | pix, а не `{o}`")),
+    };
+    let (scaler, high_scaler) = match args.dcw_preset.as_str() {
+        "think" => (0.02, 0.06),
+        "no-think" | "nothink" => (0.05, 0.02),
+        o => return Err(format!("--dcw-preset: think | no-think, а не `{o}`")),
+    };
+    Ok(DcwCorrector {
+        enabled: args.dcw,
+        mode,
+        scaler: args.dcw_scaler.unwrap_or(scaler),
+        high_scaler: args.dcw_high_scaler.unwrap_or(high_scaler),
+    })
 }
 
 pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -71,12 +112,23 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let paths = MusicPaths { lm: &lm, text_encoder: &text_encoder, dit: &dit, vae: &vae };
 
-    let duration_sec: u32 = if args.duration.trim().eq_ignore_ascii_case("auto") {
+    let auto_duration = args.duration.trim().eq_ignore_ascii_case("auto");
+    let mut duration_sec: u32 = if auto_duration {
         0 // 0 → Phase-1 CoT сам предсказывает длительность
     } else {
         args.duration.trim().parse()
             .map_err(|_| format!("--duration: ожидалось 'auto' или число секунд, получено '{}'", args.duration))?
     };
+    if args.channels != 1 && args.channels != 2 {
+        return Err(format!("--channels: 1 | 2, а не {}", args.channels).into());
+    }
+    let variant = DitVariant::detect(&dit);
+    let steps = args.steps.unwrap_or(variant.default_steps());
+    let cfg = args.cfg.unwrap_or(variant.default_cfg());
+    let shift = args.shift.unwrap_or(variant.default_shift());
+    let dcw = parse_dcw(&args)?;
+    let seed = if args.seed == 0 { random_seed() } else { args.seed };
+    let retake_seed = if args.retake_seed == 0 { random_seed() } else { args.retake_seed };
 
     let dev = device::resolve(&args.device);
     // DiT-рендеринг dtype (AR-LM всегда F32 для точных кодов). Дефолт bf16 —
@@ -100,25 +152,20 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     let dit_quant = parse_q(args.quant.as_deref(), "quant")?;
     let enc_quant = parse_q(args.quant_encoder.as_deref(), "quant-encoder")?;
 
-    let opts = SamplerOptions {
-        steps: args.steps,
-        shift: args.shift,
-        guidance_scale: args.cfg,
-        ..SamplerOptions::default()
-    };
+    let opts = SamplerOptions { steps, shift, guidance_scale: cfg, dcw };
     let copts = CodesGenOptions {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
         min_p: args.min_p,
         cfg_scale: args.lm_cfg,
-        seed: args.seed,
+        seed,
         ..CodesGenOptions::default()
     };
 
     eprintln!(
-        "synaptix music: \"{}\" lyrics={}b dur={} steps={} cfg={} shift={} lm_cfg={} ({dev:?}, compute={compute:?}, dit_quant={dit_quant:?}, enc_quant={enc_quant:?})",
-        args.caption, args.lyrics.len(), args.duration, args.steps, args.cfg, args.shift, args.lm_cfg
+        "synaptix music: \"{}\" lyrics={}b dur={} dit={variant:?} steps={steps} cfg={cfg} shift={shift} lm_cfg={} seed={seed} dcw={} ({dev:?}, compute={compute:?}, dit_quant={dit_quant:?}, enc_quant={enc_quant:?})",
+        args.caption, args.lyrics.len(), args.duration, args.lm_cfg, opts.dcw.is_active()
     );
     let mode = match args.mode.as_str() {
         "retake" => EditMode::Retake,
@@ -149,6 +196,10 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         let at = Tensor::from_vec(flat, vec![1usize, 2, n], dev)?.to_dtype(compute)?;
         let vae_enc = AceStepVae::open(&vae, dev)?;
         let lat = vae_enc.encode_mean(&at)?; // [1,64,T]
+        if auto_duration && args.mode != "extend" {
+            duration_sec = ((lat.dims()[2] as f32 / 25.0).round() as u32).max(1);
+            eprintln!("synaptix music: длительность по исходнику — {duration_sec} с");
+        }
         Some(lat.transpose(1, 2)?.contiguous()?) // [1,T,64]
     } else {
         None
@@ -157,14 +208,14 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         mode,
         track_name: args.track.clone(),
         retake_variance: args.retake_variance,
-        retake_seed: args.retake_seed,
+        retake_seed,
         src_latent,
         repaint_start_sec: args.repaint_start,
         repaint_end_sec: args.repaint_end,
         repaint_strength: args.repaint_strength,
         edit_n_min: args.edit_n_min,
         edit_n_max: args.edit_n_max,
-        edit_n_avg: 1,
+        edit_n_avg: args.edit_n_avg.max(1),
         edit_source_caption: args.edit_source_caption.clone(),
         edit_source_lyric: args.edit_source_lyric.clone(),
     };
@@ -189,7 +240,7 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..args.repeat.max(1) {
         let copts = CodesGenOptions { seed: copts.seed + round as u64, ..copts.clone() };
         let t0 = std::time::Instant::now();
-        let (samples, sr, _latent) = generate_music(
+        let (samples, sr, latent) = generate_music(
             &paths, &args.caption, &args.lyrics, duration_sec, dev, compute, dit_quant, enc_quant, &opts, &copts, args.use_cot, &edit, &extras, cache.as_mut(),
         )?;
         let dur = samples.len() as f32 / sr as f32;
@@ -200,10 +251,25 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.repeat.max(1),
             infer / dur.max(1e-6)
         );
-        result = Some((samples, sr));
+        result = Some((samples, sr, latent));
     }
-    let (samples, sr) = result.expect("хотя бы один прогон");
-    write_wav_mono_f32(&args.output, &samples, sr)?;
+    let (samples, sr, latent) = result.expect("хотя бы один прогон");
+    if let Some(path) = &args.save_latent {
+        crate::commands::song::save_latent(path, &latent)?;
+        eprintln!("synaptix music: латент {:?} → {}", latent.dims(), path.display());
+    }
+    if args.channels == 2 {
+        let audio = AceStepVae::open(&vae, dev)?.decode_tiled(&latent, 500, 32)?;
+        let channel = |c: usize| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+            Ok(audio.narrow(1, c, 1)?.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
+        };
+        let (left, right) = (channel(0)?, channel(1)?);
+        let mut stereo: Vec<f32> = left.iter().zip(&right).flat_map(|(l, r)| [*l, *r]).collect();
+        apply_norm(&mut stereo, norm_mode);
+        write_wav_interleaved_f32(&args.output, &stereo, sr, 2)?;
+    } else {
+        write_wav_mono_f32(&args.output, &samples, sr)?;
+    }
     eprintln!("synaptix music: wrote {}", args.output.display());
     Ok(())
 }

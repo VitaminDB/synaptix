@@ -21,6 +21,8 @@ pub struct SheetArgs {
     /// `both` | `vocal` | `ins`.
     pub voices: String,
     pub max_seconds: Option<f64>,
+    pub overlap_seconds: Option<f64>,
+    pub lookahead_seconds: Option<f64>,
     pub device: String,
     pub compute_dtype: Option<String>,
     /// Сохранить токены окон (для сверки с релизом).
@@ -135,11 +137,13 @@ pub fn run(args: SheetArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some("bf16") | None => DType::BF16,
         Some(other) => return Err(format!("--compute-dtype: bf16 | f32, а не `{other}`").into()),
     };
+    let defaults = TranscribeOptions::default();
     let options = TranscribeOptions {
         melody_only: !args.full,
         voices: parse_voices(&args.voices)?,
         max_seconds: args.max_seconds,
-        ..Default::default()
+        overlap_seconds: args.overlap_seconds.unwrap_or(defaults.overlap_seconds),
+        lookahead_seconds: args.lookahead_seconds.unwrap_or(defaults.lookahead_seconds),
     };
     let result = transcribe_file(&model, &args.audio, &args.device, compute, &options)?;
     if let Some(path) = &args.tokens_json {

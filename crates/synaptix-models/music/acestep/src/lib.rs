@@ -68,7 +68,7 @@ pub(crate) fn check_cancel() -> Result<()> {
 
 pub type Result<T> = std::result::Result<T, AceError>;
 
-pub use config::{DitConfig, LmConfig, VaeConfig};
+pub use config::{DitConfig, DitVariant, LmConfig, VaeConfig};
 pub use lm::AceStepLm;
 pub use vae::AceStepVae;
 
