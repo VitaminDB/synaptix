@@ -719,7 +719,7 @@ enum Commands {
         /// Кадров/сек: 24 | 25 | 48 | 50.
         #[arg(long, default_value_t = 24.0)]
         fps: f64,
-        /// Без аудио-потока (только видео, VideoDit вместо AvDit).
+        /// Без аудио в выходе (text→video — VideoDit вместо AvDit; в режимах с условием звук считается, но не пишется).
         #[arg(long)]
         no_audio: bool,
         /// Пайплайн: one-stage|two-stage|av|ti2v-two-stage|a2v|keyframe|ic-lora|... .
@@ -746,9 +746,9 @@ enum Commands {
         /// Сила LoRA (официальный дефолт 1.0). Для two-stage см. per-stage флаги.
         #[arg(long, default_value_t = 1.0)]
         lora_strength: f32,
-        /// Two-stage: сила LoRA на stage1 (офиц. HQ деф. 0.25; distilled-чекпойнт — 0).
-        #[arg(long, default_value_t = 0.0)]
-        lora_strength_stage1: f32,
+        /// Two-stage: сила LoRA на stage1 (офиц. HQ 0.25; distilled — 0). Дефолт: 0, для IC-LoRA/lipdub — --lora-strength.
+        #[arg(long)]
+        lora_strength_stage1: Option<f32>,
         /// Two-stage: сила LoRA на stage2-refine (офиц. HQ 0.5, ti2v ~0.8;
         /// distilled-чекпойнт — 0). Дефолт: --lora-strength.
         #[arg(long)]
@@ -772,7 +772,7 @@ enum Commands {
         #[arg(long, default_value_t = 1.0)]
         image_strength: f32,
         /// Пиксель-кадр для image-conditioning: 0 = replace (image→video),
-        /// >0 = keyframe (append). Одна стадия.
+        /// >0 = keyframe (append). На обеих стадиях при --two-stage.
         #[arg(long, default_value_t = 0)]
         image_frame: usize,
         /// Исходное видео для retake (перегенерация региона). С --retake-start/-end.
@@ -787,13 +787,13 @@ enum Commands {
         /// IC-LoRA reference-видео (control-сигнал: depth/pose/edges). С --lora <ic-lora>.
         #[arg(long)]
         ref_video: Option<PathBuf>,
-        /// IC-LoRA: downscale reference относительно target (из метаданных LoRA, обычно 1/2).
-        #[arg(long, default_value_t = 1)]
+        /// IC-LoRA: downscale reference относительно target (из метаданных LoRA; ref0.5-адаптеры — 2).
+        #[arg(long, default_value_t = 2)]
         ref_downscale: usize,
         /// IC-LoRA: сила reference-conditioning (1.0 = reference clean).
         #[arg(long, default_value_t = 1.0)]
         ref_strength: f32,
-        /// Аудио-файл речи для lipdub (wav; с --ref-video = лицо). 16kHz ресемпл авто.
+        /// Аудио: с --ref-video — речь для lipdub; без него — audio→video (видео под готовый звук).
         #[arg(long)]
         audio: Option<PathBuf>,
         /// Препроцессор reference-видео: none | canny | depth (control-сигнал
@@ -807,7 +807,7 @@ enum Commands {
         #[arg(long, default_value_t = 0.1)]
         canny_low: f32,
         /// Canny: верхний порог гистерезиса.
-        #[arg(long, default_value_t = 0.2)]
+        #[arg(long, default_value_t = 0.3)]
         canny_high: f32,
         /// Квант блоков DiT: none|mxfp8|nvfp4. none → dense bf16 + streaming-offload
         /// (host-RAM≈0); квант → резидентно на GPU (меньше VRAM).
@@ -846,6 +846,18 @@ enum Commands {
         /// 0=легаси-карусель, 1=слоты, 2=слоты+CUDA-graph (дефолт — см. runtime).
         #[arg(long)]
         block_mode: Option<usize>,
+        #[arg(long, help = "Seed шума (0 или без флага — случайный)")]
+        seed: Option<u64>,
+        #[arg(long, default_value_t = 0.7, help = "Guided: rescale CFG (0 — выкл)")]
+        cfg_rescale: f32,
+        #[arg(long, value_delimiter = ',', default_value = "29", help = "Guided: блоки DiT под STG-возмущение (через запятую)")]
+        stg_blocks: Vec<usize>,
+        #[arg(long, default_value_t = 0, help = "Guided: пропускать guidance каждые N шагов (0 — не пропускать)")]
+        guider_skip_step: usize,
+        #[arg(long, help = "Сохранить превью control-сигнала (canny/depth, кадр 0) в PNG")]
+        control_preview: Option<PathBuf>,
+        #[arg(long, help = "CRF libx264 (меньше — качественнее, дефолт ffmpeg 23)")]
+        crf: Option<u32>,
     },
     /// MiniMax-H3 33B: текст/кадры → видео + синхронное стерео 32 кГц.
     H3 {
@@ -1149,6 +1161,7 @@ fn main() -> ExitCode {
             ref_preprocess, canny_low, canny_high, depth_model,
             quant_transformer, quant_encoder, compute_dtype, device,
             nag_prompt, nag_scale, nag_alpha, nag_tau, force_offload, prof, block_mode,
+            seed, cfg_rescale, stg_blocks, guider_skip_step, control_preview, crf,
         } => video::run(video::VideoArgs {
             model, prompt, output, gemma, frames, duration, width, height, fps, no_audio,
             pipeline, list_pipelines, two_stage, upscaler, no_refine, lora, lora_strength,
@@ -1158,6 +1171,7 @@ fn main() -> ExitCode {
             ref_preprocess, canny_low, canny_high, depth_model,
             quant_transformer, quant_encoder, compute_dtype, device,
             nag_prompt, nag_scale, nag_alpha, nag_tau, force_offload, prof, block_mode,
+            seed, cfg_rescale, stg_blocks, guider_skip_step, control_preview, crf,
         }),
         Commands::H3 {
             model_dir, prompt, negative_prompt, output, encoder, first_frame, last_frame,
