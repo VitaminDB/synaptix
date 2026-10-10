@@ -283,6 +283,52 @@ enum Commands {
         #[arg(long, default_value_t = 1e-3)]
         rtol: f32,
     },
+    /// CTC-дообучение Wav2Vec2 (фонемы/символы) по манифесту JSONL
+    /// `{"audio": "a.wav", "labels": "токены через пробел"}`.
+    FinetuneCtc {
+        /// Базовая модель: каталог HF-снапшота или .syn.
+        base: PathBuf,
+        /// Обучающий манифест.
+        train: PathBuf,
+        /// Каталог результата (model.safetensors, config.json, vocab.json).
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long)]
+        dev: Option<PathBuf>,
+        /// Новый словарь vocab.json (по умолчанию — словарь базовой модели).
+        #[arg(long)]
+        vocab: Option<PathBuf>,
+        /// Тёплый старт головы: JSON {"новый токен": "токен базы"}.
+        #[arg(long)]
+        head_init: Option<PathBuf>,
+        #[arg(long, default_value_t = 3e-5)]
+        lr: f64,
+        #[arg(long, default_value_t = 1e-3)]
+        head_lr: f64,
+        #[arg(long, default_value_t = 500)]
+        warmup: usize,
+        #[arg(long, default_value_t = 10000)]
+        steps: usize,
+        #[arg(long, default_value_t = 8)]
+        accumulate: usize,
+        /// Слои ниже этого номера заморожены.
+        #[arg(long, default_value_t = 0)]
+        freeze_below: usize,
+        #[arg(long, default_value_t = 16.0)]
+        max_seconds: f32,
+        #[arg(long, default_value_t = 1000)]
+        eval_every: usize,
+        #[arg(long, default_value_t = 300)]
+        eval_max: usize,
+        #[arg(long, default_value_t = 1.0)]
+        max_grad_norm: f64,
+        #[arg(long, default_value_t = 0.01)]
+        weight_decay: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "cuda")]
+        device: String,
+    },
     Train {
         model: PathBuf,
         data: PathBuf,
@@ -1258,6 +1304,25 @@ fn main() -> ExitCode {
         }),
         Commands::Diff { file_a, file_b, atol, rtol } => {
             diff::run(diff::DiffArgs { file_a, file_b, atol, rtol })
+        }
+        Commands::FinetuneCtc {
+            base, train, out, dev, vocab, head_init, lr, head_lr, warmup, steps, accumulate,
+            freeze_below, max_seconds, eval_every, eval_max, max_grad_norm, weight_decay, seed, device,
+        } => {
+            (|| -> Result<(), Box<dyn std::error::Error>> {
+            let head_init = match head_init {
+                Some(p) => serde_json::from_slice(&std::fs::read(&p)?)?,
+                None => Default::default(),
+            };
+            let cfg = synaptix_asr_wav2vec2::finetune::FinetuneConfig {
+                base, train, dev, vocab, head_init, out,
+                device: synaptix_cli::commands::device::resolve(&device),
+                lr, head_lr, warmup, steps, accumulate, freeze_below, max_seconds,
+                eval_every, eval_max, max_grad_norm, weight_decay, seed,
+            };
+            synaptix_asr_wav2vec2::finetune::run(&cfg)?;
+            Ok(())
+            })()
         }
         Commands::Train { model, data, output, lora_r, lora_alpha, lr, epochs, batch_size } => {
             train::run(train::TrainArgs {

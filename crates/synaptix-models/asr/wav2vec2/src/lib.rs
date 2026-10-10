@@ -11,6 +11,8 @@
 //! `wav2vec2-xlsr-53-espeak-cv-ft` выдаёт покадровые вероятности IPA-фонем.
 
 pub mod config;
+#[cfg(feature = "train")]
+pub mod finetune;
 pub mod loader;
 pub mod model;
 pub mod pipeline;

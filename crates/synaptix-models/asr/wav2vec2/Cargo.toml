@@ -8,6 +8,8 @@ description = "Wav2Vec2 / XLS-R encoder with CTC head (phoneme and character rec
 
 [features]
 default = []
+# Дообучение CTC (synaptix-train + autograd).
+train = ["dep:synaptix-train", "dep:synaptix-autograd"]
 
 [dependencies]
 synaptix-core   = { workspace = true }
@@ -19,6 +21,8 @@ thiserror       = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 safetensors     = { workspace = true }
+synaptix-train    = { workspace = true, optional = true }
+synaptix-autograd = { workspace = true, optional = true }
 
 [dev-dependencies]
 synaptix-autograd = { workspace = true }

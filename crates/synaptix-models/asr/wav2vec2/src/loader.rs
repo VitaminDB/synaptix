@@ -27,6 +27,8 @@ pub struct Wav2Vec2Weights {
     source: Source,
     names: HashSet<String>,
     pub config: Wav2Vec2Config,
+    /// Исходный `config.json` целиком (для сохранения дообученной модели).
+    pub config_json: serde_json::Value,
     pub vocab: CtcVocab,
     pub device: Device,
     pub dtype: DType,
@@ -43,14 +45,16 @@ impl Wav2Vec2Weights {
             std::fs::read(dir.join(name))
                 .map_err(|e| Wav2Vec2Error::Load(format!("read {name}: {e}")))
         };
-        let config = Wav2Vec2Config::from_json_bytes(&read("config.json")?)?;
+        let config_bytes = read("config.json")?;
+        let config = Wav2Vec2Config::from_json_bytes(&config_bytes)?;
+        let config_json = serde_json::from_slice(&config_bytes).unwrap_or_default();
         let vocab = CtcVocab::from_json_bytes(&read("vocab.json")?)?;
         let weights_path = dir.join("model.safetensors");
         let loader = SafetensorsLoader::open(&weights_path)
             .map_err(|e| Wav2Vec2Error::Load(format!("open {}: {e}", weights_path.display())))?
             .with_device(device);
         let names = loader.names().into_iter().map(|s| s.to_string()).collect();
-        Ok(Self { source: Source::Safetensors(loader), names, config, vocab, device, dtype })
+        Ok(Self { source: Source::Safetensors(loader), names, config, config_json, vocab, device, dtype })
     }
 
     pub fn from_syn(
@@ -67,13 +71,15 @@ impl Wav2Vec2Weights {
                 ))
             })
         };
-        let config = Wav2Vec2Config::from_json_bytes(&read("config.json")?)?;
+        let config_bytes = read("config.json")?;
+        let config = Wav2Vec2Config::from_json_bytes(&config_bytes)?;
+        let config_json = serde_json::from_slice(&config_bytes).unwrap_or_default();
         let vocab = CtcVocab::from_json_bytes(&read("vocab.json")?)?;
         let slice = bundle.tensors_slice().map_err(|e| Wav2Vec2Error::Bundle(e.to_string()))?;
         let st = SafeTensors::deserialize(slice)
             .map_err(|e| Wav2Vec2Error::Load(format!("safetensors header: {e}")))?;
         let names = st.names().into_iter().map(|s| s.to_string()).collect();
-        Ok(Self { source: Source::Bundle(Box::new(bundle)), names, config, vocab, device, dtype })
+        Ok(Self { source: Source::Bundle(Box::new(bundle)), names, config, config_json, vocab, device, dtype })
     }
 
     /// Полное имя тензора: как есть, либо с префиксом `wav2vec2.`.
