@@ -175,3 +175,76 @@ impl GradFn for CastGradFn {
         "CastGradFn"
     }
 }
+
+/// Градиент `narrow`: срез вставляется в нули формы входа.
+pub struct NarrowGradFn {
+    parents: [Tensor; 1],
+    input_shape: Vec<usize>,
+    dim: usize,
+    start: usize,
+    len: usize,
+}
+
+impl NarrowGradFn {
+    pub fn new(input: &Tensor, dim: usize, start: usize, len: usize) -> Arc<dyn GradFn> {
+        Arc::new(Self { parents: [input.clone()], input_shape: input.dims().to_vec(), dim, start, len })
+    }
+}
+
+impl GradFn for NarrowGradFn {
+    fn backward(&self, output_grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+        let g = output_grad.contiguous()?;
+        let total = self.input_shape[self.dim];
+        let after = total - self.start - self.len;
+        if self.start == 0 && after == 0 {
+            return Ok(vec![Some(g)]);
+        }
+        let (dtype, device) = (g.dtype(), g.device());
+        let zeros = |n: usize| -> Result<Tensor> {
+            let mut shape = self.input_shape.clone();
+            shape[self.dim] = n;
+            Tensor::zeros(shape, dtype, device)
+        };
+        let mut parts = Vec::with_capacity(3);
+        if self.start > 0 {
+            parts.push(zeros(self.start)?);
+        }
+        parts.push(g);
+        if after > 0 {
+            parts.push(zeros(after)?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        Ok(vec![Some(Tensor::cat(&refs, self.dim)?)])
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn name(&self) -> &'static str {
+        "NarrowGradFn"
+    }
+}
+
+/// Градиент `expand`: сумма по размноженным осям.
+pub struct ExpandGradFn {
+    parents: [Tensor; 1],
+    input_shape: Vec<usize>,
+}
+
+impl ExpandGradFn {
+    pub fn new(input: &Tensor) -> Arc<dyn GradFn> {
+        Arc::new(Self { parents: [input.clone()], input_shape: input.dims().to_vec() })
+    }
+}
+
+impl GradFn for ExpandGradFn {
+    fn backward(&self, output_grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+        let g = crate::grad_fn::util::unbroadcast_to(output_grad.contiguous()?, &self.input_shape)?;
+        Ok(vec![Some(g.reshape(self.input_shape.clone())?)])
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn name(&self) -> &'static str {
+        "ExpandGradFn"
+    }
+}

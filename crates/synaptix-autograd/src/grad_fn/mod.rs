@@ -74,6 +74,10 @@ impl GradFnBuilder for Builder {
             GradOp::WhereCond { cond, a, b } => {
                 Some(indexing::WhereCondGradFn::new(cond, a, b))
             }
+            GradOp::Narrow { input, dim, start, len } => {
+                Some(reshape::NarrowGradFn::new(input, dim, start, len))
+            }
+            GradOp::Expand { input } => Some(reshape::ExpandGradFn::new(input)),
             GradOp::Cat { inputs, dim } => {
                 let refs: Vec<&Tensor> = inputs.iter().copied().collect();
                 Some(cat::CatGradFn::new(&refs, dim))

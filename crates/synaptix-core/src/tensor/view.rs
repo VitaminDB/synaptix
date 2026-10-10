@@ -4,7 +4,12 @@ use crate::tensor::Tensor;
 impl Tensor {
     pub fn narrow(&self, dim: usize, off: usize, len: usize) -> Result<Self> {
         let layout = self.layout.narrow(dim, off, len)?;
-        Ok(self.with_layout(layout))
+        let mut out = self.with_layout(layout);
+        crate::grad::try_attach_grad_fn(
+            crate::grad::GradOp::Narrow { input: self, dim, start: off, len },
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     pub fn slice(&self, dim: usize, off: usize, len: usize) -> Result<Self> {

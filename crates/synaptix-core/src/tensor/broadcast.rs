@@ -7,7 +7,9 @@ impl Tensor {
     pub fn expand<S: IntoShape>(&self, shape: S) -> Result<Self> {
         let target = shape.into_shape();
         let layout = self.layout.expand(&target)?;
-        Ok(self.with_layout(layout))
+        let mut out = self.with_layout(layout);
+        crate::grad::try_attach_grad_fn(crate::grad::GradOp::Expand { input: self }, &mut out)?;
+        Ok(out)
     }
 
     pub fn broadcast_as<S: IntoShape>(&self, shape: S) -> Result<Self> {

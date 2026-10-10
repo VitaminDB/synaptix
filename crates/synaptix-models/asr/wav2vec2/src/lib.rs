@@ -14,6 +14,7 @@ pub mod config;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod train;
 pub mod vocab;
 
 pub use config::Wav2Vec2Config;

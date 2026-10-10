@@ -21,5 +21,7 @@ serde_json      = { workspace = true }
 safetensors     = { workspace = true }
 
 [dev-dependencies]
+synaptix-autograd = { workspace = true }
+synaptix-train = { workspace = true }
 synaptix-kernels-cpu = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
