@@ -125,6 +125,21 @@ impl Wav2Vec2Ctc {
         })
     }
 
+    /// Log-probs и последний hidden state энкодера (`[T, D]` построчно на хосте).
+    pub fn log_probs_hidden(&self, pcm: &[f32], sample_rate: u32) -> Result<(CtcLogProbs, Vec<f32>, usize)> {
+        let x = self.input_tensor(pcm, sample_rate)?;
+        let (lp, hidden) = self.model.log_probs_hidden(&x)?;
+        let d = lp.dims().to_vec();
+        let data = lp.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let hd = hidden.dims()[2];
+        let h = hidden.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok((
+            CtcLogProbs { frames: d[1], vocab: d[2], data, frame_sec: self.config().hop_samples() as f32 / SR as f32 },
+            h,
+            hd,
+        ))
+    }
+
     /// Промежуточные тензоры (для гейтов). Вход — уже 16 кГц.
     pub fn forward_trace(&self, audio16k: &[f32]) -> Result<ForwardTrace> {
         let x = self.input_tensor(audio16k, SR)?;

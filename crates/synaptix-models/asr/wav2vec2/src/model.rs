@@ -351,6 +351,15 @@ impl Wav2Vec2Model {
         Ok(ForwardTrace { features, proj, pos, hidden, logits })
     }
 
+    /// Нормализованный PCM `[1, N]` → (log-probs `[1, T, V]`, hidden `[1, T, D]`).
+    pub fn log_probs_hidden(&self, wav: &Tensor) -> Result<(Tensor, Tensor)> {
+        let features = self.extract_features(wav)?;
+        let proj = self.project(&features)?;
+        let (_, hidden) = self.encode_with_pos(&proj)?;
+        let logits = self.head(&hidden)?;
+        Ok((log_softmax_dim(&logits.to_dtype(DType::F32)?, 2)?, hidden))
+    }
+
     /// Нормализованный PCM `[1, N]` → log-probs `[1, T, V]`.
     pub fn log_probs(&self, wav: &Tensor) -> Result<Tensor> {
         let features = self.extract_features(wav)?;
