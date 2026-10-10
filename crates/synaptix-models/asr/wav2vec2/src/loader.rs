@@ -48,7 +48,11 @@ impl Wav2Vec2Weights {
         let config_bytes = read("config.json")?;
         let config = Wav2Vec2Config::from_json_bytes(&config_bytes)?;
         let config_json = serde_json::from_slice(&config_bytes).unwrap_or_default();
-        let vocab = CtcVocab::from_json_bytes(&read("vocab.json")?)?;
+        // Базовые (не CTC) чекпойнты словаря не имеют.
+        let vocab = match read("vocab.json") {
+            Ok(b) => CtcVocab::from_json_bytes(&b)?,
+            Err(_) => CtcVocab::from_json_bytes(b"{}")?,
+        };
         let weights_path = dir.join("model.safetensors");
         let loader = SafetensorsLoader::open(&weights_path)
             .map_err(|e| Wav2Vec2Error::Load(format!("open {}: {e}", weights_path.display())))?
@@ -74,7 +78,10 @@ impl Wav2Vec2Weights {
         let config_bytes = read("config.json")?;
         let config = Wav2Vec2Config::from_json_bytes(&config_bytes)?;
         let config_json = serde_json::from_slice(&config_bytes).unwrap_or_default();
-        let vocab = CtcVocab::from_json_bytes(&read("vocab.json")?)?;
+        let vocab = match read("vocab.json") {
+            Ok(b) => CtcVocab::from_json_bytes(&b)?,
+            Err(_) => CtcVocab::from_json_bytes(b"{}")?,
+        };
         let slice = bundle.tensors_slice().map_err(|e| Wav2Vec2Error::Bundle(e.to_string()))?;
         let st = SafeTensors::deserialize(slice)
             .map_err(|e| Wav2Vec2Error::Load(format!("safetensors header: {e}")))?;
@@ -82,13 +89,16 @@ impl Wav2Vec2Weights {
         Ok(Self { source: Source::Bundle(Box::new(bundle)), names, config, config_json, vocab, device, dtype })
     }
 
-    /// Полное имя тензора: как есть, либо с префиксом `wav2vec2.`.
+    /// Полное имя тензора: как есть, либо с префиксом энкодера
+    /// (`wav2vec2.` / `wavlm.` / `hubert.`).
     fn resolve(&self, name: &str) -> Option<String> {
         if self.names.contains(name) {
             return Some(name.to_string());
         }
-        let prefixed = format!("wav2vec2.{name}");
-        self.names.contains(&prefixed).then_some(prefixed)
+        ["wav2vec2.", "wavlm.", "hubert."]
+            .iter()
+            .map(|p| format!("{p}{name}"))
+            .find(|n| self.names.contains(n))
     }
 
     pub fn contains(&self, name: &str) -> bool {

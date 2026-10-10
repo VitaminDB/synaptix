@@ -40,6 +40,22 @@ pub struct Wav2Vec2Config {
     pub vocab_size: usize,
     #[serde(default)]
     pub pad_token_id: Option<usize>,
+    /// `wav2vec2` | `hubert` | `wavlm` (у WavLM — относительный позиционный
+    /// bias с гейтом в каждом слое).
+    #[serde(default)]
+    pub model_type: Option<String>,
+    #[serde(default = "default_buckets")]
+    pub num_buckets: usize,
+    #[serde(default = "default_bucket_distance")]
+    pub max_bucket_distance: usize,
+}
+
+fn default_buckets() -> usize {
+    320
+}
+
+fn default_bucket_distance() -> usize {
+    800
 }
 
 impl Wav2Vec2Config {
@@ -67,6 +83,19 @@ impl Wav2Vec2Config {
             return Err(Wav2Vec2Error::Config("hidden_size % num_attention_heads != 0".into()));
         }
         Ok(cfg)
+    }
+
+    pub fn is_wavlm(&self) -> bool {
+        self.model_type.as_deref() == Some("wavlm")
+    }
+
+    /// Префикс энкодера в именах весов HF (`wav2vec2.`, `wavlm.`, `hubert.`).
+    pub fn weight_prefix(&self) -> &'static str {
+        match self.model_type.as_deref() {
+            Some("wavlm") => "wavlm.",
+            Some("hubert") => "hubert.",
+            _ => "wav2vec2.",
+        }
     }
 
     pub fn head_dim(&self) -> usize {

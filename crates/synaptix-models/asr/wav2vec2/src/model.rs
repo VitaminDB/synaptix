@@ -128,6 +128,14 @@ impl PosConv {
     }
 }
 
+/// Гейт относительного позиционного bias WavLM (в каждом слое).
+pub(crate) struct RelGate {
+    /// `gru_rel_pos_linear`: head_dim → 8.
+    pub linear: Linear,
+    /// `gru_rel_pos_const` `[1, H, 1, 1]`.
+    pub constant: Tensor,
+}
+
 pub(crate) struct Attention {
     pub q: Linear,
     pub k: Linear,
@@ -135,6 +143,7 @@ pub(crate) struct Attention {
     pub out: Linear,
     pub n_heads: usize,
     pub head_dim: usize,
+    pub gate: Option<RelGate>,
 }
 
 impl Attention {
@@ -145,14 +154,28 @@ impl Attention {
             .contiguous()?)
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// `bias` — относительный позиционный bias WavLM `[1, H, T, T]`.
+    fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         let d = x.dims();
         let (b, s) = (d[0], d[1]);
         let q = self.heads(&self.q.forward(x)?)?;
         let k = self.heads(&self.k.forward(x)?)?;
         let v = self.heads(&self.v.forward(x)?)?;
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let a = scaled_dot_attention(&q, &k, &v, scale, None)?;
+        // WavLM: bias масштабируется гейтом от входа слоя (по головам и позициям).
+        let gated = match (&self.gate, bias) {
+            (Some(g), Some(bias)) => {
+                let xh = self.heads(x)?; // [B,H,T,dh]
+                let p = g.linear.forward(&xh)?; // [B,H,T,8]
+                let p = p.reshape(vec![b, self.n_heads, s, 2, 4])?.sum_keepdim(4)?.squeeze(4)?.sigmoid()?; // [B,H,T,2]
+                let ga = p.narrow(3, 0, 1)?;
+                let gb = p.narrow(3, 1, 1)?;
+                let gate = ga.mul(&gb.broadcast_mul(&g.constant)?.affine(1.0, -1.0)?)?.affine(1.0, 2.0)?; // [B,H,T,1]
+                Some(gate.to_dtype(DType::F32)?.broadcast_mul(bias)?)
+            }
+            _ => None,
+        };
+        let a = scaled_dot_attention(&q, &k, &v, scale, gated.as_ref())?;
         let merged = a
             .permute(vec![0, 2, 1, 3])?
             .contiguous()?
@@ -176,16 +199,16 @@ impl EncoderLayer {
     }
 
     /// pre-LN (`do_stable_layer_norm`).
-    fn forward_stable(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.attn.forward(&self.attn_norm.forward(x)?)?;
+    fn forward_stable(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        let h = self.attn.forward(&self.attn_norm.forward(x)?, bias)?;
         let x = x.add(&h)?;
         let h = self.ff(&self.ff_norm.forward(&x)?)?;
         Ok(x.add(&h)?)
     }
 
     /// post-LN (base-модели): `attn_norm` = layer_norm, `ff_norm` = final_layer_norm.
-    fn forward_post(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.attn.forward(x)?;
+    fn forward_post(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        let h = self.attn.forward(x, bias)?;
         let x = self.attn_norm.forward(&x.add(&h)?)?;
         let h = self.ff(&x)?;
         self.ff_norm.forward(&x.add(&h)?)
@@ -215,6 +238,8 @@ pub struct Wav2Vec2Model {
     pub(crate) enc_norm: Ln,
     pub(crate) layers: Vec<EncoderLayer>,
     pub(crate) lm_head: Option<Linear>,
+    /// WavLM: таблица относительных позиций `[num_buckets, H]` (на хосте).
+    pub(crate) rel_embed: Option<(Vec<f32>, Tensor)>,
     device: Device,
     dtype: DType,
 }
@@ -257,6 +282,14 @@ impl Wav2Vec2Model {
                     out: Linear::load(w, &p("attention.out_proj"))?,
                     n_heads: cfg.num_attention_heads,
                     head_dim: cfg.head_dim(),
+                    gate: if cfg.is_wavlm() {
+                        Some(RelGate {
+                            linear: Linear::load(w, &p("attention.gru_rel_pos_linear"))?,
+                            constant: w.get(&p("attention.gru_rel_pos_const"))?.to_dtype(DType::F32)?,
+                        })
+                    } else {
+                        None
+                    },
                 },
                 ff_norm: Ln::load(w, &p("final_layer_norm"))?,
                 ff_in: Linear::load(w, &p("feed_forward.intermediate_dense"))?,
@@ -264,6 +297,13 @@ impl Wav2Vec2Model {
             });
         }
 
+        let rel_embed = if cfg.is_wavlm() {
+            let t = w.get_raw("encoder.layers.0.attention.rel_attn_embed.weight")?;
+            let host = t.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            Some((host, t))
+        } else {
+            None
+        };
         let lm_head = if w.contains("lm_head.weight") {
             Some(Linear::load(w, "lm_head")?)
         } else {
@@ -278,6 +318,7 @@ impl Wav2Vec2Model {
             pos_conv,
             layers,
             lm_head,
+            rel_embed,
             device: w.device,
             dtype: w.dtype,
             config: cfg,
@@ -319,18 +360,51 @@ impl Wav2Vec2Model {
     pub fn encode_with_pos(&self, proj: &Tensor) -> Result<(Tensor, Tensor)> {
         let pos = self.pos_conv.forward(proj)?;
         let mut h = proj.add(&pos)?;
+        let bias = self.relative_bias(h.dims()[1])?;
+        let bias = bias.as_ref();
         if self.config.do_stable_layer_norm {
             for l in &self.layers {
-                h = l.forward_stable(&h)?;
+                h = l.forward_stable(&h, bias)?;
             }
             h = self.enc_norm.forward(&h)?;
         } else {
             h = self.enc_norm.forward(&h)?;
             for l in &self.layers {
-                h = l.forward_post(&h)?;
+                h = l.forward_post(&h, bias)?;
             }
         }
         Ok((pos, h))
+    }
+
+    /// WavLM: относительный позиционный bias `[1, H, T, T]` (F32) по
+    /// логарифмическим корзинам расстояния `key − query`.
+    fn relative_bias(&self, t: usize) -> Result<Option<Tensor>> {
+        let Some((table, _)) = &self.rel_embed else { return Ok(None) };
+        let h = self.config.num_attention_heads;
+        let nb = self.config.num_buckets / 2;
+        let max_exact = nb / 2;
+        let ln_range = (self.config.max_bucket_distance as f64 / max_exact as f64).ln();
+        let bucket = |rel: i64| -> usize {
+            let mut b = if rel > 0 { nb } else { 0 };
+            let a = rel.unsigned_abs() as usize;
+            if a < max_exact {
+                b += a;
+            } else {
+                let large = max_exact as f64 + ((a as f64 / max_exact as f64).ln() / ln_range * (nb - max_exact) as f64);
+                b += (large as usize).min(nb - 1);
+            }
+            b
+        };
+        let mut out = vec![0f32; h * t * t];
+        for q in 0..t {
+            for k in 0..t {
+                let row = bucket(k as i64 - q as i64) * h;
+                for hh in 0..h {
+                    out[(hh * t + q) * t + k] = table[row + hh];
+                }
+            }
+        }
+        Ok(Some(Tensor::from_vec(out, vec![1, h, t, t], self.device)?))
     }
 
     /// Hidden state `[1, T, D]` → логиты `[1, T, V]`.

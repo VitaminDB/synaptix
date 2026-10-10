@@ -115,10 +115,12 @@ fn edit_distance(a: &[u32], b: &[u32]) -> usize {
 }
 
 fn trainable(name: &str, freeze_below: usize) -> bool {
-    if name.starts_with("lm_head.") || name.starts_with("wav2vec2.encoder.layer_norm.") {
+    // Имя без префикса семейства (wav2vec2./wavlm./hubert.).
+    let name = ["wav2vec2.", "wavlm.", "hubert."].iter().find_map(|p| name.strip_prefix(p)).unwrap_or(name);
+    if name.starts_with("lm_head.") || name.starts_with("encoder.layer_norm.") {
         return true;
     }
-    name.strip_prefix("wav2vec2.encoder.layers.")
+    name.strip_prefix("encoder.layers.")
         .and_then(|r| r.split('.').next())
         .and_then(|n| n.parse::<usize>().ok())
         .is_some_and(|n| n >= freeze_below)

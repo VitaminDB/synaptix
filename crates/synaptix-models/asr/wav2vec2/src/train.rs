@@ -25,6 +25,7 @@ impl Wav2Vec2Model {
     /// Все параметры с именами HF `Wav2Vec2ForCTC` (энкодер — с префиксом
     /// `wav2vec2.`). Позиционная свёртка хранится уже свёрнутой (`weight`).
     pub fn named_parameters_mut(&mut self) -> Vec<(String, &mut Tensor)> {
+        let prefix = self.config.weight_prefix();
         let mut out: Vec<(String, &mut Tensor)> = Vec::new();
         for (i, c) in self.convs.iter_mut().enumerate() {
             let p = format!("wav2vec2.feature_extractor.conv_layers.{i}");
@@ -52,9 +53,24 @@ impl Wav2Vec2Model {
             push_ln(&mut out, format!("{p}.final_layer_norm"), &mut l.ff_norm);
             push_lin(&mut out, format!("{p}.feed_forward.intermediate_dense"), &mut l.ff_in);
             push_lin(&mut out, format!("{p}.feed_forward.output_dense"), &mut l.ff_out);
+            if let Some(g) = l.attn.gate.as_mut() {
+                push_lin(&mut out, format!("{p}.attention.gru_rel_pos_linear"), &mut g.linear);
+                out.push((format!("{p}.attention.gru_rel_pos_const"), &mut g.constant));
+            }
+        }
+        if let Some((_, t)) = self.rel_embed.as_mut() {
+            out.push(("wav2vec2.encoder.layers.0.attention.rel_attn_embed.weight".into(), t));
         }
         if let Some(h) = self.lm_head.as_mut() {
             push_lin(&mut out, "lm_head".into(), h);
+        }
+        // Имена HF зависят от семейства модели.
+        for (n, _) in out.iter_mut() {
+            if prefix != "wav2vec2." {
+                if let Some(rest) = n.strip_prefix("wav2vec2.") {
+                    *n = format!("{prefix}{rest}");
+                }
+            }
         }
         out
     }
