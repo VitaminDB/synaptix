@@ -125,6 +125,21 @@ pub fn matmul_f32(
     dst: &mut CpuBuf,
     dst_lo: &Layout,
 ) -> Result<()> {
+    let (batch_a, batch_b, batch_d, m, k, n) = matmul_shapes(a_lo, b_lo, dst_lo)?;
+    // Крупные произведения — блочный SIMD-GEMM; мелкие (GEMV) — построчный путь.
+    if m >= 8 && n >= 8 && dst_lo.is_contiguous() {
+        let a_s: &[f32] = bytemuck::cast_slice(a.as_bytes());
+        let b_s: &[f32] = bytemuck::cast_slice(b.as_bytes());
+        let d_s: &mut [f32] = bytemuck::cast_slice_mut(dst.as_bytes_mut());
+        let (a_off, b_off, d_off) = (a_lo.offset(), b_lo.offset(), dst_lo.offset());
+        for bi in 0..batch_d {
+            let ab = a_off + (bi % batch_a) * m * k;
+            let bb = b_off + (bi % batch_b) * k * n;
+            let db = d_off + bi * m * n;
+            super::blocked::sgemm(m, n, k, &a_s[ab..ab + m * k], &b_s[bb..bb + k * n], &mut d_s[db..db + m * n]);
+        }
+        return Ok(());
+    }
     matmul_t::<f32>(a, a_lo, b, b_lo, dst, dst_lo)
 }
 
@@ -239,6 +254,19 @@ pub fn linear_f32(
     out: &mut CpuBuf,
     out_lo: &Layout,
 ) -> Result<()> {
+    // Много строк (prefill/кодировщик) — блочный SIMD-GEMM с упаковкой весов.
+    if x_lo.is_contiguous() && w_lo.is_contiguous() && out_lo.is_contiguous() && w_lo.dims().len() == 2 {
+        let (n, k) = (w_lo.dims()[0], w_lo.dims()[1]);
+        let m = if k > 0 { x_lo.numel() / k } else { 0 };
+        if m >= 8 && k > 0 && x_lo.dims().last() == Some(&k) && out_lo.numel() == m * n {
+            let x_s: &[f32] = bytemuck::cast_slice(x.as_bytes());
+            let w_s: &[f32] = bytemuck::cast_slice(w.as_bytes());
+            let o_s: &mut [f32] = bytemuck::cast_slice_mut(out.as_bytes_mut());
+            let (xo, wo, oo) = (x_lo.offset(), w_lo.offset(), out_lo.offset());
+            super::blocked::linear(m, n, k, &x_s[xo..xo + m * k], &w_s[wo..wo + n * k], &mut o_s[oo..oo + m * n]);
+            return Ok(());
+        }
+    }
     linear_t::<f32>(x, x_lo, w, w_lo, out, out_lo)
 }
 

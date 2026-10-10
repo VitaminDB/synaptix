@@ -37,6 +37,56 @@ impl Im2ColParams2d {
     }
 }
 
+/// Параметры im2col по диапазону строк (для `Backend::im2col`).
+#[derive(Debug, Clone, Copy)]
+pub struct Im2ColRows {
+    pub c: usize,
+    pub h: usize,
+    pub w: usize,
+    pub kh: usize,
+    pub kw: usize,
+    pub h_out: usize,
+    pub w_out: usize,
+    pub stride: (usize, usize),
+    pub padding: (usize, usize),
+    pub m_offset: usize,
+    pub m_count: usize,
+}
+
+/// im2col строк `[m_offset, m_offset + m_count)`: строка — патч (b, oy, ox),
+/// столбцы — (c, ky, kx). Параллельно по строкам.
+pub fn im2col_rows<T: bytemuck::Pod + Send + Sync>(src: &[u8], src_off: usize, dst: &mut [u8], dst_off: usize, p: Im2ColRows) {
+    use rayon::prelude::*;
+    let src: &[T] = &bytemuck::cast_slice::<u8, T>(src)[src_off..];
+    let k = p.c * p.kh * p.kw;
+    let dst: &mut [T] = &mut bytemuck::cast_slice_mut::<u8, T>(dst)[dst_off..dst_off + p.m_count * k];
+    let plane = p.h * p.w;
+    let per_img = p.h_out * p.w_out;
+    let zero = T::zeroed();
+    dst.par_chunks_mut(k).enumerate().for_each(|(r, row)| {
+        let m = p.m_offset + r;
+        let (b, rem) = (m / per_img, m % per_img);
+        let (oy, ox) = (rem / p.w_out, rem % p.w_out);
+        let base = b * p.c * plane;
+        let mut idx = 0;
+        for ci in 0..p.c {
+            let cb = base + ci * plane;
+            for ky in 0..p.kh {
+                let iy = (oy * p.stride.0 + ky) as isize - p.padding.0 as isize;
+                for kx in 0..p.kw {
+                    let ix = (ox * p.stride.1 + kx) as isize - p.padding.1 as isize;
+                    row[idx] = if iy >= 0 && (iy as usize) < p.h && ix >= 0 && (ix as usize) < p.w {
+                        src[cb + iy as usize * p.w + ix as usize]
+                    } else {
+                        zero
+                    };
+                    idx += 1;
+                }
+            }
+        }
+    });
+}
+
 pub fn im2col_2d_dispatch(
     dtype: DType,
     src: &[u8],

@@ -123,6 +123,53 @@ impl Backend for CpuBackend {
         gemm::matmul_dispatch(a_buf, a_lo, b_buf, b_lo, dst_buf, dst_lo)
     }
 
+    /// im2col для conv2d (NCHW → `[m_count, C·kh·kw]`, строки — (b, oy, ox)
+    /// начиная с `m_offset`, столбцы — (c, ky, kx), как `weight.reshape([Cout, K])`).
+    #[allow(clippy::too_many_arguments)]
+    fn im2col(
+        &self,
+        input: (&Storage, &Layout),
+        col: (&mut Storage, &Layout),
+        kh: usize,
+        kw: usize,
+        h_out: usize,
+        w_out: usize,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        m_offset: u64,
+        m_count: u64,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let (in_st, in_lo) = input;
+        let (col_st, col_lo) = col;
+        if !in_lo.is_contiguous() || in_lo.dims().len() != 4 {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let src = in_st.as_cpu().ok_or(SynaptixError::Unsupported("im2col: input non-cpu"))?;
+        let dst = col_st.as_cpu_mut().ok_or(SynaptixError::Unsupported("im2col: col non-cpu"))?;
+        let d = in_lo.dims();
+        let p = crate::conv::Im2ColRows {
+            c: d[1],
+            h: d[2],
+            w: d[3],
+            kh,
+            kw,
+            h_out,
+            w_out,
+            stride,
+            padding,
+            m_offset: m_offset as usize,
+            m_count: m_count as usize,
+        };
+        match in_lo.dtype() {
+            DType::F32 => crate::conv::im2col_rows::<f32>(src.as_bytes(), in_lo.offset(), dst.as_bytes_mut(), col_lo.offset(), p),
+            DType::F16 => crate::conv::im2col_rows::<half::f16>(src.as_bytes(), in_lo.offset(), dst.as_bytes_mut(), col_lo.offset(), p),
+            DType::BF16 => crate::conv::im2col_rows::<half::bf16>(src.as_bytes(), in_lo.offset(), dst.as_bytes_mut(), col_lo.offset(), p),
+            _ => return Err(SynaptixError::Unsupported("im2col: dtype")),
+        }
+        Ok(())
+    }
+
     fn linear(
         &self,
         x: (&Storage, &Layout),

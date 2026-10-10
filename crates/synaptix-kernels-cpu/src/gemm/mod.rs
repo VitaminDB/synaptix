@@ -1,5 +1,6 @@
 pub mod avx2;
 pub mod avx512;
+pub mod blocked;
 pub mod naive;
 pub mod neon;
 pub mod simd_dot;
