@@ -41,6 +41,7 @@ members = [
     "crates/synaptix-models/asr/whisper",
     "crates/synaptix-models/asr/gigaam",
     "crates/synaptix-models/asr/wav2vec2",
+    "crates/synaptix-models/align/mfa",
     "crates/synaptix-models/tts/omnivoice",
     "crates/synaptix-models/tts/vibevoice",
     "crates/synaptix-models/tts/voxcpm",
@@ -220,6 +221,7 @@ synaptix-llm-gemma4   = { path = "crates/synaptix-models/llm/gemma4" }
 synaptix-llm-llama    = { path = "crates/synaptix-models/llm/llama" }
 synaptix-asr-gigaam   = { path = "crates/synaptix-models/asr/gigaam" }
 synaptix-asr-wav2vec2 = { path = "crates/synaptix-models/asr/wav2vec2" }
+synaptix-align-mfa    = { path = "crates/synaptix-models/align/mfa" }
 synaptix-embedding-bge-m3 = { path = "crates/synaptix-models/embedding/bge_m3" }
 synaptix-diarization-sortformer = { path = "crates/synaptix-models/diarization/sortformer" }
 synaptix-tts-omnivoice = { path = "crates/synaptix-models/tts/omnivoice" }

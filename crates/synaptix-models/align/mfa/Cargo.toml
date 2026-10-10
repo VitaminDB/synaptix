@@ -1,0 +1,17 @@
+[package]
+name = "synaptix-align-mfa"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Montreal Forced Aligner (Kaldi GMM-HMM) alignment ported to Rust: features, triphone tree, Viterbi."
+
+[dependencies]
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rayon      = { workspace = true }
+rustfft    = { workspace = true }
+
+[dev-dependencies]
+synaptix-audio = { workspace = true }
