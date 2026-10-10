@@ -83,8 +83,11 @@ fn read_manifest(path: &Path, vocab: &CtcVocab) -> Result<(Vec<Example>, usize)>
 
 fn load_audio(path: &Path, max_seconds: f32) -> Result<Vec<f32>> {
     let (pcm, sr) = synaptix_audio::io::read_wav_mono_f32(path).map_err(|e| Wav2Vec2Error::Audio(format!("{}: {e}", path.display())))?;
-    let mut pcm = if sr == 16000 { pcm } else { resample(&pcm, sr, 16000).map_err(|e| Wav2Vec2Error::Audio(e.to_string()))? };
-    pcm.truncate((max_seconds * 16000.0) as usize);
+    let pcm = if sr == 16000 { pcm } else { resample(&pcm, sr, 16000).map_err(|e| Wav2Vec2Error::Audio(e.to_string()))? };
+    // Обрезать нельзя: разметка осталась бы полной — пример пропускается.
+    if pcm.len() as f32 > max_seconds * 16000.0 {
+        return Err(Wav2Vec2Error::Audio(format!("длиннее {max_seconds} с")));
+    }
     Ok(normalize_audio(&pcm))
 }
 
@@ -126,7 +129,7 @@ fn evaluate(model: &Wav2Vec2Model, examples: &[Example], max: usize, blank: u32,
     no_grad(|| {
         let (mut errs, mut total) = (0usize, 0usize);
         for ex in examples.iter().take(max) {
-            let x = load_audio(&ex.audio, cfg.max_seconds)?;
+            let Ok(x) = load_audio(&ex.audio, cfg.max_seconds) else { continue };
             let n = x.len();
             let t = Tensor::from_vec(x, (1, n), cfg.device)?;
             let logits = model.logits(&t)?;
@@ -226,10 +229,7 @@ pub fn run(cfg: &FinetuneConfig) -> Result<()> {
             cursor += 1;
             let x = match load_audio(&ex.audio, cfg.max_seconds) {
                 Ok(x) => x,
-                Err(e) => {
-                    eprintln!("  пропуск {}: {e}", ex.audio.display());
-                    continue;
-                }
+                Err(_) => continue,
             };
             let n = x.len();
             let xt = Tensor::from_vec(x, (1, n), cfg.device)?;
