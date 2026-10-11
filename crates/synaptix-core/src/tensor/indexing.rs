@@ -163,10 +163,15 @@ impl Tensor {
         if dim >= rank {
             return Err(SynaptixError::DimOutOfRange { dim, rank });
         }
+        if self.device().is_cuda() {
+            return self.index_select_cuda(dim, indices);
+        }
         if !self.device().is_cpu() {
-            {
-                return self.index_select_cuda(dim, indices);
-            }
+            // NPU и прочие: пока через CPU (gather общего вида в графе нет).
+            let device = self.device();
+            let host = self.to_device(Device::Cpu)?;
+            let idx = indices.to_device(Device::Cpu)?;
+            return host.index_select(dim, &idx)?.to_device(device);
         }
         let src = self.contiguous()?;
         let idx = indices.contiguous()?;

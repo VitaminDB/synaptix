@@ -116,6 +116,22 @@ impl Backend for NpuBackend {
         self.rec(NodeOp::Copy, vec![inp(src.0, src.1)?], dst)
     }
 
+    fn cat(&self, srcs: &[(&Storage, &Layout)], dim: usize, dst: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
+        let dv = value::value_of(dst.0)?;
+        let stores: Vec<&Storage> = srcs.iter().map(|(s, _)| *s).collect();
+        let origin = host_origin(&stores);
+        let ok = full(dst.1, &dv) && srcs.iter().all(|(_, lo)| ok_dtype(lo) && lo.dtype() == dst.1.dtype()) && origin.is_none();
+        if !ok {
+            // готовые данные (не из графа) или неподдерживаемый тип — склеить на CPU
+            let cpu_srcs: Vec<Storage> = srcs.iter().map(|(s, _)| cpu_storage(s)).collect::<Result<Vec<_>>>()?;
+            let pairs: Vec<(&Storage, &Layout)> = cpu_srcs.iter().zip(srcs.iter()).map(|(s, (_, lo))| (s, *lo)).collect();
+            let o = origin.unwrap_or(Origin::Graph);
+            return on_cpu!(dst.0, o, |c, d| c.cat(&pairs, dim, (&mut d, dst.1), &Stream::CpuNoop));
+        }
+        let ins = srcs.iter().map(|(s, lo)| inp(s, lo)).collect::<Result<Vec<_>>>()?;
+        self.rec(NodeOp::Concat(dim), ins, dst)
+    }
+
     fn cast(&self, src: (&Storage, &Layout), dst: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
         let dv = value::value_of(dst.0)?;
         let origin = host_origin(&[src.0]);

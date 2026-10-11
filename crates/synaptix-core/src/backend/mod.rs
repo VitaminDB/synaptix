@@ -112,6 +112,36 @@ pub fn param_upload_active() -> bool {
     PARAM_UPLOAD.with(|c| c.get())
 }
 
+/// Конкатенация по байтам: все хранилища — CPU. Общая реализация для
+/// умолчания `Backend::cat` и запасного пути бэкендов устройств.
+pub fn cat_cpu_bytes(srcs: &[(&Storage, &Layout)], dim: usize, dst: (&mut Storage, &Layout)) -> Result<()> {
+    let Some(first) = srcs.first() else {
+        return Err(SynaptixError::Unsupported("cat: empty list"));
+    };
+    let elem_bytes = first.1.dtype().size_in_bits() / 8;
+    let out_dims = dst.1.dims();
+    let outer: usize = out_dims[..dim].iter().product();
+    let inner: usize = out_dims[dim + 1..].iter().product();
+    let out_slice = out_dims[dim] * inner * elem_bytes;
+    let out = dst.0.as_cpu_mut().ok_or(SynaptixError::Unsupported("cat: dst не на CPU"))?;
+    let out = out.as_bytes_mut();
+    for o in 0..outer {
+        let mut written = 0usize;
+        for (st, lo) in srcs {
+            if !lo.is_contiguous() {
+                return Err(SynaptixError::NonContiguous);
+            }
+            let src = st.as_cpu().ok_or(SynaptixError::Unsupported("cat: вход не на CPU"))?.as_bytes();
+            let chunk = lo.dims()[dim] * inner * elem_bytes;
+            let s0 = o * chunk + lo.offset() * elem_bytes;
+            let d0 = o * out_slice + written;
+            out[d0..d0 + chunk].copy_from_slice(&src[s0..s0 + chunk]);
+            written += chunk;
+        }
+    }
+    Ok(())
+}
+
 pub trait Backend: Send + Sync + 'static {
     fn device_kind(&self) -> Device;
 
@@ -167,6 +197,20 @@ pub trait Backend: Send + Sync + 'static {
         dst: (&mut Storage, &Layout),
         stream: &Stream,
     ) -> Result<()>;
+
+    /// Конкатенация контигуальных входов по оси `dim` в контигуальный `dst`
+    /// (формы входов совпадают во всех осях, кроме `dim`). По умолчанию —
+    /// копирование байтов для CPU-хранилищ; бэкенд устройства переопределяет
+    /// (NPU — узлом графа). CUDA идёт своим путём в `Tensor::cat`.
+    fn cat(
+        &self,
+        srcs: &[(&Storage, &Layout)],
+        dim: usize,
+        dst: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        cat_cpu_bytes(srcs, dim, dst)
+    }
 
     /// Квантованный Linear (hardware tensor-core): `out[M,N] = x[M,K] @ w[N,K]ᵀ`,
     /// где `w` — `QuantWeight` (NVFP4/MXFP8) со своими scale-тензорами. Активация

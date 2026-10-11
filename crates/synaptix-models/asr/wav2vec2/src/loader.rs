@@ -110,7 +110,9 @@ impl Wav2Vec2Weights {
         let full = self
             .resolve(name)
             .ok_or_else(|| Wav2Vec2Error::Load(format!("нет тензора '{name}'")))?;
-        match &self.source {
+        // Веса — параметры модели: на NPU они вшиваются в граф статикой
+        // (`with_param_upload`), а не подаются входами на каждом запуске.
+        synaptix_core::backend::with_param_upload(|| match &self.source {
             Source::Safetensors(loader) => loader
                 .load(&full)
                 .map_err(|e| Wav2Vec2Error::Load(format!("'{full}': {e}"))),
@@ -128,7 +130,7 @@ impl Wav2Vec2Weights {
                 Tensor::from_raw_slice(view.data(), view.shape().to_vec(), src_dtype, self.device)
                     .map_err(|e| Wav2Vec2Error::Load(format!("from_raw_slice '{full}': {e}")))
             }
-        }
+        })
     }
 
     /// Тензор, приведённый к compute-dtype.

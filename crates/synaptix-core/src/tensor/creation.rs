@@ -189,10 +189,11 @@ impl Tensor {
                 }
             }
         }
+        if device.is_cuda() {
+            return cat_cuda(tensors, dim);
+        }
         if !device.is_cpu() {
-            {
-                return cat_cuda(tensors, dim);
-            }
+            return cat_device(tensors, dim);
         }
         let mut out_dims = first.dims().to_vec();
         out_dims[dim] = tensors.iter().map(|t| t.dims()[dim]).sum();
@@ -281,6 +282,37 @@ fn fill_bytes_one(dtype: DType, numel: usize) -> Result<Vec<u8>> {
         }
         _ => return Err(SynaptixError::Unsupported("ones on quantized dtype")),
     }
+    Ok(out)
+}
+
+/// `Tensor::cat` на устройстве с бэкендом из реестра (NPU и др.): выход
+/// выделяется бэкендом, конкатенация — его `cat` (NPU записывает узел графа).
+/// Если бэкенд её не умеет — через CPU: выгрузить, склеить, загрузить.
+fn cat_device(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
+    let first = tensors[0];
+    let device = first.device();
+    let dtype = first.dtype();
+    let mut out_dims = first.dims().to_vec();
+    out_dims[dim] = tensors.iter().map(|t| t.dims()[dim]).sum();
+    let out_layout = Layout::contiguous(Shape::new(out_dims), dtype);
+    let backend = crate::backend::registry::backend_for(device)?;
+    let contig: Vec<Tensor> = tensors.iter().map(|t| t.contiguous()).collect::<Result<Vec<_>>>()?;
+    let srcs: Vec<(&Storage, &Layout)> = contig.iter().map(|t| (t.storage(), t.layout())).collect();
+    let mut storage = backend.alloc_uninit(out_layout.dtype().bytes_for_numel(out_layout.numel()), device)?;
+    let stream = crate::stream::Stream::default_for(device)?;
+    let done = match backend.cat(&srcs, dim, (&mut storage, &out_layout), &stream) {
+        Ok(()) => true,
+        Err(SynaptixError::Unsupported(_)) => false,
+        Err(e) => return Err(e),
+    };
+    let mut out = if done {
+        Tensor::from_parts(Arc::new(storage), out_layout)
+    } else {
+        let host: Vec<Tensor> = contig.iter().map(|t| t.to_device(Device::Cpu)).collect::<Result<Vec<_>>>()?;
+        let refs: Vec<&Tensor> = host.iter().collect();
+        Tensor::cat(&refs, dim)?.to_device(device)?
+    };
+    crate::grad::try_attach_grad_fn(crate::grad::GradOp::Cat { inputs: tensors.to_vec(), dim }, &mut out)?;
     Ok(out)
 }
 

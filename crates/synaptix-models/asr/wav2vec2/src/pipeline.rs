@@ -89,7 +89,8 @@ impl Wav2Vec2Ctc {
         self.model.config().blank_id() as u32
     }
 
-    fn input_tensor(&self, pcm: &[f32], sample_rate: u32) -> Result<Tensor> {
+    /// Вход модели `[1, N]` (с дополнением до корзины) и число кадров настоящей записи.
+    fn input_tensor(&self, pcm: &[f32], sample_rate: u32) -> Result<(Tensor, usize)> {
         let resampled;
         let audio: &[f32] = if sample_rate == SR {
             pcm
@@ -105,20 +106,55 @@ impl Wav2Vec2Ctc {
                 audio.len()
             )));
         }
-        let x = normalize_audio(audio);
+        let mut x = normalize_audio(audio);
+        let real = x.len();
+        // Устройства с графом фиксированных форм (NPU): длина записи — из
+        // набора «корзин», хвост — тишина; лишние кадры отрезаются после модели.
+        let padded = self.bucket_len(real);
+        if padded > real {
+            x.resize(padded, 0.0);
+        }
         let n = x.len();
         let t = Tensor::from_vec(x, (1, n), self.model.device())?;
-        Ok(t.to_dtype(self.model.dtype())?)
+        Ok((t.to_dtype(self.model.dtype())?, self.config().frames_for(real)))
+    }
+
+    /// Корзины длины записи для устройств с графом фиксированных форм (NPU):
+    /// каждая новая длина входа — новая сборка графа (десятки секунд), поэтому
+    /// запись дополняется тишиной до ближайшей из ~13 длин. На CPU/CUDA — как есть.
+    /// `SYNAPTIX_LEN_BUCKETS=0` выключает, `SYNAPTIX_LEN_BUCKETS=1` включает везде.
+    pub fn length_buckets_active(&self) -> bool {
+        match std::env::var("SYNAPTIX_LEN_BUCKETS").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => matches!(self.model.device(), Device::Npu(_)),
+        }
+    }
+
+    /// Длины корзин в сэмплах 16 кГц.
+    pub fn length_buckets() -> &'static [usize] {
+        const SEC: [f32; 13] = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0];
+        static B: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+        B.get_or_init(|| SEC.iter().map(|s| (s * SR as f32) as usize).collect())
+    }
+
+    fn bucket_len(&self, n: usize) -> usize {
+        if !self.length_buckets_active() {
+            return n;
+        }
+        Self::length_buckets().iter().copied().find(|&b| b >= n).unwrap_or(n)
     }
 
     /// PCM (любой sample_rate, моно f32) → log-probs на хосте.
     pub fn log_probs(&self, pcm: &[f32], sample_rate: u32) -> Result<CtcLogProbs> {
-        let x = self.input_tensor(pcm, sample_rate)?;
+        let (x, real_frames) = self.input_tensor(pcm, sample_rate)?;
         let lp = self.model.log_probs(&x)?; // [1,T,V] f32
         let d = lp.dims().to_vec();
-        let data = lp.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut data = lp.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let frames = real_frames.min(d[1]);
+        data.truncate(frames * d[2]);
         Ok(CtcLogProbs {
-            frames: d[1],
+            frames,
             vocab: d[2],
             data,
             frame_sec: self.config().hop_samples() as f32 / SR as f32,
@@ -127,14 +163,17 @@ impl Wav2Vec2Ctc {
 
     /// Log-probs и последний hidden state энкодера (`[T, D]` построчно на хосте).
     pub fn log_probs_hidden(&self, pcm: &[f32], sample_rate: u32) -> Result<(CtcLogProbs, Vec<f32>, usize)> {
-        let x = self.input_tensor(pcm, sample_rate)?;
+        let (x, real_frames) = self.input_tensor(pcm, sample_rate)?;
         let (lp, hidden) = self.model.log_probs_hidden(&x)?;
         let d = lp.dims().to_vec();
-        let data = lp.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut data = lp.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         let hd = hidden.dims()[2];
-        let h = hidden.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut h = hidden.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let frames = real_frames.min(d[1]);
+        data.truncate(frames * d[2]);
+        h.truncate(frames * hd);
         Ok((
-            CtcLogProbs { frames: d[1], vocab: d[2], data, frame_sec: self.config().hop_samples() as f32 / SR as f32 },
+            CtcLogProbs { frames, vocab: d[2], data, frame_sec: self.config().hop_samples() as f32 / SR as f32 },
             h,
             hd,
         ))
@@ -142,7 +181,7 @@ impl Wav2Vec2Ctc {
 
     /// Промежуточные тензоры (для гейтов). Вход — уже 16 кГц.
     pub fn forward_trace(&self, audio16k: &[f32]) -> Result<ForwardTrace> {
-        let x = self.input_tensor(audio16k, SR)?;
+        let (x, _) = self.input_tensor(audio16k, SR)?;
         self.model.forward_trace(&x)
     }
 

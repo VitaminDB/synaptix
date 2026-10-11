@@ -32,6 +32,8 @@ pub enum NodeOp {
     EmbedGather,
     KvAppend,
     AttentionDev { scale: f32 },
+    /// Конкатенация входов по оси.
+    Concat(usize),
 }
 
 struct Node {
@@ -290,6 +292,11 @@ impl Builder {
             NodeOp::Cast => {
                 let x = self.input(&n.ins[0], true)?;
                 self.g.node(odt, &oshape, |out| Op::Cast { x, out })
+            }
+            NodeOp::Concat(axis) => {
+                let xs: Vec<TensorId> = n.ins.iter().map(|i| self.input(i, true)).collect::<Result<Vec<_>>>()?;
+                let axis = *axis as u32;
+                self.g.node(odt, &oshape, |out| Op::Concat { xs, axis, out })
             }
             NodeOp::Unary(op) => {
                 let x = self.input(&n.ins[0], true)?;
