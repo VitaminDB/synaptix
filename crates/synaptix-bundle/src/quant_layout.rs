@@ -79,7 +79,7 @@ impl QuantEntry {
         let (slices, n, k) = self.dims()?;
         let last = match self.kind()? {
             QuantKind::Nvfp4 => k / 2,
-            QuantKind::Mxfp8 => k,
+            QuantKind::Mxfp8 | QuantKind::Q8Row => k,
             kind @ (QuantKind::Sq(_) | QuantKind::Ggml(_)) => {
                 synaptix_core::quant::block_row_bytes(kind.dtype(), k)?
             }

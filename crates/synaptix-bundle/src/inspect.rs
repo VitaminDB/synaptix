@@ -108,6 +108,7 @@ pub enum QuantKind {
     /// Тип ggml (файл llama.cpp), один блоб байт в байт как в GGUF. Требует
     /// `K` кратно блоку типа. Только исполнение, энкодера нет.
     Ggml(synaptix_core::quant::GgmlType),
+    Q8Row,
 }
 
 impl QuantKind {
@@ -119,6 +120,7 @@ impl QuantKind {
             QuantKind::Mxfp8 => DType::MXFP8,
             QuantKind::Sq(bits) => DType::Sq { bits },
             QuantKind::Ggml(t) => DType::Ggml(t),
+            QuantKind::Q8Row => DType::Q8Row,
         }
     }
 
@@ -129,6 +131,7 @@ impl QuantKind {
             DType::MXFP8 => Some(QuantKind::Mxfp8),
             DType::Sq { bits } => Some(QuantKind::Sq(bits)),
             DType::Ggml(t) => Some(QuantKind::Ggml(t)),
+            DType::Q8Row => Some(QuantKind::Q8Row),
             _ => None,
         }
     }
@@ -136,7 +139,7 @@ impl QuantKind {
     /// Формат хранит масштабы отдельным блобом `.qscales` (NVFP4/MXFP8);
     /// одноблобные — нет.
     pub fn has_scales(self) -> bool {
-        matches!(self, QuantKind::Nvfp4 | QuantKind::Mxfp8)
+        matches!(self, QuantKind::Nvfp4 | QuantKind::Mxfp8 | QuantKind::Q8Row)
     }
 }
 
@@ -182,6 +185,7 @@ pub fn quantized_bytes(shape: &[usize], kind: QuantKind) -> Option<u64> {
             let rb = synaptix_core::quant::block_row_bytes(kind.dtype(), k as usize)? as u64;
             Some(stack * n * rb)
         }
+        QuantKind::Q8Row => Some(stack * (n * k + n * 4)),
     }
 }
 
@@ -231,6 +235,7 @@ impl SizeEstimate {
             Some(QuantKind::Mxfp8) => self.mxfp8,
             Some(QuantKind::Sq(b)) => self.sq_rest.saturating_add(self.sq_blocks.saturating_mul(20 + 32 * b as u64)),
             Some(QuantKind::Ggml(_)) => self.dense,
+            Some(QuantKind::Q8Row) => self.mxfp8,
         }
     }
 }

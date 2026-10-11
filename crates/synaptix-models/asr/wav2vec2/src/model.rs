@@ -37,18 +37,29 @@ impl Ln {
 pub(crate) struct Linear {
     pub weight: Tensor,
     pub bias: Tensor,
+    pub q: Option<synaptix_core::tensor::quant::QuantWeight>,
+    pub name: String,
 }
 
 impl Linear {
     fn load(w: &Wav2Vec2Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            weight: w.get(&format!("{prefix}.weight"))?,
-            bias: w.get(&format!("{prefix}.bias"))?,
-        })
+        let name = format!("{prefix}.weight");
+        let bias = w.get(&format!("{prefix}.bias"))?;
+        if matches!(w.device, Device::Npu(_)) && w.is_quantized(&name) {
+            if let Some(q) = w.quant_q8row(&name)? {
+                let weight = Tensor::zeros(vec![0], w.dtype, Device::Cpu)?;
+                return Ok(Self { weight, bias, q: Some(q), name: w.full_name(&name) });
+            }
+        }
+        Ok(Self { weight: w.get(&name)?, bias, q: None, name: w.full_name(&name) })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.linear(&self.weight)?.broadcast_add(&self.bias)?)
+        synaptix_core::quant::calib::record(&self.name, x)?;
+        match &self.q {
+            Some(q) => Ok(x.linear_quant(q)?.broadcast_add(&self.bias)?),
+            None => Ok(x.linear(&self.weight)?.broadcast_add(&self.bias)?),
+        }
     }
 }
 

@@ -23,6 +23,7 @@ pub struct QuantizeArgs {
     pub embed: Option<String>,
     pub keep_quant: bool,
     pub device: String,
+    pub calib: Option<PathBuf>,
 }
 
 fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
@@ -30,7 +31,7 @@ fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
         "none" | "keep" | "-" => Ok(None),
         other => match parse_dtype(other) {
             Some(d) if d.is_quantized() && !matches!(d, DType::Ggml(_)) => Ok(Some(d)),
-            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | none")),
+            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | q8row | none")),
         },
     }
 }
@@ -44,8 +45,10 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(a) => fmt(a, "--attn")?,
         None => Some(main),
     };
+    let q8 = main == DType::Q8Row;
     let lm_head = match &args.lm_head {
         Some(a) => fmt(a, "--lm-head")?,
+        None if q8 => None,
         None => Some(main),
     };
     let embed = match &args.embed {
@@ -58,14 +61,22 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts: Some(main), lm_head, embed, requant: !args.keep_quant, quantize_dense: true };
+    let experts = if q8 { None } else { Some(main) };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true };
     let device = if args.device.starts_with("cuda") {
         let ord = args.device.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Device::Cuda(ord)
+    } else if q8 {
+        Device::Cpu
     } else {
         return Err("квантование считается на карте: --device cuda[:N]".into());
     };
     synaptix::init()?;
+    if let Some(c) = &args.calib {
+        let t = synaptix_core::quant::calib::load(c)?;
+        println!("  калибровка: {} ({} тензоров)", c.display(), t.len());
+        synaptix_core::quant::calib::set_table(Some(t));
+    }
     let src_formats = synaptix::facade::arch::bundle_quant_formats(&args.input);
     println!("Quantize {} → {}", args.input.display(), args.output.display());
     println!("  spec:       {}", spec.key());

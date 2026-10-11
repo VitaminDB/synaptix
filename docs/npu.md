@@ -125,6 +125,33 @@ synmobile/hw/npu/npu-precompile.sh transcribe whisper.syn речь.wav --device 
    для всех не-CUDA устройств).
 4. Статическое квантование активаций (UFIXED8/16 + калибровка) — отдельный этап, если int8 по весам не хватит.
 
+### Формат q8row: подготовка весов (готово)
+`DType::Q8Row` — int8 по выходному каналу: `.qpacked` = i8 `[N, K]` сплошняком (так его берёт FullyConnected HTP без
+перепаковки), `.qscales` = f32 `[N]`, раскладка `syn-quant-v1` (`format = "q8row"` в `quant_manifest.json`).
+На CPU/CUDA веса деквантуются при загрузке, на `Device::Npu` модель получает `QuantWeight` и вызывает `linear_quant`.
+
+Рецепт (wav2vec2/WavLM):
+```sh
+synaptix calibrate model.syn <каталог WAV> -o model.calib --limit 256      # E[x²] входов каждого Linear
+synaptix quantize model.syn model-npu.syn --format q8row --device cpu --calib model.calib
+```
+Шкала строки подбирается перебором порога отсечения (0,6…1,0 от absmax, 40 шагов) по ошибке **выхода** слоя
+Σₖ E[xₖ²]·(wₖ−ŵₖ)². Без `--calib` — absmax: MSE по самим весам хуже absmax (обрезает редкие крупные веса, а они
+важны). `lm_head` и стопки `[E,N,K]` (у wav2vec2 это pos_conv) остаются F16. Квантование — на CPU, секунды.
+
+Замеры w2v2-lv60-espeak (эталон — F16-веса со счётом F32 на CUDA; пример `quant_parity` крейта wav2vec2):
+
+| Вариант (счёт F16) | KL, нат/кадр | argmax | расхождение фонем |
+|---|---|---|---|
+| F16-веса | 0,00002 | 99,98 % | 0,00 % |
+| q8row, MSE по весам | 0,00177 | 99,68 % | 0,87 % |
+| q8row, absmax | 0,00084 | 99,78 % | 0,47 % |
+| q8row, калибровка (256 записей speechocean762 train) | 0,00068 | 99,80 % | 0,34 % |
+
+Почти вся ошибка — в MLP (только MLP в int8: KL 0,00082). Итоговая метрика synspeak на speechocean762 test
+(PCC с экспертами, фонема/слово/фраза): F16 0,5381/0,5091/0,6492, q8row 0,5376/0,5078/0,6493 — без потерь.
+Размер весов 0,60 → 0,30 ГБ.
+
 ## Переменные окружения
 
 | Переменная | Где | Что |

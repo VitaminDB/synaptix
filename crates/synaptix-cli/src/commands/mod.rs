@@ -13,6 +13,7 @@ pub mod inspect;
 pub mod llm_facade;
 pub mod music;
 pub mod podcast;
+pub mod calibrate;
 pub mod quantize;
 pub mod run;
 pub mod sheet;

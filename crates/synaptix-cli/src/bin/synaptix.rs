@@ -368,6 +368,22 @@ enum Commands {
         keep_quant: bool,
         #[arg(long, default_value = "cuda:0")]
         device: String,
+        /// Статистика входов слоёв из `synaptix calibrate`: шкалы q8row по ошибке выхода слоя.
+        #[arg(long)]
+        calib: Option<PathBuf>,
+    },
+    /// Калибровка для квантования: прогнать модель по записям и сохранить E[x²] входов каждого Linear.
+    Calibrate {
+        model: PathBuf,
+        /// WAV-файл или каталог с записями (рекурсивно).
+        audio: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value = "cuda")]
+        device: String,
+        /// Не больше стольких записей (равномерно по списку).
+        #[arg(long, default_value_t = 256)]
+        limit: usize,
     },
     /// Транскрибация аудио (Whisper ASR): WAV → текст.
     Transcribe {
@@ -1331,8 +1347,11 @@ fn main() -> ExitCode {
                 model, data, output, lora_r, lora_alpha, lr, epochs, batch_size,
             })
         }
-        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device } => {
-            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device })
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib })
+        }
+        Commands::Calibrate { model, audio, output, device, limit } => {
+            synaptix_cli::commands::calibrate::run(synaptix_cli::commands::calibrate::CalibrateArgs { model, audio, output, device, limit })
         }
         Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps, engine, format, output, encoder_device } => {
             transcribe::run(transcribe::TranscribeArgs {

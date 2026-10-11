@@ -362,22 +362,32 @@ impl SynBundleLoader {
         let Some((key, entry)) = self.any_quant_entry(name) else { return Ok(None) };
         let Some(kind) = entry.kind() else { return Ok(None) };
         let dtype = kind.dtype();
-        if !matches!(dtype, DType::Sq { .. } | DType::Ggml(_)) {
+        if !matches!(dtype, DType::Sq { .. } | DType::Ggml(_) | DType::Q8Row) {
             return Ok(None);
         }
         let Some((slices, n, k)) = entry.dims() else { return Ok(None) };
-        let (packed, _) = self
+        let (packed, scales) = self
             .quant_blob_slices(&key)
             .ok_or_else(|| IoError::Bundle(format!("`{key}`: нет блоба кванта")))??;
-        let rb = synaptix_core::quant::block_row_bytes(dtype, k)
-            .ok_or_else(|| IoError::Bundle(format!("`{key}`: K={k} не кратен блоку формата")))?;
-        if packed.len() < slices * n * rb {
-            return Err(IoError::Bundle(format!("`{key}`: блоб короче {slices}×{n}×{rb}")));
-        }
         let mut out = vec![0f32; slices * n * k];
-        for r in 0..slices * n {
-            synaptix_core::quant::dequant_row_f32(dtype, &packed[r * rb..(r + 1) * rb], k, &mut out[r * k..(r + 1) * k])
-                .map_err(IoError::Core)?;
+        if dtype == DType::Q8Row {
+            let scales = synaptix_core::quant::q8row::scales_from_bytes(scales);
+            if packed.len() < slices * n * k || scales.len() < slices * n {
+                return Err(IoError::Bundle(format!("`{key}`: блобы короче {slices}×{n}×{k}")));
+            }
+            for r in 0..slices * n {
+                synaptix_core::quant::q8row::dequant_row(&packed[r * k..(r + 1) * k], scales[r], &mut out[r * k..(r + 1) * k]);
+            }
+        } else {
+            let rb = synaptix_core::quant::block_row_bytes(dtype, k)
+                .ok_or_else(|| IoError::Bundle(format!("`{key}`: K={k} не кратен блоку формата")))?;
+            if packed.len() < slices * n * rb {
+                return Err(IoError::Bundle(format!("`{key}`: блоб короче {slices}×{n}×{rb}")));
+            }
+            for r in 0..slices * n {
+                synaptix_core::quant::dequant_row_f32(dtype, &packed[r * rb..(r + 1) * rb], k, &mut out[r * k..(r + 1) * k])
+                    .map_err(IoError::Core)?;
+            }
         }
         let t = Tensor::from_vec(out, entry.shape.clone(), Device::Cpu).map_err(IoError::Core)?;
         let t = match want_dtype {

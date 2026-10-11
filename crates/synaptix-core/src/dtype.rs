@@ -26,6 +26,7 @@ pub enum DType {
     /// Блочный тип ggml (файлы llama.cpp), один блоб байт в байт как в GGUF —
     /// см. [`crate::quant::ggml`]. Только для исполнения, энкодеров нет.
     Ggml(GgmlType),
+    Q8Row,
 }
 
 impl DType {
@@ -44,6 +45,7 @@ impl DType {
             DType::Sq { bits } => bits as usize,
             // Средняя оценка: шкалы размазаны по блоку.
             DType::Ggml(t) => t.bits_per_weight_x8() / 8,
+            DType::Q8Row => 8,
         }
     }
 
@@ -52,7 +54,7 @@ impl DType {
     }
 
     pub const fn is_quantized(self) -> bool {
-        matches!(self, DType::NVFP4 | DType::MXFP8 | DType::Sq { .. } | DType::Ggml(_))
+        matches!(self, DType::NVFP4 | DType::MXFP8 | DType::Sq { .. } | DType::Ggml(_) | DType::Q8Row)
     }
 
     /// Формат «один блоб»: шкалы лежат внутри блока, отдельного тензора

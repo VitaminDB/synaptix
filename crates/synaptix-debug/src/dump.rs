@@ -85,6 +85,7 @@ pub(crate) fn dtype_tag(dt: DType) -> u32 {
         DType::I64 => 13,
         DType::NVFP4 => 21,
         DType::MXFP8 => 22,
+        DType::Q8Row => 23,
         // Одноблобные форматы: 100 + bits для SQ, 200 + id ggml.
         DType::Sq { bits } => 100 + bits as u32,
         DType::Ggml(t) => 200 + t as u32,
@@ -107,6 +108,7 @@ pub(crate) fn tag_to_dtype(tag: u32) -> Result<DType> {
         13 => Ok(DType::I64),
         21 => Ok(DType::NVFP4),
         22 => Ok(DType::MXFP8),
+        23 => Ok(DType::Q8Row),
         _ => Err(DebugError::UnknownDtype(tag)),
     }
 }

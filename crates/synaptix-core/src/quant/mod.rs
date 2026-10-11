@@ -9,6 +9,8 @@
 pub mod ggml;
 pub mod ggml_dequant;
 pub mod ggml_tables;
+pub mod calib;
+pub mod q8row;
 pub mod sq;
 
 pub use ggml::GgmlType;
@@ -23,6 +25,7 @@ pub fn format_key(dtype: DType) -> Option<String> {
         DType::MXFP8 => Some("mxfp8".into()),
         DType::Sq { bits } => Some(format!("sq{bits}")),
         DType::Ggml(t) => Some(format!("ggml:{}", t.key())),
+        DType::Q8Row => Some("q8row".into()),
         _ => None,
     }
 }
@@ -33,6 +36,7 @@ pub fn format_from_key(s: &str) -> Option<DType> {
     match s {
         "nvfp4" => return Some(DType::NVFP4),
         "mxfp8" | "fp8" => return Some(DType::MXFP8),
+        "q8row" | "i8row" => return Some(DType::Q8Row),
         _ => {}
     }
     if let Some(rest) = s.strip_prefix("sq") {

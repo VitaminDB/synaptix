@@ -34,9 +34,9 @@ impl QuantWeight {
         n: usize,
         k: usize,
     ) -> Result<Self> {
-        if !matches!(dtype, DType::NVFP4 | DType::MXFP8) {
+        if !matches!(dtype, DType::NVFP4 | DType::MXFP8 | DType::Q8Row) {
             return Err(SynaptixError::Unsupported(
-                "QuantWeight::new: с отдельными масштабами только NVFP4/MXFP8; одноблобные — new_block",
+                "QuantWeight::new: с отдельными масштабами только NVFP4/MXFP8/Q8Row; одноблобные — new_block",
             ));
         }
         if packed.device() != scales.device() {
@@ -122,6 +122,15 @@ impl QuantWeight {
                 let s_layout = Layout::contiguous(Shape::new(vec![self.n, self.k / 32]), DType::U8);
                 backend.mxfp8_dequant((&packed, &p_layout), (scales, &s_layout), (&mut out, &out_layout), &stream)?;
             }
+            DType::Q8Row => {
+                let host = self.dequantize_host_f32()?;
+                let bytes: Vec<u8> = if out_dt == DType::F16 {
+                    host.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect()
+                } else {
+                    host.iter().flat_map(|v| half::bf16::from_f32(*v).to_le_bytes()).collect()
+                };
+                out = backend.upload(&bytes, self.device)?;
+            }
             DType::NVFP4 => {
                 backend.nvfp4_dequant(&packed, self.scales(), (&mut out, &out_layout), self.n, self.k, &stream)?;
             }
@@ -136,6 +145,27 @@ impl QuantWeight {
     /// эксперт можно держать в pinned-зеркале уже готовым к GEMV/GEMM и
     /// поднимать на карту одной DMA, без перепаковки на устройстве.
     /// Требует `n % 16 == 0`, `k % 64 == 0`, `dst.len() == src.len() == n·k/2`.
+    pub fn q8row_host(&self) -> Result<(Vec<u8>, Vec<f32>)> {
+        use crate::backend::registry;
+        if self.dtype != DType::Q8Row {
+            return Err(SynaptixError::Unsupported("q8row_host: формат не Q8Row"));
+        }
+        let packed = self.packed_arc().ok_or(SynaptixError::Unsupported("q8row_host: packed освобождён"))?;
+        let backend = registry::backend_for(self.device)?;
+        let p = backend.download(&packed)?;
+        let s = backend.download(self.scales())?;
+        Ok((p, crate::quant::q8row::scales_from_bytes(&s)))
+    }
+
+    pub fn dequantize_host_f32(&self) -> Result<Vec<f32>> {
+        let (p, s) = self.q8row_host()?;
+        let mut out = vec![0f32; self.n * self.k];
+        for (r, (dst, src)) in out.chunks_mut(self.k).zip(p.chunks(self.k)).enumerate() {
+            crate::quant::q8row::dequant_row(src, s[r], dst);
+        }
+        Ok(out)
+    }
+
     pub fn nvfp4_repack_host(src: &[u8], dst: &mut [u8], n: usize, k: usize) -> Result<()> {
         if n % 16 != 0 || k % 64 != 0 || src.len() != n * k / 2 || dst.len() != src.len() {
             return Err(SynaptixError::Unsupported("nvfp4_repack_host: форма"));

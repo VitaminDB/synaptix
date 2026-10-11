@@ -108,6 +108,7 @@ pub fn parse_dtype(s: &str) -> Option<DType> {
         "f16" => Some(DType::F16),
         "fp8" | "mxfp8" => Some(DType::MXFP8),
         "nvfp4" => Some(DType::NVFP4),
+        "q8row" | "i8row" => Some(DType::Q8Row),
         // `sq4`, `sq2`, …: одноблобный формат движка на 1..=8 бит.
         other => other
             .strip_prefix("sq")
@@ -126,6 +127,7 @@ pub fn dtype_name(dt: DType) -> String {
         DType::NVFP4 => "nvfp4".into(),
         DType::MXFP8 => "mxfp8".into(),
         DType::Sq { bits } => format!("sq{bits}"),
+        DType::Q8Row => "q8row".into(),
         DType::Ggml(t) => format!("ggml:{}", t.name().to_ascii_lowercase()),
         other => format!("{other:?}").to_ascii_lowercase(),
     }

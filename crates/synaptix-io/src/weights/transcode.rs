@@ -258,6 +258,7 @@ fn target_ok(target: DType, n: usize, k: usize) -> bool {
     match target {
         DType::NVFP4 => n % 64 == 0 && k % 64 == 0,
         DType::MXFP8 | DType::Sq { .. } => k % 32 == 0,
+        DType::Q8Row => n > 0 && k > 0,
         _ => false,
     }
 }
@@ -305,6 +306,29 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
 /// одноблобных форматов. Считается на `device`, возвращается на хосте.
 fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
     let (slices, n, k) = item.dims;
+    if item.target == DType::Q8Row {
+        let host: Vec<f32> = match item.current {
+            Some(_) => {
+                let qw = loader
+                    .load_quant_expert(&item.name, slice, device)
+                    .ok_or_else(|| IoError::Bundle(format!("{}: квант-вес пропал из источника", item.name)))??;
+                qw.dequantize(DType::F16)
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .and_then(|t| t.to_device(Device::Cpu))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(IoError::Core)?
+            }
+            None => {
+                let t = loader.load_to(&item.name, Device::Cpu, DType::F32)?;
+                let t = if slices == 1 { t } else { t.narrow(0, slice, 1).map_err(IoError::Core)? };
+                t.contiguous().and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?
+            }
+        };
+        let h = synaptix_core::quant::calib::table_get(&item.name);
+        let (packed, scales) = synaptix_core::quant::q8row::quantize(&host, n, k, h.as_deref());
+        return Ok((packed, synaptix_core::quant::q8row::scales_to_bytes(&scales)));
+    }
     let dense: Tensor = match item.current {
         Some(_) => {
             let qw = loader

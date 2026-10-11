@@ -107,6 +107,8 @@ impl Wav2Vec2Model {
             self.lm_head = Some(Linear {
                 weight: Tensor::from_vec(w, vec![vocab, d], dev)?.to_dtype(dt)?,
                 bias: Tensor::from_vec(vec![0f32; vocab], vec![vocab], dev)?.to_dtype(dt)?,
+                q: None,
+                name: "lm_head.weight".into(),
             });
             self.config.vocab_size = vocab;
             return Ok(());
@@ -143,6 +145,8 @@ impl Wav2Vec2Model {
         self.lm_head = Some(Linear {
             weight: Tensor::from_vec(nw, vec![vocab, d], dev)?.to_dtype(dt)?,
             bias: Tensor::from_vec(nb, vec![vocab], dev)?.to_dtype(dt)?,
+            q: None,
+            name: "lm_head.weight".into(),
         });
         self.config.vocab_size = vocab;
         Ok(())
