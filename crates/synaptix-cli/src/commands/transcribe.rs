@@ -146,31 +146,30 @@ pub fn run(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (text, Vec::new(), Some("ru".to_string()))
         }
         Engine::Whisper => {
-            let mut pipe = WhisperPipeline::from_syn(&args.model, dev, dtype)?;
-            if let Some(ed) = &args.encoder_device {
-                let edev = device::resolve(ed);
-                let edt = if edev == Device::Cpu { DType::F32 } else { DType::F16 };
-                pipe = pipe.with_encoder_on(&args.model, edev, edt)?;
-                eprintln!("synaptix transcribe: энкодер на {edev:?}, декодер на {dev:?}");
-            }
-            eprintln!("synaptix transcribe: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
-            let language = match &args.language {
-                Some(l) => l.clone(),
-                None => {
-                    let l = pipe.detect_language_code(&audio)?;
-                    eprintln!("synaptix transcribe: язык — {l}");
-                    l
+            let (edev, edt) = match &args.encoder_device {
+                Some(ed) => {
+                    let edev = device::resolve(ed);
+                    let edt = if edev == Device::Cpu { DType::F32 } else { DType::F16 };
+                    eprintln!("synaptix transcribe: энкодер на {edev:?}, декодер на {dev:?}");
+                    (edev, edt)
                 }
+                None => (dev, dtype),
             };
+            let pipe = WhisperPipeline::from_syn_split(&args.model, dev, dtype, edev, edt)?;
+            eprintln!("synaptix transcribe: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
             let t1 = std::time::Instant::now();
-            let (text, segments) = if need_segments {
-                let segs = pipe.transcribe_timestamped(&audio, Some(&language), task)?;
+            let (text, segments, language) = if need_segments {
+                let (segs, lang) = pipe.transcribe_timestamped_lang(&audio, args.language.as_deref(), task)?;
                 let text = segs.iter().map(|s| s.text.trim()).collect::<Vec<_>>().join(" ");
                 let segs = segs.into_iter().map(|s| Segment { start: s.start, end: s.end, text: s.text }).collect();
-                (text, segs)
+                (text, segs, lang)
             } else {
-                (pipe.transcribe(&audio, Some(&language), task)?, Vec::new())
+                let (text, lang) = pipe.transcribe_lang(&audio, args.language.as_deref(), task)?;
+                (text, Vec::new(), lang)
             };
+            if args.language.is_none() {
+                eprintln!("synaptix transcribe: язык — {language}");
+            }
             let infer = t1.elapsed().as_secs_f32();
             eprintln!("synaptix transcribe: done in {:.2}s (RTF={:.3})", infer, infer / dur_s.max(1e-6));
             (text, segments, Some(language))

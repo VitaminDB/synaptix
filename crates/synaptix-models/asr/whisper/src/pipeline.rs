@@ -12,7 +12,7 @@ use synaptix_tokenizer::tokenizer::Tokenizer;
 use crate::config::{GenerationConfig, WhisperConfig};
 use crate::loader::WhisperWeights;
 use crate::mel::whisper_log_mel;
-use crate::model::{WhisperEncoder, WhisperModel};
+use crate::model::{WhisperDecoder, WhisperEncoder, WhisperModel};
 use crate::model::WhisperDecodeState;
 use crate::{Result, WhisperError};
 
@@ -43,31 +43,49 @@ pub struct WhisperPipeline {
     special: SpecialTokens,
     device: Device,
     dtype: DType,
-    split_encoder: Option<(WhisperEncoder, Device, DType)>,
+    enc_device: Device,
+    enc_dtype: DType,
 }
 
 impl WhisperPipeline {
-    /// Энкодер — на отдельном устройстве (например, NPU), декодер — на `device`.
-    pub fn with_encoder_on(mut self, path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self> {
-        let w = WhisperWeights::open(path, device, dtype)?;
-        self.split_encoder = Some((WhisperEncoder::load(&w)?, device, dtype));
-        Ok(self)
+    fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        let t0 = std::time::Instant::now();
+        let r = self.encode_inner(mel);
+        if std::env::var_os("SYNAPTIX_TIMING").is_some() {
+            eprintln!("whisper: энкодер {:.0} мс", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        r
     }
 
-    fn encode(&self, mel: &Tensor) -> Result<Tensor> {
-        match &self.split_encoder {
-            None => self.encode(mel),
-            Some((enc, dev, dt)) => {
-                let x = mel.to_device(*dev)?.to_dtype(*dt)?;
-                let y = enc.forward(&x)?;
-                Ok(y.to_device(self.device)?.to_dtype(self.dtype)?)
-            }
+    fn encode_inner(&self, mel: &Tensor) -> Result<Tensor> {
+        if self.enc_device == self.device && self.enc_dtype == self.dtype {
+            return self.model.encoder.forward(mel);
         }
+        let x = mel.to_device(self.enc_device)?.to_dtype(self.enc_dtype)?;
+        let y = self.model.encoder.forward(&x)?;
+        Ok(y.to_device(self.device)?.to_dtype(self.dtype)?)
     }
 
     pub fn from_syn(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self> {
+        Self::from_syn_split(path, device, dtype, device, dtype)
+    }
+
+    /// Энкодер — на `enc_device` (например, NPU), декодер — на `device`.
+    pub fn from_syn_split(
+        path: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        enc_device: Device,
+        enc_dtype: DType,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         let w = WhisperWeights::open(path, device, dtype)?;
-        let model = WhisperModel::load(&w)?;
+        let model = if enc_device == device && enc_dtype == dtype {
+            WhisperModel::load(&w)?
+        } else {
+            let we = WhisperWeights::open(path, enc_device, enc_dtype)?;
+            WhisperModel { encoder: WhisperEncoder::load(&we)?, decoder: WhisperDecoder::load(&w)? }
+        };
         let tok_bytes = w.read_aux("tokenizer.json")?;
         let tokenizer =
             HfTokenizer::from_bytes(&tok_bytes).map_err(|e| WhisperError::Tokenizer(e.to_string()))?;
@@ -94,7 +112,8 @@ impl WhisperPipeline {
             special,
             device,
             dtype,
-            split_encoder: None,
+            enc_device,
+            enc_dtype,
         })
     }
 
@@ -137,6 +156,14 @@ impl WhisperPipeline {
         Ok(argmax(&v) as u32)
     }
 
+    fn lang_code(&self, id: u32) -> Result<String> {
+        let token = self
+            .tokenizer
+            .id_to_token(id)
+            .ok_or_else(|| WhisperError::Tokenizer(format!("нет токена языка {id}")))?;
+        Ok(token.trim_start_matches("<|").trim_end_matches("|>").to_string())
+    }
+
     pub fn detect_language_code(&self, audio: &[f32]) -> Result<String> {
         let mut seg = audio[..audio.len().min(N_SAMPLES)].to_vec();
         seg.resize(N_SAMPLES, 0.0);
@@ -159,17 +186,16 @@ impl WhisperPipeline {
         let lang_token = self
             .language_token(lang)
             .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {lang}")))?;
-        self.decode_segment(&mel, lang_token, task)
+        self.decode_segment(&self.encode(&mel)?, lang_token, task)
     }
 
     /// Декод одного 30-с сегмента (greedy). `lang_token` — id `<|xx|>`.
     /// На CUDA идёт через CUDA-graph replay (decode_segment_graph), иначе —
     /// host-loop с KV-cache.
-    fn decode_segment(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
+    fn decode_segment(&self, enc_out: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
         if matches!(self.device, Device::Cuda(_)) {
-            return self.decode_segment_graph(mel, lang_token, task);
+            return self.decode_segment_graph(enc_out, lang_token, task);
         }
-        let enc_out = self.encode(mel)?;
         let mut cache = self.model.decoder.init_cache(&enc_out)?;
 
         let task_tok = match task {
@@ -205,7 +231,7 @@ impl WhisperPipeline {
     /// device-шагами (populate self-KV), затем шаг захватывается в граф и
     /// реплеится. Логиты копятся в стабильный `state.logits`, argmax+suppress
     /// на host (1 DtoH/шаг).
-    fn decode_segment_graph(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
+    fn decode_segment_graph(&self, enc_out: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
         use synaptix_core::grad::no_grad;
         use synaptix_infer::graph_capture::GraphCapturer;
         use synaptix_infer::InferError;
@@ -214,7 +240,6 @@ impl WhisperPipeline {
             Device::Cuda(o) => o,
             _ => return Err(WhisperError::Audio("graph decode requires CUDA".into())),
         };
-        let enc_out = self.encode(mel)?;
         let max_target = self.config.max_target_positions;
         let mut cache =
             self.model
@@ -287,8 +312,7 @@ impl WhisperPipeline {
 
     /// Декод одного сегмента С timestamps (порт HF `WhisperTimeStampLogitsProcessor`).
     /// Возвращает сырые сгенерированные токены (с timestamp-токенами, без префикса).
-    fn decode_segment_ts(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
-        let enc_out = self.encode(mel)?;
+    fn decode_segment_ts(&self, enc_out: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
         let mut cache = self.model.decoder.init_cache(&enc_out)?;
         let task_tok = match task {
             Task::Transcribe => self.special.transcribe,
@@ -406,7 +430,13 @@ impl WhisperPipeline {
     /// Транскрибировать весь аудиосигнал (16 кГц), при необходимости разбивая
     /// на 30-с сегменты. Язык: `Some("en")`/`None` (авто-детекция).
     pub fn transcribe(&self, audio: &[f32], lang: Option<&str>, task: Task) -> Result<String> {
+        Ok(self.transcribe_lang(audio, lang, task)?.0)
+    }
+
+    /// Как [`transcribe`], плюс код языка (заданный или определённый по первому сегменту).
+    pub fn transcribe_lang(&self, audio: &[f32], lang: Option<&str>, task: Task) -> Result<(String, String)> {
         let mut text = String::new();
+        let mut code = lang.map(str::to_string);
         let n_segments = audio.len().div_ceil(N_SAMPLES).max(1);
         for s in 0..n_segments {
             let start = s * N_SAMPLES;
@@ -415,16 +445,20 @@ impl WhisperPipeline {
             seg.resize(N_SAMPLES, 0.0);
 
             let mel = self.mel_tensor(&seg)?;
+            let enc = self.encode(&mel)?;
             let lang_token = match lang {
                 Some(l) => self
                     .language_token(l)
                     .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {l}")))?,
                 None => {
-                    let enc = self.encode(&mel)?;
-                    self.detect_language(&enc)?
+                    let id = self.detect_language(&enc)?;
+                    if code.is_none() {
+                        code = Some(self.lang_code(id)?);
+                    }
+                    id
                 }
             };
-            let ids = self.decode_segment(&mel, lang_token, task)?;
+            let ids = self.decode_segment(&enc, lang_token, task)?;
             let chunk = self
                 .tokenizer
                 .decode(&ids, true)
@@ -434,7 +468,7 @@ impl WhisperPipeline {
             }
             text.push_str(chunk.trim());
         }
-        Ok(text)
+        Ok((text, code.unwrap_or_default()))
     }
 }
 
@@ -460,7 +494,7 @@ impl WhisperPipeline {
         let lang_token = self
             .language_token(lang)
             .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {lang}")))?;
-        self.decode_segment_ts(&mel, lang_token, task)
+        self.decode_segment_ts(&self.encode(&mel)?, lang_token, task)
     }
 
     /// Транскрибация с временными метками: список сегментов (start,end,text).
@@ -470,7 +504,17 @@ impl WhisperPipeline {
         lang: Option<&str>,
         task: Task,
     ) -> Result<Vec<TsSegment>> {
+        Ok(self.transcribe_timestamped_lang(audio, lang, task)?.0)
+    }
+
+    pub fn transcribe_timestamped_lang(
+        &self,
+        audio: &[f32],
+        lang: Option<&str>,
+        task: Task,
+    ) -> Result<(Vec<TsSegment>, String)> {
         let mut segments = Vec::new();
+        let mut code = lang.map(str::to_string);
         let n_segments = audio.len().div_ceil(N_SAMPLES).max(1);
         for s in 0..n_segments {
             let start = s * N_SAMPLES;
@@ -480,19 +524,23 @@ impl WhisperPipeline {
             let offset = (s * 30) as f32;
 
             let mel = self.mel_tensor(&seg)?;
+            let enc = self.encode(&mel)?;
             let lang_token = match lang {
                 Some(l) => self
                     .language_token(l)
                     .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {l}")))?,
                 None => {
-                    let enc = self.encode(&mel)?;
-                    self.detect_language(&enc)?
+                    let id = self.detect_language(&enc)?;
+                    if code.is_none() {
+                        code = Some(self.lang_code(id)?);
+                    }
+                    id
                 }
             };
-            let seg_ids = self.decode_segment_ts(&mel, lang_token, task)?;
+            let seg_ids = self.decode_segment_ts(&enc, lang_token, task)?;
             segments.extend(self.parse_timestamps(&seg_ids, offset)?);
         }
-        Ok(segments)
+        Ok((segments, code.unwrap_or_default()))
     }
 
     fn parse_timestamps(&self, tokens: &[u32], offset_s: f32) -> Result<Vec<TsSegment>> {

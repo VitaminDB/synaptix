@@ -521,7 +521,10 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
 
     let npu = crate::npu();
     let hash = b.g.structure_hash();
+    let log = std::env::var_os("SYNAPTIX_NPU_LOG").is_some();
+    let t_seg = std::time::Instant::now();
     let cached = GRAPHS.lock().get(&hash).cloned();
+    let was_cached = cached.is_some();
     let cg = match cached {
         Some(c) => {
             STATS.lock().cache_hits += 1;
@@ -551,8 +554,20 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
     for ((t, _), buf) in out_ids.iter().zip(&out_bufs) {
         binds.push(Binding { tensor: *t, buffer: buf, offset: 0 });
     }
+    let t_prep = t_seg.elapsed();
     let t0 = std::time::Instant::now();
     cg.run(&binds).map_err(err)?;
+    if log {
+        eprintln!(
+            "npu: сегмент {:016x}: {} узлов, веса {:.0} МБ, {} {:.0} мс, исполнение {:.1} мс",
+            hash,
+            n_nodes,
+            b.static_bytes as f64 / 1048576.0,
+            if was_cached { "в памяти" } else if cg.from_cache() { "открыт из кэша" } else { "собран" },
+            t_prep.as_secs_f64() * 1e3,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+    }
     {
         let mut s = STATS.lock();
         s.flushes += 1;
