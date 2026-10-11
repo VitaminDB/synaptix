@@ -101,7 +101,7 @@ synmobile/hw/npu/npu-precompile.sh transcribe whisper.syn речь.wav --device 
 Скрипт докладывает на телефон недостающие графы (`/var/cache/synnpu`). Turbo: 25 сегментов на ПК за 64 с,
 на телефоне — 25 «открыт из кэша», ни одной сборки.
 
-## Квантованные веса на NPU (int8, в работе)
+## Квантованные веса на NPU (int8)
 Пробник `cargo run -p synaptix-npu --example npu_quant_probe` (офлайн-демон на ПК, HTP v69, QAIRT 2.42):
 
 | Граф | Результат |
@@ -151,6 +151,21 @@ synaptix quantize model.syn model-npu.syn --format q8row --device cpu --calib mo
 Почти вся ошибка — в MLP (только MLP в int8: KL 0,00082). Итоговая метрика synspeak на speechocean762 test
 (PCC с экспертами, фонема/слово/фраза): F16 0,5381/0,5091/0,6492, q8row 0,5376/0,5078/0,6493 — без потерь.
 Размер весов 0,60 → 0,30 ГБ.
+
+### q8row на NPU (готово, проверено офлайн-демоном)
+`Backend::linear_quant` NPU-бэкенда принимает `QuantWeight` формата q8row с F16-активацией и пишет узел
+`NodeOp::LinearQ`: упакованные i8 (параметр модели в `NpuBuffer`) становятся весом FullyConnected `I8 [N, K]` с
+`Quant::Axis { axis: 0, (scale, 0)×N }` через `Graph::weight_buffer_quant`; шкалы читаются с хоста один раз на вес.
+wav2vec2 на `Device::Npu` с q8row-бандлом идёт этим путём, на CPU/CUDA тот же бандл деквантуется при загрузке.
+
+Офлайн-сборка (ПК, QAIRT 2.42, HTP v69) wav2vec2-large q8row, все корзины 2/4/8/12 с: 22 контекста, **1,3 ГБ**
+(F16 — ~2,4 ГБ), 64 с. Команда `synaptix warmup <модель.syn>` прогоняет модель по всем корзинам; вместе с
+`synmobile/hw/npu/npu-cache-build.sh <каталог> warmup <модель.syn>` — готовые графы для пакета.
+
+Предсобранные графы из пакетов: демон ищет `<ключ>.bin` в своём кэше, затем в каталогах `SYNNPU_CACHE_RO`
+(через `:`, по умолчанию `/usr/lib/synaptix/npu-cache`) — в самом каталоге и на один уровень вложенности
+(`/usr/lib/synaptix/npu-cache/<модель>/<ключ>.bin`). Проверено: пустой кэш + RO-каталог — 22 «открыт из кэша», ни
+одной сборки.
 
 ## Переменные окружения
 

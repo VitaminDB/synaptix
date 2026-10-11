@@ -259,13 +259,25 @@ impl Graph {
         offset: usize,
         fingerprint: u64,
     ) -> Result<TensorId> {
+        self.weight_buffer_quant(dtype, shape, Quant::None, buffer, offset, fingerprint)
+    }
+
+    pub fn weight_buffer_quant(
+        &mut self,
+        dtype: DType,
+        shape: &[u32],
+        quant: Quant,
+        buffer: &std::sync::Arc<NpuBuffer>,
+        offset: usize,
+        fingerprint: u64,
+    ) -> Result<TensorId> {
         let need = dtype.bytes(shape.iter().map(|&d| d as usize).product());
         if offset + need > buffer.len() {
             return Err(NpuError::Graph(format!("вес {shape:?} {dtype:?} вне буфера NPU")));
         }
         self.buffers.insert(buffer.uid(), buffer.clone());
         let src = WeightSrc::Buffer { uid: buffer.uid(), offset, fingerprint };
-        Ok(self.push(TensorKind::Weight(src), dtype, shape, Quant::None))
+        Ok(self.push(TensorKind::Weight(src), dtype, shape, quant))
     }
 
     pub fn scalar_f32(&mut self, v: f32, dtype: DType) -> Result<TensorId> {

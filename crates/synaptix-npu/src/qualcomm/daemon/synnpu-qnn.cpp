@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -43,6 +44,7 @@ QnnHtpDevice_PerfInfrastructure_t* perf;
 uint32_t power_id;
 uint32_t hw_arch, hw_soc, hw_vtcm_mb;
 std::string cache_dir = "/var/cache/synnpu";
+std::string cache_ro = "/usr/lib/synaptix/npu-cache";
 std::string build_id;
 std::mutex qnn_mutex;
 int live_graphs;
@@ -282,6 +284,40 @@ std::string cache_path(const std::string& key) {
     return cache_dir + "/" + b + ".bin";
 }
 
+bool exists(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string find_cached(const std::string& key) {
+    std::string own = cache_path(key);
+    if (exists(own)) return own;
+    std::string name = own.substr(own.rfind('/') + 1);
+    size_t pos = 0;
+    while (pos <= cache_ro.size()) {
+        size_t end = cache_ro.find(':', pos);
+        if (end == std::string::npos) end = cache_ro.size();
+        std::string root = cache_ro.substr(pos, end - pos);
+        pos = end + 1;
+        if (root.empty()) continue;
+        if (exists(root + "/" + name)) return root + "/" + name;
+        DIR* d = opendir(root.c_str());
+        if (!d) continue;
+        std::string hit;
+        while (dirent* e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            std::string p = root + "/" + e->d_name + "/" + name;
+            if (exists(p)) {
+                hit = p;
+                break;
+            }
+        }
+        closedir(d);
+        if (!hit.empty()) return hit;
+    }
+    return own;
+}
+
 std::unique_ptr<Tensor> copy_tensor(const Qnn_Tensor_t& src) {
     auto t = std::make_unique<Tensor>();
     const Qnn_TensorV1_t& s = src.v1;
@@ -506,7 +542,7 @@ struct Session {
         std::string key = r.str();
         if (!r.ok) fail(SYNNPU_BAD_REQUEST, "GRAPH_OPEN: ключ");
         std::lock_guard<std::mutex> l(qnn_mutex);
-        auto g = load_cached(cache_path(key), &group);
+        auto g = load_cached(find_cached(key), &group);
         if (!g) fail(SYNNPU_NOT_FOUND, "нет в кэше");
         Graph& gr = *g;
         w.put<uint32_t>(add_graph(std::move(g)));
@@ -575,7 +611,7 @@ struct Session {
                                                         : "код " + std::to_string(WEXITSTATUS(st))) + ")");
         }
         std::lock_guard<std::mutex> l(qnn_mutex);
-        auto g = load_cached(cache_path(key), &group);
+        auto g = load_cached(find_cached(key), &group);
         if (!g) fail(SYNNPU_IO_ERROR, "собранный граф не найден в кэше");
         uint32_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         Graph& gr = *g;
@@ -924,6 +960,7 @@ int main(int argc, char** argv) {
     signal(SIGCHLD, SIG_DFL);
     setvbuf(stderr, nullptr, _IOLBF, 0);
     if (const char* c = getenv("SYNNPU_CACHE")) cache_dir = c;
+    if (const char* c = getenv("SYNNPU_CACHE_RO")) cache_ro = c;
     offline = getenv("SYNNPU_OFFLINE") != nullptr;
     if (argc >= 3 && strcmp(argv[1], "--build") == 0) _exit(build_child(argc, argv));
     if (argc >= 3 && strcmp(argv[1], "--serve") == 0) {

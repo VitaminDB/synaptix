@@ -385,6 +385,12 @@ enum Commands {
         #[arg(long, default_value_t = 256)]
         limit: usize,
     },
+    /// Собрать графы NPU модели для всех форм входа (корзины длины): дальше — из кэша.
+    Warmup {
+        model: PathBuf,
+        #[arg(long, default_value = "npu")]
+        device: String,
+    },
     /// Транскрибация аудио (Whisper ASR): WAV → текст.
     Transcribe {
         model: PathBuf,
@@ -1350,6 +1356,7 @@ fn main() -> ExitCode {
         Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib } => {
             quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib })
         }
+        Commands::Warmup { model, device } => synaptix_cli::commands::calibrate::warmup(&model, &device),
         Commands::Calibrate { model, audio, output, device, limit } => {
             synaptix_cli::commands::calibrate::run(synaptix_cli::commands::calibrate::CalibrateArgs { model, audio, output, device, limit })
         }

@@ -9,7 +9,7 @@ use synaptix_core::backend::{BinaryOp, ReduceOp, UnaryOp};
 use synaptix_core::dtype::DType as CoreDType;
 use synaptix_core::error::{Result, SynaptixError};
 use synaptix_core::tensor::layout::Layout;
-use synaptix_npu::graph::{BinaryKind, Op, ReduceKind, UnaryKind};
+use synaptix_npu::graph::{BinaryKind, Op, Quant, ReduceKind, UnaryKind};
 use synaptix_npu::{Binding, CompiledGraph, DType, Graph, NpuBuffer, TensorId};
 
 pub struct Input {
@@ -32,8 +32,8 @@ pub enum NodeOp {
     EmbedGather,
     KvAppend,
     AttentionDev { scale: f32 },
-    /// Конкатенация входов по оси.
     Concat(usize),
+    LinearQ { n: usize, k: usize, scales: Arc<Vec<f32>> },
 }
 
 struct Node {
@@ -210,6 +210,29 @@ impl Builder {
             }
         };
         view::view(&mut self.g, base, &inp.lo, materialize).map_err(err)
+    }
+
+    fn qweight(&mut self, inp: &Input, n: usize, k: usize, scales: &[f32]) -> Result<TensorId> {
+        let shape = vec![n as u32, k as u32];
+        let key = (inp.v.id, DType::I8, shape.clone());
+        if let Some(&t) = self.ready.get(&key) {
+            return Ok(t);
+        }
+        let mut st = inp.v.state.lock();
+        let State::Ready(r) = &mut *st else {
+            return Err(SynaptixError::Other("NPU: int8-вес не загружен".into()));
+        };
+        if r.origin != Origin::Param || inp.v.bytes < n * k {
+            return Err(SynaptixError::Unsupported("NPU: int8-вес должен быть параметром модели"));
+        }
+        let fp = r.fingerprint(inp.v.bytes);
+        let quant = Quant::Axis { axis: 0, scales: scales.iter().map(|&s| (s, 0)).collect() };
+        let t = self.g.weight_buffer_quant(DType::I8, &shape, quant, &r.buf, 0, fp).map_err(err)?;
+        drop(st);
+        self.static_bytes += n * k;
+        self.used.push(inp.v.clone());
+        self.ready.insert(key, t);
+        Ok(t)
     }
 
     fn scalar(&mut self, v: f32, like: TensorId) -> Result<TensorId> {
@@ -417,6 +440,11 @@ impl Builder {
                     y = self.bin(BinaryKind::Add, y, r)?;
                 }
                 y
+            }
+            NodeOp::LinearQ { n: rows, k: cols, scales } => {
+                let x = self.input(&n.ins[0], true)?;
+                let w = self.qweight(&n.ins[1], *rows, *cols, scales)?;
+                self.g.linear(x, w, None).map_err(err)?
             }
             NodeOp::LayerNorm { eps, bias } => {
                 let x = self.input(&n.ins[0], true)?;

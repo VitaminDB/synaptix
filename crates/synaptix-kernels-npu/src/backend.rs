@@ -8,6 +8,23 @@ use synaptix_core::stream::Stream;
 use synaptix_core::tensor::layout::Layout;
 use synaptix_core::tensor::storage::{CpuBuf, Storage};
 
+static SCALES: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Arc<Vec<f32>>>>> =
+    once_cell::sync::Lazy::new(Default::default);
+
+fn q8_scales(w: &synaptix_core::tensor::quant::QuantWeight) -> Result<std::sync::Arc<Vec<f32>>> {
+    let v = value::value_of(w.scales())?;
+    if let Some(s) = SCALES.lock().get(&v.id) {
+        return Ok(s.clone());
+    }
+    let bytes = record::read(&v)?;
+    let s = std::sync::Arc::new(synaptix_core::quant::q8row::scales_from_bytes(&bytes));
+    if s.len() != w.n() {
+        return Err(SynaptixError::Other(format!("NPU: шкал {} вместо {}", s.len(), w.n())));
+    }
+    SCALES.lock().insert(v.id, s.clone());
+    Ok(s)
+}
+
 pub struct NpuBackend {
     pub ordinal: usize,
 }
@@ -242,6 +259,24 @@ impl Backend for NpuBackend {
             ins.push(inp(r.0, r.1)?);
         }
         self.rec(NodeOp::Linear { bias: bias.is_some(), residual: residual.is_some() }, ins, out)
+    }
+
+    fn linear_quant(
+        &self,
+        x: (&Storage, &Layout),
+        w: &synaptix_core::tensor::quant::QuantWeight,
+        out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        if w.dtype() != DType::Q8Row || x.1.dtype() != DType::F16 {
+            return Err(SynaptixError::Unsupported("linear_quant на NPU: только q8row с F16-активациями"));
+        }
+        let packed = w.packed_arc().ok_or(SynaptixError::Unsupported("linear_quant на NPU: веса освобождены"))?;
+        let scales = q8_scales(w)?;
+        let pv = value::value_of(&packed)?;
+        let plo = Layout::contiguous(synaptix_core::tensor::shape::Shape::new(vec![w.n() * w.k()]), DType::U8);
+        let ins = vec![inp(x.0, x.1)?, record::Input { v: pv, lo: plo }];
+        self.rec(NodeOp::LinearQ { n: w.n(), k: w.k(), scales }, ins, out)
     }
 
     fn layer_norm(
