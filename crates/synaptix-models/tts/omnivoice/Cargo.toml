@@ -10,6 +10,7 @@ description = "OmniVoice — massively multilingual zero-shot TTS (masked-diffus
 default = []
 
 [dependencies]
+rayon = { workspace = true }
 synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }

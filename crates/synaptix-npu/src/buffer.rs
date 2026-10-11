@@ -28,7 +28,7 @@ pub(crate) struct Reg {
 }
 
 pub struct NpuBuffer {
-    fd: OwnedFd,
+    fd: std::mem::ManuallyDrop<OwnedFd>,
     ptr: *mut u8,
     len: usize,
     dmabuf: bool,
@@ -46,6 +46,29 @@ unsafe impl Send for NpuBuffer {}
 unsafe impl Sync for NpuBuffer {}
 
 static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+
+struct Pooled {
+    fd: OwnedFd,
+    ptr: usize,
+    dmabuf: bool,
+    regs: Vec<Reg>,
+}
+
+const POOL_MAX_BUF: usize = 32 << 20;
+const POOL_MAX_TOTAL: usize = 256 << 20;
+
+struct Pool {
+    free: std::collections::HashMap<usize, Vec<Pooled>>,
+    total: usize,
+}
+
+static POOL: std::sync::LazyLock<parking_lot::Mutex<Pool>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Pool { free: std::collections::HashMap::new(), total: 0 }));
+
+fn pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYNAPTIX_NPU_POOL").as_deref() != Ok("0"))
+}
 
 fn alloc_dmabuf(len: usize) -> Option<OwnedFd> {
     for h in HEAPS {
@@ -88,6 +111,20 @@ impl NpuBuffer {
             return Err(NpuError::Graph("буфер нулевого размера".into()));
         }
         let len = len.next_multiple_of(4096);
+        if pool_enabled() && len <= POOL_MAX_BUF {
+            let mut pool = POOL.lock();
+            if let Some(b) = pool.free.get_mut(&len).and_then(Vec::pop) {
+                pool.total -= len;
+                return Ok(Self {
+                    fd: std::mem::ManuallyDrop::new(b.fd),
+                    ptr: b.ptr as *mut u8,
+                    len,
+                    dmabuf: b.dmabuf,
+                    uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+                    regs: parking_lot::Mutex::new(b.regs),
+                });
+            }
+        }
         let (fd, dmabuf) = match alloc_dmabuf(len) {
             Some(fd) => (fd, true),
             None => (alloc_memfd(len)?, false),
@@ -106,7 +143,7 @@ impl NpuBuffer {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(Self {
-            fd,
+            fd: std::mem::ManuallyDrop::new(fd),
             ptr: ptr as *mut u8,
             len,
             dmabuf,
@@ -179,9 +216,20 @@ impl NpuBuffer {
 
 impl Drop for NpuBuffer {
     fn drop(&mut self) {
+        if pool_enabled() && self.len <= POOL_MAX_BUF {
+            let mut pool = POOL.lock();
+            if pool.total + self.len <= POOL_MAX_TOTAL {
+                let fd = unsafe { std::mem::ManuallyDrop::take(&mut self.fd) };
+                let regs = std::mem::take(self.regs.get_mut());
+                pool.total += self.len;
+                pool.free.entry(self.len).or_default().push(Pooled { fd, ptr: self.ptr as usize, dmabuf: self.dmabuf, regs });
+                return;
+            }
+        }
         for r in self.regs.get_mut().drain(..) {
             (r.release)(r.handle);
         }
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.fd) };
     }
 }

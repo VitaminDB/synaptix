@@ -56,7 +56,9 @@ struct Mlp {
     down_proj: Lin,
 }
 
-pub const NPU_BUCKETS: [usize; 3] = [128, 256, 512];
+pub static EMBED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub const NPU_BUCKETS: [usize; 6] = [96, 128, 192, 256, 384, 512];
 
 fn buckets_active(device: Device) -> bool {
     match std::env::var("SYNAPTIX_LEN_BUCKETS").ok().as_deref() {
@@ -418,7 +420,9 @@ impl Backbone {
         let msk = Tensor::from_vec(msk, vec![bsz, sb], edev).map_err(err)?;
         let b = &self.cfg.backbone;
         let eps = b.rms_norm_eps as f32;
+        let te = std::time::Instant::now();
         let mut hidden = self.prepare_embed_inputs(&ids, &msk)?;
+        EMBED_NS.fetch_add(te.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let key_mask = Tensor::from_vec(bias, vec![bsz, 1, 1, sb], self.device)
             .and_then(|t| t.to_dtype(hidden.dtype()))
             .map_err(err)?;

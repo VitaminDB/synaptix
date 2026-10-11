@@ -10,6 +10,7 @@
 //! max / layer-penalty / topk-by-flatten) — на host f32 (логиты приходят f32,
 //! точность важнее скорости). См. SPEC.md «Критичные места» п.3-4.
 
+use rayon::prelude::*;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 
@@ -108,6 +109,7 @@ pub fn generate_iterative(
 
     let mut fwd_time = std::time::Duration::ZERO;
     let mut read_time = std::time::Duration::ZERO;
+    let mut cfg_time = std::time::Duration::ZERO;
     for step in 0..gen.num_step {
         let k = sched[step];
         if k == 0 {
@@ -144,29 +146,23 @@ pub fn generate_iterative(
                 (c, u, c_len, t)
             }
         };
-        let mut pred = vec![0i64; n_cb * t];
-        let mut score = vec![f32::NEG_INFINITY; n_cb * t];
-        for c in 0..n_cb {
-            for j in 0..t {
-                // cond_logits[:, c, (c_len-t)+j, :]
+        let tc = std::time::Instant::now();
+        let rows: Vec<(i64, f32)> = (0..n_cb * t)
+            .into_par_iter()
+            .map(|idx| {
+                if tokens[idx] != mask_id {
+                    return (0, f32::NEG_INFINITY);
+                }
+                let (c, j) = (idx / t, idx % t);
                 let c_off = ((c * cond_stride) + (c_len - t + j)) * vocab;
                 let u_off = ((c * uncond_stride) + j) * vocab;
-                let c_row = &cond_flat[c_off..c_off + vocab];
-                let u_row = &uncond_flat[u_off..u_off + vocab];
-
-                let (p, s) = predict_row(c_row, u_row, g, mask_id, vocab);
-                let idx = c * t + j;
-                pred[idx] = p as i64;
-                // layer-penalty (layer_id = c по оси кодбука).
-                let penalized = s - (c as f32) * lpf;
-                // уже раскрытые (tokens != mask) -> -inf.
-                score[idx] = if tokens[idx] != mask_id {
-                    f32::NEG_INFINITY
-                } else {
-                    penalized
-                };
-            }
-        }
+                let (p, s) = predict_row(&cond_flat[c_off..c_off + vocab], &uncond_flat[u_off..u_off + vocab], g, mask_id, vocab);
+                (p as i64, s - (c as f32) * lpf)
+            })
+            .collect();
+        let pred: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let score: Vec<f32> = rows.iter().map(|r| r.1).collect();
+        cfg_time += tc.elapsed();
 
         // topk(score.flatten(), k); flatten — row-major [8,T] (как PyTorch .flatten()).
         let top = topk_indices(&score, k);
@@ -185,7 +181,8 @@ pub fn generate_iterative(
     }
 
     if std::env::var_os("SYNAPTIX_TIMING").is_some() {
-        eprintln!("omnivoice: прямые проходы {:.2} с, чтение логитов {:.2} с (C={c_len}, T={t})", fwd_time.as_secs_f32(), read_time.as_secs_f32());
+        let emb = crate::backbone::EMBED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+        eprintln!("omnivoice: проходы и чтение логитов {:.2} с (эмбеддинги {emb:.2} с), CFG {:.2} с (C={c_len}, T={t})", read_time.as_secs_f32(), cfg_time.as_secs_f32());
     }
     Tensor::from_vec(tokens, vec![n_cb, t], device).map_err(err)
 }
