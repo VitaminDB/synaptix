@@ -82,7 +82,9 @@ impl OmniVoicePipeline {
         let lm_bytes = bundle
             .tensors_slice_named("lm")
             .map_err(|e| OmniVoiceError::Bundle(format!("tensors:lm chunk: {e}")))?;
-        let lm = OmniVoiceLmWeights::load_safetensors_bytes(lm_bytes, device, dtype)?;
+        let manifest = synaptix_bundle::QuantManifest::read_from(&bundle);
+        let host: &[&str] = if matches!(device, Device::Npu(_)) { &["llm.embed_tokens.weight", "audio_embeddings.weight"] } else { &[] };
+        let lm = OmniVoiceLmWeights::load_bundle_bytes(lm_bytes, device, dtype, manifest.as_ref(), host)?;
 
         // codec: dedicated `tensors:codec` chunk. ВНИМАНИЕ: некоторые omnivoice.syn
         // спакованы только с lm-компонентом (codec отсутствует как отдельный chunk;
@@ -95,7 +97,9 @@ impl OmniVoicePipeline {
                     .into(),
             )
         })?;
-        let codec_w = OmniVoiceCodecWeights::load_safetensors_bytes(codec_bytes, device, dtype)?;
+        let codec_dev = if matches!(device, Device::Npu(_)) { Device::Cpu } else { device };
+        let codec_dtype = if matches!(device, Device::Npu(_)) { DType::F32 } else { dtype };
+        let codec_w = OmniVoiceCodecWeights::load_safetensors_bytes(codec_bytes, codec_dev, codec_dtype)?;
 
         Self::assemble(cfg, higgs, text, lm, codec_w, device)
     }
@@ -163,6 +167,27 @@ impl OmniVoicePipeline {
             hop_length,
             device,
         })
+    }
+
+    pub fn prepare(&self, text: &str, lang: Option<&str>) -> Result<(Vec<i64>, Vec<u8>, usize)> {
+        let target_len = self.duration.estimate_target_tokens(text, None, None, 1.0);
+        let p = self.text.prepare_inference_inputs(text, target_len, None, None, lang, None, true)?;
+        let ids = p.input_ids.to_dtype(DType::I64).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<i64>()).map_err(err)?;
+        let mask = p.audio_mask.to_dtype(DType::U8).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<u8>()).map_err(err)?;
+        let c = mask.len();
+        Ok((ids, mask, c))
+    }
+
+    pub fn backbone(&self) -> &Backbone {
+        &self.backbone
+    }
+
+    fn codes_for_codec(&self, codes: &Tensor) -> Result<Tensor> {
+        if matches!(self.device, Device::Npu(_)) {
+            codes.to_device(Device::Cpu).map_err(err)
+        } else {
+            Ok(codes.clone())
+        }
     }
 
     pub fn config(&self) -> &OmniVoiceConfig {
@@ -247,7 +272,7 @@ impl OmniVoicePipeline {
         )?;
 
         // codec.decode → wav [samples].
-        let wav = self.codec.decode(&codes)?;
+        let wav = self.codec.decode(&self.codes_for_codec(&codes)?)?;
         wav.to_dtype(DType::F32)
             .and_then(|w| w.flatten_all())
             .and_then(|w| w.to_vec1::<f32>())
@@ -282,9 +307,16 @@ impl OmniVoicePipeline {
             instruct,
             gen.denoise,
         )?;
+        let timing = std::env::var_os("SYNAPTIX_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let codes = generate_iterative(&self.backbone, &prepared.input_ids, &prepared.audio_mask, target_len, gen)?;
-        let wav = self.codec.decode(&codes)?;
-        wav.to_dtype(DType::F32).and_then(|w| w.flatten_all()).and_then(|w| w.to_vec1::<f32>()).map_err(err)
+        let t1 = std::time::Instant::now();
+        let wav = self.codec.decode(&self.codes_for_codec(&codes)?)?;
+        let out = wav.to_dtype(DType::F32).and_then(|w| w.flatten_all()).and_then(|w| w.to_vec1::<f32>()).map_err(err)?;
+        if timing {
+            eprintln!("omnivoice: декод {:.2} с ({} шагов, T={target_len}), кодек {:.2} с", (t1 - t0).as_secs_f32(), gen.num_step, t1.elapsed().as_secs_f32());
+        }
+        Ok(out)
     }
 
     /// Доступ к encode-пути нейро-кодека (ref-аудио → коды). Для гейтов/дебага.
@@ -389,7 +421,7 @@ impl OmniVoicePipeline {
         )?;
 
         // codec.decode → wav.
-        let wav = self.codec.decode(&codes)?;
+        let wav = self.codec.decode(&self.codes_for_codec(&codes)?)?;
         wav.to_dtype(DType::F32)
             .and_then(|w| w.flatten_all())
             .and_then(|w| w.to_vec1::<f32>())

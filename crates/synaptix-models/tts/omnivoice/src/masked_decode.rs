@@ -95,8 +95,8 @@ pub fn generate_iterative(
             uncond_ids[c * t + j] = cond_ids[c * c_len + (c_len - t + j)];
         }
     }
-    let uncond_mask: Vec<u8> = (0..t).map(|j| cond_mask[c_len - t + j]).collect();
-    let uncond_mask_t = Tensor::from_vec(uncond_mask, vec![1, t], device).map_err(err)?;
+    let uncond_mask_v: Vec<u8> = (0..t).map(|j| cond_mask[c_len - t + j]).collect();
+    let uncond_mask_t = Tensor::from_vec(uncond_mask_v.clone(), vec![1, t], device).map_err(err)?;
 
     // tokens[8,T] = MASK.
     let mut tokens = vec![mask_id; n_cb * t]; // row-major (c, s)
@@ -106,6 +106,8 @@ pub fn generate_iterative(
     let g = gen.guidance_scale;
     let lpf = gen.layer_penalty_factor;
 
+    let mut fwd_time = std::time::Duration::ZERO;
+    let mut read_time = std::time::Duration::ZERO;
     for step in 0..gen.num_step {
         let k = sched[step];
         if k == 0 {
@@ -120,28 +122,35 @@ pub fn generate_iterative(
         let uncond_ids_t = Tensor::from_vec(uncond_ids.clone(), vec![1, n_cb, t], device)
             .map_err(err)?;
 
-        let cond_logits = backbone.forward(&cond_ids_t, &cond_mask_t)?; // [1,8,C,vocab]
-        let uncond_logits = backbone.forward(&uncond_ids_t, &uncond_mask_t)?; // [1,8,T,vocab]
-
-        let cond_flat = cond_logits
-            .to_dtype(DType::F32)
-            .and_then(|x| x.flatten_all())
-            .and_then(|x| x.to_vec1::<f32>())
-            .map_err(err)?; // [8*C*vocab]
-        let uncond_flat = uncond_logits
-            .to_dtype(DType::F32)
-            .and_then(|x| x.flatten_all())
-            .and_then(|x| x.to_vec1::<f32>())
-            .map_err(err)?; // [8*T*vocab]
-
-        // pred[8,T], score[8,T]; score -= layer_id*lpf; уже раскрытые -> -inf.
+        let tf = std::time::Instant::now();
+        let to_host = |x: &Tensor| -> Result<Vec<f32>> {
+            x.to_dtype(DType::F32).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()).map_err(err)
+        };
+        let (cond_flat, uncond_flat, cond_stride, uncond_stride) = match (backbone.bucket_for(c_len), backbone.bucket_for(t)) {
+            (Some(cb), Some(ub)) => {
+                let c = to_host(&backbone.forward_padded(&[(&cond_ids, &cond_mask, c_len)], cb)?)?;
+                let u = to_host(&backbone.forward_padded(&[(&uncond_ids, &uncond_mask_v, t)], ub)?)?;
+                read_time += tf.elapsed();
+                (c, u, cb, ub)
+            }
+            _ => {
+                let cond_logits = backbone.forward(&cond_ids_t, &cond_mask_t)?;
+                let uncond_logits = backbone.forward(&uncond_ids_t, &uncond_mask_t)?;
+                fwd_time += tf.elapsed();
+                let tr = std::time::Instant::now();
+                let c = to_host(&cond_logits)?;
+                let u = to_host(&uncond_logits)?;
+                read_time += tr.elapsed();
+                (c, u, c_len, t)
+            }
+        };
         let mut pred = vec![0i64; n_cb * t];
         let mut score = vec![f32::NEG_INFINITY; n_cb * t];
         for c in 0..n_cb {
             for j in 0..t {
                 // cond_logits[:, c, (c_len-t)+j, :]
-                let c_off = ((c * c_len) + (c_len - t + j)) * vocab;
-                let u_off = ((c * t) + j) * vocab;
+                let c_off = ((c * cond_stride) + (c_len - t + j)) * vocab;
+                let u_off = ((c * uncond_stride) + j) * vocab;
                 let c_row = &cond_flat[c_off..c_off + vocab];
                 let u_row = &uncond_flat[u_off..u_off + vocab];
 
@@ -175,6 +184,9 @@ pub fn generate_iterative(
         }
     }
 
+    if std::env::var_os("SYNAPTIX_TIMING").is_some() {
+        eprintln!("omnivoice: прямые проходы {:.2} с, чтение логитов {:.2} с (C={c_len}, T={t})", fwd_time.as_secs_f32(), read_time.as_secs_f32());
+    }
     Tensor::from_vec(tokens, vec![n_cb, t], device).map_err(err)
 }
 

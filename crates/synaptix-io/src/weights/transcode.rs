@@ -60,6 +60,7 @@ pub struct TranscodeSpec {
     /// Квантовать плотные матрицы источника. При загрузке это не нужно —
     /// модель квантует их сама, — а писателю полного бандла нужно.
     pub quantize_dense: bool,
+    pub include: Vec<String>,
 }
 
 impl TranscodeSpec {
@@ -73,6 +74,7 @@ impl TranscodeSpec {
             embed: None,
             requant: true,
             quantize_dense: false,
+            include: Vec::new(),
         }
     }
 
@@ -82,6 +84,9 @@ impl TranscodeSpec {
 
     /// Целевой формат для тензора по его роли (`None` — не трогать).
     pub fn target_for(&self, name: &str, slices: usize) -> Option<DType> {
+        if !self.include.is_empty() && !self.include.iter().any(|p| name.starts_with(p.as_str())) {
+            return None;
+        }
         if slices > 1 || name.contains(".experts.") {
             return self.experts;
         }

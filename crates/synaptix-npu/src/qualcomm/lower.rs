@@ -366,7 +366,7 @@ impl<'a> Wire<'a> {
             &Op::LayerNorm { x, gamma, beta, eps, axis, out } if !self.fused_norms => {
                 self.norm_decomposed(x, gamma, beta, eps, axis, out, true)
             }
-            &Op::RmsNorm { x, gamma, eps, axis, out } if !self.fused_norms => {
+            &Op::RmsNorm { x, gamma, eps, axis, out } if !self.fused_norms || std::env::var("SYNNPU_FUSED_RMS").as_deref() != Ok("1") => {
                 self.norm_decomposed(x, gamma, None, eps, axis, out, false)
             }
             &Op::LayerNorm { x, gamma, beta, eps, axis, out } => {

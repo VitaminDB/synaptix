@@ -371,6 +371,9 @@ enum Commands {
         /// Статистика входов слоёв из `synaptix calibrate`: шкалы q8row по ошибке выхода слоя.
         #[arg(long)]
         calib: Option<PathBuf>,
+        /// Квантовать только тензоры с этими префиксами имени (повторяемый), например `llm.`.
+        #[arg(long)]
+        include: Vec<String>,
     },
     /// Калибровка для квантования: прогнать модель по записям и сохранить E[x²] входов каждого Linear.
     Calibrate {
@@ -1353,8 +1356,8 @@ fn main() -> ExitCode {
                 model, data, output, lora_r, lora_alpha, lr, epochs, batch_size,
             })
         }
-        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib } => {
-            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib })
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include })
         }
         Commands::Warmup { model, device } => synaptix_cli::commands::calibrate::warmup(&model, &device),
         Commands::Calibrate { model, audio, output, device, limit } => {

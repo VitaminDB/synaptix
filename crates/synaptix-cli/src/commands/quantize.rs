@@ -24,6 +24,7 @@ pub struct QuantizeArgs {
     pub keep_quant: bool,
     pub device: String,
     pub calib: Option<PathBuf>,
+    pub include: Vec<String>,
 }
 
 fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
@@ -62,7 +63,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let experts = if q8 { None } else { Some(main) };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone() };
     let device = if args.device.starts_with("cuda") {
         let ord = args.device.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Device::Cuda(ord)

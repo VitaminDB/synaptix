@@ -34,9 +34,55 @@ fn wavs(dir: &Path, limit: usize) -> Vec<PathBuf> {
     out
 }
 
+fn is_omnivoice(model: &Path) -> bool {
+    synaptix_bundle::Bundle::open(model)
+        .map(|b| b.tensors_slice_named("lm").is_ok() && b.tensors_slice_named("codec").is_ok())
+        .unwrap_or(false)
+}
+
+fn tts_lines(path: &Path, limit: usize) -> Result<Vec<(Option<String>, String)>, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .take(limit)
+        .map(|l| match l.split_once('|') {
+            Some((lang, t)) => (Some(lang.trim().to_string()), t.trim().to_string()),
+            None => (None, l.to_string()),
+        })
+        .collect())
+}
+
+fn calibrate_tts(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_tts_omnivoice::{OmniVoiceGenerationConfig, OmniVoicePipeline};
+    let lines = tts_lines(&args.audio, args.limit)?;
+    if lines.is_empty() {
+        return Err(format!("{}: нет фраз (строки «язык|текст»)", args.audio.display()).into());
+    }
+    let dtype = if matches!(device, Device::Npu(_)) { DType::F16 } else { DType::F32 };
+    let tts = OmniVoicePipeline::from_syn(&args.model, device, dtype)?;
+    let gen = OmniVoiceGenerationConfig::default();
+    println!("Calibrate {} (TTS) на {} фразах ({:?})", args.model.display(), lines.len(), device);
+    calib::start();
+    let t0 = std::time::Instant::now();
+    for (i, (lang, text)) in lines.iter().enumerate() {
+        tts.synthesize(text, None, lang.as_deref(), None, 1.0, None, &gen)?;
+        eprint!("\r  [{}/{}]", i + 1, lines.len());
+    }
+    eprintln!();
+    let stats = calib::finish();
+    calib::save(&args.output, &stats)?;
+    println!("Done: {} ({} слоёв, {:.1} с)", args.output.display(), stats.len(), t0.elapsed().as_secs_f32());
+    Ok(())
+}
+
 pub fn run(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     synaptix::init()?;
     let device = super::device::resolve(&args.device);
+    if is_omnivoice(&args.model) {
+        return calibrate_tts(&args, device);
+    }
     let files = if args.audio.is_dir() { wavs(&args.audio, args.limit) } else { vec![args.audio.clone()] };
     if files.is_empty() {
         return Err(format!("{}: нет WAV-файлов", args.audio.display()).into());
@@ -58,9 +104,30 @@ pub fn run(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn warmup_tts(model: &Path, device: Device) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_tts_omnivoice::OmniVoicePipeline;
+    let dtype = if matches!(device, Device::Npu(_)) { DType::F16 } else { DType::F32 };
+    let t0 = std::time::Instant::now();
+    let tts = OmniVoicePipeline::from_syn(model, device, dtype)?;
+    println!("Warmup {} (TTS, {:?}), загрузка {:.1} с", model.display(), device, t0.elapsed().as_secs_f32());
+    let n_cb = tts.config().num_audio_codebook;
+    for s in synaptix_tts_omnivoice::backbone::NPU_BUCKETS.iter().map(|&b| b - 1) {
+        let ids = vec![0i64; n_cb * s];
+        let mask = vec![1u8; s];
+        let t = std::time::Instant::now();
+        let sb = tts.backbone().bucket_for(s).unwrap_or(s);
+        tts.backbone().forward_padded(&[(&ids, &mask, s)], sb)?.to_dtype(DType::F32)?.to_device(Device::Cpu)?;
+        println!("  {s} позиций: {:.1} с", t.elapsed().as_secs_f32());
+    }
+    Ok(())
+}
+
 pub fn warmup(model: &Path, device: &str) -> Result<(), Box<dyn std::error::Error>> {
     synaptix::init()?;
     let device = super::device::resolve(device);
+    if is_omnivoice(model) {
+        return warmup_tts(model, device);
+    }
     let dtype = if device == Device::Cpu { DType::F32 } else { DType::F16 };
     let t0 = std::time::Instant::now();
     let m = synaptix_asr_wav2vec2::Wav2Vec2Ctc::load(model, &device, dtype)?;

@@ -57,6 +57,7 @@ fn tensor_from_st(
 /// Веса `lm`-компонента OmniVoice (F32, на одном устройстве).
 pub struct OmniVoiceLmWeights {
     tensors: HashMap<String, Tensor>,
+    quant: HashMap<String, synaptix_core::tensor::quant::QuantWeight>,
     pub device: Device,
     pub dtype: DType,
 }
@@ -87,7 +88,7 @@ impl OmniVoiceLmWeights {
                 .map_err(|e| OmniVoiceError::Load(format!("load '{name}': {e}")))?;
             tensors.insert(name, t);
         }
-        Ok(Self { tensors, device, dtype })
+        Ok(Self { tensors, quant: HashMap::new(), device, dtype })
     }
 
     /// Загрузить lm-компонент из safetensors-байтов (`.syn` `tensors:lm`).
@@ -96,20 +97,69 @@ impl OmniVoiceLmWeights {
         device: Device,
         dtype: DType,
     ) -> Result<Self, OmniVoiceError> {
+        Self::load_bundle_bytes(bytes, device, dtype, None, &[])
+    }
+
+    pub fn load_bundle_bytes(
+        bytes: &[u8],
+        device: Device,
+        dtype: DType,
+        manifest: Option<&synaptix_bundle::QuantManifest>,
+        host_names: &[&str],
+    ) -> Result<Self, OmniVoiceError> {
         let st = SafeTensors::deserialize(bytes)
             .map_err(|e| OmniVoiceError::Load(format!("deserialize lm st: {e}")))?;
         let names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
+        let keep_quant = matches!(device, Device::Npu(_));
         let mut tensors = HashMap::with_capacity(names.len());
-        for name in names {
-            let want = if name == "codebook_layer_offsets" {
-                DType::I64
-            } else {
-                dtype
-            };
-            let t = tensor_from_st(&st, &name, device, want)?;
-            tensors.insert(name, t);
-        }
-        Ok(Self { tensors, device, dtype })
+        let mut quant = HashMap::new();
+        synaptix_core::backend::with_param_upload(|| -> Result<(), OmniVoiceError> {
+            for name in names {
+                if let Some(m) = manifest {
+                    let base = name.strip_suffix(&m.packed_suffix).or_else(|| name.strip_suffix(&m.scales_suffix));
+                    if let Some(base) = base {
+                        if !name.ends_with(&m.packed_suffix) {
+                            continue;
+                        }
+                        let entry = m.entry(base).ok_or_else(|| OmniVoiceError::Load(format!("'{base}': нет в манифесте")))?;
+                        let (_, n, k) = entry.dims().ok_or_else(|| OmniVoiceError::Load(format!("'{base}': форма")))?;
+                        let packed = st.tensor(&name).map_err(|e| OmniVoiceError::Load(format!("'{name}': {e}")))?;
+                        let scales = st
+                            .tensor(&m.scales_name(base))
+                            .map_err(|e| OmniVoiceError::Load(format!("'{base}' шкалы: {e}")))?;
+                        let pb = packed.data();
+                        let sb = scales.data();
+                        if keep_quant && !host_names.contains(&base) {
+                            let p = Tensor::from_raw_slice(pb, vec![pb.len()], DType::U8, device)?;
+                            let sc = Tensor::from_raw_slice(sb, vec![sb.len()], DType::U8, device)?;
+                            let q = synaptix_core::tensor::quant::QuantWeight::new(p.storage_arc(), sc.storage_arc(), DType::Q8Row, n, k)?;
+                            quant.insert(base.to_string(), q);
+                        } else {
+                            let sc = synaptix_core::quant::q8row::scales_from_bytes(sb);
+                            let mut out = vec![0f32; n * k];
+                            for r in 0..n {
+                                synaptix_core::quant::q8row::dequant_row(&pb[r * k..(r + 1) * k], sc[r], &mut out[r * k..(r + 1) * k]);
+                            }
+                            let dev = if host_names.contains(&base) { Device::Cpu } else { device };
+                            let t = Tensor::from_vec(out, vec![n, k], dev)?;
+                            let t = if t.dtype() == dtype { t } else { t.to_dtype(dtype)? };
+                            tensors.insert(base.to_string(), t);
+                        }
+                        continue;
+                    }
+                }
+                let want = if name == "codebook_layer_offsets" { DType::I64 } else { dtype };
+                let dev = if host_names.contains(&name.as_str()) { Device::Cpu } else { device };
+                let t = tensor_from_st(&st, &name, dev, want)?;
+                tensors.insert(name, t);
+            }
+            Ok(())
+        })?;
+        Ok(Self { tensors, quant, device, dtype })
+    }
+
+    pub fn quant(&self, name: &str) -> Option<&synaptix_core::tensor::quant::QuantWeight> {
+        self.quant.get(name)
     }
 
     pub fn get(&self, name: &str) -> Result<&Tensor, OmniVoiceError> {

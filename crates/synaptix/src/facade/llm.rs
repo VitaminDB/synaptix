@@ -245,6 +245,7 @@ impl QuantPolicy {
             embed,
             requant: true,
             quantize_dense: false,
+            include: Vec::new(),
         }
     }
 
@@ -2861,6 +2862,7 @@ fn cpu_quant_request(
         },
         requant: false,
         quantize_dense: true,
+        include: Vec::new(),
     };
     Some(synaptix_io::weights::transcode::request(
         path,
