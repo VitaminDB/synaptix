@@ -87,6 +87,30 @@ impl Wav2Vec2Model {
     /// Новая CTC-голова под словарь размера `vocab`: строка `i` копируется из
     /// старой строки `init[i]`, иначе — среднее старых строк (смещение — то же).
     pub fn replace_head(&mut self, vocab: usize, init: &[Option<usize>]) -> Result<()> {
+        let d = self.config.hidden_size;
+        // Базовая модель без головы: случайная инициализация N(0, 0.02), смещение 0.
+        if self.lm_head.is_none() {
+            let mut seed = 0x9e3779b97f4a7c15u64;
+            let mut gauss = || {
+                let mut u = || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+                };
+                let (a, b) = (u(), u());
+                ((-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos()) as f32
+            };
+            let w: Vec<f32> = (0..vocab * d).map(|_| 0.02 * gauss()).collect();
+            let dev = self.device();
+            let dt = self.dtype();
+            self.lm_head = Some(Linear {
+                weight: Tensor::from_vec(w, vec![vocab, d], dev)?.to_dtype(dt)?,
+                bias: Tensor::from_vec(vec![0f32; vocab], vec![vocab], dev)?.to_dtype(dt)?,
+            });
+            self.config.vocab_size = vocab;
+            return Ok(());
+        }
         let head = self.lm_head.as_ref().ok_or_else(|| Wav2Vec2Error::Config("нет lm_head".into()))?;
         let w = head.weight.to_dtype(DType::F32)?.to_device(Device::Cpu)?.contiguous()?;
         let b = head.bias.to_dtype(DType::F32)?.to_device(Device::Cpu)?.contiguous()?;

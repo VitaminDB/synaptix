@@ -320,12 +320,16 @@ pub fn run(cfg: &FinetuneConfig) -> Result<()> {
             let per = if dev.is_empty() { f64::NAN } else { evaluate(&model, &dev, cfg.eval_max, blank, cfg)? };
             eprintln!("step {step}: dev PER {:.2}%", per * 100.0);
             let _ = writeln!(log, "step {step} dev_per {per:.4}");
-            if dev.is_empty() || per < best_per || last {
-                if !dev.is_empty() && per < best_per {
+            // С dev-выборкой хранится лучшая по PER модель (последняя её не
+            // затирает), без неё — последняя.
+            if dev.is_empty() || per < best_per {
+                if !dev.is_empty() {
                     best_per = per;
                 }
                 save(&mut model, &cfg.out, &w, &vocab_json)?;
                 eprintln!("  сохранено в {}", cfg.out.display());
+            } else if last {
+                eprintln!("  лучшая модель (dev PER {:.2}%) уже в {}", best_per * 100.0, cfg.out.display());
             }
         }
     }
