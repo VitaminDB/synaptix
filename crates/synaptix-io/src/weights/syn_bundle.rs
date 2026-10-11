@@ -306,6 +306,14 @@ impl SynBundleLoader {
         Ok(self.index.get_or_init(|| built))
     }
 
+    pub fn mapped_bytes(&self, name: &str) -> Option<(&[u8], DType, Vec<usize>)> {
+        let (bytes, _) = self.st_bytes().ok()?;
+        let idx = self.index().ok()?;
+        let key = Self::resolve_key(name, &idx.prefix);
+        let meta = idx.by_name.get(&key).or_else(|| idx.by_name.get(name))?;
+        Some((&bytes[meta.off..meta.off + meta.len], meta.dtype?, meta.shape.clone()))
+    }
+
     fn resolve_key(name: &str, prefix: &Option<String>) -> String {
         match prefix {
             Some(pfx) if !name.starts_with(pfx.as_str()) => format!("{pfx}.{name}"),

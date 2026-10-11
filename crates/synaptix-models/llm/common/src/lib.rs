@@ -21,4 +21,4 @@ pub use model::{
     DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
 };
 pub use moe::{MoeConfig, MoeFfn};
-pub use weights::{QLinear, WeightSource};
+pub use weights::{QLinear, RowSource, WeightSource};

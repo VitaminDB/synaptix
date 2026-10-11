@@ -186,6 +186,7 @@ pub struct FullAttn {
     rms_eps: f32,
     use_flash: bool,
     sliding_window: Option<usize>,
+    kv_shared: bool,
 }
 
 pub struct LinearAttn {
@@ -250,10 +251,24 @@ pub struct Block {
     mixer: Mixer,
     mlp: Mlp,
     moe: Option<MoeSide>,
-    /// Множитель на выходе блока (`layers.N.layer_scalar`).
     layer_scalar: Option<f32>,
+    ple: Option<BlockPle>,
     rms_eps: f32,
     post_eps: f32,
+}
+
+pub struct BlockPle {
+    gate: QLinear,
+    proj: QLinear,
+    post_norm: Tensor,
+}
+
+pub struct ModelPle {
+    rows: std::sync::Arc<dyn crate::weights::RowSource>,
+    model_proj: QLinear,
+    proj_norm: Tensor,
+    dim: usize,
+    layers: usize,
 }
 
 impl FullAttn {
@@ -285,6 +300,7 @@ impl FullAttn {
             rms_eps: self.rms_eps,
             use_flash: self.use_flash,
             sliding_window: self.sliding_window,
+            kv_shared: self.kv_shared,
         })
     }
 }
@@ -438,6 +454,10 @@ impl Block {
             mlp: self.mlp.to_device(dev)?,
             moe: None,
             layer_scalar: self.layer_scalar,
+            ple: match &self.ple {
+                Some(p) => Some(BlockPle { gate: p.gate.to_device(dev)?, proj: p.proj.to_device(dev)?, post_norm: t(&p.post_norm)? }),
+                None => None,
+            },
             rms_eps: self.rms_eps,
             post_eps: self.post_eps,
         })
@@ -479,6 +499,8 @@ pub struct DecoderModel {
     /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
     /// ([`Self::fit_expert_cache`]).
     expert_cache: Option<std::sync::Arc<crate::moe::ExpertCache>>,
+    ple: Option<ModelPle>,
+    ple_cur: std::sync::Mutex<Option<Tensor>>,
 }
 
 pub struct KvCacheLayer {
@@ -1248,6 +1270,7 @@ impl DecoderModel {
                         rms_eps: eps,
                         use_flash: flash_ok(hd),
                         sliding_window: cfg.window_for(l),
+                        kv_shared: cfg.kv_source(l).is_some(),
                     })
                 }
                 LayerKind::Linear => {
@@ -1376,6 +1399,15 @@ impl DecoderModel {
             } else {
                 None
             };
+            let ple = if cfg.ple_dim() > 0 {
+                Some(BlockPle {
+                    gate: qlin(&key("per_layer_input_gate.weight"), mlp_w)?,
+                    proj: qlin(&key("per_layer_projection.weight"), mlp_w)?,
+                    post_norm: norm(&key("post_per_layer_input_norm.weight"))?,
+                })
+            } else {
+                None
+            };
             blocks.push(Block {
                 pre_attn_norm: norm(&key("input_layernorm.weight"))?,
                 post_attn_norm: match post_attn_key {
@@ -1391,10 +1423,27 @@ impl DecoderModel {
                 mlp,
                 moe,
                 layer_scalar,
+                ple,
                 rms_eps: eps,
                 post_eps: cfg.post_norm_eps.unwrap_or(eps),
             });
         }
+        let model_ple = if cfg.ple_dim() > 0 {
+            let rows = weights
+                .rows("model.embed_tokens_per_layer.weight")
+                .ok_or_else(|| ModelError::Build("PLE: источник весов не отдаёт строки таблицы".into()))??;
+            Some(ModelPle {
+                rows,
+                model_proj: qlin("model.per_layer_model_projection.weight", mlp_w)?.to_device(device)?,
+                proj_norm: norm("model.per_layer_projection_norm.weight")?
+                    .to_device(device)
+                    .map_err(|e| ModelError::Load(e.to_string()))?,
+                dim: cfg.ple_dim(),
+                layers: cfg.num_hidden_layers,
+            })
+        } else {
+            None
+        };
 
         let rope_capacity = rope_capacity.max(1);
         let build_rope = |spec: &crate::config::RopeSpec| -> Result<RopeCache, ModelError> {
@@ -1438,6 +1487,8 @@ impl DecoderModel {
             },
             weights_gen: 0,
             expert_cache,
+            ple: model_ple,
+            ple_cur: std::sync::Mutex::new(None),
         })
     }
 
@@ -1885,6 +1936,7 @@ impl DecoderModel {
             let lc = match c.layer_kind(l) {
                 LayerKind::Full => {
                     let cap = match c.window_for(l) {
+                        _ if c.kv_source(l).is_some() => 1,
                         Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
                         _ => max_seq,
                     };
@@ -1933,7 +1985,60 @@ impl DecoderModel {
         if let Some(w) = &self.embed_norm {
             hidden = rms_norm(&hidden, w, self.config.rms_norm_eps).coerr()?;
         }
+        if let Some(p) = &self.ple {
+            let pli = self.ple_inputs(p, input_ids, &hidden)?;
+            *self.ple_cur.lock().unwrap_or_else(|e| e.into_inner()) = Some(pli);
+        }
         Ok(hidden)
+    }
+
+    fn ple_inputs(&self, p: &ModelPle, ids: &Tensor, emb: &Tensor) -> Result<Tensor, ModelError> {
+        let dims = ids.dims().to_vec();
+        let host: Vec<u32> = ids
+            .to_device(Device::Cpu)
+            .and_then(|t| t.to_dtype(DType::U32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<u32>())
+            .coerr()?;
+        let width = p.rows.width();
+        let mut buf = vec![0f32; host.len() * width];
+        p.rows.rows(&host, &mut buf)?;
+        let mut shape = dims.clone();
+        shape.extend([p.layers, p.dim]);
+        let tok = Tensor::from_vec(buf, shape.clone(), self.device)
+            .and_then(|t| t.mul_scalar((p.dim as f32).sqrt()))
+            .and_then(|t| t.to_dtype(self.dtype))
+            .coerr()?;
+        let proj = p.model_proj.forward(emb)?;
+        let proj = proj
+            .mul_scalar(1.0 / (self.config.hidden_size as f32).sqrt())
+            .and_then(|t| t.reshape(shape))
+            .coerr()?;
+        let proj = rms_norm(&proj, &p.proj_norm, self.config.rms_norm_eps).coerr()?;
+        let proj = if proj.dtype() != tok.dtype() { proj.to_dtype(tok.dtype()).coerr()? } else { proj };
+        proj.add(&tok).and_then(|t| t.mul_scalar(std::f32::consts::FRAC_1_SQRT_2)).coerr()
+    }
+
+    fn take_ple(&self) -> Option<Tensor> {
+        self.ple_cur.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn apply_ple(&self, blk: &Block, idx: usize, out: Tensor, pli: Option<&Tensor>) -> Result<Tensor, ModelError> {
+        let (Some(bp), Some(t), Some(p)) = (&blk.ple, pli, &self.ple) else { return Ok(out) };
+        let d = out.dims().to_vec();
+        let x = t
+            .narrow(t.rank() - 2, idx, 1)
+            .and_then(|x| x.contiguous())
+            .and_then(|x| x.reshape(vec![d[0], d[1], p.dim]))
+            .coerr()?;
+        let g = bp.gate.forward(&out)?;
+        let g = g.gelu_tanh().coerr()?;
+        let x = if x.dtype() != g.dtype() { x.to_dtype(g.dtype()).coerr()? } else { x };
+        let g = g.mul(&x).coerr()?;
+        let y = bp.proj.forward(&g)?;
+        let y = rms_norm(&y, &bp.post_norm, blk.rms_eps).coerr()?;
+        let y = if y.dtype() != out.dtype() { y.to_dtype(out.dtype()).coerr()? } else { y };
+        out.add(&y).coerr()
     }
 
     pub fn normed_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
@@ -2093,6 +2198,7 @@ impl DecoderModel {
         }
         let dev = self.device;
         let dump_layers = dump_layers_on();
+        let pli = self.take_ple();
 
         // Один блок (attn/linear-mixer + MLP) → новый hidden. Вынесено в замыкание,
         // чтобы общий код работал и в резидентном цикле, и в host-stream (блок
@@ -2102,8 +2208,9 @@ impl DecoderModel {
             let residual = hidden.clone();
             let h = prof(dev, "norm", || rms_norm(hidden, &blk.pre_attn_norm, blk.rms_eps).coerr())?;
             let is_lin = matches!(&blk.mixer, Mixer::Linear(_));
+            let cache_idx = self.config.kv_source(idx).unwrap_or(idx);
             let mixed = match &blk.mixer {
-                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos, spans))?,
+                Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[cache_idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos, spans))?,
                 Mixer::Linear(la) => prof(dev, "attn_linear", || la.forward(&h, &mut kv_cache.layers[idx], s, self.device, self.dtype))?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
@@ -2116,6 +2223,7 @@ impl DecoderModel {
             let mlp_out = self.ffn_branches(blk, &hidden, mlp_out, batch, s)?;
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             let out = prof(dev, "residual", || residual2.add(&mlp_out).coerr())?;
+            let out = self.apply_ple(blk, idx, out, pli.as_ref())?;
             let out = match blk.layer_scalar {
                 Some(a) if a != 1.0 => out.mul_scalar(a).coerr()?,
                 _ => out,
@@ -2220,6 +2328,7 @@ impl DecoderModel {
         let pad_ref = pad_bias.as_ref();
 
         let mut hidden = self.embed_ids(input_ids)?;
+        let _ = self.take_ple();
         let mut states: Vec<Tensor> = Vec::with_capacity(self.blocks.len() + 1);
         let mut step = |idx: usize, blk: &Block, hidden: &Tensor, kv: &mut KvCache|
             -> Result<Tensor, ModelError> {
@@ -3110,24 +3219,24 @@ impl FullAttn {
             (qg.reshape(vec![batch, s, nh, hd]).coerr()?, None)
         };
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let k = add_bias(prof(device, "attn_kproj", || self.k_proj.forward(h))?, &self.k_bias)?.reshape(vec![batch, s, nkv, hd]).coerr()?
-            .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        // `attention_k_eq_v`: значения — тот же выход `k_proj`, снятый ДО
-        // Q/K-нормы и RoPE (в HF `value_states` держит ссылку на дорезанный
-        // тензор, а `key_states` переприсваивается).
-        let v = match &self.v_proj {
-            Some(vp) => add_bias(prof(device, "attn_vproj", || vp.forward(h))?, &self.v_bias)?
-                .reshape(vec![batch, s, nkv, hd]).coerr()?
-                .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
-            None => k.clone(),
-        };
-
         let q = prof(device, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
-        let k = prof(device, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
-        let v = prof(device, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
-
         let q = prof(device, "attn_rope", || partial_rope(&q, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
-        let k = prof(device, "attn_rope", || partial_rope(&k, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
+        let kv_new = if self.kv_shared {
+            None
+        } else {
+            let k = add_bias(prof(device, "attn_kproj", || self.k_proj.forward(h))?, &self.k_bias)?.reshape(vec![batch, s, nkv, hd]).coerr()?
+                .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
+            let v = match &self.v_proj {
+                Some(vp) => add_bias(prof(device, "attn_vproj", || vp.forward(h))?, &self.v_bias)?
+                    .reshape(vec![batch, s, nkv, hd]).coerr()?
+                    .permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
+                None => k.clone(),
+            };
+            let k = prof(device, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
+            let v = prof(device, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
+            let k = prof(device, "attn_rope", || partial_rope(&k, rope, past, s, self.rotary_dim, hd, rope_pos).coerr())?;
+            Some((k, v))
+        };
 
         let new_len = past + s;
         let group = nh / nkv;
@@ -3155,8 +3264,10 @@ impl FullAttn {
                 )));
             }
             let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kv;
-            kc.kv_append_quant_mxfp8_inplace(ksc.as_mut().unwrap(), &k, past).coerr()?;
-            vc.kv_append_quant_mxfp8_inplace(vsc.as_mut().unwrap(), &v, past).coerr()?;
+            if let Some((k, v)) = &kv_new {
+                kc.kv_append_quant_mxfp8_inplace(ksc.as_mut().unwrap(), k, past).coerr()?;
+                vc.kv_append_quant_mxfp8_inplace(vsc.as_mut().unwrap(), v, past).coerr()?;
+            }
             let k_q = kc.narrow(2, 0, new_len).coerr()?;
             let v_q = vc.narrow(2, 0, new_len).coerr()?;
             // narrow по dim-2 (max_seq); блочная ось hd/32 — dim-3, не задета.
@@ -3167,7 +3278,7 @@ impl FullAttn {
         } else {
             let cap = kv.k.dims()[2];
             let mut local_past = past - kv.start;
-            if local_past + s > cap {
+            if kv_new.is_some() && local_past + s > cap {
                 let Some(w) = self.sliding_window else {
                     return Err(ModelError::Shape(format!(
                         "KV overflow: past {past} + s {s} > cap {cap}"
@@ -3191,8 +3302,10 @@ impl FullAttn {
                 kv.window = w;
                 local_past = past - kv.start;
             }
-            kv.k.kv_append_inplace(&k, local_past).coerr()?;
-            kv.v.kv_append_inplace(&v, local_past).coerr()?;
+            if let Some((k, v)) = &kv_new {
+                kv.k.kv_append_inplace(k, local_past).coerr()?;
+                kv.v.kv_append_inplace(v, local_past).coerr()?;
+            }
             let local_len = local_past + s;
             let (att_lo, att_len) = match self.sliding_window {
                 Some(w) => {

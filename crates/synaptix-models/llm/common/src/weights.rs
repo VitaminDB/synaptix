@@ -6,7 +6,16 @@ use synaptix_nn::linear::Linear;
 
 use crate::model::ModelError;
 
+pub trait RowSource: Send + Sync {
+    fn width(&self) -> usize;
+    fn rows(&self, ids: &[u32], out: &mut [f32]) -> Result<(), ModelError>;
+}
+
 pub trait WeightSource {
+    fn rows(&self, _key: &str) -> Option<Result<std::sync::Arc<dyn RowSource>, ModelError>> {
+        None
+    }
+
     fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, ModelError>;
     fn contains(&self, key: &str) -> bool;
 

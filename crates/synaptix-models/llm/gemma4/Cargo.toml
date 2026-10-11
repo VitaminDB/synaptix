@@ -10,6 +10,7 @@ description = "Gemma4 (MoE рядом с плотным MLP, широкие glob
 default = []
 
 [dependencies]
+half = { workspace = true }
 synaptix-llm-common = { workspace = true }
 synaptix-core      = { workspace = true }
 synaptix-ops       = { workspace = true }

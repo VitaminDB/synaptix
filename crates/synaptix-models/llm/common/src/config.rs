@@ -78,8 +78,9 @@ pub struct DecoderExt {
     /// RMS-норма без веса поверх V (Gemma-4 `v_norm`).
     pub v_rms_norm: bool,
     pub moe: Option<MoeBranch>,
-    /// Выход блока умножается на скаляр `layers.N.layer_scalar` из весов.
     pub layer_scalar: bool,
+    pub ple_dim: usize,
+    pub kv_source: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +207,19 @@ impl DecoderConfig {
     /// таблиц на тип слоя. Готовность MoE-ветки проверяет уже модель
     /// (`DecoderModel::graph_decode_ready`) — конфиг про веса не знает.
     pub fn graph_decode_ok(&self) -> bool {
-        true
+        self.ple_dim() == 0 && !self.has_kv_sharing()
+    }
+
+    pub fn ple_dim(&self) -> usize {
+        self.ext.as_ref().map_or(0, |e| e.ple_dim)
+    }
+
+    pub fn kv_source(&self, idx: usize) -> Option<usize> {
+        self.ext.as_ref()?.kv_source.get(idx).copied().flatten()
+    }
+
+    pub fn has_kv_sharing(&self) -> bool {
+        self.ext.as_ref().is_some_and(|e| e.kv_source.iter().any(Option::is_some))
     }
 
     /// Профиль, поддержанный device-резидентным `forward_prefill_dev` (CUDA-graph

@@ -220,15 +220,8 @@ impl Gemma4Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.hidden_size_per_layer_input != 0 {
-            return Err(ConfigError::Invalid(
-                "PLE (hidden_size_per_layer_input > 0) не поддержан: это раскладка E2B/E4B".into(),
-            ));
-        }
-        if self.num_kv_shared_layers != 0 {
-            return Err(ConfigError::Invalid(
-                "num_kv_shared_layers > 0 не поддержан: слои, делящие KV, не реализованы".into(),
-            ));
+        if self.num_kv_shared_layers >= self.num_hidden_layers {
+            return Err(ConfigError::Invalid("num_kv_shared_layers не меньше числа слоёв".into()));
         }
         if self.enable_moe_block && (self.num_experts == 0 || self.top_k_experts == 0) {
             return Err(ConfigError::Invalid("enable_moe_block без экспертов".into()));
@@ -280,6 +273,19 @@ impl Gemma4Config {
             *f = p.theta.powf(-(2.0 * j as f32) / hd as f32);
         }
         Some(freqs)
+    }
+
+    pub fn kv_sources(&self) -> Vec<Option<usize>> {
+        let first = self.num_hidden_layers - self.num_kv_shared_layers;
+        (0..self.num_hidden_layers)
+            .map(|l| {
+                if self.num_kv_shared_layers == 0 || l < first {
+                    return None;
+                }
+                let t = self.layer_types.get(l)?;
+                (0..first).rev().find(|&j| self.layer_types.get(j) == Some(t))
+            })
+            .collect()
     }
 
     pub fn to_decoder_config(&self) -> DecoderConfig {
@@ -343,6 +349,8 @@ impl Gemma4Config {
                 v_rms_norm: true,
                 moe,
                 layer_scalar: true,
+                ple_dim: self.hidden_size_per_layer_input,
+                kv_source: self.kv_sources(),
             }),
         }
     }
@@ -436,8 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ple_layout() {
-        let bad = SAMPLE.replace("\"hidden_size_per_layer_input\": 0", "\"hidden_size_per_layer_input\": 256");
-        assert!(Gemma4Config::from_hf_bytes(bad.as_bytes()).is_err());
+    fn ple_and_kv_sharing_layout() {
+        let e2b = SAMPLE
+            .replace("\"hidden_size_per_layer_input\": 0", "\"hidden_size_per_layer_input\": 256")
+            .replace("\"num_kv_shared_layers\": 0", "\"num_kv_shared_layers\": 2");
+        let c = Gemma4Config::from_hf_bytes(e2b.as_bytes()).unwrap();
+        let d = c.to_decoder_config();
+        assert_eq!(d.ple_dim(), 256);
+        let n = c.num_hidden_layers;
+        let src = c.kv_sources();
+        assert!(src[..n - 2].iter().all(Option::is_none));
+        for l in n - 2..n {
+            let s = src[l].expect("слой с общим KV");
+            assert!(s < n - 2);
+            assert_eq!(c.layer_types[s], c.layer_types[l]);
+        }
     }
 }
