@@ -138,6 +138,14 @@ paths are documented rather than hidden — see [`LTX_GEMM_PARITY.md`](LTX_GEMM_
 where bf16 GEMM lands at 0.82–1.16× of cuBLAS depending on shape: ahead on small and medium
 M, behind on large-M tails.
 
+## NPU
+
+Models also run on mobile NPUs through `Device::Npu`: tensor operations are recorded into a graph and
+executed on the NPU in segments, with unsupported operations falling back to the CPU — no per-model port.
+The first driver targets Qualcomm Hexagon HTP (QNN); NPU models are described by per-model profiles.
+`synaptix transcribe whisper.syn speech.wav --device cpu --encoder-device npu` runs the Whisper encoder on the
+NPU. Recipes, debugging and measurements: [`docs/npu.md`](docs/npu.md).
+
 ## How it is laid out
 
 | Crate | What it holds |

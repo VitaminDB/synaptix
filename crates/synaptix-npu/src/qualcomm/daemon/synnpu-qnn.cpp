@@ -46,6 +46,7 @@ std::string cache_dir = "/var/cache/synnpu";
 std::string build_id;
 std::mutex qnn_mutex;
 int live_graphs;
+bool offline;
 
 void logf(const char* fmt, ...) {
     va_list a;
@@ -229,6 +230,27 @@ void init_qnn() {
     const char* bid = nullptr;
     if (qnn.backendGetBuildId(&bid) == QNN_SUCCESS && bid) build_id = bid;
 
+    if (offline) {
+        hw_soc = getenv("SYNNPU_SOC") ? atoi(getenv("SYNNPU_SOC")) : 0;
+        hw_arch = getenv("SYNNPU_ARCH") ? atoi(getenv("SYNNPU_ARCH")) : 0;
+        hw_vtcm_mb = getenv("SYNNPU_VTCM_MB") ? atoi(getenv("SYNNPU_VTCM_MB")) : 8;
+        if (!hw_soc || !hw_arch) { logf("офлайн: нужны SYNNPU_SOC и SYNNPU_ARCH"); exit(1); }
+        QnnHtpDevice_CustomConfig_t sc{};
+        sc.option = QNN_HTP_DEVICE_CONFIG_OPTION_SOC;
+        sc.socModel = hw_soc;
+        QnnHtpDevice_CustomConfig_t ac{};
+        ac.option = QNN_HTP_DEVICE_CONFIG_OPTION_ARCH;
+        ac.arch.deviceId = 0;
+        ac.arch.arch = QnnHtpDevice_Arch_t(hw_arch);
+        QnnDevice_Config_t c1 = QNN_DEVICE_CONFIG_INIT, c2 = QNN_DEVICE_CONFIG_INIT;
+        c1.option = c2.option = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+        c1.customConfig = &sc;
+        c2.customConfig = &ac;
+        const QnnDevice_Config_t* dc[] = {&c1, &c2, nullptr};
+        if (qnn.deviceCreate(qlog, dc, &qdevice) != QNN_SUCCESS) { logf("deviceCreate (офлайн)"); exit(1); }
+        logf("офлайн-сборка: HTP v%u, SoC %u, VTCM %u МБ, QNN %s", hw_arch, hw_soc, hw_vtcm_mb, build_id.c_str());
+        return;
+    }
     const QnnDevice_PlatformInfo_t* pi = nullptr;
     if (qnn.deviceGetPlatformInfo(qlog, &pi) == QNN_SUCCESS && pi && pi->v1.numHwDevices > 0) {
         auto ext = (QnnHtpDevice_DeviceInfoExtension_t*)pi->v1.hwDevices[0].v1.deviceInfoExtension;
@@ -353,6 +375,10 @@ std::unique_ptr<Graph> load_cached(const std::string& path, Group* group = nullp
     std::string gname = gi.graphName;
     qsys.systemContextFree(sc);
 
+    if (offline) {
+        g->g = nullptr;
+        return g;
+    }
     QnnHtpContext_CustomConfig_t gr{};
     gr.option = QNN_HTP_CONTEXT_CONFIG_OPTION_REGISTER_MULTI_CONTEXTS;
     QnnContext_Config_t gc = QNN_CONTEXT_CONFIG_INIT;
@@ -763,6 +789,10 @@ struct Session {
                 (v == &g.ins ? in : out).push_back(x);
             }
         }
+        if (offline) {
+            w.put<uint64_t>(0);
+            return;
+        }
         auto t0 = std::chrono::steady_clock::now();
         check(qnn.graphExecute(g.g, in.data(), in.size(), out.data(), out.size(), nullptr, nullptr), "graphExecute");
         uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -852,7 +882,7 @@ void serve(int sock) {
 int build_child(int argc, char** argv) {
     init_qnn();
     Session s{-1};
-    s.prepare_only = !getenv("SYNNPU_NO_PREPARE_ONLY");
+    s.prepare_only = !offline && !getenv("SYNNPU_NO_PREPARE_ONLY");
     for (int i = 3; i < argc; i++) {
         unsigned id = 0, fd = 0;
         unsigned long long size = 0;
@@ -894,6 +924,7 @@ int main(int argc, char** argv) {
     signal(SIGCHLD, SIG_DFL);
     setvbuf(stderr, nullptr, _IOLBF, 0);
     if (const char* c = getenv("SYNNPU_CACHE")) cache_dir = c;
+    offline = getenv("SYNNPU_OFFLINE") != nullptr;
     if (argc >= 3 && strcmp(argv[1], "--build") == 0) _exit(build_child(argc, argv));
     if (argc >= 3 && strcmp(argv[1], "--serve") == 0) {
         int fd = atoi(argv[2]);
