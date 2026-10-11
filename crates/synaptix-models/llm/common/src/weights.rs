@@ -140,7 +140,7 @@ impl QLinear {
                 // BF16 сами (NVFP4 — везде, MXFP8 — на декоде); cast'ы туда-обратно
                 // стоили по два ядра на проекцию. Где нативного пути нет
                 // (`Unsupported`), остаётся прежний обход через F16.
-                if in_dt == DType::BF16 && bf16_native_on() {
+                if (in_dt == DType::BF16 && bf16_native_on()) || in_dt == DType::F32 {
                     match x.linear_quant(w) {
                         Ok(y) => return Ok(y),
                         Err(synaptix_core::error::SynaptixError::Unsupported(_)) => {}

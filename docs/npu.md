@@ -101,6 +101,30 @@ synmobile/hw/npu/npu-precompile.sh transcribe whisper.syn речь.wav --device 
 Скрипт докладывает на телефон недостающие графы (`/var/cache/synnpu`). Turbo: 25 сегментов на ПК за 64 с,
 на телефоне — 25 «открыт из кэша», ни одной сборки.
 
+## Квантованные веса на NPU (int8, в работе)
+Пробник `cargo run -p synaptix-npu --example npu_quant_probe` (офлайн-демон на ПК, HTP v69, QAIRT 2.42):
+
+| Граф | Результат |
+|---|---|
+| FullyConnected, x F16, вес F16 2048×2048 | собран, контекст 8,2 МБ |
+| FullyConnected, x F16, вес I8 с поканальными шкалами (`Quant::Axis`) | собран, контекст 4,2 МБ — веса остаются int8 в контексте |
+| FullyConnected, x F16, вес I8 с одной шкалой (`Quant::Tensor`) | собран, 4,1 МБ |
+| I8 → `Dequantize` → F16 → FC | **не собирается**: «Op Dequantize does not support per-channel quant tensor» |
+| I4 (`Quant::Axis`) | профиль `qualcomm-htp-v69` отклоняет (`weights` без I4); на HTP не проверено |
+
+Значит, рецепт для v69 — int8-веса по каналу прямо во входе FullyConnected/MatMul с F16-активациями; память
+контекста и PD уменьшается вдвое против F16. Инфраструктура: `Quant` в `TensorDesc`, протокол демона
+(`SYNNPU_QUANT_AXIS_SCALE_OFFSET`), `Op::Dequantize` в IR (`SYNNPU_DEQUANT_OP` — имя QNN-оп для экспериментов).
+
+Осталось:
+1. В `synaptix-kernels-npu` — `Backend::linear_quant`: из `QuantWeight` (SQ/ggml/NVFP4/MXFP8) построчно деквантовать
+   на CPU (`synaptix_kernels_cpu::quant::dequant::WeightView`), переквантовать симметрично в int8 по строке, положить в
+   `NpuBuffer` один раз на вес (кэш по указателю packed) и записать `NodeOp::LinearQuant` со шкалами в `Quant::Axis`.
+2. Попробовать I4 на v69, добавив `DType::I4` в `weights` профиля; для SQ2/SQ3 — хранить как I4 (у HTP нет 2/3 бит).
+3. Политика на `Device::Npu`: как CPU-профиль, но счёт F16 (`optimal_profile_for_device` сейчас отдаёт CPU-профиль
+   для всех не-CUDA устройств).
+4. Статическое квантование активаций (UFIXED8/16 + калибровка) — отдельный этап, если int8 по весам не хватит.
+
 ## Переменные окружения
 
 | Переменная | Где | Что |

@@ -1,7 +1,8 @@
 use std::path::Path;
 
+use synaptix_core::device::Device;
 use synaptix::facade::llm::{
-    build_precision, optimal_profile, set_dflash_enabled, set_graph_decode_enabled, set_layer_sync_mode,
+    build_precision, optimal_profile_for_device, set_dflash_enabled, set_graph_decode_enabled, set_layer_sync_mode,
     set_mtp_enabled, set_prefill_chunk_size, GenerationOptions, LayerSyncMode, LlmTokenizer,
 };
 use synaptix::facade::sampling::sampling_profile;
@@ -25,6 +26,7 @@ pub struct RuntimeFlags {
 
 pub fn resolve_precision(
     model: &Path,
+    device: Device,
     p: &PrecisionFlags,
     rt: &RuntimeFlags,
 ) -> Result<(PrecisionConfig, &'static str), String> {
@@ -34,7 +36,7 @@ pub fn resolve_precision(
         || p.embed_dtype.is_some()
         || p.kv_dtype.is_some()
         || !matches!(p.quant, None | Some("optimal"));
-    let profile = optimal_profile(model);
+    let profile = optimal_profile_for_device(model, device);
     let (precision, label) = if custom {
         let precision = build_precision(
             p.quant.filter(|q| *q != "optimal"),

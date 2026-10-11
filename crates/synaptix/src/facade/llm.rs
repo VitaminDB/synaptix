@@ -314,6 +314,34 @@ pub fn optimal_profile(path: &Path) -> OptimalProfile {
     optimal_profile_for(path, caps.as_deref())
 }
 
+pub fn optimal_profile_for_device(path: &Path, device: synaptix_core::device::Device) -> OptimalProfile {
+    match device {
+        synaptix_core::device::Device::Cuda(ord) => {
+            let caps = super::device::cuda_caps(ord).ok();
+            optimal_profile_for(path, caps.as_deref())
+        }
+        _ => cpu_profile(path),
+    }
+}
+
+pub fn cpu_profile(path: &Path) -> OptimalProfile {
+    use crate::facade::arch::LlmArch;
+    let arch = crate::facade::arch::detect_llm_arch(path).ok();
+    let mut policy = QuantPolicy::balance();
+    policy.preset_name = "optimal".to_string();
+    policy.weights_storage = DType::Sq { bits: 4 };
+    policy.attn_storage = None;
+    policy.lm_head_storage = DType::Sq { bits: 8 };
+    policy.embed_storage = DType::F16;
+    policy.compute = DType::F32;
+    policy.kv_dtype = KvDtypePolicy::F16;
+    policy.conv_state_dtype = KvDtypePolicy::F32;
+    if matches!(arch, Some(LlmArch::Gemma4) | Some(LlmArch::Gemma3)) {
+        policy.attn_storage = Some(DType::Sq { bits: 8 });
+    }
+    OptimalProfile { policy, graph_decode: false, speculation: false, layer_sync: LayerSyncMode::Auto }
+}
+
 /// Выверенные настройки под архитектуру бандла и возможности карты.
 ///
 /// Без FP4-MMA (всё ниже Blackwell) NVFP4 в политике заменяется на SQ4:
@@ -2628,7 +2656,7 @@ mod stream_delta_tests {
         use synaptix_tokenizer::{HfTokenizer, Tokenizer};
         let text = "Привет, мир! Hello   world — 🎉🥐 日本語のテキスト.\n\n```rust\nfn main() {}\n```\n  отступ, «кавычки» ,запятая";
         for name in ["qwen3.8-27b.syn", "gemma-4-26b-a4b-it.syn", "muse-glimmer-30b.syn", "ltx-gemma-3-12b-qat.syn"] {
-            let bundle = std::path::Path::new("/run/media/storage/syn_models").join(name);
+            let bundle = std::path::Path::new("/run/media/storage/Нейросети/Модели").join(name);
             let Some(bytes) = crate::facade::arch::read_model_file(&bundle, "tokenizer.json") else {
                 eprintln!("{name}: нет бандла — скип");
                 continue;
@@ -2767,6 +2795,7 @@ pub fn load_llm(
 ) -> Result<(Llm, LlmTokenizer), LlmError> {
     ensure_kernels_registered();
 
+    let _cpu_quant = cpu_quant_request(path, device, &precision);
     let arch = detect_llm_arch(path).map_err(LlmError)?;
     let pipeline = match arch {
         LlmArch::Qwen3 => Qwen3Pipeline::load_with_precision(path, device, precision, max_seq)
@@ -2812,8 +2841,38 @@ pub fn load_llm(
     build_facade(pipeline, path, device, max_seq, precision.compute)
 }
 
-/// Удобная загрузка из квант-политики (synthos-путь): строит precision из
-/// [`QuantPolicy`], берёт `max_seq` из config.json.
+fn cpu_quant_request(
+    path: &Path,
+    device: Device,
+    precision: &PrecisionConfig,
+) -> Option<synaptix_io::weights::transcode::RequestGuard> {
+    if !device.is_cpu() || path.is_dir() || !path.extension().is_some_and(|e| e == "syn") || !precision.any_quantized() {
+        return None;
+    }
+    let q = |d: DType| d.is_quantized().then_some(d);
+    let spec = synaptix_io::weights::transcode::TranscodeSpec {
+        attn: q(precision.attn_w),
+        mlp: q(precision.mlp_w),
+        experts: q(precision.mlp_w),
+        lm_head: q(precision.lm_head),
+        embed: match precision.embed {
+            d @ (DType::MXFP8 | DType::Sq { .. }) => Some(d),
+            _ => None,
+        },
+        requant: false,
+        quantize_dense: true,
+    };
+    Some(synaptix_io::weights::transcode::request(
+        path,
+        synaptix_io::weights::transcode::Request {
+            spec,
+            device,
+            placement: synaptix_io::weights::transcode::Placement::Disk,
+            progress: transcode_progress(),
+        },
+    ))
+}
+
 pub fn load_llm_with_policy(
     path: &Path,
     policy: QuantPolicy,

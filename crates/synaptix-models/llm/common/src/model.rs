@@ -62,6 +62,10 @@ pub fn set_decode_prof(on: bool) {
 }
 
 #[inline]
+fn quant_on_load(device: Device) -> bool {
+    matches!(device, Device::Cuda(_) | Device::Cpu)
+}
+
 fn prof_on() -> bool {
     prefill_prof_on() || DECODE_PROF.with(|c| c.get())
 }
@@ -1052,27 +1056,17 @@ impl DecoderModel {
             c
         });
 
-        // Квантование выполняется на GPU (CPU-backend не реализует quantize_nvfp4/
-        // mxfp8), результат кладётся на `b_dev`:
-        //  • резидент (b_dev==device==GPU): квант остаётся на GPU;
-        //  • offload (b_dev==Cpu): F16 материализуется на GPU временно, квантуется,
-        //    компактный квант переносится на CPU; host-stream вернёт его на GPU
-        //    per-block в forward. На GPU при загрузке живёт ~1 вес → влезает при
-        //    скромной VRAM;
-        //  • device==Cpu (чистый CPU-инференс): квант недоступен → плотный путь.
         let qlin = |key: &str, wq: DType| -> Result<QLinear, ModelError> {
-            // Веса, уже упакованные в бандле, берём как есть: ни чтения F16,
-            // ни повторного квантования на загрузке.
             if let Some(prequant) = weights.quant(key, if b_dev == device { device } else { b_dev }) {
                 let qw = prequant?;
                 return Ok(QLinear::Quant(qw));
             }
-            if wq.is_quantized() && matches!(device, Device::Cuda(_)) {
+            if wq.is_quantized() && quant_on_load(device) {
                 let w = weights.tensor(key, device, DType::F16)?;
                 let q = QLinear::build(w, wq, compute)?;
                 return if b_dev == device { Ok(q) } else { q.to_device(b_dev) };
             }
-            let qd = if matches!(device, Device::Cuda(_)) { wq } else { compute };
+            let qd = if quant_on_load(device) { wq } else { compute };
             let wdt = if qd.is_quantized() { DType::F16 } else { compute };
             let w = weights.tensor(key, b_dev, wdt)?;
             QLinear::build(w, qd, compute)
@@ -1183,7 +1177,7 @@ impl DecoderModel {
                 )?,
                 None => return Err(ModelError::Build("tied lm_head без embed".into())),
             };
-            if lm_head_dtype.is_quantized() && matches!(device, Device::Cuda(_)) {
+            if lm_head_dtype.is_quantized() && quant_on_load(device) {
                 let f16 = dense
                     .to_dtype(DType::F16)
                     .map_err(|e| ModelError::Build(e.to_string()))?;
@@ -1199,9 +1193,7 @@ impl DecoderModel {
             // Голова уже упакована в бандле — берём как есть.
             QLinear::Quant(prequant?)
         } else {
-            // lm_head всегда резидентен на `device` (даже при offload); квант
-            // считается на GPU. На CPU-устройстве квант недоступен → плотный.
-            let ld = if matches!(device, Device::Cuda(_)) { lm_head_dtype } else { compute };
+            let ld = if quant_on_load(device) { lm_head_dtype } else { compute };
             let wdt = if ld.is_quantized() { DType::F16 } else { compute };
             let w = weights.tensor("lm_head.weight", device, wdt)?;
             QLinear::build(w, ld, compute)?

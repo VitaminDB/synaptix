@@ -128,6 +128,7 @@ pub enum Op {
     Concat { xs: Vec<TensorId>, axis: u32, out: TensorId },
     Gather { x: TensorId, indices: TensorId, axis: i32, out: TensorId },
     Cast { x: TensorId, out: TensorId },
+    Dequantize { x: TensorId, out: TensorId },
     LayerNorm { x: TensorId, gamma: TensorId, beta: Option<TensorId>, eps: f32, axis: u32, out: TensorId },
     RmsNorm { x: TensorId, gamma: TensorId, eps: f32, axis: u32, out: TensorId },
     Conv2d {
@@ -160,6 +161,7 @@ impl Op {
             | Op::Concat { out, .. }
             | Op::Gather { out, .. }
             | Op::Cast { out, .. }
+            | Op::Dequantize { out, .. }
             | Op::LayerNorm { out, .. }
             | Op::RmsNorm { out, .. }
             | Op::Conv2d { out, .. } => *out,
@@ -179,7 +181,8 @@ impl Op {
             | Op::Transpose { x, .. }
             | Op::Slice { x, .. }
             | Op::Tile { x, .. }
-            | Op::Cast { x, .. } => vec![*x],
+            | Op::Cast { x, .. }
+            | Op::Dequantize { x, .. } => vec![*x],
             Op::Concat { xs, .. } => xs.clone(),
             Op::Gather { x, indices, .. } => vec![*x, *indices],
             Op::LayerNorm { x, gamma, beta, .. } => [Some(*x), Some(*gamma), *beta].into_iter().flatten().collect(),

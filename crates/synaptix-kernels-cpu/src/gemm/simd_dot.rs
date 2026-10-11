@@ -1,9 +1,3 @@
-//! SIMD dot-product для linear-пути: `Σ_k x[k]·w[k]` (оба операнда непрерывны).
-//! AVX2+FMA с 4 независимыми аккумуляторами (ILP) + хвост скаляром. F16 через F16C
-//! (`vcvtph2ps`), BF16 через widening-shift (bf16→f32 = `<<16`). Горизонтальная
-//! сумма в конце меняет порядок суммирования относительно скалярного цикла — для
-//! inference допустимо (bit-exact не требуется на linear-пути, нет ref-теста).
-
 #[inline]
 pub fn scalar_dot_f32(x: &[f32], w: &[f32]) -> f32 {
     let mut acc = 0.0f32;
@@ -140,14 +134,113 @@ mod x86 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_f32(x: &[f32], w: &[f32]) -> f32 {
+        let k = x.len();
+        let xp = x.as_ptr();
+        let wp = w.as_ptr();
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 16 <= k {
+            a0 = vfmaq_f32(a0, vld1q_f32(xp.add(i)), vld1q_f32(wp.add(i)));
+            a1 = vfmaq_f32(a1, vld1q_f32(xp.add(i + 4)), vld1q_f32(wp.add(i + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xp.add(i + 8)), vld1q_f32(wp.add(i + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(xp.add(i + 12)), vld1q_f32(wp.add(i + 12)));
+            i += 16;
+        }
+        while i + 4 <= k {
+            a0 = vfmaq_f32(a0, vld1q_f32(xp.add(i)), vld1q_f32(wp.add(i)));
+            i += 4;
+        }
+        let mut s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while i < k {
+            s += *xp.add(i) * *wp.add(i);
+            i += 1;
+        }
+        s
+    }
+
+    #[inline]
+    unsafe fn ld_f16(p: *const u16) -> float32x4_t {
+        vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)))
+    }
+
+    #[inline]
+    unsafe fn ld_bf16(p: *const u16) -> float32x4_t {
+        vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vld1_u16(p)), 16))
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_f16(x: &[half::f16], w: &[half::f16]) -> f32 {
+        let k = x.len();
+        let xp = x.as_ptr() as *const u16;
+        let wp = w.as_ptr() as *const u16;
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= k {
+            a0 = vfmaq_f32(a0, ld_f16(xp.add(i)), ld_f16(wp.add(i)));
+            a1 = vfmaq_f32(a1, ld_f16(xp.add(i + 4)), ld_f16(wp.add(i + 4)));
+            i += 8;
+        }
+        while i + 4 <= k {
+            a0 = vfmaq_f32(a0, ld_f16(xp.add(i)), ld_f16(wp.add(i)));
+            i += 4;
+        }
+        let mut s = vaddvq_f32(vaddq_f32(a0, a1));
+        while i < k {
+            s += x[i].to_f32() * w[i].to_f32();
+            i += 1;
+        }
+        s
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_bf16(x: &[half::bf16], w: &[half::bf16]) -> f32 {
+        let k = x.len();
+        let xp = x.as_ptr() as *const u16;
+        let wp = w.as_ptr() as *const u16;
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= k {
+            a0 = vfmaq_f32(a0, ld_bf16(xp.add(i)), ld_bf16(wp.add(i)));
+            a1 = vfmaq_f32(a1, ld_bf16(xp.add(i + 4)), ld_bf16(wp.add(i + 4)));
+            i += 8;
+        }
+        while i + 4 <= k {
+            a0 = vfmaq_f32(a0, ld_bf16(xp.add(i)), ld_bf16(wp.add(i)));
+            i += 4;
+        }
+        let mut s = vaddvq_f32(vaddq_f32(a0, a1));
+        while i < k {
+            s += x[i].to_f32() * w[i].to_f32();
+            i += 1;
+        }
+        s
+    }
+}
+
 #[inline]
 pub fn dot_f32(x: &[f32], w: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        if crate::dispatch::cpu_features().avx2 && crate::dispatch::cpu_features().fma {
             return unsafe { x86::dot_f32(x, w) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { arm::dot_f32(x, w) };
+    }
+    #[allow(unreachable_code)]
     scalar_dot_f32(x, w)
 }
 
@@ -155,10 +248,15 @@ pub fn dot_f32(x: &[f32], w: &[f32]) -> f32 {
 pub fn dot_bf16(x: &[half::bf16], w: &[half::bf16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        if crate::dispatch::cpu_features().avx2 && crate::dispatch::cpu_features().fma {
             return unsafe { x86::dot_bf16(x, w) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { arm::dot_bf16(x, w) };
+    }
+    #[allow(unreachable_code)]
     scalar_dot_bf16(x, w)
 }
 
@@ -166,13 +264,16 @@ pub fn dot_bf16(x: &[half::bf16], w: &[half::bf16]) -> f32 {
 pub fn dot_f16(x: &[half::f16], w: &[half::f16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2")
-            && std::is_x86_feature_detected!("fma")
-            && std::is_x86_feature_detected!("f16c")
-        {
+        let f = crate::dispatch::cpu_features();
+        if f.avx2 && f.fma && f.f16c {
             return unsafe { x86::dot_f16(x, w) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { arm::dot_f16(x, w) };
+    }
+    #[allow(unreachable_code)]
     scalar_dot_f16(x, w)
 }
 

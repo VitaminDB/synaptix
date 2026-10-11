@@ -1,4 +1,8 @@
+pub mod dequant;
+pub mod encode;
 pub mod fp8_blocks;
+pub mod gemv;
+pub mod ggml_simd;
 pub mod fp8_e4m3;
 pub mod mxfp8;
 

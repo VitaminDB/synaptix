@@ -12,17 +12,22 @@ use rayon::prelude::*;
 const MB: usize = 64;
 const NB: usize = 64;
 
-/// Указатель, который можно отдать в rayon-задачи: тайлы не пересекаются.
 #[derive(Clone, Copy)]
-struct SendPtr(*mut f32);
+pub struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 impl SendPtr {
-    /// Метод (а не поле) — замыкание захватывает обёртку целиком, а не `*mut`.
     #[inline]
-    fn at(self, off: usize) -> SendPtr {
-        // SAFETY: вызывающий гарантирует, что смещение внутри буфера.
+    pub fn new(p: *mut f32) -> SendPtr {
+        SendPtr(p)
+    }
+    #[inline]
+    pub fn ptr(self) -> *mut f32 {
+        self.0
+    }
+    #[inline]
+    pub fn at(self, off: usize) -> SendPtr {
         SendPtr(unsafe { self.0.add(off) })
     }
 }
@@ -102,27 +107,27 @@ pub fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) 
     });
 }
 
-/// `out = x·wᵀ`: x `[m, k]`, w `[n, k]` (вес Linear), out `[m, n]`.
 pub fn linear(m: usize, n: usize, k: usize, x: &[f32], w: &[f32], out: &mut [f32]) {
     let op = SendPtr(out.as_mut_ptr());
-    // Колоночные полосы снаружи: упакованная (транспонированная) полоса весов
-    // общая для всех строк входа.
     (0..n.div_ceil(NB)).into_par_iter().for_each(|jb| {
         let c0 = jb * NB;
         let cols = NB.min(n - c0);
-        let colsp = round_up(cols, NR);
-        let mut bp = vec![0f32; k * colsp];
-        for (jj, row) in w[c0 * k..(c0 + cols) * k].chunks_exact(k).enumerate() {
-            for (p, &v) in row.iter().enumerate() {
-                bp[p * colsp + jj] = v;
-            }
+        linear_panel(m, cols, k, x, &w[c0 * k..(c0 + cols) * k], op.at(c0), n);
+    });
+}
+
+pub fn linear_panel(m: usize, cols: usize, k: usize, x: &[f32], w_rows: &[f32], out: SendPtr, ldo: usize) {
+    let colsp = round_up(cols, NR);
+    let mut bp = vec![0f32; k * colsp];
+    for (jj, row) in w_rows[..cols * k].chunks_exact(k).enumerate() {
+        for (p, &v) in row.iter().enumerate() {
+            bp[p * colsp + jj] = v;
         }
-        (0..m.div_ceil(MB)).into_par_iter().for_each(|ib| {
-            let r0 = ib * MB;
-            let rows = MB.min(m - r0);
-            let o = op.at(r0 * n + c0);
-            tile(rows, cols, k, &x[r0 * k..], k, &bp, colsp, o, n);
-        });
+    }
+    (0..m.div_ceil(MB)).into_par_iter().for_each(|ib| {
+        let r0 = ib * MB;
+        let rows = MB.min(m - r0);
+        tile(rows, cols, k, &x[r0 * k..], k, &bp, colsp, out.at(r0 * ldo), ldo);
     });
 }
 

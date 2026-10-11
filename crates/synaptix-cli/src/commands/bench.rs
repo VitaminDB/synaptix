@@ -39,6 +39,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let arch = detect_llm_arch(&args.model)?;
     let (precision, profile) = resolve_precision(
         &args.model,
+        device,
         &PrecisionFlags {
             quant: args.quant.as_deref(),
             compute_dtype: args.compute_dtype.as_deref(),

@@ -359,6 +359,7 @@ impl<'a> Wire<'a> {
             }
             Op::Concat { xs, axis, out } => self.node("Concat", xs, *out, &[("axis", Param::U32(*axis))]),
             &Op::Cast { x, out } => self.node("Cast", &[x], out, &[]),
+            &Op::Dequantize { x, out } => self.node(std::env::var("SYNNPU_DEQUANT_OP").as_deref().unwrap_or("Dequantize"), &[x], out, &[]),
             &Op::Gather { x, indices, axis, out } => {
                 self.node("Gather", &[x, indices], out, &[("axis", Param::I32(axis))])
             }
