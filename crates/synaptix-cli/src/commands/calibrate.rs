@@ -76,6 +76,7 @@ pub fn warmup(model: &Path, device: &str) -> Result<(), Box<dyn std::error::Erro
             .collect();
         let t = std::time::Instant::now();
         m.log_probs(&pcm, 16000)?;
+        m.log_probs_hidden(&pcm, 16000)?;
         println!("  {:.0} с записи: {:.1} с", n as f32 / 16000.0, t.elapsed().as_secs_f32());
     }
     Ok(())
