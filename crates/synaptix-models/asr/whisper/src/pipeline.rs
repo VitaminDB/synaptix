@@ -196,6 +196,9 @@ impl WhisperPipeline {
         if matches!(self.device, Device::Cuda(_)) {
             return self.decode_segment_graph(enc_out, lang_token, task);
         }
+        if matches!(self.device, Device::Npu(_)) {
+            return self.decode_segment_dev(enc_out, lang_token, task);
+        }
         let mut cache = self.model.decoder.init_cache(&enc_out)?;
 
         let task_tok = match task {
@@ -222,6 +225,40 @@ impl WhisperPipeline {
             }
             out.push(next);
             logits = Some(self.model.decoder.decode_step(next, pos, &mut cache)?);
+            pos += 1;
+        }
+        Ok(out)
+    }
+
+    /// Greedy-декод сегмента device-шагами с фиксированными формами (preallocated self-KV,
+    /// позиция и длина — тензоры): каждый шаг — один и тот же граф (NPU).
+    fn decode_segment_dev(&self, enc_out: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
+        let max_target = self.config.max_target_positions;
+        let mut cache = self.model.decoder.make_dev_cache(enc_out, max_target, self.device, self.dtype)?;
+        let mut state = WhisperDecodeState::new(self.device, self.dtype, self.config.vocab_size)?;
+        let task_tok = match task {
+            Task::Transcribe => self.special.transcribe,
+            Task::Translate => self.special.translate,
+        };
+        let prefix = [self.special.sot, lang_token, task_tok, self.special.no_timestamps];
+        let mut logits = Vec::new();
+        for (p, &t) in prefix.iter().enumerate() {
+            state.update(t, p as u32)?;
+            self.model.decoder.forward_decode_dev(&mut state, &mut cache)?;
+            logits = logits_to_f32(&state.logits)?;
+        }
+        let mut out: Vec<u32> = Vec::new();
+        let mut pos = prefix.len();
+        loop {
+            self.suppress(&mut logits, out.is_empty());
+            let next = argmax(&logits) as u32;
+            if next == self.special.eot || pos >= max_target {
+                break;
+            }
+            out.push(next);
+            state.update(next, pos as u32)?;
+            self.model.decoder.forward_decode_dev(&mut state, &mut cache)?;
+            logits = logits_to_f32(&state.logits)?;
             pos += 1;
         }
         Ok(out)

@@ -279,6 +279,56 @@ impl Backend for NpuBackend {
         self.rec(NodeOp::Attention { scale, causal }, vec![inp(q.0, q.1)?, inp(k.0, k.1)?, inp(v.0, v.1)?], out)
     }
 
+    fn embed_gather(&self, table: (&Storage, &Layout), ids: (&Storage, &Layout), out: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
+        if !float(table.1) || table.1.rank() != 2 || !matches!(ids.1.dtype(), DType::U32 | DType::I32) {
+            return Err(SynaptixError::Unsupported("embed_gather на NPU"));
+        }
+        self.rec(NodeOp::EmbedGather, vec![inp(table.0, table.1)?, inp(ids.0, ids.1)?], out)
+    }
+
+    fn kv_append_dev(&self, dst: (&mut Storage, &Layout), src: (&Storage, &Layout), seq_pos: (&Storage, &Layout), _stream: &Stream) -> Result<()> {
+        let dv = value::value_of(dst.0)?;
+        let ok = float(dst.1)
+            && src.1.dtype() == dst.1.dtype()
+            && dst.1.rank() == 4
+            && src.1.rank() == 4
+            && src.1.dims()[2] == 1
+            && src.1.dims()[1] == dst.1.dims()[1]
+            && full(dst.1, &dv);
+        if !ok {
+            return Err(SynaptixError::Unsupported("kv_append_dev на NPU"));
+        }
+        let old = record::snapshot(&dv);
+        let ins = vec![Input { v: old, lo: dst.1.clone() }, inp(src.0, src.1)?, inp(seq_pos.0, seq_pos.1)?];
+        record::record(NodeOp::KvAppend, ins, &dv, dst.1.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_dev(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        t_cache: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        scale: f32,
+        _causal: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let ok = float(q.1)
+            && q.1.rank() == 4
+            && k.1.rank() == 4
+            && q.1.dims()[2] == 1
+            && q.1.dims()[1] == k.1.dims()[1]
+            && k.1.dtype() == q.1.dtype()
+            && v.1.dtype() == q.1.dtype();
+        if !ok {
+            return Err(SynaptixError::Unsupported("flash_attention_dev на NPU"));
+        }
+        let ins = vec![inp(q.0, q.1)?, inp(k.0, k.1)?, inp(v.0, v.1)?, inp(t_cache.0, t_cache.1)?];
+        self.rec(NodeOp::AttentionDev { scale }, ins, out)
+    }
+
     fn conv2d(
         &self,
         input: (&Storage, &Layout),

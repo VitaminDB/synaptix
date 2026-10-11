@@ -32,7 +32,7 @@ impl NpuModel {
 
 const GIB: u64 = 1 << 30;
 
-const QC_ACT: &[DType] = &[DType::F16, DType::F32, DType::U8, DType::U16, DType::I32];
+const QC_ACT: &[DType] = &[DType::F16, DType::F32, DType::U8, DType::U16, DType::I32, DType::U32];
 const QC_W_V68: &[DType] = &[DType::F16, DType::F32, DType::U8, DType::I8];
 const QC_W_V73: &[DType] = &[DType::F16, DType::F32, DType::U8, DType::I8, DType::I4];
 

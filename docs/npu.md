@@ -59,6 +59,18 @@ let host = y.to_device(Device::Cpu)?;                   // здесь граф �
 - Раздельные устройства в модели: `WhisperPipeline::from_syn_split(path, Cpu, F32, Npu(0), F16)`.
 - Режимы: `--device npu` — всё возможное на NPU, остальное на CPU; раздельный — по компонентам; `cpu` — как раньше.
 
+### Пошаговый декодер на NPU
+Граф должен быть одинаковым на каждом шаге, иначе каждый токен — новая сборка. Рецепт — device-путь с
+фиксированными формами (тот же, что для CUDA-graph): KV-буфер выделен на `max_target`, позиция и длина — тензоры
+(`write_host_u32` на NPU загружает новое значение — вход графа).
+- `kv_append_dev` → `buf + onehot(pos)·(k − buf)`, onehot = clamp(1 − |iota − pos|, 0, 1), `iota` — статика 0..cap−1;
+  весь буфер — выход шага и вход следующего (без копий через CPU).
+- `flash_attention_dev` → маска `(clamp(t − iota, 0, 1) − 1)·60000` к scores, Softmax, MatMul.
+- Изменение тензора на месте записывается со «снимком» старой версии (`record::snapshot`): узел читает снимок,
+  тензор получает новую версию.
+- `embed_gather` → Gather (индексы U32 → I32 в графе).
+- Whisper: `decode_segment_dev` — на `Device::Npu` декод идёт так; `--device npu` — весь Whisper на NPU.
+
 ## Предкомпиляция графов на ПК
 Сборка графов большой модели на телефоне долгая (turbo — ~2 мин один раз). На ПК: x86 QAIRT, офлайн-демон
 (`build.sh --host`, `SYNNPU_OFFLINE=1 SYNNPU_SOC=42 SYNNPU_ARCH=69`) готовит context binary тех же ключей;
@@ -140,3 +152,5 @@ synmobile/hw/npu/npu-precompile.sh transcribe whisper.syn речь.wav --device 
 | Whisper-tiny энкодер, 30 с | 67 мс | cos 0,99997 |
 | Whisper large-v3-turbo энкодер, 30 с | 2,0 с | CPU ноутбука 67 с |
 | turbo, распознавание 7,5 с речи (энкодер NPU, декодер CPU) | ≈ 10 с вместе с загрузкой | текст ru/en слово в слово |
+| Whisper-tiny целиком на NPU, 7,3 с речи | 0,51 с (RTF 0,07), шаг декодера 4,6 мс | CPU — 4,5 с, текст тот же |
+| turbo целиком на NPU, 7,3 с речи | 8,1 с (из них ≈5 с — открытие 35 контекстов в новом процессе), шаг декодера ≈17 мс | текст слово в слово |

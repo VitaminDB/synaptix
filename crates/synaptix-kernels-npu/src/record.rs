@@ -29,6 +29,9 @@ pub enum NodeOp {
     RmsNorm { eps: f32, qwen: bool },
     Conv2d { stride: (usize, usize), padding: (usize, usize), bias: bool },
     Attention { scale: f32, causal: bool },
+    EmbedGather,
+    KvAppend,
+    AttentionDev { scale: f32 },
 }
 
 struct Node {
@@ -76,6 +79,20 @@ pub fn npu_dtype(d: CoreDType) -> Option<DType> {
         CoreDType::U8 => DType::U8,
         _ => return None,
     })
+}
+
+pub fn snapshot(v: &ValueRef) -> ValueRef {
+    let st = std::mem::replace(&mut *v.state.lock(), State::Unset);
+    let pending = if let State::Pending(s) = st { Some(s) } else { None };
+    let snap = Value::new(v.bytes, st);
+    if let Some(s) = pending {
+        for n in REC.lock().iter_mut() {
+            if n.serial == s {
+                n.out = Arc::downgrade(&snap);
+            }
+        }
+    }
+    snap
 }
 
 pub fn record(op: NodeOp, ins: Vec<Input>, dst: &ValueRef, out_lo: Layout) -> Result<()> {
@@ -228,6 +245,29 @@ impl Builder {
             }
             _ => Err(SynaptixError::Unsupported("унарная операция на NPU")),
         }
+    }
+
+    fn iota(&mut self, n: usize, dt: DType) -> Result<TensorId> {
+        let bytes: Vec<u8> = if dt == DType::F16 {
+            (0..n).flat_map(|i| half::f16::from_f32(i as f32).to_le_bytes()).collect()
+        } else {
+            (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect()
+        };
+        self.g.weight(dt, &[n as u32], &bytes).map_err(err)
+    }
+
+    fn cast(&mut self, x: TensorId, dt: DType) -> TensorId {
+        if self.g.tensor(x).dtype == dt {
+            return x;
+        }
+        let s = self.g.tensor(x).shape.clone();
+        self.g.node(dt, &s, |out| Op::Cast { x, out })
+    }
+
+    fn clamp01(&mut self, x: TensorId) -> TensorId {
+        let d = self.g.tensor(x);
+        let (dt, s) = (d.dtype, d.shape.clone());
+        self.g.node(dt, &s, |out| Op::Clamp { x, min: 0.0, max: 1.0, out })
     }
 
     fn reshape_to(&mut self, x: TensorId, lo: &Layout) -> TensorId {
@@ -408,6 +448,56 @@ impl Builder {
                     os[1] = nh as u32;
                     self.g.node(dt, &os, |out| Op::Concat { xs: parts, axis: 1, out })
                 }
+            }
+            NodeOp::EmbedGather => {
+                let table = self.input(&n.ins[0], true)?;
+                let ids = self.input(&n.ins[1], true)?;
+                let ids = self.cast(ids, DType::I32);
+                let ids = self.g.reshape(ids, &[self.g.tensor(ids).elems() as u32]).map_err(err)?;
+                let ts = self.g.tensor(table).shape.clone();
+                let rows = self.g.tensor(ids).shape[0];
+                self.g.node(odt, &[rows, ts[ts.len() - 1]], |out| Op::Gather { x: table, indices: ids, axis: 0, out })
+            }
+            NodeOp::KvAppend => {
+                let buf = self.input(&n.ins[0], true)?;
+                let k = self.input(&n.ins[1], true)?;
+                let pos = self.input(&n.ins[2], true)?;
+                let dt = self.g.tensor(buf).dtype;
+                let cap = self.g.tensor(buf).shape[2] as usize;
+                let iota = self.iota(cap, dt)?;
+                let p = self.cast(pos, dt);
+                let d = self.bin(BinaryKind::Sub, iota, p)?;
+                let a = self.g.unary(UnaryKind::Abs, d);
+                let one = self.scalar(1.0, a)?;
+                let oh = self.bin(BinaryKind::Sub, one, a)?;
+                let oh = self.clamp01(oh);
+                let oh = self.g.reshape(oh, &[1, 1, cap as u32, 1]).map_err(err)?;
+                let diff = self.bin(BinaryKind::Sub, k, buf)?;
+                let upd = self.bin(BinaryKind::Mul, diff, oh)?;
+                self.bin(BinaryKind::Add, buf, upd)?
+            }
+            NodeOp::AttentionDev { scale } => {
+                let q = self.input(&n.ins[0], true)?;
+                let k = self.input(&n.ins[1], true)?;
+                let v = self.input(&n.ins[2], true)?;
+                let t = self.input(&n.ins[3], true)?;
+                let dt = self.g.tensor(q).dtype;
+                let cap = self.g.tensor(k).shape[2] as usize;
+                let sc = self.scalar(*scale, q)?;
+                let q = self.bin(BinaryKind::Mul, q, sc)?;
+                let s = self.g.matmul(q, k, false, true).map_err(err)?;
+                let iota = self.iota(cap, dt)?;
+                let tf = self.cast(t, dt);
+                let m = self.bin(BinaryKind::Sub, tf, iota)?;
+                let m = self.clamp01(m);
+                let one = self.scalar(1.0, m)?;
+                let m = self.bin(BinaryKind::Sub, m, one)?;
+                let big = self.scalar(60000.0, m)?;
+                let bias = self.bin(BinaryKind::Mul, m, big)?;
+                let bias = self.g.reshape(bias, &[1, 1, 1, cap as u32]).map_err(err)?;
+                let s = self.bin(BinaryKind::Add, s, bias)?;
+                let p = self.g.softmax(s);
+                self.g.matmul(p, v, false, false).map_err(err)?
             }
             NodeOp::Conv2d { stride, padding, bias } => {
                 let x = self.input(&n.ins[0], true)?;
