@@ -168,10 +168,12 @@ impl Attention {
                 let xh = self.heads(x)?; // [B,H,T,dh]
                 let p = g.linear.forward(&xh)?; // [B,H,T,8]
                 let p = p.reshape(vec![b, self.n_heads, s, 2, 4])?.sum_keepdim(4)?.squeeze(4)?.sigmoid()?; // [B,H,T,2]
+                // Гейт — в F32, как `constant` и bias (модель может быть в F16).
+                let p = p.to_dtype(DType::F32)?;
                 let ga = p.narrow(3, 0, 1)?;
                 let gb = p.narrow(3, 1, 1)?;
                 let gate = ga.mul(&gb.broadcast_mul(&g.constant)?.affine(1.0, -1.0)?)?.affine(1.0, 2.0)?; // [B,H,T,1]
-                Some(gate.to_dtype(DType::F32)?.broadcast_mul(bias)?)
+                Some(gate.broadcast_mul(bias)?)
             }
             _ => None,
         };
