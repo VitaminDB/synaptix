@@ -80,10 +80,26 @@ impl std::fmt::Debug for CudaBuf {
 
 
 
+pub struct NpuBuf {
+    pub ordinal: usize,
+    pub byte_len: usize,
+    pub inner: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for NpuBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NpuBuf")
+            .field("byte_len", &self.byte_len)
+            .field("ordinal", &self.ordinal)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub enum Storage {
     Cpu(CpuBuf),
     Cuda(CudaBuf),
+    Npu(NpuBuf),
 }
 
 impl Storage {
@@ -91,6 +107,7 @@ impl Storage {
         match self {
             Storage::Cpu(_) => Device::Cpu,
             Storage::Cuda(b) => Device::Cuda(b.ordinal),
+            Storage::Npu(b) => Device::Npu(b.ordinal),
         }
     }
 
@@ -98,6 +115,7 @@ impl Storage {
         match self {
             Storage::Cpu(b) => b.byte_len(),
             Storage::Cuda(b) => b.byte_len(),
+            Storage::Npu(b) => b.byte_len,
         }
     }
 
@@ -119,7 +137,21 @@ impl Storage {
     pub fn device_address(&self) -> Option<u64> {
         match self {
             Storage::Cuda(b) => Some(b.device_address()),
-            Storage::Cpu(_) => None,
+            Storage::Cpu(_) | Storage::Npu(_) => None,
+        }
+    }
+
+    pub fn as_npu(&self) -> Option<&NpuBuf> {
+        match self {
+            Storage::Npu(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn as_npu_mut(&mut self) -> Option<&mut NpuBuf> {
+        match self {
+            Storage::Npu(b) => Some(b),
+            _ => None,
         }
     }
 

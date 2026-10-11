@@ -1,0 +1,19 @@
+[package]
+name = "synaptix-kernels-npu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: бэкенд Device::Npu — ленивая запись графа и исполнение на NPU через synaptix-npu, недостающее — на CPU."
+
+[dependencies]
+synaptix-core        = { workspace = true }
+synaptix-npu         = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }
+parking_lot          = { workspace = true }
+once_cell            = { workspace = true }
+half                 = { workspace = true }
+bytemuck             = { workspace = true }
+
+[dev-dependencies]
+synaptix-ops = { workspace = true }

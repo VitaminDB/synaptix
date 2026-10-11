@@ -1,6 +1,6 @@
 use synaptix_core::device::Device;
 
-/// Разбирает `--device` (`cuda` | `cuda:N` | `gpu` | `auto` | `cpu`) и
+/// Разбирает `--device` (`cuda` | `cuda:N` | `gpu` | `npu` | `auto` | `cpu`) и
 /// регистрирует нужные backend'ы. CPU backend регистрируется всегда (нужен как
 /// fallback и для host-операций). Возвращает выбранное устройство.
 pub fn resolve(pref: &str) -> Device {
@@ -9,6 +9,18 @@ pub fn resolve(pref: &str) -> Device {
     let p = pref.trim().to_ascii_lowercase();
     if p == "cpu" {
         return Device::Cpu;
+    }
+    if p == "npu" || p.starts_with("npu:") {
+        match synaptix_kernels_npu::register() {
+            Ok(info) => {
+                eprintln!("synaptix: NPU {} ({}), недостающие операции — на CPU", info.model.name, info.model.id);
+                return Device::Npu(0);
+            }
+            Err(e) => {
+                eprintln!("synaptix: NPU недоступен ({e}); fallback на CPU");
+                return Device::Cpu;
+            }
+        }
     }
     let want_cuda = p.is_empty() || p == "auto" || p == "cuda" || p == "gpu" || p.starts_with("cuda:");
 
@@ -56,6 +68,10 @@ pub fn resolve_attn(cli: Option<&str>) {
 /// `synaptix devices`: по строке на карту — что умеет и под что компилируются
 /// ядра. С `SYN_FORCE_ARCH` показывает принудительную цель.
 pub fn list() {
+    for npu in synaptix_npu::probe() {
+        let i = npu.info();
+        println!("npu:0   {} ({}), SoC {}, VTCM {} МБ, рантайм {}", i.model.name, i.model.id, i.soc, i.vtcm_mb, i.runtime);
+    }
     let n = synaptix::facade::device::cuda_device_count();
     if n == 0 {
         println!("CUDA-карт не найдено");

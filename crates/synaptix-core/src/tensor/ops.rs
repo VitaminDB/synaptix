@@ -3440,6 +3440,7 @@ impl Tensor {
                 }
                 Ok(())
             }
+            Storage::Npu(_) => Err(SynaptixError::Unsupported("write_host_u32 на NPU")),
             Storage::Cuda(b) => {
                 let stream = b.stream().clone();
                 let dst = b.slice_mut();

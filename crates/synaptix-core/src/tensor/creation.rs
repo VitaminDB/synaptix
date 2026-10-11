@@ -20,7 +20,7 @@ impl Tensor {
                     cuda_alloc_zeros(device, n_bytes)?
                 }
             }
-            _ => return Err(SynaptixError::Unsupported("device for Tensor::zeros")),
+            _ => crate::backend::registry::backend_for(device)?.alloc_zeros(n_bytes, device)?,
         };
         Ok(Tensor::from_parts(Arc::new(storage), Layout::contiguous(shape, dtype)))
     }
@@ -45,7 +45,7 @@ impl Tensor {
                     cuda_alloc_from_bytes(device, &bytes)?
                 }
             }
-            _ => return Err(SynaptixError::Unsupported("device for Tensor::from_vec")),
+            _ => crate::backend::registry::backend_for(device)?.upload(&bytes, device)?,
         };
         let layout = Layout::contiguous(shape, T::DTYPE);
         Ok(Tensor::from_parts(Arc::new(storage), layout))
@@ -83,7 +83,7 @@ impl Tensor {
                     cuda_alloc_from_bytes(device, &bytes)?
                 }
             }
-            _ => return Err(SynaptixError::Unsupported("device for Tensor::from_raw_bytes")),
+            _ => crate::backend::registry::backend_for(device)?.upload(&bytes, device)?,
         };
         Ok(Tensor::from_parts(Arc::new(storage), Layout::contiguous(shape, dtype)))
     }
@@ -116,7 +116,7 @@ impl Tensor {
                     cuda_alloc_from_bytes(device, bytes)?
                 }
             }
-            _ => return Err(SynaptixError::Unsupported("device for Tensor::from_raw_slice")),
+            _ => crate::backend::registry::backend_for(device)?.upload(bytes, device)?,
         };
         Ok(Tensor::from_parts(Arc::new(storage), Layout::contiguous(shape, dtype)))
     }
@@ -143,7 +143,7 @@ impl Tensor {
                     cuda_alloc_from_bytes(device, &bytes)?
                 }
             }
-            _ => return Err(SynaptixError::Unsupported("device for Tensor::ones")),
+            _ => crate::backend::registry::backend_for(device)?.upload(&bytes, device)?,
         };
         Ok(Tensor::from_parts(Arc::new(storage), Layout::contiguous(shape, dtype)))
     }

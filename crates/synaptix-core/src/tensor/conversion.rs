@@ -52,6 +52,24 @@ impl Tensor {
                     Ok(Tensor::from_parts(Arc::new(storage), layout))
                 }
             }
+            (Storage::Npu(_), _) => {
+                let backend = crate::backend::registry::backend_for(self.device())?;
+                let bytes = backend.download(&self.storage)?;
+                let host = Tensor::from_parts(Arc::new(Storage::Cpu(CpuBuf::from_vec(bytes))), self.layout.clone());
+                if device == Device::Cpu {
+                    return Ok(host);
+                }
+                host.to_device(device)
+            }
+            (_, Device::Npu(_)) => {
+                let host = self.to_device(Device::Cpu)?;
+                let Storage::Cpu(b) = &*host.storage else { unreachable!() };
+                let off = host.layout.offset() * elem_bytes;
+                let storage = crate::backend::registry::backend_for(device)?
+                    .upload(&b.as_bytes()[off..off + n_bytes], device)?;
+                let layout = Layout::contiguous(self.shape().clone(), self.dtype());
+                Ok(Tensor::from_parts(Arc::new(storage), layout))
+            }
             _ => Err(SynaptixError::Unsupported("to_device: device combo")),
         }
     }
@@ -82,6 +100,11 @@ pub(crate) fn storage_to_device(s: &Storage, device: Device) -> Result<Storage> 
                 Ok(Storage::Cpu(CpuBuf::from_vec(bytes)))
             }
         }
+        (Storage::Npu(_), Device::Cpu) => {
+            let bytes = crate::backend::registry::backend_for(s.device())?.download(s)?;
+            Ok(Storage::Cpu(CpuBuf::from_vec(bytes)))
+        }
+        (Storage::Cpu(b), Device::Npu(_)) => crate::backend::registry::backend_for(device)?.upload(b.as_bytes(), device),
         _ => Err(SynaptixError::Unsupported("storage_to_device: device combo")),
     }
 }
@@ -167,6 +190,10 @@ impl Tensor {
             Storage::Cpu(b) => {
                 let bytes = &b.as_bytes()[offset_bytes..offset_bytes + numel * elem_bytes];
                 Ok(bytemuck::cast_slice(bytes).to_vec())
+            }
+            Storage::Npu(_) => {
+                let bytes = crate::backend::registry::backend_for(self.device())?.download(&self.storage)?;
+                Ok(bytemuck::cast_slice(&bytes[offset_bytes..offset_bytes + numel * elem_bytes]).to_vec())
             }
             Storage::Cuda(b) => {
                 {

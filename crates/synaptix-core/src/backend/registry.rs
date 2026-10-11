@@ -4,7 +4,7 @@ use crate::error::{Result, SynaptixError};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
-const NUM_KINDS: usize = 4;
+const NUM_KINDS: usize = 5;
 
 static REGISTRY: Lazy<RwLock<[Option<&'static dyn Backend>; NUM_KINDS]>> =
     Lazy::new(|| RwLock::new([None; NUM_KINDS]));
@@ -15,6 +15,7 @@ fn kind_index(k: DeviceKind) -> usize {
         DeviceKind::Cuda => 1,
         DeviceKind::Metal => 2,
         DeviceKind::Wgpu => 3,
+        DeviceKind::Npu => 4,
     }
 }
 

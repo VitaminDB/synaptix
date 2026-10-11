@@ -288,11 +288,11 @@ fn index_shard(
 
 impl WeightLoader for SafetensorsLoader {
     fn load(&self, name: &str) -> Result<Tensor> {
-        self.load_internal(name, self.default_device, None)
+        synaptix_core::backend::with_param_upload(|| self.load_internal(name, self.default_device, None))
     }
 
     fn load_to(&self, name: &str, device: Device, dtype: DType) -> Result<Tensor> {
-        self.load_internal(name, device, Some(dtype))
+        synaptix_core::backend::with_param_upload(|| self.load_internal(name, device, Some(dtype)))
     }
 
     fn names(&self) -> Vec<&str> {

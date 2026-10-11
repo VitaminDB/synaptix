@@ -132,10 +132,25 @@ fn convert_safetensors_to_syn(args: &ConvertArgs) -> Result<(), Box<dyn std::err
     println!("  arch:       {}", arch);
     println!("  component:  {}", component);
 
-    let builder = BundleBuilder::new(id, "0.1.0")
+    let mut builder = BundleBuilder::new(id, "0.1.0")
         .arch(arch)
         .component(component.clone(), "")
         .add_safetensors_component(&component, vec![args.input.clone()], None);
+    let dir = args.input.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    for name in [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+    ] {
+        let p = if name == "tokenizer.json" { args.tokenizer.clone().unwrap_or_else(|| dir.join(name)) } else { dir.join(name) };
+        if p.is_file() {
+            println!("  file:       {name}");
+            builder = builder.add_file_path(name, &p, synaptix_bundle::FileTag::Inference)?;
+        }
+    }
 
     let count = builder.item_count();
     println!("  tensors to pack: {}", count);

@@ -97,6 +97,21 @@ pub enum DecIndexedOut<'a> {
     Accumulate { acc: &'a mut Storage, wts: &'a Storage },
 }
 
+thread_local! {
+    static PARAM_UPLOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn with_param_upload<R>(f: impl FnOnce() -> R) -> R {
+    let prev = PARAM_UPLOAD.with(|c| c.replace(true));
+    let r = f();
+    PARAM_UPLOAD.with(|c| c.set(prev));
+    r
+}
+
+pub fn param_upload_active() -> bool {
+    PARAM_UPLOAD.with(|c| c.get())
+}
+
 pub trait Backend: Send + Sync + 'static {
     fn device_kind(&self) -> Device;
 
@@ -104,6 +119,14 @@ pub trait Backend: Send + Sync + 'static {
 
     fn alloc_uninit(&self, n_bytes: usize, device: Device) -> Result<Storage> {
         self.alloc_zeros(n_bytes, device)
+    }
+
+    fn upload(&self, _bytes: &[u8], _device: Device) -> Result<Storage> {
+        Err(SynaptixError::Unsupported("upload не поддержан этим backend"))
+    }
+
+    fn download(&self, _src: &Storage) -> Result<Vec<u8>> {
+        Err(SynaptixError::Unsupported("download не поддержан этим backend"))
     }
 
     fn copy(

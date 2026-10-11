@@ -11,6 +11,7 @@ pub enum Device {
     Cuda(usize),
     Metal(usize),
     Wgpu(usize),
+    Npu(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19,11 +20,13 @@ pub enum DeviceKind {
     Cuda,
     Metal,
     Wgpu,
+    Npu,
 }
 
 impl Device {
     pub fn is_cpu(self) -> bool { matches!(self, Device::Cpu) }
     pub fn is_cuda(self) -> bool { matches!(self, Device::Cuda(_)) }
+    pub fn is_npu(self) -> bool { matches!(self, Device::Npu(_)) }
 
     pub fn kind(self) -> DeviceKind {
         match self {
@@ -31,13 +34,14 @@ impl Device {
             Device::Cuda(_) => DeviceKind::Cuda,
             Device::Metal(_) => DeviceKind::Metal,
             Device::Wgpu(_) => DeviceKind::Wgpu,
+            Device::Npu(_) => DeviceKind::Npu,
         }
     }
 
     pub fn ordinal(self) -> usize {
         match self {
             Device::Cpu => 0,
-            Device::Cuda(i) | Device::Metal(i) | Device::Wgpu(i) => i,
+            Device::Cuda(i) | Device::Metal(i) | Device::Wgpu(i) | Device::Npu(i) => i,
         }
     }
 

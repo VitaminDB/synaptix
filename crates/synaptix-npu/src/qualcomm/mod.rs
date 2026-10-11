@@ -1,5 +1,7 @@
 use crate::buffer::{NpuBuffer, Release};
-use crate::graph::{DType, Graph, Op, Quant, TensorId, TensorKind};
+mod lower;
+
+use crate::graph::{DType, Graph, Quant, TensorId, TensorKind};
 use crate::models::{self, Vendor};
 use crate::{Binding, CompiledGraph, IoTensor, Npu, NpuError, NpuInfo, Result};
 use parking_lot::Mutex;
@@ -24,12 +26,6 @@ const OP_EXECUTE: u32 = 7;
 
 const ST_NOT_FOUND: u32 = 1;
 
-const KIND_INPUT: u8 = 0;
-const KIND_OUTPUT: u8 = 1;
-const KIND_STATIC: u8 = 2;
-const KIND_NATIVE: u8 = 3;
-const PARAM_SCALAR: u8 = 0;
-const BUILD_FP16: u32 = 1;
 
 const QNN_F32: u32 = 0x0232;
 const QNN_F16: u32 = 0x0216;
@@ -50,6 +46,7 @@ fn qnn_dtype(d: DType, q: &Quant) -> u32 {
         (DType::F32, _) => QNN_F32,
         (DType::F16, _) => QNN_F16,
         (DType::I32, _) => QNN_I32,
+        (DType::U32, _) => QNN_U32,
         (DType::U8, true) => QNN_UFX8,
         (DType::U16, true) => QNN_UFX16,
         (DType::I8, true) => QNN_SFX8,
@@ -65,6 +62,7 @@ fn from_qnn_dtype(d: u32) -> Result<DType> {
         QNN_F32 => DType::F32,
         QNN_F16 => DType::F16,
         QNN_I32 => DType::I32,
+        QNN_U32 => DType::U32,
         QNN_UFX8 | QNN_U8 => DType::U8,
         QNN_UFX16 | QNN_U16 => DType::U16,
         QNN_SFX8 | QNN_I8 => DType::I8,
@@ -235,7 +233,7 @@ impl QnnNpu {
         let m = self.info.model;
         for t in &g.tensors {
             let ok = match t.kind {
-                TensorKind::Weight { .. } => m.supports_weight(t.dtype),
+                TensorKind::Weight(_) => m.supports_weight(t.dtype) || matches!(t.dtype, DType::I32 | DType::U32),
                 _ => m.supports_activation(t.dtype),
             };
             if !ok {
@@ -245,95 +243,6 @@ impl QnnNpu {
         Ok(())
     }
 
-    fn lower(&self, key: &str, g: &Graph, weights: Option<&NpuBuffer>) -> Vec<u8> {
-        let mut w = Wr::default();
-        w.str(key);
-        let fp16 = g.tensors.iter().any(|t| t.dtype == DType::F16);
-        w.u32(if fp16 { BUILD_FP16 } else { 0 });
-        w.u32(g.tensors.len() as u32);
-        for t in &g.tensors {
-            w.u32(t.id.0);
-            w.u8(match t.kind {
-                TensorKind::Input => KIND_INPUT,
-                TensorKind::Output => KIND_OUTPUT,
-                TensorKind::Weight { .. } => KIND_STATIC,
-                TensorKind::Internal => KIND_NATIVE,
-            });
-            w.u32(qnn_dtype(t.dtype, &t.quant));
-            w.u8(t.shape.len() as u8);
-            for &d in &t.shape {
-                w.u32(d);
-            }
-            match &t.quant {
-                Quant::None => w.u8(0),
-                Quant::Tensor { scale, offset } => {
-                    w.u8(1);
-                    w.f32(*scale);
-                    w.i32(*offset);
-                }
-                Quant::Axis { axis, scales } => {
-                    w.u8(2);
-                    w.i32(*axis);
-                    w.u32(scales.len() as u32);
-                    for &(s, o) in scales {
-                        w.f32(s);
-                        w.i32(o);
-                    }
-                }
-            }
-            if let TensorKind::Weight { offset } = t.kind {
-                w.u32(weights.map(|b| b.handle).unwrap_or(0));
-                w.u64(offset as u64);
-                w.u64(t.bytes() as u64);
-            }
-        }
-        w.u32(g.ops.len() as u32);
-        for (i, op) in g.ops.iter().enumerate() {
-            let name = format!("n{i}");
-            let node = |w: &mut Wr, ty: &str, ins: &[TensorId], out: TensorId, params: &[(&str, u32, u64)]| {
-                w.str(&name);
-                w.str("qti.aisw");
-                w.str(ty);
-                w.u32(ins.len() as u32);
-                for t in ins {
-                    w.u32(t.0);
-                }
-                w.u32(1);
-                w.u32(out.0);
-                w.u32(params.len() as u32);
-                for &(n, dt, v) in params {
-                    w.str(n);
-                    w.u8(PARAM_SCALAR);
-                    w.u32(dt);
-                    w.u64(v);
-                }
-            };
-            match *op {
-                Op::Linear { x, w: wt, bias, out } => {
-                    let mut ins = vec![x, wt];
-                    ins.extend(bias);
-                    let keep = (g.tensor(x).shape.len() > 2) as u64;
-                    node(&mut w, "FullyConnected", &ins, out, &[("keep_dims", QNN_BOOL, keep)]);
-                }
-                Op::MatMul { a, b, transpose_a, transpose_b, out } => node(
-                    &mut w,
-                    "MatMul",
-                    &[a, b],
-                    out,
-                    &[("transpose_in0", QNN_BOOL, transpose_a as u64), ("transpose_in1", QNN_BOOL, transpose_b as u64)],
-                ),
-                Op::Add { a, b, out } => node(&mut w, "ElementWiseAdd", &[a, b], out, &[]),
-                Op::Mul { a, b, out } => node(&mut w, "ElementWiseMultiply", &[a, b], out, &[]),
-                Op::Softmax { x, out } => {
-                    let axis = g.tensor(x).shape.len() as u64 - 1;
-                    node(&mut w, "Softmax", &[x], out, &[("axis", QNN_U32, axis), ("beta", QNN_F32, 1f32.to_bits() as u64)])
-                }
-                Op::Gelu { x, out } => node(&mut w, "Gelu", &[x], out, &[]),
-                Op::Sigmoid { x, out } => node(&mut w, "Sigmoid", &[x], out, &[]),
-            }
-        }
-        w.0
-    }
 }
 
 fn read_io(r: &mut Rd) -> Result<Vec<IoTensor>> {
@@ -360,24 +269,42 @@ impl Npu for QnnNpu {
 
     fn compile(&self, key: &str, g: &Graph) -> Result<Box<dyn CompiledGraph>> {
         self.check(g)?;
-        let key = format!("{key}#{:016x}", g.structure_hash());
+        let key = format!("{key}#{:016x}#{}", g.structure_hash(), lower::variant(self.info.model));
         let mut w = Wr::default();
         w.str(&key);
         let opened = self.conn.lock().call(OP_GRAPH_OPEN, &w.0, None)?;
         let (b, from_cache, build_ms) = match opened {
             Ok(b) => (b, true, 0),
             Err((ST_NOT_FOUND, _)) => {
-                let weights = if g.weights.is_empty() {
+                let mut wire = lower::Wire::new(g, self.info.model);
+                wire.lower_ops();
+                let weights = if wire.blob.is_empty() {
                     None
                 } else {
-                    let mut wb = self.alloc(g.weights.len())?;
+                    let mut wb = self.alloc(wire.blob.len())?;
                     wb.cpu_begin();
-                    wb.as_mut_slice()[..g.weights.len()].copy_from_slice(&g.weights);
+                    wb.as_mut_slice()[..wire.blob.len()].copy_from_slice(&wire.blob);
                     wb.cpu_end();
                     Some(wb)
                 };
-                let body = self.lower(&key, g, weights.as_ref());
-                let b = call(&self.conn, OP_GRAPH_BUILD, &body, None)?;
+                let body = wire.encode(&key, weights.as_ref().map(|b| b.handle).unwrap_or(0));
+                if std::env::var("SYNNPU_TRACE").as_deref() == Ok("2") {
+                    eprintln!("== граф {key}");
+                    for l in &wire.trace {
+                        eprintln!("{l}");
+                    }
+                }
+                let b = match call(&self.conn, OP_GRAPH_BUILD, &body, None) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if std::env::var_os("SYNNPU_TRACE").is_some() {
+                            for l in &wire.trace {
+                                eprintln!("{l}");
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
                 let ms = {
                     let mut r = Rd { b: &b, off: 4 };
                     read_io(&mut r)?;

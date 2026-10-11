@@ -9,6 +9,7 @@ members = [
     "crates/synaptix-kernels-cpu",
     "crates/synaptix-kernels-cuda",
     "crates/synaptix-npu",
+    "crates/synaptix-kernels-npu",
     "crates/synaptix-ops",
     "crates/synaptix-nn",
     "crates/synaptix-tokenizer",
@@ -178,6 +179,7 @@ synaptix-dispatch     = { path = "crates/synaptix-dispatch" }
 synaptix-kernels-cpu  = { path = "crates/synaptix-kernels-cpu" }
 synaptix-kernels-cuda = { path = "crates/synaptix-kernels-cuda" }
 synaptix-npu = { path = "crates/synaptix-npu" }
+synaptix-kernels-npu = { path = "crates/synaptix-kernels-npu" }
 synaptix-ops          = { path = "crates/synaptix-ops" }
 synaptix-nn           = { path = "crates/synaptix-nn" }
 synaptix-tokenizer    = { path = "crates/synaptix-tokenizer" }

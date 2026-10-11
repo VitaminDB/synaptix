@@ -1,0 +1,608 @@
+use crate::value::{Origin, Ready, State, Value, ValueRef};
+use crate::view;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use synaptix_core::backend::{BinaryOp, ReduceOp, UnaryOp};
+use synaptix_core::dtype::DType as CoreDType;
+use synaptix_core::error::{Result, SynaptixError};
+use synaptix_core::tensor::layout::Layout;
+use synaptix_npu::graph::{BinaryKind, Op, ReduceKind, UnaryKind};
+use synaptix_npu::{Binding, CompiledGraph, DType, Graph, NpuBuffer, TensorId};
+
+pub struct Input {
+    pub v: ValueRef,
+    pub lo: Layout,
+}
+
+pub enum NodeOp {
+    Copy,
+    Cast,
+    Unary(UnaryOp),
+    Binary(BinaryOp),
+    MatMul,
+    Reduce(ReduceOp, Vec<usize>),
+    Linear { bias: bool, residual: bool },
+    LayerNorm { eps: f32, bias: bool },
+    RmsNorm { eps: f32, qwen: bool },
+    Conv2d { stride: (usize, usize), padding: (usize, usize), bias: bool },
+    Attention { scale: f32, causal: bool },
+}
+
+struct Node {
+    serial: u64,
+    op: NodeOp,
+    ins: Vec<Input>,
+    out: Weak<Value>,
+    out_lo: Layout,
+}
+
+static REC: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static SERIAL: AtomicU64 = AtomicU64::new(1);
+static GRAPHS: Lazy<Mutex<HashMap<u64, Arc<dyn CompiledGraph>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static STATS: Lazy<Mutex<Stats>> = Lazy::new(|| Mutex::new(Stats::default()));
+
+#[derive(Default, Clone, Debug)]
+pub struct Stats {
+    pub flushes: u64,
+    pub nodes: u64,
+    pub compiles: u64,
+    pub cache_hits: u64,
+    pub compile_ms: f64,
+    pub exec_ms: f64,
+    pub cpu_fallbacks: u64,
+}
+
+pub fn stats() -> Stats {
+    STATS.lock().clone()
+}
+
+pub fn note_cpu_fallback() {
+    STATS.lock().cpu_fallbacks += 1;
+}
+
+fn err(e: synaptix_npu::NpuError) -> SynaptixError {
+    SynaptixError::Other(format!("NPU: {e}"))
+}
+
+pub fn npu_dtype(d: CoreDType) -> Option<DType> {
+    Some(match d {
+        CoreDType::F32 => DType::F32,
+        CoreDType::F16 => DType::F16,
+        CoreDType::I32 => DType::I32,
+        CoreDType::U32 => DType::U32,
+        CoreDType::U8 => DType::U8,
+        _ => return None,
+    })
+}
+
+pub fn record(op: NodeOp, ins: Vec<Input>, dst: &ValueRef, out_lo: Layout) -> Result<()> {
+    for i in &ins {
+        if matches!(*i.v.state.lock(), State::Unset) {
+            return Err(SynaptixError::Other("NPU: вход операции не записан".into()));
+        }
+    }
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    *dst.state.lock() = State::Pending(serial);
+    REC.lock().push(Node { serial, op, ins, out: Arc::downgrade(dst), out_lo });
+    Ok(())
+}
+
+struct Builder {
+    g: Graph,
+    static_bytes: usize,
+    act_elems: usize,
+    by_serial: HashMap<u64, TensorId>,
+    ready: HashMap<(u64, DType, Vec<u32>), TensorId>,
+    bind_in: Vec<(TensorId, Arc<NpuBuffer>)>,
+    used: Vec<ValueRef>,
+}
+
+fn u32s(v: &[usize]) -> Vec<u32> {
+    v.iter().map(|&x| x as u32).collect()
+}
+
+impl Builder {
+    fn input(&mut self, inp: &Input, materialize: bool) -> Result<TensorId> {
+        let dt = npu_dtype(inp.lo.dtype()).ok_or(SynaptixError::Unsupported("тип тензора на NPU"))?;
+        let base = {
+            let mut st = inp.v.state.lock();
+            match &mut *st {
+                State::Unset => return Err(SynaptixError::Other("NPU: вход не записан".into())),
+                State::Pending(s) => *self
+                    .by_serial
+                    .get(s)
+                    .ok_or_else(|| SynaptixError::Other("NPU: значение из другого графа не готово".into()))?,
+                State::Ready(r) => {
+                    let elem = dt.bits() / 8;
+                    let numel = inp.lo.numel();
+                    let full = inp.lo.is_contiguous() && inp.lo.offset() == 0 && numel * elem == inp.v.bytes;
+                    let shape = if full { u32s(inp.lo.dims()) } else { vec![(inp.v.bytes / elem) as u32] };
+                    let key = (inp.v.id, dt, shape.clone());
+                    if let Some(&t) = self.ready.get(&key) {
+                        t
+                    } else {
+                        let is_static = r.origin == Origin::Param;
+                        let t = if is_static {
+                            let fp = r.fingerprint(inp.v.bytes);
+                            self.static_bytes += inp.v.bytes;
+                            self.g.weight_buffer(dt, &shape, &r.buf, 0, fp).map_err(err)?
+                        } else {
+                            let t = self.g.input(dt, &shape);
+                            self.bind_in.push((t, r.buf.clone()));
+                            t
+                        };
+                        self.used.push(inp.v.clone());
+                        self.ready.insert(key, t);
+                        t
+                    }
+                }
+            }
+        };
+        view::view(&mut self.g, base, &inp.lo, materialize).map_err(err)
+    }
+
+    fn scalar(&mut self, v: f32, like: TensorId) -> Result<TensorId> {
+        let dt = self.g.tensor(like).dtype;
+        self.g.scalar_f32(v, dt).map_err(err)
+    }
+
+    fn bin(&mut self, kind: BinaryKind, a: TensorId, b: TensorId) -> Result<TensorId> {
+        self.g.binary(kind, a, b).map_err(err)
+    }
+
+    fn unary(&mut self, op: UnaryOp, x: TensorId) -> Result<TensorId> {
+        let u = |b: &mut Self, k| Ok(b.g.unary(k, x));
+        match op {
+            UnaryOp::Identity => Ok(view::fresh(&mut self.g, x)),
+            UnaryOp::Neg => u(self, UnaryKind::Neg),
+            UnaryOp::Abs => u(self, UnaryKind::Abs),
+            UnaryOp::Sqrt => u(self, UnaryKind::Sqrt),
+            UnaryOp::Recip => u(self, UnaryKind::Recip),
+            UnaryOp::Exp => u(self, UnaryKind::Exp),
+            UnaryOp::Log => u(self, UnaryKind::Log),
+            UnaryOp::Sin => u(self, UnaryKind::Sin),
+            UnaryOp::Cos => u(self, UnaryKind::Cos),
+            UnaryOp::Tanh => u(self, UnaryKind::Tanh),
+            UnaryOp::Sigmoid => u(self, UnaryKind::Sigmoid),
+            UnaryOp::Relu => u(self, UnaryKind::Relu),
+            UnaryOp::GeluExact => u(self, UnaryKind::Gelu),
+            UnaryOp::Round => u(self, UnaryKind::Round),
+            UnaryOp::Floor => u(self, UnaryKind::Floor),
+            UnaryOp::Ceil => u(self, UnaryKind::Ceil),
+            UnaryOp::Sign => u(self, UnaryKind::Sign),
+            UnaryOp::Sqr => self.bin(BinaryKind::Mul, x, x),
+            UnaryOp::Relu2 => {
+                let r = self.g.unary(UnaryKind::Relu, x);
+                self.bin(BinaryKind::Mul, r, r)
+            }
+            UnaryOp::Silu => {
+                let s = self.g.unary(UnaryKind::Sigmoid, x);
+                self.bin(BinaryKind::Mul, x, s)
+            }
+            UnaryOp::GeluTanh => {
+                let x2 = self.bin(BinaryKind::Mul, x, x)?;
+                let x3 = self.bin(BinaryKind::Mul, x2, x)?;
+                let c = self.scalar(0.044715, x)?;
+                let t = self.bin(BinaryKind::Mul, x3, c)?;
+                let inner = self.bin(BinaryKind::Add, x, t)?;
+                let k = self.scalar((2.0f32 / std::f32::consts::PI).sqrt(), x)?;
+                let inner = self.bin(BinaryKind::Mul, inner, k)?;
+                let th = self.g.unary(UnaryKind::Tanh, inner);
+                let one = self.scalar(1.0, x)?;
+                let p = self.bin(BinaryKind::Add, th, one)?;
+                let hx = self.scalar(0.5, x)?;
+                let hx = self.bin(BinaryKind::Mul, x, hx)?;
+                self.bin(BinaryKind::Mul, hx, p)
+            }
+            UnaryOp::Clamp(lo, hi) => {
+                let d = self.g.tensor(x);
+                let (dt, s) = (d.dtype, d.shape.clone());
+                Ok(self.g.node(dt, &s, |out| Op::Clamp { x, min: lo, max: hi, out }))
+            }
+            UnaryOp::Powf(p) => {
+                let e = self.scalar(p, x)?;
+                self.bin(BinaryKind::Pow, x, e)
+            }
+            UnaryOp::Affine(a, b) => {
+                let mut y = x;
+                if a != 1.0 {
+                    let s = self.scalar(a, x)?;
+                    y = self.bin(BinaryKind::Mul, y, s)?;
+                }
+                if b != 0.0 {
+                    let s = self.scalar(b, x)?;
+                    y = self.bin(BinaryKind::Add, y, s)?;
+                }
+                if y == x {
+                    y = view::fresh(&mut self.g, x);
+                }
+                Ok(y)
+            }
+            UnaryOp::LeakyRelu(a) if a <= 1.0 => {
+                let s = self.scalar(a, x)?;
+                let ax = self.bin(BinaryKind::Mul, x, s)?;
+                self.bin(BinaryKind::Max, x, ax)
+            }
+            _ => Err(SynaptixError::Unsupported("унарная операция на NPU")),
+        }
+    }
+
+    fn reshape_to(&mut self, x: TensorId, lo: &Layout) -> TensorId {
+        let shape = u32s(lo.dims());
+        if self.g.tensor(x).shape == shape {
+            return x;
+        }
+        let dt = self.g.tensor(x).dtype;
+        self.g.node(dt, &shape, |out| Op::Reshape { x, out })
+    }
+
+    fn lower(&mut self, n: &Node) -> Result<TensorId> {
+        let odt = npu_dtype(n.out_lo.dtype()).ok_or(SynaptixError::Unsupported("тип выхода на NPU"))?;
+        let oshape = u32s(n.out_lo.dims());
+        let t = match &n.op {
+            NodeOp::Copy => {
+                let x = self.input(&n.ins[0], true)?;
+                view::fresh(&mut self.g, x)
+            }
+            NodeOp::Cast => {
+                let x = self.input(&n.ins[0], true)?;
+                self.g.node(odt, &oshape, |out| Op::Cast { x, out })
+            }
+            NodeOp::Unary(op) => {
+                let x = self.input(&n.ins[0], true)?;
+                self.unary(*op, x)?
+            }
+            NodeOp::Binary(op) => {
+                let a = self.input(&n.ins[0], false)?;
+                let b = self.input(&n.ins[1], false)?;
+                let kind = match op {
+                    BinaryOp::Add => BinaryKind::Add,
+                    BinaryOp::Sub => BinaryKind::Sub,
+                    BinaryOp::Mul => BinaryKind::Mul,
+                    BinaryOp::Div => BinaryKind::Div,
+                    BinaryOp::Max => BinaryKind::Max,
+                    BinaryOp::Min => BinaryKind::Min,
+                };
+                let y = self.bin(kind, a, b)?;
+                if self.g.tensor(y).shape != oshape {
+                    let dt = self.g.tensor(y).dtype;
+                    let multiples: Vec<u32> =
+                        oshape.iter().zip(&self.g.tensor(y).shape).map(|(&o, &c)| if c == 1 { o } else { 1 }).collect();
+                    self.g.node(dt, &oshape, |out| Op::Tile { x: y, multiples, out })
+                } else {
+                    y
+                }
+            }
+            NodeOp::MatMul => {
+                let a = self.input(&n.ins[0], true)?;
+                let b = self.input(&n.ins[1], true)?;
+                self.g.matmul(a, b, false, false).map_err(err)?
+            }
+            NodeOp::Reduce(op, dims) => {
+                let x = self.input(&n.ins[0], true)?;
+                let mut kshape = self.g.tensor(x).shape.clone();
+                for &d in dims {
+                    kshape[d] = 1;
+                }
+                let axes = u32s(dims);
+                let dt = self.g.tensor(x).dtype;
+                let r = match op {
+                    ReduceOp::ArgMax => {
+                        let axis = axes[0];
+                        self.g.node(odt, &kshape, |out| Op::ArgMax { x, axis, keep_dims: true, out })
+                    }
+                    _ => {
+                        let kind = match op {
+                            ReduceOp::Sum => ReduceKind::Sum,
+                            ReduceOp::Mean => ReduceKind::Mean,
+                            _ => ReduceKind::Max,
+                        };
+                        self.g.node(dt, &kshape, |out| Op::Reduce { kind, x, axes, keep_dims: true, out })
+                    }
+                };
+                self.reshape_to(r, &n.out_lo)
+            }
+            NodeOp::Linear { bias, residual } => {
+                let x = self.input(&n.ins[0], true)?;
+                let w = self.input(&n.ins[1], true)?;
+                let mut k = 2;
+                let b = if *bias {
+                    k += 1;
+                    Some(self.input(&n.ins[2], true)?)
+                } else {
+                    None
+                };
+                let mut y = self.g.linear(x, w, b).map_err(err)?;
+                if *residual {
+                    let r = self.input(&n.ins[k], false)?;
+                    y = self.bin(BinaryKind::Add, y, r)?;
+                }
+                y
+            }
+            NodeOp::LayerNorm { eps, bias } => {
+                let x = self.input(&n.ins[0], true)?;
+                let gamma = self.input(&n.ins[1], true)?;
+                let beta = if *bias { Some(self.input(&n.ins[2], true)?) } else { None };
+                let axis = oshape.len() as u32 - 1;
+                let eps = *eps;
+                self.g.node(odt, &oshape, |out| Op::LayerNorm { x, gamma, beta, eps, axis, out })
+            }
+            NodeOp::RmsNorm { eps, qwen } => {
+                let x = self.input(&n.ins[0], true)?;
+                let mut gamma = self.input(&n.ins[1], true)?;
+                if *qwen {
+                    let one = self.scalar(1.0, gamma)?;
+                    gamma = self.bin(BinaryKind::Add, gamma, one)?;
+                }
+                let axis = oshape.len() as u32 - 1;
+                let eps = *eps;
+                self.g.node(odt, &oshape, |out| Op::RmsNorm { x, gamma, eps, axis, out })
+            }
+            NodeOp::Attention { scale, causal } => {
+                let q = self.input(&n.ins[0], true)?;
+                let k = self.input(&n.ins[1], true)?;
+                let v = self.input(&n.ins[2], true)?;
+                let qs = self.g.tensor(q).shape.clone();
+                let nh = qs[1] as usize;
+                let chunk = std::env::var("SYNAPTIX_NPU_ATTN_HEADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(nh).clamp(1, nh);
+                if chunk < nh && !*causal {
+                    let mut parts = Vec::new();
+                    let mut h = 0;
+                    while h < nh {
+                        let e = (h + chunk).min(nh);
+                        let mut sl = |b: &mut Self, x: TensorId| {
+                            let sh = b.g.tensor(x).shape.clone();
+                            let dt = b.g.tensor(x).dtype;
+                            let mut os = sh.clone();
+                            os[1] = (e - h) as u32;
+                            let begin = vec![0, h as i32, 0, 0];
+                            let end = vec![sh[0] as i32, e as i32, sh[2] as i32, sh[3] as i32];
+                            b.g.node(dt, &os, |out| Op::Slice { x, begin, end, stride: vec![1; 4], out })
+                        };
+                        let (qh, kh, vh) = (sl(self, q), sl(self, k), sl(self, v));
+                        let sc = self.g.matmul(qh, kh, false, true).map_err(err)?;
+                        let f = self.scalar(*scale, sc)?;
+                        let sc = self.bin(BinaryKind::Mul, sc, f)?;
+                        let p = self.g.softmax(sc);
+                        parts.push(self.g.matmul(p, vh, false, false).map_err(err)?);
+                        h = e;
+                    }
+                    let dt = self.g.tensor(parts[0]).dtype;
+                    let mut os = self.g.tensor(parts[0]).shape.clone();
+                    os[1] = nh as u32;
+                    let t = self.g.node(dt, &os, |out| Op::Concat { xs: parts, axis: 1, out });
+                    return Ok(self.reshape_to(t, &n.out_lo));
+                }
+                let s = self.g.matmul(q, k, false, true).map_err(err)?;
+                let sc = self.scalar(*scale, s)?;
+                let mut s = self.bin(BinaryKind::Mul, s, sc)?;
+                if *causal {
+                    let sh = self.g.tensor(s).shape.clone();
+                    let (tq, tk) = (sh[sh.len() - 2] as usize, sh[sh.len() - 1] as usize);
+                    let dt = self.g.tensor(s).dtype;
+                    let shift = tk.saturating_sub(tq);
+                    let neg = if dt == DType::F16 { -60000.0f32 } else { -1e30 };
+                    let mut bytes = Vec::with_capacity(tq * tk * 4);
+                    for i in 0..tq {
+                        for j in 0..tk {
+                            let m = if j > i + shift { neg } else { 0.0 };
+                            if dt == DType::F16 {
+                                bytes.extend_from_slice(&half::f16::from_f32(m).to_le_bytes());
+                            } else {
+                                bytes.extend_from_slice(&m.to_le_bytes());
+                            }
+                        }
+                    }
+                    let mask = self.g.weight(dt, &[tq as u32, tk as u32], &bytes).map_err(err)?;
+                    s = self.bin(BinaryKind::Add, s, mask)?;
+                }
+                let p = self.g.softmax(s);
+                self.g.matmul(p, v, false, false).map_err(err)?
+            }
+            NodeOp::Conv2d { stride, padding, bias } => {
+                let x = self.input(&n.ins[0], true)?;
+                let w = self.input(&n.ins[1], true)?;
+                let b = if *bias { Some(self.input(&n.ins[2], true)?) } else { None };
+                let (s, p) = (*stride, *padding);
+                self.g.node(odt, &oshape, |out| Op::Conv2d {
+                    x,
+                    w,
+                    bias: b,
+                    stride: [s.0 as u32, s.1 as u32],
+                    pad: [[p.0 as u32, p.0 as u32], [p.1 as u32, p.1 as u32]],
+                    dilation: [1, 1],
+                    groups: 1,
+                    out,
+                })
+            }
+        };
+        if self.g.tensor(t).dtype != odt {
+            return Err(SynaptixError::Other(format!("NPU: тип выхода {:?} вместо {odt:?}", self.g.tensor(t).dtype)));
+        }
+        Ok(self.reshape_to(t, &n.out_lo))
+    }
+}
+
+fn budget() -> (usize, usize, usize) {
+    let mb = std::env::var("SYNAPTIX_NPU_SEGMENT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or((crate::npu().info().model.session_bytes / 16 >> 20) as usize);
+    let nodes = std::env::var("SYNAPTIX_NPU_SEGMENT_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+    let melems: usize = std::env::var("SYNAPTIX_NPU_SEGMENT_MELEMS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    (mb << 20, nodes, melems * 1_000_000)
+}
+
+fn new_builder() -> Builder {
+    Builder {
+        g: Graph::new(),
+        static_bytes: 0,
+        act_elems: 0,
+        by_serial: HashMap::new(),
+        ready: HashMap::new(),
+        bind_in: Vec::new(),
+        used: Vec::new(),
+    }
+}
+
+pub fn flush() -> Result<()> {
+    let nodes = std::mem::take(&mut *REC.lock());
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let mut internal: HashMap<u64, usize> = HashMap::new();
+    let mut last_use: HashMap<u64, usize> = HashMap::new();
+    for (k, n) in nodes.iter().enumerate() {
+        for i in &n.ins {
+            *internal.entry(i.v.id).or_default() += 1;
+            last_use.insert(i.v.id, k);
+        }
+    }
+    let mut outv: Vec<Option<ValueRef>> = Vec::with_capacity(nodes.len());
+    let mut ext: Vec<bool> = Vec::with_capacity(nodes.len());
+    for n in &nodes {
+        let v = n.out.upgrade().filter(|v| matches!(*v.state.lock(), State::Pending(s) if s == n.serial));
+        let e = v.as_ref().is_some_and(|v| Arc::strong_count(v) - 1 - internal.get(&v.id).copied().unwrap_or(0) > 0);
+        ext.push(e);
+        outv.push(v);
+    }
+
+    let (max_bytes, max_nodes, max_elems) = budget();
+    let mut b = new_builder();
+    let mut start = 0;
+    for k in 0..nodes.len() {
+        let before = b.g.tensors.len();
+        let t = b.lower(&nodes[k])?;
+        b.act_elems += b.g.tensors[before..]
+            .iter()
+            .filter(|d| d.kind == synaptix_npu::TensorKind::Internal)
+            .map(|d| d.elems())
+            .sum::<usize>();
+        let t = if b.g.tensor(t).kind != synaptix_npu::TensorKind::Internal { view::fresh(&mut b.g, t) } else { t };
+        b.by_serial.insert(nodes[k].serial, t);
+        let last = k + 1 == nodes.len();
+        if last || b.static_bytes >= max_bytes || b.g.ops.len() >= max_nodes || b.act_elems >= max_elems {
+            let mut outs = Vec::new();
+            for i in start..=k {
+                if let Some(v) = &outv[i] {
+                    if ext[i] || last_use.get(&v.id).is_some_and(|&u| u > k) {
+                        outs.push((b.by_serial[&nodes[i].serial], v.clone()));
+                    }
+                }
+            }
+            run_segment(std::mem::replace(&mut b, new_builder()), outs, k + 1 - start)?;
+            start = k + 1;
+        }
+    }
+    drop(nodes);
+    Ok(())
+}
+
+fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) -> Result<()> {
+    if live.is_empty() {
+        return Ok(());
+    }
+    let mut out_ids: Vec<(TensorId, ValueRef)> = Vec::new();
+    for (t, v) in live {
+        let t = if out_ids.iter().any(|(x, _)| *x == t) { view::fresh(&mut b.g, t) } else { t };
+        b.g.output(t).map_err(err)?;
+        out_ids.push((t, v));
+    }
+
+    let npu = crate::npu();
+    let hash = b.g.structure_hash();
+    let cached = GRAPHS.lock().get(&hash).cloned();
+    let cg = match cached {
+        Some(c) => {
+            STATS.lock().cache_hits += 1;
+            c
+        }
+        None => {
+            let t0 = std::time::Instant::now();
+            let c: Arc<dyn CompiledGraph> = Arc::from(npu.compile("synaptix", &b.g).map_err(err)?);
+            let mut s = STATS.lock();
+            s.compiles += 1;
+            s.compile_ms += t0.elapsed().as_secs_f64() * 1e3;
+            drop(s);
+            GRAPHS.lock().insert(hash, c.clone());
+            c
+        }
+    };
+
+    let mut out_bufs = Vec::with_capacity(out_ids.len());
+    for (t, v) in &out_ids {
+        let need = b.g.tensor(*t).bytes();
+        if need != v.bytes {
+            return Err(SynaptixError::Other(format!("NPU: выход {need} байт вместо {}", v.bytes)));
+        }
+        out_bufs.push(Arc::new(npu.alloc(need.max(64)).map_err(err)?));
+    }
+    let mut binds: Vec<Binding> = b.bind_in.iter().map(|(t, buf)| Binding { tensor: *t, buffer: buf, offset: 0 }).collect();
+    for ((t, _), buf) in out_ids.iter().zip(&out_bufs) {
+        binds.push(Binding { tensor: *t, buffer: buf, offset: 0 });
+    }
+    let t0 = std::time::Instant::now();
+    cg.run(&binds).map_err(err)?;
+    {
+        let mut s = STATS.lock();
+        s.flushes += 1;
+        s.nodes += n_nodes as u64;
+        s.exec_ms += t0.elapsed().as_secs_f64() * 1e3;
+    }
+    for ((_, v), buf) in out_ids.iter().zip(out_bufs) {
+        *v.state.lock() = State::Ready(Ready { buf, origin: Origin::Graph, uses: 0, fingerprint: None });
+    }
+    for v in &b.used {
+        if let State::Ready(r) = &mut *v.state.lock() {
+            r.uses += 1;
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_ready(v: &ValueRef) -> Result<()> {
+    if matches!(*v.state.lock(), State::Pending(_)) {
+        flush()?;
+    }
+    match &*v.state.lock() {
+        State::Ready(_) => Ok(()),
+        State::Pending(_) => Err(SynaptixError::Other("NPU: значение не вычислено после сброса графа".into())),
+        State::Unset => Err(SynaptixError::Other("NPU: чтение незаписанного тензора".into())),
+    }
+}
+
+pub fn read(v: &ValueRef) -> Result<Vec<u8>> {
+    ensure_ready(v)?;
+    let st = v.state.lock();
+    let State::Ready(r) = &*st else { unreachable!() };
+    r.buf.cpu_begin();
+    let out = r.buf.as_slice()[..v.bytes].to_vec();
+    r.buf.cpu_end();
+    Ok(out)
+}
+
+pub fn origin_of(v: &ValueRef) -> Option<Origin> {
+    match &*v.state.lock() {
+        State::Ready(r) => Some(r.origin),
+        _ => None,
+    }
+}
+
+pub fn set_ready(v: &ValueRef, bytes: &[u8], origin: Origin) -> Result<()> {
+    let npu = crate::npu();
+    let mut buf = npu.alloc(bytes.len().max(64)).map_err(err)?;
+    buf.cpu_begin();
+    buf.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+    buf.cpu_end();
+    *v.state.lock() = State::Ready(Ready { buf: Arc::new(buf), origin, uses: 0, fingerprint: None });
+    Ok(())
+}
+
+pub fn new_ready(bytes: &[u8], origin: Origin) -> Result<ValueRef> {
+    let v = Value::new(bytes.len(), State::Unset);
+    set_ready(&v, bytes, origin)?;
+    Ok(v)
+}

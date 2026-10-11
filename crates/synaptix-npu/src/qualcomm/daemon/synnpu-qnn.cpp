@@ -7,10 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -21,7 +23,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "HTP/QnnHtpContext.h"
 #include "HTP/QnnHtpDevice.h"
+#include "HTP/QnnHtpSystemContext.h"
 #include "HTP/QnnHtpGraph.h"
 #include "HTP/QnnHtpPerfInfrastructure.h"
 #include "QnnInterface.h"
@@ -278,7 +282,29 @@ std::unique_ptr<Tensor> copy_tensor(const Qnn_Tensor_t& src) {
     return t;
 }
 
-std::unique_ptr<Graph> load_cached(const std::string& path) {
+struct Group {
+    Qnn_ContextHandle_t first = nullptr;
+    uint64_t cap = 0;
+};
+
+uint64_t spill_fill_of(const QnnSystemContext_BinaryInfo_t* info, const QnnSystemContext_GraphInfo_t& g) {
+    if (g.version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3 && g.graphInfoV3.graphBlobInfo) {
+        auto b = (const QnnHtpSystemContext_GraphBlobInfo_t*)g.graphInfoV3.graphBlobInfo;
+        if (b->version == QNN_SYSTEM_CONTEXT_HTP_GRAPH_INFO_BLOB_VERSION_V1)
+            return b->contextBinaryGraphBlobInfoV1.spillFillBufferSize;
+    }
+    const void* hw = nullptr;
+    if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1) hw = info->contextBinaryInfoV1.hwInfoBlob;
+    if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2) hw = info->contextBinaryInfoV2.hwInfoBlob;
+    if (hw) {
+        auto b = (const QnnHtpSystemContext_HwBlobInfo_t*)hw;
+        if (b->version == QNN_SYSTEM_CONTEXT_HTP_HW_INFO_BLOB_VERSION_V1)
+            return b->contextBinaryHwInfoBlobV1_t.spillFillBufferSize;
+    }
+    return 0;
+}
+
+std::unique_ptr<Graph> load_cached(const std::string& path, Group* group = nullptr) {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return nullptr;
     struct stat st;
@@ -320,15 +346,34 @@ std::unique_ptr<Graph> load_cached(const std::string& path) {
         qsys.systemContextFree(sc);
         fail(SYNNPU_IO_ERROR, "в кэше не один граф");
     }
+    uint64_t spill = spill_fill_of(info, gs[0]);
     auto& gi = gs[0].graphInfoV1;
     for (uint32_t i = 0; i < gi.numGraphInputs; i++) g->ins.push_back(copy_tensor(gi.graphInputs[i]));
     for (uint32_t i = 0; i < gi.numGraphOutputs; i++) g->outs.push_back(copy_tensor(gi.graphOutputs[i]));
     std::string gname = gi.graphName;
     qsys.systemContextFree(sc);
 
-    check(qnn.contextCreateFromBinary(qbackend, qdevice, nullptr, buf.data(), buf.size(), &g->ctx, nullptr),
+    QnnHtpContext_CustomConfig_t gr{};
+    gr.option = QNN_HTP_CONTEXT_CONFIG_OPTION_REGISTER_MULTI_CONTEXTS;
+    QnnContext_Config_t gc = QNN_CONTEXT_CONFIG_INIT;
+    gc.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+    gc.customConfig = &gr;
+    const QnnContext_Config_t* cfg[] = {&gc, nullptr};
+    bool grouped = group && spill > 0 && (!group->first || spill <= group->cap);
+    if (grouped) {
+        if (!group->first) {
+            const char* mb = getenv("SYNNPU_SPILLFILL_MB");
+            group->cap = std::max<uint64_t>(spill, uint64_t(mb ? atoi(mb) : 256) << 20);
+        }
+        gr.groupRegistration.firstGroupHandle = group->first;
+        gr.groupRegistration.maxSpillFillBuffer = group->cap;
+    }
+    logf("контекст %s: %.1f МБ, spill-fill %.1f МБ%s", path.c_str(), buf.size() / 1048576.0, spill / 1048576.0,
+         grouped ? (group->first ? " (общий буфер группы)" : " (новая группа)") : "");
+    check(qnn.contextCreateFromBinary(qbackend, qdevice, grouped ? cfg : nullptr, buf.data(), buf.size(), &g->ctx, nullptr),
           "contextCreateFromBinary");
     check(qnn.graphRetrieve(g->ctx, gname.c_str(), &g->g), "graphRetrieve");
+    if (grouped && !group->first) group->first = g->ctx;
     return g;
 }
 
@@ -358,6 +403,8 @@ struct Session {
     std::unordered_map<uint32_t, std::unique_ptr<Mem>> mems;
     std::unordered_map<uint32_t, std::unique_ptr<Graph>> graphs;
     uint32_t next_mem = 1, next_graph = 1;
+    Group group;
+    bool prepare_only = false;
 
     ~Session() {
         std::lock_guard<std::mutex> l(qnn_mutex);
@@ -430,7 +477,7 @@ struct Session {
         std::string key = r.str();
         if (!r.ok) fail(SYNNPU_BAD_REQUEST, "GRAPH_OPEN: ключ");
         std::lock_guard<std::mutex> l(qnn_mutex);
-        auto g = load_cached(cache_path(key));
+        auto g = load_cached(cache_path(key), &group);
         if (!g) fail(SYNNPU_NOT_FOUND, "нет в кэше");
         Graph& gr = *g;
         w.put<uint32_t>(add_graph(std::move(g)));
@@ -440,13 +487,91 @@ struct Session {
     void graph_build(Rd& r, Wr& w) {
         auto t0 = std::chrono::steady_clock::now();
         std::string key = r.str();
+        if (!r.ok) fail(SYNNPU_BAD_REQUEST, "GRAPH_BUILD: заголовок");
+        mkdir(cache_dir.c_str(), 0755);
+        std::string req = cache_dir + "/req." + std::to_string(getpid()) + "." + std::to_string(gettid());
+        int fd = open(req.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) fail(SYNNPU_IO_ERROR, req + ": " + strerror(errno));
+        size_t off = 0;
+        while (off < r.n) {
+            ssize_t k = write(fd, r.p + off, r.n - off);
+            if (k <= 0) break;
+            off += k;
+        }
+        close(fd);
+        if (off != r.n) {
+            unlink(req.c_str());
+            fail(SYNNPU_IO_ERROR, "запрос сборки не записан");
+        }
+        std::vector<std::string> args = {"synnpu-qnn", "--build", req};
+        std::vector<int> fds;
+        for (auto& [id, m] : mems) {
+            args.push_back(std::to_string(id) + ":" + std::to_string(m->fd) + ":" + std::to_string(m->size));
+            fds.push_back(m->fd);
+        }
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(a.data());
+        argv.push_back(nullptr);
+        pid_t pid = fork();
+        if (pid == 0) {
+            for (int f : fds) fcntl(f, F_SETFD, 0);
+            execv("/proc/self/exe", argv.data());
+            _exit(127);
+        }
+        int st = 0;
+        if (pid < 0) {
+            unlink(req.c_str());
+            fail(SYNNPU_IO_ERROR, std::string("fork: ") + strerror(errno));
+        }
+        for (;;) {
+            pid_t r = waitpid(pid, &st, WNOHANG);
+            if (r == pid) break;
+            if (r < 0 && errno != EINTR) {
+                unlink(req.c_str());
+                fail(SYNNPU_IO_ERROR, std::string("waitpid: ") + strerror(errno));
+            }
+            pollfd pf{sock, POLLRDHUP, 0};
+            if (poll(&pf, 1, 200) > 0 && (pf.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &st, 0);
+                unlink(req.c_str());
+                logf("клиент отключился — сборка графа остановлена");
+                fail(SYNNPU_IO_ERROR, "клиент отключился");
+            }
+        }
+        unlink(req.c_str());
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            fail(SYNNPU_QNN_ERROR, "сборка графа в процессе " + std::to_string(pid) + " не удалась (" +
+                                       (WIFSIGNALED(st) ? "сигнал " + std::to_string(WTERMSIG(st))
+                                                        : "код " + std::to_string(WEXITSTATUS(st))) + ")");
+        }
+        std::lock_guard<std::mutex> l(qnn_mutex);
+        auto g = load_cached(cache_path(key), &group);
+        if (!g) fail(SYNNPU_IO_ERROR, "собранный граф не найден в кэше");
+        uint32_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        Graph& gr = *g;
+        w.put<uint32_t>(add_graph(std::move(g)));
+        io_table(w, gr);
+        w.put<uint32_t>(ms);
+    }
+
+    void build_inproc(Rd& r, Wr& w) {
+        auto t0 = std::chrono::steady_clock::now();
+        std::string key = r.str();
         uint32_t flags = r.get<uint32_t>();
         uint32_t nt = r.get<uint32_t>();
         if (!r.ok) fail(SYNNPU_BAD_REQUEST, "GRAPH_BUILD: заголовок");
 
         std::lock_guard<std::mutex> l(qnn_mutex);
         auto g = std::make_unique<Graph>();
-        check(qnn.contextCreate(qbackend, qdevice, nullptr, &g->ctx), "contextCreate");
+        QnnHtpContext_CustomConfig_t po{};
+        po.option = QNN_HTP_CONTEXT_CONFIG_OPTION_PREPARE_ONLY;
+        po.isPrepareOnly = true;
+        QnnContext_Config_t pc = QNN_CONTEXT_CONFIG_INIT;
+        pc.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+        pc.customConfig = &po;
+        const QnnContext_Config_t* pcfg[] = {&pc, nullptr};
+        check(qnn.contextCreate(qbackend, qdevice, prepare_only ? pcfg : nullptr, &g->ctx), "contextCreate");
 
         QnnHtpGraph_CustomConfig_t prec = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
         prec.option = QNN_HTP_GRAPH_CONFIG_OPTION_PRECISION;
@@ -454,7 +579,8 @@ struct Session {
         QnnHtpGraph_CustomConfig_t opt = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
         opt.option = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
         opt.optimizationOption.type = QNN_HTP_GRAPH_OPTIMIZATION_TYPE_FINALIZE_OPTIMIZATION_FLAG;
-        opt.optimizationOption.floatValue = 3;
+        uint32_t olvl = (flags >> 8) & 0xf;
+        opt.optimizationOption.floatValue = olvl ? float(olvl) : (getenv("SYNNPU_OPT") ? float(atoi(getenv("SYNNPU_OPT"))) : 2.0f);
         QnnHtpGraph_CustomConfig_t vtcm = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
         vtcm.option = QNN_HTP_GRAPH_CONFIG_OPTION_VTCM_SIZE;
         vtcm.vtcmSizeInMB = hw_vtcm_mb ? hw_vtcm_mb : 8;
@@ -600,7 +726,10 @@ struct Session {
     void graph_free(Rd& r, Wr&) {
         uint32_t id = r.get<uint32_t>();
         std::lock_guard<std::mutex> l(qnn_mutex);
-        if (!graphs.erase(id)) fail(SYNNPU_BAD_REQUEST, "нет графа " + std::to_string(id));
+        auto it = graphs.find(id);
+        if (it == graphs.end()) fail(SYNNPU_BAD_REQUEST, "нет графа " + std::to_string(id));
+        if (it->second->ctx == group.first) group = Group{};
+        graphs.erase(it);
         graph_ref(-1);
     }
 
@@ -717,10 +846,51 @@ void serve(int sock) {
 
 }
 
-int main() {
+int build_child(int argc, char** argv) {
+    init_qnn();
+    Session s{-1};
+    s.prepare_only = !getenv("SYNNPU_NO_PREPARE_ONLY");
+    for (int i = 3; i < argc; i++) {
+        unsigned id = 0, fd = 0;
+        unsigned long long size = 0;
+        if (sscanf(argv[i], "%u:%u:%llu", &id, &fd, &size) != 3) return 2;
+        auto m = std::make_unique<Mem>();
+        m->fd = int(fd);
+        m->size = size;
+        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd, 0);
+        if (p == MAP_FAILED) { logf("mmap %u: %s", id, strerror(errno)); return 3; }
+        m->ptr = (uint8_t*)p;
+        s.mems[id] = std::move(m);
+    }
+    int fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 4;
+    struct stat st;
+    fstat(fd, &st);
+    std::vector<uint8_t> body(st.st_size);
+    if (!read_full(fd, body.data(), body.size())) return 5;
+    close(fd);
+    Rd r{body.data(), body.size()};
+    Wr w;
+    int rc = 0;
+    try {
+        s.build_inproc(r, w);
+    } catch (const Error& e) {
+        logf("сборка: %s", e.msg.c_str());
+        rc = 1;
+    }
+    FILE* f = fopen("/proc/self/status", "r");
+    char line[256];
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "VmHWM:", 6)) logf("сборка: пик памяти %s", line + 6);
+    if (f) fclose(f);
+    return rc;
+}
+
+int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stderr, nullptr, _IOLBF, 0);
     if (const char* c = getenv("SYNNPU_CACHE")) cache_dir = c;
+    if (argc >= 3 && strcmp(argv[1], "--build") == 0) _exit(build_child(argc, argv));
     init_qnn();
 
     const char* path = getenv("SYNNPU_SOCKET") ? getenv("SYNNPU_SOCKET") : SYNNPU_SOCKET;

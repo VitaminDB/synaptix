@@ -10,7 +10,7 @@ pub enum Stream {
 impl Stream {
     pub fn default_for(device: Device) -> Result<Self> {
         match device {
-            Device::Cpu => Ok(Stream::CpuNoop),
+            Device::Cpu | Device::Npu(_) => Ok(Stream::CpuNoop),
             Device::Cuda(_ord) => {
                 {
                     let s = crate::device::cuda::default_stream(_ord)?;

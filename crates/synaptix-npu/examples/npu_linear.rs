@@ -24,13 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut g = Graph::new();
     let xi = g.input(DType::F16, &[m as u32, k as u32]);
-    let wi = g.weight(DType::F16, &[n as u32, k as u32], bytemuck::cast_slice(&w))?;
+    let dyn_w = std::env::var("NPU_DYN_W").is_ok();
+    let wi = if dyn_w { g.input(DType::F16, &[n as u32, k as u32]) } else { g.weight(DType::F16, &[n as u32, k as u32], bytemuck::cast_slice(&w))? };
     let bi = g.weight(DType::F16, &[n as u32], bytemuck::cast_slice(&b))?;
     let y = g.linear(xi, wi, Some(bi))?;
     g.output(y)?;
 
     let t0 = std::time::Instant::now();
-    let cg = npu.compile(&format!("npu_linear_{m}x{k}x{n}"), &g)?;
+    let cg = npu.compile(&format!("npu_linear_{m}x{k}x{n}_{dyn_w}"), &g)?;
     println!(
         "граф: {} за {:.1} мс (сборка на NPU {} мс)",
         if cg.from_cache() { "из кэша" } else { "собран" },
@@ -43,10 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     xb.cpu_begin();
     xb.typed_mut::<f16>(0, m * k).copy_from_slice(&x);
     xb.cpu_end();
-    let bind = [
+    let mut wb = npu.alloc(n * k * 2)?;
+    wb.typed_mut::<f16>(0, n * k).copy_from_slice(&w);
+    let mut bind = vec![
         Binding { tensor: xi, buffer: &xb, offset: 0 },
         Binding { tensor: y, buffer: &yb, offset: 0 },
     ];
+    if dyn_w {
+        bind.push(Binding { tensor: wi, buffer: &wb, offset: 0 });
+    }
     let mut npu_us = Vec::new();
     let mut wall = Vec::new();
     for _ in 0..iters.max(1) {

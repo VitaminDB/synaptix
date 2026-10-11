@@ -12,6 +12,8 @@ synaptix-infer        = { workspace = true }
 synaptix-train        = { workspace = true }
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+synaptix-kernels-npu  = { workspace = true }
+synaptix-npu          = { workspace = true }
 synaptix-bundle       = { workspace = true }
 synaptix-gguf         = { workspace = true, optional = true }
 synaptix-tokenizer    = { workspace = true }

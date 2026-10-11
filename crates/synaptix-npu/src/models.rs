@@ -16,6 +16,7 @@ pub struct NpuModel {
     pub weights: &'static [DType],
     pub weight_bits: &'static [u8],
     pub fp16_native: bool,
+    pub fused_norms: bool,
     pub session_bytes: u64,
 }
 
@@ -46,6 +47,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V68,
         weight_bits: &[8, 16],
         fp16_native: false,
+        fused_norms: false,
         session_bytes: 2 * GIB,
     },
     NpuModel {
@@ -58,6 +60,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V68,
         weight_bits: &[8, 16],
         fp16_native: true,
+        fused_norms: true,
         session_bytes: 2 * GIB,
     },
     NpuModel {
@@ -70,6 +73,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V73,
         weight_bits: &[4, 8, 16],
         fp16_native: true,
+        fused_norms: true,
         session_bytes: 3 * GIB,
     },
     NpuModel {
@@ -82,6 +86,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V73,
         weight_bits: &[4, 8, 16],
         fp16_native: true,
+        fused_norms: true,
         session_bytes: 3 * GIB,
     },
     NpuModel {
@@ -94,6 +99,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V73,
         weight_bits: &[4, 8, 16],
         fp16_native: true,
+        fused_norms: true,
         session_bytes: 3 * GIB,
     },
     NpuModel {
@@ -106,6 +112,7 @@ pub static MODELS: &[NpuModel] = &[
         weights: QC_W_V73,
         weight_bits: &[4, 8, 16],
         fp16_native: true,
+        fused_norms: true,
         session_bytes: 3 * GIB,
     },
 ];

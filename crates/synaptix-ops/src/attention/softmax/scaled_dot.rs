@@ -19,6 +19,13 @@ pub fn scaled_dot_attention(
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
         return Err(SynaptixError::dtype_mismatch(q.dtype(), k.dtype()));
     }
+    if q.device().is_npu() && mask.is_none() && q.rank() == 4 && !synaptix_core::grad::needs_graph(&[q, k, v]) {
+        match q.flash_attention(k, v, scale, false) {
+            Ok(o) => return Ok(o),
+            Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let dtype_in = q.dtype();
     let q_f32 = q.to_dtype(DType::F32)?;
     let k_f32 = k.to_dtype(DType::F32)?;
