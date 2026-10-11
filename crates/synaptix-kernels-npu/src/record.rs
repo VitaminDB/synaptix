@@ -46,7 +46,55 @@ struct Node {
 
 static REC: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static SERIAL: AtomicU64 = AtomicU64::new(1);
-static GRAPHS: Lazy<Mutex<HashMap<u64, Arc<dyn CompiledGraph>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Кэш скомпилированных графов процесса: по хэшу структуры, с вытеснением
+/// давно не использованных по бюджету резидентной статики (веса графов
+/// занимают память PD на DSP и процесса-исполнителя демона; модель с
+/// несколькими формами входа — корзинами длины — иначе не помещается).
+/// Вытеснение снимает только ссылку кэша; контекст освобождается, когда
+/// граф никем не держится (`Drop`). Бюджет — `SYNAPTIX_NPU_RESIDENT_MB`,
+/// по умолчанию ¾ `session_bytes` модели NPU.
+#[derive(Default)]
+struct GraphCache {
+    map: HashMap<u64, (Arc<dyn CompiledGraph>, usize, u64)>,
+    total: usize,
+    tick: u64,
+}
+
+impl GraphCache {
+    fn budget() -> usize {
+        if let Some(mb) = std::env::var("SYNAPTIX_NPU_RESIDENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return mb << 20;
+        }
+        crate::info().map(|i| (i.model.session_bytes as usize / 4) * 3).unwrap_or(1 << 30)
+    }
+
+    fn get(&mut self, hash: u64) -> Option<Arc<dyn CompiledGraph>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(&hash).map(|(g, _, last)| {
+            *last = tick;
+            g.clone()
+        })
+    }
+
+    fn insert(&mut self, hash: u64, g: Arc<dyn CompiledGraph>, bytes: usize) {
+        let budget = Self::budget();
+        while self.total + bytes > budget && !self.map.is_empty() {
+            let Some((&victim, _)) = self.map.iter().min_by_key(|(_, (_, _, last))| *last) else { break };
+            if let Some((_, b, _)) = self.map.remove(&victim) {
+                self.total -= b;
+                if std::env::var_os("SYNAPTIX_NPU_LOG").is_some() {
+                    eprintln!("npu: граф {victim:016x} вытеснен из памяти ({} МБ статики)", b >> 20);
+                }
+            }
+        }
+        self.tick += 1;
+        self.total += bytes;
+        self.map.insert(hash, (g, bytes, self.tick));
+    }
+}
+
+static GRAPHS: Lazy<Mutex<GraphCache>> = Lazy::new(|| Mutex::new(GraphCache::default()));
 static STATS: Lazy<Mutex<Stats>> = Lazy::new(|| Mutex::new(Stats::default()));
 
 #[derive(Default, Clone, Debug)]
@@ -620,7 +668,7 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
     let hash = b.g.structure_hash();
     let log = std::env::var_os("SYNAPTIX_NPU_LOG").is_some();
     let t_seg = std::time::Instant::now();
-    let cached = GRAPHS.lock().get(&hash).cloned();
+    let cached = GRAPHS.lock().get(hash);
     let was_cached = cached.is_some();
     let cg = match cached {
         Some(c) => {
@@ -634,7 +682,7 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
             s.compiles += 1;
             s.compile_ms += t0.elapsed().as_secs_f64() * 1e3;
             drop(s);
-            GRAPHS.lock().insert(hash, c.clone());
+            GRAPHS.lock().insert(hash, c.clone(), b.static_bytes);
             c
         }
     };

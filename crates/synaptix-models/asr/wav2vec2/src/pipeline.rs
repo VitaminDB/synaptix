@@ -121,7 +121,10 @@ impl Wav2Vec2Ctc {
 
     /// Корзины длины записи для устройств с графом фиксированных форм (NPU):
     /// каждая новая длина входа — новая сборка графа (десятки секунд), поэтому
-    /// запись дополняется тишиной до ближайшей из ~13 длин. На CPU/CUDA — как есть.
+    /// запись дополняется тишиной до ближайшей из 4 длин. Каждая корзина — свой
+    /// набор контекстов с копией весов (~600 МБ у wav2vec2-large на диске и в PD),
+    /// поэтому корзин мало, а резидентными держатся последние (см. кэш графов).
+    /// На CPU/CUDA — как есть.
     /// `SYNAPTIX_LEN_BUCKETS=0` выключает, `SYNAPTIX_LEN_BUCKETS=1` включает везде.
     pub fn length_buckets_active(&self) -> bool {
         match std::env::var("SYNAPTIX_LEN_BUCKETS").ok().as_deref() {
@@ -133,7 +136,7 @@ impl Wav2Vec2Ctc {
 
     /// Длины корзин в сэмплах 16 кГц.
     pub fn length_buckets() -> &'static [usize] {
-        const SEC: [f32; 13] = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0];
+        const SEC: [f32; 4] = [2.0, 4.0, 8.0, 15.0];
         static B: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
         B.get_or_init(|| SEC.iter().map(|s| (s * SR as f32) as usize).collect())
     }
