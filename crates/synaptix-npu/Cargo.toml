@@ -1,0 +1,14 @@
+[package]
+name = "synaptix-npu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synaptix: NPU — общий API, профили моделей NPU и драйверы производителей."
+
+[dependencies]
+libc      = { workspace = true }
+half      = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+bytemuck  = { workspace = true }
