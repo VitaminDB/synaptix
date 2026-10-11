@@ -52,7 +52,8 @@ static SERIAL: AtomicU64 = AtomicU64::new(1);
 /// несколькими формами входа — корзинами длины — иначе не помещается).
 /// Вытеснение снимает только ссылку кэша; контекст освобождается, когда
 /// граф никем не держится (`Drop`). Бюджет — `SYNAPTIX_NPU_RESIDENT_MB`,
-/// по умолчанию ¾ `session_bytes` модели NPU.
+/// по умолчанию половина `session_bytes` модели NPU (контексты несут ещё
+/// spill-fill активаций, которого клиент не видит).
 #[derive(Default)]
 struct GraphCache {
     map: HashMap<u64, (Arc<dyn CompiledGraph>, usize, u64)>,
@@ -65,7 +66,7 @@ impl GraphCache {
         if let Some(mb) = std::env::var("SYNAPTIX_NPU_RESIDENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
             return mb << 20;
         }
-        crate::info().map(|i| (i.model.session_bytes as usize / 4) * 3).unwrap_or(1 << 30)
+        crate::info().map(|i| i.model.session_bytes as usize / 2).unwrap_or(1 << 30)
     }
 
     fn get(&mut self, hash: u64) -> Option<Arc<dyn CompiledGraph>> {

@@ -363,24 +363,30 @@ impl Npu for QnnNpu {
     fn compile(&self, key: &str, g: &Graph) -> Result<Box<dyn CompiledGraph>> {
         self.check(g)?;
         let key = format!("{key}#{:016x}#{}", g.structure_hash(), lower::variant(self.info.model));
+        // Контекст кладётся в первый PD, где есть место: место в ранних PD
+        // освобождается, когда графы отпускает кэш клиента. Все заняты и
+        // соединений меньше предела — открыть ещё одно.
         loop {
-            let lane = self.lanes.lock().last().cloned().expect("нет соединения с NPU");
-            match self.compile_on(&lane, &key, g)? {
-                Ok(cg) => return Ok(Box::new(cg)),
-                Err((ST_PD_FULL, msg)) => {
-                    let mut lanes = self.lanes.lock();
-                    if lanes.len() >= self.max_lanes {
-                        return Err(NpuError::Driver {
-                            driver: "qualcomm",
-                            msg: format!("{msg}; занято {} PD (SYNNPU_MAX_PD)", lanes.len()),
-                        });
-                    }
-                    if lanes.last().map(|l| l.id) == Some(lane.id) {
-                        lanes.push(Lane::open()?.0);
-                    }
+            let lanes: Vec<Lane> = self.lanes.lock().clone();
+            let mut last_full = String::new();
+            for lane in &lanes {
+                match self.compile_on(lane, &key, g)? {
+                    Ok(cg) => return Ok(Box::new(cg)),
+                    Err((ST_PD_FULL, msg)) => last_full = msg,
+                    Err((_, msg)) => return Err(NpuError::Driver { driver: "qualcomm", msg }),
                 }
-                Err((_, msg)) => return Err(NpuError::Driver { driver: "qualcomm", msg }),
             }
+            let mut guard = self.lanes.lock();
+            if guard.len() > lanes.len() {
+                continue; // кто-то уже открыл новое соединение — попробовать и его
+            }
+            if guard.len() >= self.max_lanes {
+                return Err(NpuError::Driver {
+                    driver: "qualcomm",
+                    msg: format!("{last_full}; занято {} PD (SYNNPU_MAX_PD)", guard.len()),
+                });
+            }
+            guard.push(Lane::open()?.0);
         }
     }
 }
