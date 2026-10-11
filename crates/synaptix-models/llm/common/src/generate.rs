@@ -11,7 +11,7 @@ use synaptix_infer::sampling::{
 };
 use synaptix_ops::rng::Philox4x32;
 
-use crate::model::{DecoderModel, KvCache, ModelError};
+use crate::model::{DecodeState, DecoderModel, KvCache, ModelError};
 
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
@@ -256,6 +256,9 @@ pub fn generate_streaming_resume(
     if prompt_ids.is_empty() {
         return Err(ModelError::Forward("empty prompt".into()));
     }
+    if model.npu_decode_ready() {
+        return generate_step_streaming_resume(model, kv, prompt_ids, cfg, sink);
+    }
     let device = model.device;
     let prompt_len = prompt_ids.len();
     let prefix = kv.seq_len.min(prompt_len.saturating_sub(1));
@@ -342,6 +345,72 @@ pub fn generate_streaming_resume(
 ///
 /// Требует [`DecoderModel::graph_decode_supported`]; иначе — ошибка, и
 /// вызывающий идёт обычным путём.
+pub fn generate_step_streaming_resume(
+    model: &DecoderModel,
+    kv: &mut KvCache,
+    prompt_ids: &[u32],
+    cfg: &GenerationConfig,
+    sink: &mut dyn StreamSink,
+) -> Result<(Vec<u32>, GenerationStats), ModelError> {
+    let prompt_len = prompt_ids.len();
+    let prefix = kv.seq_len.min(prompt_len.saturating_sub(1));
+    let eos = eos_set(cfg);
+    let mut sampler = TokenSampler::new(cfg, prompt_ids);
+    let mut state = model.make_decode_state()?;
+    let max_seq = kv.max_seq;
+    let step = |state: &mut DecodeState, kv: &mut KvCache, tok: u32, pos: usize| -> Result<Vec<f32>, ModelError> {
+        if pos >= max_seq {
+            return Err(ModelError::Shape(format!("KV overflow: позиция {pos} при max_seq {max_seq}")));
+        }
+        state.update(tok, pos as u32)?;
+        no_grad(|| model.forward_decode_dev(state, kv))?;
+        state
+            .logits
+            .to_dtype(synaptix_core::dtype::DType::F32)
+            .and_then(|t| t.to_device(synaptix_core::device::Device::Cpu))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ModelError::Forward(e.to_string()))
+    };
+    let t0 = Instant::now();
+    let mut last = Vec::new();
+    for (i, &tok) in prompt_ids[prefix..].iter().enumerate() {
+        if sink.interrupted() {
+            return Err(ModelError::Forward(INTERRUPTED.into()));
+        }
+        last = step(&mut state, kv, tok, prefix + i)?;
+    }
+    kv.seq_len = prompt_len;
+    let prefill_ms = t0.elapsed().as_millis();
+    let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+    if cfg.max_new_tokens == 0 {
+        return Ok((out, GenerationStats { prompt_tokens: prompt_len, new_tokens: 0, prefill_ms, decode_ms: 0 }));
+    }
+    let vocab = last.len();
+    let as_tensor = |v: Vec<f32>| {
+        Tensor::from_vec(v, vec![1usize, vocab], synaptix_core::device::Device::Cpu).map_err(|e| ModelError::Forward(e.to_string()))
+    };
+    let first = sampler.sample(&as_tensor(last)?)?;
+    out.push(first);
+    let mut cancelled = !sink.on_token(first);
+    let dec_t0 = Instant::now();
+    while !cancelled && out.len() < cfg.max_new_tokens {
+        let tok = *out.last().unwrap();
+        if eos.contains(&tok) {
+            break;
+        }
+        let pos = prompt_len + out.len() - 1;
+        let logits = step(&mut state, kv, tok, pos)?;
+        kv.seq_len = pos + 1;
+        let next = sampler.sample(&as_tensor(logits)?)?;
+        out.push(next);
+        cancelled = !sink.on_token(next);
+    }
+    let decode_ms = dec_t0.elapsed().as_millis();
+    let new_tokens = out.len();
+    Ok((out, GenerationStats { prompt_tokens: prompt_len, new_tokens, prefill_ms, decode_ms }))
+}
+
 pub fn generate_graph_streaming_resume(
     model: &DecoderModel,
     kv: &mut KvCache,

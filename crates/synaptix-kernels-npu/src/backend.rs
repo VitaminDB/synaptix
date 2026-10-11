@@ -92,6 +92,32 @@ macro_rules! on_cpu {
 }
 
 impl NpuBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn attention_dev(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        t_cache: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        scale: f32,
+        window: Option<i32>,
+    ) -> Result<()> {
+        let ok = float(q.1)
+            && q.1.rank() == 4
+            && k.1.rank() == 4
+            && q.1.dims()[2] == 1
+            && k.1.dims()[1] > 0
+            && q.1.dims()[1] % k.1.dims()[1] == 0
+            && k.1.dtype() == q.1.dtype()
+            && v.1.dtype() == q.1.dtype();
+        if !ok {
+            return Err(SynaptixError::Unsupported("flash_attention_dev на NPU"));
+        }
+        let ins = vec![inp(q.0, q.1)?, inp(k.0, k.1)?, inp(v.0, v.1)?, inp(t_cache.0, t_cache.1)?];
+        self.rec(NodeOp::AttentionDev { scale, window }, ins, out)
+    }
+
     fn rec(&self, op: NodeOp, ins: Vec<Input>, dst: (&mut Storage, &Layout)) -> Result<()> {
         let v = value::value_of(dst.0)?;
         record::record(op, ins, &v, dst.1.clone())
@@ -366,18 +392,50 @@ impl Backend for NpuBackend {
         _causal: bool,
         _stream: &Stream,
     ) -> Result<()> {
-        let ok = float(q.1)
-            && q.1.rank() == 4
-            && k.1.rank() == 4
-            && q.1.dims()[2] == 1
-            && q.1.dims()[1] == k.1.dims()[1]
-            && k.1.dtype() == q.1.dtype()
-            && v.1.dtype() == q.1.dtype();
+        self.attention_dev(q, k, v, t_cache, out, scale, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_window_dev(
+        &self,
+        q: (&Storage, &Layout),
+        k: (&Storage, &Layout),
+        v: (&Storage, &Layout),
+        t_cache: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        scale: f32,
+        window: i32,
+        _causal: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        self.attention_dev(q, k, v, t_cache, out, scale, Some(window))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rope_apply_dev(
+        &self,
+        x: (&Storage, &Layout),
+        cos: (&Storage, &Layout),
+        sin: (&Storage, &Layout),
+        start_pos: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        rotary_dim: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let d = x.1.dims();
+        let ok = float(x.1)
+            && d.len() == 4
+            && d[2] == 1
+            && rotary_dim % 2 == 0
+            && rotary_dim <= d[3]
+            && cos.1.rank() == 2
+            && cos.1.dims()[1] == rotary_dim
+            && cos.1.dtype() == x.1.dtype();
         if !ok {
-            return Err(SynaptixError::Unsupported("flash_attention_dev на NPU"));
+            return Err(SynaptixError::Unsupported("rope_apply_dev на NPU"));
         }
-        let ins = vec![inp(q.0, q.1)?, inp(k.0, k.1)?, inp(v.0, v.1)?, inp(t_cache.0, t_cache.1)?];
-        self.rec(NodeOp::AttentionDev { scale }, ins, out)
+        let ins = vec![inp(x.0, x.1)?, inp(cos.0, cos.1)?, inp(sin.0, sin.1)?, inp(start_pos.0, start_pos.1)?];
+        self.rec(NodeOp::RopeDev { rotary_dim }, ins, out)
     }
 
     fn conv2d(

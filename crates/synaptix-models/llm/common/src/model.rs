@@ -1022,6 +1022,9 @@ impl DecoderModel {
         let resident = |()| Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity);
         let offload = |()| Self::build_ext(cfg, weights, device, Some(Device::Cpu), compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity);
 
+        if matches!(device, Device::Npu(_)) {
+            return synaptix_core::backend::with_param_upload(|| resident(()));
+        }
         if device.is_cpu() || mode == OffloadMode::Resident {
             return resident(());
         }
@@ -1112,8 +1115,10 @@ impl DecoderModel {
 
         // Эмбеддинги, уже упакованные в бандле: плотной копии там нет,
         // поэтому и читать её не пробуем, и квантовать заново незачем.
+        let npu = matches!(device, Device::Npu(_));
+        let embed_dev = if npu { Device::Cpu } else { device };
         let prequant_embed = weights
-            .quant("model.embed_tokens.weight", device)
+            .quant("model.embed_tokens.weight", embed_dev)
             .transpose()?;
         // Оффлоад блоков значит, что модель на карту не влезла: таблица
         // эмбеддингов тогда живёт в RAM (см. `embed_host`). Упакованную в
@@ -1176,7 +1181,12 @@ impl DecoderModel {
         // lm_head: при tie_word_embeddings = embed (Dense, не квантуем — embed нужен
         // для gather). Иначе грузим lm_head.weight и квантуем по `lm_head_dtype`
         // (NVFP4 [vocab,hidden] %64==0 → GEMV; экономит 2.5GB→0.7GB чтения/токен).
-        let lm_head = if cfg.tie_word_embeddings && embed_dense.is_none() && embed_quant.is_some() {
+        let lm_head = if npu && cfg.tie_word_embeddings && embed_quant.is_some() {
+            let q = weights
+                .quant("model.embed_tokens.weight", device)
+                .ok_or_else(|| ModelError::Build("NPU: голова без квантованной таблицы".into()))??;
+            QLinear::Quant(q)
+        } else if cfg.tie_word_embeddings && embed_dense.is_none() && embed_quant.is_some() {
             // Эмбеддинг уже упакован (GGUF / бандл с квантованным
             // `embed_tokens`): голова — та же ручка на тот же блоб, ни копии,
             // ни повторного кванта. Форма [vocab, hidden] у него и так «как у
@@ -1851,10 +1861,8 @@ impl DecoderModel {
                     .and_then(|t| t.reshape(vec![input_ids.numel()]))
                     .coerr()?;
                 let emb = q.embed_gather(&flat).coerr()?;
-                // Gather кванта отдаёт F16; при BF16-счёте (GGUF на sm_80+,
-                // Gemma) приводим к рабочему типу — иначе KV-append видит
-                // разные типы.
                 let emb = if emb.dtype() != self.dtype { emb.to_dtype(self.dtype).coerr()? } else { emb };
+                let emb = if emb.device() != self.device { emb.to_device(self.device).coerr()? } else { emb };
                 dims.push(self.config.hidden_size);
                 emb.reshape(dims).coerr()
             }
@@ -1872,7 +1880,8 @@ impl DecoderModel {
         match (&self.embed_q, &self.embed) {
             (Some(q), _) => {
                 let emb = q.embed_gather(ids_flat).coerr()?;
-                if emb.dtype() != self.dtype { emb.to_dtype(self.dtype).coerr() } else { Ok(emb) }
+                let emb = if emb.dtype() != self.dtype { emb.to_dtype(self.dtype).coerr()? } else { emb };
+                if emb.device() != self.device { emb.to_device(self.device).coerr() } else { Ok(emb) }
             }
             (None, Some(t)) => t.embed_gather(ids_flat).coerr(),
             (None, None) => Err(ModelError::Build("embed отсутствует".into())),
@@ -2376,10 +2385,11 @@ impl DecoderModel {
     /// Batched decode state for `batch` independent rows (per-row token +
     /// position). `batch==1` is the ordinary single-sequence decode.
     pub fn make_decode_state_batched(&self, batch: usize) -> Result<DecodeState, ModelError> {
-        if !self.config.graph_decode_ok() {
+        let npu = self.npu_decode_ready();
+        if !npu && !self.config.graph_decode_ok() {
             return Err(ModelError::Forward("make_decode_state: профиль не поддержан CUDA-graph (два реальных RoPE)".into()));
         }
-        if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
+        if !npu && self.config.sliding_window.is_some() && !self.ring_kv_ok() {
             return Err(ModelError::Forward(
                 "make_decode_state: sliding-профиль требует ring-KV (CUDA, f16/bf16, hd=128)".into(),
             ));
@@ -2403,8 +2413,6 @@ impl DecoderModel {
             self.rope_local.as_ref().unwrap_or(&self.rope_global)
         };
         let (rope_cos, rope_sin) = dup(rope)?;
-        // Вторая пара нужна, только если sliding-слои вращаются иначе: у Gemma
-        // у них и база другая, и голова уже.
         let (rope_cos_local, rope_sin_local) = match self.rope_local.as_ref() {
             Some(r) if self.config.rope_global.rotary_dim > 0 => {
                 let (c, s) = dup(r)?;
@@ -2563,18 +2571,23 @@ impl DecoderModel {
         true
     }
 
+    pub fn npu_decode_ready(&self) -> bool {
+        matches!(self.device, Device::Npu(_))
+            && self.blocks_all_resident()
+            && self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Full(_)) && b.moe.is_none())
+    }
+
     pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
-        if !self.graph_decode_ready() {
+        let npu = self.npu_decode_ready();
+        if !npu && !self.graph_decode_ready() {
             return Err(ModelError::Forward(
                 "forward_decode_dev: профиль не поддержан (MoE без device-пути, оффлоад блоков или sliding без ring-KV)".into(),
             ));
         }
-        if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
+        if !npu && self.config.sliding_window.is_some() && !self.ring_kv_ok() {
             return Err(ModelError::Forward("forward_decode_dev: sliding без ring-KV не поддержан".into()));
         }
         let dev = self.device;
-        // Batch B: state.input is [B, 1]; B>1 runs a batched decode (e.g. CFG
-        // cond+uncond in one forward) with per-row positions in state.pos_dev.
         let b = state.input.dims()[0];
         let ids_flat = state.input.reshape(vec![b]).coerr()?;
         let emb = prof(dev, "embed_gather", || self.embed_rows(&ids_flat))?;
@@ -2585,19 +2598,15 @@ impl DecoderModel {
         if let Some(w) = &self.embed_norm {
             hidden = rms_norm(&hidden, w, self.config.rms_norm_eps).coerr()?;
         }
-
-        // Fused residual+norm цепочкой: каждая пара (add, следующий rms_norm)
-        // сливается в один launch (rmsnorm_residual). `h` — нормированный вход в
-        // attn слоя idx; внутри слоя сначала fuse(add_attn, mlp_norm), затем
-        // fuse(add_mlp, next_attn_norm). Стартовый attn-norm слоя 0 — отдельно.
+        let pli = match &self.ple {
+            Some(p) => Some(self.ple_inputs(p, &state.input, &hidden)?),
+            None => None,
+        };
         let nb = self.blocks.len();
         let mut h = prof(dev, "rms_norm", || {
             rms_norm(&hidden, &self.blocks[0].pre_attn_norm, self.blocks[0].rms_eps)
         })
         .coerr()?;
-        // Вход внимания слитого пути: квант-пара, которую выдал хвост
-        // предыдущего слоя. `None` — пары нет (первый слой, слой после
-        // обычного пути): её посчитает сам слой из `h`.
         let mut h_pair: Option<(Tensor, Tensor)> = None;
         for idx in 0..nb {
             let blk = &self.blocks[idx];
@@ -2623,18 +2632,16 @@ impl DecoderModel {
                 continue;
             }
             h_pair = None;
+            let cache_idx = self.config.kv_source(idx).unwrap_or(idx);
             let mixed = match &blk.mixer {
-                Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[idx], state)?,
+                Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[cache_idx], state)?,
                 Mixer::Linear(la) => la.forward_decode_dev(&h, &mut kv.layers[idx])?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
-            // hidden = hidden + mixed; h_mlp = norm(hidden, pre_mlp).
             let (new_hidden, h_mlp) =
                 fused_add_norm(dev, &mixed, &hidden, &blk.pre_mlp_norm, blk.rms_eps)?;
             hidden = new_hidden;
             let mlp_out = blk.mlp.forward(&h_mlp)?;
-            // MoE-ветка: роутер и выбор экспертов идут НА КАРТЕ
-            // (`MoeFfn::forward_dev`), иначе граф не захватился бы.
             let mlp_out = match &blk.moe {
                 None => mlp_out,
                 Some(moe) => {
@@ -2657,10 +2664,12 @@ impl DecoderModel {
                 }
             };
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
-            // `layer_scalar` умножает СУММУ с residual, поэтому слить сложение
-            // со следующей нормой одним ядром тут нельзя.
-            if let Some(a) = blk.layer_scalar.filter(|a| *a != 1.0) {
-                hidden = hidden.add(&mlp_out).coerr()?.mul_scalar(a).coerr()?;
+            if blk.ple.is_some() || blk.layer_scalar.is_some_and(|a| a != 1.0) {
+                hidden = hidden.add(&mlp_out).coerr()?;
+                hidden = self.apply_ple(blk, idx, hidden, pli.as_ref())?;
+                if let Some(a) = blk.layer_scalar.filter(|a| *a != 1.0) {
+                    hidden = hidden.mul_scalar(a).coerr()?;
+                }
                 if idx + 1 < nb {
                     let nx = &self.blocks[idx + 1];
                     h = rms_norm(&hidden, &nx.pre_attn_norm, nx.rms_eps).coerr()?;
@@ -2668,7 +2677,6 @@ impl DecoderModel {
                 continue;
             }
             if idx + 1 < nb {
-                // hidden = hidden + mlp_out; h = norm(hidden, next.pre_attn).
                 let nb_next = &self.blocks[idx + 1];
                 let (new_hidden2, h_next) =
                     fused_add_norm(dev, &mlp_out, &hidden, &nb_next.pre_attn_norm, nb_next.rms_eps)?;
@@ -2679,8 +2687,6 @@ impl DecoderModel {
             }
         }
 
-        // Финальная норма с квант-эпилогом: голова читает пару сразу, без
-        // отдельного квантования.
         let last_in = hidden.reshape(vec![b, self.config.hidden_size]).coerr()?;
         let logits = if b == 1 {
             let (normed, pq) =
@@ -3507,10 +3513,7 @@ impl FullAttn {
             LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
         let dev = h.device();
-        // Batch B (>1 for batched CFG decode); seq dim stays 1. Per-row RoPE/KV
-        // positions come from `state.pos_dev`/`tcache_dev` ([B]).
         let b = h.dims()[0];
-        // q/k/v берут один `h` → квантуем 1× и переиспользуем во всех трёх.
         let act = quant_act_shared(h, self.q_proj.quant_dtype());
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let qg = add_bias(proj_shared(&self.q_proj, h, &act, dev, "attn_qproj")?, &self.q_bias)?;
@@ -3523,44 +3526,47 @@ impl FullAttn {
             (qg.reshape(vec![b, 1, nh, hd]).coerr()?, None)
         };
         let q = q.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        let k = add_bias(proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?, &self.k_bias)?
-            .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
-        // `attention_k_eq_v`: значения — выход `k_proj` ДО Q/K-нормы и RoPE.
-        let v = match self.v_proj.as_ref() {
-            Some(vp) => add_bias(proj_shared(vp, h, &act, dev, "attn_vproj")?, &self.v_bias)?
-                .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
-            None => k.clone(),
-        };
-        let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
-        let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
-        let v = prof(dev, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
-        // Sliding- и global-слои вращаются разными таблицами (Gemma).
+        let npu = matches!(dev, Device::Npu(_));
         let (rope_cos, rope_sin) = match (self.sliding_window, &state.rope_cos_local, &state.rope_sin_local) {
             (Some(_), Some(c), Some(s)) => (c, s),
             _ => (&state.rope_cos, &state.rope_sin),
         };
-        let (q, k) = if self.rotary_dim > 0 {
-            let q = prof(dev, "attn_rope", || q.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
-            let k = prof(dev, "attn_rope", || k.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?;
-            (q, k)
+        let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
+        let q = if self.rotary_dim > 0 {
+            prof(dev, "attn_rope", || q.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?
         } else {
-            (q, k)
+            q
+        };
+        let kv_new = if self.kv_shared {
+            None
+        } else {
+            let k = add_bias(proj_shared(&self.k_proj, h, &act, dev, "attn_kproj")?, &self.k_bias)?
+                .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
+            let v = match self.v_proj.as_ref() {
+                Some(vp) => add_bias(proj_shared(vp, h, &act, dev, "attn_vproj")?, &self.v_bias)?
+                    .reshape(vec![b, 1, nkv, hd]).coerr()?.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?,
+                None => k.clone(),
+            };
+            let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
+            let v = prof(dev, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
+            let k = if self.rotary_dim > 0 {
+                prof(dev, "attn_rope", || k.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?
+            } else {
+                k
+            };
+            Some((k, v))
         };
 
         if let Some(w) = self.sliding_window {
-            prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
-                kvl.k.kv_append_dev(&k, &state.ring_pos_dev).coerr()?;
-                kvl.v.kv_append_dev(&v, &state.ring_pos_dev).coerr()
-            })?;
+            let (pos, len) = if npu { (&state.pos_dev, &state.tcache_dev) } else { (&state.ring_pos_dev, &state.ring_len_dev) };
+            if let Some((k, v)) = &kv_new {
+                prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
+                    kvl.k.kv_append_dev(k, pos).coerr()?;
+                    kvl.v.kv_append_dev(v, pos).coerr()
+                })?;
+            }
             let attn = prof(dev, "attn_flash", || {
-                q.flash_attention_window_dev(
-                    &kvl.k,
-                    &kvl.v,
-                    &state.ring_len_dev,
-                    self.attn_scale,
-                    (w - 1) as i32,
-                    true,
-                )
+                q.flash_attention_window_dev(&kvl.k, &kvl.v, len, self.attn_scale, (w - 1) as i32, true)
             })
             .map_err(|e| ModelError::Forward(e.to_string()))?;
             let attn = attn.permute(vec![0, 2, 1, 3]).coerr()?.contiguous().coerr()?;
@@ -3574,10 +3580,12 @@ impl FullAttn {
 
         let attn = if kvl.k.dtype() == DType::MXFP8 {
             let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kvl;
-            prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
-                kc.kv_append_quant_mxfp8_dev(ksc.as_mut().unwrap(), &k, &state.pos_dev).coerr()?;
-                vc.kv_append_quant_mxfp8_dev(vsc.as_mut().unwrap(), &v, &state.pos_dev).coerr()
-            })?;
+            if let Some((k, v)) = &kv_new {
+                prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
+                    kc.kv_append_quant_mxfp8_dev(ksc.as_mut().unwrap(), k, &state.pos_dev).coerr()?;
+                    vc.kv_append_quant_mxfp8_dev(vsc.as_mut().unwrap(), v, &state.pos_dev).coerr()
+                })?;
+            }
             prof(dev, "attn_flash", || q.flash_attention_mxfp8kv_dev(
                 kc,
                 vc,
@@ -3589,10 +3597,12 @@ impl FullAttn {
             ))
             .map_err(|e| ModelError::Forward(e.to_string()))?
         } else {
-            prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
-                kvl.k.kv_append_dev(&k, &state.pos_dev).coerr()?;
-                kvl.v.kv_append_dev(&v, &state.pos_dev).coerr()
-            })?;
+            if let Some((k, v)) = &kv_new {
+                prof(dev, "attn_kv_append", || -> Result<(), ModelError> {
+                    kvl.k.kv_append_dev(k, &state.pos_dev).coerr()?;
+                    kvl.v.kv_append_dev(v, &state.pos_dev).coerr()
+                })?;
+            }
             prof(dev, "attn_flash", || q.flash_attention_dev(&kvl.k, &kvl.v, &state.tcache_dev, self.attn_scale, true))
                 .map_err(|e| ModelError::Forward(e.to_string()))?
         };

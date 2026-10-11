@@ -31,7 +31,8 @@ pub enum NodeOp {
     Attention { scale: f32, causal: bool },
     EmbedGather,
     KvAppend,
-    AttentionDev { scale: f32 },
+    AttentionDev { scale: f32, window: Option<i32> },
+    RopeDev { rotary_dim: usize },
     Concat(usize),
     LinearQ { n: usize, k: usize, scales: Arc<Vec<f32>> },
 }
@@ -560,20 +561,31 @@ impl Builder {
                 let upd = self.bin(BinaryKind::Mul, diff, oh)?;
                 self.bin(BinaryKind::Add, buf, upd)?
             }
-            NodeOp::AttentionDev { scale } => {
+            NodeOp::AttentionDev { scale, window } => {
                 let q = self.input(&n.ins[0], true)?;
                 let k = self.input(&n.ins[1], true)?;
                 let v = self.input(&n.ins[2], true)?;
                 let t = self.input(&n.ins[3], true)?;
                 let dt = self.g.tensor(q).dtype;
-                let cap = self.g.tensor(k).shape[2] as usize;
+                let qs = self.g.tensor(q).shape.clone();
+                let ks = self.g.tensor(k).shape.clone();
+                let cap = ks[2] as usize;
+                let (nh, nkv, hd) = (qs[1], ks[1], qs[3]);
                 let sc = self.scalar(*scale, q)?;
                 let q = self.bin(BinaryKind::Mul, q, sc)?;
+                let q = if nh != nkv { self.g.reshape(q, &[qs[0], nkv, nh / nkv, hd]).map_err(err)? } else { q };
                 let s = self.g.matmul(q, k, false, true).map_err(err)?;
                 let iota = self.iota(cap, dt)?;
                 let tf = self.cast(t, dt);
                 let m = self.bin(BinaryKind::Sub, tf, iota)?;
-                let m = self.clamp01(m);
+                let mut m = self.clamp01(m);
+                if let Some(w) = window {
+                    let lo = self.scalar((*w + 1) as f32, tf)?;
+                    let start = self.bin(BinaryKind::Sub, tf, lo)?;
+                    let d = self.bin(BinaryKind::Sub, iota, start)?;
+                    let inw = self.clamp01(d);
+                    m = self.bin(BinaryKind::Mul, m, inw)?;
+                }
                 let one = self.scalar(1.0, m)?;
                 let m = self.bin(BinaryKind::Sub, m, one)?;
                 let big = self.scalar(60000.0, m)?;
@@ -581,7 +593,50 @@ impl Builder {
                 let bias = self.g.reshape(bias, &[1, 1, 1, cap as u32]).map_err(err)?;
                 let s = self.bin(BinaryKind::Add, s, bias)?;
                 let p = self.g.softmax(s);
-                self.g.matmul(p, v, false, false).map_err(err)?
+                let o = self.g.matmul(p, v, false, false).map_err(err)?;
+                if nh != nkv { self.g.reshape(o, &qs).map_err(err)? } else { o }
+            }
+            NodeOp::RopeDev { rotary_dim } => {
+                let x = self.input(&n.ins[0], true)?;
+                let cos = self.input(&n.ins[1], true)?;
+                let sin = self.input(&n.ins[2], true)?;
+                let pos = self.input(&n.ins[3], true)?;
+                let xs = self.g.tensor(x).shape.clone();
+                let dt = self.g.tensor(x).dtype;
+                let rd = *rotary_dim as i32;
+                let hd = xs[3] as i32;
+                let half = rd / 2;
+                let pos = self.cast(pos, DType::I32);
+                let pos = self.g.reshape(pos, &[1]).map_err(err)?;
+                let gather = |b: &mut Self, tab: TensorId| -> Result<TensorId> {
+                    let w = b.g.tensor(tab).shape[1];
+                    let r = b.g.node(dt, &[1, w], |out| Op::Gather { x: tab, indices: pos, axis: 0, out });
+                    b.g.reshape(r, &[1, 1, 1, w]).map_err(err)
+                };
+                let c = gather(self, cos)?;
+                let sn = gather(self, sin)?;
+                let slice = |b: &mut Self, from: i32, to: i32| -> TensorId {
+                    let mut os = xs.clone();
+                    os[3] = (to - from) as u32;
+                    let end = vec![xs[0] as i32, xs[1] as i32, xs[2] as i32, to];
+                    b.g.node(dt, &os, |out| Op::Slice { x, begin: vec![0, 0, 0, from], end, stride: vec![1; 4], out })
+                };
+                let x1 = slice(self, 0, half);
+                let x2 = slice(self, half, rd);
+                let xr = if rd == hd { x } else { slice(self, 0, rd) };
+                let nx2 = self.g.unary(UnaryKind::Neg, x2);
+                let mut hs = xs.clone();
+                hs[3] = rd as u32;
+                let rot = self.g.node(dt, &hs, |out| Op::Concat { xs: vec![nx2, x1], axis: 3, out });
+                let a = self.bin(BinaryKind::Mul, xr, c)?;
+                let b2 = self.bin(BinaryKind::Mul, rot, sn)?;
+                let y = self.bin(BinaryKind::Add, a, b2)?;
+                if rd == hd {
+                    y
+                } else {
+                    let rest = slice(self, rd, hd);
+                    self.g.node(dt, &xs, |out| Op::Concat { xs: vec![y, rest], axis: 3, out })
+                }
             }
             NodeOp::Conv2d { stride, padding, bias } => {
                 let x = self.input(&n.ins[0], true)?;

@@ -77,7 +77,10 @@ impl Gemma4Pipeline {
         // резидуальный поток обязан быть BF16 даже при квантованных весах —
         // каст bf16↔f16 вокруг квант-ядра делает сам `QLinear::Quant`.
         let mut precision = precision;
-        if precision.compute == DType::F16 {
+        if matches!(device, Device::Npu(_)) {
+            precision.compute = DType::F16;
+            precision.kv = DType::F16;
+        } else if precision.compute == DType::F16 {
             precision.compute = DType::BF16;
         }
         let weights = Gemma4Weights::open(&path, device, precision.compute)
