@@ -3398,8 +3398,8 @@ impl FullAttn {
                 && self.use_flash
                 && pad_bias.is_none()
                 && bidi_spans.is_empty()
-                && matches!(device, Device::Cuda(_))
-                && matches!(kv.k.dtype(), DType::F16 | DType::BF16)
+                && ((matches!(device, Device::Cuda(_)) && matches!(kv.k.dtype(), DType::F16 | DType::BF16))
+                    || (device.is_cpu() && matches!(kv.k.dtype(), DType::F32 | DType::F16 | DType::BF16)))
             {
                 let tc = Tensor::from_vec(vec![local_len as u32], vec![1usize], device).coerr()?;
                 let r = match self.sliding_window {

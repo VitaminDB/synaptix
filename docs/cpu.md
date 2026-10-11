@@ -67,3 +67,20 @@ cargo check -p synaptix-kernels-cpu --target aarch64-unknown-linux-gnu
 5. Проверка NEON-веток на телефоне/qemu, замеры на SM8475.
 6. Intel iGPU (OpenCL/Level Zero есть в системе): Xe-LPG Arrow Lake по пропускной способности сравним с
    24 потоками AVX2, отдельный бэкенд не оправдан — не планируется.
+
+## int8 по каналу (q8row) на CPU
+Веса `DType::Q8Row` (i8 `[N,K]` + шкала строки, см. docs/npu.md) исполняются без распаковки:
+- декод (m < 8): активация квантуется на лету в int8 блоками по 32 (как Q8_0 у llama.cpp), свёртка — `sdot`
+  (ARM dotprod, через `asm!`: `vdotq_s32` в стабильном Rust ещё нестабилен) или AVX2 `maddubs`; итог × шкала блока ×
+  шкала строки (`quant/q8dot.rs`);
+- префилл — деквант строк в f32 и панельный GEMM;
+- `QuantWeight::embed_gather` для q8row — выборка и деквант строк таблицы (эмбеддинги Gemma-4 в int8);
+- внимание на декоде — CPU-ядро по KV-буферу без `repeat_kv` (`flash_attention_dev`/`window_dev`): 1,97 → 0,23 мс на
+  слой у Gemma-4 E2B на телефоне.
+
+Потоки по умолчанию — только быстрые ядра (частота ≥ 70 % максимальной, `/sys/…/cpuinfo_max_freq`): на Snapdragon 8+
+Gen 1 это 4 из 8, малые A510 тормозили общий проход (8 потоков — 4,3 ток/с, 4 — 6,7). `SYNAPTIX_THREADS` — вручную.
+
+Gemma-4 q8row (`synaptix quantize … --format q8row --include model.language_model. --embed q8row`), Xiaomi 12T Pro,
+CPU: E2B — ~6,9 ток/с, E4B — ~3,1 ток/с; ноутбук (x86, AVX2): E2B — 9 ток/с. Декод упирается в память: на токен
+читается ~2 ГБ int8 (E2B), голова на 262 тыс. слов — 400 МБ.

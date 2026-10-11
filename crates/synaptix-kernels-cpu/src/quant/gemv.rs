@@ -37,6 +37,42 @@ pub fn x_rows_f32(dt: DType, bytes: &[u8], off: usize, m: usize, k: usize) -> Re
 pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
     let (n, k) = (view.n, view.k);
     debug_assert_eq!(out.len(), m * n);
+    if m < PREFILL_M && view.dtype == DType::Q8Row {
+        use super::q8dot;
+        let op = blocked::SendPtr::new(out.as_mut_ptr());
+        if k % q8dot::QK == 0 {
+            let mut xq = vec![0i8; m * k];
+            let mut xs = vec![0f32; m * k / q8dot::QK];
+            for i in 0..m {
+                q8dot::quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * k / q8dot::QK..(i + 1) * k / q8dot::QK]);
+            }
+            let chunk = (n / (crate::common::threads() * 8)).max(16);
+            (0..n.div_ceil(chunk)).into_par_iter().for_each(|ci| {
+                let (n0, n1) = (ci * chunk, ((ci + 1) * chunk).min(n));
+                for j in n0..n1 {
+                    let q = view.row_bytes_of(j);
+                    let sc = view.q8_scale(j);
+                    for i in 0..m {
+                        let nb = k / q8dot::QK;
+                        let v = q8dot::dot(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], q) * sc;
+                        unsafe { *op.ptr().add(i * n + j) = v };
+                    }
+                }
+            });
+            return;
+        }
+        par_chunks_cost(n, k * (m + 1) / 8, |n0, n1| {
+            for j in n0..n1 {
+                let q = view.row_bytes_of(j);
+                let sc = view.q8_scale(j);
+                for i in 0..m {
+                    let v = dot_f32_i8(&xf[i * k..(i + 1) * k], q) * sc;
+                    unsafe { *op.ptr().add(i * n + j) = v };
+                }
+            }
+        });
+        return;
+    }
     if m < PREFILL_M {
         let op = blocked::SendPtr::new(out.as_mut_ptr());
         par_chunks_cost(n, k * (m + 2) / 4, |n0, n1| {
@@ -61,6 +97,23 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
         }
         blocked::linear_panel(m, cols, k, xf, &wrows, op.at(c0), n);
     });
+}
+
+#[inline]
+pub fn dot_f32_i8(x: &[f32], q: &[u8]) -> f32 {
+    let mut acc = [0f32; 16];
+    let n = x.len().min(q.len());
+    let full = n / 16 * 16;
+    for (xc, qc) in x[..full].chunks_exact(16).zip(q[..full].chunks_exact(16)) {
+        for l in 0..16 {
+            acc[l] += xc[l] * (qc[l] as i8) as f32;
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for i in full..n {
+        s += x[i] * (q[i] as i8) as f32;
+    }
+    s
 }
 
 fn out_dims_check(x_lo: &Layout, w: &QuantWeight, out_lo: &Layout) -> Result<usize> {

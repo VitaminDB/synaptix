@@ -310,6 +310,30 @@ impl QuantWeight {
         ))?;
         let ids_c = if ids.is_contiguous() { ids.clone() } else { ids.contiguous()? };
         let n = ids_c.numel();
+        if self.dtype == DType::Q8Row {
+            let idx: Vec<u32> = ids_c.to_dtype(DType::U32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            let k = self.k;
+            let mut out = vec![half::f16::ZERO; n * k];
+            let mut row = vec![0f32; k];
+            let mut fill = |p: &[u8], sc: &[u8]| {
+                for (i, &id) in idx.iter().enumerate() {
+                    let r = (id as usize).min(self.n.saturating_sub(1));
+                    let scale = f32::from_le_bytes([sc[r * 4], sc[r * 4 + 1], sc[r * 4 + 2], sc[r * 4 + 3]]);
+                    crate::quant::q8row::dequant_row(&p[r * k..(r + 1) * k], scale, &mut row);
+                    for (d, v) in out[i * k..(i + 1) * k].iter_mut().zip(&row) {
+                        *d = half::f16::from_f32(*v);
+                    }
+                }
+            };
+            match (packed.as_cpu(), self.scales().as_cpu()) {
+                (Some(p), Some(sc)) => fill(p.as_bytes(), sc.as_bytes()),
+                _ => {
+                    let (p, sc) = self.q8row_host()?;
+                    fill(&p, &crate::quant::q8row::scales_to_bytes(&sc));
+                }
+            }
+            return Tensor::from_vec(out, vec![n, k], self.device);
+        }
         let out_layout = Layout::contiguous(Shape::new(vec![n, self.k]), DType::F16);
         let backend = registry::backend_for(self.device)?;
         let mut storage =

@@ -45,6 +45,12 @@ impl<'a> WeightView<'a> {
                 }
                 k
             }
+            DType::Q8Row => {
+                if scales.is_none_or(|s| s.len() < n * 4) {
+                    return Err(SynaptixError::Unsupported("WeightView: Q8Row требует шкалы f32 на строку"));
+                }
+                k
+            }
             DType::Sq { .. } | DType::Ggml(_) => synaptix_core::quant::block_row_bytes(dtype, k)
                 .ok_or(SynaptixError::Unsupported("WeightView: K не кратен блоку формата"))?,
             _ => return Err(SynaptixError::Unsupported("WeightView: не квантованный dtype")),
@@ -60,6 +66,12 @@ impl<'a> WeightView<'a> {
         &self.packed[i * self.row_bytes..(i + 1) * self.row_bytes]
     }
 
+    #[inline]
+    pub fn q8_scale(&self, i: usize) -> f32 {
+        let s = &self.scales.unwrap()[i * 4..i * 4 + 4];
+        f32::from_le_bytes([s[0], s[1], s[2], s[3]])
+    }
+
     pub fn row(&self, i: usize, dst: &mut [f32]) {
         debug_assert!(dst.len() >= self.k);
         let src = self.row_bytes_of(i);
@@ -71,6 +83,7 @@ impl<'a> WeightView<'a> {
                 let nb = self.k / 32;
                 mxfp8_dequant_row(src, &self.scales.unwrap()[i * nb..(i + 1) * nb], dst)
             }
+            DType::Q8Row => synaptix_core::quant::q8row::dequant_row(src, self.q8_scale(i), &mut dst[..self.k]),
             _ => unreachable!(),
         }
     }
