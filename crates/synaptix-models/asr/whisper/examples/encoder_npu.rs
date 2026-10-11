@@ -38,6 +38,11 @@ fn main() -> R<()> {
             (Device::Cpu, DType::F32)
         }
     };
+    let dtype = match std::env::var("DTYPE").as_deref() {
+        Ok("f16") => DType::F16,
+        Ok("f32") => DType::F32,
+        _ => dtype,
+    };
     let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
 
     let t = Instant::now();
@@ -58,7 +63,10 @@ fn main() -> R<()> {
     for i in 0..iters {
         let t = Instant::now();
         let mel = Tensor::from_vec(flat.clone(), (1, n_mels, n_frames), device)?.to_dtype(dtype)?;
-        let y = enc.forward(&mel)?;
+        let y = match std::env::var("LAYERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(n) => enc.forward_partial(&mel, n)?,
+            None => enc.forward(&mel)?,
+        };
         let v = y.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         println!("прогон {i}: {:.1} мс, выход {:?}", t.elapsed().as_secs_f64() * 1e3, y.dims());
         out = v;

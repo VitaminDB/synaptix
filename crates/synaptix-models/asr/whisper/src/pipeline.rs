@@ -12,7 +12,7 @@ use synaptix_tokenizer::tokenizer::Tokenizer;
 use crate::config::{GenerationConfig, WhisperConfig};
 use crate::loader::WhisperWeights;
 use crate::mel::whisper_log_mel;
-use crate::model::WhisperModel;
+use crate::model::{WhisperEncoder, WhisperModel};
 use crate::model::WhisperDecodeState;
 use crate::{Result, WhisperError};
 
@@ -43,9 +43,28 @@ pub struct WhisperPipeline {
     special: SpecialTokens,
     device: Device,
     dtype: DType,
+    split_encoder: Option<(WhisperEncoder, Device, DType)>,
 }
 
 impl WhisperPipeline {
+    /// Энкодер — на отдельном устройстве (например, NPU), декодер — на `device`.
+    pub fn with_encoder_on(mut self, path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self> {
+        let w = WhisperWeights::open(path, device, dtype)?;
+        self.split_encoder = Some((WhisperEncoder::load(&w)?, device, dtype));
+        Ok(self)
+    }
+
+    fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        match &self.split_encoder {
+            None => self.encode(mel),
+            Some((enc, dev, dt)) => {
+                let x = mel.to_device(*dev)?.to_dtype(*dt)?;
+                let y = enc.forward(&x)?;
+                Ok(y.to_device(self.device)?.to_dtype(self.dtype)?)
+            }
+        }
+    }
+
     pub fn from_syn(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self> {
         let w = WhisperWeights::open(path, device, dtype)?;
         let model = WhisperModel::load(&w)?;
@@ -75,6 +94,7 @@ impl WhisperPipeline {
             special,
             device,
             dtype,
+            split_encoder: None,
         })
     }
 
@@ -121,7 +141,7 @@ impl WhisperPipeline {
         let mut seg = audio[..audio.len().min(N_SAMPLES)].to_vec();
         seg.resize(N_SAMPLES, 0.0);
         let mel = self.mel_tensor(&seg)?;
-        let enc = self.model.encoder.forward(&mel)?;
+        let enc = self.encode(&mel)?;
         let id = self.detect_language(&enc)?;
         let token = self
             .tokenizer
@@ -149,7 +169,7 @@ impl WhisperPipeline {
         if matches!(self.device, Device::Cuda(_)) {
             return self.decode_segment_graph(mel, lang_token, task);
         }
-        let enc_out = self.model.encoder.forward(mel)?;
+        let enc_out = self.encode(mel)?;
         let mut cache = self.model.decoder.init_cache(&enc_out)?;
 
         let task_tok = match task {
@@ -194,7 +214,7 @@ impl WhisperPipeline {
             Device::Cuda(o) => o,
             _ => return Err(WhisperError::Audio("graph decode requires CUDA".into())),
         };
-        let enc_out = self.model.encoder.forward(mel)?;
+        let enc_out = self.encode(mel)?;
         let max_target = self.config.max_target_positions;
         let mut cache =
             self.model
@@ -268,7 +288,7 @@ impl WhisperPipeline {
     /// Декод одного сегмента С timestamps (порт HF `WhisperTimeStampLogitsProcessor`).
     /// Возвращает сырые сгенерированные токены (с timestamp-токенами, без префикса).
     fn decode_segment_ts(&self, mel: &Tensor, lang_token: u32, task: Task) -> Result<Vec<u32>> {
-        let enc_out = self.model.encoder.forward(mel)?;
+        let enc_out = self.encode(mel)?;
         let mut cache = self.model.decoder.init_cache(&enc_out)?;
         let task_tok = match task {
             Task::Transcribe => self.special.transcribe,
@@ -400,7 +420,7 @@ impl WhisperPipeline {
                     .language_token(l)
                     .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {l}")))?,
                 None => {
-                    let enc = self.model.encoder.forward(&mel)?;
+                    let enc = self.encode(&mel)?;
                     self.detect_language(&enc)?
                 }
             };
@@ -465,7 +485,7 @@ impl WhisperPipeline {
                     .language_token(l)
                     .ok_or_else(|| WhisperError::Tokenizer(format!("unknown language {l}")))?,
                 None => {
-                    let enc = self.model.encoder.forward(&mel)?;
+                    let enc = self.encode(&mel)?;
                     self.detect_language(&enc)?
                 }
             };

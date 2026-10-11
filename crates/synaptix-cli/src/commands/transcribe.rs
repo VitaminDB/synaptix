@@ -17,6 +17,7 @@ pub struct TranscribeArgs {
     pub engine: String,
     pub format: String,
     pub output: Option<PathBuf>,
+    pub encoder_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +146,13 @@ pub fn run(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (text, Vec::new(), Some("ru".to_string()))
         }
         Engine::Whisper => {
-            let pipe = WhisperPipeline::from_syn(&args.model, dev, dtype)?;
+            let mut pipe = WhisperPipeline::from_syn(&args.model, dev, dtype)?;
+            if let Some(ed) = &args.encoder_device {
+                let edev = device::resolve(ed);
+                let edt = if edev == Device::Cpu { DType::F32 } else { DType::F16 };
+                pipe = pipe.with_encoder_on(&args.model, edev, edt)?;
+                eprintln!("synaptix transcribe: энкодер на {edev:?}, декодер на {dev:?}");
+            }
             eprintln!("synaptix transcribe: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
             let language = match &args.language {
                 Some(l) => l.clone(),

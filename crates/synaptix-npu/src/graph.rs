@@ -41,7 +41,7 @@ pub struct TensorId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightSrc {
     Inline { offset: usize },
-    Buffer { handle: u32, offset: usize, fingerprint: u64 },
+    Buffer { uid: u64, offset: usize, fingerprint: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +194,7 @@ pub struct Graph {
     pub tensors: Vec<TensorDesc>,
     pub ops: Vec<Op>,
     pub weights: Vec<u8>,
+    pub buffers: std::collections::HashMap<u64, std::sync::Arc<NpuBuffer>>,
     reshape_src: std::collections::HashMap<TensorId, TensorId>,
 }
 
@@ -251,15 +252,16 @@ impl Graph {
         &mut self,
         dtype: DType,
         shape: &[u32],
-        buffer: &NpuBuffer,
+        buffer: &std::sync::Arc<NpuBuffer>,
         offset: usize,
         fingerprint: u64,
     ) -> Result<TensorId> {
         let need = dtype.bytes(shape.iter().map(|&d| d as usize).product());
-        if buffer.handle == 0 || offset + need > buffer.len() {
+        if offset + need > buffer.len() {
             return Err(NpuError::Graph(format!("вес {shape:?} {dtype:?} вне буфера NPU")));
         }
-        let src = WeightSrc::Buffer { handle: buffer.handle, offset, fingerprint };
+        self.buffers.insert(buffer.uid(), buffer.clone());
+        let src = WeightSrc::Buffer { uid: buffer.uid(), offset, fingerprint };
         Ok(self.push(TensorKind::Weight(src), dtype, shape, Quant::None))
     }
 

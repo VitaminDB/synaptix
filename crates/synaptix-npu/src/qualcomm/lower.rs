@@ -23,7 +23,7 @@ struct WireTensor {
     dtype: u32,
     shape: Vec<u32>,
     quant: Quant,
-    data: Option<(Option<u32>, usize, usize)>,
+    data: Option<(Option<u64>, usize, usize)>,
 }
 
 pub(super) fn fused_norms(model: &crate::NpuModel) -> bool {
@@ -34,12 +34,16 @@ pub(super) fn fused_norms(model: &crate::NpuModel) -> bool {
     }
 }
 
+pub(super) fn norm_prescale() -> f32 {
+    std::env::var("SYNNPU_NORM_PRESCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0)
+}
+
 pub(super) fn opt_level() -> u32 {
     std::env::var("SYNNPU_OPT").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(15)
 }
 
 pub(super) fn variant(model: &crate::NpuModel) -> String {
-    format!("{}{}+o{}", model.id, if fused_norms(model) { "+ln" } else { "" }, opt_level())
+    format!("{}{}+o{}+ns{}", model.id, if fused_norms(model) { "+ln" } else { "" }, opt_level(), norm_prescale())
 }
 
 pub(super) struct Wire<'a> {
@@ -71,8 +75,8 @@ impl<'a> Wire<'a> {
             TensorKind::Output => (KIND_OUTPUT, None),
             TensorKind::Internal => (KIND_NATIVE, None),
             TensorKind::Weight(WeightSrc::Inline { offset }) => (KIND_STATIC, Some((None, offset, t.bytes()))),
-            TensorKind::Weight(WeightSrc::Buffer { handle, offset, .. }) => {
-                (KIND_STATIC, Some((Some(handle), offset, t.bytes())))
+            TensorKind::Weight(WeightSrc::Buffer { uid, offset, .. }) => {
+                (KIND_STATIC, Some((Some(uid), offset, t.bytes())))
             }
         };
         WireTensor { id: t.id.0, kind, dtype: qnn_dtype(t.dtype, &t.quant), shape: t.shape.clone(), quant: t.quant.clone(), data }
@@ -245,7 +249,30 @@ impl<'a> Wire<'a> {
         }
     }
 
+    fn prescale(&mut self, x: TensorId, eps: f32) -> (TensorId, f32) {
+        let dt = self.dtype(x);
+        let s = norm_prescale();
+        if dt != QNN_F16 || s == 1.0 {
+            return (x, eps);
+        }
+        let k = self.scalar_tensor(1.0 / s, dt);
+        let y = self.native(dt, self.shape(x).to_vec());
+        self.node("ElementWiseMultiply", &[x, k], y, &[]);
+        (y, eps / (s * s))
+    }
+
     fn lower_op(&mut self, op: &Op) {
+        let op = &match op.clone() {
+            Op::LayerNorm { x, gamma, beta, eps, axis, out } => {
+                let (x, eps) = self.prescale(x, eps);
+                Op::LayerNorm { x, gamma, beta, eps, axis, out }
+            }
+            Op::RmsNorm { x, gamma, eps, axis, out } => {
+                let (x, eps) = self.prescale(x, eps);
+                Op::RmsNorm { x, gamma, eps, axis, out }
+            }
+            o => o,
+        };
         match op {
             &Op::Linear { x, w, bias, out } => {
                 let mut ins = vec![x, w];
@@ -373,7 +400,21 @@ impl<'a> Wire<'a> {
         }
     }
 
-    pub fn encode(&self, key: &str, blob_handle: u32) -> Vec<u8> {
+    pub fn buffer_uids(&self) -> Vec<u64> {
+        let n_graph = self.live_t.len();
+        let mut v: Vec<u64> = self
+            .tensors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= n_graph || self.live_t[*i])
+            .filter_map(|(_, t)| t.data.and_then(|d| d.0))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub fn encode(&self, key: &str, blob_handle: u32, handles: &std::collections::HashMap<u64, u32>) -> Vec<u8> {
         let mut w = Wr::default();
         w.str(key);
         w.u32(BUILD_FP16 | (opt_level() << 8));
@@ -407,7 +448,7 @@ impl<'a> Wire<'a> {
                 }
             }
             if let Some((h, off, bytes)) = t.data {
-                w.u32(h.unwrap_or(blob_handle));
+                w.u32(h.map(|u| handles[&u]).unwrap_or(blob_handle));
                 w.u64(off as u64);
                 w.u64(bytes as u64);
             }

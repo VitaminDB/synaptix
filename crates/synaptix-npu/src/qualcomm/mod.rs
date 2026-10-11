@@ -1,4 +1,4 @@
-use crate::buffer::{NpuBuffer, Release};
+use crate::buffer::NpuBuffer;
 mod lower;
 
 use crate::graph::{DType, Graph, Quant, TensorId, TensorKind};
@@ -188,21 +188,60 @@ fn send_with_fd(sock: &UnixStream, data: &[u8], fd: Option<RawFd>) -> Result<()>
 
 type Shared = Arc<Mutex<Conn>>;
 
+const ST_PD_FULL: u32 = 5;
+
 fn call(conn: &Shared, op: u32, body: &[u8], fd: Option<RawFd>) -> Result<Vec<u8>> {
     conn.lock().call(op, body, fd)?.map_err(|(_, msg)| NpuError::Driver { driver: "qualcomm", msg })
 }
 
-pub struct QnnNpu {
+static NEXT_LANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Clone)]
+struct Lane {
+    id: u64,
     conn: Shared,
+}
+
+impl Lane {
+    fn open() -> Result<(Self, Vec<u8>)> {
+        let path = std::env::var("SYNNPU_QNN_SOCKET").unwrap_or_else(|_| SOCKET.into());
+        let sock = UnixStream::connect(&path).map_err(|e| NpuError::Unavailable(format!("{path}: {e}")))?;
+        let conn = Arc::new(Mutex::new(Conn { sock, seq: 0 }));
+        let hello = call(&conn, OP_HELLO, &[], None)?;
+        Ok((Self { id: NEXT_LANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed), conn }, hello))
+    }
+
+    fn handle(&self, b: &NpuBuffer) -> Result<u32> {
+        if let Some(h) = b.handle_in(self.id) {
+            return Ok(h);
+        }
+        let mut w = Wr::default();
+        w.u64(b.len() as u64);
+        let r = call(&self.conn, OP_MEM_REGISTER, &w.0, Some(b.fd()))?;
+        let handle = Rd { b: &r, off: 0 }.u32()?;
+        let conn = Arc::downgrade(&self.conn);
+        b.add_reg(crate::buffer::Reg {
+            lane: self.id,
+            handle,
+            release: Box::new(move |h| {
+                if let Some(c) = conn.upgrade() {
+                    let _ = c.lock().call(OP_MEM_FREE, &h.to_le_bytes(), None);
+                }
+            }),
+        });
+        Ok(handle)
+    }
+}
+
+pub struct QnnNpu {
+    lanes: Mutex<Vec<Lane>>,
+    max_lanes: usize,
     info: NpuInfo,
 }
 
 impl QnnNpu {
     pub fn connect() -> Result<Self> {
-        let path = std::env::var("SYNNPU_QNN_SOCKET").unwrap_or_else(|_| SOCKET.into());
-        let sock = UnixStream::connect(&path).map_err(|e| NpuError::Unavailable(format!("{path}: {e}")))?;
-        let conn = Arc::new(Mutex::new(Conn { sock, seq: 0 }));
-        let b = call(&conn, OP_HELLO, &[], None)?;
+        let (lane, b) = Lane::open()?;
         let mut r = Rd { b: &b, off: 0 };
         let (ver, arch, soc, vtcm) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
         let runtime = r.str()?;
@@ -211,22 +250,8 @@ impl QnnNpu {
         }
         let model = models::find(Vendor::Qualcomm, arch)
             .ok_or_else(|| NpuError::Unavailable(format!("Hexagon HTP v{arch}: нет профиля модели NPU")))?;
-        Ok(Self { conn, info: NpuInfo { model, soc, vtcm_mb: vtcm, runtime } })
-    }
-
-    fn register(&self, mut b: NpuBuffer) -> Result<NpuBuffer> {
-        let mut w = Wr::default();
-        w.u64(b.len() as u64);
-        let r = call(&self.conn, OP_MEM_REGISTER, &w.0, Some(b.fd()))?;
-        let handle = Rd { b: &r, off: 0 }.u32()?;
-        let conn = Arc::downgrade(&self.conn);
-        let release: Release = Arc::new(move |h| {
-            if let Some(c) = conn.upgrade() {
-                let _ = c.lock().call(OP_MEM_FREE, &h.to_le_bytes(), None);
-            }
-        });
-        b.attach(handle, release);
-        Ok(b)
+        let max_lanes = std::env::var("SYNNPU_MAX_PD").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        Ok(Self { lanes: Mutex::new(vec![lane]), max_lanes, info: NpuInfo { model, soc, vtcm_mb: vtcm, runtime } })
     }
 
     fn check(&self, g: &Graph) -> Result<()> {
@@ -243,6 +268,74 @@ impl QnnNpu {
         Ok(())
     }
 
+    fn compile_on(&self, lane: &Lane, key: &str, g: &Graph) -> Result<std::result::Result<QnnGraph, (u32, String)>> {
+        let mut w = Wr::default();
+        w.str(key);
+        let opened = lane.conn.lock().call(OP_GRAPH_OPEN, &w.0, None)?;
+        let (b, from_cache, build_ms) = match opened {
+            Ok(b) => (b, true, 0),
+            Err((ST_NOT_FOUND, _)) => {
+                let mut wire = lower::Wire::new(g, self.info.model);
+                wire.lower_ops();
+                let mut handles = std::collections::HashMap::new();
+                for uid in wire.buffer_uids() {
+                    let buf = g.buffers.get(&uid).ok_or_else(|| NpuError::Graph(format!("нет буфера {uid}")))?;
+                    handles.insert(uid, lane.handle(buf)?);
+                }
+                let weights = if wire.blob.is_empty() {
+                    None
+                } else {
+                    let mut wb = NpuBuffer::new(wire.blob.len())?;
+                    wb.cpu_begin();
+                    wb.as_mut_slice()[..wire.blob.len()].copy_from_slice(&wire.blob);
+                    wb.cpu_end();
+                    Some(wb)
+                };
+                let blob_handle = match &weights {
+                    Some(wb) => lane.handle(wb)?,
+                    None => 0,
+                };
+                let body = wire.encode(key, blob_handle, &handles);
+                if std::env::var("SYNNPU_TRACE").as_deref() == Ok("2") {
+                    eprintln!("== граф {key}");
+                    for l in &wire.trace {
+                        eprintln!("{l}");
+                    }
+                }
+                let b = match lane.conn.lock().call(OP_GRAPH_BUILD, &body, None)? {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if e.0 != ST_PD_FULL && std::env::var_os("SYNNPU_TRACE").is_some() {
+                            for l in &wire.trace {
+                                eprintln!("{l}");
+                            }
+                        }
+                        return Ok(Err(e));
+                    }
+                };
+                let ms = {
+                    let mut r = Rd { b: &b, off: 4 };
+                    read_io(&mut r)?;
+                    read_io(&mut r)?;
+                    r.u32()?
+                };
+                (b, false, ms)
+            }
+            Err(e) => return Ok(Err(e)),
+        };
+        let mut r = Rd { b: &b, off: 0 };
+        let id = r.u32()?;
+        let inputs = read_io(&mut r)?;
+        let outputs = read_io(&mut r)?;
+        Ok(Ok(QnnGraph {
+            lane: lane.clone(),
+            id,
+            inputs,
+            outputs,
+            from_cache,
+            build: Duration::from_millis(build_ms as u64),
+        }))
+    }
 }
 
 fn read_io(r: &mut Rd) -> Result<Vec<IoTensor>> {
@@ -264,74 +357,36 @@ impl Npu for QnnNpu {
     }
 
     fn alloc(&self, bytes: usize) -> Result<NpuBuffer> {
-        self.register(NpuBuffer::new(bytes)?)
+        NpuBuffer::new(bytes)
     }
 
     fn compile(&self, key: &str, g: &Graph) -> Result<Box<dyn CompiledGraph>> {
         self.check(g)?;
         let key = format!("{key}#{:016x}#{}", g.structure_hash(), lower::variant(self.info.model));
-        let mut w = Wr::default();
-        w.str(&key);
-        let opened = self.conn.lock().call(OP_GRAPH_OPEN, &w.0, None)?;
-        let (b, from_cache, build_ms) = match opened {
-            Ok(b) => (b, true, 0),
-            Err((ST_NOT_FOUND, _)) => {
-                let mut wire = lower::Wire::new(g, self.info.model);
-                wire.lower_ops();
-                let weights = if wire.blob.is_empty() {
-                    None
-                } else {
-                    let mut wb = self.alloc(wire.blob.len())?;
-                    wb.cpu_begin();
-                    wb.as_mut_slice()[..wire.blob.len()].copy_from_slice(&wire.blob);
-                    wb.cpu_end();
-                    Some(wb)
-                };
-                let body = wire.encode(&key, weights.as_ref().map(|b| b.handle).unwrap_or(0));
-                if std::env::var("SYNNPU_TRACE").as_deref() == Ok("2") {
-                    eprintln!("== граф {key}");
-                    for l in &wire.trace {
-                        eprintln!("{l}");
+        loop {
+            let lane = self.lanes.lock().last().cloned().expect("нет соединения с NPU");
+            match self.compile_on(&lane, &key, g)? {
+                Ok(cg) => return Ok(Box::new(cg)),
+                Err((ST_PD_FULL, msg)) => {
+                    let mut lanes = self.lanes.lock();
+                    if lanes.len() >= self.max_lanes {
+                        return Err(NpuError::Driver {
+                            driver: "qualcomm",
+                            msg: format!("{msg}; занято {} PD (SYNNPU_MAX_PD)", lanes.len()),
+                        });
+                    }
+                    if lanes.last().map(|l| l.id) == Some(lane.id) {
+                        lanes.push(Lane::open()?.0);
                     }
                 }
-                let b = match call(&self.conn, OP_GRAPH_BUILD, &body, None) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        if std::env::var_os("SYNNPU_TRACE").is_some() {
-                            for l in &wire.trace {
-                                eprintln!("{l}");
-                            }
-                        }
-                        return Err(e);
-                    }
-                };
-                let ms = {
-                    let mut r = Rd { b: &b, off: 4 };
-                    read_io(&mut r)?;
-                    read_io(&mut r)?;
-                    r.u32()?
-                };
-                (b, false, ms)
+                Err((_, msg)) => return Err(NpuError::Driver { driver: "qualcomm", msg }),
             }
-            Err((_, msg)) => return Err(NpuError::Driver { driver: "qualcomm", msg }),
-        };
-        let mut r = Rd { b: &b, off: 0 };
-        let id = r.u32()?;
-        let inputs = read_io(&mut r)?;
-        let outputs = read_io(&mut r)?;
-        Ok(Box::new(QnnGraph {
-            conn: self.conn.clone(),
-            id,
-            inputs,
-            outputs,
-            from_cache,
-            build: Duration::from_millis(build_ms as u64),
-        }))
+        }
     }
 }
 
 pub struct QnnGraph {
-    conn: Shared,
+    lane: Lane,
     id: u32,
     inputs: Vec<IoTensor>,
     outputs: Vec<IoTensor>,
@@ -361,20 +416,17 @@ impl CompiledGraph for QnnGraph {
         w.u32(self.id);
         w.u32(bindings.len() as u32);
         for b in bindings {
-            if b.buffer.handle == 0 {
-                return Err(NpuError::Graph("буфер не зарегистрирован в NPU (Npu::alloc)".into()));
-            }
             w.u32(b.tensor.0);
-            w.u32(b.buffer.handle);
+            w.u32(self.lane.handle(b.buffer)?);
             w.u64(b.offset as u64);
         }
-        let r = call(&self.conn, OP_EXECUTE, &w.0, None)?;
+        let r = call(&self.lane.conn, OP_EXECUTE, &w.0, None)?;
         Ok(Duration::from_micros(Rd { b: &r, off: 0 }.u64()?))
     }
 }
 
 impl Drop for QnnGraph {
     fn drop(&mut self) {
-        let _ = self.conn.lock().call(OP_GRAPH_FREE, &self.id.to_le_bytes(), None);
+        let _ = self.lane.conn.lock().call(OP_GRAPH_FREE, &self.id.to_le_bytes(), None);
     }
 }

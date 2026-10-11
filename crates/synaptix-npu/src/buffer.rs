@@ -1,7 +1,6 @@
 use crate::{NpuError, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 const DMA_HEAP_IOCTL_ALLOC: libc::c_ulong = 0xC018_4800;
 const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
@@ -20,7 +19,13 @@ struct HeapAlloc {
     heap_flags: u64,
 }
 
-pub(crate) type Release = Arc<dyn Fn(u32) + Send + Sync>;
+pub(crate) type Release = Box<dyn Fn(u32) + Send + Sync>;
+
+pub(crate) struct Reg {
+    pub lane: u64,
+    pub handle: u32,
+    pub release: Release,
+}
 
 pub struct NpuBuffer {
     fd: OwnedFd,
@@ -28,8 +33,13 @@ pub struct NpuBuffer {
     len: usize,
     dmabuf: bool,
     uid: u64,
-    pub(crate) handle: u32,
-    release: Option<Release>,
+    regs: parking_lot::Mutex<Vec<Reg>>,
+}
+
+impl std::fmt::Debug for NpuBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NpuBuffer").field("uid", &self.uid).field("len", &self.len).finish()
+    }
 }
 
 unsafe impl Send for NpuBuffer {}
@@ -101,14 +111,16 @@ impl NpuBuffer {
             len,
             dmabuf,
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
-            handle: 0,
-            release: None,
+            regs: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn attach(&mut self, handle: u32, release: Release) {
-        self.handle = handle;
-        self.release = Some(release);
+    pub(crate) fn handle_in(&self, lane: u64) -> Option<u32> {
+        self.regs.lock().iter().find(|r| r.lane == lane).map(|r| r.handle)
+    }
+
+    pub(crate) fn add_reg(&self, reg: Reg) {
+        self.regs.lock().push(reg);
     }
 
     pub fn len(&self) -> usize {
@@ -167,8 +179,8 @@ impl NpuBuffer {
 
 impl Drop for NpuBuffer {
     fn drop(&mut self) {
-        if let Some(r) = self.release.take() {
-            r(self.handle);
+        for r in self.regs.get_mut().drain(..) {
+            (r.release)(r.handle);
         }
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
     }

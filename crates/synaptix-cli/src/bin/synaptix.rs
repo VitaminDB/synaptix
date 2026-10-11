@@ -393,6 +393,8 @@ enum Commands {
         format: String,
         #[arg(short, long, help = "Записать результат в файл")]
         output: Option<PathBuf>,
+        #[arg(long, help = "Устройство энкодера Whisper (npu | cuda | cpu); декодер — на --device")]
+        encoder_device: Option<String>,
     },
     /// Диаризация (Sortformer): кто и когда говорит.
     Diarize {
@@ -1332,7 +1334,7 @@ fn main() -> ExitCode {
         Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device } => {
             quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device })
         }
-        Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps, engine, format, output } => {
+        Commands::Transcribe { model, audio, language, task, device, compute_dtype, timestamps, engine, format, output, encoder_device } => {
             transcribe::run(transcribe::TranscribeArgs {
                 model,
                 audio,
@@ -1344,6 +1346,7 @@ fn main() -> ExitCode {
                 engine,
                 format,
                 output,
+                encoder_device,
             })
         }
         Commands::Diarize {

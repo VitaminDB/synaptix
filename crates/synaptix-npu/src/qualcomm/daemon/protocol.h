@@ -22,6 +22,7 @@ enum synnpu_status {
     SYNNPU_BAD_REQUEST = 2,
     SYNNPU_QNN_ERROR = 3,
     SYNNPU_IO_ERROR = 4,
+    SYNNPU_PD_FULL = 5,
 };
 
 enum synnpu_tensor_kind {

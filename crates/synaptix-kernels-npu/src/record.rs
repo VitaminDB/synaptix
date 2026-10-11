@@ -345,44 +345,19 @@ impl Builder {
                 let q = self.input(&n.ins[0], true)?;
                 let k = self.input(&n.ins[1], true)?;
                 let v = self.input(&n.ins[2], true)?;
+                let sc = self.scalar(*scale, q)?;
+                let q = self.bin(BinaryKind::Mul, q, sc)?;
                 let qs = self.g.tensor(q).shape.clone();
-                let nh = qs[1] as usize;
-                let chunk = std::env::var("SYNAPTIX_NPU_ATTN_HEADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(nh).clamp(1, nh);
-                if chunk < nh && !*causal {
-                    let mut parts = Vec::new();
-                    let mut h = 0;
-                    while h < nh {
-                        let e = (h + chunk).min(nh);
-                        let mut sl = |b: &mut Self, x: TensorId| {
-                            let sh = b.g.tensor(x).shape.clone();
-                            let dt = b.g.tensor(x).dtype;
-                            let mut os = sh.clone();
-                            os[1] = (e - h) as u32;
-                            let begin = vec![0, h as i32, 0, 0];
-                            let end = vec![sh[0] as i32, e as i32, sh[2] as i32, sh[3] as i32];
-                            b.g.node(dt, &os, |out| Op::Slice { x, begin, end, stride: vec![1; 4], out })
-                        };
-                        let (qh, kh, vh) = (sl(self, q), sl(self, k), sl(self, v));
-                        let sc = self.g.matmul(qh, kh, false, true).map_err(err)?;
-                        let f = self.scalar(*scale, sc)?;
-                        let sc = self.bin(BinaryKind::Mul, sc, f)?;
-                        let p = self.g.softmax(sc);
-                        parts.push(self.g.matmul(p, vh, false, false).map_err(err)?);
-                        h = e;
-                    }
-                    let dt = self.g.tensor(parts[0]).dtype;
-                    let mut os = self.g.tensor(parts[0]).shape.clone();
-                    os[1] = nh as u32;
-                    let t = self.g.node(dt, &os, |out| Op::Concat { xs: parts, axis: 1, out });
-                    return Ok(self.reshape_to(t, &n.out_lo));
-                }
-                let s = self.g.matmul(q, k, false, true).map_err(err)?;
-                let sc = self.scalar(*scale, s)?;
-                let mut s = self.bin(BinaryKind::Mul, s, sc)?;
-                if *causal {
-                    let sh = self.g.tensor(s).shape.clone();
-                    let (tq, tk) = (sh[sh.len() - 2] as usize, sh[sh.len() - 1] as usize);
-                    let dt = self.g.tensor(s).dtype;
+                let ks = self.g.tensor(k).shape.clone();
+                let (nh, tq, tk) = (qs[1] as usize, qs[2] as usize, ks[2] as usize);
+                let target: usize = std::env::var("SYNAPTIX_NPU_ATTN_ELEMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_500_000);
+                let chunk = std::env::var("SYNAPTIX_NPU_ATTN_HEADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or_else(|| (target / (tq * tk).max(1)).max(1))
+                    .clamp(1, nh);
+                let mask = if *causal {
+                    let dt = self.g.tensor(q).dtype;
                     let shift = tk.saturating_sub(tq);
                     let neg = if dt == DType::F16 { -60000.0f32 } else { -1e30 };
                     let mut bytes = Vec::with_capacity(tq * tk * 4);
@@ -396,11 +371,43 @@ impl Builder {
                             }
                         }
                     }
-                    let mask = self.g.weight(dt, &[tq as u32, tk as u32], &bytes).map_err(err)?;
-                    s = self.bin(BinaryKind::Add, s, mask)?;
+                    Some(self.g.weight(dt, &[tq as u32, tk as u32], &bytes).map_err(err)?)
+                } else {
+                    None
+                };
+                let mut parts = Vec::new();
+                let mut h = 0;
+                while h < nh {
+                    let e = (h + chunk).min(nh);
+                    let sl = |b: &mut Self, x: TensorId| {
+                        if e - h == nh {
+                            return x;
+                        }
+                        let sh = b.g.tensor(x).shape.clone();
+                        let dt = b.g.tensor(x).dtype;
+                        let mut os = sh.clone();
+                        os[1] = (e - h) as u32;
+                        let begin = vec![0, h as i32, 0, 0];
+                        let end = vec![sh[0] as i32, e as i32, sh[2] as i32, sh[3] as i32];
+                        b.g.node(dt, &os, |out| Op::Slice { x, begin, end, stride: vec![1; 4], out })
+                    };
+                    let (qh, kh, vh) = (sl(self, q), sl(self, k), sl(self, v));
+                    let mut s = self.g.matmul(qh, kh, false, true).map_err(err)?;
+                    if let Some(m) = mask {
+                        s = self.bin(BinaryKind::Add, s, m)?;
+                    }
+                    let p = self.g.softmax(s);
+                    parts.push(self.g.matmul(p, vh, false, false).map_err(err)?);
+                    h = e;
                 }
-                let p = self.g.softmax(s);
-                self.g.matmul(p, v, false, false).map_err(err)?
+                if parts.len() == 1 {
+                    parts[0]
+                } else {
+                    let dt = self.g.tensor(parts[0]).dtype;
+                    let mut os = self.g.tensor(parts[0]).shape.clone();
+                    os[1] = nh as u32;
+                    self.g.node(dt, &os, |out| Op::Concat { xs: parts, axis: 1, out })
+                }
             }
             NodeOp::Conv2d { stride, padding, bias } => {
                 let x = self.input(&n.ins[0], true)?;

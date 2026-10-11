@@ -167,6 +167,36 @@ impl EncoderLayer {
     }
 }
 
+impl EncoderLayer {
+    fn trace(&self, x: &Tensor) -> Result<Vec<(&'static str, Tensor)>> {
+        let mut v = Vec::new();
+        let h = self.self_attn_ln.forward(x)?;
+        v.push(("ln1", h.clone()));
+        let a = &self.self_attn;
+        v.push(("q", a.q.forward(&h)?));
+        v.push(("k", a.k.forward(&h)?));
+        v.push(("v", a.v.forward(&h)?));
+        let q = a.q_heads(&h)?;
+        let (k, vv) = a.kv_heads(&h)?;
+        let att = merge_heads(&scaled_dot_attention(&q, &k, &vv, a.scale, None)?)?;
+        v.push(("attn", att.clone()));
+        let o = a.out.forward(&att)?;
+        v.push(("out", o.clone()));
+        let x1 = x.add(&o)?;
+        v.push(("res1", x1.clone()));
+        let h2 = self.final_ln.forward(&x1)?;
+        v.push(("ln2", h2.clone()));
+        let f1 = self.fc1.forward(&h2)?;
+        v.push(("fc1", f1.clone()));
+        let g = gelu_exact(&f1)?;
+        v.push(("gelu", g.clone()));
+        let f2 = self.fc2.forward(&g)?;
+        v.push(("fc2", f2.clone()));
+        v.push(("res2", x1.add(&f2)?));
+        Ok(v)
+    }
+}
+
 pub struct WhisperEncoder {
     conv1_w: Tensor,
     conv1_b: Tensor,
@@ -178,6 +208,23 @@ pub struct WhisperEncoder {
 }
 
 impl WhisperEncoder {
+    pub fn trace_layer(&self, i: usize, x: &Tensor) -> Result<Vec<(&'static str, Tensor)>> {
+        self.layers[i].trace(x)
+    }
+
+    pub fn forward_partial(&self, mel: &Tensor, n_layers: usize) -> Result<Tensor> {
+        let x = gelu_exact(&conv1d(mel, &self.conv1_w, Some(&self.conv1_b), 1, 1)?)?;
+        let x = gelu_exact(&conv1d(&x, &self.conv2_w, Some(&self.conv2_b), 2, 1)?)?;
+        let x = x.transpose(1, 2)?.contiguous()?;
+        let seq = x.dims()[1];
+        let pos = self.embed_positions.narrow(0, 0, seq)?.unsqueeze(0)?;
+        let mut h = x.broadcast_add(&pos)?;
+        for layer in self.layers.iter().take(n_layers) {
+            h = layer.forward(&h)?;
+        }
+        Ok(h)
+    }
+
     /// mel `[B, num_mel_bins, T]` → `[B, T/2, d_model]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let x = gelu_exact(&conv1d(mel, &self.conv1_w, Some(&self.conv1_b), 1, 1)?)?;

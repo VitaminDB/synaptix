@@ -370,8 +370,11 @@ std::unique_ptr<Graph> load_cached(const std::string& path, Group* group = nullp
     }
     logf("контекст %s: %.1f МБ, spill-fill %.1f МБ%s", path.c_str(), buf.size() / 1048576.0, spill / 1048576.0,
          grouped ? (group->first ? " (общий буфер группы)" : " (новая группа)") : "");
-    check(qnn.contextCreateFromBinary(qbackend, qdevice, grouped ? cfg : nullptr, buf.data(), buf.size(), &g->ctx, nullptr),
-          "contextCreateFromBinary");
+    auto ce = qnn.contextCreateFromBinary(qbackend, qdevice, grouped ? cfg : nullptr, buf.data(), buf.size(), &g->ctx, nullptr);
+    if (ce != QNN_SUCCESS) {
+        g->ctx = nullptr;
+        fail(SYNNPU_PD_FULL, "contextCreateFromBinary: QNN " + std::to_string(ce) + " — нет места в PD");
+    }
     check(qnn.graphRetrieve(g->ctx, gname.c_str(), &g->g), "graphRetrieve");
     if (grouped && !group->first) group->first = g->ctx;
     return g;
@@ -888,10 +891,18 @@ int build_child(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
     setvbuf(stderr, nullptr, _IOLBF, 0);
     if (const char* c = getenv("SYNNPU_CACHE")) cache_dir = c;
     if (argc >= 3 && strcmp(argv[1], "--build") == 0) _exit(build_child(argc, argv));
-    init_qnn();
+    if (argc >= 3 && strcmp(argv[1], "--serve") == 0) {
+        int fd = atoi(argv[2]);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        init_qnn();
+        serve(fd);
+        _exit(0);
+    }
+    signal(SIGCHLD, SIG_IGN);
 
     const char* path = getenv("SYNNPU_SOCKET") ? getenv("SYNNPU_SOCKET") : SYNNPU_SOCKET;
     std::string dir(path);
@@ -921,6 +932,16 @@ int main(int argc, char** argv) {
             logf("accept: %s", strerror(errno));
             continue;
         }
-        std::thread(serve, c).detach();
+        char fdarg[16];
+        snprintf(fdarg, sizeof fdarg, "%d", c);
+        pid_t pid = fork();
+        if (pid == 0) {
+            fcntl(c, F_SETFD, 0);
+            char* av[] = {(char*)"synnpu-qnn", (char*)"--serve", fdarg, nullptr};
+            execv("/proc/self/exe", av);
+            _exit(127);
+        }
+        if (pid < 0) logf("fork: %s", strerror(errno));
+        close(c);
     }
 }
