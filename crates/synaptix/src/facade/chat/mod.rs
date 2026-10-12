@@ -154,3 +154,28 @@ fn gemma4_restore_empty_thinking(prompt: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_empty_thinking_restored_after_tool_response() {
+        let p = "<|tool_call>call:bash{}<tool_call|><|tool_response>response:bash{value:<|\"|>ok<|\"|>}<tool_response|>Ответ.<turn|>\n<|turn>user\nещё<turn|>\n<|turn>model\n";
+        let fixed = gemma4_restore_empty_thinking(p);
+        assert_eq!(
+            fixed,
+            "<|tool_call>call:bash{}<tool_call|><|tool_response>response:bash{value:<|\"|>ok<|\"|>}<tool_response|><|channel>thought\n<channel|>Ответ.<turn|>\n<|turn>user\nещё<turn|>\n<|turn>model\n"
+        );
+        let p = "…<tool_response|><|channel>thought\n";
+        assert_eq!(gemma4_restore_empty_thinking(p), p);
+        let p = "…<tool_response|>";
+        assert_eq!(gemma4_restore_empty_thinking(p), p);
+        let p = "…<tool_response|><|channel>thought\nмысль\n<channel|>Ответ.";
+        assert_eq!(gemma4_restore_empty_thinking(p), p);
+        let p = "…<tool_response|><|tool_response>response:x{value:1}<tool_response|><|tool_call>call:y{}<tool_call|>";
+        assert_eq!(
+            gemma4_restore_empty_thinking(p),
+            "…<tool_response|><|tool_response>response:x{value:1}<tool_response|><|channel>thought\n<channel|><|tool_call>call:y{}<tool_call|>"
+        );
+    }
+}
