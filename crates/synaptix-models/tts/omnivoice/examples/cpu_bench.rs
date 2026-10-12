@@ -32,7 +32,11 @@ fn main() {
     let t0 = std::time::Instant::now();
     let p = OmniVoicePipeline::from_syn_quant(&path, dev, dtype, quant).expect("загрузка");
     println!("{prec}: загрузка {:.1} с", t0.elapsed().as_secs_f32());
-    let gen = OmniVoiceGenerationConfig { num_step: steps, ..Default::default() };
+    // SEED — зерно шума Гумбеля (без него — случайное), PT — температура позиций.
+    let mut gen = OmniVoiceGenerationConfig { num_step: steps, seed: std::env::var("SEED").ok().and_then(|v| v.parse().ok()), ..Default::default() };
+    if let Some(pt) = std::env::var("PT").ok().and_then(|v| v.parse().ok()) {
+        gen.position_temperature = pt;
+    }
     let texts = ["Привет! Так звучит эта модель с заданными настройками.", "Сегодня хорошая погода, пойдём гулять в парк у реки."];
     let runs: usize = std::env::var("RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     // CONT=1 — как служба: каждая фраза продолжает голос уже сказанного.

@@ -1,8 +1,11 @@
 //! Итеративное masked-diffusion раскрытие (MaskGIT-стиль).
 //!
 //! Порт `_generate_iterative` + `_predict_tokens_with_scoring` + `_get_time_steps`
-//! из `~/Temp/OmniVoice/omnivoice/models/omnivoice.py` для B=1, greedy
-//! (position_temperature=0, class_temperature=0 → без gumbel/top-k-фильтра).
+//! из `~/Temp/OmniVoice/omnivoice/models/omnivoice.py` для B=1. Шум Гумбеля
+//! как upstream: `position_temperature` — на оценках позиций (какие токены
+//! раскрыть на шаге), `class_temperature` — выбор токена из верхних 10 %;
+//! обе 0 — чистый argmax/topk (детерминизм, сверка с эталоном). Шум —
+//! счётный от (зерно, шаг, позиция), не зависит от порядка потоков.
 //!
 //! Каждый step: ДВА отдельных `Backbone::forward` (cond длины C + uncond длины T)
 //! — для B=1 это эквивалентно батч-паддингу 2B с диагональю в attention-маске
@@ -106,6 +109,11 @@ pub fn generate_iterative(
     let sched = schedule(t * n_cb, gen.num_step, &ts);
     let g = gen.guidance_scale;
     let lpf = gen.layer_penalty_factor;
+    let (pt, ct) = (gen.position_temperature, gen.class_temperature);
+    let seed = gen.seed.unwrap_or_else(|| {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1);
+        (n ^ (n >> 64)) as u64
+    });
 
     let mut fwd_time = std::time::Duration::ZERO;
     let mut read_time = std::time::Duration::ZERO;
@@ -165,8 +173,12 @@ pub fn generate_iterative(
                 let (c, j) = (idx / t, idx % t);
                 let c_off = ((c * cond_stride) + (c_len - t + j)) * vocab;
                 let u_off = ((c * uncond_stride) + j) * vocab;
-                let (p, s) = predict_row(&cond_flat[c_off..c_off + vocab], &uncond_flat[u_off..u_off + vocab], g, mask_id, vocab);
-                (p as i64, s - (c as f32) * lpf)
+                let class_noise = (ct > 0.0).then(|| (ct, noise_key(seed, step, 1, idx)));
+                let (p, s) = predict_row(&cond_flat[c_off..c_off + vocab], &uncond_flat[u_off..u_off + vocab], g, mask_id, vocab, class_noise);
+                let s = s - (c as f32) * lpf;
+                // scores = gumbel(scores, position_temperature): s/τ + шум.
+                let s = if pt > 0.0 { s / pt + gumbel(noise_key(seed, step, 0, idx)) } else { s };
+                (p as i64, s)
             })
             .collect();
         let pred: Vec<i64> = rows.iter().map(|r| r.0).collect();
@@ -196,14 +208,35 @@ pub fn generate_iterative(
     Tensor::from_vec(tokens, vec![n_cb, t], device).map_err(err)
 }
 
-/// Один (c,j): CFG log_softmax(c_lp + g*(c_lp-u_lp)) → mask_id=-inf → (argmax, max).
-/// greedy (class_temperature=0). Возврат (pred_token, confidence_score).
+/// SplitMix64: счётный генератор — значение по ключу.
+fn splitmix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Ключ шума: (зерно, шаг, вид — 0 позиции / 1 классы, позиция).
+fn noise_key(seed: u64, step: usize, kind: u64, idx: usize) -> u64 {
+    splitmix(splitmix(seed ^ ((step as u64) << 40) ^ (kind << 63)) ^ idx as u64)
+}
+
+/// Шум Гумбеля −ln(−ln(u + 1e−10) + 1e−10), u ∈ [0, 1) — как `_gumbel_sample`.
+fn gumbel(key: u64) -> f32 {
+    let u = (splitmix(key) >> 11) as f64 / (1u64 << 53) as f64;
+    (-(-(u + 1e-10).ln() + 1e-10).ln()) as f32
+}
+
+/// Один (c,j): CFG log_softmax(c_lp + g*(c_lp-u_lp)) → mask_id=-inf → (токен, max).
+/// Токен — argmax, а с `class_noise` (τ, ключ) — argmax(lp/τ + Гумбель) среди
+/// верхних ceil(0,1·V) (`_filter_top_k`). Оценка — max lp, как upstream.
 fn predict_row(
     c_logits: &[f32],
     u_logits: &[f32],
     g: f32,
     mask_id: i64,
     vocab: usize,
+    class_noise: Option<(f32, u64)>,
 ) -> (usize, f32) {
     // c_lp = log_softmax(c_logits); u_lp = log_softmax(u_logits).
     let c_lp = log_softmax(c_logits);
@@ -230,6 +263,22 @@ fn predict_row(
         if val > best_val {
             best_val = val;
             best_idx = i;
+        }
+    }
+    if let Some((tau, key)) = class_noise {
+        let k = (vocab as f32 * 0.1).ceil() as usize;
+        let mut lp: Vec<(usize, f32)> = combined.iter().enumerate().map(|(i, &v)| (i, if i as i64 == mask_id { f32::NEG_INFINITY } else { v })).collect();
+        if k < lp.len() {
+            lp.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            lp.truncate(k);
+        }
+        let pick = lp
+            .iter()
+            .filter(|(_, v)| v.is_finite())
+            .map(|&(i, v)| (i, v / tau + gumbel(key ^ splitmix(i as u64))))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((i, _)) = pick {
+            return (i, best_val);
         }
     }
     (best_idx, best_val)

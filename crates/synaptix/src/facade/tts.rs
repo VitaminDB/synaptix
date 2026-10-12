@@ -81,15 +81,14 @@ fn map_err<E: std::fmt::Display>(e: E) -> OmniVoiceError {
     OmniVoiceError::Inference(e.to_string())
 }
 
-/// Нативный greedy-конфиг из фасадного `GenerationConfig`. Сэмплинг отключён
-/// (position/class temperature = 0.0) — сверенный детерминированный путь.
+/// Нативный конфиг из фасадного `GenerationConfig`: температуры как в
+/// upstream, шум Гумбеля — от `cfg.seed` (одно зерно — один результат).
 fn native_gen(cfg: &GenerationConfig) -> NativeGenConfig {
     NativeGenConfig {
         num_step: cfg.num_step as usize,
         guidance_scale: cfg.guidance_scale,
         t_shift: cfg.t_shift,
-        position_temperature: 0.0,
-        class_temperature: 0.0,
+        seed: Some(cfg.seed),
         denoise: true,
         postprocess_output: true,
         ..NativeGenConfig::default()

@@ -152,6 +152,7 @@ fn speak_omnivoice(
         guidance_scale: args.cfg.unwrap_or(defaults.guidance_scale),
         t_shift: args.t_shift.unwrap_or(defaults.t_shift),
         layer_penalty_factor: args.layer_penalty.unwrap_or(defaults.layer_penalty_factor),
+        seed: Some(args.seed),
         denoise: !args.no_denoise,
         ..defaults
     };

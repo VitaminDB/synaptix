@@ -295,6 +295,9 @@ pub struct OmniVoiceGenerationConfig {
     pub layer_penalty_factor: f32,
     pub position_temperature: f32,
     pub class_temperature: f32,
+    /// Зерно шума Гумбеля (`position_temperature`, `class_temperature`):
+    /// `None` — случайное на каждый вызов (как upstream без `torch.manual_seed`).
+    pub seed: Option<u64>,
     pub denoise: bool,
     pub preprocess_prompt: bool,
     pub postprocess_output: bool,
@@ -311,6 +314,7 @@ impl Default for OmniVoiceGenerationConfig {
             layer_penalty_factor: 5.0,
             position_temperature: 5.0,
             class_temperature: 0.0,
+            seed: None,
             denoise: true,
             preprocess_prompt: true,
             postprocess_output: true,
