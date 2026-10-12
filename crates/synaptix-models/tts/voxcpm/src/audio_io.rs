@@ -11,6 +11,11 @@ pub enum PadMode {
 
 pub fn load_resampled(path: &str, target_sr: usize) -> Result<Vec<f32>, VoxError> {
     let (samples, sr) = read_wav_mono_f32(path).map_err(|e| VoxError::Audio(e.to_string()))?;
+    resampled(samples, sr, target_sr)
+}
+
+/// PCM в `target_sr` Гц: как есть при совпадении частоты, иначе ресэмплинг.
+pub fn resampled(samples: Vec<f32>, sr: u32, target_sr: usize) -> Result<Vec<f32>, VoxError> {
     if sr as usize == target_sr {
         Ok(samples)
     } else {

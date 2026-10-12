@@ -101,13 +101,29 @@ impl VibeVoicePipeline {
         Self::open(path, device, dtype, DEFAULT_ROPE_CAPACITY)
     }
 
+    /// Линейные слои LM квантуются при загрузке в `quant` (NVFP4/MXFP8/Sq)
+    /// независимо от формата весов; `dtype` — точность счёта.
+    pub fn from_syn_quant(path: impl AsRef<Path>, device: Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
+        Self::open_quant(path, device, dtype, DEFAULT_ROPE_CAPACITY, quant)
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         device: Device,
         dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self> {
-        let ckpt = VibeVoiceCheckpoint::open(path, device, dtype)?;
+        Self::open_quant(path, device, dtype, rope_capacity, None)
+    }
+
+    pub fn open_quant(
+        path: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        rope_capacity: usize,
+        quant: Option<DType>,
+    ) -> Result<Self> {
+        let ckpt = VibeVoiceCheckpoint::open_quant(path, device, dtype, quant)?;
         let rope = rope_capacity
             .min(ckpt.config.decoder_config.max_position_embeddings)
             .max(2048);

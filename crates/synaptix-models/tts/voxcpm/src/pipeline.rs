@@ -54,7 +54,13 @@ pub struct VoxCpmPipeline {
 
 impl VoxCpmPipeline {
     pub fn from_bundle(path: impl AsRef<Path>, device: Device, compute: DType) -> Result<Self, VoxError> {
-        let ck = VoxCheckpoint::open(path, device, compute)?;
+        Self::from_bundle_quant(path, device, compute, None)
+    }
+
+    /// Линейные слои квантуются при загрузке в `quant` (NVFP4/MXFP8/Sq)
+    /// независимо от формата весов; `compute` — точность счёта.
+    pub fn from_bundle_quant(path: impl AsRef<Path>, device: Device, compute: DType, quant: Option<DType>) -> Result<Self, VoxError> {
+        let ck = VoxCheckpoint::open_quant(path, device, compute, quant.unwrap_or(compute))?;
         let tok_bytes = ck.read_file("tokenizer.json")?;
         let tokenizer = TextTokenizer::from_bytes(&tok_bytes)?;
         let model = VoxCpmModel::load(&ck)?;
@@ -91,10 +97,23 @@ impl VoxCpmPipeline {
     }
 
     fn encode_wav(&self, path: &str, mode: PadMode) -> Result<Tensor, VoxError> {
+        let sr = self.model.config.audio_vae_config.sample_rate;
+        let samples = audio_io::load_resampled(path, sr)?;
+        self.encode_pcm(samples, sr as u32, mode)
+    }
+
+    /// Частота дискретизации, в которой работает кодек (и выходной звук).
+    pub fn sample_rate(&self) -> usize {
+        self.model.config.audio_vae_config.sample_rate
+    }
+
+    /// Признаки референса из PCM (`samples` в `sr` Гц; при несовпадении —
+    /// ресэмплинг).
+    fn encode_pcm(&self, samples: Vec<f32>, sr: u32, mode: PadMode) -> Result<Tensor, VoxError> {
         let cfg = &self.model.config.audio_vae_config;
         let patch = self.model.config.patch_size;
         let patch_len = patch * cfg.hop_length();
-        let samples = audio_io::load_resampled(path, cfg.sample_rate)?;
+        let samples = audio_io::resampled(samples, sr, cfg.sample_rate)?;
         let samples = audio_io::pad_to_multiple(samples, patch_len, mode);
         let len = samples.len();
         let x = Tensor::from_vec(samples, vec![1usize, 1, len], self.device)?;
@@ -181,6 +200,23 @@ impl VoxCpmPipeline {
         opts: &GenerateOptions,
     ) -> Result<Waveform, VoxError> {
         let ref_feat = self.encode_wav(reference_wav, PadMode::Right)?;
+        self.synthesize_with_reference_feat(text, ref_feat, opts)
+    }
+
+    /// Как [`Self::synthesize_with_reference`], но референс — PCM в памяти
+    /// (например, уже синтезированная речь: следующие фразы тем же голосом).
+    pub fn synthesize_with_reference_pcm(
+        &self,
+        text: &str,
+        reference: &[f32],
+        sr: u32,
+        opts: &GenerateOptions,
+    ) -> Result<Waveform, VoxError> {
+        let ref_feat = self.encode_pcm(reference.to_vec(), sr, PadMode::Right)?;
+        self.synthesize_with_reference_feat(text, ref_feat, opts)
+    }
+
+    fn synthesize_with_reference_feat(&self, text: &str, ref_feat: Tensor, opts: &GenerateOptions) -> Result<Waveform, VoxError> {
         let mut ids = self.tokenizer.encode(text)?;
         ids.push(AUDIO_START);
         let segments = vec![
@@ -200,6 +236,23 @@ impl VoxCpmPipeline {
         opts: &GenerateOptions,
     ) -> Result<Waveform, VoxError> {
         let prompt_feat = self.encode_wav(prompt_wav, PadMode::Left)?;
+        self.synthesize_continuation_feat(target_text, prompt_text, prompt_feat, opts)
+    }
+
+    /// Как [`Self::synthesize_continuation`], но промпт-речь — PCM в памяти.
+    pub fn synthesize_continuation_pcm(
+        &self,
+        target_text: &str,
+        prompt_text: &str,
+        prompt: &[f32],
+        sr: u32,
+        opts: &GenerateOptions,
+    ) -> Result<Waveform, VoxError> {
+        let prompt_feat = self.encode_pcm(prompt.to_vec(), sr, PadMode::Left)?;
+        self.synthesize_continuation_feat(target_text, prompt_text, prompt_feat, opts)
+    }
+
+    fn synthesize_continuation_feat(&self, target_text: &str, prompt_text: &str, prompt_feat: Tensor, opts: &GenerateOptions) -> Result<Waveform, VoxError> {
         let a = prompt_feat.dims()[0];
         let context_len = opts.streaming_prefix_len.saturating_sub(1).min(a);
         let text = format!("{prompt_text}{target_text}");

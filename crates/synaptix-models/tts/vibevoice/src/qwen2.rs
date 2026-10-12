@@ -7,6 +7,9 @@ use synaptix_ops::norm::rms_norm::rms_norm;
 use synaptix_ops::pos::rope::{apply_rope_range, RopeLayout};
 use synaptix_ops::pos::rope_cache::RopeCache;
 
+use synaptix_nn::quant_linear::QuantLinear;
+use synaptix_nn::Module;
+
 use crate::config::DecoderConfig;
 use crate::loader::WeightSource;
 use crate::{err, Result, VibeVoiceError};
@@ -14,19 +17,36 @@ use crate::{err, Result, VibeVoiceError};
 const NEG_LARGE: f32 = -1.0e30;
 
 struct Attn {
-    q_w: Tensor,
-    q_b: Tensor,
-    k_w: Tensor,
-    k_b: Tensor,
-    v_w: Tensor,
-    v_b: Tensor,
-    o_w: Tensor,
+    q: QuantLinear,
+    k: QuantLinear,
+    v: QuantLinear,
+    o: QuantLinear,
 }
 
 struct Mlp {
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+    gate: QuantLinear,
+    up: QuantLinear,
+    down: QuantLinear,
+}
+
+/// Байт на устройстве у линейного слоя (для бюджета выгрузки слоёв на хост).
+fn lin_bytes(l: &QuantLinear) -> usize {
+    match l {
+        QuantLinear::Dense(d) => {
+            let w = d.weight();
+            w.dtype().bytes_for_numel(w.numel()) + d.bias().map(|b| b.dtype().bytes_for_numel(b.numel())).unwrap_or(0)
+        }
+        QuantLinear::Quant { w, bias } => {
+            let nk = w.n() * w.k();
+            let packed = match w.dtype() {
+                DType::NVFP4 => nk / 2 + nk / 16,
+                DType::MXFP8 => nk + nk / 32,
+                DType::Sq { bits } => nk * bits as usize / 8 + nk / 16,
+                other => other.bytes_for_numel(nk),
+            };
+            packed + bias.as_ref().map(|b| b.dtype().bytes_for_numel(b.numel())).unwrap_or(0)
+        }
+    }
 }
 
 struct Layer {
@@ -45,37 +65,23 @@ impl Layer {
             input_ln: t(&self.input_ln)?,
             post_ln: t(&self.post_ln)?,
             attn: Attn {
-                q_w: t(&self.attn.q_w)?,
-                q_b: t(&self.attn.q_b)?,
-                k_w: t(&self.attn.k_w)?,
-                k_b: t(&self.attn.k_b)?,
-                v_w: t(&self.attn.v_w)?,
-                v_b: t(&self.attn.v_b)?,
-                o_w: t(&self.attn.o_w)?,
+                q: self.attn.q.to_device(dev).map_err(err)?,
+                k: self.attn.k.to_device(dev).map_err(err)?,
+                v: self.attn.v.to_device(dev).map_err(err)?,
+                o: self.attn.o.to_device(dev).map_err(err)?,
             },
-            mlp: Mlp { gate: t(&self.mlp.gate)?, up: t(&self.mlp.up)?, down: t(&self.mlp.down)? },
+            mlp: Mlp {
+                gate: self.mlp.gate.to_device(dev).map_err(err)?,
+                up: self.mlp.up.to_device(dev).map_err(err)?,
+                down: self.mlp.down.to_device(dev).map_err(err)?,
+            },
         })
     }
 
     fn bytes(&self) -> usize {
         let a = &self.attn;
-        [
-            &self.input_ln,
-            &self.post_ln,
-            &a.q_w,
-            &a.q_b,
-            &a.k_w,
-            &a.k_b,
-            &a.v_w,
-            &a.v_b,
-            &a.o_w,
-            &self.mlp.gate,
-            &self.mlp.up,
-            &self.mlp.down,
-        ]
-        .iter()
-        .map(|t| t.dtype().bytes_for_numel(t.numel()))
-        .sum()
+        let norms: usize = [&self.input_ln, &self.post_ln].iter().map(|t| t.dtype().bytes_for_numel(t.numel())).sum();
+        norms + [&a.q, &a.k, &a.v, &a.o, &self.mlp.gate, &self.mlp.up, &self.mlp.down].iter().map(|l| lin_bytes(l)).sum::<usize>()
     }
 }
 
@@ -184,6 +190,7 @@ impl Qwen2Model {
     ) -> Result<Self> {
         let final_norm = src.get(&format!("{prefix}.norm.weight"))?;
         let dev = final_norm.device();
+        let w_dtype = final_norm.dtype();
         let table_dev = if dev.is_cuda() { Device::Cpu } else { dev };
         let embed = src.get_on(&format!("{prefix}.embed_tokens.weight"), table_dev)?;
         let lm_head = if src.has(lm_head_name) {
@@ -215,22 +222,28 @@ impl Qwen2Model {
                 }
             }
             let k = |s: &str| format!("{prefix}.layers.{i}.{s}");
+            // Линейные слои: квант на лету по `src.quant()` или плотные.
+            let lin = |name: &str, bias: bool| -> Result<QuantLinear> {
+                let w = src.get(&k(&format!("{name}.weight")))?;
+                let b = if bias { Some(src.get(&k(&format!("{name}.bias")))?) } else { None };
+                match src.quant() {
+                    Some(q) => QuantLinear::build(w, b, q, w_dtype).map_err(err),
+                    None => QuantLinear::dense(w, b).map_err(err),
+                }
+            };
             let layer = Layer {
                 input_ln: src.get(&k("input_layernorm.weight"))?,
                 post_ln: src.get(&k("post_attention_layernorm.weight"))?,
                 attn: Attn {
-                    q_w: src.get(&k("self_attn.q_proj.weight"))?,
-                    q_b: src.get(&k("self_attn.q_proj.bias"))?,
-                    k_w: src.get(&k("self_attn.k_proj.weight"))?,
-                    k_b: src.get(&k("self_attn.k_proj.bias"))?,
-                    v_w: src.get(&k("self_attn.v_proj.weight"))?,
-                    v_b: src.get(&k("self_attn.v_proj.bias"))?,
-                    o_w: src.get(&k("self_attn.o_proj.weight"))?,
+                    q: lin("self_attn.q_proj", true)?,
+                    k: lin("self_attn.k_proj", true)?,
+                    v: lin("self_attn.v_proj", true)?,
+                    o: lin("self_attn.o_proj", false)?,
                 },
                 mlp: Mlp {
-                    gate: src.get(&k("mlp.gate_proj.weight"))?,
-                    up: src.get(&k("mlp.up_proj.weight"))?,
-                    down: src.get(&k("mlp.down_proj.weight"))?,
+                    gate: lin("mlp.gate_proj", false)?,
+                    up: lin("mlp.up_proj", false)?,
+                    down: lin("mlp.down_proj", false)?,
                 },
             };
             blk = blk.max(layer.bytes());
@@ -398,20 +411,23 @@ impl Qwen2Model {
         let hd = self.cfg.head_dim();
         let scale = 1.0f32 / (hd as f32).sqrt();
 
-        let q = h
-            .linear_bias_residual(&a.q_w, Some(&a.q_b), None)
+        let q = a
+            .q
+            .forward(h)
             .and_then(|t| t.reshape(vec![1usize, s, nh, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
             .map_err(err)?;
-        let k = h
-            .linear_bias_residual(&a.k_w, Some(&a.k_b), None)
+        let k = a
+            .k
+            .forward(h)
             .and_then(|t| t.reshape(vec![1usize, s, nkv, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
             .map_err(err)?;
-        let v = h
-            .linear_bias_residual(&a.v_w, Some(&a.v_b), None)
+        let v = a
+            .v
+            .forward(h)
             .and_then(|t| t.reshape(vec![1usize, s, nkv, hd]))
             .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
             .and_then(|t| t.contiguous())
@@ -446,19 +462,19 @@ impl Qwen2Model {
         attn.permute(vec![0usize, 2, 1, 3])
             .and_then(|t| t.contiguous())
             .and_then(|t| t.reshape(vec![1usize, s, nh * hd]))
-            .and_then(|t| t.linear(&a.o_w))
+            .and_then(|t| a.o.forward(&t))
             .map_err(err)
     }
 
     fn mlp(&self, layer: &Layer, h: &Tensor) -> Result<Tensor> {
         let m = &layer.mlp;
-        let gate = h.linear(&m.gate).map_err(err)?;
-        let up = h.linear(&m.up).map_err(err)?;
+        let gate = m.gate.forward(h).map_err(err)?;
+        let up = m.up.forward(h).map_err(err)?;
         let act = match gate.silu_and_mul(&up) {
             Ok(t) => t,
             Err(_) => gate.silu().and_then(|g| g.mul(&up)).map_err(err)?,
         };
-        act.linear(&m.down).map_err(err)
+        m.down.forward(&act).map_err(err)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -476,16 +492,16 @@ impl Qwen2Model {
         let hd = self.cfg.head_dim();
         let scale = 1.0f32 / (hd as f32).sqrt();
 
-        let proj = |w: &Tensor, b: &Tensor, heads: usize| -> Result<Tensor> {
-            h.linear_bias_residual(w, Some(b), None)
+        let proj = |l: &QuantLinear, heads: usize| -> Result<Tensor> {
+            l.forward(h)
                 .and_then(|t| t.reshape(vec![2usize, 1, heads, hd]))
                 .and_then(|t| t.permute(vec![0usize, 2, 1, 3]))
                 .and_then(|t| t.contiguous())
                 .map_err(err)
         };
-        let q = proj(&a.q_w, &a.q_b, nh)?;
-        let k = proj(&a.k_w, &a.k_b, nkv)?;
-        let v = proj(&a.v_w, &a.v_b, nkv)?;
+        let q = proj(&a.q, nh)?;
+        let k = proj(&a.k, nkv)?;
+        let v = proj(&a.v, nkv)?;
 
         let mut outs: Vec<Tensor> = Vec::with_capacity(2);
         for slot in 0..2usize {
@@ -518,7 +534,7 @@ impl Qwen2Model {
             .permute(vec![0usize, 2, 1, 3])
             .and_then(|t| t.contiguous())
             .and_then(|t| t.reshape(vec![2usize, 1, nh * hd]))
-            .and_then(|t| t.linear(&a.o_w))
+            .and_then(|t| a.o.forward(&t))
             .map_err(err)
     }
 

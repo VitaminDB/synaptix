@@ -17,6 +17,12 @@ pub trait WeightSource {
     fn get(&self, name: &str) -> Result<Tensor>;
     fn has(&self, name: &str) -> bool;
 
+    /// Квант линейных слоёв LM при загрузке (NVFP4/MXFP8/Sq) — на лету,
+    /// независимо от формата весов; `None` — плотные в compute-dtype.
+    fn quant(&self) -> Option<DType> {
+        None
+    }
+
     /// Как [`Self::get`], но на заданное устройство (таблицы, которые живут
     /// в RAM, читаются сразу туда, без захода на карту).
     fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
@@ -37,6 +43,7 @@ pub struct LoaderSource<L: WeightLoader> {
     names: HashSet<String>,
     device: Device,
     dtype: DType,
+    quant: Option<DType>,
 }
 
 impl<L: WeightLoader> LoaderSource<L> {
@@ -47,11 +54,21 @@ impl<L: WeightLoader> LoaderSource<L> {
             names,
             device,
             dtype,
+            quant: None,
         }
+    }
+
+    pub fn with_quant(mut self, quant: Option<DType>) -> Self {
+        self.quant = quant;
+        self
     }
 }
 
 impl<L: WeightLoader> WeightSource for LoaderSource<L> {
+    fn quant(&self) -> Option<DType> {
+        self.quant
+    }
+
     fn get(&self, name: &str) -> Result<Tensor> {
         self.loader
             .load_to(name, self.device, self.dtype)
@@ -80,18 +97,24 @@ pub struct VibeVoiceCheckpoint {
 
 impl VibeVoiceCheckpoint {
     pub fn open(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self> {
+        Self::open_quant(path, device, dtype, None)
+    }
+
+    /// Линейные слои LM квантуются при загрузке в `quant` (NVFP4/MXFP8/Sq)
+    /// независимо от формата весов; `dtype` — точность счёта.
+    pub fn open_quant(path: impl AsRef<Path>, device: Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(VibeVoiceError::Load(format!("not found: {}", path.display())));
         }
         if path.is_dir() {
-            Self::open_dir(path, device, dtype)
+            Self::open_dir(path, device, dtype, quant)
         } else {
-            Self::open_bundle(path, device, dtype)
+            Self::open_bundle(path, device, dtype, quant)
         }
     }
 
-    fn open_bundle(path: &Path, device: Device, dtype: DType) -> Result<Self> {
+    fn open_bundle(path: &Path, device: Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
         let bundle = Arc::new(
             Bundle::open(path).map_err(|e| VibeVoiceError::Bundle(e.to_string()))?,
         );
@@ -112,7 +135,7 @@ impl VibeVoiceCheckpoint {
             .with_component("main")
             .with_device(device);
         Ok(Self {
-            source: Box::new(LoaderSource::new(loader, device, dtype)),
+            source: Box::new(LoaderSource::new(loader, device, dtype).with_quant(quant)),
             config,
             preprocessor,
             tokenizer_json,
@@ -121,7 +144,7 @@ impl VibeVoiceCheckpoint {
         })
     }
 
-    fn open_dir(dir: &Path, device: Device, dtype: DType) -> Result<Self> {
+    fn open_dir(dir: &Path, device: Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
         let read = |name: &str| -> Result<Vec<u8>> {
             std::fs::read(dir.join(name))
                 .map_err(|e| VibeVoiceError::Load(format!("{name}: {e}")))
@@ -143,7 +166,7 @@ impl VibeVoiceCheckpoint {
             .map_err(|e| VibeVoiceError::Load(e.to_string()))?
             .with_device(device);
         Ok(Self {
-            source: Box::new(LoaderSource::new(loader, device, dtype)),
+            source: Box::new(LoaderSource::new(loader, device, dtype).with_quant(quant)),
             config,
             preprocessor,
             tokenizer_json,

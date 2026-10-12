@@ -88,6 +88,15 @@ fn duration(default: f64, max: f64) -> ParamSpec {
     spec("duration", "Длительность, с", "Длина результата в секундах", float(0.5, max, 0.5, 1), f(default))
 }
 
+/// Образец голоса для клонирования — у всех движков синтеза речи.
+fn ref_audio() -> ParamSpec {
+    spec("ref_audio", "Образец голоса", "WAV-запись речи одного человека на 3–10 секунд: голос клонируется с неё", ParamKind::File { patterns: vec!["audio/wav".into(), "audio/x-wav".into(), "*.wav".into()] }, None)
+}
+
+fn ref_text() -> ParamSpec {
+    spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово", ParamKind::Text { multiline: true }, None)
+}
+
 fn language(hint: &'static str) -> ParamSpec {
     spec("language", "Язык", hint, ParamKind::Text { multiline: false }, None)
 }
@@ -98,13 +107,13 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
     match task {
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
-            "vibevoice" => vec![steps(Some(20), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
-            "voxcpm" | "voxcpm2" => vec![language("Код языка; пусто — по тексту"), steps(Some(10), "Шаги диффузии"), seed()],
+            "vibevoice" => vec![ref_audio(), steps(Some(20), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
+            "voxcpm" | "voxcpm2" => vec![ref_audio(), ref_text(), steps(Some(10), "Шаги диффузии"), guidance(2.0, "Guidance (CFG)"), seed()],
             _ => vec![
                 language("Код языка (ru, en, kk); пусто — определять по тексту"),
                 spec("voice", "Голос", "Описание голоса по-английски: пол, возраст, манера (например, calm female voice); цифры и русский текст модель может прочитать вслух. Не нужно, если задан образец", ParamKind::Text { multiline: true }, None),
-                spec("ref_audio", "Образец голоса", "WAV-запись речи одного человека на 3–10 секунд: голос клонируется с неё", ParamKind::File { patterns: vec!["audio/wav".into(), "audio/x-wav".into(), "*.wav".into()] }, None),
-                spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово", ParamKind::Text { multiline: true }, None),
+                ref_audio(),
+                ref_text(),
                 spec("speed", "Скорость речи", "1 — обычная", float(0.25, 4.0, 0.05, 2), f(1.0)),
                 steps(None, "Шаги маскированного декода; авто — 16 на NPU, 32 на остальных"),
                 guidance(2.0, "Guidance (CFG)"),
