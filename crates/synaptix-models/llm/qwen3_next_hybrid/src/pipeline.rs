@@ -201,7 +201,7 @@ impl HybridPipeline {
         let config = weights.config.clone();
         let tokenizer = HfTokenizer::from_bytes(&weights.tokenizer_json)
             .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?;
-        let cap = config.max_position_embeddings.min(4096);
+        let cap = config.max_position_embeddings;
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, dtype, cap)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
@@ -223,7 +223,7 @@ impl HybridPipeline {
         let config = weights.config.clone();
         let tokenizer = HfTokenizer::from_bytes(&weights.tokenizer_json)
             .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?;
-        let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
+        let cap = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(
             &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, cap,
@@ -264,7 +264,7 @@ impl HybridPipeline {
         if !synaptix_llm_common::mtp::present(&weights) {
             return Ok(me);
         }
-        let cap = max_seq.unwrap_or_else(|| me.config.max_position_embeddings.min(4096));
+        let cap = max_seq.unwrap_or(me.config.max_position_embeddings);
         let dcfg = me.config.to_decoder_config();
         let module = synaptix_llm_common::mtp::MtpModule::build(
             &dcfg,

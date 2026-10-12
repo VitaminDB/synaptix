@@ -254,7 +254,7 @@ impl Qwen4ExpPipeline {
                     .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?,
             )
         };
-        let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
+        let cap = max_seq.unwrap_or(config.max_position_embeddings);
         // MoE считает вход своими под-чанками; если они мельче чанка префилла,
         // каждый под-чанк заново поднимает почти всех экспертов слоя — на
         // длинном промпте это кратный перечит всей стопки.

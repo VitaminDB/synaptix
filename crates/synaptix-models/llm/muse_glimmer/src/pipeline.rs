@@ -169,7 +169,7 @@ impl MusePipeline {
         let config = weights.config.clone();
         let tokenizer = HfTokenizer::from_bytes(&weights.tokenizer_json)
             .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?;
-        let cap = max_seq.unwrap_or_else(|| config.max_position_embeddings.min(4096));
+        let cap = max_seq.unwrap_or(config.max_position_embeddings);
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(
             &dcfg,

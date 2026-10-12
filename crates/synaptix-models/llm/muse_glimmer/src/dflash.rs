@@ -301,7 +301,7 @@ impl DFlashModule {
             });
         }
 
-        let rope_cap = config.max_position_embeddings.min(131_072);
+        let rope_cap = config.max_position_embeddings;
         let rope = RopeCache::new(config.head_dim, rope_cap, config.rope_theta, device)
             .map_err(|e| ModelError::Build(format!("dflash rope: {e}")))?;
 
