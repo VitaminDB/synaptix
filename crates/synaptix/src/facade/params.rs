@@ -163,9 +163,11 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     let template = path.and_then(super::llm::load_template_source).unwrap_or_default();
     let preset = profile.pick("", false).or_else(|| profile.presets.first());
     let p = |get: fn(&super::sampling::SamplingPreset) -> f64, fallback: f64| f(preset.map(get).unwrap_or(fallback));
+    let window = path.and_then(super::arch::config_max_seq).unwrap_or(131072).max(2048);
     let mut out = vec![
         spec("system_prompt", "Стартовый промпт", "Системное сообщение в начале диалога, если программа не задала своё", ParamKind::Text { multiline: true }, None),
-        spec("max_tokens", "Длина ответа, токенов", "Предел длины одного ответа", int(1, 131072, 64), i(1024)),
+        spec("context", "Размер контекста, токенов", "Сколько токенов модель держит в памяти: промпт, история и ответ. Кэш растёт по мере разговора до этого предела", int(2048, window as i64, 1024), i(window as i64)),
+        spec("max_tokens", "Максимум генерируемых токенов", "Предел длины одного ответа вместе с размышлениями", int(16, window as i64, 64), i(16384.min(window as i64))),
         spec("temperature", "Температура", "Выше — разнообразнее, ниже — точнее", float(0.0, 2.0, 0.05, 2), p(|s| s.temperature as f64, 0.7)),
         spec("top_p", "Top-p", "Доля вероятности, из которой выбирается слово", float(0.0, 1.0, 0.05, 2), p(|s| s.top_p as f64, 0.95)),
         spec("top_k", "Top-k", "Из скольких самых вероятных слов выбирать; 0 — без ограничения", int(0, 1000, 1), i(preset.map(|s| s.top_k as i64).unwrap_or(20))),
