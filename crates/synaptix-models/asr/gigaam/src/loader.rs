@@ -28,6 +28,9 @@ pub struct GigaAmWeights {
     pub tokenizer_model: Vec<u8>,
     pub device: Device,
     pub dtype: DType,
+    /// Квантовать линейные слои при загрузке (NVFP4/MXFP8/Sq) — на лету,
+    /// независимо от формата весов; `None` — плотные в `dtype`.
+    pub quant: Option<DType>,
 }
 
 impl GigaAmWeights {
@@ -59,6 +62,7 @@ impl GigaAmWeights {
             tokenizer_model,
             device,
             dtype,
+            quant: None,
         })
     }
 
@@ -100,6 +104,7 @@ impl GigaAmWeights {
             tokenizer_model,
             device,
             dtype,
+            quant: None,
         })
     }
 

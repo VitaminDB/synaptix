@@ -36,7 +36,13 @@ impl Lin {
                 synaptix_core::quant::calib::record(name, h).map_err(err)?;
                 h.linear(w).map_err(err)
             }
-            Lin::Quant(q, _) => h.linear_quant(q).map_err(err),
+            Lin::Quant(q, _) => {
+                let dt = h.dtype();
+                if dt == DType::F16 || (dt == DType::BF16 && q.dtype() == DType::NVFP4) {
+                    return h.linear_quant(q).map_err(err);
+                }
+                h.to_dtype(DType::F16).and_then(|x| x.linear_quant(q)).and_then(|y| y.to_dtype(dt)).map_err(err)
+            }
         }
     }
 }
@@ -109,10 +115,16 @@ impl Backbone {
             }
         };
         let lin = |name: &str| -> Result<Lin> {
-            match weights.quant(name) {
-                Some(q) => Ok(Lin::Quant(q.share().map_err(err)?, name.to_string())),
-                None => Ok(Lin::Dense(get(name)?, name.to_string())),
+            if let Some(q) = weights.quant(name) {
+                return Ok(Lin::Quant(q.share().map_err(err)?, name.to_string()));
             }
+            let w = get(name)?;
+            if let Some(qd) = weights.quant_dtype {
+                if let Some(q) = w.quantize_weight(qd).map_err(err)? {
+                    return Ok(Lin::Quant(q, name.to_string()));
+                }
+            }
+            Ok(Lin::Dense(w, name.to_string()))
         };
 
         let embed_tokens = get("llm.embed_tokens.weight")?;

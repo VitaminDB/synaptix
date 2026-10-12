@@ -57,6 +57,18 @@ impl OmniVoicePipeline {
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_syn_quant(syn_path, device, dtype, None)
+    }
+
+    /// То же, но линейные слои LM квантуются при загрузке в `quant`
+    /// (NVFP4/MXFP8/Sq) независимо от формата весов в бандле; `dtype` —
+    /// точность счёта и остальных тензоров.
+    pub fn from_syn_quant(
+        syn_path: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        quant: Option<DType>,
+    ) -> Result<Self> {
         let bundle = Bundle::open(syn_path.as_ref())
             .map_err(|e| OmniVoiceError::Bundle(e.to_string()))?;
 
@@ -84,7 +96,8 @@ impl OmniVoicePipeline {
             .map_err(|e| OmniVoiceError::Bundle(format!("tensors:lm chunk: {e}")))?;
         let manifest = synaptix_bundle::QuantManifest::read_from(&bundle);
         let host: &[&str] = if matches!(device, Device::Npu(_)) { &["llm.embed_tokens.weight", "audio_embeddings.weight"] } else { &[] };
-        let lm = OmniVoiceLmWeights::load_bundle_bytes(lm_bytes, device, dtype, manifest.as_ref(), host)?;
+        let mut lm = OmniVoiceLmWeights::load_bundle_bytes(lm_bytes, device, dtype, manifest.as_ref(), host)?;
+        lm.quant_dtype = quant;
 
         // codec: dedicated `tensors:codec` chunk. ВНИМАНИЕ: некоторые omnivoice.syn
         // спакованы только с lm-компонентом (codec отсутствует как отдельный chunk;
@@ -294,6 +307,61 @@ impl OmniVoicePipeline {
         target_len: Option<usize>,
         gen: &OmniVoiceGenerationConfig,
     ) -> Result<Vec<f32>> {
+        self.synthesize_codes(text, prompt, lang, instruct, speed, target_len, gen).map(|(wav, _)| wav)
+    }
+
+    /// Референс голоса из уже сгенерированной речи (`codes` — из
+    /// [`Self::synthesize_codes`]): следующие фразы выйдут тем же голосом.
+    pub fn prompt_from_generated(&self, codes: &Tensor, text: &str, wav: &[f32]) -> Result<VoiceClonePrompt> {
+        let ref_audio_tokens = codes.to_device(Device::Cpu).and_then(|c| c.to_dtype(DType::I64)).map_err(err)?;
+        Ok(VoiceClonePrompt { ref_audio_tokens, ref_text: crate::prompt::add_punctuation(text), ref_rms: crate::prompt::rms_f32(wav) })
+    }
+
+    /// Озвучка текста фразами одним голосом. `voice` — референс из
+    /// предыдущих фраз: `None` — голос выбирается по `instruct` (или
+    /// случайно) и запоминается, иначе фраза синтезируется как продолжение
+    /// референса, а `instruct` уже не нужен (описание голоса в промпте
+    /// модель порой читает вслух). Референс дополняется фразами до
+    /// `max_ref_sec` секунд.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_continuing(
+        &self,
+        text: &str,
+        voice: &mut Option<VoiceClonePrompt>,
+        lang: Option<&str>,
+        instruct: Option<&str>,
+        speed: f64,
+        gen: &OmniVoiceGenerationConfig,
+        max_ref_sec: f32,
+    ) -> Result<Vec<f32>> {
+        let (wav, codes) = match voice.as_ref() {
+            Some(p) => self.synthesize_codes(text, Some(p), lang, None, speed, None, gen)?,
+            None => self.synthesize_codes(text, None, lang, instruct, speed, None, gen)?,
+        };
+        let part = self.prompt_from_generated(&codes, text, &wav)?;
+        let max_tokens = (max_ref_sec.max(0.0) * self.frame_rate as f32) as usize;
+        match voice {
+            Some(p) => {
+                p.extend(&part, max_tokens)?;
+            }
+            None => *voice = Some(part),
+        }
+        Ok(wav)
+    }
+
+    /// [`Self::synthesize`], возвращающий и коды кодека `[C, T]` сгенерированной
+    /// речи — для референса голоса ([`Self::prompt_from_generated`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_codes(
+        &self,
+        text: &str,
+        prompt: Option<&VoiceClonePrompt>,
+        lang: Option<&str>,
+        instruct: Option<&str>,
+        speed: f64,
+        target_len: Option<usize>,
+        gen: &OmniVoiceGenerationConfig,
+    ) -> Result<(Vec<f32>, Tensor)> {
         let target_len = target_len.unwrap_or_else(|| match prompt {
             Some(p) => self.estimate_target_tokens_clone(text, p, speed),
             None => self.duration.estimate_target_tokens(text, None, None, speed),
@@ -316,7 +384,7 @@ impl OmniVoicePipeline {
         if timing {
             eprintln!("omnivoice: декод {:.2} с ({} шагов, T={target_len}), кодек {:.2} с", (t1 - t0).as_secs_f32(), gen.num_step, t1.elapsed().as_secs_f32());
         }
-        Ok(out)
+        Ok((out, codes))
     }
 
     /// Доступ к encode-пути нейро-кодека (ref-аудио → коды). Для гейтов/дебага.

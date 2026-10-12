@@ -10,6 +10,7 @@
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
+use synaptix_nn::quant_linear::QuantLinear;
 use synaptix_nn::{Linear, Module};
 use synaptix_ops::activation::gelu_exact;
 use synaptix_ops::attention::softmax::scaled_dot_attention;
@@ -36,10 +37,10 @@ impl LayerNorm {
 /// Multi-head attention Whisper. Используется и как self-, и как cross-attention:
 /// query берётся из `x`, key/value — из `kv_source` (для self-attn это тот же `x`).
 pub struct WhisperAttention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
+    q: QuantLinear,
+    k: QuantLinear,
+    v: QuantLinear,
+    out: QuantLinear,
     num_heads: usize,
     head_dim: usize,
     scale: f32,
@@ -149,8 +150,8 @@ pub struct EncoderLayer {
     self_attn_ln: LayerNorm,
     self_attn: WhisperAttention,
     final_ln: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: QuantLinear,
+    fc2: QuantLinear,
 }
 
 impl EncoderLayer {
@@ -271,8 +272,8 @@ pub struct DecoderLayer {
     encoder_attn_ln: LayerNorm,
     encoder_attn: WhisperAttention,
     final_ln: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: QuantLinear,
+    fc2: QuantLinear,
 }
 
 impl DecoderLayer {
@@ -574,14 +575,17 @@ impl WhisperModel {
     }
 }
 
-fn load_linear(w: &WhisperWeights, prefix: &str, with_bias: bool) -> Result<Linear> {
+fn load_linear(w: &WhisperWeights, prefix: &str, with_bias: bool) -> Result<QuantLinear> {
     let weight = w.get(&format!("{prefix}.weight"))?;
     let bias = if with_bias {
         Some(w.get(&format!("{prefix}.bias"))?)
     } else {
         None
     };
-    Ok(Linear::new(weight, bias)?)
+    Ok(match w.quant {
+        Some(q) => QuantLinear::build(weight, bias, q, w.dtype)?,
+        None => QuantLinear::dense(weight, bias)?,
+    })
 }
 
 fn load_layer_norm(w: &WhisperWeights, prefix: &str) -> Result<LayerNorm> {

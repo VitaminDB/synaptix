@@ -28,6 +28,8 @@ pub enum ParamKind {
     Float { min: f64, max: f64, step: f64, decimals: u8 },
     Bool,
     Choice { options: Vec<String> },
+    /// Путь к файлу; `patterns` — MIME-типы или маски для диалога выбора.
+    File { patterns: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,7 +102,9 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             "voxcpm" | "voxcpm2" => vec![language("Код языка; пусто — по тексту"), steps(Some(10), "Шаги диффузии"), seed()],
             _ => vec![
                 language("Код языка (ru, en, kk); пусто — определять по тексту"),
-                spec("voice", "Голос", "Описание голоса: пол, возраст, манера", ParamKind::Text { multiline: true }, None),
+                spec("voice", "Голос", "Описание голоса по-английски: пол, возраст, манера (например, calm female voice); цифры и русский текст модель может прочитать вслух. Не нужно, если задан образец", ParamKind::Text { multiline: true }, None),
+                spec("ref_audio", "Образец голоса", "WAV-запись речи одного человека на 3–10 секунд: голос клонируется с неё", ParamKind::File { patterns: vec!["audio/wav".into(), "audio/x-wav".into(), "*.wav".into()] }, None),
+                spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово", ParamKind::Text { multiline: true }, None),
                 spec("speed", "Скорость речи", "1 — обычная", float(0.25, 4.0, 0.05, 2), f(1.0)),
                 steps(None, "Шаги маскированного декода; авто — 16 на NPU, 32 на остальных"),
                 guidance(2.0, "Guidance (CFG)"),

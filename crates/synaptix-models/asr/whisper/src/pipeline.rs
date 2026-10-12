@@ -70,6 +70,12 @@ impl WhisperPipeline {
         Self::from_syn_split(path, device, dtype, device, dtype)
     }
 
+    /// Линейные слои квантуются при загрузке в `quant` (NVFP4/MXFP8/Sq) — на
+    /// лету, независимо от формата весов в бандле; `dtype` — точность счёта.
+    pub fn from_syn_quant(path: impl AsRef<Path>, device: Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
+        Self::from_syn_split_quant(path, device, dtype, device, dtype, quant)
+    }
+
     /// Энкодер — на `enc_device` (например, NPU), декодер — на `device`.
     pub fn from_syn_split(
         path: impl AsRef<Path>,
@@ -78,12 +84,25 @@ impl WhisperPipeline {
         enc_device: Device,
         enc_dtype: DType,
     ) -> Result<Self> {
+        Self::from_syn_split_quant(path, device, dtype, enc_device, enc_dtype, None)
+    }
+
+    pub fn from_syn_split_quant(
+        path: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        enc_device: Device,
+        enc_dtype: DType,
+        quant: Option<DType>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let w = WhisperWeights::open(path, device, dtype)?;
+        let mut w = WhisperWeights::open(path, device, dtype)?;
+        w.quant = quant;
         let model = if enc_device == device && enc_dtype == dtype {
             WhisperModel::load(&w)?
         } else {
-            let we = WhisperWeights::open(path, enc_device, enc_dtype)?;
+            let mut we = WhisperWeights::open(path, enc_device, enc_dtype)?;
+            we.quant = quant;
             WhisperModel { encoder: WhisperEncoder::load(&we)?, decoder: WhisperDecoder::load(&w)? }
         };
         let tok_bytes = w.read_aux("tokenizer.json")?;

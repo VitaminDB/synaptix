@@ -74,12 +74,16 @@ pub struct Transcriber {
 
 impl Transcriber {
     pub fn load(cfg: AsrConfig) -> Result<Self, String> {
+        // Квант-формат хранения → линейные слои квантуются при загрузке
+        // независимо от того, как сохранены веса; плотные dtype — счёт как есть.
+        let quant = matches!(cfg.storage_dtype, DType::NVFP4 | DType::MXFP8 | DType::Sq { .. }).then_some(cfg.storage_dtype);
         match cfg.kind {
             AsrModelKind::Whisper => {
-                let whisper = WhisperPipeline::from_syn(
+                let whisper = WhisperPipeline::from_syn_quant(
                     &cfg.model_path,
                     cfg.device,
                     cfg.compute_dtype.to_dtype(),
+                    quant,
                 )
                 .map_err(|e| e.to_string())?;
                 Ok(Self {
@@ -91,9 +95,9 @@ impl Transcriber {
             AsrModelKind::GigaAm => {
                 // Каталог = распакованный HF-снапшот; файл = .syn-бандл.
                 let gigaam = if cfg.model_path.is_dir() {
-                    GigaAm::from_unpacked(&cfg.model_path, &cfg.device, cfg.compute_dtype.to_dtype())
+                    GigaAm::from_unpacked_quant(&cfg.model_path, &cfg.device, cfg.compute_dtype.to_dtype(), quant)
                 } else {
-                    GigaAm::from_syn(&cfg.model_path, &cfg.device, cfg.compute_dtype.to_dtype())
+                    GigaAm::from_syn_quant(&cfg.model_path, &cfg.device, cfg.compute_dtype.to_dtype(), quant)
                 }
                 .map_err(|e| e.to_string())?;
                 Ok(Self {

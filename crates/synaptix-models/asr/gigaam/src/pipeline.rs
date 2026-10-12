@@ -31,6 +31,20 @@ impl GigaAm {
         Self::build(w)
     }
 
+    /// Линейные слои квантуются при загрузке в `quant` (NVFP4/MXFP8/Sq) — на
+    /// лету, независимо от формата весов; `dtype` — точность счёта.
+    pub fn from_syn_quant(path: impl AsRef<Path>, device: &Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
+        let mut w = GigaAmWeights::from_syn(path, *device, dtype)?;
+        w.quant = quant;
+        Self::build(w)
+    }
+
+    pub fn from_unpacked_quant(dir: impl AsRef<Path>, device: &Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
+        let mut w = GigaAmWeights::from_unpacked(dir, *device, dtype)?;
+        w.quant = quant;
+        Self::build(w)
+    }
+
     /// Загрузить из распакованного HF-снапшота (`model.safetensors` +
     /// `config.json` + `tokenizer.model`).
     pub fn from_unpacked(dir: impl AsRef<Path>, device: &Device, dtype: DType) -> Result<Self> {

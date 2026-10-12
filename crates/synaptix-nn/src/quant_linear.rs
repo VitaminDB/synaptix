@@ -85,14 +85,8 @@ impl QuantLinear {
             Some(b) => Some(b.to_dtype(compute)?),
             None => None,
         };
-        let to_f16 = |w: Tensor| -> Result<Tensor> {
-            if w.dtype() == DType::F16 { Ok(w) } else { w.to_dtype(DType::F16) }
-        };
-        let quant = match quant_dtype {
-            DType::NVFP4 if n % 64 == 0 && k % 64 == 0 => Some(to_f16(weight.clone())?.quantize_to_nvfp4()?),
-            DType::MXFP8 if k % 32 == 0 => Some(to_f16(weight.clone())?.quantize_to_mxfp8()?),
-            _ => None,
-        };
+        let _ = (n, k);
+        let quant = weight.quantize_weight(quant_dtype)?;
         match quant {
             Some(w) => Ok(QuantLinear::Quant { w, bias: bias_c }),
             None => {

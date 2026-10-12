@@ -24,6 +24,9 @@ pub struct WhisperWeights {
     pub gen_config: GenerationConfig,
     pub device: Device,
     pub dtype: DType,
+    /// Квантовать линейные слои при загрузке (NVFP4/MXFP8/Sq) — на лету,
+    /// независимо от формата весов; `None` — плотные в `dtype`.
+    pub quant: Option<DType>,
 }
 
 impl WhisperWeights {
@@ -50,7 +53,7 @@ impl WhisperWeights {
             .map_err(|e| WhisperError::Load(format!("safetensors header: {e}")))?;
         let names: HashSet<String> = st.names().into_iter().map(|s| s.to_string()).collect();
 
-        Ok(Self { bundle, loader, names, config, gen_config, device, dtype })
+        Ok(Self { bundle, loader, names, config, gen_config, device, dtype, quant: None })
     }
 
     /// Тензор по HF-имени, приведённый к compute-dtype на целевом устройстве.

@@ -28,6 +28,28 @@ impl Tensor {
     pub fn quantize_to_mxfp8(&self) -> Result<QuantWeight> { run_quantize_mxfp8(self) }
     /// Квант в SQ`bits` (1..=8 бит, супер-блоки по 256): F16/BF16 `[n, k]`.
     pub fn quantize_to_sq(&self, bits: u8) -> Result<QuantWeight> { run_quantize_sq(self, bits) }
+
+    /// Квантовать плотный вес `[N, K]` при загрузке в `quant` (NVFP4, MXFP8,
+    /// `Sq{bits}`): так любая модель получает квантование на лету независимо
+    /// от того, как сохранены её веса. `None` — вес не 2D или его форма не
+    /// подходит ядрам (NVFP4: N и K кратны 64; MXFP8 и Sq: K кратен 32), для
+    /// других `quant` — тоже `None`: слой остаётся плотным.
+    pub fn quantize_weight(&self, quant: DType) -> Result<Option<QuantWeight>> {
+        let dims = self.dims();
+        if dims.len() != 2 {
+            return Ok(None);
+        }
+        let (n, k) = (dims[0], dims[1]);
+        let half = || -> Result<Tensor> {
+            if matches!(self.dtype(), DType::F16 | DType::BF16) { Ok(self.clone()) } else { self.to_dtype(DType::F16) }
+        };
+        Ok(match quant {
+            DType::NVFP4 if n % 64 == 0 && k % 64 == 0 => Some(half()?.to_dtype(DType::F16)?.quantize_to_nvfp4()?),
+            DType::MXFP8 if k % 32 == 0 => Some(half()?.to_dtype(DType::F16)?.quantize_to_mxfp8()?),
+            DType::Sq { bits } if k % 32 == 0 => Some(half()?.quantize_to_sq(bits)?),
+            _ => None,
+        })
+    }
     /// Квант в формат по `dtype`: NVFP4, MXFP8 или SQ; иначе `Unsupported`.
     pub fn quantize_to(&self, dtype: DType) -> Result<QuantWeight> {
         match dtype {

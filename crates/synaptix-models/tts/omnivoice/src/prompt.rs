@@ -24,10 +24,34 @@ fn err<E: std::fmt::Display>(e: E) -> OmniVoiceError {
 
 /// Результат `create_voice_clone_prompt`: ref-коды `[C, T]` (i64, host), ref-текст
 /// (с пунктуацией), ref_rms (для post-process громкости).
+#[derive(Clone)]
 pub struct VoiceClonePrompt {
     pub ref_audio_tokens: Tensor,
     pub ref_text: String,
     pub ref_rms: f32,
+}
+
+impl VoiceClonePrompt {
+    /// Длина референса в кадрах кодека.
+    pub fn num_tokens(&self) -> usize {
+        self.ref_audio_tokens.dims().last().copied().unwrap_or(0)
+    }
+
+    /// Дописать к референсу следующий фрагмент той же речи (коды + текст),
+    /// пока референс короче `max_tokens`: короткая первая фраза плохо
+    /// задаёт голос, несколько фраз — надёжно. `false` — уже достаточно.
+    pub fn extend(&mut self, other: &VoiceClonePrompt, max_tokens: usize) -> Result<bool> {
+        if self.num_tokens() >= max_tokens || other.num_tokens() == 0 {
+            return Ok(false);
+        }
+        let dim = self.ref_audio_tokens.rank().saturating_sub(1);
+        self.ref_audio_tokens = Tensor::cat(&[&self.ref_audio_tokens, &other.ref_audio_tokens], dim).map_err(err)?;
+        if !self.ref_text.is_empty() && !self.ref_text.ends_with(char::is_whitespace) {
+            self.ref_text.push(' ');
+        }
+        self.ref_text.push_str(&other.ref_text);
+        Ok(true)
+    }
 }
 
 // ── pydub-faithful AudioSegment (int16 mono) ──────────────────────────────────
@@ -415,7 +439,7 @@ fn round_half_even(v: f64) -> f64 {
 }
 
 /// rms = sqrt(mean(x²)) (как `np.sqrt(np.mean(ref_wav**2))`).
-fn rms_f32(x: &[f32]) -> f32 {
+pub(crate) fn rms_f32(x: &[f32]) -> f32 {
     if x.is_empty() {
         return 0.0;
     }

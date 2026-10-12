@@ -6,6 +6,8 @@
 //! валидны): `att_mask=None`, `pad_mask=None` в upstream при `shape[0]==1`.
 
 use synaptix_core::device::Device;
+use synaptix_nn::quant_linear::QuantLinear;
+use synaptix_nn::Module;
 use synaptix_core::tensor::Tensor;
 use synaptix_ops::activation::glu;
 use synaptix_ops::attention::log_softmax_dim;
@@ -88,31 +90,31 @@ impl Subsampling {
 }
 
 struct FeedForward {
-    linear1: (Tensor, Tensor),
-    linear2: (Tensor, Tensor),
+    linear1: QuantLinear,
+    linear2: QuantLinear,
 }
 
 impl FeedForward {
     /// linear2(SiLU(linear1(x))).
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = x.linear(&self.linear1.0)?.broadcast_add(&self.linear1.1)?;
+        let h = self.linear1.forward(x)?;
         let h = h.silu()?;
-        Ok(h.linear(&self.linear2.0)?.broadcast_add(&self.linear2.1)?)
+        Ok(self.linear2.forward(&h)?)
     }
 }
 
 struct Attn {
-    q: (Tensor, Tensor),
-    k: (Tensor, Tensor),
-    v: (Tensor, Tensor),
-    out: (Tensor, Tensor),
+    q: QuantLinear,
+    k: QuantLinear,
+    v: QuantLinear,
+    out: QuantLinear,
     n_heads: usize,
     head_dim: usize,
 }
 
 impl Attn {
-    fn proj(x: &Tensor, w: &(Tensor, Tensor)) -> Result<Tensor> {
-        Ok(x.linear(&w.0)?.broadcast_add(&w.1)?)
+    fn proj(x: &Tensor, w: &QuantLinear) -> Result<Tensor> {
+        Ok(w.forward(x)?)
     }
 
     /// `[B,S,D] -> [B,H,S,Dh]`.
@@ -264,8 +266,13 @@ impl GigaAmModel {
             conv2: conv("encoder.pre_encode.conv.2", 2, pad, 1)?,
         };
 
-        let lin = |prefix: &str| -> Result<(Tensor, Tensor)> {
-            Ok((w.get(&format!("{prefix}.weight"))?, w.get(&format!("{prefix}.bias"))?))
+        let lin = |prefix: &str| -> Result<QuantLinear> {
+            let weight = w.get(&format!("{prefix}.weight"))?;
+            let bias = Some(w.get(&format!("{prefix}.bias"))?);
+            Ok(match w.quant {
+                Some(q) => QuantLinear::build(weight, bias, q, w.dtype)?,
+                None => QuantLinear::dense(weight, bias)?,
+            })
         };
         let ln = |prefix: &str| -> Result<Ln> {
             Ok(Ln {

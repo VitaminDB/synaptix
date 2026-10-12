@@ -107,15 +107,17 @@ impl TtsPipeline {
         }
     }
 
-    /// Грузит реальный `.syn`-бандл в `compute`-dtype. `storage` игнорируется —
-    /// OmniVoice грузит веса сразу в compute-dtype.
+    /// Грузит `.syn`-бандл: счёт в `compute`, линейные слои LM — в `storage`,
+    /// если это квант-формат (NVFP4/MXFP8/Sq): квантуются на лету при
+    /// загрузке, как бы ни были сохранены веса. Иначе веса плотные в `compute`.
     pub fn from_syn(
         bundle_path: &Path,
         device: &Device,
-        _storage: StorageDType,
+        storage: StorageDType,
         compute: DType,
     ) -> Result<Self, OmniVoiceError> {
-        let inner = NativePipeline::from_syn(bundle_path, *device, compute).map_err(map_err)?;
+        let quant = matches!(storage, DType::NVFP4 | DType::MXFP8 | DType::Sq { .. }).then_some(storage);
+        let inner = NativePipeline::from_syn_quant(bundle_path, *device, compute, quant).map_err(map_err)?;
         Ok(Self { inner })
     }
 

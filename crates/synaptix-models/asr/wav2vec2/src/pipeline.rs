@@ -44,6 +44,16 @@ impl Wav2Vec2Ctc {
         Self::build(Wav2Vec2Weights::from_syn(path, *device, dtype)?)
     }
 
+    /// Как [`Self::load`], но линейные слои квантуются при загрузке в `quant`
+    /// (NVFP4/MXFP8/Sq) — на лету, независимо от формата весов; `dtype` —
+    /// точность счёта.
+    pub fn load_quant(path: impl AsRef<Path>, device: &Device, dtype: DType, quant: Option<DType>) -> Result<Self> {
+        let p = path.as_ref();
+        let mut w = if p.is_dir() { Wav2Vec2Weights::from_unpacked(p, *device, dtype)? } else { Wav2Vec2Weights::from_syn(p, *device, dtype)? };
+        w.quant_dtype = quant;
+        Self::build(w)
+    }
+
     pub fn from_unpacked(dir: impl AsRef<Path>, device: &Device, dtype: DType) -> Result<Self> {
         Self::build(Wav2Vec2Weights::from_unpacked(dir, *device, dtype)?)
     }

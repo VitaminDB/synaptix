@@ -51,13 +51,30 @@ impl Linear {
                 return Ok(Self { weight, bias, q: Some(q), name: w.full_name(&name) });
             }
         }
-        Ok(Self { weight: w.get(&name)?, bias, q: None, name: w.full_name(&name) })
+        let weight = w.get(&name)?;
+        if let Some(qd) = w.quant_dtype {
+            if let Some(q) = weight.quantize_weight(qd)? {
+                let weight = Tensor::zeros(vec![0], w.dtype, Device::Cpu)?;
+                return Ok(Self { weight, bias, q: Some(q), name: w.full_name(&name) });
+            }
+        }
+        Ok(Self { weight, bias, q: None, name: w.full_name(&name) })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         synaptix_core::quant::calib::record(&self.name, x)?;
         match &self.q {
-            Some(q) => Ok(x.linear_quant(q)?.broadcast_add(&self.bias)?),
+            Some(q) => {
+                let dt = x.dtype();
+                let y = match x.linear_quant(q) {
+                    Ok(y) => y,
+                    Err(synaptix_core::error::SynaptixError::Unsupported(_)) if dt != DType::F16 => {
+                        x.to_dtype(DType::F16)?.linear_quant(q)?.to_dtype(dt)?
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                Ok(y.broadcast_add(&self.bias)?)
+            }
             None => Ok(x.linear(&self.weight)?.broadcast_add(&self.bias)?),
         }
     }

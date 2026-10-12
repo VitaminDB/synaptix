@@ -60,6 +60,9 @@ pub struct OmniVoiceLmWeights {
     quant: HashMap<String, synaptix_core::tensor::quant::QuantWeight>,
     pub device: Device,
     pub dtype: DType,
+    /// Квантовать линейные слои при сборке (NVFP4/MXFP8/Sq) — на лету, как бы
+    /// ни были сохранены веса; `None` — плотные в `dtype`.
+    pub quant_dtype: Option<DType>,
 }
 
 impl OmniVoiceLmWeights {
@@ -88,7 +91,7 @@ impl OmniVoiceLmWeights {
                 .map_err(|e| OmniVoiceError::Load(format!("load '{name}': {e}")))?;
             tensors.insert(name, t);
         }
-        Ok(Self { tensors, quant: HashMap::new(), device, dtype })
+        Ok(Self { tensors, quant: HashMap::new(), device, dtype, quant_dtype: None })
     }
 
     /// Загрузить lm-компонент из safetensors-байтов (`.syn` `tensors:lm`).
@@ -155,7 +158,7 @@ impl OmniVoiceLmWeights {
             }
             Ok(())
         })?;
-        Ok(Self { tensors, quant, device, dtype })
+        Ok(Self { tensors, quant, device, dtype, quant_dtype: None })
     }
 
     pub fn quant(&self, name: &str) -> Option<&synaptix_core::tensor::quant::QuantWeight> {

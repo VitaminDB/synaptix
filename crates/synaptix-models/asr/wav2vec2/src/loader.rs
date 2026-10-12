@@ -31,6 +31,9 @@ pub struct Wav2Vec2Weights {
     /// Исходный `config.json` целиком (для сохранения дообученной модели).
     pub config_json: serde_json::Value,
     pub vocab: CtcVocab,
+    /// Квантовать линейные слои при загрузке (NVFP4/MXFP8/Sq) — на лету,
+    /// независимо от формата весов; `None` — плотные в `dtype`.
+    pub quant_dtype: Option<DType>,
     pub device: Device,
     pub dtype: DType,
 }
@@ -59,7 +62,7 @@ impl Wav2Vec2Weights {
             .map_err(|e| Wav2Vec2Error::Load(format!("open {}: {e}", weights_path.display())))?
             .with_device(device);
         let names = loader.names().into_iter().map(|s| s.to_string()).collect();
-        Ok(Self { source: Source::Safetensors(loader), names, quant: None, config, config_json, vocab, device, dtype })
+        Ok(Self { source: Source::Safetensors(loader), names, quant: None, config, config_json, vocab, quant_dtype: None, device, dtype })
     }
 
     pub fn from_syn(
@@ -91,7 +94,7 @@ impl Wav2Vec2Weights {
         if let Some(q) = &quant {
             names.extend(q.tensors.keys().cloned());
         }
-        Ok(Self { source: Source::Bundle(Box::new(bundle)), names, quant, config, config_json, vocab, device, dtype })
+        Ok(Self { source: Source::Bundle(Box::new(bundle)), names, quant, config, config_json, vocab, quant_dtype: None, device, dtype })
     }
 
     /// Полное имя тензора: как есть, либо с префиксом энкодера
