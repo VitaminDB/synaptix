@@ -112,7 +112,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 spec(
                     "voice",
                     "Голос",
-                    "Описание голоса, лучше по-английски: пол, возраст, тембр, эмоция (например, young woman, gentle and sweet voice). С образцом — манера поверх его тембра (slightly faster, cheerful tone); с текстом образца не действует",
+                    "Подробное описание по-английски: кто, возраст, высота и тембр, манера — например, A little boy, about 7 years old, high-pitched childish voice, playful. Короткое (small boy) модель почти не слушает. С образцом — манера поверх его тембра (slightly faster, cheerful tone); с текстом образца не действует",
                     ParamKind::Text { multiline: true },
                     None,
                 ),
