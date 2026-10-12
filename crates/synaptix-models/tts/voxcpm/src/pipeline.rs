@@ -49,6 +49,9 @@ pub struct VoxCpmPipeline {
     model: VoxCpmModel,
     tokenizer: TextTokenizer,
     device: Device,
+    /// Где собираются входы модели: на NPU — на хосте (сборка на NPU — граф
+    /// на каждую длину фразы).
+    host: Device,
     compute: DType,
 }
 
@@ -64,7 +67,8 @@ impl VoxCpmPipeline {
         let tok_bytes = ck.read_file("tokenizer.json")?;
         let tokenizer = TextTokenizer::from_bytes(&tok_bytes)?;
         let model = VoxCpmModel::load(&ck)?;
-        Ok(Self { model, tokenizer, device, compute })
+        let host = if matches!(device, Device::Npu(_)) { Device::Cpu } else { device };
+        Ok(Self { model, tokenizer, device, host, compute })
     }
 
     fn zeros_patches(&self, n: usize) -> Result<Tensor, VoxError> {
@@ -72,7 +76,7 @@ impl VoxCpmPipeline {
         Ok(Tensor::zeros(
             vec![n, cfg.patch_size, cfg.feat_dim],
             self.compute,
-            self.device,
+            self.host,
         )?)
     }
 
@@ -116,7 +120,7 @@ impl VoxCpmPipeline {
         let samples = audio_io::resampled(samples, sr, cfg.sample_rate)?;
         let samples = audio_io::pad_to_multiple(samples, patch_len, mode);
         let len = samples.len();
-        let x = Tensor::from_vec(samples, vec![1usize, 1, len], self.device)?;
+        let x = Tensor::from_vec(samples, vec![1usize, 1, len], self.host)?;
         let mu = self.model.audio_vae.encode(&x)?;
         let t_lat = mu.dims()[2];
         let t = t_lat / patch;
@@ -125,7 +129,8 @@ impl VoxCpmPipeline {
             .reshape((cfg.latent_dim, t, patch))?
             .permute([1usize, 2, 0])?
             .contiguous()?
-            .to_dtype(self.compute)?;
+            .to_dtype(self.compute)?
+            .to_device(self.host)?;
         Ok(feat)
     }
 
@@ -141,9 +146,9 @@ impl VoxCpmPipeline {
             feats.push(seg.feat.clone());
         }
         let l = tokens.len();
-        let token_t = Tensor::from_vec(tokens, vec![1usize, l], self.device)?;
-        let tmask_t = Tensor::from_vec(tmask, vec![1usize, l], self.device)?.to_dtype(self.compute)?;
-        let amask_t = Tensor::from_vec(amask, vec![1usize, l], self.device)?.to_dtype(self.compute)?;
+        let token_t = Tensor::from_vec(tokens, vec![1usize, l], self.host)?;
+        let tmask_t = Tensor::from_vec(tmask, vec![1usize, l], self.host)?.to_dtype(self.compute)?;
+        let amask_t = Tensor::from_vec(amask, vec![1usize, l], self.host)?.to_dtype(self.compute)?;
         let feat_t = Tensor::cat(&feats.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
         Ok((token_t, tmask_t, amask_t, feat_t))
     }

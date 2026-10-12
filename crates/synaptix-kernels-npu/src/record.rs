@@ -31,7 +31,7 @@ pub enum NodeOp {
     Attention { scale: f32, causal: bool },
     EmbedGather,
     KvAppend,
-    AttentionDev { scale: f32, window: Option<i32> },
+    AttentionDev { scale: f32, window: Option<i32>, causal: bool },
     RopeDev { rotary_dim: usize },
     RopeSplit,
     Concat(usize),
@@ -68,7 +68,11 @@ impl GraphCache {
         if let Some(mb) = std::env::var("SYNAPTIX_NPU_RESIDENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
             return mb << 20;
         }
-        crate::info().map(|i| i.model.session_bytes as usize / 2).unwrap_or(1 << 30)
+        // Intel NPU работает в общей памяти: графы держатся в ОЗУ процесса,
+        // бюджет — весь `session_bytes` (VoxCPM2: префилл и шаг — ~7 ГБ весов).
+        crate::info()
+            .map(|i| if i.model.vendor == synaptix_npu::models::Vendor::Intel { i.model.session_bytes as usize * 2 } else { i.model.session_bytes as usize / 2 })
+            .unwrap_or(1 << 30)
     }
 
     fn get(&mut self, hash: u64) -> Option<Arc<dyn CompiledGraph>> {
@@ -138,10 +142,16 @@ pub fn snapshot(v: &ValueRef) -> ValueRef {
     let st = std::mem::replace(&mut *v.state.lock(), State::Unset);
     let pending = if let State::Pending(s) = st { Some(s) } else { None };
     let snap = Value::new(v.bytes, st);
-    if let Some(s) = pending {
-        for n in REC.lock().iter_mut() {
-            if n.serial == s {
-                n.out = Arc::downgrade(&snap);
+    // Записанные раньше потребители читают прежнее содержимое — теперь оно в
+    // снимке (иначе внимание шага N увидит KV-буфер, уже переписанный шагом N+1
+    // того же сброса).
+    for n in REC.lock().iter_mut() {
+        if pending == Some(n.serial) {
+            n.out = Arc::downgrade(&snap);
+        }
+        for i in n.ins.iter_mut() {
+            if Arc::ptr_eq(&i.v, v) {
+                i.v = snap.clone();
             }
         }
     }
@@ -184,7 +194,7 @@ impl Builder {
                 State::Pending(s) => *self
                     .by_serial
                     .get(s)
-                    .ok_or_else(|| SynaptixError::Other("NPU: значение из другого графа не готово".into()))?,
+                    .ok_or_else(|| SynaptixError::Other(format!("NPU: значение из другого графа не готово (узел {s}, вход {:?})", inp.lo.dims())))?,
                 State::Ready(r) => {
                     let elem = dt.bits() / 8;
                     let numel = inp.lo.numel();
@@ -544,25 +554,57 @@ impl Builder {
                 let rows = self.g.tensor(ids).shape[0];
                 self.g.node(odt, &[rows, ts[ts.len() - 1]], |out| Op::Gather { x: table, indices: ids, axis: 0, out })
             }
+            NodeOp::KvAppend if n.ins[1].lo.dims()[2] > 1 => {
+                // T строк с позиции pos: one-hot oh[t, j] = [j = pos + t];
+                // buf' = buf·(1 − Σₜ oh) + ohᵀ·k (копия точная: одна единица в строке).
+                let buf = self.input(&n.ins[0], true)?;
+                let k = self.input(&n.ins[1], true)?;
+                let pos = self.input(&n.ins[2], true)?;
+                let dt = self.g.tensor(buf).dtype;
+                let cap = self.g.tensor(buf).shape[2] as usize;
+                let t = self.g.tensor(k).shape[2] as usize;
+                let iota = self.iota(cap, DType::F32)?;
+                let iota = self.g.reshape(iota, &[1, cap as u32]).map_err(err)?;
+                let it = self.iota(t, DType::F32)?;
+                let it = self.g.reshape(it, &[t as u32, 1]).map_err(err)?;
+                let p = self.cast(pos, DType::F32);
+                let row = self.bin(BinaryKind::Add, it, p)?;
+                let d = self.bin(BinaryKind::Sub, iota, row)?;
+                let a = self.g.unary(UnaryKind::Abs, d);
+                let one = self.scalar(1.0, a)?;
+                let oh = self.bin(BinaryKind::Sub, one, a)?;
+                let oh = self.clamp01(oh);
+                let oh = self.cast(oh, dt);
+                let oht = self.g.node(dt, &[cap as u32, t as u32], |out| Op::Transpose { x: oh, perm: vec![1, 0], out });
+                let oht = self.g.reshape(oht, &[1, 1, cap as u32, t as u32]).map_err(err)?;
+                let put = self.g.matmul(oht, k, false, false).map_err(err)?;
+                let hit = self.g.node(dt, &[1, cap as u32], |out| Op::Reduce { kind: ReduceKind::Sum, x: oh, axes: vec![0], keep_dims: true, out });
+                let one = self.scalar(1.0, hit)?;
+                let keep = self.bin(BinaryKind::Sub, one, hit)?;
+                let keep = self.g.reshape(keep, &[1, 1, cap as u32, 1]).map_err(err)?;
+                let kept = self.bin(BinaryKind::Mul, buf, keep)?;
+                self.bin(BinaryKind::Add, kept, put)?
+            }
             NodeOp::KvAppend => {
                 let buf = self.input(&n.ins[0], true)?;
                 let k = self.input(&n.ins[1], true)?;
                 let pos = self.input(&n.ins[2], true)?;
                 let dt = self.g.tensor(buf).dtype;
                 let cap = self.g.tensor(buf).shape[2] as usize;
-                let iota = self.iota(cap, dt)?;
-                let p = self.cast(pos, dt);
+                let iota = self.iota(cap, DType::F32)?;
+                let p = self.cast(pos, DType::F32);
                 let d = self.bin(BinaryKind::Sub, iota, p)?;
                 let a = self.g.unary(UnaryKind::Abs, d);
                 let one = self.scalar(1.0, a)?;
                 let oh = self.bin(BinaryKind::Sub, one, a)?;
                 let oh = self.clamp01(oh);
+                let oh = self.cast(oh, dt);
                 let oh = self.g.reshape(oh, &[1, 1, cap as u32, 1]).map_err(err)?;
                 let diff = self.bin(BinaryKind::Sub, k, buf)?;
                 let upd = self.bin(BinaryKind::Mul, diff, oh)?;
                 self.bin(BinaryKind::Add, buf, upd)?
             }
-            NodeOp::AttentionDev { scale, window } => {
+            NodeOp::AttentionDev { scale, window, causal } => {
                 let q = self.input(&n.ins[0], true)?;
                 let k = self.input(&n.ins[1], true)?;
                 let v = self.input(&n.ins[2], true)?;
@@ -571,14 +613,25 @@ impl Builder {
                 let qs = self.g.tensor(q).shape.clone();
                 let ks = self.g.tensor(k).shape.clone();
                 let cap = ks[2] as usize;
-                let (nh, nkv, hd) = (qs[1], ks[1], qs[3]);
+                let (nh, nkv, hd, tq) = (qs[1], ks[1], qs[3], qs[2]);
                 let sc = self.scalar(*scale, q)?;
                 let q = self.bin(BinaryKind::Mul, q, sc)?;
-                let q = if nh != nkv { self.g.reshape(q, &[qs[0], nkv, nh / nkv, hd]).map_err(err)? } else { q };
+                let q = if nh != nkv { self.g.reshape(q, &[qs[0], nkv, nh / nkv * tq, hd]).map_err(err)? } else { q };
                 let s = self.g.matmul(q, k, false, true).map_err(err)?;
-                let iota = self.iota(cap, dt)?;
-                let tf = self.cast(t, dt);
-                let m = self.bin(BinaryKind::Sub, tf, iota)?;
+                let iota = self.iota(cap, DType::F32)?;
+                let tf = self.cast(t, DType::F32);
+                let m = if tq > 1 && *causal {
+                    // Строка r видит j ≤ t_cache − T + r: m = clamp01(t_cache − T + 1 + r − j).
+                    let ir = self.iota(tq as usize, DType::F32)?;
+                    let ir = self.g.reshape(ir, &[tq, 1]).map_err(err)?;
+                    let sh = self.scalar(1.0 - tq as f32, tf)?;
+                    let base = self.bin(BinaryKind::Add, tf, sh)?;
+                    let lim = self.bin(BinaryKind::Add, ir, base)?;
+                    let iota2 = self.g.reshape(iota, &[1, cap as u32]).map_err(err)?;
+                    self.bin(BinaryKind::Sub, lim, iota2)?
+                } else {
+                    self.bin(BinaryKind::Sub, tf, iota)?
+                };
                 let mut m = self.clamp01(m);
                 if let Some(w) = window {
                     let lo = self.scalar((*w + 1) as f32, tf)?;
@@ -591,8 +644,17 @@ impl Builder {
                 let m = self.bin(BinaryKind::Sub, m, one)?;
                 let big = self.scalar(60000.0, m)?;
                 let bias = self.bin(BinaryKind::Mul, m, big)?;
-                let bias = self.g.reshape(bias, &[1, 1, 1, cap as u32]).map_err(err)?;
-                let s = self.bin(BinaryKind::Add, s, bias)?;
+                let bias = self.cast(bias, dt);
+                let s = if tq > 1 && *causal {
+                    let bias = self.g.reshape(bias, &[1, 1, 1, tq, cap as u32]).map_err(err)?;
+                    let ss = self.g.tensor(s).shape.clone();
+                    let s5 = self.g.reshape(s, &[ss[0], ss[1], ss[2] / tq, tq, ss[3]]).map_err(err)?;
+                    let s5 = self.bin(BinaryKind::Add, s5, bias)?;
+                    self.g.reshape(s5, &ss).map_err(err)?
+                } else {
+                    let bias = self.g.reshape(bias, &[1, 1, 1, cap as u32]).map_err(err)?;
+                    self.bin(BinaryKind::Add, s, bias)?
+                };
                 let p = self.g.softmax(s);
                 let o = self.g.matmul(p, v, false, false).map_err(err)?;
                 if nh != nkv { self.g.reshape(o, &qs).map_err(err)? } else { o }
@@ -644,12 +706,21 @@ impl Builder {
                 let rd = *rotary_dim as i32;
                 let hd = xs[3] as i32;
                 let half = rd / 2;
-                let pos = self.cast(pos, DType::I32);
-                let pos = self.g.reshape(pos, &[1]).map_err(err)?;
+                let tq = xs[2];
+                let pos = if tq > 1 {
+                    // Строки pos..pos+T: индексы pos + iota(T) (в F32 точны до 2²⁴).
+                    let p = self.cast(pos, DType::F32);
+                    let it = self.iota(tq as usize, DType::F32)?;
+                    let idx = self.bin(BinaryKind::Add, it, p)?;
+                    self.cast(idx, DType::I32)
+                } else {
+                    let p = self.cast(pos, DType::I32);
+                    self.g.reshape(p, &[1]).map_err(err)?
+                };
                 let gather = |b: &mut Self, tab: TensorId| -> Result<TensorId> {
                     let w = b.g.tensor(tab).shape[1];
-                    let r = b.g.node(dt, &[1, w], |out| Op::Gather { x: tab, indices: pos, axis: 0, out });
-                    b.g.reshape(r, &[1, 1, 1, w]).map_err(err)
+                    let r = b.g.node(dt, &[tq, w], |out| Op::Gather { x: tab, indices: pos, axis: 0, out });
+                    b.g.reshape(r, &[1, 1, tq, w]).map_err(err)
                 };
                 let c = gather(self, cos)?;
                 let sn = gather(self, sin)?;
@@ -659,13 +730,33 @@ impl Builder {
                     let end = vec![xs[0] as i32, xs[1] as i32, xs[2] as i32, to];
                     b.g.node(dt, &os, |out| Op::Slice { x, begin: vec![0, 0, 0, from], end, stride: vec![1; 4], out })
                 };
-                let x1 = slice(self, 0, half);
-                let x2 = slice(self, half, rd);
+                let intel = crate::info().is_some_and(|i| i.model.vendor == synaptix_npu::Vendor::Intel);
                 let xr = if rd == hd { x } else { slice(self, 0, rd) };
-                let nx2 = self.g.unary(UnaryKind::Neg, x2);
-                let mut hs = xs.clone();
-                hs[3] = rd as u32;
-                let rot = self.g.node(dt, &hs, |out| Op::Concat { xs: vec![nx2, x1], axis: 3, out });
+                let rot = if intel && rd == hd {
+                    // Поворот половин — MatMul на постоянную матрицу: срезы и Concat
+                    // по последней оси компилятор Intel NPU на части форм не собирает
+                    // (K [1, 2, 32, 128] — ZE_RESULT_ERROR_INVALID_ARGUMENT).
+                    let d = rd as usize;
+                    let mut r = vec![0f32; d * d];
+                    for i in 0..d / 2 {
+                        r[(i + d / 2) * d + i] = -1.0;
+                        r[i * d + i + d / 2] = 1.0;
+                    }
+                    let bytes: Vec<u8> = if dt == DType::F16 {
+                        r.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect()
+                    } else {
+                        r.iter().flat_map(|v| v.to_le_bytes()).collect()
+                    };
+                    let rw = self.g.weight(dt, &[d as u32, d as u32], &bytes).map_err(err)?;
+                    self.g.matmul(x, rw, false, false).map_err(err)?
+                } else {
+                    let x1 = slice(self, 0, half);
+                    let x2 = slice(self, half, rd);
+                    let nx2 = self.g.unary(UnaryKind::Neg, x2);
+                    let mut hs = xs.clone();
+                    hs[3] = rd as u32;
+                    self.g.node(dt, &hs, |out| Op::Concat { xs: vec![nx2, x1], axis: 3, out })
+                };
                 let a = self.bin(BinaryKind::Mul, xr, c)?;
                 let b2 = self.bin(BinaryKind::Mul, rot, sn)?;
                 let y = self.bin(BinaryKind::Add, a, b2)?;
@@ -749,7 +840,18 @@ pub fn flush() -> Result<()> {
     let mut start = 0;
     for k in 0..nodes.len() {
         let before = b.g.tensors.len();
-        let t = b.lower(&nodes[k])?;
+        let t = b.lower(&nodes[k]).map_err(|e| {
+            if std::env::var_os("SYNAPTIX_NPU_LOG").is_some() {
+                eprintln!("npu: узел {} ({}), сегмент с {start}: {e}", nodes[k].serial, k);
+                for i in &nodes[k].ins {
+                    if let State::Pending(s) = &*i.v.state.lock() {
+                        let at = nodes.iter().position(|n| n.serial == *s);
+                        eprintln!("  вход ожидает узел {s}: позиция {at:?}, out жив {:?}", at.map(|a| outv[a].is_some()));
+                    }
+                }
+            }
+            e
+        })?;
         b.act_elems += b.g.tensors[before..]
             .iter()
             .filter(|d| d.kind == synaptix_npu::TensorKind::Internal)

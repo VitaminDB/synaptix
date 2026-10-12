@@ -58,6 +58,19 @@ pub struct KvCache {
     pub len: usize,
 }
 
+/// KV-кэш постоянной ёмкости для NPU: буферы `[1, kv, cap, hd]`, позиция и
+/// длина — тензоры. Шаг декода — один и тот же граф на любой позиции (иначе
+/// граф собирается заново на каждом шаге с новой длиной кэша).
+pub struct StaticKv {
+    k: Vec<Tensor>,
+    v: Vec<Tensor>,
+    pub cap: usize,
+    pub len: usize,
+    pos: Tensor,
+    t_cache: Tensor,
+    rope: Option<(Tensor, Tensor)>,
+}
+
 impl MiniCpm {
     pub fn load(
         ck: &VoxCheckpoint,
@@ -252,6 +265,58 @@ impl MiniCpm {
             h = self.layer_forward(layer, &h, 0, Some(&mask), Some((&mut cache.k[i], &mut cache.v[i])))?;
         }
         cache.len = s;
+        Ok(rms_norm(&h, &self.norm, self.eps)?)
+    }
+
+    /// Пустой [`StaticKv`] ёмкости `cap`.
+    pub fn static_cache(&self, cap: usize, dtype: synaptix_core::dtype::DType, dev: synaptix_core::device::Device) -> Result<StaticKv, VoxError> {
+        let zeros = || Tensor::zeros(vec![1usize, self.num_kv_heads, cap, self.head_dim], dtype, dev);
+        let mut k = Vec::with_capacity(self.layers.len());
+        let mut v = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            k.push(zeros()?);
+            v.push(zeros()?);
+        }
+        let rope = match &self.rope {
+            Some(r) => {
+                let (cos, sin) = (r.cos(), r.sin());
+                Some((Tensor::cat(&[cos, cos], 1)?.to_dtype(dtype)?.to_device(dev)?, Tensor::cat(&[sin, sin], 1)?.to_dtype(dtype)?.to_device(dev)?))
+            }
+            None => None,
+        };
+        let pos = Tensor::from_vec(vec![0u32], vec![1usize], dev)?;
+        let t_cache = Tensor::from_vec(vec![0u32], vec![1usize], dev)?;
+        Ok(StaticKv { k, v, cap, len: 0, pos, t_cache, rope })
+    }
+
+    /// `T` строк `x` (`[1, T, H]`) с позиции `start` по [`StaticKv`]: префилл
+    /// куском и шаг декода (T = 1) — графы одной формы на любой позиции.
+    pub fn forward_static(&self, x: &Tensor, cache: &mut StaticKv, start: usize) -> Result<Tensor, VoxError> {
+        let t = x.dims()[1];
+        if start + t > cache.cap {
+            return Err(VoxError::Other(format!("forward_static: {} строк больше ёмкости кэша {}", start + t, cache.cap)));
+        }
+        cache.pos.write_host_u32(&[start as u32])?;
+        cache.t_cache.write_host_u32(&[(start + t) as u32])?;
+        let mut h = x.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let normed = rms_norm(&h, &layer.input_ln, self.eps)?;
+            let mut q = self.project_heads(&normed, &layer.attn.q, self.num_heads)?;
+            let mut k = self.project_heads(&normed, &layer.attn.k, self.num_kv_heads)?;
+            let v = self.project_heads(&normed, &layer.attn.v, self.num_kv_heads)?;
+            if let Some((cos, sin)) = &cache.rope {
+                q = q.rope_apply_dev(cos, sin, &cache.pos, self.head_dim)?;
+                k = k.rope_apply_dev(cos, sin, &cache.pos, self.head_dim)?;
+            }
+            cache.k[i].kv_append_dev(&k, &cache.pos)?;
+            cache.v[i].kv_append_dev(&v, &cache.pos)?;
+            let a = q.flash_attention_dev(&cache.k[i], &cache.v[i], &cache.t_cache, self.scale, true)?;
+            let a = a.transpose(1, 2)?.contiguous()?.reshape((1usize, t, self.num_heads * self.head_dim))?;
+            let hx = h.add(&layer.attn.o.forward(&a)?)?;
+            let normed = rms_norm(&hx, &layer.post_ln, self.eps)?;
+            h = hx.add(&self.mlp(layer, &normed)?)?;
+        }
+        cache.len = cache.len.max(start + t);
         Ok(rms_norm(&h, &self.norm, self.eps)?)
     }
 

@@ -310,6 +310,7 @@ pub struct AudioVae {
     encoder: Encoder,
     decoder: Decoder,
     hop_length: usize,
+    device: synaptix_core::device::Device,
 }
 
 impl AudioVae {
@@ -318,10 +319,12 @@ impl AudioVae {
             encoder: Encoder::load(ck)?,
             decoder: Decoder::load(ck)?,
             hop_length: ck.config.audio_vae_config.hop_length(),
+            device: ck.vae_device,
         })
     }
 
     pub fn encode(&self, audio: &Tensor) -> Result<Tensor, VoxError> {
+        let audio = &audio.to_device(self.device)?;
         let x = if audio.rank() == 2 {
             audio.unsqueeze(1)?
         } else {
@@ -341,6 +344,6 @@ impl AudioVae {
     }
 
     pub fn decode(&self, z: &Tensor) -> Result<Tensor, VoxError> {
-        self.decoder.forward(&z.to_dtype(DType::F32)?)
+        self.decoder.forward(&z.to_device(self.device)?.to_dtype(DType::F32)?)
     }
 }

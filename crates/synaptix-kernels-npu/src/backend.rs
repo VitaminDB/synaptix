@@ -102,11 +102,16 @@ impl NpuBackend {
         out: (&mut Storage, &Layout),
         scale: f32,
         window: Option<i32>,
+        causal: bool,
     ) -> Result<()> {
+        // T строк запроса (T > 1 — префилл куском): строка t видит позиции
+        // ≤ t_cache − T + t; окно — только для T = 1.
         let ok = float(q.1)
             && q.1.rank() == 4
             && k.1.rank() == 4
-            && q.1.dims()[2] == 1
+            && q.1.dims()[2] >= 1
+            && q.1.dims()[2] <= k.1.dims()[2]
+            && (q.1.dims()[2] == 1 || window.is_none())
             && k.1.dims()[1] > 0
             && q.1.dims()[1] % k.1.dims()[1] == 0
             && k.1.dtype() == q.1.dtype()
@@ -115,7 +120,7 @@ impl NpuBackend {
             return Err(SynaptixError::Unsupported("flash_attention_dev на NPU"));
         }
         let ins = vec![inp(q.0, q.1)?, inp(k.0, k.1)?, inp(v.0, v.1)?, inp(t_cache.0, t_cache.1)?];
-        self.rec(NodeOp::AttentionDev { scale, window }, ins, out)
+        self.rec(NodeOp::AttentionDev { scale, window, causal }, ins, out)
     }
 
     fn rec(&self, op: NodeOp, ins: Vec<Input>, dst: (&mut Storage, &Layout)) -> Result<()> {
@@ -127,6 +132,10 @@ impl NpuBackend {
 impl Backend for NpuBackend {
     fn device_kind(&self) -> Device {
         Device::Npu(self.ordinal)
+    }
+
+    fn flush(&self) -> Result<()> {
+        record::flush()
     }
 
     fn alloc_zeros(&self, n_bytes: usize, _device: Device) -> Result<Storage> {
@@ -369,7 +378,8 @@ impl Backend for NpuBackend {
             && src.1.dtype() == dst.1.dtype()
             && dst.1.rank() == 4
             && src.1.rank() == 4
-            && src.1.dims()[2] == 1
+            && src.1.dims()[2] >= 1
+            && src.1.dims()[2] <= dst.1.dims()[2]
             && src.1.dims()[1] == dst.1.dims()[1]
             && full(dst.1, &dv);
         if !ok {
@@ -389,10 +399,10 @@ impl Backend for NpuBackend {
         t_cache: (&Storage, &Layout),
         out: (&mut Storage, &Layout),
         scale: f32,
-        _causal: bool,
+        causal: bool,
         _stream: &Stream,
     ) -> Result<()> {
-        self.attention_dev(q, k, v, t_cache, out, scale, None)
+        self.attention_dev(q, k, v, t_cache, out, scale, None, causal)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -405,10 +415,10 @@ impl Backend for NpuBackend {
         out: (&mut Storage, &Layout),
         scale: f32,
         window: i32,
-        _causal: bool,
+        causal: bool,
         _stream: &Stream,
     ) -> Result<()> {
-        self.attention_dev(q, k, v, t_cache, out, scale, Some(window))
+        self.attention_dev(q, k, v, t_cache, out, scale, Some(window), causal)
     }
 
     /// Split-RoPE по таблицам `[S, D/2]` F32. Только Intel NPU: поворот половин —
@@ -450,7 +460,7 @@ impl Backend for NpuBackend {
         let d = x.1.dims();
         let ok = float(x.1)
             && d.len() == 4
-            && d[2] == 1
+            && d[2] >= 1
             && rotary_dim % 2 == 0
             && rotary_dim <= d[3]
             && cos.1.rank() == 2

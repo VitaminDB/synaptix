@@ -365,8 +365,12 @@ fn build_blob(g: &Graph, tool: &str, dir: &std::path::Path, key: &str, blob_path
         .arg(&cfg)
         .stdin(std::process::Stdio::null())
         .output();
+    // SYNAPTIX_NPU_KEEP_FAILED — оставить IR графа, который не собрался.
+    let failed = !out.as_ref().is_ok_and(|o| o.status.success()) && std::env::var_os("SYNAPTIX_NPU_KEEP_FAILED").is_some();
     for f in [&xml, &bin, &cfg] {
-        let _ = std::fs::remove_file(f);
+        if !failed || f == &cfg {
+            let _ = std::fs::remove_file(f);
+        }
     }
     let out = out.map_err(|e| NpuError::Driver { driver: "openvino", msg: format!("{tool}: {e}") })?;
     if !out.status.success() || !tmp.exists() {

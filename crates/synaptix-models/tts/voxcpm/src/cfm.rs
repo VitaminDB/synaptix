@@ -3,6 +3,11 @@ use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use crate::locdit::LocDit;
 use crate::VoxError;
 
+/// Граница графа на NPU: каждый шаг CFM — один и тот же граф.
+fn flush(device: Device) -> Result<(), VoxError> {
+    Ok(synaptix_core::backend::registry::flush(device)?)
+}
+
 #[derive(Debug, Clone)]
 pub struct CfmOptions {
     pub n_timesteps: usize,
@@ -54,6 +59,7 @@ pub fn sample(
     let dt_in = Tensor::zeros(vec![2 * b], DType::F32, device)?;
 
     let mut x = z;
+    flush(device)?;
     for s in 1..len {
         let tval = span[s - 1];
         let dt = span[s - 1] - span[s];
@@ -66,13 +72,22 @@ pub fn sample(
         let cond_v = out.narrow(0, 0, b)?.contiguous()?;
         let uncond_v = out.narrow(0, b, b)?.contiguous()?;
 
-        let num = cond_v.mul(&uncond_v)?.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-        let den = uncond_v.sqr()?.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()? + 1e-8;
-        let st = num / den;
-
-        let u_s = uncond_v.mul_scalar(st)?;
+        let u_s = if matches!(device, Device::Npu(_)) {
+            // На NPU коэффициент считается на устройстве: чтение скаляра на
+            // хост — сброс графа на каждом из шагов CFM.
+            let (c32, u32_) = (cond_v.to_dtype(DType::F32)?, uncond_v.to_dtype(DType::F32)?);
+            let num = c32.mul(&u32_)?.sum_all()?;
+            let den = u32_.sqr()?.sum_all()?.add_scalar(1e-8)?;
+            let st = num.div(&den)?.reshape((1usize, 1usize, 1usize))?;
+            u32_.broadcast_mul(&st)?.to_dtype(compute)?
+        } else {
+            let num = cond_v.mul(&uncond_v)?.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            let den = uncond_v.sqr()?.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()? + 1e-8;
+            uncond_v.mul_scalar(num / den)?
+        };
         let guided = u_s.add(&cond_v.sub(&u_s)?.mul_scalar(opts.cfg_value)?)?;
         x = x.sub(&guided.mul_scalar(dt)?)?;
+        flush(device)?;
     }
 
     Ok(x.transpose(1, 2)?.contiguous()?)

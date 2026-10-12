@@ -20,6 +20,9 @@ pub struct VoxCheckpoint {
     vae: SynBundleLoader,
     pub config: VoxConfig,
     pub device: Device,
+    /// Устройство кодека звука: на NPU — CPU (свёртки кодека по всей длине
+    /// фразы — новый граф NPU на каждую длину).
+    pub vae_device: Device,
     pub compute: DType,
     pub quant: DType,
 }
@@ -49,10 +52,11 @@ impl VoxCheckpoint {
             .map_err(|e| VoxError::Load(e.to_string()))?
             .with_component(BASE_COMPONENT)
             .with_device(device);
+        let vae_device = if matches!(device, Device::Npu(_)) { Device::Cpu } else { device };
         let vae = SynBundleLoader::open(path)
             .map_err(|e| VoxError::Load(e.to_string()))?
             .with_component(VAE_COMPONENT)
-            .with_device(device);
+            .with_device(vae_device);
 
         Ok(Self {
             bundle: Arc::new(bundle),
@@ -60,6 +64,7 @@ impl VoxCheckpoint {
             vae,
             config,
             device,
+            vae_device,
             compute,
             quant,
         })
@@ -90,7 +95,7 @@ impl VoxCheckpoint {
 
     pub fn vae(&self, name: &str) -> Result<Tensor, VoxError> {
         self.vae
-            .load_to(name, self.device, DType::F32)
+            .load_to(name, self.vae_device, DType::F32)
             .map_err(|e| VoxError::Load(format!("vae '{name}': {e}")))
     }
 

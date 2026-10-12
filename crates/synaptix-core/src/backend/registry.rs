@@ -32,6 +32,14 @@ pub fn backend_for(device: Device) -> Result<&'static dyn Backend> {
     }
 }
 
+/// [`Backend::flush`] устройства (если бэкенд зарегистрирован).
+pub fn flush(device: Device) -> Result<()> {
+    match backend_for(device) {
+        Ok(b) => b.flush(),
+        Err(_) => Ok(()),
+    }
+}
+
 pub fn is_registered(kind: DeviceKind) -> bool {
     REGISTRY.read()[kind_index(kind)].is_some()
 }

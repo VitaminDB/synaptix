@@ -155,6 +155,14 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("upload не поддержан этим backend"))
     }
 
+    /// Граница графа: исполнить записанные, но ещё не исполненные операции
+    /// (NPU копит операции в граф до чтения результата). Модель ставит её
+    /// между повторяющимися блоками, чтобы каждый блок был одним и тем же
+    /// графом, а не куском длинной записи, разрезанной в случайных местах.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn download(&self, _src: &Storage) -> Result<Vec<u8>> {
         Err(SynaptixError::Unsupported("download не поддержан этим backend"))
     }
