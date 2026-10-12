@@ -37,30 +37,12 @@ pub fn x_rows_f32(dt: DType, bytes: &[u8], off: usize, m: usize, k: usize) -> Re
 pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
     let (n, k) = (view.n, view.k);
     debug_assert_eq!(out.len(), m * n);
+    if view.dtype == DType::Q8Row && k % super::q8dot::QK == 0 {
+        gemm_q8row(view, xf, m, out);
+        return;
+    }
     if m < PREFILL_M && view.dtype == DType::Q8Row {
-        use super::q8dot;
         let op = blocked::SendPtr::new(out.as_mut_ptr());
-        if k % q8dot::QK == 0 {
-            let mut xq = vec![0i8; m * k];
-            let mut xs = vec![0f32; m * k / q8dot::QK];
-            for i in 0..m {
-                q8dot::quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * k / q8dot::QK..(i + 1) * k / q8dot::QK]);
-            }
-            let chunk = (n / (crate::common::threads() * 8)).max(16);
-            (0..n.div_ceil(chunk)).into_par_iter().for_each(|ci| {
-                let (n0, n1) = (ci * chunk, ((ci + 1) * chunk).min(n));
-                for j in n0..n1 {
-                    let q = view.row_bytes_of(j);
-                    let sc = view.q8_scale(j);
-                    for i in 0..m {
-                        let nb = k / q8dot::QK;
-                        let v = q8dot::dot(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], q) * sc;
-                        unsafe { *op.ptr().add(i * n + j) = v };
-                    }
-                }
-            });
-            return;
-        }
         par_chunks_cost(n, k * (m + 1) / 8, |n0, n1| {
             for j in n0..n1 {
                 let q = view.row_bytes_of(j);
@@ -96,6 +78,48 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
             view.row(c0 + jj, r);
         }
         blocked::linear_panel(m, cols, k, xf, &wrows, op.at(c0), n);
+    });
+}
+
+fn gemm_q8row(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
+    use super::q8dot::{self, QK};
+    let (n, k) = (view.n, view.k);
+    let nb = k / QK;
+    let mut xq = vec![0i8; m * k];
+    let mut xs = vec![0f32; m * nb];
+    if m >= PREFILL_M {
+        crate::threads::pool();
+        xq.par_chunks_mut(k).zip(xs.par_chunks_mut(nb)).enumerate().for_each(|(i, (q, s))| q8dot::quantize_act(&xf[i * k..(i + 1) * k], q, s));
+    } else {
+        for i in 0..m {
+            q8dot::quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * nb..(i + 1) * nb]);
+        }
+    }
+    let op = blocked::SendPtr::new(out.as_mut_ptr());
+    let threads = crate::common::threads();
+    let chunk = if m < PREFILL_M { (n / (threads * 8)).max(16) } else { (n / (threads * 4)).clamp(8, 128) };
+    (0..n.div_ceil(chunk)).into_par_iter().for_each(|ci| {
+        let (n0, n1) = (ci * chunk, ((ci + 1) * chunk).min(n));
+        let mut i = 0;
+        while i + 4 <= m {
+            let (xq4, xs4) = (&xq[i * k..(i + 4) * k], &xs[i * nb..(i + 4) * nb]);
+            for j in n0..n1 {
+                let sc = view.q8_scale(j);
+                let r = q8dot::dot4(xq4, xs4, k, view.row_bytes_of(j));
+                for (t, v) in r.iter().enumerate() {
+                    unsafe { *op.ptr().add((i + t) * n + j) = v * sc };
+                }
+            }
+            i += 4;
+        }
+        for j in n0..n1 {
+            let q = view.row_bytes_of(j);
+            let sc = view.q8_scale(j);
+            for i in i..m {
+                let v = q8dot::dot(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], q) * sc;
+                unsafe { *op.ptr().add(i * n + j) = v };
+            }
+        }
     });
 }
 
