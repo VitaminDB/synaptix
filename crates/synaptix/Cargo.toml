@@ -21,6 +21,7 @@ synaptix-ops          = { workspace = true }
 synaptix-infer        = { workspace = true }
 synaptix-bundle       = { workspace = true }
 synaptix-tokenizer    = { workspace = true }
+tracing               = { workspace = true }
 synaptix-runtime      = { workspace = true }
 synaptix-audio        = { workspace = true }
 
