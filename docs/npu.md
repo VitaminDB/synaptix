@@ -283,3 +283,24 @@ FullyConnected на v69 читает веса на 6–10 ГБ/с) против 
 | turbo, распознавание 7,5 с речи (энкодер NPU, декодер CPU) | ≈ 10 с вместе с загрузкой | текст ru/en слово в слово |
 | Whisper-tiny целиком на NPU, 7,3 с речи | 0,51 с (RTF 0,07), шаг декодера 4,6 мс | CPU — 4,5 с, текст тот же |
 | turbo целиком на NPU, 7,3 с речи | 8,1 с (из них ≈5 с — открытие 35 контекстов в новом процессе), шаг декодера ≈17 мс | текст слово в слово |
+
+## Intel NPU (Core Ultra, «AI Boost») через OpenVINO
+Драйвер `synaptix-npu::intel`: граф synaptix переводится в OpenVINO IR v11 (XML + блоб констант в памяти, `intel/ir.rs`),
+собирается плагином NPU OpenVINO и исполняется с буферами synaptix как тензорами поверх памяти хоста. OpenVINO
+подгружается через `dlopen("libopenvino_c.so")` — зависимости при сборке нет; без библиотеки, плагина или
+`/dev/accel/accel0` драйвер не находится. Пакеты Arch: `openvino openvino-intel-npu-plugin intel-npu-driver
+intel-npu-compiler`. Кэш собранных графов — OpenVINO `CACHE_DIR` (`SYNAPTIX_NPU_CACHE`, по умолчанию
+`~/.cache/synaptix/npu-intel`), `SYNAPTIX_NPU_INTEL=0` — выключить, `SYNAPTIX_NPU_DUMP=<каталог>` — сохранить IR.
+
+Перевод: Linear → MatMul(transpose_b); int8-веса по каналу (`Quant::Axis`, q8row) → Const i8 → Convert → Multiply на
+шкалы (шаблон сжатых весов); RMSNorm раскладывается, в F16 — с предмасштабом 1/16 (x² не переполняет F16);
+LayerNorm → MVN; ArgMax → TopK; Slice → opset8 Slice; Conv2d → Convolution/GroupConvolution.
+`Tensor::quantize_weight(DType::Q8Row)` квантует любой плотный вес в q8row на лету — int8 на NPU без отдельного бандла.
+
+Замеры (Core Ultra 9 275HX, NPU 3720, 2 тайла; `DEVICE_GOPS`: F16 6,55 TFLOPS, int8 13,1 TOPS):
+- OmniVoice, фраза 3,4 с, 16 шагов (`DEV=npu cpu_bench … f16 16`): NPU F16 — 3,2 с (CPU F32 — 4,3 с), первая сборка
+  графов ~8 с, дальше — кэш; отличие от CPU после 28 слоёв — 0,19 %, argmax логитов совпадает в 93 % строк.
+- int8-веса (q8row) — 4,4 с: префилл упирается в счёт, распаковка весов только добавляет работы; выигрыш — память ×2.
+- Стопка MLP 28×(1024→3072→1024), 228 токенов, через OpenVINO напрямую: F16 — 1,8–2,0 TFLOPS, int8-веса — 1,9,
+  FakeQuantize на активациях (полный int8) — 1,1–1,6. Полный int8 на этом компиляторе (2026.38) быстрее не стал.
+- iGPU Arrow Lake (OpenVINO GPU) на той же стопке — 0,2–0,9 TFLOPS, медленнее CPU: не подключается.

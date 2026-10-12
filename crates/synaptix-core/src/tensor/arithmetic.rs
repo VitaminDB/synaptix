@@ -47,8 +47,33 @@ impl Tensor {
             DType::NVFP4 if n % 64 == 0 && k % 64 == 0 => Some(half()?.to_dtype(DType::F16)?.quantize_to_nvfp4()?),
             DType::MXFP8 if k % 32 == 0 => Some(half()?.to_dtype(DType::F16)?.quantize_to_mxfp8()?),
             DType::Sq { bits } if k % 32 == 0 => Some(half()?.quantize_to_sq(bits)?),
+            DType::Q8Row => Some(self.quantize_to_q8row()?),
             _ => None,
         })
+    }
+
+    /// Квант в q8row (int8 по выходному каналу, шкала строки по absmax) на хосте;
+    /// упакованные байты и шкалы выгружаются на устройство веса как параметры
+    /// модели (на NPU — статикой графа).
+    pub fn quantize_to_q8row(&self) -> Result<QuantWeight> {
+        use crate::backend::registry;
+        use crate::tensor::storage::{CpuBuf, Storage};
+        let dims = self.dims();
+        if dims.len() != 2 {
+            return Err(crate::error::SynaptixError::Unsupported("quantize_to_q8row: вес не 2D"));
+        }
+        let (n, k) = (dims[0], dims[1]);
+        let w = self.to_dtype(DType::F32)?.to_device(crate::device::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let (q, scales) = crate::quant::q8row::quantize(&w, n, k, None);
+        let sb = crate::quant::q8row::scales_to_bytes(&scales);
+        let dev = self.device();
+        let (p, s) = if dev.is_cpu() {
+            (Storage::Cpu(CpuBuf::from_vec(q)), Storage::Cpu(CpuBuf::from_vec(sb)))
+        } else {
+            let backend = registry::backend_for(dev)?;
+            crate::backend::with_param_upload(|| -> Result<_> { Ok((backend.upload(&q, dev)?, backend.upload(&sb, dev)?)) })?
+        };
+        QuantWeight::new(std::sync::Arc::new(p), std::sync::Arc::new(s), DType::Q8Row, n, k)
     }
     /// Квант в формат по `dtype`: NVFP4, MXFP8 или SQ; иначе `Unsupported`.
     pub fn quantize_to(&self, dtype: DType) -> Result<QuantWeight> {

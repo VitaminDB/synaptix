@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod graph;
+pub mod intel;
 pub mod models;
 pub mod qualcomm;
 
@@ -72,6 +73,11 @@ pub fn probe() -> Vec<Box<dyn Npu>> {
     let mut v: Vec<Box<dyn Npu>> = Vec::new();
     if let Ok(q) = qualcomm::QnnNpu::connect() {
         v.push(Box::new(q));
+    }
+    match intel::IntelNpu::connect() {
+        Ok(n) => v.push(Box::new(n)),
+        Err(e) if std::env::var_os("SYNAPTIX_NPU_LOG").is_some() => eprintln!("npu: Intel: {e}"),
+        Err(_) => {}
     }
     v
 }

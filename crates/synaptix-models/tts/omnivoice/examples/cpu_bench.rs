@@ -1,5 +1,6 @@
-//! Замер синтеза на CPU: `cpu_bench <omnivoice.syn> [f32|f16|bf16|int8|nvfp4|mxfp8] [шаги]`.
+//! Замер синтеза: `cpu_bench <omnivoice.syn> [f32|f16|bf16|int8|nvfp4|mxfp8] [шаги]`.
 //! Печатает время загрузки, синтеза и RTF; WAV — в `$OUT` (если задан).
+//! `DEV=npu` — на NPU (счёт F16; `int8` — веса q8row, int8 по строке).
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_tts_omnivoice::config::OmniVoiceGenerationConfig;
@@ -14,13 +15,22 @@ fn main() {
     let (dtype, quant) = match prec.as_str() {
         "f16" => (DType::F16, None),
         "bf16" => (DType::BF16, None),
+        "int8" if std::env::var("DEV").as_deref() == Ok("npu") => (DType::F16, Some(DType::Q8Row)),
         "int8" => (DType::F32, Some(DType::Sq { bits: 8 })),
+        "q8row" => (DType::F32, Some(DType::Q8Row)),
         "nvfp4" => (DType::F32, Some(DType::NVFP4)),
         "mxfp8" => (DType::F32, Some(DType::MXFP8)),
         _ => (DType::F32, None),
     };
+    let npu = std::env::var("DEV").as_deref() == Ok("npu");
+    let (dev, dtype) = if npu {
+        synaptix_kernels_npu::register().expect("NPU");
+        (Device::Npu(0), DType::F16)
+    } else {
+        (Device::Cpu, dtype)
+    };
     let t0 = std::time::Instant::now();
-    let p = OmniVoicePipeline::from_syn_quant(&path, Device::Cpu, dtype, quant).expect("загрузка");
+    let p = OmniVoicePipeline::from_syn_quant(&path, dev, dtype, quant).expect("загрузка");
     println!("{prec}: загрузка {:.1} с", t0.elapsed().as_secs_f32());
     let gen = OmniVoiceGenerationConfig { num_step: steps, ..Default::default() };
     let text = "Привет! Так звучит эта модель с заданными настройками.";

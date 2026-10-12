@@ -3,6 +3,7 @@ use crate::graph::DType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vendor {
     Qualcomm,
+    Intel,
 }
 
 #[derive(Debug)]
@@ -114,6 +115,21 @@ pub static MODELS: &[NpuModel] = &[
         fp16_native: true,
         fused_norms: true,
         session_bytes: 3 * GIB,
+    },
+    // Intel Core Ultra (NPU 37xx/40xx, «AI Boost») через OpenVINO: F16 и int8-веса
+    // по каналу; память — общая с системой.
+    NpuModel {
+        id: "intel-npu",
+        vendor: Vendor::Intel,
+        name: "Intel AI Boost",
+        arch: 37,
+        socs: &["Meteor Lake", "Arrow Lake", "Lunar Lake"],
+        activations: &[DType::F16, DType::F32, DType::I32, DType::U32, DType::U8],
+        weights: &[DType::F16, DType::F32, DType::I8, DType::U8, DType::I4],
+        weight_bits: &[4, 8, 16],
+        fp16_native: true,
+        fused_norms: false,
+        session_bytes: 8 * GIB,
     },
 ];
 
