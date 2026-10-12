@@ -129,6 +129,12 @@ pub fn generate_iterative(
             x.to_dtype(DType::F32).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()).map_err(err)
         };
         let (cond_flat, uncond_flat, cond_stride, uncond_stride) = match (backbone.bucket_for(c_len), backbone.bucket_for(t)) {
+            _ if backbone.batch_cfg() && c_len >= t => {
+                let mut both = to_host(&backbone.forward_padded(&[(&cond_ids, &cond_mask, c_len), (&uncond_ids, &uncond_mask_v, t)], c_len)?)?;
+                let u = both.split_off(both.len() / 2);
+                read_time += tf.elapsed();
+                (both, u, c_len, c_len)
+            }
             (Some(cb), Some(ub)) => {
                 let c = to_host(&backbone.forward_padded(&[(&cond_ids, &cond_mask, c_len)], cb)?)?;
                 let u = to_host(&backbone.forward_padded(&[(&uncond_ids, &uncond_mask_v, t)], ub)?)?;

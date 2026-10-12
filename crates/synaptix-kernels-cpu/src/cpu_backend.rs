@@ -37,6 +37,21 @@ impl Backend for CpuBackend {
         Ok(Storage::Cpu(CpuBuf::alloc_zeros(n_bytes)))
     }
 
+    /// Выход операции ядро пишет целиком, обнулять его незачем: `memset` больших
+    /// буферов шёл в одном потоке перед каждой операцией (у OmniVoice — больше
+    /// половины времени главного потока, пока остальные ждали).
+    /// `SYNAPTIX_CPU_ZERO_ALLOC=1` — как раньше, для поиска ядра, читающего выход.
+    fn alloc_uninit(&self, n_bytes: usize, device: Device) -> Result<Storage> {
+        if !matches!(device, Device::Cpu) {
+            return Err(SynaptixError::Unsupported("CpuBackend::alloc_uninit on non-CPU"));
+        }
+        static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ZERO.get_or_init(|| std::env::var("SYNAPTIX_CPU_ZERO_ALLOC").is_ok_and(|v| v == "1")) {
+            return Ok(Storage::Cpu(CpuBuf::alloc_zeros(n_bytes)));
+        }
+        Ok(Storage::Cpu(synaptix_core::memory::arena::alloc_uninit_cpu(n_bytes)))
+    }
+
     fn copy(&self, src: (&Storage, &Layout), dst: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
         let (src_st, src_lo) = src;
         let (dst_st, dst_lo) = dst;

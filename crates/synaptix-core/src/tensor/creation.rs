@@ -200,30 +200,46 @@ impl Tensor {
         let out_shape = Shape::new(out_dims.clone());
         let elem_bytes = dtype.size_in_bits() / 8;
         let total_bytes = out_shape.numel() * elem_bytes;
-        let mut out_bytes = vec![0u8; total_bytes];
 
         let outer: usize = first.dims()[..dim].iter().product();
         let inner_first: usize = first.dims()[dim + 1..].iter().product();
-        let inner_bytes_each = |t: &Tensor| t.dims()[dim] * inner_first * elem_bytes;
         let out_slice_bytes_per_outer: usize = out_dims[dim] * inner_first * elem_bytes;
-
-        for o in 0..outer {
+        // Источники: байты, начало и размер куска на одну внешнюю позицию.
+        let mut srcs: Vec<(&[u8], usize, usize)> = Vec::with_capacity(tensors.len());
+        for t in tensors {
+            if !t.is_contiguous() {
+                return Err(SynaptixError::NonContiguous);
+            }
+            let src = match &*t.storage {
+                Storage::Cpu(b) => b.as_bytes(),
+                _ => return Err(SynaptixError::Unsupported("cat: non-cpu storage")),
+            };
+            srcs.push((src, t.layout.offset() * elem_bytes, t.dims()[dim] * inner_first * elem_bytes));
+        }
+        // Выход заполняется целиком — без обнуления; строки выхода (по внешней
+        // позиции) независимы, большие объёмы копируются параллельно.
+        let mut out_bytes = crate::memory::arena::alloc_uninit_cpu(total_bytes).into_vec();
+        let fill = |o: usize, row: &mut [u8]| {
             let mut written = 0usize;
-            for t in tensors {
-                if !t.is_contiguous() {
-                    return Err(SynaptixError::NonContiguous);
-                }
-                let src = match &*t.storage {
-                    Storage::Cpu(b) => b.as_bytes(),
-                    _ => return Err(SynaptixError::Unsupported("cat: non-cpu storage")),
-                };
-                let chunk = inner_bytes_each(t);
-                let src_start = (o * chunk + t.layout.offset() * elem_bytes) as usize;
-                let src_end = src_start + chunk;
-                let dst_start = o * out_slice_bytes_per_outer + written;
-                let dst_end = dst_start + chunk;
-                out_bytes[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
+            for &(src, base, chunk) in &srcs {
+                let s0 = base + o * chunk;
+                row[written..written + chunk].copy_from_slice(&src[s0..s0 + chunk]);
                 written += chunk;
+            }
+        };
+        if out_slice_bytes_per_outer > 0 {
+            if total_bytes >= 1 << 20 && outer > 1 {
+                use rayon::prelude::*;
+                let rows_per_task = ((256usize << 10) / out_slice_bytes_per_outer).max(1);
+                out_bytes.par_chunks_mut(out_slice_bytes_per_outer * rows_per_task).enumerate().for_each(|(ti, blk)| {
+                    for (r, row) in blk.chunks_mut(out_slice_bytes_per_outer).enumerate() {
+                        fill(ti * rows_per_task + r, row);
+                    }
+                });
+            } else {
+                for (o, row) in out_bytes.chunks_mut(out_slice_bytes_per_outer).enumerate().take(outer) {
+                    fill(o, row);
+                }
             }
         }
         let storage = Storage::Cpu(CpuBuf::from_vec(out_bytes));

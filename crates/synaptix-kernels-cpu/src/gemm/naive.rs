@@ -132,12 +132,13 @@ pub fn matmul_f32(
         let b_s: &[f32] = bytemuck::cast_slice(b.as_bytes());
         let d_s: &mut [f32] = bytemuck::cast_slice_mut(dst.as_bytes_mut());
         let (a_off, b_off, d_off) = (a_lo.offset(), b_lo.offset(), dst_lo.offset());
-        for bi in 0..batch_d {
+        // Батч (головы внимания) — параллельно: одна матрица 114×114 даёт всего
+        // несколько тайлов, последовательный перебор 32 голов простаивал потоками.
+        d_s[d_off..d_off + batch_d * m * n].par_chunks_mut(m * n).enumerate().for_each(|(bi, d)| {
             let ab = a_off + (bi % batch_a) * m * k;
             let bb = b_off + (bi % batch_b) * k * n;
-            let db = d_off + bi * m * n;
-            super::blocked::sgemm(m, n, k, &a_s[ab..ab + m * k], &b_s[bb..bb + k * n], &mut d_s[db..db + m * n]);
-        }
+            super::blocked::sgemm(m, n, k, &a_s[ab..ab + m * k], &b_s[bb..bb + k * n], d);
+        });
         return Ok(());
     }
     matmul_t::<f32>(a, a_lo, b, b_lo, dst, dst_lo)
@@ -246,6 +247,60 @@ fn linear_t<T: GemmScalar>(
     Ok(())
 }
 
+/// Быстрый путь `x·wᵀ` ([`super::xwt`]): сплошные `x`, `w [N, K]`, `out`. Половинные
+/// вход и выход переводятся в F32 целиком (это m·K и m·N против m·N·K умножений).
+/// `None` — форма или машина не подходят, считать общим путём.
+fn linear_fast(x: &CpuBuf, x_lo: &Layout, w: &CpuBuf, w_lo: &Layout, out: &mut CpuBuf, out_lo: &Layout) -> Option<()> {
+    use super::xwt::{self, WType};
+    use synaptix_core::dtype::DType;
+    if !xwt::available() || !x_lo.is_contiguous() || !w_lo.is_contiguous() || !out_lo.is_contiguous() || w_lo.dims().len() != 2 {
+        return None;
+    }
+    let (n, k) = (w_lo.dims()[0], w_lo.dims()[1]);
+    if k == 0 || x_lo.dims().last() != Some(&k) {
+        return None;
+    }
+    let m = x_lo.numel() / k;
+    if out_lo.numel() != m * n {
+        return None;
+    }
+    let wt = match w_lo.dtype() {
+        DType::F32 => WType::F32,
+        DType::F16 => WType::F16,
+        DType::BF16 => WType::BF16,
+        _ => return None,
+    };
+    let eb = wt_bytes(w_lo.dtype());
+    let wb = &w.as_bytes()[w_lo.offset() * eb..(w_lo.offset() + n * k) * eb];
+    let xdt = x_lo.dtype();
+    let xe = wt_bytes(xdt);
+    let xb = &x.as_bytes()[x_lo.offset() * xe..(x_lo.offset() + m * k) * xe];
+    let xf: std::borrow::Cow<[f32]> = match xdt {
+        DType::F32 => std::borrow::Cow::Borrowed(bytemuck::cast_slice(xb)),
+        DType::F16 | DType::BF16 => {
+            let mut v = vec![0f32; m * k];
+            crate::common::to_f32(xdt, xb, 0, &mut v).ok()?;
+            std::borrow::Cow::Owned(v)
+        }
+        _ => return None,
+    };
+    let oe = wt_bytes(out_lo.dtype());
+    let oo = out_lo.offset();
+    if out_lo.dtype() == DType::F32 {
+        let o: &mut [f32] = bytemuck::cast_slice_mut(&mut out.as_bytes_mut()[oo * 4..(oo + m * n) * 4]);
+        xwt::linear(m, n, k, &xf, wb, wt, o);
+    } else {
+        let mut o = vec![0f32; m * n];
+        xwt::linear(m, n, k, &xf, wb, wt, &mut o);
+        crate::common::from_f32(out_lo.dtype(), &o, &mut out.as_bytes_mut()[oo * oe..(oo + m * n) * oe], 0).ok()?;
+    }
+    Some(())
+}
+
+fn wt_bytes(dt: synaptix_core::dtype::DType) -> usize {
+    dt.size_in_bits() / 8
+}
+
 pub fn linear_f32(
     x: &CpuBuf,
     x_lo: &Layout,
@@ -254,6 +309,9 @@ pub fn linear_f32(
     out: &mut CpuBuf,
     out_lo: &Layout,
 ) -> Result<()> {
+    if linear_fast(x, x_lo, w, w_lo, out, out_lo).is_some() {
+        return Ok(());
+    }
     // Много строк (prefill/кодировщик) — блочный SIMD-GEMM с упаковкой весов.
     if x_lo.is_contiguous() && w_lo.is_contiguous() && out_lo.is_contiguous() && w_lo.dims().len() == 2 {
         let (n, k) = (w_lo.dims()[0], w_lo.dims()[1]);
@@ -278,6 +336,9 @@ pub fn linear_f16(
     out: &mut CpuBuf,
     out_lo: &Layout,
 ) -> Result<()> {
+    if linear_fast(x, x_lo, w, w_lo, out, out_lo).is_some() {
+        return Ok(());
+    }
     linear_t::<half::f16>(x, x_lo, w, w_lo, out, out_lo)
 }
 
@@ -289,6 +350,9 @@ pub fn linear_bf16(
     out: &mut CpuBuf,
     out_lo: &Layout,
 ) -> Result<()> {
+    if linear_fast(x, x_lo, w, w_lo, out, out_lo).is_some() {
+        return Ok(());
+    }
     linear_t::<half::bf16>(x, x_lo, w, w_lo, out, out_lo)
 }
 

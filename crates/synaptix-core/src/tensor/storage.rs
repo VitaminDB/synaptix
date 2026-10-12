@@ -11,6 +11,8 @@ impl CpuBuf {
 
     pub fn from_vec(bytes: Vec<u8>) -> Self { Self { bytes } }
 
+    pub fn into_vec(self) -> Vec<u8> { self.bytes }
+
     pub fn byte_len(&self) -> usize { self.bytes.len() }
 
     pub fn as_bytes(&self) -> &[u8] { &self.bytes }

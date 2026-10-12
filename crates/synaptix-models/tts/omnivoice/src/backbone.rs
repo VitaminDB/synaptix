@@ -325,7 +325,10 @@ impl Backbone {
     fn mlp_forward(&self, mlp: &Mlp, h: &Tensor) -> Result<Tensor> {
         let gate = mlp.gate_proj.forward(h)?;
         let up = mlp.up_proj.forward(h)?;
-        let gated = gate.silu().and_then(|g| g.mul(&up)).map_err(err)?;
+        let gated = match gate.silu_and_mul(&up) {
+            Ok(g) => g,
+            Err(_) => gate.silu().and_then(|g| g.mul(&up)).map_err(err)?,
+        };
         mlp.down_proj.forward(&gated)
     }
 
@@ -399,6 +402,12 @@ impl Backbone {
 }
 
 impl Backbone {
+    /// CPU: cond и uncond CFG — одним проходом B=2 (uncond добивается до длины
+    /// cond маской ключей): вдвое меньше операций и крупнее матрицы Linear.
+    pub fn batch_cfg(&self) -> bool {
+        matches!(self.device, Device::Cpu) && std::env::var("SYNAPTIX_CFG_BATCH").ok().as_deref() != Some("0")
+    }
+
     pub fn bucket_for(&self, s: usize) -> Option<usize> {
         if buckets_active(self.device) {
             NPU_BUCKETS.iter().copied().find(|&b| b >= s)

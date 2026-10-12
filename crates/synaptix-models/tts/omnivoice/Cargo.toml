@@ -27,3 +27,4 @@ safetensors        = { workspace = true }
 synaptix-kernels-cpu = { workspace = true }
 synaptix-kernels-npu = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+hound = { workspace = true }

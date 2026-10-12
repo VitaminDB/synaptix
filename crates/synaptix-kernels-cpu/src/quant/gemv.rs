@@ -70,6 +70,7 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
         return;
     }
     let op = blocked::SendPtr::new(out.as_mut_ptr());
+    let fast = crate::gemm::xwt::available();
     (0..n.div_ceil(NB)).into_par_iter().for_each(|jb| {
         let c0 = jb * NB;
         let cols = NB.min(n - c0);
@@ -77,7 +78,13 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
         for (jj, r) in wrows.chunks_exact_mut(k).enumerate() {
             view.row(c0 + jj, r);
         }
-        blocked::linear_panel(m, cols, k, xf, &wrows, op.at(c0), n);
+        if fast {
+            // Полоса строк веса в F32 — сразу в ядро x·wᵀ, без транспонирования.
+            // SAFETY: полоса колонок [c0, c0 + cols) у каждой задачи своя.
+            unsafe { crate::gemm::xwt::linear_ld(m, cols, k, xf, bytemuck::cast_slice(&wrows), crate::gemm::xwt::WType::F32, op.ptr().add(c0), n) };
+        } else {
+            blocked::linear_panel(m, cols, k, xf, &wrows, op.at(c0), n);
+        }
     });
 }
 

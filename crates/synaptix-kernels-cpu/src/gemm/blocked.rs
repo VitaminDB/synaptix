@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-const MB: usize = 64;
+const MB: usize = 48;
 const NB: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -52,7 +52,13 @@ fn microkernel(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], l
 
 /// Строки микроядра (MR) и колонки (NR): тайлы дополняются до кратных, чтобы
 /// микроядро не уходило в скалярный хвост.
+#[cfg(target_arch = "x86_64")]
+const MR: usize = super::avx2::MR;
+#[cfg(target_arch = "x86_64")]
+const NR: usize = super::avx2::NR;
+#[cfg(not(target_arch = "x86_64"))]
 const MR: usize = 8;
+#[cfg(not(target_arch = "x86_64"))]
 const NR: usize = 16;
 
 #[inline]

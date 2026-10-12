@@ -4,6 +4,7 @@ pub mod blocked;
 pub mod naive;
 pub mod neon;
 pub mod simd_dot;
+pub mod xwt;
 
 use synaptix_core::dtype::DType;
 use synaptix_core::error::{Result, SynaptixError};
