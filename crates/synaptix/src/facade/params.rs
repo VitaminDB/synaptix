@@ -108,7 +108,20 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
             "vibevoice" => vec![ref_audio(), steps(Some(20), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
-            "voxcpm" | "voxcpm2" => vec![ref_audio(), ref_text(), steps(Some(10), "Шаги диффузии"), guidance(2.0, "Guidance (CFG)"), seed()],
+            "voxcpm" | "voxcpm2" => vec![
+                spec(
+                    "voice",
+                    "Голос",
+                    "Описание голоса, лучше по-английски: пол, возраст, тембр, эмоция (например, young woman, gentle and sweet voice). С образцом — манера поверх его тембра (slightly faster, cheerful tone); с текстом образца не действует",
+                    ParamKind::Text { multiline: true },
+                    None,
+                ),
+                ref_audio(),
+                ref_text(),
+                steps(Some(10), "Шаги диффузии"),
+                guidance(2.0, "Guidance (CFG)"),
+                seed(),
+            ],
             _ => vec![
                 language("Код языка (ru, en, kk); пусто — определять по тексту"),
                 spec("voice", "Голос", "Описание голоса по-английски: пол, возраст, манера (например, calm female voice); цифры и русский текст модель может прочитать вслух. Не нужно, если задан образец", ParamKind::Text { multiline: true }, None),
