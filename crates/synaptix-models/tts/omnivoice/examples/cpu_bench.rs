@@ -41,13 +41,21 @@ fn main() {
     let runs: usize = std::env::var("RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     // CONT=1 — как служба: каждая фраза продолжает голос уже сказанного.
     let mut voice = None;
+    // LANG / INSTRUCT — пустые: без языка и описания голоса (как ассистент).
+    let lang = Some(std::env::var("LANG_CODE").unwrap_or_else(|_| "ru".into())).filter(|s| !s.is_empty());
+    let instr = Some(std::env::var("INSTRUCT").unwrap_or_else(|_| "female, young adult".into())).filter(|s| !s.is_empty());
     for run in 0..runs {
-        let text = if std::env::var_os("VARY").is_some() { texts[run % 2] } else { texts[0] };
+        let owned = std::env::var("TEXT").ok();
+        let text = match &owned {
+            Some(t) => t.as_str(),
+            None if std::env::var_os("VARY").is_some() => texts[run % 2],
+            None => texts[0],
+        };
         let t = std::time::Instant::now();
         let wav = if std::env::var_os("CONT").is_some() {
-            p.synthesize_continuing(text, &mut voice, Some("ru"), Some("female, young adult"), 1.0, &gen, std::env::var("REF_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0)).expect("синтез")
+            p.synthesize_continuing(text, &mut voice, lang.as_deref(), instr.as_deref(), 1.0, &gen, std::env::var("REF_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0)).expect("синтез")
         } else {
-            p.synthesize(text, None, Some("ru"), Some("female, young adult"), 1.0, None, &gen).expect("синтез")
+            p.synthesize(text, None, lang.as_deref(), instr.as_deref(), 1.0, None, &gen).expect("синтез")
         };
         let sec = wav.len() as f32 / p.output_sample_rate() as f32;
         let dt = t.elapsed().as_secs_f32();
