@@ -129,7 +129,9 @@ pub fn generate_iterative(
             x.to_dtype(DType::F32).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()).map_err(err)
         };
         let (cond_flat, uncond_flat, cond_stride, uncond_stride) = match (backbone.bucket_for(c_len), backbone.bucket_for(t)) {
-            (cb, _) if backbone.batch_cfg() && c_len >= t => {
+            // Батч — если добивка uncond до длины cond почти ничего не стоит: с
+            // длинным образцом голоса uncond (только цель) вчетверо короче cond.
+            (cb, ub) if backbone.batch_cfg() && c_len >= t && 2 * cb.unwrap_or(c_len) * 20 <= (cb.unwrap_or(c_len) + ub.unwrap_or(t)) * 23 => {
                 let sb = cb.unwrap_or(c_len);
                 let mut both = to_host(&backbone.forward_padded(&[(&cond_ids, &cond_mask, c_len), (&uncond_ids, &uncond_mask_v, t)], sb)?)?;
                 let u = both.split_off(both.len() / 2);

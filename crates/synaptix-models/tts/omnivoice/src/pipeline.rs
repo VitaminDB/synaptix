@@ -339,7 +339,13 @@ impl OmniVoicePipeline {
             None => self.synthesize_codes(text, None, lang, instruct, speed, None, gen)?,
         };
         let part = self.prompt_from_generated(&codes, text, &wav)?;
-        let max_tokens = (max_ref_sec.max(0.0) * self.frame_rate as f32) as usize;
+        // Кадров в секунду — по самим кодам: `frame_rate` (24000/320 = 75) втрое
+        // больше реальных 25 кадров/с кодов, и «12 с» референса были 36 с —
+        // вход рос с каждой фразой, синтез замедлялся на любом устройстве.
+        let sec = wav.len() as f32 / self.output_sample_rate() as f32;
+        let t = codes.dims().last().copied().unwrap_or(0);
+        let fps = if sec > 0.1 && t > 0 { t as f32 / sec } else { self.frame_rate as f32 };
+        let max_tokens = (max_ref_sec.max(0.0) * fps) as usize;
         match voice {
             Some(p) => {
                 p.extend(&part, max_tokens)?;

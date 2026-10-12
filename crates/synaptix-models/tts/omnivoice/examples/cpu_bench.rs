@@ -33,10 +33,18 @@ fn main() {
     let p = OmniVoicePipeline::from_syn_quant(&path, dev, dtype, quant).expect("загрузка");
     println!("{prec}: загрузка {:.1} с", t0.elapsed().as_secs_f32());
     let gen = OmniVoiceGenerationConfig { num_step: steps, ..Default::default() };
-    let text = "Привет! Так звучит эта модель с заданными настройками.";
-    for run in 0..2 {
+    let texts = ["Привет! Так звучит эта модель с заданными настройками.", "Сегодня хорошая погода, пойдём гулять в парк у реки."];
+    let runs: usize = std::env::var("RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    // CONT=1 — как служба: каждая фраза продолжает голос уже сказанного.
+    let mut voice = None;
+    for run in 0..runs {
+        let text = if std::env::var_os("VARY").is_some() { texts[run % 2] } else { texts[0] };
         let t = std::time::Instant::now();
-        let wav = p.synthesize(text, None, Some("ru"), Some("female, young adult"), 1.0, None, &gen).expect("синтез");
+        let wav = if std::env::var_os("CONT").is_some() {
+            p.synthesize_continuing(text, &mut voice, Some("ru"), Some("female, young adult"), 1.0, &gen, std::env::var("REF_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0)).expect("синтез")
+        } else {
+            p.synthesize(text, None, Some("ru"), Some("female, young adult"), 1.0, None, &gen).expect("синтез")
+        };
         let sec = wav.len() as f32 / p.output_sample_rate() as f32;
         let dt = t.elapsed().as_secs_f32();
         println!("{prec}: прогон {run}: {sec:.1} с звука за {dt:.1} с (RTF {:.2})", dt / sec);
