@@ -411,6 +411,31 @@ impl Backend for NpuBackend {
         self.attention_dev(q, k, v, t_cache, out, scale, Some(window))
     }
 
+    /// Split-RoPE по таблицам `[S, D/2]` F32. Только Intel NPU: поворот половин —
+    /// MatMul на постоянную матрицу (QNN такой broadcast MatMul не собирает).
+    fn rope_split(
+        &self,
+        x: (&Storage, &Layout),
+        cos: (&Storage, &Layout),
+        sin: (&Storage, &Layout),
+        out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        let d = x.1.dims();
+        let intel = crate::info().is_some_and(|i| i.model.vendor == synaptix_npu::Vendor::Intel);
+        let ok = intel
+            && float(x.1)
+            && d.len() >= 2
+            && d[d.len() - 1] % 2 == 0
+            && cos.1.dims() == [d[d.len() - 2], d[d.len() - 1] / 2]
+            && sin.1.dims() == cos.1.dims();
+        if !ok {
+            return Err(SynaptixError::Unsupported("rope_split на NPU"));
+        }
+        let ins = vec![inp(x.0, x.1)?, inp(cos.0, cos.1)?, inp(sin.0, sin.1)?];
+        self.rec(NodeOp::RopeSplit, ins, out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn rope_apply_dev(
         &self,

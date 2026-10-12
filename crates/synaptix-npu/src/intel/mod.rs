@@ -7,8 +7,10 @@
 //! драйвер просто не находится. Нужны пакеты `openvino`,
 //! `openvino-intel-npu-plugin`, `intel-npu-driver`, `intel-npu-compiler`.
 //!
-//! Собранные графы кэширует сам OpenVINO (`CACHE_DIR`, по умолчанию
-//! `~/.cache/synaptix/npu-intel`): повторная сборка того же графа — чтение блоба.
+//! Графы собирает `ov-compile_tool` в отдельном процессе (компилятор NPU умеет
+//! падать с SEGV — тогда не роняет программу), готовые блобы лежат в
+//! `SYNAPTIX_NPU_CACHE` (по умолчанию `~/.cache/synaptix/npu-intel`) по ключу
+//! структуры графа и весов; повторный запрос — `import_model` из файла.
 
 mod ir;
 
@@ -30,6 +32,7 @@ struct Ov {
     core_free: unsafe extern "C" fn(P),
     read_model_mem: unsafe extern "C" fn(P, *const c_char, usize, P, *mut P) -> Status,
     compile: unsafe extern "C" fn(P, P, *const c_char, usize, *mut P, ...) -> Status,
+    import_model: unsafe extern "C" fn(P, *const c_char, usize, *const c_char, *mut P) -> Status,
     model_free: unsafe extern "C" fn(P),
     compiled_free: unsafe extern "C" fn(P),
     create_request: unsafe extern "C" fn(P, *mut P) -> Status,
@@ -84,7 +87,8 @@ fn ov_type(d: DType) -> u32 {
         DType::I32 => 9,
         DType::U8 => 16,
         DType::U16 => 17,
-        DType::U32 => 18,
+        // u32 графа исполняется как i32 (см. ir.rs).
+        DType::U32 => 9,
     }
 }
 
@@ -118,6 +122,7 @@ impl Ov {
             core_free: f!("ov_core_free"),
             read_model_mem: f!("ov_core_read_model_from_memory_buffer"),
             compile: f!("ov_core_compile_model"),
+            import_model: f!("ov_core_import_model"),
             model_free: f!("ov_model_free"),
             compiled_free: f!("ov_compiled_model_free"),
             create_request: f!("ov_compiled_model_create_infer_request"),
@@ -244,6 +249,7 @@ struct IntelGraph {
     inputs: Vec<IoTensor>,
     outputs: Vec<IoTensor>,
     build: Duration,
+    cached: bool,
 }
 
 unsafe impl Send for IntelGraph {}
@@ -260,43 +266,120 @@ impl Npu for IntelNpu {
 
     fn compile(&self, _key: &str, g: &Graph) -> Result<Box<dyn CompiledGraph>> {
         let t0 = Instant::now();
-        let lowered = ir::lower(g)?;
-        if let Ok(dir) = std::env::var("SYNAPTIX_NPU_DUMP") {
-            let h = g.structure_hash();
-            let _ = std::fs::write(format!("{dir}/{h:016x}.xml"), &lowered.xml);
-            let _ = std::fs::write(format!("{dir}/{h:016x}.bin"), &lowered.bin);
-        }
         let ov = self.ov;
-        let mut bin = lowered.bin;
-        let wt = ov.host_tensor(DType::U8, &[bin.len().max(1) as u32], bin.as_mut_ptr())?;
-        let mut model: P = std::ptr::null_mut();
-        let xml = lowered.xml.as_bytes();
-        ov.check(unsafe { (ov.read_model_mem)(self.core, xml.as_ptr() as *const c_char, xml.len(), wt.t, &mut model) }, "чтение IR")?;
-        let dev = CString::new("NPU").unwrap();
-        let (k_cache, k_hint) = (CString::new("CACHE_DIR").unwrap(), CString::new("PERFORMANCE_HINT").unwrap());
-        let v_hint = CString::new("LATENCY").unwrap();
-        let mut compiled: P = std::ptr::null_mut();
-        let st = unsafe {
-            (ov.compile)(self.core, model, dev.as_ptr(), 4, &mut compiled, k_cache.as_ptr(), self.cache_dir.as_ptr(), k_hint.as_ptr(), v_hint.as_ptr())
+        let dump = std::env::var("SYNAPTIX_NPU_DUMP").ok();
+        let tool = compile_tool();
+        let (compiled, inputs, outputs, cached) = match tool.filter(|_| dump.is_none()) {
+            // Сборка в отдельном процессе: компилятор NPU падает (SEGV) на
+            // некоторых графах — тогда умирает только он, модель уходит на CPU.
+            Some(tool) => {
+                let (live_t, _) = g.live();
+                let (inputs, outputs) = (io_of(g, TensorKind::Input, &live_t), io_of(g, TensorKind::Output, &live_t));
+                let key = blob_key(g.structure_hash(), &self.info.runtime);
+                let dir = std::path::PathBuf::from(self.cache_dir.to_string_lossy().into_owned());
+                let blob_path = dir.join(format!("{key}.blob"));
+                let cached = blob_path.exists();
+                if !cached {
+                    build_blob(g, &tool, &dir, &key, &blob_path)?;
+                }
+                let blob = std::fs::read(&blob_path)?;
+                let dev = CString::new("NPU").unwrap();
+                let mut compiled: P = std::ptr::null_mut();
+                let st = unsafe { (ov.import_model)(self.core, blob.as_ptr() as *const c_char, blob.len(), dev.as_ptr(), &mut compiled) };
+                if let Err(e) = ov.check(st, "загрузка собранного графа") {
+                    // Блоб от другой версии драйвера — собрать заново при следующем запросе.
+                    let _ = std::fs::remove_file(&blob_path);
+                    return Err(e);
+                }
+                (compiled, inputs, outputs, cached)
+            }
+            None => {
+                let lowered = ir::lower(g)?;
+                if let Some(dir) = &dump {
+                    let h = g.structure_hash();
+                    let _ = std::fs::write(format!("{dir}/{h:016x}.xml"), &lowered.xml);
+                    let _ = std::fs::write(format!("{dir}/{h:016x}.bin"), &lowered.bin);
+                }
+                let mut bin = lowered.bin;
+                let wt = ov.host_tensor(DType::U8, &[bin.len().max(1) as u32], bin.as_mut_ptr())?;
+                let mut model: P = std::ptr::null_mut();
+                let xml = lowered.xml.as_bytes();
+                ov.check(unsafe { (ov.read_model_mem)(self.core, xml.as_ptr() as *const c_char, xml.len(), wt.t, &mut model) }, "чтение IR")?;
+                let dev = CString::new("NPU").unwrap();
+                let (k_cache, k_hint) = (CString::new("CACHE_DIR").unwrap(), CString::new("PERFORMANCE_HINT").unwrap());
+                let v_hint = CString::new("LATENCY").unwrap();
+                let mut compiled: P = std::ptr::null_mut();
+                let st = unsafe {
+                    (ov.compile)(self.core, model, dev.as_ptr(), 4, &mut compiled, k_cache.as_ptr(), self.cache_dir.as_ptr(), k_hint.as_ptr(), v_hint.as_ptr())
+                };
+                unsafe { (ov.model_free)(model) };
+                drop(wt);
+                drop(bin);
+                ov.check(st, "сборка графа на NPU")?;
+                (compiled, lowered.inputs, lowered.outputs, false)
+            }
         };
-        unsafe { (ov.model_free)(model) };
-        drop(wt);
-        drop(bin);
-        ov.check(st, "сборка графа на NPU")?;
         let mut req: P = std::ptr::null_mut();
         if let Err(e) = ov.check(unsafe { (ov.create_request)(compiled, &mut req) }, "запрос исполнения") {
             unsafe { (ov.compiled_free)(compiled) };
             return Err(e);
         }
-        Ok(Box::new(IntelGraph {
-            ov,
-            compiled,
-            request: parking_lot::Mutex::new(req),
-            inputs: lowered.inputs,
-            outputs: lowered.outputs,
-            build: t0.elapsed(),
-        }))
+        Ok(Box::new(IntelGraph { ov, compiled, request: parking_lot::Mutex::new(req), inputs, outputs, build: t0.elapsed(), cached }))
     }
+}
+
+/// `ov-compile_tool` из плагина NPU (`SYNAPTIX_NPU_COMPILE_TOOL` — свой путь,
+/// `=0` — собирать в процессе).
+fn compile_tool() -> Option<String> {
+    match std::env::var("SYNAPTIX_NPU_COMPILE_TOOL") {
+        Ok(v) if v == "0" => None,
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => ["/usr/bin/ov-compile_tool", "/usr/local/bin/ov-compile_tool"].iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string()),
+    }
+}
+
+/// Версия перевода в IR: меняется — старые блобы не подходят.
+const IR_VERSION: &str = "ir2";
+
+fn blob_key(structure: u64, runtime: &str) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in format!("{structure:016x}|{IR_VERSION}|{runtime}").bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn build_blob(g: &Graph, tool: &str, dir: &std::path::Path, key: &str, blob_path: &std::path::Path) -> Result<()> {
+    let lowered = ir::lower(g)?;
+    let stem = dir.join(format!("build-{}-{key}", std::process::id()));
+    let (xml, bin, cfg, tmp) = (stem.with_extension("xml"), stem.with_extension("bin"), stem.with_extension("cfg"), stem.with_extension("blob"));
+    std::fs::write(&xml, &lowered.xml)?;
+    std::fs::write(&bin, &lowered.bin)?;
+    std::fs::write(&cfg, "PERFORMANCE_HINT LATENCY\n")?;
+    let out = std::process::Command::new(tool)
+        .arg("-m")
+        .arg(&xml)
+        .args(["-d", "NPU", "-o"])
+        .arg(&tmp)
+        .arg("-c")
+        .arg(&cfg)
+        .stdin(std::process::Stdio::null())
+        .output();
+    for f in [&xml, &bin, &cfg] {
+        let _ = std::fs::remove_file(f);
+    }
+    let out = out.map_err(|e| NpuError::Driver { driver: "openvino", msg: format!("{tool}: {e}") })?;
+    if !out.status.success() || !tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect();
+        return Err(NpuError::Driver {
+            driver: "openvino",
+            msg: format!("сборка графа на NPU ({}): {}", out.status, tail.into_iter().rev().collect::<Vec<_>>().join(" | ")),
+        });
+    }
+    std::fs::rename(&tmp, blob_path)?;
+    Ok(())
 }
 
 impl CompiledGraph for IntelGraph {
@@ -309,7 +392,7 @@ impl CompiledGraph for IntelGraph {
     }
 
     fn from_cache(&self) -> bool {
-        false
+        self.cached
     }
 
     fn build_time(&self) -> Duration {

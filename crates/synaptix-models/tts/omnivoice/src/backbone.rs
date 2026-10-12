@@ -66,6 +66,12 @@ pub static EMBED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub const NPU_BUCKETS: [usize; 6] = [96, 128, 192, 256, 384, 512];
 
+/// NPU — Intel (OpenVINO): там батч CFG выгоднее, на телефоне (QNN) графы
+/// собраны под B=1.
+fn npu_is_intel() -> bool {
+    std::env::var("SYNAPTIX_NPU_INTEL_ACTIVE").is_ok() || std::path::Path::new("/dev/accel/accel0").exists()
+}
+
 fn buckets_active(device: Device) -> bool {
     match std::env::var("SYNAPTIX_LEN_BUCKETS").ok().as_deref() {
         Some("0") => false,
@@ -402,10 +408,16 @@ impl Backbone {
 }
 
 impl Backbone {
-    /// CPU: cond и uncond CFG — одним проходом B=2 (uncond добивается до длины
-    /// cond маской ключей): вдвое меньше операций и крупнее матрицы Linear.
+    /// cond и uncond CFG — одним проходом B=2 (uncond добивается до длины cond
+    /// маской ключей): вдвое меньше операций и крупнее матрицы Linear. CPU и
+    /// Intel NPU (там вдвое больше строк — ближе к 256, на которых NPU 3720 в
+    /// полтора-два раза быстрее, чем на 128). `SYNAPTIX_CFG_BATCH=0/1` — вручную.
     pub fn batch_cfg(&self) -> bool {
-        matches!(self.device, Device::Cpu) && std::env::var("SYNAPTIX_CFG_BATCH").ok().as_deref() != Some("0")
+        match std::env::var("SYNAPTIX_CFG_BATCH").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => matches!(self.device, Device::Cpu) || (matches!(self.device, Device::Npu(_)) && std::env::var("SYNAPTIX_NPU_VENDOR").as_deref() != Ok("qualcomm") && npu_is_intel()),
+        }
     }
 
     pub fn bucket_for(&self, s: usize) -> Option<usize> {

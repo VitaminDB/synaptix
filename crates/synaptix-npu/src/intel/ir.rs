@@ -32,7 +32,9 @@ impl Et {
             Et::G(DType::F32) => "f32",
             Et::G(DType::F16) => "f16",
             Et::G(DType::I32) => "i32",
-            Et::G(DType::U32) => "u32",
+            // NPU 37xx не умеет Convert u32 → i32, а индексы Gather нужны целые со
+            // знаком: u32 графа объявляется i32 (значения < 2³¹, байты те же).
+            Et::G(DType::U32) => "i32",
             Et::G(DType::U8) => "u8",
             Et::G(DType::U16) => "u16",
             Et::G(DType::I8) => "i8",
@@ -46,7 +48,7 @@ impl Et {
             Et::G(DType::F32) => "FP32",
             Et::G(DType::F16) => "FP16",
             Et::G(DType::I32) => "I32",
-            Et::G(DType::U32) => "U32",
+            Et::G(DType::U32) => "I32",
             Et::G(DType::U8) => "U8",
             Et::G(DType::U16) => "U16",
             Et::G(DType::I8) => "I8",
@@ -383,7 +385,6 @@ impl<'a> B<'a> {
                 let (_, shape) = self.out_desc(out);
                 let xv = self.get(x)?;
                 let iv = self.get(indices)?;
-                let iv = if matches!(iv.et, Et::G(DType::U32)) { self.convert(&iv, Et::G(DType::I32)) } else { iv };
                 let a = self.i64_scalar(axis as i64);
                 let y = self.one("Gather", "opset8", "batch_dims=\"0\"", &[&xv, &iv, &a], xv.et, shape);
                 self.set(out, y);
@@ -484,10 +485,15 @@ pub(super) fn lower(g: &Graph) -> Result<Lowered> {
     }
     let mut b = B { g, xml: String::with_capacity(1 << 16), edges: Vec::new(), next: 0, bin: Vec::new(), vals: HashMap::new() };
     b.xml.push_str("<?xml version=\"1.0\"?><net name=\"synaptix\" version=\"11\"><layers>");
+    // Скаляры на границе графа — `[1]` (так их передаёт исполнение), внутри — `[]`.
     for io in &inputs {
         let et = Et::G(io.dtype);
-        let data = format!("shape=\"{}\" element_type=\"{}\"", csv(&io.shape), et.name());
-        let v = b.one("Parameter", "opset1", &data, &[], et, io.shape.clone());
+        let shape = if io.shape.is_empty() { vec![1] } else { io.shape.clone() };
+        let data = format!("shape=\"{}\" element_type=\"{}\"", csv(&shape), et.name());
+        let mut v = b.one("Parameter", "opset1", &data, &[], et, shape);
+        if io.shape.is_empty() {
+            v = b.reshape(&v, &[]);
+        }
         b.vals.insert(io.id.0, v);
     }
     for (i, op) in g.ops.iter().enumerate() {
@@ -496,7 +502,10 @@ pub(super) fn lower(g: &Graph) -> Result<Lowered> {
         }
     }
     for io in &outputs {
-        let v = b.get(io.id)?;
+        let mut v = b.get(io.id)?;
+        if v.shape.is_empty() {
+            v = b.reshape(&v, &[1]);
+        }
         b.layer("Result", "opset1", "", &[&v], &[]);
     }
     b.xml.push_str("</layers><edges>");

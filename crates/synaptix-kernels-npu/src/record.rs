@@ -33,6 +33,7 @@ pub enum NodeOp {
     KvAppend,
     AttentionDev { scale: f32, window: Option<i32> },
     RopeDev { rotary_dim: usize },
+    RopeSplit,
     Concat(usize),
     LinearQ { n: usize, k: usize, scales: Arc<Vec<f32>> },
 }
@@ -595,6 +596,43 @@ impl Builder {
                 let p = self.g.softmax(s);
                 let o = self.g.matmul(p, v, false, false).map_err(err)?;
                 if nh != nkv { self.g.reshape(o, &qs).map_err(err)? } else { o }
+            }
+            NodeOp::RopeSplit => {
+                // out = x·[cos, cos] + (x·R)·[sin, sin], R — поворот половин
+                // (rotate_half = [−x₂, x₁]) постоянной матрицей D×D: поворот идёт
+                // на матричном блоке, без срезов и Concat по последней оси.
+                let x = self.input(&n.ins[0], true)?;
+                let cos = self.input(&n.ins[1], true)?;
+                let sin = self.input(&n.ins[2], true)?;
+                let xs = self.g.tensor(x).shape.clone();
+                let dt = self.g.tensor(x).dtype;
+                let (s, d) = (xs[xs.len() - 2], xs[xs.len() - 1]);
+                let half = d / 2;
+                let full = |b: &mut Self, tab: TensorId| -> Result<TensorId> {
+                    let t = b.cast(tab, dt);
+                    let c = b.g.node(dt, &[s, d], |out| Op::Concat { xs: vec![t, t], axis: 1, out });
+                    let mut bs = vec![1u32; xs.len()];
+                    bs[xs.len() - 2] = s;
+                    bs[xs.len() - 1] = d;
+                    b.g.reshape(c, &bs).map_err(err)
+                };
+                let c2 = full(self, cos)?;
+                let s2 = full(self, sin)?;
+                let mut r = vec![0f32; (d * d) as usize];
+                for i in 0..half as usize {
+                    r[(i + half as usize) * d as usize + i] = -1.0;
+                    r[i * d as usize + i + half as usize] = 1.0;
+                }
+                let bytes: Vec<u8> = if dt == DType::F16 {
+                    r.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect()
+                } else {
+                    r.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                let rw = self.g.weight(dt, &[d, d], &bytes).map_err(err)?;
+                let rot = self.g.matmul(x, rw, false, false).map_err(err)?;
+                let a = self.bin(BinaryKind::Mul, x, c2)?;
+                let b2 = self.bin(BinaryKind::Mul, rot, s2)?;
+                self.bin(BinaryKind::Add, a, b2)?
             }
             NodeOp::RopeDev { rotary_dim } => {
                 let x = self.input(&n.ins[0], true)?;
