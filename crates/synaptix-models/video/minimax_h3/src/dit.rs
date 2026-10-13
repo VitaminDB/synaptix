@@ -178,6 +178,19 @@ impl Attention {
         })
     }
 
+    /// qk-норма голов (вес F32) + RoPE с позиции `off`: одно слитое ядро в
+    /// dtype входа (бит-в-бит с F32-цепочкой ниже, она — фолбэк).
+    fn norm_rope(&self, x: Tensor, w: &Tensor, rt: &RopeTables, off: usize) -> R<Tensor> {
+        if matches!(x.dtype(), DType::BF16 | DType::F16) && rt.cos.dtype() == DType::F32 {
+            if let Ok(y) = x.qk_norm_rope(w, &rt.cos, &rt.sin, off, rt.rot_dim, self.eps) {
+                return Ok(y);
+            }
+        }
+        let dt = x.dtype();
+        let y = rms_norm(&x.to_dtype(DType::F32)?, w, self.eps)?;
+        rt.apply_bshd_at(&y, off).map_err(to_tensor_err)?.to_dtype(dt)
+    }
+
     fn stream_bshd(
         &self,
         x: &Tensor,
@@ -193,11 +206,11 @@ impl Attention {
             let xc = x.narrow(0, off, n)?.contiguous()?;
             let mut p = proj.forward(&xc)?.reshape(vec![1, n, self.heads, self.head_dim])?;
             drop(xc);
-            if let Some(w) = norm {
-                p = rms_norm(&p.to_dtype(DType::F32)?, w, self.eps)?;
-            }
-            if let Some(rt) = rt {
-                p = rt.apply_bshd_at(&p, off).map_err(to_tensor_err)?;
+            match (norm, rt) {
+                (Some(w), Some(rt)) => p = self.norm_rope(p, w, rt, off)?,
+                (Some(w), None) => p = rms_norm(&p.to_dtype(DType::F32)?, w, self.eps)?,
+                (None, Some(rt)) => p = rt.apply_bshd_at(&p, off).map_err(to_tensor_err)?,
+                (None, None) => {}
             }
             if p.dtype() != x.dtype() {
                 p = p.to_dtype(x.dtype())?;
@@ -231,8 +244,7 @@ impl Attention {
             let xq = x.narrow(0, off, n)?.contiguous()?;
             let q = self.q_proj.forward(&xq)?.reshape(vec![1, n, self.heads, self.head_dim])?;
             drop(xq);
-            let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
-            let q = rt.apply_bshd_at(&q, off).map_err(to_tensor_err)?;
+            let q = self.norm_rope(q, &q_norm, rt, off)?;
             let q = q.to_dtype(x.dtype())?;
             let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
             drop(q);
@@ -268,8 +280,7 @@ impl Attention {
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
             let k = self.k_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape.clone())?;
-            let k = rms_norm(&k.to_dtype(DType::F32)?, &k_norm, self.eps)?;
-            let k = rt.apply_bshd_at(&k, *off).map_err(to_tensor_err)?.to_dtype(attn_dt)?;
+            let k = self.norm_rope(k, &k_norm, rt, *off)?;
             let v = if attn_dt == DType::F16 && out_dt != DType::F16 {
                 self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?
                     .mul_scalar(1.0 / 16.0)?
@@ -293,8 +304,7 @@ impl Attention {
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
             let q = self.q_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape)?;
-            let q = rms_norm(&q.to_dtype(DType::F32)?, &q_norm, self.eps)?;
-            let q = rt.apply_bshd_at(&q, *off).map_err(to_tensor_err)?.to_dtype(attn_dt)?;
+            let q = self.norm_rope(q, &q_norm, rt, *off)?;
             let a = q.flash_attention_bshd(&k_full, &v_full, self.scale, false)?;
             drop(q);
             let y = self.out.forward(&a.reshape(vec![*n, inner])?)?;
@@ -604,8 +614,9 @@ impl DiTBlock {
             eprintln!("[h3-mod] {} · {}", st("gate_msa", &mods.gate_msa), st("gate_mlp", &mods.gate_mlp));
             eprintln!("[h3-mod] {} · {}", st("shift_mlp", &mods.shift_mlp), st("scale_mlp", &mods.scale_mlp));
         }
-        if !prof && x.dtype() == DType::BF16 && self.attn.q_proj.0.is_nvfp4() && self.mlp.fc1.0.is_nvfp4() {
-            if let Some(y) = self.forward_fused(x, mods, segments, rope)? {
+        let fmt = fused_format(&self.attn.q_proj, &self.mlp.fc1);
+        if let (false, DType::BF16, Some(fmt)) = (prof, x.dtype(), fmt) {
+            if let Some(y) = self.forward_fused(x, mods, segments, rope, fmt)? {
                 return Ok(y);
             }
         }
@@ -646,9 +657,10 @@ impl DiTBlock {
         mods: &BlockMods,
         segments: &[ModSegment],
         rope: &RopeTables,
+        fmt: DType,
     ) -> R<Option<Tensor>> {
         let s = x.dims()[0];
-        let Some(chunks) = self.quant_chunks(x, &mods.scale_msa, &mods.shift_msa, &self.norm1, segments)? else {
+        let Some(chunks) = self.quant_chunks(x, &mods.scale_msa, &mods.shift_msa, &self.norm1, segments, fmt)? else {
             return Ok(None);
         };
         let a = self.attn.forward_bshd_prequant(&chunks, s, rope, x.dtype())?;
@@ -656,7 +668,7 @@ impl DiTBlock {
         let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
         drop(a);
 
-        let Some(chunks) = self.quant_chunks(&x, &mods.scale_mlp, &mods.shift_mlp, &self.norm2, segments)? else {
+        let Some(chunks) = self.quant_chunks(&x, &mods.scale_mlp, &mods.shift_mlp, &self.norm2, segments, fmt)? else {
             let hn = rms_norm(&x, &self.norm2, self.eps)?;
             let h = mod_scale_shift(&hn, &mods.shift_mlp, &mods.scale_mlp, segments)?;
             let m = self.mlp.forward(&h)?;
@@ -674,13 +686,39 @@ impl DiTBlock {
         shift_rows: &Tensor,
         norm_w: &Tensor,
         segments: &[ModSegment],
+        fmt: DType,
     ) -> R<Option<Vec<(Tensor, Tensor, usize, usize)>>> {
         let s = x.dims()[0];
         let hidden = x.dims()[1];
         check_coverage(s, segments)?;
         let dt = x.dtype();
         let w = norm_w.to_dtype(dt)?.reshape(vec![1, hidden])?;
+        // Таблица модуляции [R, hidden] и строка на токен: одно ядро на кусок,
+        // без развёрнутых по-токенных scale/shift (те же значения поэлементно).
+        let ridx = seg_index(segments, s, x.device())?;
+        let sc_t = w.broadcast_mul(&scale_rows.to_dtype(dt)?.add_scalar(1.0)?)?.add_scalar(-1.0)?;
+        let sh_t = shift_rows.to_dtype(dt)?.contiguous()?;
         let mut out = Vec::with_capacity(s.div_ceil(LIN_CHUNK_ROWS));
+        let mut off = 0;
+        let mut seg_ok = true;
+        while off < s {
+            let n = LIN_CHUNK_ROWS.min(s - off);
+            match x.narrow(0, off, n)?.rms_segmod_quant(&sc_t, &sh_t, &ridx.narrow(0, off, n)?, self.eps, fmt) {
+                Ok((packed, scales)) => out.push((packed, scales, off, n)),
+                Err(_) => {
+                    seg_ok = false;
+                    break;
+                }
+            }
+            off += n;
+        }
+        if seg_ok {
+            return Ok(Some(out));
+        }
+        if fmt != DType::NVFP4 {
+            return Ok(None);
+        }
+        out.clear();
         let mut off = 0;
         while off < s {
             let n = LIN_CHUNK_ROWS.min(s - off);
@@ -752,6 +790,40 @@ fn row_of(t: &Tensor, row: usize) -> R<Tensor> {
     t.narrow(0, row, 1)?.contiguous()
 }
 
+/// Строка модуляции каждого токена (I32 `[s]`) по сегментам — для слитых
+/// ядер с таблицей модуляции. Сегменты одинаковы для всех блоков и шагов
+/// прогона: тензор кэшируется, пока они не изменятся.
+fn seg_index(segments: &[ModSegment], s: usize, device: Device) -> R<Tensor> {
+    type Key = (Vec<(usize, usize, usize)>, usize, Device);
+    static CACHE: std::sync::Mutex<Option<(Key, Tensor)>> = std::sync::Mutex::new(None);
+    let key: Key = (segments.iter().map(|g| (g.start, g.stop, g.row)).collect(), s, device);
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, t)) = g.as_ref() {
+        if *k == key {
+            return Ok(t.clone());
+        }
+    }
+    check_coverage(s, segments)?;
+    let mut idx = vec![0i32; s];
+    for seg in segments {
+        for v in &mut idx[seg.start..seg.stop] {
+            *v = seg.row as i32;
+        }
+    }
+    let t = Tensor::from_vec(idx, vec![s], device)?;
+    *g = Some((key, t.clone()));
+    Ok(t)
+}
+
+/// Формат слитого квант-пути блока: q-проекция и fc1 в одном block-scale
+/// кванте (NVFP4 или MXFP8).
+fn fused_format(a: &Lin, b: &Lin) -> Option<DType> {
+    match (a.0.quant_dtype(), b.0.quant_dtype()) {
+        (Some(x), Some(y)) if x == y && matches!(x, DType::NVFP4 | DType::MXFP8) => Some(x),
+        _ => None,
+    }
+}
+
 fn check_coverage(rows: usize, segments: &[ModSegment]) -> R<()> {
     let mut cursor = 0usize;
     for seg in segments {
@@ -806,6 +878,14 @@ fn mod_scale_shift(
 fn mod_gate(x: &Tensor, other: &Tensor, gate: &Tensor, segments: &[ModSegment]) -> R<Tensor> {
     let dims = x.dims().to_vec();
     check_coverage(dims[0], segments)?;
+    // Одним запуском по таблице gate (то же округление, что fused_gate_residual).
+    if matches!(x.device(), Device::Cuda(_)) && gate.dtype() == x.dtype() && other.dtype() == x.dtype() {
+        if let Ok(ridx) = seg_index(segments, dims[0], x.device()) {
+            if let Ok(y) = x.gate_residual_seg(&other.reshape(dims.clone())?, gate, &ridx) {
+                return Ok(y);
+            }
+        }
+    }
     let mut out = Tensor::empty_uninit(vec![1, dims[0], dims[1]], x.dtype(), x.device())?;
     for seg in segments {
         if seg.stop == seg.start {

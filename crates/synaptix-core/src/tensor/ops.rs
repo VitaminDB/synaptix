@@ -1034,6 +1034,132 @@ impl Tensor {
         ))
     }
 
+    /// Сегментная adaLN-модуляция + квант активации (MiniMax-H3): строки
+    /// `self [m, k]` → `rms(x)·(1+scale[r])+shift[r]`, `r = ridx[row]`
+    /// (`scale/shift` — таблица `[R, k]` того же dtype, `ridx` — I32 `[m]`) →
+    /// `(packed, scales)` в формате `fmt` (NVFP4 | MXFP8). Бит-в-бит с
+    /// [`Self::rms_mod_quant_nvfp4`] от развёрнутых по-токенных scale/shift,
+    /// но без них и без записи нормы.
+    pub fn rms_segmod_quant(&self, scale: &Tensor, shift: &Tensor, ridx: &Tensor, eps: f32, fmt: DType) -> Result<(Tensor, Tensor)> {
+        let dt = self.dtype();
+        if !matches!(dt, DType::F16 | DType::BF16) || scale.dtype() != dt || shift.dtype() != dt || ridx.dtype() != DType::I32 {
+            return Err(SynaptixError::Unsupported("rms_segmod_quant: dtype"));
+        }
+        let dims = self.dims();
+        let k = *dims.last().ok_or(SynaptixError::Unsupported("rms_segmod_quant: scalar x"))?;
+        let m = self.layout.numel() / k.max(1);
+        let rows = scale.layout.numel() / k.max(1);
+        if k == 0 || scale.dims() != shift.dims() || scale.layout.numel() != rows * k || ridx.layout.numel() != m {
+            return Err(SynaptixError::Unsupported("rms_segmod_quant: формы"));
+        }
+        let mxfp8 = match fmt {
+            DType::NVFP4 => false,
+            DType::MXFP8 => true,
+            _ => return Err(SynaptixError::Unsupported("rms_segmod_quant: формат")),
+        };
+        let (packed_bytes, scales_bytes) = if mxfp8 { (m * k, m * k / 32) } else { (m * k / 2, (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128)) };
+        let x = self.contiguous_view()?;
+        let sc = scale.contiguous_view()?;
+        let sh = shift.contiguous_view()?;
+        let ri = ridx.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.rms_segmod_quant(
+            (&x.storage, &x.layout),
+            (&sc.storage, &sc.layout),
+            (&sh.storage, &sh.layout),
+            (&ri.storage, &ri.layout),
+            &mut packed_st,
+            &mut scales_st,
+            m,
+            k,
+            rows,
+            eps,
+            mxfp8,
+            &stream,
+        )?;
+        Ok((
+            Tensor::from_parts(Arc::new(packed_st), Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8)),
+            Tensor::from_parts(Arc::new(scales_st), Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8)),
+        ))
+    }
+
+    /// Gated residual с сегментной модуляцией: `self + y·g[ridx[row]]`
+    /// (`self/y [m, d]`, `g` — таблица `[R, d]`, `ridx` I32 `[m]`) одним
+    /// запуском; округления = [`Self::fused_gate_residual`] бит-в-бит.
+    pub fn gate_residual_seg(&self, y: &Tensor, g: &Tensor, ridx: &Tensor) -> Result<Tensor> {
+        let dt = self.dtype();
+        let d = *self.dims().last().ok_or(SynaptixError::Unsupported("gate_residual_seg: scalar"))?;
+        let m = self.layout.numel() / d.max(1);
+        if y.dtype() != dt || g.dtype() != dt || ridx.dtype() != DType::I32 || y.layout.numel() != m * d || ridx.layout.numel() != m || g.layout.numel() % d.max(1) != 0 {
+            return Err(SynaptixError::Unsupported("gate_residual_seg: формы/dtype"));
+        }
+        let (x, yv, gv, ri) = (self.contiguous_view()?, y.contiguous_view()?, g.contiguous_view()?, ridx.contiguous_view()?);
+        let backend = registry::backend_for(self.device())?;
+        let out_layout = Layout::contiguous(Shape::new(self.dims().to_vec()), dt);
+        let mut out_st = backend.alloc_uninit(dt.bytes_for_numel(m * d), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.gate_residual_seg(
+            (&x.storage, &x.layout),
+            (&yv.storage, &yv.layout),
+            (&gv.storage, &gv.layout),
+            (&ri.storage, &ri.layout),
+            &mut out_st,
+            m,
+            d,
+            g.layout.numel() / d,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out_st), out_layout))
+    }
+
+    /// qk-норма голов + RoPE split-partial: `self [.., heads, d]` (F16|BF16) →
+    /// `rope(rms(x)·w)` того же dtype. `w` F32 `[d]`, `cos/sin` F32
+    /// `[S, rot_dim/2]`, позиция строки-головы `pos_off + row / heads`.
+    /// Бит-в-бит с `to_dtype(F32) → rms_norm_fused → rope_split_partial_fused
+    /// → to_dtype` (head-строки, rms-блок 256).
+    pub fn qk_norm_rope(&self, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize, rot_dim: usize, eps: f32) -> Result<Tensor> {
+        let dt = self.dtype();
+        let dims = self.dims();
+        if dims.len() < 2 || !matches!(dt, DType::F16 | DType::BF16) || w.dtype() != DType::F32 || cos.dtype() != DType::F32 || sin.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported("qk_norm_rope: формы/dtype"));
+        }
+        let d = dims[dims.len() - 1];
+        let heads = dims[dims.len() - 2];
+        let rows = self.layout.numel() / d.max(1);
+        let half = rot_dim / 2;
+        if w.layout.numel() != d || half == 0 || cos.layout.numel() % half != 0 || cos.layout.numel() != sin.layout.numel() {
+            return Err(SynaptixError::Unsupported("qk_norm_rope: формы w/cos/sin"));
+        }
+        let table_rows = cos.layout.numel() / half;
+        if pos_off + rows / heads > table_rows {
+            return Err(SynaptixError::Unsupported("qk_norm_rope: позиция за таблицей"));
+        }
+        let (x, wv, cv, sv) = (self.contiguous_view()?, w.contiguous_view()?, cos.contiguous_view()?, sin.contiguous_view()?);
+        let backend = registry::backend_for(self.device())?;
+        let out_layout = Layout::contiguous(Shape::new(dims.to_vec()), dt);
+        let mut out_st = backend.alloc_uninit(dt.bytes_for_numel(rows * d), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.qk_norm_rope(
+            (&x.storage, &x.layout),
+            (&wv.storage, &wv.layout),
+            (&cv.storage, &cv.layout),
+            (&sv.storage, &sv.layout),
+            table_rows,
+            &mut out_st,
+            rows,
+            heads,
+            d,
+            rot_dim,
+            pos_off,
+            eps,
+            &stream,
+        )?;
+        Ok(Tensor::from_parts(Arc::new(out_st), out_layout))
+    }
+
     /// RMS+вес-вариант (LLM prefill, без модуляции): `y = rms(self)·w`
     /// (`qwen` → `·(1+w)`) + NVFP4-квант f16(y). Бит-в-бит с
     /// rms_norm_fused(w, eps, qwen) → quantize_act.

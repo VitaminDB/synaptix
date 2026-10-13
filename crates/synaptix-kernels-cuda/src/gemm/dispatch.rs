@@ -568,8 +568,9 @@ pub fn mxfp8_linear_tiled(
     out_u8: &mut CudaSlice<u8>,
     w: &QuantWeight,
     m: u32,
+    bf16: bool,
 ) -> Result<bool> {
-    mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, out_u8, w, m, w.n() as u32)
+    mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, out_u8, w, m, w.n() as u32, bf16)
 }
 
 /// Как [`mxfp8_linear_tiled`], но считает только ПЕРВЫЕ `n` строк веса
@@ -598,6 +599,9 @@ pub fn mxfp8_linear_tiled_n(
     w: &QuantWeight,
     m: u32,
     n: u32,
+    // BF16-активация и BF16-выход (`qk` — квант-ядра BF16): без кастов
+    // и без переполнения f16 на больших выходах.
+    bf16: bool,
 ) -> Result<bool> {
     let k = w.k() as u32;
     let m_pad = (m + 127) & !127;
@@ -607,7 +611,7 @@ pub fn mxfp8_linear_tiled_n(
     let k_us = k as usize;
     // Без block-scale MMA (карта ниже Blackwell или SYN_FORCE_ARCH) tiled-ядра
     // нет — вызывающий уходит в деквант-фолбэк.
-    let gk = match GemmMxFp8Kernels::for_context(ctx) {
+    let gk = match if bf16 { GemmMxFp8Kernels::for_context_bf16(ctx) } else { GemmMxFp8Kernels::for_context(ctx) } {
         Ok(gk) => gk,
         Err(SynaptixError::Unsupported(_)) => return Ok(false),
         Err(e) => return Err(e),
@@ -672,14 +676,43 @@ pub fn mxfp8_linear_prequant(
     out_u8: &mut CudaSlice<u8>,
     w: &QuantWeight,
     m: u32,
+    out_bf16: bool,
 ) -> Result<()> {
     let n = w.n() as u32;
     let k = w.k() as u32;
     let use_rot = n % 128 == 0 && k % 128 == 0 && k % 512 == 0 && k / 128 >= 2;
+    let gk = if out_bf16 { GemmMxFp8Kernels::for_context_bf16(ctx)? } else { GemmMxFp8Kernels::for_context(ctx)? };
     if !use_rot {
-        return Err(SynaptixError::Unsupported("mxfp8 prequant: форма вне rot-пути"));
+        // K не кратен 512 (H3: 5376): cp.async-ядро читает полные 128-строчные
+        // тайлы A — квант активации копируется в скретч m_pad строк с нулевым
+        // хвостом (fp8-нуль, E8M0-нуль → вклад 0), как в tiled-пути.
+        if !tiled_shape_ok(n, k) {
+            return Err(SynaptixError::Unsupported("mxfp8 prequant: форма вне tiled-ядер"));
+        }
+        let (m_us, k_us) = (m as usize, k as usize);
+        let m_pad = (m + 127) & !127;
+        let mp_us = m_pad as usize;
+        let packed_arc = w.packed_arc().ok_or_else(|| SynaptixError::Cuda("mxfp8 prequant: packed W освобождён".into()))?;
+        let w_packed = packed_arc.as_cuda().ok_or(SynaptixError::Unsupported("mxfp8 prequant: packed non-cuda"))?.slice();
+        let w_scales = w.scales().as_cuda().ok_or(SynaptixError::Unsupported("mxfp8 prequant: scales non-cuda"))?.slice();
+        return with_mxfp8_scratch(stream, ctx.ordinal(), mp_us * k_us, mp_us * k_us / 32, |xp, sp| {
+            let copy = |src: &CudaSlice<u8>, dst: &mut CudaSlice<u8>, len: usize, total: usize| -> Result<()> {
+                stream
+                    .memcpy_dtod(&src.slice(0..len), &mut dst.slice_mut(0..len))
+                    .map_err(|e| SynaptixError::Cuda(format!("mxfp8 prequant: copy: {e:?}")))?;
+                if total > len {
+                    stream
+                        .memset_zeros(&mut dst.slice_mut(len..total))
+                        .map_err(|e| SynaptixError::Cuda(format!("mxfp8 prequant: zero tail: {e:?}")))?;
+                }
+                Ok(())
+            };
+            copy(xq, xp, m_us * k_us, mp_us * k_us)?;
+            copy(sa, sp, m_us * k_us / 32, mp_us * k_us / 32)?;
+            run_mxfp8_gemm(&gk, stream, xp, w_packed, sp, w_scales, out_u8, m, m_pad, n, k, false, m == m_pad)
+        })
+        .map(|_| ());
     }
-    let gk = GemmMxFp8Kernels::for_context(ctx)?;
     let packed_arc = w
         .packed_arc()
         .ok_or_else(|| SynaptixError::Cuda("mxfp8 prequant: packed W освобождён".into()))?;
@@ -864,7 +897,7 @@ pub fn mxfp8_linear_dequant_fallback(
 
     with_mxfp8_deq_scratch(stream, ctx.ordinal(), w_need, y_need, |w_f16, y| {
         if n_head > 0 {
-            if !mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, y, w, m, n_head)? {
+            if !mxfp8_linear_tiled_n(qk, ctx, stream, x_u8, y, w, m, n_head, false)? {
                 return Err(SynaptixError::Cuda(format!(
                     "mxfp8 fallback: голова {n_head}×{k} не взялась tiled-ядром"
                 )));

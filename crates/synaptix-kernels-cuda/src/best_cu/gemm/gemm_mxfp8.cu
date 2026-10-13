@@ -1,6 +1,21 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+// Тип выхода: f16 (по умолчанию) или bf16 (-DSYN_OUT_BF16 — модели с BF16-
+// активациями без каста и без переполнения f16 на больших выходах).
+#ifdef SYN_OUT_BF16
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 syn_out_t;
+typedef __nv_bfloat162 syn_out2_t;
+__device__ __forceinline__ syn_out_t syn_to_out(float v) { return __float2bfloat16(v); }
+__device__ __forceinline__ syn_out2_t syn_to_out2(float2 v) { return __float22bfloat162_rn(v); }
+#else
+typedef __half syn_out_t;
+typedef __half2 syn_out2_t;
+__device__ __forceinline__ syn_out_t syn_to_out(float v) { return __float2half(v); }
+__device__ __forceinline__ syn_out2_t syn_to_out2(float2 v) { return __float22half2_rn(v); }
+#endif
+
 // КОРРЕКТНОЕ MXFP8 GEMM (sm_120a), порт gau-nernst/learn-cuda 09a_block_scaled_mm_sm120 v1.
 // Простой cp.async-конвейер (БЕЗ TMA/warp-spec) — проверен cos=0.999999 на outlier-данных,
 // в отличие от нашего TMA-warp-spec gemm_mxfp8.cu (баг на широком scale-разбросе: TMA-swizzle
@@ -67,7 +82,7 @@ __device__ inline void load_scales(int dst, const char *src, int src_stride, int
 
 template <int BM, int BN, int BK, int NWM, int NWN, int NSTAGES>
 __device__ void mxfp8_device(const char *A_ptr, const char *B_ptr, const char *SFA_ptr,
-                                const char *SFB_ptr, __half *C_ptr, int M, int N, int K) {
+                                const char *SFB_ptr, syn_out_t *C_ptr, int M, int N, int K) {
     constexpr int TB = NWM * NWN * WARP_SIZE;
     constexpr int WARP_M = BM / NWM, WARP_N = BN / NWN;
     const int bid = blockIdx.x;
@@ -148,13 +163,13 @@ __device__ void mxfp8_device(const char *A_ptr, const char *B_ptr, const char *S
         for (int n = 0; n < WARP_N / MMA_N; n++) {
             const int row = m * MMA_M + lane / 4, col = n * MMA_N + (lane % 4) * 2;
             float *rg = acc[m][n];
-            reinterpret_cast<__half2 *>(C_ptr + (row + 0) * N + col)[0] = __float22half2_rn({rg[0], rg[1]});
-            reinterpret_cast<__half2 *>(C_ptr + (row + 8) * N + col)[0] = __float22half2_rn({rg[2], rg[3]});
+            reinterpret_cast<syn_out2_t *>(C_ptr + (row + 0) * N + col)[0] = syn_to_out2({rg[0], rg[1]});
+            reinterpret_cast<syn_out2_t *>(C_ptr + (row + 8) * N + col)[0] = syn_to_out2({rg[2], rg[3]});
         }
 }
 
 extern "C" __global__ __launch_bounds__(128) void gn_mxfp8_128x128(
-    const char *A, const char *B, const char *SFA, const char *SFB, __half *C, int M, int N, int K) {
+    const char *A, const char *B, const char *SFA, const char *SFB, syn_out_t *C, int M, int N, int K) {
     mxfp8_device<128, 128, 128, 2, 2, 3>(A, B, SFA, SFB, C, M, N, K);
 }
 
@@ -186,7 +201,7 @@ __device__ __forceinline__ void mxfp8_rot_device(
     const void* __restrict__ b_desc,
     const void* __restrict__ sfa_desc,
     const void* __restrict__ sfb_desc,
-    __half*     __restrict__ out,
+    syn_out_t*  __restrict__ out,
     unsigned int M,
     unsigned int N,
     unsigned int K,
@@ -475,10 +490,10 @@ __device__ __forceinline__ void mxfp8_rot_device(
             } else if constexpr (WARP_N * 2u == 64u) {
                 soff ^= ((soff >> 7u) & 3u) << 4u;
             }
-            __half2 p0 = __float22half2_rn({acc[m][n][0], acc[m][n][1]});
-            __half2 p1 = __float22half2_rn({acc[m][n][2], acc[m][n][3]});
-            __half2 p2 = __float22half2_rn({acc[m][n + 1][0], acc[m][n + 1][1]});
-            __half2 p3 = __float22half2_rn({acc[m][n + 1][2], acc[m][n + 1][3]});
+            syn_out2_t p0 = syn_to_out2({acc[m][n][0], acc[m][n][1]});
+            syn_out2_t p1 = syn_to_out2({acc[m][n][2], acc[m][n][3]});
+            syn_out2_t p2 = syn_to_out2({acc[m][n + 1][0], acc[m][n + 1][1]});
+            syn_out2_t p3 = syn_to_out2({acc[m][n + 1][2], acc[m][n + 1][3]});
             asm volatile(
                 "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%0], {%1, %2, %3, %4};\n"
                 :: "r"(slot + soff), "r"(*(unsigned int*)&p0), "r"(*(unsigned int*)&p1),
@@ -503,7 +518,7 @@ __device__ __forceinline__ void mxfp8_rot_device(
 
 extern "C" __global__ __launch_bounds__(256, 1) void gn_mxfp8_rot_128x128_s2(
     const void* a_desc, const void* b_desc, const void* sfa_desc, const void* sfb_desc,
-    __half* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
     const void* out_desc) {
     mxfp8_rot_device<128, 128, 2, 4, 2>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }
@@ -513,7 +528,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void gn_mxfp8_rot_128x128_s2(
 // long_sb 18.6% + wait 21.7%).
 extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_128x128_s2(
     const void* a_desc, const void* b_desc, const void* sfa_desc, const void* sfb_desc,
-    __half* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
     const void* out_desc) {
     mxfp8_rot_device<128, 128, 2, 4, 2, 4u, 24, 240>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }
@@ -533,26 +548,26 @@ extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_128x128_s2_sk
 
 // Редьюс split-K: фикс-порядок суммирования (детерминизм), f32 → f16.
 extern "C" __global__ void mxfp8_sk_reduce(const float* __restrict__ ws,
-                                           __half* __restrict__ out,
+                                           syn_out_t* __restrict__ out,
                                            long long mn, int splits) {
     long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < mn; i += stride) {
         float v = 0.f;
         for (int s = 0; s < splits; s++)
             v += ws[(size_t)s * mn + i];
-        out[i] = __float2half(v);
+        out[i] = syn_to_out(v);
     }
 }
 
 extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_64x128_s2(
     const void* a_desc, const void* b_desc, const void* sfa_desc, const void* sfb_desc,
-    __half* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
     const void* out_desc) {
     mxfp8_rot_device<64, 128, 2, 4, 2, 4u, 24, 240>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }
 extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_64x128_s3(
     const void* a_desc, const void* b_desc, const void* sfa_desc, const void* sfb_desc,
-    __half* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
     const void* out_desc) {
     mxfp8_rot_device<64, 128, 2, 4, 3, 4u, 24, 240>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }
@@ -560,7 +575,7 @@ extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_64x128_s3(
 // стадия (64+256)×144 = 46.1KB → 2 стадии 92.2KB (лимит 99KB).
 extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_64x256_s2(
     const void* a_desc, const void* b_desc, const void* sfa_desc, const void* sfb_desc,
-    __half* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr,
     const void* out_desc) {
     mxfp8_rot_device<64, 256, 2, 4, 2, 4u, 24, 240>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }

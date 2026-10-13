@@ -53,6 +53,10 @@ pub struct RmsModQuantKernels {
     mx_ln_bf16: CudaFunction,
     mx_w_f16: CudaFunction,
     mx_w_bf16: CudaFunction,
+    seg_f16: CudaFunction,
+    seg_bf16: CudaFunction,
+    mx_seg_f16: CudaFunction,
+    mx_seg_bf16: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<RmsModQuantKernels>)>>> = OnceLock::new();
@@ -84,6 +88,10 @@ impl RmsModQuantKernels {
             mx_ln_bf16: load_fn(&module, "ln_mod_quant_mxfp8_bf16")?,
             mx_w_f16: load_fn(&module, "rms_w_quant_mxfp8_f16")?,
             mx_w_bf16: load_fn(&module, "rms_w_quant_mxfp8_bf16")?,
+            seg_f16: load_fn(&module, "rms_segmod_quant_nvfp4_f16")?,
+            seg_bf16: load_fn(&module, "rms_segmod_quant_nvfp4_bf16")?,
+            mx_seg_f16: load_fn(&module, "rms_segmod_quant_mxfp8_f16")?,
+            mx_seg_bf16: load_fn(&module, "rms_segmod_quant_mxfp8_bf16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -232,6 +240,71 @@ pub fn run_rms_mod_quant_u8(
                 "rms_mod_quant: dtype {other:?} не поддержан"
             )))
         }
+    }
+    Ok(())
+}
+
+/// Сегментная модуляция + квант (MiniMax-H3): `scale/shift` — таблица строк
+/// `[table_rows, k]`, `ridx` — i32 `[m]` строка таблицы для токена; `y` не
+/// пишется. Арифметика = [`run_rms_mod_quant_u8`] (`RmsMod`) бит-в-бит.
+#[allow(clippy::too_many_arguments)]
+pub fn run_rms_segmod_quant_u8(
+    kernels: &RmsModQuantKernels,
+    stream: &Arc<CudaStream>,
+    (x, x_off): (&CudaSlice<u8>, usize),
+    (scale, scale_off): (&CudaSlice<u8>, usize),
+    (shift, shift_off): (&CudaSlice<u8>, usize),
+    table_rows: usize,
+    (ridx, ridx_off): (&CudaSlice<u8>, usize),
+    packed: &mut CudaSlice<u8>,
+    scales_out: &mut CudaSlice<u8>,
+    m: u32,
+    k: u32,
+    eps: f32,
+    dtype: DType,
+    mxfp8: bool,
+) -> Result<()> {
+    if m == 0 || k == 0 {
+        return Ok(());
+    }
+    if (mxfp8 && k % 32 != 0) || k % 16 != 0 {
+        return Err(SynaptixError::Unsupported("rms_segmod_quant: K не кратен блоку"));
+    }
+    let m_cov = m.div_ceil(128) * 128;
+    let params = RmsModQuantParams {
+        batch: m as i32,
+        batch_cov: m_cov as i32,
+        hidden: k as i32,
+        eps,
+        sf_inner_dim: (k.div_ceil(64) * 4) as i32,
+    };
+    let block = if m <= 8 { k.next_multiple_of(32).clamp(BLOCK, 1024) } else { BLOCK };
+    let grid = if mxfp8 { m } else { m_cov };
+    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: k * 2 };
+    let esz = (dtype.size_in_bits() / 8) as usize;
+    let n = (m as usize) * (k as usize);
+    let nt = table_rows * k as usize;
+    let r_v = unsafe { ridx.slice(ridx_off..ridx_off + m as usize * 4).transmute::<i32>(m as usize) }
+        .ok_or_else(|| SynaptixError::Cuda("rms_segmod_quant: transmute ridx".into()))?;
+    macro_rules! go {
+        ($t:ty, $func:expr) => {{
+            let x_v = unsafe { x.slice(x_off..x_off + n * esz).transmute::<$t>(n) }
+                .ok_or_else(|| SynaptixError::Cuda("rms_segmod_quant: transmute x".into()))?;
+            let s_v = unsafe { scale.slice(scale_off..scale_off + nt * esz).transmute::<$t>(nt) }
+                .ok_or_else(|| SynaptixError::Cuda("rms_segmod_quant: transmute scale".into()))?;
+            let b_v = unsafe { shift.slice(shift_off..shift_off + nt * esz).transmute::<$t>(nt) }
+                .ok_or_else(|| SynaptixError::Cuda("rms_segmod_quant: transmute shift".into()))?;
+            let mut b = stream.launch_builder($func);
+            b.arg(&x_v).arg(&s_v).arg(&b_v).arg(&mut *packed).arg(&mut *scales_out).arg(&params).arg(&r_v);
+            unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch rms_segmod_quant: {e:?}")))?;
+        }};
+    }
+    match (dtype, mxfp8) {
+        (DType::F16, false) => go!(half::f16, &kernels.seg_f16),
+        (DType::BF16, false) => go!(half::bf16, &kernels.seg_bf16),
+        (DType::F16, true) => go!(half::f16, &kernels.mx_seg_f16),
+        (DType::BF16, true) => go!(half::bf16, &kernels.mx_seg_bf16),
+        _ => return Err(SynaptixError::Unsupported("rms_segmod_quant: dtype")),
     }
     Ok(())
 }

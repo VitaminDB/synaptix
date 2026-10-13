@@ -36,6 +36,14 @@ fn quant_matmul_target(x: &Tensor, w: &QuantWeight, target: f32) -> Result<Tenso
     if in_dt == DType::F16 {
         return x.linear_quant(w);
     }
+    // MXFP8 с BF16-активацией: квант и GEMM нативные, выход BF16. Пред-
+    // масштаб не нужен — E8M0-шкалы блоков (2^±127) не насыщаются, в отличие
+    // от e4m3-шкал NVFP4, а BF16-выход не переполняется.
+    if in_dt == DType::BF16 && w.dtype() == DType::MXFP8 {
+        if let Ok(y) = x.linear_quant(w) {
+            return Ok(y);
+        }
+    }
     let native = in_dt == DType::BF16 && w.dtype() == DType::NVFP4 && !nvfp4_weight_only();
     if !prescale_enabled() {
         if native {

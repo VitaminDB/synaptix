@@ -259,7 +259,8 @@ __device__ __forceinline__ void rms_mod_quant_impl(
     T*       __restrict__ y,
     unsigned char* __restrict__ packed,
     unsigned char* __restrict__ scales_e4m3,
-    RmsModQuantParams p)
+    RmsModQuantParams p,
+    const int* __restrict__ ridx = nullptr)
 {
     int row = blockIdx.x;
     int tid = threadIdx.x;
@@ -269,10 +270,13 @@ __device__ __forceinline__ void rms_mod_quant_impl(
     __shared__ float warp_sums[32];
     extern __shared__ __half s_y16[]; // D половинок (после warp_sums — отдельный extern)
 
+    // ridx (сегментная модуляция): строка таблицы scale/shift для токена —
+    // вместо развёрнутых по-токенных [m, D]. y == nullptr — y не пишется.
+    long long mrow = ridx ? (long long)ridx[row] : (long long)row;
     const T* x_row = x + (long long)row * p.hidden;
-    const T* s_row = scale + (long long)row * p.hidden;
-    const T* b_row = shift + (long long)row * p.hidden;
-    T*       y_row = y + (long long)row * p.hidden;
+    const T* s_row = scale + mrow * p.hidden;
+    const T* b_row = shift + mrow * p.hidden;
+    T*       y_row = y ? y + (long long)row * p.hidden : nullptr;
 
     float sumsq = rmq_row_sumsq(x_row, p.hidden, tid, block_size, warp_sums);
     __shared__ float s_rms;
@@ -289,7 +293,7 @@ __device__ __forceinline__ void rms_mod_quant_impl(
         float m1 = rnd_t(x_row, ld_f32(s_row + t) + 1.0f); // add_scalar(1.0) = affine(1,1)
         float y1 = rnd_t(x_row, n0 * m1);                  // broadcast_mul
         float y2 = rnd_t(x_row, y1 + ld_f32(b_row + t));   // broadcast_add
-        st_t(y_row + t, y2);
+        if (y_row) st_t(y_row + t, y2);
         s_y16[t] = __float2half(y2); // f16 от УЖЕ округлённого y (bf16→f16 точен)
     }
     __syncthreads();
@@ -491,3 +495,26 @@ extern "C" __global__ void rms_mod_quant_mxfp8_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
     __nv_bfloat16* y, unsigned char* packed, unsigned char* scales, RmsModQuantParams p)
 { rms_mod_quant_impl<__nv_bfloat16, 1>(x, scale, shift, y, packed, scales, p); }
+
+// ── Сегментная модуляция (MiniMax-H3): scale/shift — таблица строк [R, D],
+// ridx[m] — строка таблицы для токена; y не пишется (нужен только квант).
+// Арифметика = rms_mod_quant_* бит-в-бит (та же строка значений). ──
+extern "C" __global__ void rms_segmod_quant_nvfp4_f16(
+    const __half* x, const __half* scale, const __half* shift,
+    unsigned char* packed, unsigned char* scales, RmsModQuantParams p, const int* ridx)
+{ rms_mod_quant_impl<__half, 0>(x, scale, shift, nullptr, packed, scales, p, ridx); }
+
+extern "C" __global__ void rms_segmod_quant_nvfp4_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    unsigned char* packed, unsigned char* scales, RmsModQuantParams p, const int* ridx)
+{ rms_mod_quant_impl<__nv_bfloat16, 0>(x, scale, shift, nullptr, packed, scales, p, ridx); }
+
+extern "C" __global__ void rms_segmod_quant_mxfp8_f16(
+    const __half* x, const __half* scale, const __half* shift,
+    unsigned char* packed, unsigned char* scales, RmsModQuantParams p, const int* ridx)
+{ rms_mod_quant_impl<__half, 1>(x, scale, shift, nullptr, packed, scales, p, ridx); }
+
+extern "C" __global__ void rms_segmod_quant_mxfp8_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    unsigned char* packed, unsigned char* scales, RmsModQuantParams p, const int* ridx)
+{ rms_mod_quant_impl<__nv_bfloat16, 1>(x, scale, shift, nullptr, packed, scales, p, ridx); }

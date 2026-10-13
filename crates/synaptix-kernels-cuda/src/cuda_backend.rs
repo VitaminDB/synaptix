@@ -664,13 +664,9 @@ impl Backend for CudaBackend {
             DType::MXFP8 => {
                 use half::f16;
                 // BF16-активация: декод (M=1) квантует и пишет выход прямо в
-                // BF16-модулях; prefill (M>1) идёт tiled-GEMM'ом с F16-входом —
-                // там `Unsupported`, и QLinear::forward берёт путь с cast'ом.
-                if bf16 && m != 1 {
-                    return Err(SynaptixError::Unsupported(
-                        "linear_quant MXFP8: активация BF16 поддержана только при M=1",
-                    ));
-                }
+                // BF16-модулях; prefill (M>1) — tiled-GEMM с BF16-квантом и
+                // BF16-выходом. Формы вне tiled-ядра для BF16 — `Unsupported`
+                // (QLinear::forward берёт путь с cast'ом).
                 let nn = w.n();
                 if k % 32 != 0 {
                     return Err(SynaptixError::Cuda(format!(
@@ -747,7 +743,13 @@ impl Backend for CudaBackend {
                         out_buf.slice_mut(),
                         w,
                         m,
+                        bf16,
                     )?;
+                    if !handled && bf16 {
+                        return Err(SynaptixError::Unsupported(
+                            "linear_quant MXFP8: BF16-активация вне tiled-формы",
+                        ));
+                    }
                     if !handled {
                         // Голова N (кратная 128) — тем же tiled-ядром, хвост —
                         // деквант полосами. Прежний путь дековантовал W целиком
@@ -1387,6 +1389,149 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn rms_segmod_quant(
+        &self,
+        x: (&Storage, &Layout),
+        scale: (&Storage, &Layout),
+        shift: (&Storage, &Layout),
+        ridx: (&Storage, &Layout),
+        packed_out: &mut Storage,
+        scales_out: &mut Storage,
+        m: usize,
+        k: usize,
+        table_rows: usize,
+        eps: f32,
+        mxfp8: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        let fmt = if mxfp8 { DType::MXFP8 } else { DType::NVFP4 };
+        require_quant_native(x.0, fmt, "rms_segmod_quant: карта без block-scale MMA")?;
+        for lo in [x.1, scale.1, shift.1, ridx.1] {
+            if !lo.is_contiguous() {
+                return Err(SynaptixError::NonContiguous);
+            }
+        }
+        fn buf(st: &Storage) -> Result<&synaptix_core::tensor::storage::CudaBuf> {
+            st.as_cuda().ok_or(SynaptixError::Unsupported("rms_segmod_quant: non-cuda"))
+        }
+        let x_buf = buf(x.0)?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kernels = crate::fused::rms_mod_quant::RmsModQuantKernels::for_context(&ctx)?;
+        let (s_buf, b_buf, r_buf) = (buf(scale.0)?, buf(shift.0)?, buf(ridx.0)?);
+        let p_buf = packed_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("rms_segmod_quant: packed non-cuda"))?;
+        let p_sl = p_buf.slice_mut();
+        let sc_buf = scales_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("rms_segmod_quant: scales non-cuda"))?;
+        crate::fused::rms_mod_quant::run_rms_segmod_quant_u8(
+            &kernels,
+            &stream,
+            (x_buf.slice(), x.1.byte_offset()),
+            (s_buf.slice(), scale.1.byte_offset()),
+            (b_buf.slice(), shift.1.byte_offset()),
+            table_rows,
+            (r_buf.slice(), ridx.1.byte_offset()),
+            p_sl,
+            sc_buf.slice_mut(),
+            m as u32,
+            k as u32,
+            eps,
+            x.1.dtype(),
+            mxfp8,
+        )
+    }
+
+    fn gate_residual_seg(
+        &self,
+        x: (&Storage, &Layout),
+        y: (&Storage, &Layout),
+        g: (&Storage, &Layout),
+        ridx: (&Storage, &Layout),
+        out: &mut Storage,
+        m: usize,
+        d: usize,
+        table_rows: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [x.1, y.1, g.1, ridx.1] {
+            if !lo.is_contiguous() {
+                return Err(SynaptixError::NonContiguous);
+            }
+        }
+        fn buf(st: &Storage) -> Result<&synaptix_core::tensor::storage::CudaBuf> {
+            st.as_cuda().ok_or(SynaptixError::Unsupported("gate_residual_seg: non-cuda"))
+        }
+        let x_buf = buf(x.0)?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::fused::seg_mod::SegModKernels::for_context(&ctx)?;
+        let (y_buf, g_buf, r_buf) = (buf(y.0)?, buf(g.0)?, buf(ridx.0)?);
+        let o_buf = out.as_cuda_mut().ok_or(SynaptixError::Unsupported("gate_residual_seg: out non-cuda"))?;
+        crate::fused::seg_mod::gate_residual_seg(
+            &k,
+            &stream,
+            (x_buf.slice(), x.1.byte_offset()),
+            (y_buf.slice(), y.1.byte_offset()),
+            (g_buf.slice(), g.1.byte_offset(), table_rows),
+            (r_buf.slice(), ridx.1.byte_offset()),
+            o_buf.slice_mut(),
+            m,
+            d,
+            x.1.dtype(),
+        )
+    }
+
+    fn qk_norm_rope(
+        &self,
+        x: (&Storage, &Layout),
+        w: (&Storage, &Layout),
+        cos: (&Storage, &Layout),
+        sin: (&Storage, &Layout),
+        table_rows: usize,
+        out: &mut Storage,
+        rows: usize,
+        heads: usize,
+        d: usize,
+        rot_dim: usize,
+        pos_off: usize,
+        eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        for lo in [x.1, w.1, cos.1, sin.1] {
+            if !lo.is_contiguous() {
+                return Err(SynaptixError::NonContiguous);
+            }
+        }
+        fn buf(st: &Storage) -> Result<&synaptix_core::tensor::storage::CudaBuf> {
+            st.as_cuda().ok_or(SynaptixError::Unsupported("qk_norm_rope: non-cuda"))
+        }
+        let x_buf = buf(x.0)?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::fused::seg_mod::SegModKernels::for_context(&ctx)?;
+        let (w_buf, c_buf, s_buf) = (buf(w.0)?, buf(cos.0)?, buf(sin.0)?);
+        let o_buf = out.as_cuda_mut().ok_or(SynaptixError::Unsupported("qk_norm_rope: out non-cuda"))?;
+        crate::fused::seg_mod::qk_norm_rope(
+            &k,
+            &stream,
+            (x_buf.slice(), x.1.byte_offset()),
+            (w_buf.slice(), w.1.byte_offset()),
+            (c_buf.slice(), cos.1.byte_offset()),
+            (s_buf.slice(), sin.1.byte_offset()),
+            table_rows,
+            o_buf.slice_mut(),
+            rows,
+            heads,
+            d,
+            rot_dim,
+            pos_off,
+            eps,
+            x.1.dtype(),
+        )
+    }
+
     fn rms_mod_quant_mxfp8(
         &self,
         x: (&Storage, &Layout),
@@ -1629,9 +1774,6 @@ impl Backend for CudaBackend {
                     k as u32,
                 )
             }
-            DType::MXFP8 if out_bf16 => {
-                Err(SynaptixError::Unsupported("linear_quant_prequant MXFP8: BF16-выход не поддержан"))
-            }
             DType::MXFP8 => crate::gemm::dispatch::mxfp8_linear_prequant(
                 &ctx,
                 &stream,
@@ -1640,6 +1782,7 @@ impl Backend for CudaBackend {
                 out_buf.slice_mut(),
                 w,
                 m as u32,
+                out_bf16,
             ),
             _ => Err(SynaptixError::Unsupported("linear_quant_prequant: вес не NVFP4/MXFP8")),
         }

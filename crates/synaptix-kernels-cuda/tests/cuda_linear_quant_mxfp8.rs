@@ -257,3 +257,48 @@ fn linear_quant_mxfp8_model_shape_k2048() {
     let Some((ctx, stream)) = setup() else { return };
     run_mxfp8(&ctx, &stream, 2048, 2048, 256);
 }
+
+/// BF16-активация на prefill: tiled-ядро с BF16-квантом и BF16-выходом
+/// (rot-путь при K%512 == 0, cp.async при K%128 == 0) и prequant-GEMM —
+/// совпадают с F16-путём до округления выхода (квант активации одинаков:
+/// bf16-значения умеренного диапазона точны в f16).
+fn run_mxfp8_bf16(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, n: usize, k: usize, m: usize) {
+    let q = Mxfp8QuantKernels::for_context(ctx).expect("compile mxfp8_quant");
+    let w_host = det_f16(0xA110_C8E2, n * k, 0.5);
+    let dev_w: CudaSlice<f16> = stream.clone_htod(&w_host).unwrap();
+    let mut w_fp8: CudaSlice<u8> = stream.alloc_zeros(n * k).unwrap();
+    let mut w_scales: CudaSlice<u8> = stream.alloc_zeros(n * (k / 32)).unwrap();
+    mxfp8_quant_natural(&q, stream, &dev_w.as_view(), &mut w_fp8, &mut w_scales, n as u32, k as u32).unwrap();
+    stream.synchronize().unwrap();
+    let qw = QuantWeight::new(
+        Arc::new(Storage::Cuda(CudaBuf::new(ctx.clone(), stream.clone(), w_fp8, 0))),
+        Arc::new(Storage::Cuda(CudaBuf::new(ctx.clone(), stream.clone(), w_scales, 0))),
+        DType::MXFP8,
+        n,
+        k,
+    )
+    .unwrap();
+    let x = Tensor::from_vec(det_f16(0xC0DE_BA5F, m * k, 0.5), (m, k), Device::Cuda(0)).unwrap().to_dtype(DType::BF16).unwrap();
+    let y16 = x.to_dtype(DType::F16).unwrap().linear_quant(&qw).unwrap().to_dtype(DType::BF16).unwrap();
+    let yb = x.linear_quant(&qw).expect("linear_quant MXFP8 bf16");
+    assert_eq!(yb.dtype(), DType::BF16);
+    let a: Vec<f32> = yb.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<f32> = y16.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs() / y.abs().max(1e-3)).fold(0f32, f32::max);
+    eprintln!("[mxfp8 bf16 N={n} K={k} M={m}] max rel Δ vs f16-путь = {worst:e}");
+    assert!(worst <= 1.0 / 128.0, "bf16-выход расходится с f16-путём: {worst}");
+
+    // prequant: квант активации отдельно (из BF16), GEMM с BF16-выходом.
+    let (packed, scales) = x.mxfp8_quantize_act().expect("mxfp8_quantize_act bf16");
+    let yp = packed.linear_quant_prequant(&scales, &qw, m, DType::BF16).expect("prequant bf16");
+    let c: Vec<f32> = yp.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    assert_eq!(a, c, "prequant bf16 ≠ linear_quant bf16 (N={n} K={k} M={m})");
+}
+
+#[test]
+fn mxfp8_bf16_prefill_matches_f16() {
+    let Some((ctx, stream)) = setup() else { return };
+    run_mxfp8_bf16(&ctx, &stream, 512, 1024, 300); // rot
+    run_mxfp8_bf16(&ctx, &stream, 384, 5376, 257); // cp.async (K%512 ≠ 0), хвост M
+    run_mxfp8_bf16(&ctx, &stream, 256, 640, 128);
+}

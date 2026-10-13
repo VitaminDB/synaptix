@@ -66,10 +66,24 @@ pub struct GemmMxFp8Kernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<GemmMxFp8Kernels>)>>> = OnceLock::new();
+static CACHE_BF16: OnceLock<Mutex<Vec<(usize, Arc<GemmMxFp8Kernels>)>>> = OnceLock::new();
 
 impl GemmMxFp8Kernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, CACHE.get_or_init(|| Mutex::new(Vec::new())), &[], "gemm_mxfp8.cu")
+    }
+
+    /// Тот же набор ядер с выходом BF16.
+    pub fn for_context_bf16(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
+        Self::build(ctx, CACHE_BF16.get_or_init(|| Mutex::new(Vec::new())), &["-DSYN_OUT_BF16"], "gemm_mxfp8_bf16.cu")
+    }
+
+    fn build(
+        ctx: &Arc<CudaContext>,
+        cache: &Mutex<Vec<(usize, Arc<GemmMxFp8Kernels>)>>,
+        opts: &[&str],
+        name: &'static str,
+    ) -> Result<Arc<Self>> {
         let key = Arc::as_ptr(ctx) as usize;
         {
             let g = cache.lock();
@@ -80,7 +94,7 @@ impl GemmMxFp8Kernels {
             }
         }
         let src = include_str!("gemm_mxfp8.cu");
-        let module = compile_module_req(ctx, src, "gemm_mxfp8.cu", &[], crate::caps::Feature::Mxfp8Mma)?;
+        let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Mxfp8Mma)?;
         let f = load_fn(&module, "gn_mxfp8_128x128")?;
         f.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -140,14 +154,14 @@ impl GemmMxFp8Kernels {
 /// M%128==N%128==0, K%512==0, K/128>=2. Bit-exact к gn_mxfp8_128x128.
 /// drot: выделенный producer-warpgroup (384 потока) вместо fused-tid0.
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_mxfp8_rot(
+pub fn gemm_mxfp8_rot<T: cudarc::driver::DeviceRepr>(
     kernels: &GemmMxFp8Kernels,
     stream: &Arc<CudaStream>,
     a: &CudaSlice<u8>,
     b: &CudaSlice<u8>,
     sa: &CudaSlice<u8>,
     sb: &CudaSlice<u8>,
-    y: &mut cudarc::driver::CudaViewMut<'_, f16>,
+    y: &mut cudarc::driver::CudaViewMut<'_, T>,
     m: u32,
     n: u32,
     k: u32,
@@ -270,14 +284,14 @@ fn pick_rot_cfg(m: u32, n: u32, k: u32) -> RotCfg {
 /// split-K вариант drot 128×128: грид (tiles, splits), f32-ws + reduce f16.
 /// kt_chunk кратен 4 (SF-окно TMA по 4 стадии). Детерминизм: фикс-порядок в reduce.
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_mxfp8_rot_splitk(
+pub fn gemm_mxfp8_rot_splitk<T: cudarc::driver::DeviceRepr>(
     kernels: &GemmMxFp8Kernels,
     stream: &Arc<CudaStream>,
     a: &CudaSlice<u8>,
     b: &CudaSlice<u8>,
     sa: &CudaSlice<u8>,
     sb: &CudaSlice<u8>,
-    y: &mut cudarc::driver::CudaViewMut<'_, f16>,
+    y: &mut cudarc::driver::CudaViewMut<'_, T>,
     m: u32,
     n: u32,
     k: u32,
@@ -348,14 +362,14 @@ pub fn gemm_mxfp8_rot_splitk(
 /// GEMM на ПРЕДКВАНТОВАННЫХ операндах: a/b = e4m3 [M,K]/[N,K] (natural row-major),
 /// sa/sb = натуральные E8M0 [rows,K/32], y = f16 [M,N]. M%128==N%128==K%128==0.
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_mxfp8(
+pub fn gemm_mxfp8<T: cudarc::driver::DeviceRepr>(
     kernels: &GemmMxFp8Kernels,
     stream: &Arc<CudaStream>,
     a: &CudaSlice<u8>,
     b: &CudaSlice<u8>,
     sa: &CudaSlice<u8>,
     sb: &CudaSlice<u8>,
-    y: &mut cudarc::driver::CudaViewMut<'_, f16>,
+    y: &mut cudarc::driver::CudaViewMut<'_, T>,
     m: u32,
     n: u32,
     k: u32,
@@ -382,12 +396,12 @@ pub fn gemm_mxfp8(
 
 /// Высокоуровневый MXFP8 linear: Y[M,N] f16 = X[M,K] f16 @ W[N,K]ᵀ. Натуральный device-quant
 /// обоих операндов + корректное ядро (cp.async). M%128==N%128==K%128==0.
-pub fn gemm_mxfp8_linear(
+pub fn gemm_mxfp8_linear<T: cudarc::driver::DeviceRepr>(
     qk: &crate::elementwise::quant::Mxfp8QuantKernels,
     stream: &Arc<CudaStream>,
     x: &CudaSlice<f16>,
     w: &CudaSlice<f16>,
-    y: &mut cudarc::driver::CudaViewMut<'_, f16>,
+    y: &mut cudarc::driver::CudaViewMut<'_, T>,
     m: u32,
     n: u32,
     k: u32,

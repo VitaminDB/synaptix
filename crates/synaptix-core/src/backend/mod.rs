@@ -433,6 +433,70 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("rms_mod_quant_nvfp4 не поддержан этим backend"))
     }
 
+    /// Сегментная модуляция + квант (MiniMax-H3): `scale/shift` — таблица
+    /// строк `[table_rows, k]`, `ridx` — i32 `[m]` (строка таблицы токена);
+    /// норма-выход не пишется. NVFP4 (`mxfp8 = false`): `packed` `[m·k/2]`,
+    /// tiled-scales; MXFP8: `packed` `[m·k]`, natural-scales `[m·k/32]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_segmod_quant(
+        &self,
+        _x: (&Storage, &Layout),
+        _scale: (&Storage, &Layout),
+        _shift: (&Storage, &Layout),
+        _ridx: (&Storage, &Layout),
+        _packed_out: &mut Storage,
+        _scales_out: &mut Storage,
+        _m: usize,
+        _k: usize,
+        _table_rows: usize,
+        _eps: f32,
+        _mxfp8: bool,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("rms_segmod_quant не поддержан этим backend"))
+    }
+
+    /// `out[m, d] = x + round(y · g[ridx[row]])` (gated residual с сегментной
+    /// модуляцией) одним запуском.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_residual_seg(
+        &self,
+        _x: (&Storage, &Layout),
+        _y: (&Storage, &Layout),
+        _g: (&Storage, &Layout),
+        _ridx: (&Storage, &Layout),
+        _out: &mut Storage,
+        _m: usize,
+        _d: usize,
+        _table_rows: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("gate_residual_seg не поддержан этим backend"))
+    }
+
+    /// qk-норма головы (вес F32) + RoPE split-partial (таблицы F32
+    /// `[table_rows, rot_dim/2]`, позиция `pos_off + row/heads`), вход и выход
+    /// F16|BF16 `[rows, d]`.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope(
+        &self,
+        _x: (&Storage, &Layout),
+        _w: (&Storage, &Layout),
+        _cos: (&Storage, &Layout),
+        _sin: (&Storage, &Layout),
+        _table_rows: usize,
+        _out: &mut Storage,
+        _rows: usize,
+        _heads: usize,
+        _d: usize,
+        _rot_dim: usize,
+        _pos_off: usize,
+        _eps: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("qk_norm_rope не поддержан этим backend"))
+    }
+
     /// MXFP8-вариант [`Self::rms_mod_quant_nvfp4`]: тот же контракт нормы
     /// (kind 0..3), эпилог = mxfp8-квант (бит-в-бит с mxfp8-квантом активации).
     /// `packed_out` u8 `[m·k]`, `scales_out` natural u8 `[m·k/32]`.
