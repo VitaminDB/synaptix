@@ -492,7 +492,7 @@ pub fn keyframe_positions(hp: usize, wp: usize, frame_idx: usize, fps: f64) -> V
 
 /// Объединить два набора pixel-координат `[3,Ta,2]`+`[3,Tb,2]` (d-major flat) в
 /// `[3,Ta+Tb,2]` (токены b идут после a). Для append-conditioning (keyframe).
-fn cat_positions(a: &[f64], ta: usize, b: &[f64], tb: usize) -> Vec<f64> {
+pub fn cat_positions(a: &[f64], ta: usize, b: &[f64], tb: usize) -> Vec<f64> {
     let t = ta + tb;
     let mut p = vec![0f64; 3 * t * 2];
     for d in 0..3 {

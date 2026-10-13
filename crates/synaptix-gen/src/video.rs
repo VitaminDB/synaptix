@@ -320,12 +320,17 @@ fn ffmpeg_f32(path: &Path, rate: u32, channels: u32) -> R<Vec<f32>> {
 
 /// Видео → `[1,3,F,H,W]` в [−1,1] (ffmpeg, кадры по fps).
 fn load_video_frames(path: &Path, ph: usize, pw: usize, n: usize, fps: f64, dev: Device) -> R<Tensor> {
+    load_video_frames_vf(path, ph, pw, n, fps, dev, "")
+}
+
+/// То же с дополнительным фильтром ffmpeg после масштаба (`edgedetect` — контуры).
+fn load_video_frames_vf(path: &Path, ph: usize, pw: usize, n: usize, fps: f64, dev: Device, extra: &str) -> R<Tensor> {
     let dir = scratch("vin")?;
     let result = (|| -> R<Tensor> {
         let ok = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-i"])
             .arg(path)
-            .args(["-vf", &format!("fps={fps},scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph}")])
+            .args(["-vf", &format!("fps={fps},scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph}{extra}")])
             .args(["-frames:v", &n.to_string()])
             .arg(dir.join("f%05d.png"))
             .status()
@@ -358,17 +363,13 @@ fn load_video_frames(path: &Path, ph: usize, pw: usize, n: usize, fps: f64, dev:
     result
 }
 
-/// Canny по кадрам `[1,3,F,H,W]` → контуры той же формы (control-сигнал union).
-fn canny_frames(frames: &Tensor) -> R<Tensor> {
-    let (f, h, w) = (frames.dims()[2], frames.dims()[3], frames.dims()[4]);
-    let mut out = Vec::with_capacity(f);
-    for fi in 0..f {
-        let fr = frames.narrow(2, fi, 1).map_err(err)?.contiguous().map_err(err)?.reshape(vec![3, h, w]).map_err(err)?.affine(0.5, 0.5).map_err(err)?;
-        let edges = synaptix_io::image::canny_rgb(&fr, 100.0, 200.0).map_err(err)?;
-        out.push(edges.affine(2.0, -1.0).map_err(err)?.reshape(vec![1, 3, 1, h, w]).map_err(err)?);
+/// Во сколько раз уменьшен образец IC-LoRA при обучении (`…-ref0.5` → 2).
+fn ic_downscale(lora: Option<&Path>) -> usize {
+    let name = lora.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match name.split("ref").nth(1).and_then(|r| r.trim_end_matches(".syn").trim_end_matches(".safetensors").parse::<f64>().ok()) {
+        Some(f) if f > 0.0 && f < 1.0 => (1.0 / f).round().max(1.0) as usize,
+        _ => 1,
     }
-    let refs: Vec<&Tensor> = out.iter().collect();
-    Tensor::cat(&refs, 2).map_err(err)?.contiguous().map_err(err)
 }
 
 /// Длительность медиафайла, с (ffprobe).
@@ -559,8 +560,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                                 // Первый тоже ключевым: два кадра одним блоком.
                                 let ft = first_toks.clone();
                                 let both = Tensor::cat(&[&ft, &toks], 1).map_err(err)?.contiguous().map_err(err)?;
-                                let mut pos_all = lp::keyframe_positions(g.0, g.1, 0, fps);
-                                pos_all.extend(pos);
+                                let t = g.0 * g.1;
+                                let pos_all = lp::cat_positions(&lp::keyframe_positions(g.0, g.1, 0, fps), t, &pos, t);
                                 let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&both, &pos_all, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
                                 (l, a, None)
                             } else {
@@ -591,7 +592,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let audio_lat = if far >= fa {
                         enc.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err)?
                     } else {
-                        let last = enc.narrow(1, far - 1, 1).map_err(err)?;
+                        let last = enc.narrow(1, far - 1, 1).map_err(err)?.contiguous().map_err(err)?;
                         let mut parts = vec![enc];
                         parts.extend((far..fa).map(|_| last.clone()));
                         let refs: Vec<&Tensor> = parts.iter().collect();
@@ -601,13 +602,14 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     (l, audio_lat, Some(ffmpeg_f32(audio, 48000, 2)?))
                 }
                 LtxMode::Ic { video, canny } => {
-                    let mut frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
-                    if *canny {
-                        frames = canny_frames(&frames)?;
-                    }
+                    // Образец — в масштабе, на котором обучена IC-LoRA («ref0.5» — вдвое меньше);
+                    // контуры считает ffmpeg (edgedetect) при чтении кадров.
+                    let ds = ic_downscale(adapter.as_deref());
+                    let edges = if *canny { ",edgedetect=low=0.1:high=0.3,format=rgb24" } else { "" };
+                    let frames = load_video_frames_vf(video, g.0 * 32 / ds, g.1 * 32 / ds, out_frames, fps, device, edges)?;
                     let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
                     let (tok, f_, h_, w_) = latent_tokens(&lat)?;
-                    let pos = lp::ref_video_positions(f_, h_, w_, fps, 1);
+                    let pos = lp::ref_video_positions(f_, h_, w_, fps, ds);
                     let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
                     (l, a, None)
                 }
