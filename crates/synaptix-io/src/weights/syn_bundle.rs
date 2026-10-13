@@ -123,6 +123,21 @@ impl SynBundleLoader {
         })
     }
 
+    /// Загрузчик поверх уже открытого бандла (компонент `component`), если
+    /// в бандле есть манифест квантования; иначе `None`.
+    pub(crate) fn from_bundle_arc(bundle: Arc<Bundle>, component: Option<&str>) -> Option<Self> {
+        bundle.read_file(synaptix_bundle::quant_layout::MANIFEST_NAME).ok()?;
+        Some(Self {
+            bundle: Some(bundle),
+            gguf: None,
+            component: component.map(String::from),
+            default_device: Device::Cpu,
+            index: OnceLock::new(),
+            quant: OnceLock::new(),
+            overlay: None,
+        })
+    }
+
     /// Перекодировать квант-веса по `spec` (см. [`super::transcode`]) и
     /// положить результат оверлеем поверх источника.
     pub fn transcode(

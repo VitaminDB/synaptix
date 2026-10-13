@@ -63,10 +63,13 @@ pub struct TranscodeSpec {
     pub include: Vec<String>,
     /// Башни зрения (`visual.*`, `vision_tower.*`): их матрицы.
     pub vision: Option<DType>,
-    /// Правила по подстроке имени — первое совпадение сильнее роли
-    /// (`.layers.0.` → MXFP8 у крайних слоёв, `shared_expert` и т. п.).
-    /// `None` — оставить тензор как есть.
+    /// Правила по подстроке имени (`^…` — с начала), первое совпадение:
+    /// формат заменяет ролевой у тензоров, которые квантуются и по роли
+    /// (`.layers.0.` → MXFP8 у крайних слоёв); `None` — оставить как есть.
     pub rules: Vec<(String, Option<DType>)>,
+    /// Квантовать только эти компоненты бандла (`transformer`, `main`…);
+    /// пусто — все. Остальные компоненты копируются как есть (VAE и т. п.).
+    pub components: Vec<String>,
 }
 
 impl TranscodeSpec {
@@ -83,7 +86,13 @@ impl TranscodeSpec {
             include: Vec::new(),
             vision: None,
             rules: Vec::new(),
+            components: Vec::new(),
         }
+    }
+
+    /// Ничего не трогать: компонент копируется как есть.
+    pub fn keep() -> Self {
+        Self { attn: None, mlp: None, experts: None, lm_head: None, embed: None, requant: false, quantize_dense: false, ..Self::uniform(DType::MXFP8) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,19 +104,29 @@ impl TranscodeSpec {
         if !self.include.is_empty() && !self.include.iter().any(|p| name.starts_with(p.as_str())) {
             return None;
         }
-        if let Some((_, d)) = self.rules.iter().find(|(p, _)| name.contains(p.as_str())) {
-            return *d;
-        }
-        if slices > 1 || name.contains(".experts.") {
-            return self.experts;
-        }
-        match classify_in(name, None) {
-            LayerRole::Attention => self.attn,
-            LayerRole::Mlp => self.mlp,
-            LayerRole::LmHead => self.lm_head,
-            LayerRole::Embedding => self.embed,
-            LayerRole::Vision => self.vision,
-            _ => None,
+        // `^префикс` — с начала имени, иначе подстрока.
+        let hit = |p: &str| match p.strip_prefix('^') {
+            Some(pre) => name.starts_with(pre),
+            None => name.contains(p),
+        };
+        let by_role = if slices > 1 || name.contains(".experts.") {
+            self.experts
+        } else {
+            match classify_in(name, None) {
+                LayerRole::Attention => self.attn,
+                LayerRole::Mlp => self.mlp,
+                LayerRole::LmHead => self.lm_head,
+                LayerRole::Embedding => self.embed,
+                LayerRole::Vision => self.vision,
+                _ => None,
+            }
+        };
+        // Правило с форматом меняет формат только тому, что квантуется и по
+        // роли (крайний блок не тянет за собой модуляцию); `none` исключает всегда.
+        match self.rules.iter().find(|(p, _)| hit(p)) {
+            Some((_, None)) => None,
+            Some((_, Some(d))) => by_role.map(|_| *d),
+            None => by_role,
         }
     }
 
@@ -129,6 +148,9 @@ impl TranscodeSpec {
         }
         for (p, d) in &self.rules {
             k += &format!(",[{p}]={}", f(*d));
+        }
+        if !self.components.is_empty() {
+            k += &format!(",components={}", self.components.join("+"));
         }
         k
     }
@@ -817,6 +839,34 @@ impl TensorStream for FullStream {
     }
 }
 
+/// План перекодировки без записи: `(компонент, имя, текущий формат, цель)`
+/// по каждому тензору, который будет перекодирован.
+pub fn plan(src: &Path, spec: &TranscodeSpec) -> Result<Vec<(String, String, String, DType)>> {
+    let base = SynBundleLoader::open(src)?;
+    let comps: Vec<String> = match base.bundle_handle() {
+        Some(b) => {
+            let c: Vec<String> = b.cdir().entries.iter().filter(|e| e.is_alive() && matches!(e.kind_typed(), synaptix_bundle::ChunkType::Tensors)).filter_map(|e| e.name.strip_prefix("tensors:").map(String::from)).collect();
+            if c.is_empty() { vec!["main".into()] } else { c }
+        }
+        None => vec!["main".into()],
+    };
+    let mut out = Vec::new();
+    for c in comps {
+        if !spec.components.is_empty() && !spec.components.contains(&c) {
+            continue;
+        }
+        let l = if base.bundle_handle().is_some() { SynBundleLoader::open_plain(src)?.with_component(c.clone()) } else { SynBundleLoader::open_plain(src)? };
+        for it in plan_items(&l, spec) {
+            let cur = match it.current {
+                Some(k) => synaptix_core::precision::dtype_name(k.dtype()),
+                None => l.dense_shape(&it.name).map(|(_, d)| synaptix_core::precision::dtype_name(d)).unwrap_or_default(),
+            };
+            out.push((c.clone(), it.name.clone(), cur, it.target));
+        }
+    }
+    Ok(out)
+}
+
 /// Полный самостоятельный бандл: веса источника (`.syn` или `.gguf`) с
 /// перекодированными по `spec` матрицами, остальные тензоры и файлы — как
 /// есть. Компоненты `.syn` (`tensors:<имя>`) переносятся все.
@@ -847,9 +897,11 @@ pub fn write_bundle(src: &Path, out: &Path, spec: &TranscodeSpec, device: Device
     let mut before = 0u64;
     let mut after = 0u64;
     let mut streams: Vec<(String, FullStream)> = Vec::new();
+    let keep = TranscodeSpec::keep();
     for (c, prefix) in &components {
         let l = if base.bundle_handle().is_some() { SynBundleLoader::open_plain(src)?.with_component(c.clone()) } else { SynBundleLoader::open_plain(src)? };
-        let s = FullStream::new(l, spec, device, &mut manifest, progress.clone())?;
+        let cspec = if spec.components.is_empty() || spec.components.contains(c) { spec } else { &keep };
+        let s = FullStream::new(l, cspec, device, &mut manifest, progress.clone())?;
         let (b, a) = bytes_of_items(&s.items);
         tensors += s.items.len();
         before += b;

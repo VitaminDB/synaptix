@@ -261,6 +261,16 @@ impl H3Checkpoint {
         self.loader.raw_bytes(name)
     }
 
+    /// Формат готового кванта веса в квантованном бандле; `None` — плотный.
+    pub fn quant_dtype(&self, name: &str) -> Option<DType> {
+        self.loader.quant_dtype(name)
+    }
+
+    /// Готовый квант-вес на устройство чекпойнта.
+    pub fn load_quant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, SynaptixError>> {
+        self.loader.load_quant(name, self.device).map(|r| r.map_err(|e| SynaptixError::Other(format!("load '{name}': {e}"))))
+    }
+
     pub fn source(&self) -> &H3Source {
         &self.source
     }

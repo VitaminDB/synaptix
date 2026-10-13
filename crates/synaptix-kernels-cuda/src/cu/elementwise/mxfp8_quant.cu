@@ -141,3 +141,17 @@ extern "C" __global__ void mxfp8_dequant_f16(const __nv_fp8_e4m3 *__restrict__ p
   float sv = __uint_as_float(((unsigned)scales[(long)row * (K / 32) + (kcol / 32)]) << 23);
   out[idx] = __float2half(float(packed[idx]) * sv);
 }
+
+// То же в bf16: значения e4m3·2^s в bf16 представимы точно (без потерь
+// f16 на малых и больших весах).
+extern "C" __global__ void mxfp8_dequant_bf16(const __nv_fp8_e4m3 *__restrict__ packed,
+                                              const unsigned char *__restrict__ scales,
+                                              __nv_bfloat16 *__restrict__ out, int rows, int K) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)rows * K)
+    return;
+  const int row = (int)(idx / K);
+  const int kcol = (int)(idx % K);
+  float sv = __uint_as_float(((unsigned)scales[(long)row * (K / 32) + (kcol / 32)]) << 23);
+  out[idx] = __float2bfloat16(float(packed[idx]) * sv);
+}

@@ -26,7 +26,8 @@ fn prefetch_block(ckpt: &H3Checkpoint, idx: usize) {
     let ranges: Vec<&[u8]> = names
         .iter()
         .filter(|n| n.starts_with(&p) && !n.contains("adaln_proj"))
-        .filter_map(|n| ckpt.raw_bytes(n).map(|r| r.0))
+        .flat_map(|n| [n.to_string(), format!("{n}.qpacked"), format!("{n}.qscales")])
+        .filter_map(|n| ckpt.raw_bytes(&n).map(|r| r.0))
         .collect();
     crate::prefetch::populate(&ranges);
 }
@@ -39,15 +40,25 @@ impl Lin {
         qdt: DType,
         compute: DType,
     ) -> Result<Self, H3Error> {
-        let mut w = ckpt.get_raw(&format!("{key}.weight"))?;
+        let name = format!("{key}.weight");
+        let b = if bias { Some(ckpt.get_raw(&format!("{key}.bias"))?) } else { None };
+        // Квантованный бандл: формат веса — как в файле. Без LoRA вес берётся
+        // готовым; с LoRA — деквант + дельта + квант тем же форматом.
+        let stored = ckpt.quant_dtype(&name);
+        if stored.is_some() && !ckpt.has_lora() {
+            if let Some(q) = ckpt.load_quant(&name) {
+                let bias = b.map(|t| t.to_dtype(compute)).transpose()?;
+                return Ok(Self(QuantLinear::Quant { w: q?, bias }));
+            }
+        }
+        let mut w = ckpt.get_raw(&name)?;
         if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
             w = w.add(&d)?;
         }
         if let Some(d) = ckpt.lora_diff(key, w.dtype())? {
             w = w.add(&d)?;
         }
-        let b = if bias { Some(ckpt.get_raw(&format!("{key}.bias"))?) } else { None };
-        Ok(Self(QuantLinear::build(w, b, qdt, compute).map_err(H3Error::from)?))
+        Ok(Self(QuantLinear::build(w, b, stored.unwrap_or(qdt), compute).map_err(H3Error::from)?))
     }
 
     pub fn load_qkv(
@@ -58,6 +69,9 @@ impl Lin {
         qdt: DType,
         compute: DType,
     ) -> Result<[Self; 3], H3Error> {
+        // Квантованный бандл: qkv делится по головам из деквантованных
+        // значений и квантуется тем же форматом (MXFP8 — те же байты).
+        let qdt = ckpt.quant_dtype(&format!("{key}.weight")).unwrap_or(qdt);
         let mut w = ckpt.get_raw(&format!("{key}.weight"))?;
         if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
             w = w.add(&d)?;
@@ -1429,7 +1443,9 @@ pub fn block_bytes(ckpt: &H3Checkpoint, quant: DType, compute: DType) -> (usize,
             && name.ends_with(".weight")
             && (name.contains(".attn.") || name.contains(".mlp."))
             && dt != DType::F32;
-        q += match quant {
+        // квантованный бандл: формат веса — как лежит в файле
+        let fmt = if dt.is_quantized() { dt } else { quant };
+        q += match fmt {
             DType::NVFP4 if quantizable => numel / 2 + numel / 16,
             DType::MXFP8 if quantizable => numel + numel / 32,
             _ => d,
@@ -1444,8 +1460,8 @@ pub fn dit_resident_bytes(
     compute: DType,
     include_adaln: bool,
 ) -> usize {
-    let qbits = |n: usize, k: usize| -> Option<usize> {
-        match quant {
+    let qbits = |n: usize, k: usize, dt: DType| -> Option<usize> {
+        match if dt.is_quantized() { dt } else { quant } {
             DType::NVFP4 if n % 64 == 0 && k % 64 == 0 => Some(n * k / 2 + n * k / 16),
             DType::MXFP8 if k % 32 == 0 => Some(n * k + n * k / 32),
             _ => None,
@@ -1463,7 +1479,7 @@ pub fn dit_resident_bytes(
             && (name.contains(".attn.") || name.contains(".mlp."))
             && dt != DType::F32;
         total += if quantizable {
-            qbits(shape[0], shape[1]).unwrap_or(numel * cbytes)
+            qbits(shape[0], shape[1], dt).unwrap_or(numel * cbytes)
         } else if dt == DType::F32 {
             numel * 4
         } else {

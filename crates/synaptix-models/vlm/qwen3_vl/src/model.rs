@@ -12,6 +12,10 @@ const ROPE_THETA: f32 = 10_000.0;
 
 pub trait VisionWeights {
     fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, VisionError>;
+    /// Готовый квант-вес из квантованного бандла; `None` — вес плотный.
+    fn quant(&self, _key: &str, _device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, VisionError>> {
+        None
+    }
 }
 
 struct Lin {

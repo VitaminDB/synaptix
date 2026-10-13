@@ -381,10 +381,16 @@ enum Commands {
         /// роли; `none` — оставить как есть), например `.layers.0.=mxfp8`.
         #[arg(long)]
         rule: Vec<String>,
-        /// Пресет политики: `llm` — MLP/эксперты NVFP4; внимание, эмбеддинг,
-        /// голова, башня зрения, общие эксперты и крайние слои — MXFP8.
+        /// Пресет политики: `llm` (MLP NVFP4, чувствительное MXFP8), `encoder`
+        /// (всё MXFP8), `dit` (MLP блоков `--format`, внимание MXFP8).
         #[arg(long)]
         policy: Option<String>,
+        /// Квантовать только этот компонент бандла (повторяемый); прочие — как есть.
+        #[arg(long)]
+        component: Vec<String>,
+        /// Показать план (что во что) и выйти, ничего не записывая.
+        #[arg(long, default_value_t = false)]
+        plan: bool,
     },
     /// Калибровка для квантования: прогнать модель по записям и сохранить E[x²] входов каждого Linear.
     Calibrate {
@@ -1367,8 +1373,8 @@ fn main() -> ExitCode {
                 model, data, output, lora_r, lora_alpha, lr, epochs, batch_size,
             })
         }
-        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy } => {
-            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy })
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan })
         }
         Commands::Warmup { model, device } => synaptix_cli::commands::calibrate::warmup(&model, &device),
         Commands::Calibrate { model, audio, output, device, limit } => {

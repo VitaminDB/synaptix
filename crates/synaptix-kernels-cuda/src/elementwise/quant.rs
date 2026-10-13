@@ -356,6 +356,7 @@ pub struct Mxfp8QuantKernels {
     quant_natural_fast: CudaFunction,
     quant_natural_fast4: CudaFunction,
     dequant: CudaFunction,
+    dequant_bf16: CudaFunction,
 }
 
 static MXFP8_CACHE: OnceLock<Mutex<Vec<(usize, Arc<Mxfp8QuantKernels>)>>> = OnceLock::new();
@@ -400,6 +401,7 @@ impl Mxfp8QuantKernels {
             quant_natural_fast: load_fn(&module, "mxfp8_quant_natural_fast")?,
             quant_natural_fast4: load_fn(&module, "mxfp8_quant_natural_fast4")?,
             dequant: load_fn(&module, "mxfp8_dequant_f16")?,
+            dequant_bf16: load_fn(&module, "mxfp8_dequant_bf16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -463,10 +465,26 @@ pub fn mxfp8_dequant_f16(
     rows: u32,
     k: u32,
 ) -> Result<()> {
+    mxfp8_dequant_to(kernels, stream, packed, scales, out, rows, k, false)
+}
+
+/// Деквант MXFP8 в `f16` (`bf16 = false`) или `bf16` — `out` как байты
+/// нужного типа (2 байта на значение).
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_dequant_to<T: cudarc::driver::DeviceRepr>(
+    kernels: &Mxfp8QuantKernels,
+    stream: &Arc<CudaStream>,
+    packed: &CudaView<'_, u8>,
+    scales: &CudaView<'_, u8>,
+    out: &mut CudaViewMut<T>,
+    rows: u32,
+    k: u32,
+    bf16: bool,
+) -> Result<()> {
     let block = 256u32;
-    let grid = (rows * k).div_ceil(block);
+    let grid = ((rows as u64 * k as u64).div_ceil(block as u64)) as u32;
     let (ri, ki) = (rows as i32, k as i32);
-    let mut bld = stream.launch_builder(&kernels.dequant);
+    let mut bld = stream.launch_builder(if bf16 { &kernels.dequant_bf16 } else { &kernels.dequant });
     bld.arg(packed).arg(scales).arg(&mut *out).arg(&ri).arg(&ki);
     unsafe {
         bld.launch(LaunchConfig {

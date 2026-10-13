@@ -79,6 +79,9 @@ pub struct SafetensorsLoader {
     metadata: HashMap<String, String>,
     default_device: Device,
     prefix: Option<String>,
+    /// Квантованный бандл (`quant_manifest.json`): готовые NVFP4/MXFP8-веса
+    /// читаются через загрузчик бандла того же компонента.
+    quant: Option<Arc<super::syn_bundle::SynBundleLoader>>,
 }
 
 impl SafetensorsLoader {
@@ -93,6 +96,7 @@ impl SafetensorsLoader {
             metadata,
             default_device: Device::Cpu,
             prefix: None,
+            quant: None,
         })
     }
 
@@ -105,7 +109,7 @@ impl SafetensorsLoader {
             index_shard(&shard, &mut entries, &mut metadata)?;
             shards.push(shard);
         }
-        Ok(Self { _shards: shards, entries, metadata, default_device: Device::Cpu, prefix: None })
+        Ok(Self { _shards: shards, entries, metadata, default_device: Device::Cpu, prefix: None, quant: None })
     }
 
     /// Открыть safetensors-поток компонента из `.syn`-бандла.
@@ -136,6 +140,7 @@ impl SafetensorsLoader {
         // Указатель снимаем до move `bundle` в шард — сам слайс заимствует mmap,
         // который живёт внутри Arc и переезжает вместе с ним.
         let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        let quant = super::syn_bundle::SynBundleLoader::from_bundle_arc(bundle.clone(), component).map(Arc::new);
         let shard = Arc::new(Shard::from_bundle(bundle, ptr, len));
         let mut entries = HashMap::new();
         let mut metadata = HashMap::new();
@@ -146,6 +151,7 @@ impl SafetensorsLoader {
             metadata,
             default_device: Device::Cpu,
             prefix,
+            quant,
         })
     }
 
@@ -165,6 +171,7 @@ impl SafetensorsLoader {
             metadata: self.metadata.clone(),
             default_device: device,
             prefix: self.prefix.clone(),
+            quant: self.quant.clone(),
         }
     }
 
@@ -186,17 +193,33 @@ impl SafetensorsLoader {
     }
 
     /// Форма + dtype тензора без загрузки данных (учитывает `with_prefix`).
+    /// Квантованный вес — логическая форма и формат кванта.
     pub fn tensor_info(&self, name: &str) -> Option<TensorInfo> {
-        self.entries.get(&self.resolve_name(name)).map(|e| TensorInfo {
-            dtype: e.dtype,
-            shape: e.shape.clone(),
-        })
+        if let Some(e) = self.entries.get(&self.resolve_name(name)) {
+            return Some(TensorInfo { dtype: e.dtype, shape: e.shape.clone() });
+        }
+        let q = self.quant_here(name)?;
+        let dtype = q.quant_kind(name)?.dtype();
+        let (s, n, k) = q.quant_dims(name)?;
+        Some(TensorInfo { dtype, shape: if s == 1 { vec![n, k] } else { vec![s, n, k] } })
     }
 
     /// Итератор `(имя, dtype, форма)` по всем тензорам (имена — как в файле, без
-    /// снятия префикса).
+    /// снятия префикса). Квантованный вес — под своим именем, с форматом
+    /// кванта и логической формой (блобы `.qpacked`/`.qscales` не видны).
     pub fn infos(&self) -> impl Iterator<Item = (&str, DType, &[usize])> {
-        self.entries.iter().map(|(k, e)| (k.as_str(), e.dtype, e.shape.as_slice()))
+        let manifest = self.quant.as_deref().and_then(|q| q.quant_manifest());
+        self.entries.iter().filter_map(move |(k, e)| {
+            if k.ends_with(".qscales") {
+                return None;
+            }
+            if let (Some(m), Some(base)) = (manifest, k.strip_suffix(".qpacked")) {
+                let (mk, me) = m.tensors.get_key_value(base)?;
+                let dt = me.kind()?.dtype();
+                return Some((mk.as_str(), dt, me.shape.as_slice()));
+            }
+            Some((k.as_str(), e.dtype, e.shape.as_slice()))
+        })
     }
 
     /// Сырой mmap-слайс тензора + dtype файла + форма (учитывает `with_prefix`),
@@ -218,6 +241,32 @@ impl SafetensorsLoader {
         advise_random_range(entry.data)
     }
 
+    /// Лежит ли `name` в этом компоненте готовым квантом (по блобу
+    /// `.qpacked` — ключи манифеста общие на все компоненты бандла).
+    fn quant_here(&self, name: &str) -> Option<&super::syn_bundle::SynBundleLoader> {
+        let q = self.quant.as_deref()?;
+        let key = self.resolve_name(name);
+        self.entries.contains_key(&format!("{key}.qpacked")).then_some(q)
+    }
+
+    /// Готовый квант-вес из квантованного бандла; `None` — вес плотный.
+    /// NVFP4 на карте сразу перемешивается: иначе это делает первое
+    /// умножение, а сырой packed остаётся в резерве пула весов (резерв ×2).
+    pub fn load_quant(&self, name: &str, device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        let r = self.quant_here(name)?.load_quant(name, device)?;
+        Some(r.map(|w| {
+            if w.dtype() == DType::NVFP4 && w.device().is_cuda() {
+                let _ = w.ensure_shuffled();
+            }
+            w
+        }))
+    }
+
+    /// Формат готового кванта (`NVFP4`/`MXFP8`/…); `None` — вес плотный.
+    pub fn quant_dtype(&self, name: &str) -> Option<DType> {
+        self.quant_here(name)?.quant_kind(name).map(|k| k.dtype())
+    }
+
     fn resolve_name(&self, name: &str) -> String {
         match &self.prefix {
             Some(p) if !name.starts_with(p.as_str()) => format!("{p}.{name}"),
@@ -227,8 +276,13 @@ impl SafetensorsLoader {
 
     fn load_internal(&self, name: &str, device: Device, dtype: Option<DType>) -> Result<Tensor> {
         let key = self.resolve_name(name);
-        let entry = self.entries.get(&key)
-            .ok_or_else(|| IoError::Safetensors(format!("tensor not found: {key}")))?;
+        let Some(entry) = self.entries.get(&key) else {
+            // Квантованный бандл: плотный читатель получает деквант.
+            if let Some(q) = self.quant_here(name) {
+                return q.load_to(name, device, dtype.unwrap_or(DType::BF16));
+            }
+            return Err(IoError::Safetensors(format!("tensor not found: {key}")));
+        };
         // zero-copy: H2D напрямую из mmap-слайса. Индекс с dtype/shape/slice разобран
         // один раз в open(), без повторного SafeTensors::deserialize на каждый тензор
         // (для 5947-тензорного LTX это убирает ~5947 разборов 872KB-заголовка).
@@ -296,7 +350,13 @@ impl WeightLoader for SafetensorsLoader {
     }
 
     fn names(&self) -> Vec<&str> {
-        self.entries.keys().map(|s| s.as_str()).collect()
+        // Квантованный вес виден под своим именем (без суффиксов блобов).
+        self.entries
+            .keys()
+            .map(|s| s.as_str())
+            .map(|s| s.strip_suffix(".qpacked").unwrap_or(s))
+            .filter(|s| !s.ends_with(".qscales"))
+            .collect()
     }
 }
 

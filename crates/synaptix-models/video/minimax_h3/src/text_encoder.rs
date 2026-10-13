@@ -61,7 +61,8 @@ impl EncoderHandle {
                 let mut ranges: Vec<&[u8]> = pre
                     .infos()
                     .filter(|(n, _, _)| layer_of(n).is_none_or(|l| l < layers))
-                    .filter_map(|(n, _, _)| pre.raw_bytes(n).map(|r| r.0))
+                    .flat_map(|(n, _, _)| [n.to_string(), format!("{n}.qpacked"), format!("{n}.qscales")])
+                    .filter_map(|n| pre.raw_bytes(&n).map(|r| r.0))
                     .collect();
                 ranges.sort_by_key(|r| r.as_ptr() as usize);
                 crate::prefetch::populate(&ranges);

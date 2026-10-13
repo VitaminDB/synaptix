@@ -28,6 +28,8 @@ pub struct QuantizeArgs {
     pub vision: Option<String>,
     pub rule: Vec<String>,
     pub policy: Option<String>,
+    pub component: Vec<String>,
+    pub plan: bool,
 }
 
 /// Поле `config.json` бандла (в т. ч. внутри `text_config`).
@@ -71,18 +73,27 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.input.is_dir() {
         return Err("каталог HF не поддержан: сперва `synaptix convert <dir> model.syn`, затем quantize".into());
     }
-    let llm = match args.policy.as_deref() {
-        None => false,
-        Some("llm") => true,
-        Some(p) => return Err(format!("--policy {p}: известен только `llm`").into()),
-    };
-    let main = if llm { DType::NVFP4 } else { fmt(&args.format, "--format")?.ok_or("--format обязан быть форматом кванта")? };
+    // Пресеты политики. Качество важнее «влезет ли»: размещение — дело
+    // движка (оффлоад), чувствительные веса — MXFP8 или как есть.
+    //   llm     — MLP/эксперты NVFP4; внимание, эмбеддинг, голова, зрение,
+    //             общие эксперты, первый и последний слой — MXFP8;
+    //   encoder — текстовые энкодеры и LLM внутри генераторов: всё MXFP8;
+    //   dit     — блоки DiT: MLP `--format` (по умолчанию nvfp4), внимание
+    //             MXFP8; модуляция/эмбеддеры/выходы и прочие компоненты
+    //             (VAE) — как есть; крайние блоки — правилами `--rule`.
+    let policy = args.policy.clone();
+    let llm = policy.as_deref() == Some("llm");
     let mx = || Some("mxfp8".to_string());
-    let (attn_a, head_a, embed_a, vision_a) = if llm {
-        // Качество важнее «влезет ли»: размещение — дело движка (оффлоад).
-        (args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx))
-    } else {
-        (args.attn.clone(), args.lm_head.clone(), args.embed.clone(), args.vision.clone())
+    let none = || Some("none".to_string());
+    let (main, attn_a, head_a, embed_a, vision_a) = match policy.as_deref() {
+        None => (fmt(&args.format, "--format")?.ok_or("--format обязан быть форматом кванта")?, args.attn.clone(), args.lm_head.clone(), args.embed.clone(), args.vision.clone()),
+        Some("llm") => (DType::NVFP4, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx)),
+        Some("encoder") => (DType::MXFP8, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx)),
+        Some("dit") => {
+            let f = if args.format == "sq4" { DType::NVFP4 } else { fmt(&args.format, "--format")?.ok_or("--format")? };
+            (f, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(none), args.embed.clone().or_else(none), args.vision.clone())
+        }
+        Some(p) => return Err(format!("--policy {p}: известны llm | encoder | dit").into()),
     };
     let args = QuantizeArgs { attn: attn_a, lm_head: head_a, embed: embed_a, vision: vision_a, ..args };
     let mut rules: Vec<(String, Option<DType>)> = Vec::new();
@@ -92,6 +103,9 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if llm {
         rules.extend(llm_rules(&args.input)?);
+    } else if policy.is_some() {
+        // таблицы, из которых читают строки, — как есть
+        rules.push(("pos_embed".into(), None));
     }
     let vision = match &args.vision {
         Some(v) => fmt(v, "--vision")?,
@@ -118,7 +132,20 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let experts = if q8 { None } else { Some(main) };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone() };
+    if args.plan {
+        let items = synaptix_io::weights::transcode::plan(&args.input, &spec)?;
+        let mut g: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();
+        for (c, n, cur, t) in &items {
+            let pat: String = n.split('.').map(|p| if p.chars().all(|ch| ch.is_ascii_digit()) { "N" } else { p }).collect::<Vec<_>>().join(".");
+            *g.entry((c.clone(), pat, cur.clone(), synaptix_core::precision::dtype_name(*t))).or_default() += 1;
+        }
+        println!("План {} ({}):", args.input.display(), spec.key());
+        for ((c, pat, cur, t), n) in g {
+            println!("  {c:<12} {n:>4} × {pat:<60} {cur} → {t}");
+        }
+        return Ok(());
+    }
     let device = if args.device.starts_with("cuda") {
         let ord = args.device.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Device::Cuda(ord)

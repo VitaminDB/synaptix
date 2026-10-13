@@ -107,7 +107,12 @@ impl Lin {
         compute: DType,
         quant: DType,
     ) -> R<Self> {
-        let raw = w.tensor(&format!("{key}.weight"), device, compute)?;
+        let name = format!("{key}.weight");
+        // Квантованный бандл: вес берётся как лежит (формат — по политике файла).
+        if let Some(q) = w.quant(&name, device) {
+            return Ok(Self(QuantLinear::Quant { w: q?, bias: None }));
+        }
+        let raw = w.tensor(&name, device, compute)?;
         QuantLinear::build(raw, None, quant, compute)
             .map(Self)
             .map_err(|e| VisionError::Load(format!("{key}: {e}")))

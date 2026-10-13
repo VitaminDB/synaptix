@@ -248,6 +248,7 @@ impl QuantPolicy {
             include: Vec::new(),
             vision: None,
             rules: Vec::new(),
+            components: Vec::new(),
         }
     }
 
@@ -2867,6 +2868,7 @@ fn cpu_quant_request(
         include: Vec::new(),
         vision: None,
         rules: Vec::new(),
+        components: Vec::new(),
     };
     Some(synaptix_io::weights::transcode::request(
         path,

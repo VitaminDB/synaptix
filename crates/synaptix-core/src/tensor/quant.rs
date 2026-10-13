@@ -116,7 +116,7 @@ impl QuantWeight {
             DType::Sq { .. } | DType::Ggml(_) => {
                 backend.block_dequant(&packed, self.dtype, (&mut out, &out_layout), self.n, self.k, &stream)?;
             }
-            DType::MXFP8 if out_dt == DType::F16 => {
+            DType::MXFP8 => {
                 let scales = self.scales();
                 let p_layout = Layout::contiguous(Shape::new(vec![self.n, self.k]), DType::MXFP8);
                 let s_layout = Layout::contiguous(Shape::new(vec![self.n, self.k / 32]), DType::U8);

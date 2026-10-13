@@ -2983,9 +2983,11 @@ impl Backend for CudaBackend {
         if p_lo.dtype() != DType::MXFP8 {
             return Err(SynaptixError::Unsupported("mxfp8_dequant: packed не MXFP8"));
         }
-        if o_lo.dtype() != DType::F16 {
-            return Err(SynaptixError::Unsupported("mxfp8_dequant: выход не F16"));
-        }
+        let out_bf16 = match o_lo.dtype() {
+            DType::F16 => false,
+            DType::BF16 => true,
+            _ => return Err(SynaptixError::Unsupported("mxfp8_dequant: выход не F16/BF16")),
+        };
         if !p_lo.is_contiguous() || !s_lo.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
         }
@@ -3015,7 +3017,7 @@ impl Backend for CudaBackend {
         let o_buf = o_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("mxfp8_dequant: out non-cuda"))?;
         let mut o_view = unsafe { o_buf.slice_mut().transmute_mut::<half::f16>(numel) }
             .ok_or_else(|| SynaptixError::Cuda("mxfp8_dequant: transmute выхода".into()))?;
-        crate::elementwise::quant::mxfp8_dequant_f16(
+        crate::elementwise::quant::mxfp8_dequant_to(
             &kernels,
             &stream,
             &p_view,
@@ -3023,6 +3025,7 @@ impl Backend for CudaBackend {
             &mut o_view,
             rows as u32,
             k as u32,
+            out_bf16,
         )
     }
 

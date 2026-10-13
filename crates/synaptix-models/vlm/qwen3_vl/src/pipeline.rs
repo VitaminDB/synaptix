@@ -53,6 +53,9 @@ impl VisionWeights for DirWeights {
             .load_to(key, device, dtype)
             .map_err(|e| VisionError::Load(format!("{key}: {e}")))
     }
+    fn quant(&self, key: &str, device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, VisionError>> {
+        self.loader.load_quant(key, device).map(|r| r.map_err(|e| VisionError::Load(format!("{key}: {e}"))))
+    }
 }
 
 pub struct H3Encoder {
