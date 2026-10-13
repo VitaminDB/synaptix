@@ -40,6 +40,19 @@ pub struct VideoRequest {
     /// Квант трансформера и энкодера: `nvfp4`, `mxfp8`, `bf16` (плотный);
     /// пусто/`auto` — умолчание модели.
     pub quant: Option<String>,
+    /// LTX: звук, под который строится видео (липсинк речи, движение под
+    /// музыку); с `control_video` — LipDub (переозвучка ролика).
+    pub audio: Option<PathBuf>,
+    /// LTX: исходное видео для retake (`retake` — отрезок, с) или продления (`extend`).
+    pub source_video: Option<PathBuf>,
+    pub retake: Option<(f64, f64)>,
+    pub extend: bool,
+    /// LTX IC-LoRA: видео-образец движения/структуры; `control` — `canny`
+    /// (контуры, union-control) или `motion` (motion-track).
+    pub control_video: Option<PathBuf>,
+    pub control: Option<String>,
+    /// LTX: две стадии (половинное разрешение → апскейлер ×2 → доводка).
+    pub two_stage: bool,
 }
 
 /// Квант из настройки; `None` — умолчание пайплайна.
@@ -258,32 +271,132 @@ pub fn write_mp4(frames: &[Tensor], audio: Option<(&[f32], u32, u16)>, fps: f64,
     result
 }
 
-/// Компоненты LTX-2.3: чекпойнт (DiT+VAE+вокодер), Gemma-3 (текст), distilled
-/// LoRA (нужна dev-чекпойнту для дистиллированных сигм).
+
+/// Компоненты LTX-2.3 из библиотеки.
+#[derive(Clone, Debug, Default)]
 pub struct LtxPaths {
+    /// Чекпойнт (DiT + VAE + вокодер + проекции).
     pub model: PathBuf,
+    /// Gemma-3 LTX (текстовый энкодер).
     pub gemma: PathBuf,
+    /// Distilled LoRA (dev-чекпойнту для дистиллированных сигм).
     pub distilled_lora: Option<PathBuf>,
+    /// Апскейлер ×2 (две стадии, LipDub).
+    pub upscaler: Option<PathBuf>,
+    pub ic_union: Option<PathBuf>,
+    pub ic_motion: Option<PathBuf>,
+    pub ic_lipdub: Option<PathBuf>,
 }
 
-/// LTX-2.3: видео со звуком одной стадией (дистиллированные сигмы, 8 шагов),
-/// по описанию или с первого кадра (`first_frame`). Порядок — как у
-/// `synaptix video`: Gemma (выгружается) → коннекторы → DiT → VAE → звук.
+enum LtxMode {
+    Text,
+    Frames { first: Option<PathBuf>, last: Option<PathBuf> },
+    Retake { video: PathBuf, start: f64, end: f64 },
+    Extend { video: PathBuf, last_frame: PathBuf },
+    A2v { audio: PathBuf },
+    Ic { video: PathBuf, canny: bool },
+    Lipdub { video: PathBuf, audio: PathBuf },
+}
+
+fn scratch(tag: &str) -> R<PathBuf> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("synaptix_gen_{tag}_{}_{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    Ok(dir)
+}
+
+fn ffmpeg_f32(path: &Path, rate: u32, channels: u32) -> R<Vec<f32>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-vn", "-ar", &rate.to_string(), "-ac", &channels.to_string(), "-f", "f32le", "-"])
+        .output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ffmpeg: звук {} не прочитан", path.display()));
+    }
+    Ok(out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// Видео → `[1,3,F,H,W]` в [−1,1] (ffmpeg, кадры по fps).
+fn load_video_frames(path: &Path, ph: usize, pw: usize, n: usize, fps: f64, dev: Device) -> R<Tensor> {
+    let dir = scratch("vin")?;
+    let result = (|| -> R<Tensor> {
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(path)
+            .args(["-vf", &format!("fps={fps},scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph}")])
+            .args(["-frames:v", &n.to_string()])
+            .arg(dir.join("f%05d.png"))
+            .status()
+            .map_err(|e| format!("ffmpeg: {e}"))?
+            .success();
+        if !ok {
+            return Err(format!("ffmpeg: видео {} не прочитано", path.display()));
+        }
+        let mut frames = Vec::with_capacity(n);
+        for i in 1..=n {
+            let p = dir.join(format!("f{i:05}.png"));
+            if !p.exists() {
+                break;
+            }
+            let img = synaptix_io::image::load_image(&p, dev).map_err(err)?;
+            frames.push(img.contiguous().map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?);
+        }
+        if frames.is_empty() {
+            return Err(format!("{}: видео не дало кадров", path.display()));
+        }
+        // Короче нужного — последний кадр повторяется.
+        while frames.len() < n {
+            let last = frames.last().unwrap().clone();
+            frames.push(last);
+        }
+        let refs: Vec<&Tensor> = frames.iter().collect();
+        Tensor::cat(&refs, 2).map_err(err)?.contiguous().map_err(err)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Canny по кадрам `[1,3,F,H,W]` → контуры той же формы (control-сигнал union).
+fn canny_frames(frames: &Tensor) -> R<Tensor> {
+    let (f, h, w) = (frames.dims()[2], frames.dims()[3], frames.dims()[4]);
+    let mut out = Vec::with_capacity(f);
+    for fi in 0..f {
+        let fr = frames.narrow(2, fi, 1).map_err(err)?.contiguous().map_err(err)?.reshape(vec![3, h, w]).map_err(err)?.affine(0.5, 0.5).map_err(err)?;
+        let edges = synaptix_io::image::canny_rgb(&fr, 100.0, 200.0).map_err(err)?;
+        out.push(edges.affine(2.0, -1.0).map_err(err)?.reshape(vec![1, 3, 1, h, w]).map_err(err)?);
+    }
+    let refs: Vec<&Tensor> = out.iter().collect();
+    Tensor::cat(&refs, 2).map_err(err)?.contiguous().map_err(err)
+}
+
+/// Длительность медиафайла, с (ffprobe).
+fn media_seconds(path: &Path) -> Option<f64> {
+    let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(path).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// LTX-2.3: видео со звуком (дистиллированные сигмы, NAG по умолчанию) — как
+/// `synaptix video`: по описанию, с первого и/или последнего кадра, по звуку
+/// (липсинк), retake отрезка, продление ролика, IC-LoRA (контуры/движение),
+/// LipDub; одна стадия или две (апскейлер ×2 и доводка).
 pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> R<VideoOutput> {
     use synaptix_core::precision::PrecisionConfig;
     use synaptix_llm_gemma3::pipeline::GemmaPipeline;
-    use synaptix_video_ltx23::audio_vae::AudioVaeDecoder;
+    use synaptix_video_ltx23::audio_vae::{ltx_log_mel, AudioVaeDecoder, AudioVaeEncoder};
     use synaptix_video_ltx23::dit::AvDit;
     use synaptix_video_ltx23::loader::{LoraWeights, LtxCheckpoint};
     use synaptix_video_ltx23::pipeline as lp;
     use synaptix_video_ltx23::text_encoder::{AudioTextConditioner, VideoTextConditioner};
+    use synaptix_video_ltx23::upscaler::Upsampler;
     use synaptix_video_ltx23::vae::{VaeDecoder, VaeEncoder};
     use synaptix_video_ltx23::vocoder::VocoderWithBwe;
     if !device.is_cuda() {
         return Err("LTX-2.3 работает только на видеокарте".into());
     }
-    if !req.refs.is_empty() || req.last_frame.is_some() {
-        return Err("LTX-2.3 здесь умеет видео по описанию и с первого кадра; референсы и последний кадр — у MiniMax-H3".into());
+    if !req.refs.is_empty() {
+        return Err("референсы-картинки понимает MiniMax-H3; у LTX — кадры, звук, видео-образец".into());
     }
     synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
@@ -292,22 +405,62 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let _ = synaptix_core::device::cuda::synchronize_all(ord);
         let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
     };
+    let fps = 24.0;
     let compute = DType::BF16;
     let quant_dit = quant_setting(req.quant.as_deref()).unwrap_or(compute);
-    let quant_enc = match quant_dit {
-        DType::NVFP4 => DType::NVFP4,
-        _ => DType::MXFP8,
+    let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
+    let seed = Some(req.seed.max(1));
+
+    // Режим и источник длительности/размера.
+    let mode = match (&req.control_video, &req.audio, &req.source_video) {
+        (Some(v), Some(a), _) => LtxMode::Lipdub { video: v.clone(), audio: a.clone() },
+        (Some(v), None, _) => LtxMode::Ic { video: v.clone(), canny: req.control.as_deref() != Some("motion") },
+        (None, _, Some(v)) if req.extend => {
+            let dir = scratch("tail")?;
+            let frame = dir.join("last.png");
+            let ok = Command::new("ffmpeg").args(["-v", "error", "-y", "-sseof", "-0.2", "-i"]).arg(v).args(["-frames:v", "1", "-update", "1"]).arg(&frame).status().map(|s| s.success()).unwrap_or(false);
+            if !ok || !frame.exists() {
+                return Err(format!("{}: последний кадр не извлечён", v.display()));
+            }
+            LtxMode::Extend { video: v.clone(), last_frame: frame }
+        }
+        (None, _, Some(v)) => {
+            let (a, b) = req.retake.unwrap_or((0.0, media_seconds(v).unwrap_or(5.0)));
+            LtxMode::Retake { video: v.clone(), start: a, end: b }
+        }
+        (None, Some(a), None) => LtxMode::A2v { audio: a.clone() },
+        (None, None, None) if req.first_frame.is_some() || req.last_frame.is_some() => LtxMode::Frames { first: req.first_frame.clone(), last: req.last_frame.clone() },
+        _ => LtxMode::Text,
     };
-    let fps = 24.0;
+    let adapter = match &mode {
+        LtxMode::Lipdub { .. } => Some(paths.ic_lipdub.clone().ok_or("нет IC-LoRA LipDub (ltx-2.3-…-ic-lora-lipdub)")?),
+        LtxMode::Ic { canny: true, .. } => Some(paths.ic_union.clone().ok_or("нет IC-LoRA union-control")?),
+        LtxMode::Ic { canny: false, .. } => Some(paths.ic_motion.clone().ok_or("нет IC-LoRA motion-track")?),
+        _ => None,
+    };
+    let distilled_ckpt = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
+    if adapter.is_some() && !distilled_ckpt {
+        return Err("IC-LoRA и LipDub идут на distilled-чекпойнте LTX-2.3 (ltx-2-3-22b-distilled)".into());
+    }
+    // Retake — одной стадией на целевом разрешении; LipDub — всегда две.
+    let two_stage = (req.two_stage && !matches!(mode, LtxMode::Retake { .. })) || matches!(mode, LtxMode::Lipdub { .. });
+    if two_stage && paths.upscaler.is_none() {
+        return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
+    }
+    // Длительность: у звука, retake и образцов — по исходнику.
+    let src_secs = match &mode {
+        LtxMode::A2v { audio } | LtxMode::Lipdub { audio, .. } => media_seconds(audio),
+        LtxMode::Retake { video, .. } | LtxMode::Ic { video, .. } => media_seconds(video),
+        _ => None,
+    };
+    let secs = req.seconds.filter(|s| *s > 0.0).or(src_secs).unwrap_or(5.0).clamp(1.0, 20.0);
     let width = req.width.filter(|&v| v > 0).unwrap_or(960);
     let height = req.height.filter(|&v| v > 0).unwrap_or(544);
     let (hp, wp) = lp::latent_grid(width, height);
-    let fp = lp::frames_for_duration(req.seconds.filter(|s| *s > 0.0).unwrap_or(5.0), fps);
-    let seed = Some(req.seed.max(1));
+    let fp = lp::frames_for_duration(secs, fps);
+    let out_frames = lp::out_frame_count(fp);
 
     let ckpt = LtxCheckpoint::open(&paths.model, Device::Cpu, DType::BF16).map_err(|e| format!("LTX: {e}"))?;
-    // Плотный DiT — всегда стриминг блоков с хоста; квантованный — на карту,
-    // если влезает с VAE и активациями (оценка как у CLI).
     let offload = quant_dit == compute || {
         let dit_b = synaptix_video_ltx23::dit::dit_resident_bytes(&ckpt, quant_dit, compute);
         let vae_b: usize = ckpt.infos().filter(|(n, _, _)| n.starts_with("vae.")).map(|(_, _, s)| compute.bytes_for_numel(s.iter().product())).sum();
@@ -316,18 +469,17 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let need = dit_b + vae_b + act_b + pad_b + (1usize << 30);
         synaptix_core::device::cuda::mem_info(ord).map(|(free, _)| need > free).unwrap_or(true)
     };
-    let pin = synaptix_core::device::cuda::OffloadPinCacheGuard::new_paused(&ckpt.shard_bytes());
-    let distilled_name = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
-    let lora = match (&paths.distilled_lora, distilled_name) {
-        (Some(p), false) => Some(LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
-        _ => None,
-    };
+    let pin = (offload && quant_dit == compute).then(|| synaptix_core::device::cuda::OffloadPinCacheGuard::new_paused(&ckpt.shard_bytes()));
+    let lora_path = adapter.clone().or_else(|| if distilled_ckpt { None } else { paths.distilled_lora.clone() });
 
+    // Текст: Gemma (выгружается) → коннекторы.
     synaptix_core::device::cuda::set_offload_pinned(true);
     let (states, mask, nag_states) = {
         let prec = PrecisionConfig { compute, attn_w: quant_enc, mlp_w: quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
         let gemma = GemmaPipeline::load_with_precision(&paths.gemma, device, prec, Some(1024)).map_err(|e| format!("Gemma: {e}"))?;
-        pin.resume();
+        if let Some(p) = &pin {
+            p.resume();
+        }
         let (s, m) = gemma.encode_for_ltx(&req.prompt, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
         let nag = gemma.encode_for_ltx(lp::DEFAULT_NAG_PROMPT, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
         (s, m, nag)
@@ -346,26 +498,158 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     synaptix_core::device::cuda::set_offload_pinned(false);
     let v_nag = Some((&nag_enc, lp::NAG_DEFAULT_SCALE, lp::NAG_DEFAULT_ALPHA, lp::NAG_DEFAULT_TAU));
 
-    let on_step = |p: lp::DenoiseProgress| progress(p.step + 1, p.total);
+    let total_steps = (lp::DISTILLED_SIGMAS.len() - 1) + if two_stage { lp::STAGE2_SIGMAS.len() - 1 } else { 0 };
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let on_step = |_: lp::DenoiseProgress| {
+        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        progress(n.min(total_steps), total_steps);
+    };
     let hooks = lp::DenoiseHooks { progress: Some(&on_step), cancel: Some(cancel) };
-    let (latent, a_tok) = synaptix_core::grad::no_grad(|| -> R<(Tensor, Tensor)> {
+
+    let (latent, a_tok, input_wave) = synaptix_core::grad::no_grad(|| -> R<(Tensor, Option<Tensor>, Option<Vec<f32>>)> {
+        let lora = match &lora_path {
+            Some(p) => Some(LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
+            None => None,
+        };
         let lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
         let dit = AvDit::load_with(lora_ckpt.as_ref().unwrap_or(&ckpt), device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
-        let conds = match &req.first_frame {
-            Some(p) => {
-                let raw = synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
-                let enc = VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
-                let (ph, pw) = (hp * 32, wp * 32);
-                let img = synaptix_io::image::fit_image(&raw, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
-                let lat = enc.encode(&img).map_err(|e| format!("VAE: {e}"))?;
-                vec![(0usize, lp::frame_latent_to_tokens(&lat).map_err(err)?, 1.0f32)]
-            }
-            None => Vec::new(),
+        let (hp1, wp1) = if two_stage { lp::stage1_grid(hp, wp) } else { (hp, wp) };
+        let (hp2, wp2) = (hp1 * 2, wp1 * 2);
+        let venc = if matches!(mode, LtxMode::Text | LtxMode::A2v { .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
+        let image_tokens = |img: &Tensor, g: (usize, usize)| -> R<Tensor> {
+            let (ph, pw) = (g.0 * 32, g.1 * 32);
+            let x = synaptix_io::image::fit_image(img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
+            let lat = venc.as_ref().unwrap().encode(&x).map_err(|e| format!("VAE: {e}"))?;
+            lp::frame_latent_to_tokens(&lat).map_err(err)
         };
-        let r = lp::denoise_av(&dit, &v_enc, &a_enc, fp, hp, wp, &lp::DISTILLED_SIGMAS, None, None, fps, device, v_nag, &conds, seed, &hooks).map_err(err)?;
+        let latent_tokens = |lat: &Tensor| -> R<(Tensor, usize, usize, usize)> {
+            let (f, h, w) = (lat.dims()[2], lat.dims()[3], lat.dims()[4]);
+            Ok((lat.reshape(vec![1, 128, f * h * w]).map_err(err)?.transpose(1, 2).map_err(err)?.contiguous().map_err(err)?, f, h, w))
+        };
+        // Этап денойза на сетке g (stage1: с NAG, без init; stage2: init — апскейл).
+        let stage = |g: (usize, usize), sigmas: &[f64], init: Option<(&Tensor, &Tensor)>| -> R<(Tensor, Tensor, Option<Vec<f32>>)> {
+            let (vi, ai) = match init {
+                Some((v, a)) => (Some(v), Some(a)),
+                None => (None, None),
+            };
+            let nag = if init.is_none() { v_nag } else { None };
+            Ok(match &mode {
+                LtxMode::Text => {
+                    let (l, a) = lp::denoise_av(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, fps, device, nag, &[], seed, &hooks).map_err(err)?;
+                    (l, a, None)
+                }
+                LtxMode::Frames { .. } | LtxMode::Extend { .. } => {
+                    let (first, last) = match &mode {
+                        LtxMode::Extend { last_frame, .. } => (Some(last_frame.clone()), None),
+                        LtxMode::Frames { first, last } => (first.clone(), last.clone()),
+                        _ => (None, None),
+                    };
+                    let load = |p: &PathBuf| synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()));
+                    let conds = match &first {
+                        Some(p) => vec![(0usize, image_tokens(&load(p)?, g)?, 1.0f32)],
+                        None => Vec::new(),
+                    };
+                    match &last {
+                        // Последний кадр — ключевым кадром в конце ролика.
+                        Some(p) => {
+                            let toks = image_tokens(&load(p)?, g)?;
+                            let frame = out_frames - 1;
+                            let pos = lp::keyframe_positions(g.0, g.1, frame, fps);
+                            if let Some((_, first_toks, _)) = conds.first() {
+                                // Первый тоже ключевым: два кадра одним блоком.
+                                let ft = first_toks.clone();
+                                let both = Tensor::cat(&[&ft, &toks], 1).map_err(err)?.contiguous().map_err(err)?;
+                                let mut pos_all = lp::keyframe_positions(g.0, g.1, 0, fps);
+                                pos_all.extend(pos);
+                                let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&both, &pos_all, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                                (l, a, None)
+                            } else {
+                                let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&toks, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                                (l, a, None)
+                            }
+                        }
+                        None => {
+                            let (l, a) = lp::denoise_av(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, fps, device, nag, &conds, seed, &hooks).map_err(err)?;
+                            (l, a, None)
+                        }
+                    }
+                }
+                LtxMode::Retake { video, start, end } => {
+                    let frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
+                    let source = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
+                    let (f_, h_, w_) = (source.dims()[2], source.dims()[3], source.dims()[4]);
+                    let (l, a) = lp::denoise_av_retake(&dit, &v_enc, &a_enc, f_, h_, w_, sigmas, &source, *start, *end, fps, device, seed, &hooks).map_err(err)?;
+                    (l, a, None)
+                }
+                LtxMode::A2v { audio } => {
+                    let fa = lp::audio_token_count(fp, fps);
+                    let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                    let mel = ltx_log_mel(&[ffmpeg_f32(audio, 16000, 1)?], device).map_err(err)?;
+                    let enc = aenc.encode(&mel).map_err(err)?;
+                    drop(aenc);
+                    let far = enc.dims()[1];
+                    let audio_lat = if far >= fa {
+                        enc.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err)?
+                    } else {
+                        let last = enc.narrow(1, far - 1, 1).map_err(err)?;
+                        let mut parts = vec![enc];
+                        parts.extend((far..fa).map(|_| last.clone()));
+                        let refs: Vec<&Tensor> = parts.iter().collect();
+                        Tensor::cat(&refs, 1).map_err(err)?.contiguous().map_err(err)?
+                    };
+                    let (l, _) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, None, None, fps, device, seed, &hooks).map_err(err)?;
+                    (l, audio_lat, Some(ffmpeg_f32(audio, 48000, 2)?))
+                }
+                LtxMode::Ic { video, canny } => {
+                    let mut frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
+                    if *canny {
+                        frames = canny_frames(&frames)?;
+                    }
+                    let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
+                    let (tok, f_, h_, w_) = latent_tokens(&lat)?;
+                    let pos = lp::ref_video_positions(f_, h_, w_, fps, 1);
+                    let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                    (l, a, None)
+                }
+                LtxMode::Lipdub { video, audio } => {
+                    let frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
+                    let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
+                    let (tok, f_, h_, w_) = latent_tokens(&lat)?;
+                    let pos = lp::pixel_coords(f_, h_, w_, fps);
+                    let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                    let mel = ltx_log_mel(&[ffmpeg_f32(audio, 16000, 1)?], device).map_err(err)?;
+                    let audio_ref = aenc.encode(&mel).map_err(err)?;
+                    drop(aenc);
+                    let (aref, frozen) = match ai {
+                        Some(a) => (a.clone(), true),
+                        None => (audio_ref.clone(), false),
+                    };
+                    let apos = lp::lipdub_audio_ref_positions(aref.dims()[1]);
+                    let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, if frozen { Some(&aref) } else { None }, frozen, Some((&tok, &pos, 1.0)), Some((&aref, &apos)), fps, device, seed, &hooks).map_err(err)?;
+                    (l, a, Some(ffmpeg_f32(audio, 48000, 2)?))
+                }
+            })
+        };
+        let (mut l, mut a, mut wave) = stage((hp1, wp1), &lp::DISTILLED_SIGMAS, None)?;
+        if two_stage {
+            let view = ckpt.view_on(device);
+            let mean = view.get_raw("vae.per_channel_statistics.mean-of-means").map_err(err)?;
+            let std = view.get_raw("vae.per_channel_statistics.std-of-means").map_err(err)?;
+            let up = Upsampler::load(paths.upscaler.as_ref().unwrap(), &mean, &std, device).map_err(|e| format!("апскейлер: {e}"))?;
+            let l2 = up.upsample(&l).map_err(err)?.to_dtype(compute).map_err(err)?;
+            drop(up);
+            synaptix_core::tensor::ops::conv_filter_cache_clear();
+            let (l3, a3, w3) = stage((hp2, wp2), &lp::STAGE2_SIGMAS, Some((&l2, &a)))?;
+            l = l3;
+            a = a3;
+            if w3.is_some() {
+                wave = w3;
+            }
+        }
         drop(dit);
+        drop(venc);
         synaptix_core::tensor::ops::conv_filter_cache_gc();
-        Ok(r)
+        Ok((l, Some(a), wave))
     })?;
     release();
     let rgb = synaptix_core::grad::no_grad(|| -> R<Tensor> {
@@ -373,22 +657,73 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         vae.decode(&latent).map_err(|e| format!("VAE: {e}"))
     })?;
     release();
-    let wave = synaptix_core::grad::no_grad(|| -> R<Tensor> {
-        let avae = AudioVaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
-        let voc = VocoderWithBwe::load(&paths.model, device).map_err(|e| format!("вокодер: {e}"))?;
-        lp::decode_audio_tokens(&avae, &voc, &a_tok).map_err(err)
-    })?;
-    release();
-    let frames = lp::rgb_to_frames(&rgb).map_err(err)?;
-    let (ch, l) = (wave.dims()[1], wave.dims()[2]);
-    let planar: Vec<f32> = wave.reshape(vec![ch * l]).map_err(err)?.to_dtype(DType::F32).map_err(err)?.to_vec1::<f32>().map_err(err)?;
-    let mut pcm = Vec::with_capacity(ch * l);
-    for i in 0..l {
-        for c in 0..ch {
-            pcm.push(planar[c * l + i]);
+    // Звук: исходный (липсинк, LipDub) или сгенерированный.
+    let pcm: Vec<f32> = match input_wave {
+        Some(w) => w,
+        None => {
+            let wave = synaptix_core::grad::no_grad(|| -> R<Tensor> {
+                let avae = AudioVaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                let voc = VocoderWithBwe::load(&paths.model, device).map_err(|e| format!("вокодер: {e}"))?;
+                lp::decode_audio_tokens(&avae, &voc, a_tok.as_ref().unwrap()).map_err(err)
+            })?;
+            release();
+            let (ch, l) = (wave.dims()[1], wave.dims()[2]);
+            let planar: Vec<f32> = wave.reshape(vec![ch * l]).map_err(err)?.to_dtype(DType::F32).map_err(err)?.to_vec1::<f32>().map_err(err)?;
+            (0..l).flat_map(|i| (0..ch).map(move |c| (c, i))).map(|(c, i)| planar[c * l + i]).collect()
         }
-    }
+    };
+    let frames = lp::rgb_to_frames(&rgb).map_err(err)?;
     let n = frames.len();
-    write_mp4(&frames, Some((&pcm, 48_000, ch as u16)), fps, out)?;
-    Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label: format!("LTX-2.3 {}×{}, {:.1} с{}", wp * 32, hp * 32, n as f64 / fps, if req.first_frame.is_some() { ", с первого кадра" } else { "" }) })
+    let label_mode = match &mode {
+        LtxMode::Text => "по описанию",
+        LtxMode::Frames { first: Some(_), last: Some(_) } => "между первым и последним кадром",
+        LtxMode::Frames { last: Some(_), .. } => "к последнему кадру",
+        LtxMode::Frames { .. } => "с первого кадра",
+        LtxMode::Retake { .. } => "retake отрезка",
+        LtxMode::Extend { .. } => "продление",
+        LtxMode::A2v { .. } => "по звуку (липсинк)",
+        LtxMode::Ic { canny: true, .. } => "по контурам образца (IC-LoRA)",
+        LtxMode::Ic { .. } => "по движению образца (IC-LoRA)",
+        LtxMode::Lipdub { .. } => "LipDub",
+    };
+    match &mode {
+        LtxMode::Extend { video, last_frame } => {
+            // Новое продолжение — следом за исходным роликом (без повтора стыкового кадра).
+            let dir = scratch("ext")?;
+            let part = dir.join("part.mp4");
+            write_mp4(&frames[1..], Some((&pcm, 48_000, 2)), fps, &part)?;
+            let ok = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-i"])
+                .arg(video)
+                .arg("-i")
+                .arg(&part)
+                .args(["-filter_complex", &format!("[0:v]fps={fps},scale={}:{},setsar=1[a];[1:v]setsar=1[b];[a][b]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[s]", wp * 32, hp * 32), "-map", "[v]", "-map", "[s]", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
+                .arg(out)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                // У исходника нет звука — склейка только видео + звук продолжения.
+                let ok2 = Command::new("ffmpeg")
+                    .args(["-v", "error", "-y", "-i"])
+                    .arg(video)
+                    .arg("-i")
+                    .arg(&part)
+                    .args(["-filter_complex", &format!("[0:v]fps={fps},scale={}:{},setsar=1[a];[1:v]setsar=1[b];[a][b]concat=n=2:v=1:a=0[v]", wp * 32, hp * 32), "-map", "[v]", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+                    .arg(out)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok2 {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err("ffmpeg: склейка продления не удалась".into());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(last_frame);
+        }
+        _ => write_mp4(&frames, Some((&pcm, 48_000, 2)), fps, out)?,
+    }
+    let label = format!("LTX-2.3 {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / fps, if two_stage { ", две стадии" } else { "" });
+    Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label })
 }
