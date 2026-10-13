@@ -49,6 +49,14 @@ impl CompLoader {
         self.device
     }
 
+    /// Готовый квант-вес квантованного бандла (формат задаёт файл);
+    /// `None` — вес плотный.
+    pub fn prequant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, AceError>> {
+        use synaptix_io::weights::WeightLoader;
+        let r = self.inner.prequant(name, self.device)?;
+        Some(r.map_err(|e| AceError::Load(format!("{name}: {e}"))))
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.inner.contains(name)
     }

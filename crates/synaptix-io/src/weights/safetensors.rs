@@ -349,6 +349,10 @@ impl WeightLoader for SafetensorsLoader {
         synaptix_core::backend::with_param_upload(|| self.load_internal(name, device, Some(dtype)))
     }
 
+    fn prequant(&self, name: &str, device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        self.load_quant(name, device)
+    }
+
     fn names(&self) -> Vec<&str> {
         // Квантованный вес виден под своим именем (без суффиксов блобов).
         self.entries

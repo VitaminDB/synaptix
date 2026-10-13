@@ -48,6 +48,10 @@ impl WeightSource for BundleWeightSource {
     fn contains(&self, key: &str) -> bool {
         self.loader.has(key) || self.loader.has(strip(key))
     }
+    fn quant(&self, key: &str, _device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, ModelError>> {
+        let r = self.loader.prequant(self.resolve(key))?;
+        Some(r.map_err(|e| ModelError::Load(e.to_string())))
+    }
 }
 
 pub fn to_decoder_config(cfg: &LmConfig) -> DecoderConfig {

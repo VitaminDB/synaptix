@@ -20,8 +20,12 @@ fn lin(ck: &CompLoader, name: &str, bias: bool, dt: DType) -> R<Linear> {
 }
 
 fn qlin(ck: &CompLoader, name: &str, bias: bool, qdt: DType, compute: DType) -> R<QuantLinear> {
-    let w = ck.get(&format!("{name}.weight"), compute)?;
     let b = if bias { Some(ck.get(&format!("{name}.bias"), compute)?) } else { None };
+    // Квантованный бандл: вес как в файле.
+    if let Some(q) = ck.prequant(&format!("{name}.weight")) {
+        return Ok(QuantLinear::Quant { w: q?, bias: b });
+    }
+    let w = ck.get(&format!("{name}.weight"), compute)?;
     QuantLinear::build(w, b, qdt, compute).map_err(AceError::Tensor)
 }
 

@@ -48,6 +48,14 @@ impl CompLoader {
         self.device
     }
 
+    /// Готовый квант-вес квантованного бандла (формат задаёт файл);
+    /// `None` — вес плотный.
+    pub fn prequant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, YueError>> {
+        use synaptix_io::weights::WeightLoader;
+        let r = self.inner.prequant(name, self.device)?;
+        Some(r.map_err(|e| YueError::Load(format!("{name}: {e}"))))
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.inner.contains(name)
     }
@@ -74,6 +82,10 @@ impl WeightSource for BundleWeightSource {
     }
     fn contains(&self, key: &str) -> bool {
         self.loader.has(key)
+    }
+    fn quant(&self, key: &str, _device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, ModelError>> {
+        let r = self.loader.prequant(key)?;
+        Some(r.map_err(|e| ModelError::Load(e.to_string())))
     }
 }
 

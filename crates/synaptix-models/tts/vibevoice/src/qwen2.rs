@@ -224,8 +224,13 @@ impl Qwen2Model {
             let k = |s: &str| format!("{prefix}.layers.{i}.{s}");
             // Линейные слои: квант на лету по `src.quant()` или плотные.
             let lin = |name: &str, bias: bool| -> Result<QuantLinear> {
-                let w = src.get(&k(&format!("{name}.weight")))?;
                 let b = if bias { Some(src.get(&k(&format!("{name}.bias")))?) } else { None };
+                // Квантованный бандл: вес как в файле, политика `layer_quant` не нужна.
+                if let Some(q) = src.prequant(&k(&format!("{name}.weight"))) {
+                    let bias = b.map(|t| t.to_dtype(w_dtype)).transpose().map_err(err)?;
+                    return Ok(QuantLinear::Quant { w: q?, bias });
+                }
+                let w = src.get(&k(&format!("{name}.weight")))?;
                 match src.quant().map(|q| layer_quant(q, i, n, name)) {
                     Some(Some(q)) => QuantLinear::build(w, b, q, w_dtype).map_err(err),
                     _ => QuantLinear::dense(w, b).map_err(err),

@@ -112,12 +112,21 @@ impl Lin {
     }
 
     pub fn load_direct(ck: &VoxCheckpoint, base: &str, bias: bool) -> Result<Self, VoxError> {
-        let w = ck.get_raw(&format!("{base}.weight"))?;
         let b = if bias {
             Some(ck.get_raw(&format!("{base}.bias"))?)
         } else {
             None
         };
+        // Квантованный бандл: вес как в файле.
+        {
+            use synaptix_io::weights::WeightLoader;
+            if let Some(q) = ck.base.prequant(&format!("{base}.weight"), ck.device) {
+                let q = q.map_err(|e| VoxError::Load(format!("{base}: {e}")))?;
+                let bias = b.map(|t| t.to_dtype(ck.compute)).transpose()?;
+                return Ok(Self(QuantLinear::Quant { w: q, bias }));
+            }
+        }
+        let w = ck.get_raw(&format!("{base}.weight"))?;
         let q = QuantLinear::build(w, b, ck.quant, ck.compute)?;
         Ok(Self(q))
     }

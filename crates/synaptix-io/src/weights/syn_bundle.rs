@@ -782,7 +782,25 @@ impl WeightLoader for SynBundleLoader {
             return g.names();
         }
         let Ok(idx) = self.index() else { return Vec::new(); };
-        idx.names.iter().map(|s| s.as_str()).collect()
+        // Квантованный вес виден под своим именем (без суффиксов блобов):
+        // иначе модели, проверяющие наличие веса по списку имён (отдельный
+        // lm_head и т. п.), решают, что его нет.
+        idx.names
+            .iter()
+            .map(|s| s.as_str())
+            .map(|s| s.strip_suffix(".qpacked").unwrap_or(s))
+            .filter(|s| !s.ends_with(".qscales"))
+            .collect()
+    }
+
+    fn prequant(&self, name: &str, device: Device) -> Option<Result<QuantWeight>> {
+        let r = self.load_quant(name, device)?;
+        Some(r.map(|w| {
+            if w.dtype() == DType::NVFP4 && w.device().is_cuda() {
+                let _ = w.ensure_shuffled();
+            }
+            w
+        }))
     }
 
     fn contains(&self, name: &str) -> bool {

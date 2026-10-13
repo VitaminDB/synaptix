@@ -50,6 +50,10 @@ impl NarLayer {
     fn load(ck: &CompLoader, idx: usize, compute: DType, quant: Option<DType>) -> R<Self> {
         let p = format!("model.layers.{idx}");
         let dense = |name: &str| -> R<QLinear> {
+            // Квантованный бандл: вес как в файле.
+            if let Some(q) = ck.prequant(&format!("{p}.{name}.weight")) {
+                return Ok(QLinear::Quant(q?));
+            }
             let w = ck.get(&format!("{p}.{name}.weight"), compute)?;
             QLinear::build(w, quant.unwrap_or(compute), compute)
                 .map_err(|e| YueError::Load(e.to_string()))

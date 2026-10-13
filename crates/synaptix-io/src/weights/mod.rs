@@ -15,4 +15,9 @@ pub trait WeightLoader: Send + Sync {
     fn contains(&self, name: &str) -> bool {
         self.names().iter().any(|n| *n == name)
     }
+    /// Готовый квант-вес (квантованный бандл); `None` — вес плотный или
+    /// загрузчик про кванты не знает. NVFP4 на карте уже перемешан.
+    fn prequant(&self, _name: &str, _device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        None
+    }
 }

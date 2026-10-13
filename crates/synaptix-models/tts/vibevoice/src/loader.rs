@@ -23,6 +23,12 @@ pub trait WeightSource {
         None
     }
 
+    /// Готовый квант-вес из квантованного бандла (формат задаёт файл);
+    /// `None` — вес плотный.
+    fn prequant(&self, _name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        None
+    }
+
     /// Как [`Self::get`], но на заданное устройство (таблицы, которые живут
     /// в RAM, читаются сразу туда, без захода на карту).
     fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
@@ -77,6 +83,11 @@ impl<L: WeightLoader> WeightSource for LoaderSource<L> {
 
     fn has(&self, name: &str) -> bool {
         self.names.contains(name)
+    }
+
+    fn prequant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        let r = self.loader.prequant(name, self.device)?;
+        Some(r.map_err(|e| VibeVoiceError::Load(format!("{name}: {e}"))))
     }
 
     fn get_on(&self, name: &str, device: Device) -> Result<Tensor> {
@@ -191,5 +202,9 @@ impl WeightSource for VibeVoiceCheckpoint {
 
     fn has(&self, name: &str) -> bool {
         self.source.has(name)
+    }
+
+    fn prequant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight>> {
+        self.source.prequant(name)
     }
 }
