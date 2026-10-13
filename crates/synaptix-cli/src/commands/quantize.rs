@@ -56,6 +56,7 @@ fn llm_rules(path: &std::path::Path) -> Result<Vec<(String, Option<DType>)>, Str
         ("shared_expert".into(), m),
         // таблицы, из которых читают строки, — как есть
         ("pos_embed".into(), None),
+        ("position_embedding".into(), None),
     ])
 }
 
@@ -78,9 +79,9 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     //   llm     — MLP/эксперты NVFP4; внимание, эмбеддинг, голова, зрение,
     //             общие эксперты, первый и последний слой — MXFP8;
     //   encoder — текстовые энкодеры и LLM внутри генераторов: всё MXFP8;
-    //   dit     — блоки DiT: MLP `--format` (по умолчанию nvfp4), внимание
-    //             MXFP8; модуляция/эмбеддеры/выходы и прочие компоненты
-    //             (VAE) — как есть; крайние блоки — правилами `--rule`.
+    //   dit     — блоки DiT (видео/картинки/аудио): MXFP8 (`--format`
+    //             меняет MLP); модуляция/эмбеддеры/выходы и прочие
+    //             компоненты (VAE) — как есть.
     let policy = args.policy.clone();
     let llm = policy.as_deref() == Some("llm");
     let mx = || Some("mxfp8".to_string());
@@ -90,7 +91,8 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some("llm") => (DType::NVFP4, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx)),
         Some("encoder") => (DType::MXFP8, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx)),
         Some("dit") => {
-            let f = if args.format == "sq4" { DType::NVFP4 } else { fmt(&args.format, "--format")?.ok_or("--format")? };
+            // Медиа-модели — MXFP8 целиком (решение владельца: качество).
+            let f = if args.format == "sq4" { DType::MXFP8 } else { fmt(&args.format, "--format")?.ok_or("--format")? };
             (f, args.attn.clone().or_else(mx), args.lm_head.clone().or_else(none), args.embed.clone().or_else(none), args.vision.clone())
         }
         Some(p) => return Err(format!("--policy {p}: известны llm | encoder | dit").into()),
@@ -106,6 +108,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else if policy.is_some() {
         // таблицы, из которых читают строки, — как есть
         rules.push(("pos_embed".into(), None));
+        rules.push(("position_embedding".into(), None));
     }
     let vision = match &args.vision {
         Some(v) => fmt(v, "--vision")?,

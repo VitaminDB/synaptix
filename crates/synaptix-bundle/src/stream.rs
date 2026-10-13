@@ -58,18 +58,41 @@ impl StreamTensor {
 pub trait TensorStream: Send {
     fn plan(&self) -> &[StreamTensor];
     fn write_tensor(&mut self, index: usize, w: &mut dyn Write) -> Result<()>;
+    /// Секция `__metadata__` safetensors-заголовка (например `config` у LTX);
+    /// по умолчанию — нет.
+    fn metadata(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        None
+    }
 }
 
 pub fn safetensors_header(plan: &[StreamTensor], align: usize) -> Result<Vec<u8>> {
+    safetensors_header_meta(plan, align, None)
+}
+
+/// Заголовок с секцией `__metadata__` (строка → строка, как в safetensors).
+pub fn safetensors_header_meta(
+    plan: &[StreamTensor],
+    align: usize,
+    meta: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<Vec<u8>> {
     use std::fmt::Write as _;
 
     let mut offset: u64 = 0;
     let mut json = String::from("{");
-    for (i, t) in plan.iter().enumerate() {
+    let mut first = true;
+    if let Some(m) = meta.filter(|m| !m.is_empty()) {
+        let v = serde_json::to_string(m).map_err(|e| {
+            crate::error::Error::Safetensors(format!("__metadata__ не сериализуется: {e}"))
+        })?;
+        let _ = write!(json, "\"__metadata__\":{v}");
+        first = false;
+    }
+    for t in plan.iter() {
         let n = t.nbytes();
-        if i > 0 {
+        if !first {
             json.push(',');
         }
+        first = false;
         let shape = t
             .shape
             .iter()
@@ -103,7 +126,15 @@ pub fn safetensors_header(plan: &[StreamTensor], align: usize) -> Result<Vec<u8>
 }
 
 pub fn payload_len(plan: &[StreamTensor], align: usize) -> Result<u64> {
-    let hdr = safetensors_header(plan, align)?;
+    payload_len_meta(plan, align, None)
+}
+
+pub fn payload_len_meta(
+    plan: &[StreamTensor],
+    align: usize,
+    meta: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<u64> {
+    let hdr = safetensors_header_meta(plan, align, meta)?;
     let data: u64 = plan.iter().map(|t| t.nbytes()).sum();
     Ok(hdr.len() as u64 + data)
 }

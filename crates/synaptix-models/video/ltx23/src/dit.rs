@@ -187,13 +187,24 @@ impl Lin {
         qdt: DType,
         compute: DType,
     ) -> Result<Self, LtxError> {
-        let mut w = ckpt.get_raw(&format!("{prefix}.{key}.weight"))?;
+        let name = format!("{prefix}.{key}.weight");
+        let b = if bias { Some(ckpt.get_raw(&format!("{prefix}.{key}.bias"))?) } else { None };
+        // Квантованный бандл: формат веса — как в файле. Без LoRA вес берётся
+        // готовым; с LoRA — деквант + ΔW + квант тем же форматом.
+        let stored = ckpt.quant_dtype(&name);
+        if stored.is_some() && !ckpt.has_lora() {
+            if let Some(q) = ckpt.load_quant(&name) {
+                let bias = b.map(|t| t.to_dtype(compute)).transpose().map_err(LtxError::from)?;
+                return Ok(Self(QuantLinear::Quant { w: q?, bias }));
+            }
+        }
+        let qdt = stored.unwrap_or(qdt);
+        let mut w = ckpt.get_raw(&name)?;
         // distilled-LoRA merge: W += (B·strength)@A (до кванта). None если LoRA не трогает.
         if let Some(d) = ckpt.lora_delta(&format!("{prefix}.{key}"), w.dtype())? {
             let d = if d.device() == w.device() { d } else { d.to_device(w.device()).map_err(LtxError::from)? };
             w = w.add(&d).map_err(LtxError::from)?;
         }
-        let b = if bias { Some(ckpt.get_raw(&format!("{prefix}.{key}.bias"))?) } else { None };
         let ql = QuantLinear::build(w, b, qdt, compute)
             .map_err(|e| LtxError::Load(format!("qlinear {prefix}.{key}: {e}")))?;
         Ok(Self(ql))

@@ -65,7 +65,8 @@ pub struct TranscodeSpec {
     pub vision: Option<DType>,
     /// Правила по подстроке имени (`^…` — с начала), первое совпадение:
     /// формат заменяет ролевой у тензоров, которые квантуются и по роли
-    /// (`.layers.0.` → MXFP8 у крайних слоёв); `None` — оставить как есть.
+    /// (`.layers.0.` → MXFP8 у крайних слоёв); `+…` — принудительно, даже
+    /// если роль тензор не квантует; `None` — оставить как есть.
     pub rules: Vec<(String, Option<DType>)>,
     /// Квантовать только эти компоненты бандла (`transformer`, `main`…);
     /// пусто — все. Остальные компоненты копируются как есть (VAE и т. п.).
@@ -104,10 +105,14 @@ impl TranscodeSpec {
         if !self.include.is_empty() && !self.include.iter().any(|p| name.starts_with(p.as_str())) {
             return None;
         }
+        // `+…` — принудительно (и для того, что роль не квантует); затем
         // `^префикс` — с начала имени, иначе подстрока.
-        let hit = |p: &str| match p.strip_prefix('^') {
-            Some(pre) => name.starts_with(pre),
-            None => name.contains(p),
+        let hit = |p: &str| {
+            let p = p.strip_prefix('+').unwrap_or(p);
+            match p.strip_prefix('^') {
+                Some(pre) => name.starts_with(pre),
+                None => name.contains(p),
+            }
         };
         let by_role = if slices > 1 || name.contains(".experts.") {
             self.experts
@@ -125,6 +130,7 @@ impl TranscodeSpec {
         // роли (крайний блок не тянет за собой модуляцию); `none` исключает всегда.
         match self.rules.iter().find(|(p, _)| hit(p)) {
             Some((_, None)) => None,
+            Some((p, Some(d))) if p.starts_with('+') => Some(*d),
             Some((_, Some(d))) => by_role.map(|_| *d),
             None => by_role,
         }
@@ -708,6 +714,8 @@ pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Req
 
 /// Тензоры одного компонента: перекодированные + всё остальное как есть.
 struct FullStream {
+    /// `__metadata__` источника (конфиг LTX и т. п.) — переносится как есть.
+    meta: Option<BTreeMap<String, String>>,
     loader: SynBundleLoader,
     device: Device,
     plan: Vec<StreamTensor>,
@@ -781,13 +789,17 @@ impl FullStream {
             plan.push(StreamTensor { name: name.to_string(), dtype: st, shape });
             kinds.push(Kind::Pass(name.to_string()));
         }
-        Ok(Self { loader, device, plan, kinds, items, pending_scales: None, progress, done: 0 })
+        Ok(Self { meta: loader.st_metadata(), loader, device, plan, kinds, items, pending_scales: None, progress, done: 0 })
     }
 }
 
 impl TensorStream for FullStream {
     fn plan(&self) -> &[StreamTensor] {
         &self.plan
+    }
+
+    fn metadata(&self) -> Option<&BTreeMap<String, String>> {
+        self.meta.as_ref()
     }
 
     fn write_tensor(&mut self, index: usize, w: &mut dyn std::io::Write) -> synaptix_bundle::Result<()> {

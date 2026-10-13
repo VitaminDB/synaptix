@@ -19,7 +19,7 @@ use crate::header::{
     FLAG_HAS_SHA256_MANIFEST,
 };
 use crate::path as syn_path;
-use crate::stream::{payload_len as stream_payload_len, safetensors_header, CountingWriter, TensorStream};
+use crate::stream::{payload_len_meta as stream_payload_len, safetensors_header_meta, CountingWriter, TensorStream};
 use crate::CURRENT_MINOR;
 
 /// Размер блока для стриминговой копии payload'а: достаточно большой, чтобы
@@ -156,7 +156,7 @@ impl BundleBuilder {
             }
         }
         for s in &self.streams {
-            total = total.saturating_add(stream_payload_len(s.stream.plan(), ALIGNMENT as usize)?);
+            total = total.saturating_add(stream_payload_len(s.stream.plan(), ALIGNMENT as usize, s.stream.metadata())?);
         }
         for fp in &self.files {
             match &fp.payload {
@@ -439,7 +439,7 @@ impl BundleBuilder {
         let total_stream_bytes: u64 = self
             .streams
             .iter()
-            .map(|s| stream_payload_len(s.stream.plan(), ALIGNMENT as usize).unwrap_or(0))
+            .map(|s| stream_payload_len(s.stream.plan(), ALIGNMENT as usize, s.stream.metadata()).unwrap_or(0))
             .sum();
         let total_tensor_bytes: u64 = self
             .tensor_sources
@@ -546,7 +546,7 @@ impl BundleBuilder {
         let streams = std::mem::take(&mut self.streams);
         for src in streams {
             let chunk_name = format!("tensors:{}", src.name);
-            let plan_bytes = stream_payload_len(src.stream.plan(), ALIGNMENT as usize)?;
+            let plan_bytes = stream_payload_len(src.stream.plan(), ALIGNMENT as usize, src.stream.metadata())?;
             emit(
                 &self.progress,
                 ProgressEvent::ItemStart {
@@ -842,7 +842,7 @@ fn write_chunk_from_stream(
         return Err(Error::InvalidPath { path: name.into(), reason: "name exceeds MAX_PATH_LEN" });
     }
     let plan: Vec<crate::stream::StreamTensor> = stream.plan().to_vec();
-    let header = safetensors_header(&plan, ALIGNMENT as usize)?;
+    let header = safetensors_header_meta(&plan, ALIGNMENT as usize, stream.metadata())?;
     let payload_len = header.len() as u64 + plan.iter().map(|t| t.nbytes()).sum::<u64>();
     let hlen = header_len(name_bytes.len());
 

@@ -382,7 +382,7 @@ enum Commands {
         #[arg(long)]
         rule: Vec<String>,
         /// Пресет политики: `llm` (MLP NVFP4, чувствительное MXFP8), `encoder`
-        /// (всё MXFP8), `dit` (MLP блоков `--format`, внимание MXFP8).
+        /// (всё MXFP8), `dit` (блоки DiT MXFP8, модуляция и VAE как есть).
         #[arg(long)]
         policy: Option<String>,
         /// Квантовать только этот компонент бандла (повторяемый); прочие — как есть.

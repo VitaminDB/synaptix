@@ -275,6 +275,13 @@ impl SynBundleLoader {
         self
     }
 
+    /// Секция `__metadata__` tensors-чанка (компонента), если есть.
+    pub fn st_metadata(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        let (bytes, _) = self.st_bytes().ok()?;
+        let (_, meta) = safetensors::SafeTensors::read_metadata(bytes).ok()?;
+        meta.metadata().as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
     fn st_bytes(&self) -> Result<(&[u8], Option<String>)> {
         let bundle = self.syn()?;
         match &self.component {

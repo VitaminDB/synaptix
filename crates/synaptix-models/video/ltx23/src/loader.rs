@@ -189,6 +189,16 @@ impl LtxCheckpoint {
         self.loader.raw_bytes(name)
     }
 
+    /// Формат готового кванта веса в квантованном бандле; `None` — плотный.
+    pub fn quant_dtype(&self, name: &str) -> Option<DType> {
+        self.loader.quant_dtype(name)
+    }
+
+    /// Готовый квант-вес на устройство чекпойнта.
+    pub fn load_quant(&self, name: &str) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, LtxError>> {
+        self.loader.load_quant(name, self.device).map(|r| r.map_err(|e| LtxError::Load(format!("{name}: {e}"))))
+    }
+
     /// LoRA прикреплена (слот-стриминг несовместим: веса слота — сырые байты
     /// файла, без мерджа ΔW).
     pub fn has_lora(&self) -> bool {
