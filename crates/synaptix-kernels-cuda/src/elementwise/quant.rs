@@ -37,6 +37,9 @@ pub struct Nvfp4QuantKernels {
     quantize_f16_to_nvfp4_fast: CudaFunction,
     silu_mul_quantize_nvfp4_fast: CudaFunction,
     nvfp4_dequant_f16: CudaFunction,
+    quantize_prescaled_fast: CudaFunction,
+    prescale_absmax: CudaFunction,
+    prescale_finalize: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Nvfp4QuantKernels>)>>> = OnceLock::new();
@@ -78,6 +81,9 @@ impl Nvfp4QuantKernels {
             quantize_f16_to_nvfp4_fast: load_fn(&module, "quantize_f16_to_nvfp4_fast")?,
             silu_mul_quantize_nvfp4_fast: load_fn(&module, "silu_mul_quantize_nvfp4_fast")?,
             nvfp4_dequant_f16: load_fn(&module, "nvfp4_dequant_f16")?,
+            quantize_prescaled_fast: load_fn(&module, "quantize_prescaled_to_nvfp4_fast")?,
+            prescale_absmax: load_fn(&module, "prescale_absmax")?,
+            prescale_finalize: load_fn(&module, "prescale_finalize")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -96,6 +102,49 @@ pub fn nvfp4_scale_buffer_size(outer_dim: usize, inner_dim: usize) -> usize {
 }
 
 const QUANT_CHUNK: u32 = 32_768;
+
+/// Предмасштаб + квант активации (QuantLinear): `max|x|` → шкала
+/// `s = max/target + MIN_POSITIVE`, `inv = 1/s` (оба — в dtype входа,
+/// `scale_out` / `inv_out` по 2 байта), квант `round(x·inv)` в NVFP4. Бит-в-бит с
+/// цепочкой abs → max → affine → recip → broadcast_mul → quantize.
+/// `x` — `[outer, inner]` в dtype ядер (F16 или BF16 — по `kernels`), 16B-выровнен.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_prescale_quant(
+    kernels: &Nvfp4QuantKernels,
+    stream: &Arc<CudaStream>,
+    x: &CudaView<'_, f16>,
+    packed: &mut CudaSlice<u8>,
+    scales_e4m3: &mut CudaSlice<u8>,
+    inv_out: &mut CudaSlice<u8>,
+    scale_out: &mut CudaSlice<u8>,
+    outer_dim: u32,
+    inner_dim: u32,
+    target: f32,
+) -> Result<()> {
+    if inner_dim % 16 != 0 {
+        return Err(SynaptixError::Unsupported("nvfp4_prescale_quant: K%16"));
+    }
+    let n = (outer_dim as u64) * (inner_dim as u64);
+    let mut amax: CudaSlice<u32> = stream.alloc_zeros(1).map_err(|e| SynaptixError::Cuda(format!("prescale amax: {e:?}")))?;
+    let blocks = (n.div_ceil(256 * 8)).clamp(1, 4096) as u32;
+    let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let mut b = stream.launch_builder(&kernels.prescale_absmax);
+    b.arg(x).arg(&n).arg(&mut amax);
+    unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch prescale_absmax: {e:?}")))?;
+    let inv_target = 1.0f32 / target;
+    let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+    let mut b = stream.launch_builder(&kernels.prescale_finalize);
+    b.arg(&amax).arg(&inv_target).arg(&mut *inv_out).arg(&mut *scale_out);
+    unsafe { b.launch(one) }.map_err(|e| SynaptixError::Cuda(format!("launch prescale_finalize: {e:?}")))?;
+    let sf_inner_dim = inner_dim.div_ceil(64) * 4;
+    let outer_cov = outer_dim.div_ceil(128) * 128;
+    let total = (outer_cov as u64) * ((inner_dim / 16) as u64);
+    let cfg = LaunchConfig { grid_dim: (total.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let mut b = stream.launch_builder(&kernels.quantize_prescaled_fast);
+    b.arg(x).arg(&mut *packed).arg(&mut *scales_e4m3).arg(&outer_dim).arg(&inner_dim).arg(&sf_inner_dim).arg(&outer_cov).arg(&*inv_out);
+    unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch quantize_prescaled: {e:?}")))?;
+    Ok(())
+}
 
 pub fn quantize_f16_to_nvfp4(
     kernels: &Nvfp4QuantKernels,

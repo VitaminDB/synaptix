@@ -1505,6 +1505,43 @@ impl Backend for CudaBackend {
         crate::fused::seg_mod::silu_mul_quant_mxfp8(&k, &stream, (x_buf.slice(), x.1.byte_offset()), p_sl, s.slice_mut(), m, f, x.1.dtype())
     }
 
+    fn nvfp4_prescale_quant(
+        &self,
+        x: (&Storage, &Layout),
+        packed_out: &mut Storage,
+        scales_out: &mut Storage,
+        scale_out: &mut Storage,
+        m: usize,
+        k: usize,
+        target: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        require_quant_native(x.0, DType::NVFP4, "nvfp4_prescale_quant: карта без FP4 MMA")?;
+        if !x.1.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let x_buf = x.0.as_cuda().ok_or(SynaptixError::Unsupported("nvfp4_prescale_quant: non-cuda"))?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let qk = match x.1.dtype() {
+            DType::BF16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context_bf16(&ctx)?,
+            DType::F16 => crate::elementwise::quant::Nvfp4QuantKernels::for_context(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("nvfp4_prescale_quant: dtype")),
+        };
+        let n = m * k;
+        let off = x.1.byte_offset();
+        let xv = unsafe { x_buf.slice().slice(off..off + n * 2).transmute::<half::f16>(n) }
+            .ok_or_else(|| SynaptixError::Cuda("nvfp4_prescale_quant: transmute".into()))?;
+        let mut inv: cudarc::driver::CudaSlice<u8> = stream.alloc_zeros(2).map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
+        let p = packed_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("nvfp4_prescale_quant: packed"))?;
+        let p_sl = p.slice_mut();
+        let sc = scales_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("nvfp4_prescale_quant: scales"))?;
+        let sc_sl = sc.slice_mut();
+        let so = scale_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("nvfp4_prescale_quant: scale"))?;
+        crate::elementwise::quant::nvfp4_prescale_quant(&qk, &stream, &xv, p_sl, sc_sl, &mut inv, so.slice_mut(), m as u32, k as u32, target)
+    }
+
     fn qk_norm_rope(
         &self,
         x: (&Storage, &Layout),

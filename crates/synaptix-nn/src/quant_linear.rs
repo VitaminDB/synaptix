@@ -51,6 +51,19 @@ fn quant_matmul_target(x: &Tensor, w: &QuantWeight, target: f32) -> Result<Tenso
         }
         return x.to_dtype(DType::F16)?.linear_quant(w)?.to_dtype(in_dt);
     }
+    // NVFP4 с BF16: предмасштаб одним проходом (amax) прямо в квант и
+    // prequant-GEMM — бит-в-бит с цепочкой ниже, без abs/max/broadcast_mul по x.
+    if native && x.rank() >= 1 {
+        let k = *x.dims().last().unwrap_or(&0);
+        if let Ok((p, sc, scale)) = x.nvfp4_prescale_quant(target) {
+            let m = x.numel() / k.max(1);
+            if let Ok(y) = p.linear_quant_prequant(&sc, w, m, in_dt) {
+                let mut dims = x.dims().to_vec();
+                *dims.last_mut().unwrap() = w.n();
+                return y.reshape(dims)?.broadcast_mul(&scale);
+            }
+        }
+    }
     // max|x| в два этапа: по строкам (быстрое ядро reduce_rows), затем по
     // столбцу максимумов — одна общая редукция по всему тензору шла через
     // generic-путь и на больших активациях стоила больше самих квант-GEMM.

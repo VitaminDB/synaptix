@@ -6,11 +6,13 @@ typedef __nv_bfloat16 syn_in_t;
 typedef __nv_bfloat162 syn_in2_t;
 #define SYN_IN_TO_F(v) __bfloat162float(v)
 #define SYN_IN2_TO_F2(v) __bfloat1622float2(v)
+#define SYN_F_TO_IN(v) __float2bfloat16(v)
 #else
 typedef __half syn_in_t;
 typedef __half2 syn_in2_t;
 #define SYN_IN_TO_F(v) __half2float(v)
 #define SYN_IN2_TO_F2(v) __half22float2(v)
+#define SYN_F_TO_IN(v) __float2half(v)
 #endif
 
 // NVFP4 quantize / dequant kernels (foundation).
@@ -211,14 +213,15 @@ __global__ void quantize_f16_to_nvfp4(
 // outer_cov >= outer_dim: строки [outer_dim, outer_cov) пишут scale=0 (хвост
 // 128-тайла scale-раскладки) — буфер скейлов полностью определён БЕЗ CE-memset
 // со стороны вызывающего (тот аллоцирует uninit).
-__global__ void quantize_f16_to_nvfp4_fast(
+__device__ __forceinline__ void quantize_nvfp4_fast_impl(
     const syn_in_t* __restrict__ x,
     unsigned char* __restrict__ packed,
     unsigned char* __restrict__ scales_e4m3,
     unsigned int outer_dim,
     unsigned int inner_dim,
     unsigned int sf_inner_dim,
-    unsigned int outer_cov
+    unsigned int outer_cov,
+    const syn_in_t* __restrict__ pre_inv
 ) {
     unsigned int groups_per_row = inner_dim >> 4;
     unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -241,9 +244,15 @@ __global__ void quantize_f16_to_nvfp4_fast(
 
     float v[16];
     float amax = 0.0f;
+    float pre = pre_inv ? SYN_IN_TO_F(*pre_inv) : 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float2 f = SYN_IN2_TO_F2(h[i]);
+        if (pre_inv) {
+            // предмасштаб = broadcast_mul(x, inv) в dtype входа (бит-в-бит)
+            f.x = SYN_IN_TO_F(SYN_F_TO_IN(f.x * pre));
+            f.y = SYN_IN_TO_F(SYN_F_TO_IN(f.y * pre));
+        }
         v[2 * i] = f.x;
         v[2 * i + 1] = f.y;
         amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
@@ -286,6 +295,44 @@ __global__ void quantize_f16_to_nvfp4_fast(
 #endif
     *reinterpret_cast<unsigned long long*>(
         packed + ((size_t)outer * inner_dim + (size_t)block_col * 16u) / 2) = out8;
+}
+
+__global__ void quantize_f16_to_nvfp4_fast(
+    const syn_in_t* __restrict__ x, unsigned char* __restrict__ packed, unsigned char* __restrict__ scales_e4m3,
+    unsigned int outer_dim, unsigned int inner_dim, unsigned int sf_inner_dim, unsigned int outer_cov) {
+    quantize_nvfp4_fast_impl(x, packed, scales_e4m3, outer_dim, inner_dim, sf_inner_dim, outer_cov, nullptr);
+}
+
+// Предмасштаб активации (QuantLinear: max|x| → target) одним проходом:
+// x·inv (inv — скаляр dtype входа на устройстве) прямо в кванте — вместо
+// abs → max → broadcast_mul (бит-в-бит с той цепочкой).
+__global__ void quantize_prescaled_to_nvfp4_fast(
+    const syn_in_t* __restrict__ x, unsigned char* __restrict__ packed, unsigned char* __restrict__ scales_e4m3,
+    unsigned int outer_dim, unsigned int inner_dim, unsigned int sf_inner_dim, unsigned int outer_cov,
+    const syn_in_t* __restrict__ inv) {
+    quantize_nvfp4_fast_impl(x, packed, scales_e4m3, outer_dim, inner_dim, sf_inner_dim, outer_cov, inv);
+}
+
+// max|x| по тензору: биты неотрицательного f32 упорядочены как u32 → atomicMax.
+// out обнулён вызывающим.
+__global__ void prescale_absmax(const syn_in_t* __restrict__ x, unsigned long long n, unsigned int* out) {
+    float m = 0.0f;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x)
+        m = fmaxf(m, fabsf(SYN_IN_TO_F(x[i])));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(m));
+}
+
+// Шкала как в QuantLinear: s = max·(1/target) + MIN_POSITIVE (f32, affine),
+// inv = round(1/s), scale = round(s) в dtype входа.
+__global__ void prescale_finalize(const unsigned int* amax, float inv_target, syn_in_t* inv, syn_in_t* scale) {
+    float a = __uint_as_float(*amax);
+    float s = inv_target * a + 0.0f;
+    s = 1.0f * s + 1.17549435e-38f;
+    float r = 1.0f / s;
+    *inv = SYN_F_TO_IN(r);
+    *scale = SYN_F_TO_IN(s);
 }
 
 // `act`: 0 — silu(gate)·up, 1 — gelu_tanh(gate)·up (эксперты Gemma-4).

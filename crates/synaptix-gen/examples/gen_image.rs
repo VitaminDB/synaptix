@@ -22,6 +22,7 @@ fn main() {
             "--steps" => req.steps = v.parse().ok(),
             "--seed" => req.seed = v.parse().unwrap_or(7),
             "--quant" => req.quant = Some(v),
+            "--ref" => req.images.push(v.into()),
             other => panic!("неизвестный флаг {other}"),
         }
         i += 2;

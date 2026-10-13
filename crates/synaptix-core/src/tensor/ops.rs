@@ -1109,6 +1109,32 @@ impl Tensor {
         ))
     }
 
+    /// Предмасштаб + NVFP4-квант активации (QuantLinear): `(packed, scales,
+    /// scale)`, `scale` — `[1]` dtype входа: `y = prequant_gemm · scale`.
+    /// Бит-в-бит с abs → max → affine → recip → broadcast_mul → квант.
+    pub fn nvfp4_prescale_quant(&self, target: f32) -> Result<(Tensor, Tensor, Tensor)> {
+        let dt = self.dtype();
+        let k = *self.dims().last().ok_or(SynaptixError::Unsupported("nvfp4_prescale_quant: scalar"))?;
+        if !matches!(dt, DType::F16 | DType::BF16) || k == 0 || k % 16 != 0 {
+            return Err(SynaptixError::Unsupported("nvfp4_prescale_quant: dtype/K"));
+        }
+        let m = self.layout.numel() / k;
+        let packed_bytes = m * k / 2;
+        let scales_bytes = (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128);
+        let x = self.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
+        let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;
+        let mut scale_st = backend.alloc_uninit(2, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.nvfp4_prescale_quant((&x.storage, &x.layout), &mut packed_st, &mut scales_st, &mut scale_st, m, k, target, &stream)?;
+        Ok((
+            Tensor::from_parts(Arc::new(packed_st), Layout::contiguous(Shape::new(vec![packed_bytes]), DType::U8)),
+            Tensor::from_parts(Arc::new(scales_st), Layout::contiguous(Shape::new(vec![scales_bytes]), DType::U8)),
+            Tensor::from_parts(Arc::new(scale_st), Layout::contiguous(Shape::new(vec![1]), dt)),
+        ))
+    }
+
     /// Gated residual с сегментной модуляцией: `self + y·g[ridx[row]]`
     /// (`self/y [m, d]`, `g` — таблица `[R, d]`, `ridx` I32 `[m]`) одним
     /// запуском; округления = [`Self::fused_gate_residual`] бит-в-бит.

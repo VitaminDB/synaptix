@@ -511,6 +511,24 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("silu_mul_quant_mxfp8 не поддержан этим backend"))
     }
 
+    /// Предмасштаб + NVFP4-квант активации `x [m, k]` (F16|BF16): шкала
+    /// `max|x|/target + MIN_POSITIVE` (скаляр dtype входа → `scale_out`),
+    /// квант `round(x/шкала)` (бит-в-бит с abs→max→recip→broadcast_mul→квант).
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_prescale_quant(
+        &self,
+        _x: (&Storage, &Layout),
+        _packed_out: &mut Storage,
+        _scales_out: &mut Storage,
+        _scale_out: &mut Storage,
+        _m: usize,
+        _k: usize,
+        _target: f32,
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_prescale_quant не поддержан этим backend"))
+    }
+
     /// MXFP8-вариант [`Self::rms_mod_quant_nvfp4`]: тот же контракт нормы
     /// (kind 0..3), эпилог = mxfp8-квант (бит-в-бит с mxfp8-квантом активации).
     /// `packed_out` u8 `[m·k]`, `scales_out` natural u8 `[m·k/32]`.
