@@ -140,3 +140,24 @@ fn silu_mul_quant_mxfp8_bitexact() {
         }
     }
 }
+
+#[test]
+fn layer_norm_plain_bitexact() {
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    for dt in [DType::BF16, DType::F16] {
+        for (m, n) in [(300usize, 3072usize), (4106, 4096), (5, 512), (3, 9000)] {
+            // смещение и выбросы — как остаточный поток Qwen-Image
+            let v: Vec<f32> = det(31, m * n, 3.0).iter().enumerate().map(|(i, x)| if i % 101 == 0 { x * 900.0 + 50.0 } else { x + 50.0 }).collect();
+            let x = Tensor::from_vec(v, vec![1, m, n], dev).unwrap().to_dtype(dt).unwrap();
+            let y = x.layer_norm_plain(1e-6).unwrap();
+            let xf = x.to_dtype(DType::F32).unwrap();
+            let mean = xf.mean_keepdim(2).unwrap();
+            let c = xf.broadcast_sub(&mean).unwrap();
+            let var = c.sqr().unwrap().mean_keepdim(2).unwrap();
+            let inv = var.add_scalar(1e-6).unwrap().sqrt().unwrap().recip().unwrap();
+            let r = c.broadcast_mul(&inv).unwrap().to_dtype(dt).unwrap();
+            assert_eq!(bytes(&y), bytes(&r), "layer_norm_plain (m={m} n={n} {dt:?})");
+        }
+    }
+}

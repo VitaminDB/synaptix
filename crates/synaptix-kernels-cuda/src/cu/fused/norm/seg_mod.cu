@@ -203,3 +203,59 @@ extern "C" __global__ void silu_mul_quant_mxfp8_bf16(
 extern "C" __global__ void silu_mul_quant_mxfp8_f16(
     const __half* h, unsigned char* out_fp8, unsigned char* out_scales, int rows, int F)
 { silu_mul_quant_mxfp8_impl<__half>(h, out_fp8, out_scales, rows, F); }
+
+// LayerNorm без γ/β (Qwen-Image и др.): одним блоком на строку — бит-в-бит с
+// разложенной цепочкой to(F32) → mean_keepdim → sub → sqr → mean_keepdim →
+// +eps → sqrt → recip → mul → to(T): редукции повторяют reduce_rows (та же
+// раскладка нитей, xor-шаффлы, частичные суммы варпов, деление на n), блок —
+// как rows_launch_cfg (128/256/1024 по длине строки).
+__device__ __forceinline__ float lnp_block_sum(float acc, float* part) {
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+  unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = (blockDim.x + 31u) >> 5;
+  if (lane == 0u) part[warp] = acc;
+  __syncthreads();
+  if (warp == 0u) {
+    acc = (lane < nwarps) ? part[lane] : 0.0f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+  }
+  return acc;
+}
+
+template <typename T>
+__device__ __forceinline__ void layer_norm_plain_impl(const T* __restrict__ x, T* __restrict__ y, long long n, float eps) {
+  __shared__ float part[32];
+  __shared__ float s_val;
+  const T* xr = x + (long long)blockIdx.x * n;
+  T* yr = y + (long long)blockIdx.x * n;
+  float acc = 0.0f;
+  for (long long j = threadIdx.x; j < n; j += blockDim.x) acc += qk_ld(xr + j);
+  acc = lnp_block_sum(acc, part);
+  if (threadIdx.x == 0) s_val = acc / (float)n;
+  __syncthreads();
+  float mean = s_val;
+  __syncthreads();
+  acc = 0.0f;
+  for (long long j = threadIdx.x; j < n; j += blockDim.x) {
+    float c = qk_ld(xr + j) - mean;
+    acc += __fmul_rn(c, c); // sqr округляет до сложения — без fma-слияния
+  }
+  acc = lnp_block_sum(acc, part);
+  if (threadIdx.x == 0) {
+    float var = acc / (float)n;
+    float v = 1.0f * var + eps;
+    s_val = 1.0f / sqrtf(v);
+  }
+  __syncthreads();
+  float inv = s_val;
+  for (long long j = threadIdx.x; j < n; j += blockDim.x) {
+    float c = qk_ld(xr + j) - mean;
+    qk_st(yr + j, c * inv);
+  }
+}
+
+extern "C" __global__ void layer_norm_plain_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, float eps)
+{ layer_norm_plain_impl<__nv_bfloat16>(x, y, n, eps); }
+extern "C" __global__ void layer_norm_plain_f16(const __half* x, __half* y, long long n, float eps)
+{ layer_norm_plain_impl<__half>(x, y, n, eps); }

@@ -529,6 +529,12 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("nvfp4_prescale_quant не поддержан этим backend"))
     }
 
+    /// LayerNorm без γ/β по последней оси (F16|BF16), бит-в-бит с разложенной
+    /// F32-цепочкой.
+    fn layer_norm_plain(&self, _x: (&Storage, &Layout), _out: &mut Storage, _rows: usize, _n: usize, _eps: f32, _stream: &Stream) -> Result<()> {
+        Err(SynaptixError::Unsupported("layer_norm_plain не поддержан этим backend"))
+    }
+
     /// MXFP8-вариант [`Self::rms_mod_quant_nvfp4`]: тот же контракт нормы
     /// (kind 0..3), эпилог = mxfp8-квант (бит-в-бит с mxfp8-квантом активации).
     /// `packed_out` u8 `[m·k]`, `scales_out` natural u8 `[m·k/32]`.

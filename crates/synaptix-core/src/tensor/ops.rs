@@ -1135,6 +1135,24 @@ impl Tensor {
         ))
     }
 
+    /// LayerNorm без γ/β по последней оси одним ядром (F16|BF16) — бит-в-бит
+    /// с разложенной F32-цепочкой `synaptix_ops::norm::layer_norm(x, None, None)`.
+    pub fn layer_norm_plain(&self, eps: f32) -> Result<Tensor> {
+        let dt = self.dtype();
+        let n = *self.dims().last().ok_or(SynaptixError::Unsupported("layer_norm_plain: scalar"))?;
+        if !matches!(dt, DType::F16 | DType::BF16) || n == 0 {
+            return Err(SynaptixError::Unsupported("layer_norm_plain: dtype"));
+        }
+        let rows = self.layout.numel() / n;
+        let x = self.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let out_layout = Layout::contiguous(Shape::new(self.dims().to_vec()), dt);
+        let mut out_st = backend.alloc_uninit(dt.bytes_for_numel(rows * n), self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.layer_norm_plain((&x.storage, &x.layout), &mut out_st, rows, n, eps, &stream)?;
+        Ok(Tensor::from_parts(Arc::new(out_st), out_layout))
+    }
+
     /// Gated residual с сегментной модуляцией: `self + y·g[ridx[row]]`
     /// (`self/y [m, d]`, `g` — таблица `[R, d]`, `ridx` I32 `[m]`) одним
     /// запуском; округления = [`Self::fused_gate_residual`] бит-в-бит.

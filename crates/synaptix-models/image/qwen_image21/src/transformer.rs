@@ -389,9 +389,12 @@ impl Block {
         let (h, hd) = (cfg.num_heads, cfg.head_dim);
         let d = x.dims();
         let (b, s) = (d[0], d[1]);
-        let q = rms_norm(&to_heads(&qf(&self.to_q, x)?, h, hd)?, &self.norm_q, cfg.eps)?;
-        let k = rms_norm(&to_heads(&qf(&self.to_k, x)?, h, hd)?, &self.norm_k, cfg.eps)?;
-        let v = to_heads(&qf(&self.to_v, x)?, h, hd)?;
+        // Общий вход q/k/v квантуется один раз (бит-в-бит с отдельными qf).
+        let [qx, kx, vx]: [Tensor; 3] = QuantLinear::forward_many(x, &[&self.to_q, &self.to_k, &self.to_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
+        let q = rms_norm(&to_heads(&qx, h, hd)?, &self.norm_q, cfg.eps)?;
+        let k = rms_norm(&to_heads(&kx, h, hd)?, &self.norm_k, cfg.eps)?;
+        let v = to_heads(&vx, h, hd)?;
+        drop((qx, kx));
         let q = heads_first(&apply_rope(&q, cos, sin)?)?;
         let k = heads_first(&apply_rope(&k, cos, sin)?)?;
         let v = heads_first(&v)?;
@@ -447,8 +450,7 @@ impl Block {
         let x = res_add(x, &m1.gated(&a)?)?;
         drop(a);
         let n2 = m2.modulate(&layer_norm(&x, None, None, cfg.eps)?)?;
-        let g = qf(&self.gate_layer, &n2)?;
-        let u = qf(&self.proj, &n2)?;
+        let [g, u]: [Tensor; 2] = QuantLinear::forward_many(&n2, &[&self.gate_layer, &self.proj])?.try_into().map_err(|_| SynaptixError::Other("mlp".into()))?;
         drop(n2);
         let act = match g.silu_and_mul(&u) {
             Ok(a) => a,

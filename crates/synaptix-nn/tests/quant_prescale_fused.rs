@@ -43,3 +43,29 @@ fn prescale_fused_bitexact() {
         assert_eq!(diff, 0, "m={m} k={k} n={n}: {diff} элементов отличаются");
     }
 }
+
+#[test]
+fn forward_many_bitexact() {
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    for q in [DType::NVFP4, DType::MXFP8] {
+        let (m, k) = (300usize, 1024usize);
+        let ls: Vec<QuantLinear> = (0..3)
+            .map(|i| {
+                let w = Tensor::from_vec(det(10 + i, 512 * k, 0.05), vec![512, k], dev).unwrap().to_dtype(DType::BF16).unwrap();
+                let b = Tensor::from_vec(det(20 + i, 512, 0.1), vec![512], dev).unwrap().to_dtype(DType::BF16).unwrap();
+                QuantLinear::build(w, Some(b), q, DType::BF16).unwrap()
+            })
+            .collect();
+        let x = Tensor::from_vec(det(3, m * k, 5.0), vec![1, m, k], dev).unwrap().to_dtype(DType::BF16).unwrap();
+        let refs: Vec<&QuantLinear> = ls.iter().collect();
+        let many = QuantLinear::forward_many(&x, &refs).unwrap();
+        for (l, y) in ls.iter().zip(&many) {
+            let r = l.forward(&x).unwrap();
+            assert_eq!(r.dims(), y.dims());
+            let a: Vec<f32> = y.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let b: Vec<f32> = r.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()), "{q:?}: forward_many ≠ forward");
+        }
+    }
+}

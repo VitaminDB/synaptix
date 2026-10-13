@@ -22,6 +22,12 @@ pub fn layer_norm(
         }
     }
 
+    // Без γ/β — слитое ядро (бит-в-бит с цепочкой ниже).
+    if weight.is_none() && bias.is_none() && !synaptix_core::grad::needs_graph(&[x]) {
+        if let Ok(out) = x.layer_norm_plain(eps) {
+            return Ok(out);
+        }
+    }
     let dtype_in = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
     let last = x_f32.rank() - 1;

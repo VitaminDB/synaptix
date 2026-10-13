@@ -91,6 +91,43 @@ fn quant_matmul_target(x: &Tensor, w: &QuantWeight, target: f32) -> Result<Tenso
 }
 
 impl QuantLinear {
+    /// Несколько проекций одного входа (q/k/v, gate/up): вход квантуется один
+    /// раз и идёт в prequant-GEMM каждой — бит-в-бит с отдельными `forward`
+    /// (у них одинаковый вход → одинаковые шкала и квант). Иначе — по одной.
+    pub fn forward_many(x: &Tensor, ls: &[&QuantLinear]) -> Result<Vec<Tensor>> {
+        let dt = ls.iter().map(|l| l.quant_dtype()).collect::<Vec<_>>();
+        let same = dt.first().copied().flatten().filter(|d| dt.iter().all(|x| *x == Some(*d)));
+        let k = *x.dims().last().unwrap_or(&0);
+        if let (Some(q), DType::BF16, true) = (same, x.dtype(), ls.len() > 1 && k > 0) {
+            let m = x.numel() / k;
+            let shared = match q {
+                DType::NVFP4 if prescale_enabled() && !nvfp4_weight_only() => {
+                    x.nvfp4_prescale_quant(F16_TARGET).ok().map(|(p, s, sc)| (p, s, Some(sc)))
+                }
+                DType::MXFP8 => x.mxfp8_quantize_act().ok().map(|(p, s)| (p, s, None)),
+                _ => None,
+            };
+            if let Some((p, s, scale)) = shared {
+                let mut out = Vec::with_capacity(ls.len());
+                for l in ls {
+                    let QuantLinear::Quant { w, bias } = l else { unreachable!() };
+                    let mut dims = x.dims().to_vec();
+                    *dims.last_mut().unwrap() = w.n();
+                    let mut y = p.linear_quant_prequant(&s, w, m, DType::BF16)?.reshape(dims)?;
+                    if let Some(sc) = &scale {
+                        y = y.broadcast_mul(sc)?;
+                    }
+                    if let Some(b) = bias {
+                        y = y.broadcast_add(b)?;
+                    }
+                    out.push(y);
+                }
+                return Ok(out);
+            }
+        }
+        ls.iter().map(|l| l.forward(x)).collect()
+    }
+
     pub fn build(
         weight: Tensor,
         bias: Option<Tensor>,

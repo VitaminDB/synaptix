@@ -1542,6 +1542,19 @@ impl Backend for CudaBackend {
         crate::elementwise::quant::nvfp4_prescale_quant(&qk, &stream, &xv, p_sl, sc_sl, &mut inv, so.slice_mut(), m as u32, k as u32, target)
     }
 
+    fn layer_norm_plain(&self, x: (&Storage, &Layout), out: &mut Storage, rows: usize, n: usize, eps: f32, _stream: &Stream) -> Result<()> {
+        if !x.1.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let x_buf = x.0.as_cuda().ok_or(SynaptixError::Unsupported("layer_norm_plain: non-cuda"))?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::fused::seg_mod::SegModKernels::for_context(&ctx)?;
+        let o = out.as_cuda_mut().ok_or(SynaptixError::Unsupported("layer_norm_plain: out"))?;
+        crate::fused::seg_mod::layer_norm_plain(&k, &stream, (x_buf.slice(), x.1.byte_offset()), o.slice_mut(), rows, n, eps, x.1.dtype())
+    }
+
     fn qk_norm_rope(
         &self,
         x: (&Storage, &Layout),

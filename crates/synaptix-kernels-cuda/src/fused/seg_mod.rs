@@ -20,6 +20,8 @@ pub struct SegModKernels {
     qk_f16: CudaFunction,
     smq_bf16: CudaFunction,
     smq_f16: CudaFunction,
+    lnp_bf16: CudaFunction,
+    lnp_f16: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<SegModKernels>)>>> = OnceLock::new();
@@ -40,6 +42,8 @@ impl SegModKernels {
             qk_f16: load_fn(&module, "qk_norm_rope_f16")?,
             smq_bf16: load_fn(&module, "silu_mul_quant_mxfp8_bf16")?,
             smq_f16: load_fn(&module, "silu_mul_quant_mxfp8_f16")?,
+            lnp_bf16: load_fn(&module, "layer_norm_plain_bf16")?,
+            lnp_f16: load_fn(&module, "layer_norm_plain_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -182,6 +186,42 @@ pub fn silu_mul_quant_mxfp8(
         DType::BF16 => go!(half::bf16, &k.smq_bf16),
         DType::F16 => go!(half::f16, &k.smq_f16),
         _ => return Err(SynaptixError::Unsupported("silu_mul_quant_mxfp8: dtype")),
+    }
+    Ok(())
+}
+
+/// LayerNorm без γ/β по строкам `[rows, n]` (T = F16|BF16), бит-в-бит с
+/// разложенной F32-цепочкой (блок — как у reduce_rows).
+pub fn layer_norm_plain(
+    k: &SegModKernels,
+    stream: &Arc<CudaStream>,
+    (x, x_off): (&CudaSlice<u8>, usize),
+    out: &mut CudaSlice<u8>,
+    rows: usize,
+    n: usize,
+    eps: f32,
+    dtype: DType,
+) -> Result<()> {
+    if rows == 0 || n == 0 {
+        return Ok(());
+    }
+    let threads = if n >= 8192 { 1024 } else if n >= 1024 { 256 } else { 128 };
+    let cfg = LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    let nl = n as i64;
+    macro_rules! go {
+        ($t:ty, $f:expr) => {{
+            let xv = view::<$t>(x, x_off, rows * n, "x")?;
+            let mut os = out.slice_mut(0..rows * n * 2);
+            let mut ov = unsafe { os.transmute_mut::<$t>(rows * n) }.ok_or_else(|| SynaptixError::Cuda("layer_norm_plain: out".into()))?;
+            let mut b = stream.launch_builder($f);
+            b.arg(&xv).arg(&mut ov).arg(&nl).arg(&eps);
+            unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch layer_norm_plain: {e:?}")))?;
+        }};
+    }
+    match dtype {
+        DType::BF16 => go!(half::bf16, &k.lnp_bf16),
+        DType::F16 => go!(half::f16, &k.lnp_f16),
+        _ => return Err(SynaptixError::Unsupported("layer_norm_plain: dtype")),
     }
     Ok(())
 }

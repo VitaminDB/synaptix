@@ -224,9 +224,7 @@ struct ImgMod<'a> {
 impl ImgMod<'_> {
     /// `x·(1 + scale) + shift` по отрезкам.
     fn modulate(&self, x: &Tensor, k: usize) -> Result<Tensor> {
-        let one = |x: &Tensor, m: &Mod6| -> Result<Tensor> {
-            x.broadcast_mul(&m.scale(k).add_scalar(1.0)?)?.broadcast_add(m.shift(k))
-        };
+        let one = |x: &Tensor, m: &Mod6| -> Result<Tensor> { modulate(x, m, k) };
         match self.cond {
             None => one(x, self.main),
             Some((c, split)) => {
@@ -235,6 +233,14 @@ impl ImgMod<'_> {
                 let b = one(&x.narrow(1, split, n - split)?.contiguous()?, c)?;
                 Tensor::cat(&[&a, &b], 1)
             }
+        }
+    }
+
+    /// `acc + gated(y)`: без отрезков — одним ядром.
+    fn gate_add(&self, acc: &Tensor, y: &Tensor, k: usize) -> Result<Tensor> {
+        match self.cond {
+            None => gate_add(acc, y, self.main.gate(k)),
+            Some(_) => res_add(acc, &self.gated(y, k)?),
         }
     }
 
@@ -251,8 +257,22 @@ impl ImgMod<'_> {
     }
 }
 
+/// `x·(1+scale)+shift`: слитым ядром (те же округления), иначе по шагам.
 fn modulate(x: &Tensor, m: &Mod6, k: usize) -> Result<Tensor> {
+    if let Ok(y) = x.fused_mod_row(m.scale(k), m.shift(k)) {
+        return Ok(y);
+    }
     x.broadcast_mul(&m.scale(k).add_scalar(1.0)?)?.broadcast_add(m.shift(k))
+}
+
+/// `acc + y·g` одним ядром (бит-в-бит с broadcast_mul → add), иначе по шагам.
+fn gate_add(acc: &Tensor, y: &Tensor, g: &Tensor) -> Result<Tensor> {
+    if acc.dtype() == y.dtype() && y.dtype() == g.dtype() {
+        if let Ok(r) = acc.fused_gate_residual(y, g) {
+            return Ok(r);
+        }
+    }
+    res_add(acc, &y.broadcast_mul(g)?)
 }
 
 /// Веса блока без модуляций.
@@ -351,12 +371,16 @@ impl Block {
         let ni = im.modulate(&layer_norm(img, None, None, EPS)?, 0)?;
         let nt = modulate(&layer_norm(txt, None, None, EPS)?, tm, 0)?;
 
-        let q = rms_norm(&to_heads(&qf(&self.to_q, &ni)?, h, hd)?, &self.norm_q, EPS)?;
-        let k = rms_norm(&to_heads(&qf(&self.to_k, &ni)?, h, hd)?, &self.norm_k, EPS)?;
-        let v = to_heads(&qf(&self.to_v, &ni)?, h, hd)?;
-        let eq = rms_norm(&to_heads(&qf(&self.add_q, &nt)?, h, hd)?, &self.norm_aq, EPS)?;
-        let ek = rms_norm(&to_heads(&qf(&self.add_k, &nt)?, h, hd)?, &self.norm_ak, EPS)?;
-        let ev = to_heads(&qf(&self.add_v, &nt)?, h, hd)?;
+        // Общий вход q/k/v квантуется один раз (бит-в-бит с отдельными qf).
+        let [qi, ki, vi]: [Tensor; 3] = QuantLinear::forward_many(&ni, &[&self.to_q, &self.to_k, &self.to_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
+        let [qt, kt, vt]: [Tensor; 3] = QuantLinear::forward_many(&nt, &[&self.add_q, &self.add_k, &self.add_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
+        let q = rms_norm(&to_heads(&qi, h, hd)?, &self.norm_q, EPS)?;
+        let k = rms_norm(&to_heads(&ki, h, hd)?, &self.norm_k, EPS)?;
+        let v = to_heads(&vi, h, hd)?;
+        let eq = rms_norm(&to_heads(&qt, h, hd)?, &self.norm_aq, EPS)?;
+        let ek = rms_norm(&to_heads(&kt, h, hd)?, &self.norm_ak, EPS)?;
+        let ev = to_heads(&vt, h, hd)?;
+        drop((qi, ki, vi, qt, kt, vt));
         drop((ni, nt));
 
         let q = apply_rope(&Tensor::cat(&[&eq, &q], 1)?, cos, sin)?;
@@ -370,19 +394,19 @@ impl Block {
         let img_attn = qf(&self.to_out, &attn.narrow(1, st, total - st)?.contiguous()?)?;
         drop(attn);
 
-        let img = res_add(img, &im.gated(&img_attn, 0)?)?;
-        let txt = res_add(txt, &txt_attn.broadcast_mul(tm.gate(0))?)?;
+        let img = im.gate_add(img, &img_attn, 0)?;
+        let txt = gate_add(txt, &txt_attn, tm.gate(0))?;
         drop((img_attn, txt_attn));
 
         let n2 = im.modulate(&layer_norm(&img, None, None, EPS)?, 1)?;
         let ff = qf(&self.img_ff_out, &qf(&self.img_ff_in, &n2)?.gelu_tanh()?)?;
         drop(n2);
-        let img = res_add(&img, &im.gated(&ff, 1)?)?;
+        let img = im.gate_add(&img, &ff, 1)?;
         drop(ff);
 
         let n2 = modulate(&layer_norm(&txt, None, None, EPS)?, tm, 1)?;
         let ff = qf(&self.txt_ff_out, &qf(&self.txt_ff_in, &n2)?.gelu_tanh()?)?;
-        let txt = res_add(&txt, &ff.broadcast_mul(tm.gate(1))?)?;
+        let txt = gate_add(&txt, &ff, tm.gate(1))?;
         Ok((img, txt))
     }
 }
