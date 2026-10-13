@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.environ.get("VIBEVOICE_SRC", "/home/master/Storage/VibeVoice"))
+sys.path.insert(0, os.environ.get("VIBEVOICE_SRC", "/home/master/Storage/Нейросети/VibeVoice"))
 
 from safetensors.torch import save_file
 

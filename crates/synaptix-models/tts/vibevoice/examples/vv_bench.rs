@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     synaptix_kernels_cuda::ensure_registered();
     let bundle = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/run/media/storage/syn_models/vibevoice-1.5b.syn".into());
+        .unwrap_or_else(|| "/run/media/storage/Нейросети/Модели/vibevoice-1.5b.syn".into());
     let dtype = match std::env::args().nth(2).as_deref() {
         Some("f32") => DType::F32,
         Some("f16") => DType::F16,

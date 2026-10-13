@@ -5,7 +5,7 @@
 латенты; акустический σ-VAE стримингово декодирует их в звук 24 кГц, а
 семантический энкодер тем же шагом возвращает признаки обратно в LM.
 
-Источник истины — upstream `/home/master/Storage/VibeVoice` (`vibevoice/`),
+Источник истины — upstream `/home/master/Storage/Нейросети/VibeVoice` (`vibevoice/`),
 конвертация весов не требуется: имена тензоров в `.syn` совпадают с HF.
 
 ## Компоненты и раскладка весов
@@ -133,9 +133,9 @@ RMS > 1e-3.
 ## Запуск гейтов
 
 ```
-SYN_VV_BUNDLE=/run/media/storage/syn_models/vibevoice-1.5b.syn \
-SYN_VV_REF=/run/media/storage/tmp/vv_ref/components.safetensors \
-SYN_VV_GEN_REF=/run/media/storage/tmp/vv_ref/generate.safetensors \
+SYN_VV_BUNDLE=/run/media/storage/Нейросети/Модели/vibevoice-1.5b.syn \
+SYN_VV_REF=/run/media/storage/Нейросети/Эталоны/vv_ref/components.safetensors \
+SYN_VV_GEN_REF=/run/media/storage/Нейросети/Эталоны/vv_ref/generate.safetensors \
   cargo test -p synaptix-tts-vibevoice --release
 ```
 

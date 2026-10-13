@@ -226,9 +226,9 @@ impl Qwen2Model {
             let lin = |name: &str, bias: bool| -> Result<QuantLinear> {
                 let w = src.get(&k(&format!("{name}.weight")))?;
                 let b = if bias { Some(src.get(&k(&format!("{name}.bias")))?) } else { None };
-                match src.quant() {
-                    Some(q) => QuantLinear::build(w, b, q, w_dtype).map_err(err),
-                    None => QuantLinear::dense(w, b).map_err(err),
+                match src.quant().map(|q| layer_quant(q, i, n, name)) {
+                    Some(Some(q)) => QuantLinear::build(w, b, q, w_dtype).map_err(err),
+                    _ => QuantLinear::dense(w, b).map_err(err),
                 }
             };
             let layer = Layer {
@@ -604,5 +604,31 @@ impl Qwen2Model {
         })?;
         cache.len = past + s;
         rms_norm(&hidden, &self.final_norm, eps).map_err(err)
+    }
+}
+
+/// Квант слоя LM с учётом чувствительности. NVFP4 по всем слоям портит речь
+/// 1.5B-модели (распознавание: «Сибонт и тепли осенний ген…»); по умолчанию
+/// NVFP4 — только gate/up MLP (2/3 весов слоя), внимание и down_proj — MXFP8,
+/// два крайних слоя с каждой стороны плотные: качество на уровне bf16 у 1.5B
+/// и 7B. `SYN_VV_POLICY` = gu4 (умолч.) | all | down8 | attn8 | edge |
+/// edge_down8 | mx8. `None` — слой плотный.
+fn layer_quant(q: DType, i: usize, n: usize, name: &str) -> Option<DType> {
+    if q != DType::NVFP4 {
+        return Some(q);
+    }
+    let policy = std::env::var("SYN_VV_POLICY").unwrap_or_else(|_| "gu4".into());
+    let edge = i < 2 || i + 2 >= n;
+    match policy.as_str() {
+        "down8" if name.ends_with("down_proj") => Some(DType::MXFP8),
+        "attn8" if name.contains("self_attn") => Some(DType::MXFP8),
+        "edge" if edge => None,
+        "edge_down8" if edge => None,
+        "edge_down8" if name.ends_with("down_proj") => Some(DType::MXFP8),
+        "mx8" => Some(DType::MXFP8),
+        "gu4" if edge => None,
+        "gu4" if name.ends_with("gate_proj") || name.ends_with("up_proj") => Some(q),
+        "gu4" => Some(DType::MXFP8),
+        _ => Some(q),
     }
 }
