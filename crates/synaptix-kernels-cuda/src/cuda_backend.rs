@@ -2379,7 +2379,7 @@ impl Backend for CudaBackend {
             && v_lo.offset() == 0
             && fp8_attention_applies(dtype, d, causal, nh, nkv, t_q, t_kv)
         {
-            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_context(&ctx)?;
+            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_dtype(&ctx, dtype)?;
             return crate::attention::flash_fp8::flash_fp8_bshd(
                 &k8, &stream, (q_buf.slice(), 0), (k_buf.slice(), 0), (v_buf.slice(), 0), out_buf.slice_mut(), b * nh, 1, t_q, t_kv, scale, true,
             );
@@ -3320,7 +3320,7 @@ impl Backend for CudaBackend {
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let out_buf = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("flash_bshd: out non-cuda"))?;
         if fp8_attention_applies(dtype, d, causal, h, hkv, s_q, s_kv) {
-            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_context(&ctx)?;
+            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_dtype(&ctx, dtype)?;
             return crate::attention::flash_fp8::flash_fp8_bshd(
                 &k8, &stream, (q_buf.slice(), 0), (k_buf.slice(), 0), (v_buf.slice(), 0), out_buf.slice_mut(), b, h, s_q, s_kv, scale, true,
             );
@@ -7225,5 +7225,5 @@ impl Backend for CudaBackend {
 /// FP8-внимание вместо bf16: включено для потока (`set_attention_fp8`),
 /// bf16, head_dim 128, без маски и GQA, обе последовательности ≥ 256.
 fn fp8_attention_applies(dtype: DType, d: usize, causal: bool, h: usize, hkv: usize, s_q: usize, s_kv: usize) -> bool {
-    synaptix_core::precision::attention_fp8() && dtype == DType::BF16 && d == 128 && !causal && h == hkv && s_q >= 256 && s_kv >= 256
+    synaptix_core::precision::attention_fp8() && matches!(dtype, DType::BF16 | DType::F16) && d == 128 && !causal && h == hkv && s_q >= 256 && s_kv >= 256
 }

@@ -23,19 +23,34 @@ pub struct FlashFp8Kernels {
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashFp8Kernels>)>>> = OnceLock::new();
+static CACHE_F16: OnceLock<Mutex<Vec<(usize, Arc<FlashFp8Kernels>)>>> = OnceLock::new();
 
 const SMEM_QK: u32 = 8192 + 16384 + 32768;
 const SMEM_FULL: u32 = 8192 + 16384 + 16384;
 
 impl FlashFp8Kernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
-        let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        Self::build(ctx, &CACHE, false)
+    }
+
+    /// Ядра под тип входа/выхода: BF16 или F16 (`-DFA8_F16`).
+    pub fn for_dtype(ctx: &Arc<CudaContext>, dt: synaptix_core::dtype::DType) -> Result<Arc<Self>> {
+        if dt == synaptix_core::dtype::DType::F16 {
+            Self::build(ctx, &CACHE_F16, true)
+        } else {
+            Self::build(ctx, &CACHE, false)
+        }
+    }
+
+    fn build(ctx: &Arc<CudaContext>, cache: &OnceLock<Mutex<Vec<(usize, Arc<FlashFp8Kernels>)>>>, f16: bool) -> Result<Arc<Self>> {
+        let cache = cache.get_or_init(|| Mutex::new(Vec::new()));
         let key = Arc::as_ptr(ctx) as usize;
         if let Some((_, v)) = cache.lock().iter().find(|(k, _)| *k == key) {
             return Ok(v.clone());
         }
         let src = include_str!("../cu/fused/attention/flash_fp8.cu");
-        let module = compile_module_req(ctx, src, "flash_fp8.cu", &[], crate::caps::Feature::Fp8Mma)?;
+        let (name, opts): (&str, &[&str]) = if f16 { ("flash_fp8_f16.cu", &["-DFA8_F16"]) } else { ("flash_fp8.cu", &[]) };
+        let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Fp8Mma)?;
         let main_qk = load_fn(&module, "flash_fp8_qk_hd128_bshd")?;
         let main_full = load_fn(&module, "flash_fp8_full_hd128_bshd")?;
         for (f, s) in [(&main_qk, SMEM_QK), (&main_full, SMEM_FULL)] {
@@ -60,8 +75,8 @@ fn launch_err(what: &str) -> impl Fn(cudarc::driver::DriverError) -> SynaptixErr
     move |e| SynaptixError::Cuda(format!("launch {what}: {e:?}"))
 }
 
-/// `q [B,Sq,H,128]`, `k/v [B,Skv,H,128]` bf16 (байтовые срезы со смещением),
-/// `out [B,Sq,H,128]` bf16.
+/// `q [B,Sq,H,128]`, `k/v [B,Skv,H,128]` bf16 или f16 — по ядрам `kern`
+/// (байтовые срезы со смещением), `out [B,Sq,H,128]` того же типа.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_fp8_bshd(
     kern: &FlashFp8Kernels,

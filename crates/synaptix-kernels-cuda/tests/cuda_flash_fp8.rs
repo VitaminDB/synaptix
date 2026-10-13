@@ -18,6 +18,10 @@ fn det(seed: u64, n: usize) -> Vec<f32> {
 }
 
 fn run(h: usize, sq: usize, skv: usize, full: bool) -> (f32, f32) {
+    run_dt(h, sq, skv, full, DType::BF16)
+}
+
+fn run_dt(h: usize, sq: usize, skv: usize, full: bool, dt: DType) -> (f32, f32) {
     synaptix_kernels_cuda::ensure_registered();
     let ctx = synaptix_core::device::cuda::get(0).unwrap();
     let stream = synaptix_core::device::cuda::default_stream(0).unwrap();
@@ -30,7 +34,8 @@ fn run(h: usize, sq: usize, skv: usize, full: bool) -> (f32, f32) {
             .flat_map(|(i, x)| {
                 let c = i % d;
                 let b = if c % 7 == 0 { bias } else { 0.0 };
-                bf16::from_f32(x * amp + b).to_le_bytes()
+                let y = x * amp + b;
+                if dt == DType::F16 { half::f16::from_f32(y).to_le_bytes() } else { bf16::from_f32(y).to_le_bytes() }
             })
             .collect();
         stream.clone_htod(&v).unwrap()
@@ -41,11 +46,11 @@ fn run(h: usize, sq: usize, skv: usize, full: bool) -> (f32, f32) {
     let mut o_ref: CudaSlice<u8> = stream.alloc_zeros(n * 2).unwrap();
     let mut o8: CudaSlice<u8> = stream.alloc_zeros(n * 2).unwrap();
     let ks = FlashSplitQKernels::for_context(&ctx).unwrap();
-    flash_splitq_u8(&ks, &stream, &q, 0, &k, 0, &v, 0, &mut o_ref, 0, 1, h as u32, h as u32, sq as u32, skv as u32, d as u32, scale, false, 0, DType::BF16, true).unwrap();
-    let k8 = FlashFp8Kernels::for_context(&ctx).unwrap();
+    flash_splitq_u8(&ks, &stream, &q, 0, &k, 0, &v, 0, &mut o_ref, 0, 1, h as u32, h as u32, sq as u32, skv as u32, d as u32, scale, false, 0, dt, true).unwrap();
+    let k8 = FlashFp8Kernels::for_dtype(&ctx, dt).unwrap();
     flash_fp8_bshd(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o8, 1, h, sq, skv, scale, full).unwrap();
     stream.synchronize().unwrap();
-    let to_f = |s: &CudaSlice<u8>| -> Vec<f32> { stream.clone_dtoh(s).unwrap().chunks(2).map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect() };
+    let to_f = |s: &CudaSlice<u8>| -> Vec<f32> { stream.clone_dtoh(s).unwrap().chunks(2).map(|c| if dt == DType::F16 { half::f16::from_le_bytes([c[0], c[1]]).to_f32() } else { bf16::from_le_bytes([c[0], c[1]]).to_f32() }).collect() };
     let (a, b) = (to_f(&o8), to_f(&o_ref));
     let (mut dot, mut na, mut nb, mut err, mut refn) = (0f64, 0f64, 0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(&b) {
@@ -65,6 +70,18 @@ fn fp8_attention_close_to_bf16() {
         for (h, sq, skv) in [(2usize, 300usize, 300usize), (3, 1100, 777), (2, 64, 2050)] {
             let (cos, rel) = run(h, sq, skv, full);
             eprintln!("[fp8 attn full={full} h={h} sq={sq} skv={skv}] cos={cos:.6} rel={rel:.4}");
+            assert!(cos > 0.995, "cos {cos}");
+            assert!(rel < if full { 0.08 } else { 0.05 }, "rel {rel}");
+        }
+    }
+}
+
+#[test]
+fn fp8_attention_f16_close() {
+    for full in [false, true] {
+        for (h, sq, skv) in [(2usize, 300usize, 300usize), (3, 1100, 777), (2, 64, 2050)] {
+            let (cos, rel) = run_dt(h, sq, skv, full, DType::F16);
+            eprintln!("[fp8 attn f16 full={full} h={h} sq={sq} skv={skv}] cos={cos:.6} rel={rel:.4}");
             assert!(cos > 0.995, "cos {cos}");
             assert!(rel < if full { 0.08 } else { 0.05 }, "rel {rel}");
         }

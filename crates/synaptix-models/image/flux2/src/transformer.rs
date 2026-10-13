@@ -143,6 +143,12 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let d = q.dims();
     let (b, s, h, hd) = (d[0], d[1], d[2], d[3]);
     let scale = 1.0 / (hd as f32).sqrt();
+    // FP8-внимание читает BSHD как есть — без транспозиций q/k/v и выхода.
+    if synaptix_core::precision::attention_fp8() && q.device().is_cuda() {
+        if let Ok(o) = q.flash_attention_bshd(k, v, scale, false) {
+            return o.reshape((b, s, h * hd));
+        }
+    }
     let qh = q.transpose(1, 2)?.contiguous()?;
     let kh = k.transpose(1, 2)?.contiguous()?;
     let vh = v.transpose(1, 2)?.contiguous()?;
@@ -205,14 +211,43 @@ fn lin_pq(lin: &QuantLinear, x: &Tensor, pq: Option<&(Tensor, Tensor, DType)>) -
 /// `x·(1+scale) + shift`; scale/shift `[1, D]` → broadcast по токенам.
 fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
     let d = scale.dims()[1];
+    if x.dtype() == scale.dtype() && scale.dtype() == shift.dtype() {
+        // одним ядром, раунды как add_scalar→broadcast_mul→broadcast_add
+        if let Ok(y) = x.fused_mod_row(&scale.reshape((1, 1, d))?, &shift.reshape((1, 1, d))?) {
+            return Ok(y);
+        }
+    }
     let sc = scale.add_scalar(1.0)?.reshape((1, 1, d))?;
     let sh = shift.reshape((1, 1, d))?;
     x.broadcast_mul(&sc)?.broadcast_add(&sh)
 }
 
-fn gated(gate: &Tensor, y: &Tensor) -> Result<Tensor> {
+/// `acc + gate·y` одним ядром — бит-в-бит с `res_add(acc, gate·y)`
+/// (произведение коммутативно); иначе decomposed.
+fn gate_add(acc: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
     let d = gate.dims()[1];
-    gate.reshape((1, 1, d))?.broadcast_mul(y)
+    let g = gate.reshape((1, 1, d))?;
+    if acc.dtype() == y.dtype() && g.dtype() == y.dtype() {
+        if let Ok(r) = acc.fused_gate_residual(y, &g) {
+            return Ok(r);
+        }
+    }
+    res_add(acc, &g.broadcast_mul(y)?)
+}
+
+/// q/k/v одного входа: при prequant-паре — по ней, иначе общий квант входа
+/// (`QuantLinear::forward_many`, бит-в-бит с отдельными forward).
+fn qkv(ls: [&QuantLinear; 3], x: &Tensor, pq: Option<&(Tensor, Tensor, DType)>) -> Result<[Tensor; 3]> {
+    if pq.is_none() {
+        let d = x.dims();
+        let (b, t, k) = (d[0], d[1], d[2]);
+        let v = QuantLinear::forward_many(&x.reshape((b * t, k))?, &ls)?;
+        if let [a, bb, c] = v.as_slice() {
+            let r = |y: &Tensor| y.reshape((b, t, y.dims()[1]));
+            return Ok([r(a)?, r(bb)?, r(c)?]);
+        }
+    }
+    Ok([lin_pq(ls[0], x, pq)?, lin_pq(ls[1], x, pq)?, lin_pq(ls[2], x, pq)?])
 }
 
 fn res_add(acc: &Tensor, contrib: &Tensor) -> Result<Tensor> {
@@ -386,12 +421,14 @@ impl DoubleBlock {
         let (nh, pq_h) = ada_ln_quant(img, mi.get(1), mi.get(0), eps, self.to_q.quant_dtype())?;
         let (ne, pq_e) = ada_ln_quant(txt, mt.get(1), mt.get(0), eps, self.add_q.quant_dtype())?;
 
-        let q = rms_norm(&to_heads(&lin_pq(&self.to_q, &nh, pq_h.as_ref())?, h, hd)?, &self.norm_q, eps)?;
-        let k = rms_norm(&to_heads(&lin_pq(&self.to_k, &nh, pq_h.as_ref())?, h, hd)?, &self.norm_k, eps)?;
-        let v = to_heads(&lin_pq(&self.to_v, &nh, pq_h.as_ref())?, h, hd)?;
-        let eq = rms_norm(&to_heads(&lin_pq(&self.add_q, &ne, pq_e.as_ref())?, h, hd)?, &self.norm_aq, eps)?;
-        let ek = rms_norm(&to_heads(&lin_pq(&self.add_k, &ne, pq_e.as_ref())?, h, hd)?, &self.norm_ak, eps)?;
-        let ev = to_heads(&lin_pq(&self.add_v, &ne, pq_e.as_ref())?, h, hd)?;
+        let [q, k, v] = qkv([&self.to_q, &self.to_k, &self.to_v], &nh, pq_h.as_ref())?;
+        let q = rms_norm(&to_heads(&q, h, hd)?, &self.norm_q, eps)?;
+        let k = rms_norm(&to_heads(&k, h, hd)?, &self.norm_k, eps)?;
+        let v = to_heads(&v, h, hd)?;
+        let [eq, ek, ev] = qkv([&self.add_q, &self.add_k, &self.add_v], &ne, pq_e.as_ref())?;
+        let eq = rms_norm(&to_heads(&eq, h, hd)?, &self.norm_aq, eps)?;
+        let ek = rms_norm(&to_heads(&ek, h, hd)?, &self.norm_ak, eps)?;
+        let ev = to_heads(&ev, h, hd)?;
         drop((nh, ne, pq_h, pq_e));
 
         let q = apply_rope(&Tensor::cat(&[&eq, &q], 1)?, &c.cos, &c.sin)?;
@@ -404,15 +441,15 @@ impl DoubleBlock {
         let img_attn = self.to_out.forward(&attn.narrow(1, st, total - st)?.contiguous()?)?;
         drop(attn);
 
-        let img = res_add(img, &gated(mi.get(2), &img_attn)?)?;
+        let img = gate_add(img, mi.get(2), &img_attn)?;
         let (n2, pq) = ada_ln_quant(&img, mi.get(4), mi.get(3), eps, self.ff_in.quant_dtype())?;
         let ff = self.ff_out.forward(&swiglu(&lin_pq(&self.ff_in, &n2, pq.as_ref())?)?)?;
-        let img = res_add(&img, &gated(mi.get(5), &ff)?)?;
+        let img = gate_add(&img, mi.get(5), &ff)?;
 
-        let txt = res_add(txt, &gated(mt.get(2), &ctx_attn)?)?;
+        let txt = gate_add(txt, mt.get(2), &ctx_attn)?;
         let (n2c, pqc) = ada_ln_quant(&txt, mt.get(4), mt.get(3), eps, self.ffc_in.quant_dtype())?;
         let ffc = self.ffc_out.forward(&swiglu(&lin_pq(&self.ffc_in, &n2c, pqc.as_ref())?)?)?;
-        let txt = res_add(&txt, &gated(mt.get(5), &ffc)?)?;
+        let txt = gate_add(&txt, mt.get(5), &ffc)?;
         Ok((img, txt))
     }
 }
@@ -442,7 +479,7 @@ impl SingleBlock {
         };
         drop((gate, up));
         let y = self.to_out.forward(&Tensor::cat(&[&attn, &act], 2)?)?;
-        res_add(x, &gated(ms.get(2), &y)?)
+        gate_add(x, ms.get(2), &y)
     }
 }
 

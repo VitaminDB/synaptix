@@ -1,5 +1,21 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+// Тип входа/выхода: bf16 (по умолчанию) или f16 (-DFA8_F16, FLUX.1 и др.).
+#ifdef FA8_F16
+typedef __half fa8_t;
+typedef __half2 fa8_t2;
+#define FA8_MMA_T "f16"
+#define FA8_CVT2 "cvt.rn.f16x2.f32"
+__device__ __forceinline__ float fa8_tof(fa8_t x) { return __half2float(x); }
+#else
+typedef __nv_bfloat16 fa8_t;
+typedef __nv_bfloat162 fa8_t2;
+#define FA8_MMA_T "bf16"
+#define FA8_CVT2 "cvt.rn.bf16x2.f32"
+__device__ __forceinline__ float fa8_tof(fa8_t x) { return __bfloat162float(x); }
+#endif
 
 // FP8-внимание (sm_89+/sm_120): softmax(scale·Q·Kᵀ)·V, раскладка BSHD
 // [B,S,H,128], без маски (DiT: видео/картинки). Схема — FA-2 split-Q
@@ -51,7 +67,7 @@ __device__ __forceinline__ void fa8_mma_e4m3(float* d, const unsigned* a, unsign
 }
 __device__ __forceinline__ void fa8_mma_bf16(float* d, const unsigned* a, unsigned b0, unsigned b1) {
   asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      "mma.sync.aligned.m16n8k16.row.col.f32." FA8_MMA_T "." FA8_MMA_T ".f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
@@ -69,9 +85,9 @@ __device__ __forceinline__ unsigned short fa8_e4m3x2(float lo, float hi) {
 __device__ __forceinline__ unsigned fa8_pack4(float x0, float x1, float x2, float x3) {
   return (unsigned)fa8_e4m3x2(x0, x1) | ((unsigned)fa8_e4m3x2(x2, x3) << 16);
 }
-__device__ __forceinline__ unsigned fa8_bf16x2(float lo, float hi) {
+__device__ __forceinline__ unsigned fa8_pack2(float lo, float hi) {
   unsigned u;
-  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(u) : "f"(hi), "f"(lo));
+  asm(FA8_CVT2 " %0, %1, %2;" : "=r"(u) : "f"(hi), "f"(lo));
   return u;
 }
 
@@ -81,15 +97,15 @@ __device__ __forceinline__ unsigned fa8_bf16x2(float lo, float hi) {
 // (по d), грид (B·H, SPLIT): частичные результаты атомиками в out (обнулён /
 // для amax — 0). Среднее делится на S в главном квант-ядре.
 template <int MODE>
-__device__ __forceinline__ void fa8_col_reduce_impl(const __nv_bfloat16* x, float* out, int S, int H) {
+__device__ __forceinline__ void fa8_col_reduce_impl(const fa8_t* x, float* out, int S, int H) {
   int bh = blockIdx.x, d = threadIdx.x;
   int b = bh / H, h = bh % H;
   int split = gridDim.y, per = (S + split - 1) / split;
   int s0 = blockIdx.y * per, s1 = min(S, s0 + per);
   float acc = 0.f;
-  const __nv_bfloat16* p = x + ((size_t)b * S * H + h) * FA8_D + d;
+  const fa8_t* p = x + ((size_t)b * S * H + h) * FA8_D + d;
   for (int s = s0; s < s1; s++) {
-    float v = __bfloat162float(p[(size_t)s * H * FA8_D]);
+    float v = fa8_tof(p[(size_t)s * H * FA8_D]);
     if (MODE == 0) acc += v; else acc = fmaxf(acc, fabsf(v));
   }
   // Сумма — частичная на сплит (детерминизм: складываются в кванте по порядку);
@@ -97,12 +113,12 @@ __device__ __forceinline__ void fa8_col_reduce_impl(const __nv_bfloat16* x, floa
   if (MODE == 0) out[((size_t)blockIdx.y * gridDim.x + bh) * FA8_D + d] = acc;
   else atomicMax(reinterpret_cast<int*>(out + (size_t)bh * FA8_D + d), __float_as_int(acc));
 }
-extern "C" __global__ void fa8_col_sum(const __nv_bfloat16* x, float* out, int S, int H) { fa8_col_reduce_impl<0>(x, out, S, H); }
-extern "C" __global__ void fa8_col_amax(const __nv_bfloat16* x, float* out, int S, int H) { fa8_col_reduce_impl<1>(x, out, S, H); }
+extern "C" __global__ void fa8_col_sum(const fa8_t* x, float* out, int S, int H) { fa8_col_reduce_impl<0>(x, out, S, H); }
+extern "C" __global__ void fa8_col_amax(const fa8_t* x, float* out, int S, int H) { fa8_col_reduce_impl<1>(x, out, S, H); }
 
 // Строки [B,S,H,128] → e4m3 той же раскладки + шкала [B,H,S] (·mul).
 // sum != null — вычесть среднее канала (sum/S). Варп = строка.
-extern "C" __global__ void fa8_quant_rows(const __nv_bfloat16* x, const float* sum, unsigned char* out,
+extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* sum, unsigned char* out,
                                           float* sc, int B, int S, int H, float mul, int nsplit) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   long long r = (long long)blockIdx.x * 8 + warp;
@@ -110,10 +126,10 @@ extern "C" __global__ void fa8_quant_rows(const __nv_bfloat16* x, const float* s
   int h = (int)(r % H);
   int s = (int)((r / H) % S);
   int b = (int)(r / ((long long)S * H));
-  const __nv_bfloat16* p = x + r * FA8_D + lane * 4;
+  const fa8_t* p = x + r * FA8_D + lane * 4;
   float v[4];
   uint2 raw = *reinterpret_cast<const uint2*>(p);
-  __nv_bfloat162 lo = *reinterpret_cast<__nv_bfloat162*>(&raw.x), hi = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
+  fa8_t2 lo = *reinterpret_cast<fa8_t2*>(&raw.x), hi = *reinterpret_cast<fa8_t2*>(&raw.y);
   v[0] = __low2float(lo); v[1] = __high2float(lo); v[2] = __low2float(hi); v[3] = __high2float(hi);
   if (sum) {
     float inv_s = 1.0f / (float)S;
@@ -142,9 +158,9 @@ __device__ __forceinline__ int fa8_perm(int p) {
 // V [B,S,H,128] bf16 → V̂ᵀ [B,H,128,Spad] e4m3 (ключи переставлены fa8_perm),
 // шкала канала = amax/448; vsc[b,h,d] = шкала/448 (масштаб P·448 учтён).
 // Грид (Spad/64, B·H), блок 128 (по d).
-extern "C" __global__ void fa8_quant_vt(const __nv_bfloat16* v, const float* amax, unsigned char* vt,
+extern "C" __global__ void fa8_quant_vt(const fa8_t* v, const float* amax, unsigned char* vt,
                                         float* vsc, int S, int H, int Spad) {
-  __shared__ __nv_bfloat16 tile[FA8_BN][FA8_D + 8];
+  __shared__ fa8_t tile[FA8_BN][FA8_D + 8];
   int bh = blockIdx.y, b = bh / H, h = bh % H, d = threadIdx.x;
   int s0 = blockIdx.x * FA8_BN;
   for (int c = threadIdx.x; c < FA8_BN * 16; c += 128) {
@@ -160,7 +176,7 @@ extern "C" __global__ void fa8_quant_vt(const __nv_bfloat16* v, const float* ama
   unsigned w[16];
   for (int k = 0; k < 16; k++) {
     float x[4];
-    for (int i = 0; i < 4; i++) x[i] = __bfloat162float(tile[fa8_perm(k * 4 + i)][d]) * inv;
+    for (int i = 0; i < 4; i++) x[i] = fa8_tof(tile[fa8_perm(k * 4 + i)][d]) * inv;
     w[k] = fa8_pack4(x[0], x[1], x[2], x[3]);
   }
   uint4* dst = reinterpret_cast<uint4*>(vt + ((size_t)bh * FA8_D + d) * Spad + s0);
@@ -173,7 +189,7 @@ __device__ __forceinline__ void fa8_main_impl(
     const unsigned char* __restrict__ qq, const float* __restrict__ qs,
     const unsigned char* __restrict__ kq, const float* __restrict__ ks,
     const void* __restrict__ vptr, const float* __restrict__ vsc,
-    __nv_bfloat16* __restrict__ out, int B, int H, int Sq, int Skv, int Spad) {
+    fa8_t* __restrict__ out, int B, int H, int Sq, int Skv, int Spad) {
   extern __shared__ __align__(128) unsigned char smem[];
   unsigned char* sQ = smem;
   unsigned char* sK = smem + 8192;
@@ -206,7 +222,7 @@ __device__ __forceinline__ void fa8_main_impl(
         fa8_cp16(fa8_smem(dv + d * 64 + ((ch ^ ((d >> 1) & 3)) << 4)), vt + (size_t)d * Spad + ch * 16, true);
       }
     } else {
-      const __nv_bfloat16* vb = (const __nv_bfloat16*)vptr + ((size_t)b * Skv * H + h) * FA8_D;
+      const fa8_t* vb = (const fa8_t*)vptr + ((size_t)b * Skv * H + h) * FA8_D;
       for (int c = tid; c < 1024; c += 128) {
         int r = c >> 4, ch = c & 15, s = k0 + r;
         fa8_cp16(fa8_smem(dv + r * 256 + ((ch ^ (r & 7)) << 4)), vb + (size_t)min(s, Skv - 1) * rs + ch * 8, s < Skv);
@@ -336,10 +352,10 @@ __device__ __forceinline__ void fa8_main_impl(
 #pragma unroll
       for (int kk = 0; kk < 4; kk++) {
         unsigned pa[4];
-        pa[0] = fa8_bf16x2(s[2 * kk][0], s[2 * kk][1]);
-        pa[1] = fa8_bf16x2(s[2 * kk][2], s[2 * kk][3]);
-        pa[2] = fa8_bf16x2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
-        pa[3] = fa8_bf16x2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+        pa[0] = fa8_pack2(s[2 * kk][0], s[2 * kk][1]);
+        pa[1] = fa8_pack2(s[2 * kk][2], s[2 * kk][3]);
+        pa[2] = fa8_pack2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+        pa[3] = fa8_pack2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
 #pragma unroll
         for (int dp = 0; dp < 8; dp++) {
           int r = kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
@@ -358,8 +374,8 @@ __device__ __forceinline__ void fa8_main_impl(
   l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
   l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
   float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
-  __nv_bfloat16* ob0 = out + (((size_t)b * Sq + row0) * H + h) * FA8_D;
-  __nv_bfloat16* ob1 = out + (((size_t)b * Sq + row1) * H + h) * FA8_D;
+  fa8_t* ob0 = out + (((size_t)b * Sq + row0) * H + h) * FA8_D;
+  fa8_t* ob1 = out + (((size_t)b * Sq + row1) * H + h) * FA8_D;
 #pragma unroll
   for (int dt = 0; dt < 16; dt++) {
     int d = dt * 8 + t * 2;
@@ -368,18 +384,18 @@ __device__ __forceinline__ void fa8_main_impl(
       v0 = vsc[(size_t)bh * FA8_D + d];
       v1 = vsc[(size_t)bh * FA8_D + d + 1];
     }
-    if (row0 < Sq) *reinterpret_cast<unsigned*>(ob0 + d) = fa8_bf16x2(o[dt][0] * il0 * v0, o[dt][1] * il0 * v1);
-    if (row1 < Sq) *reinterpret_cast<unsigned*>(ob1 + d) = fa8_bf16x2(o[dt][2] * il1 * v0, o[dt][3] * il1 * v1);
+    if (row0 < Sq) *reinterpret_cast<unsigned*>(ob0 + d) = fa8_pack2(o[dt][0] * il0 * v0, o[dt][1] * il0 * v1);
+    if (row1 < Sq) *reinterpret_cast<unsigned*>(ob1 + d) = fa8_pack2(o[dt][2] * il1 * v0, o[dt][3] * il1 * v1);
   }
 }
 
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_qk_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
-    const __nv_bfloat16* v, const float* vsc, __nv_bfloat16* out, int B, int H, int Sq, int Skv, int Spad) {
+    const fa8_t* v, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
   fa8_main_impl<0>(qq, qs, kq, ks, v, vsc, out, B, H, Sq, Skv, Spad);
 }
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_full_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
-    const unsigned char* vt, const float* vsc, __nv_bfloat16* out, int B, int H, int Sq, int Skv, int Spad) {
+    const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
   fa8_main_impl<1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
 }

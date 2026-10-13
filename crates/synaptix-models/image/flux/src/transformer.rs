@@ -280,6 +280,17 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let scale = 1.0 / (HEAD_DIM as f64).sqrt();
     // (bshd-путь [B,S,H,D] без транспоз пробовали — perf-нейтрально: ядро читает
     // K/V strided, что съедает экономию транспоза. Оставлен transpose→[B,H,S,D].)
+    // FP8-внимание (квантованный трансформер) читает BSHD как есть — без
+    // транспозиций q/k/v и выхода; результат тот же, что у BHSD-вызова.
+    if synaptix_core::precision::attention_fp8() && matches!(q.device(), Device::Cuda(_)) {
+        if let Ok(o) = q.flash_attention_bshd(k, v, scale as f32, false) {
+            if prof {
+                prof_sync(&q.device());
+                prof_add("attn", t_attn.elapsed().as_secs_f64());
+            }
+            return o.reshape((b, sq, INNER));
+        }
+    }
     let qh = q.transpose(1, 2)?.contiguous()?; // [B,H,S,128]
     let kh = k.transpose(1, 2)?.contiguous()?;
     let vh = v.transpose(1, 2)?.contiguous()?;
@@ -394,9 +405,28 @@ fn lin_pq(
 /// `LN(x)·(1+scale) + shift` (scale/shift `[B,3072]` → broadcast по seq).
 fn modulate(norm_x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
     let b = scale.dims()[0];
+    if b == 1 && norm_x.dtype() == scale.dtype() && scale.dtype() == shift.dtype() {
+        // одним ядром, раунды как add_scalar→broadcast_mul→broadcast_add
+        if let Ok(y) = norm_x.fused_mod_row(&scale.reshape((1, 1, INNER))?, &shift.reshape((1, 1, INNER))?) {
+            return Ok(y);
+        }
+    }
     let sc = scale.add_scalar(1.0)?.reshape((b, 1, INNER))?;
     let sh = shift.reshape((b, 1, INNER))?;
     norm_x.broadcast_mul(&sc)?.broadcast_add(&sh)
+}
+
+/// `acc + g·y` (g `[B,3072]` — гейт по каналу): одним ядром, бит-в-бит с
+/// `res_add(acc, g.broadcast_mul(y))` (произведение коммутативно); иначе —
+/// decomposed.
+fn gate_add(acc: &Tensor, g: &Tensor, y: &Tensor) -> Result<Tensor> {
+    let g3 = g.reshape((g.dims()[0], 1, INNER))?;
+    if acc.dtype() == y.dtype() && g.dtype() == y.dtype() {
+        if let Ok(r) = acc.fused_gate_residual(y, &g3) {
+            return Ok(r);
+        }
+    }
+    res_add(acc, &g3.broadcast_mul(y)?)
 }
 
 fn chunk(t: &Tensor, i: usize, size: usize) -> Result<Tensor> {
@@ -557,17 +587,17 @@ impl DoubleBlock {
         dbg_push("ctx_attn", &ctx_attn);
 
         // img: attn-residual + ff
-        let img = res_add(&img, &g_msa.reshape((g_msa.dims()[0], 1, INNER))?.broadcast_mul(&img_attn)?)?;
+        let img = gate_add(img, &g_msa, &img_attn)?;
         let (n2, pq_f) = ada_ln_quant(&img, &sc_mlp, &sh_mlp, self.ff0.quant_dtype())?;
         let ff = self.ff2.forward(&gelu_tanh(&lin_pq(&self.ff0, &n2, pq_f.as_ref())?)?)?;
         dbg_push("ff", &ff);
-        let img = res_add(&img, &g_mlp.reshape((g_mlp.dims()[0], 1, INNER))?.broadcast_mul(&ff)?)?;
+        let img = gate_add(&img, &g_mlp, &ff)?;
 
         // txt: attn-residual + ff
-        let txt = res_add(&txt, &cg_msa.reshape((cg_msa.dims()[0], 1, INNER))?.broadcast_mul(&ctx_attn)?)?;
+        let txt = gate_add(txt, &cg_msa, &ctx_attn)?;
         let (n2c, pq_fc) = ada_ln_quant(&txt, &csc_mlp, &csh_mlp, self.ffc0.quant_dtype())?;
         let ffc = self.ffc2.forward(&gelu_tanh(&lin_pq(&self.ffc0, &n2c, pq_fc.as_ref())?)?)?;
-        let txt = res_add(&txt, &cg_mlp.reshape((cg_mlp.dims()[0], 1, INNER))?.broadcast_mul(&ffc)?)?;
+        let txt = gate_add(&txt, &cg_mlp, &ffc)?;
 
         Ok((img, txt))
     }
@@ -636,9 +666,7 @@ impl SingleBlock {
         let attn = attention(&q, &k, &v)?; // [B,seq,3072]
 
         let cat = Tensor::cat(&[&attn, &mlp], 2)?; // [B,seq,15360]
-        let b = gate.dims()[0];
-        let proj = prof_t("s_projout", &dev, || Ok(gate.reshape((b, 1, INNER))?.broadcast_mul(&self.proj_out.forward(&cat)?)?))?;
-        let hidden = res_add(&residual, &proj)?;
+        let hidden = prof_t("s_projout", &dev, || gate_add(&residual, &gate, &self.proj_out.forward(&cat)?))?;
         let txt_out = hidden.narrow(1, 0, st)?.contiguous()?;
         let img_out = hidden.narrow(1, st, hidden.dims()[1] - st)?.contiguous()?;
         Ok((img_out, txt_out))
