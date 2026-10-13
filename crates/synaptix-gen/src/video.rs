@@ -37,6 +37,19 @@ pub struct VideoRequest {
     /// Референсы (ref2va): картинки (до 9), видео (до 3), звук (до 3 — голос
     /// для липсинка, музыка), всего до 12. Не сочетаются с ключевыми кадрами.
     pub refs: Vec<PathBuf>,
+    /// Квант трансформера и энкодера: `nvfp4`, `mxfp8`, `bf16` (плотный);
+    /// пусто/`auto` — умолчание модели.
+    pub quant: Option<String>,
+}
+
+/// Квант из настройки; `None` — умолчание пайплайна.
+fn quant_setting(q: Option<&str>) -> Option<DType> {
+    match q.unwrap_or("").to_ascii_lowercase().as_str() {
+        "nvfp4" => Some(DType::NVFP4),
+        "mxfp8" | "fp8" => Some(DType::MXFP8),
+        "bf16" | "dense" | "none" => Some(DType::BF16),
+        _ => None,
+    }
 }
 
 pub struct VideoOutput {
@@ -57,7 +70,8 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let mode = h3::H3MemoryMode::parse("auto").ok_or("режим памяти")?;
     mode.install();
     let compute = DType::BF16;
-    let (quant_dit, quant_enc) = (DType::NVFP4, DType::NVFP4);
+    let q = quant_setting(req.quant.as_deref()).unwrap_or(DType::NVFP4);
+    let (quant_dit, quant_enc) = (q, q);
     h3::runtime::set_sigma_shift(None, None);
     h3::runtime::set_vae_tile(None);
     h3::runtime::set_load_reserve_bytes(13 << 29);
@@ -279,8 +293,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
     };
     let compute = DType::BF16;
-    let quant_dit = compute;
-    let quant_enc = DType::MXFP8;
+    let quant_dit = quant_setting(req.quant.as_deref()).unwrap_or(compute);
+    let quant_enc = match quant_dit {
+        DType::NVFP4 => DType::NVFP4,
+        _ => DType::MXFP8,
+    };
     let fps = 24.0;
     let width = req.width.filter(|&v| v > 0).unwrap_or(960);
     let height = req.height.filter(|&v| v > 0).unwrap_or(544);
@@ -289,8 +306,16 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let seed = Some(req.seed.max(1));
 
     let ckpt = LtxCheckpoint::open(&paths.model, Device::Cpu, DType::BF16).map_err(|e| format!("LTX: {e}"))?;
-    // Плотный DiT — всегда стриминг блоков с хоста (как у CLI).
-    let offload = true;
+    // Плотный DiT — всегда стриминг блоков с хоста; квантованный — на карту,
+    // если влезает с VAE и активациями (оценка как у CLI).
+    let offload = quant_dit == compute || {
+        let dit_b = synaptix_video_ltx23::dit::dit_resident_bytes(&ckpt, quant_dit, compute);
+        let vae_b: usize = ckpt.infos().filter(|(n, _, _)| n.starts_with("vae.")).map(|(_, _, s)| compute.bytes_for_numel(s.iter().product())).sum();
+        let act_b = fp * hp * wp * 4096 * 2 * 28;
+        let pad_b = (fp * hp * wp + 256) * (16384 * 2 + 16384 * 2 + 12288 * 2);
+        let need = dit_b + vae_b + act_b + pad_b + (1usize << 30);
+        synaptix_core::device::cuda::mem_info(ord).map(|(free, _)| need > free).unwrap_or(true)
+    };
     let pin = synaptix_core::device::cuda::OffloadPinCacheGuard::new_paused(&ckpt.shard_bytes());
     let distilled_name = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
     let lora = match (&paths.distilled_lora, distilled_name) {

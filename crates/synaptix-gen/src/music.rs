@@ -21,6 +21,10 @@ pub struct MusicRequest {
     pub seconds: u32,
     pub seed: u64,
     pub steps: Option<usize>,
+    /// CFG (ACE-Step); `None` — умолчание варианта.
+    pub guidance: Option<f32>,
+    /// Квант: `nvfp4`, `mxfp8`, `bf16`; пусто/`auto` — плотный.
+    pub quant: Option<String>,
 }
 
 pub struct MusicOutput {
@@ -52,13 +56,18 @@ pub fn acestep(paths: &AcePaths, device: Device, req: &MusicRequest, cancel: Arc
     synaptix_kernels_cuda::ensure_registered();
     let variant = DitVariant::detect(&paths.dit);
     let steps = req.steps.filter(|&s| s > 0).unwrap_or(variant.default_steps());
-    let opts = SamplerOptions { steps, shift: variant.default_shift(), guidance_scale: variant.default_cfg(), ..Default::default() };
+    let opts = SamplerOptions { steps, shift: variant.default_shift(), guidance_scale: req.guidance.unwrap_or(variant.default_cfg()), ..Default::default() };
     let copts = CodesGenOptions { seed: req.seed.max(1), ..CodesGenOptions::default() };
     let extras = GenExtras { norm_mode: NormMode::Peak, ..Default::default() };
     let mp = MusicPaths { lm: &paths.lm, text_encoder: &paths.text_encoder, dit: &paths.dit, vae: &paths.vae };
     let compute = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+    let quant = match req.quant.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+        "nvfp4" if device.is_cuda() => DType::NVFP4,
+        "mxfp8" | "fp8" if device.is_cuda() => DType::MXFP8,
+        _ => compute,
+    };
     let (samples, sample_rate, _latent) = synaptix_music_acestep::with_cancel(Some(cancel), || {
-        generate_music(&mp, &req.prompt, &req.lyrics, req.seconds, device, compute, compute, compute, &opts, &copts, true, &EditOptions::default(), &extras, None)
+        generate_music(&mp, &req.prompt, &req.lyrics, req.seconds, device, compute, quant, quant, &opts, &copts, true, &EditOptions::default(), &extras, None)
     })
     .map_err(|e| e.to_string())?;
     let secs = samples.len() as f32 / sample_rate.max(1) as f32;
@@ -80,7 +89,11 @@ pub fn yue2(model: &Path, vae: &Path, device: Device, req: &MusicRequest, cancel
     let options = Yue2Options {
         device,
         compute: DType::BF16,
-        quant: None,
+        quant: match req.quant.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+            "nvfp4" => Some(DType::NVFP4),
+            "mxfp8" | "fp8" => Some(DType::MXFP8),
+            _ => None,
+        },
         vae_dtype: DType::F32,
         vae_core_frames: 1024,
         vae_halo_frames: 16,
