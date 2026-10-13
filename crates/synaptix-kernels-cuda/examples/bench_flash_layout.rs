@@ -4,6 +4,7 @@
 
 use cudarc::driver::CudaSlice;
 use synaptix_core::dtype::DType;
+use synaptix_kernels_cuda::attention::flash_fp8::{flash_fp8_bshd, FlashFp8Kernels};
 use synaptix_kernels_cuda::attention::flash_splitq::{flash_splitq_u8, FlashSplitQKernels};
 
 fn main() {
@@ -37,5 +38,23 @@ fn main() {
         stream.synchronize().unwrap();
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         println!("{} S={s} H={h}: {ms:.3} мс, {:.1} TFLOP/s", if bshd { "BSHD" } else { "BHSD" }, flops / ms / 1e9);
+    }
+    let k8 = FlashFp8Kernels::for_context(&ctx).unwrap();
+    for full in [false, true] {
+        let run = |o: &mut CudaSlice<u8>| {
+            flash_fp8_bshd(&k8, &stream, (&q, 0), (&kk, 0), (&v, 0), o, 1, h, s, s, 0.088, full).unwrap();
+        };
+        for _ in 0..5 {
+            run(&mut out);
+        }
+        stream.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        let iters = 30;
+        for _ in 0..iters {
+            run(&mut out);
+        }
+        stream.synchronize().unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        println!("FP8 {} S={s} H={h}: {ms:.3} мс, {:.1} TFLOP/s (с квантом)", if full { "QK+PV" } else { "QK" }, flops / ms / 1e9);
     }
 }

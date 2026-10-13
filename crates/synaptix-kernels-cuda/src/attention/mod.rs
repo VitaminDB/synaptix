@@ -13,3 +13,4 @@ pub mod linear_decode;
 pub mod linear_prefill;
 pub mod sdpa_f32_acc;
 pub mod flash_decode_gqa;
+pub mod flash_fp8;

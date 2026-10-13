@@ -2322,6 +2322,19 @@ impl Backend for CudaBackend {
             .as_cuda_mut()
             .ok_or(SynaptixError::Unsupported("cuda flash: out non-cuda"))?;
 
+        // FP8 (BHSD = BSHD с B'=B·H, H'=1): плотные K/V без смещений.
+        if t_stride as usize == t_kv
+            && q_lo.offset() == 0
+            && k_lo.offset() == 0
+            && v_lo.offset() == 0
+            && fp8_attention_applies(dtype, d, causal, nh, nkv, t_q, t_kv)
+        {
+            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_context(&ctx)?;
+            return crate::attention::flash_fp8::flash_fp8_bshd(
+                &k8, &stream, (q_buf.slice(), 0), (k_buf.slice(), 0), (v_buf.slice(), 0), out_buf.slice_mut(), b * nh, 1, t_q, t_kv, scale, true,
+            );
+        }
+
         // Выбор attention-backend.
         // Prefill (Tq>1) → flash_splitq (FA-2-схема: split-Q BM=64, softmax в
         // регистрах, mma.sync m16n8k16), hd∈{64,128,256}, F16/BF16.
@@ -3256,6 +3269,12 @@ impl Backend for CudaBackend {
         let ord = q_buf.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let out_buf = out_st.as_cuda_mut().ok_or(SynaptixError::Unsupported("flash_bshd: out non-cuda"))?;
+        if fp8_attention_applies(dtype, d, causal, h, hkv, s_q, s_kv) {
+            let k8 = crate::attention::flash_fp8::FlashFp8Kernels::for_context(&ctx)?;
+            return crate::attention::flash_fp8::flash_fp8_bshd(
+                &k8, &stream, (q_buf.slice(), 0), (k_buf.slice(), 0), (v_buf.slice(), 0), out_buf.slice_mut(), b, h, s_q, s_kv, scale, true,
+            );
+        }
         let kernels = crate::attention::flash_splitq::FlashSplitQKernels::for_context(&ctx)?;
         crate::attention::flash_splitq::flash_splitq_u8(
             &kernels,
@@ -7151,4 +7170,10 @@ impl Backend for CudaBackend {
         let kernels = crate::kernels::reduce::ReduceKernels::for_context(&ctx)?;
         crate::kernels::reduce::run_reduce(&kernels, op, src, dst, dims)
     }
+}
+
+/// FP8-внимание вместо bf16: включено для потока (`set_attention_fp8`),
+/// bf16, head_dim 128, без маски и GQA, обе последовательности ≥ 256.
+fn fp8_attention_applies(dtype: DType, d: usize, causal: bool, h: usize, hkv: usize, s_q: usize, s_kv: usize) -> bool {
+    synaptix_core::precision::attention_fp8() && dtype == DType::BF16 && d == 128 && !causal && h == hkv && s_q >= 256 && s_kv >= 256
 }

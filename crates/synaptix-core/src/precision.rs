@@ -181,3 +181,40 @@ mod tests {
         assert_eq!(parse_dtype("xyz"), None);
     }
 }
+
+thread_local! {
+    static ATTN_FP8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// FP8-внимание (e4m3 QKᵀ и P·V) для текущего потока: длинные
+/// некаузальные bf16-последовательности с head_dim 128 (DiT картинок и видео)
+/// идут FP8-ядром. `SYN_ATTN_FP8=0|1` перебивает выбор вызывающего.
+pub fn set_attention_fp8(on: bool) {
+    ATTN_FP8.with(|c| c.set(on));
+}
+
+pub fn attention_fp8() -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("SYN_ATTN_FP8").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    env.unwrap_or_else(|| ATTN_FP8.with(|c| c.get()))
+}
+
+/// Охранник: FP8-внимание на время жизни, затем прежнее значение.
+pub struct AttentionFp8Guard(bool);
+
+impl AttentionFp8Guard {
+    pub fn new(on: bool) -> Self {
+        let prev = ATTN_FP8.with(|c| c.replace(on));
+        Self(prev)
+    }
+}
+
+impl Drop for AttentionFp8Guard {
+    fn drop(&mut self) {
+        ATTN_FP8.with(|c| c.set(self.0));
+    }
+}

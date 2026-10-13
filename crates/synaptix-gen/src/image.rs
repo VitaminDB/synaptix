@@ -114,6 +114,8 @@ fn size_or(req: &ImageRequest, fallback: (usize, usize), snap: impl Fn(usize) ->
 
 /// Сгенерировать картинку моделью `model` (бандл `.syn` или каталог diffusers).
 pub fn generate(model: &Path, device: Device, req: &ImageRequest, progress: &mut dyn FnMut(usize, usize) -> bool) -> R<ImageOutput> {
+    // Квантованный трансформер — и внимание в FP8 (e4m3 QKᵀ и P·V).
+    let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_of(req).map(|q| q.is_quantized()).unwrap_or(false));
     if !model.exists() {
         return Err(format!("модели нет: {}", model.display()));
     }

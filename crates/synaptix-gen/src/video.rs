@@ -87,6 +87,8 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let compute = DType::BF16;
     let q = quant_setting(req.quant.as_deref()).unwrap_or(DType::NVFP4);
     let (quant_dit, quant_enc) = (q, q);
+    // Квантованный DiT — и внимание в FP8 (e4m3 QKᵀ и P·V).
+    let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_dit.is_quantized());
     h3::runtime::set_sigma_shift(None, None);
     h3::runtime::set_vae_tile(None);
     h3::runtime::set_load_reserve_bytes(13 << 29);
@@ -461,6 +463,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let fps = 24.0;
     let compute = DType::BF16;
     let quant_dit = quant_setting(req.quant.as_deref()).unwrap_or(compute);
+    let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_dit.is_quantized());
     let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
     let seed = Some(req.seed.max(1));
 
