@@ -48,6 +48,9 @@ pub const DESKTOP_MARGIN: usize = 1_000_000_000;
 /// латент + референсы): FF-вход `[S, 4·inner]` в BF16 плюс его GELU, q/k/v и
 /// склейка внимания, остаток и модулированная копия потока.
 pub fn dit_activation_bytes(tokens: usize, inner: usize) -> usize {
-    let per_token = 2 * (2 * 4 * inner + 8 * inner);
+    // Пик блока: вход и выход gelu MLP (4d каждый) обоих потоков плюс q/k/v/o
+    // и остаток — ≈64·d байт bf16 на токен (замер Qwen-Image-Edit с
+    // референсом, 8.4K токенов: 32·d давало OOM на gelu).
+    let per_token = 2 * (2 * 8 * inner + 16 * inner);
     tokens * per_token + 256 * (1 << 20)
 }

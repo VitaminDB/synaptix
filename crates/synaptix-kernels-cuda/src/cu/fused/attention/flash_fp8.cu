@@ -92,7 +92,9 @@ __device__ __forceinline__ void fa8_col_reduce_impl(const __nv_bfloat16* x, floa
     float v = __bfloat162float(p[(size_t)s * H * FA8_D]);
     if (MODE == 0) acc += v; else acc = fmaxf(acc, fabsf(v));
   }
-  if (MODE == 0) atomicAdd(out + (size_t)bh * FA8_D + d, acc);
+  // Сумма — частичная на сплит (детерминизм: складываются в кванте по порядку);
+  // amax — atomicMax (max порядконезависим).
+  if (MODE == 0) out[((size_t)blockIdx.y * gridDim.x + bh) * FA8_D + d] = acc;
   else atomicMax(reinterpret_cast<int*>(out + (size_t)bh * FA8_D + d), __float_as_int(acc));
 }
 extern "C" __global__ void fa8_col_sum(const __nv_bfloat16* x, float* out, int S, int H) { fa8_col_reduce_impl<0>(x, out, S, H); }
@@ -101,7 +103,7 @@ extern "C" __global__ void fa8_col_amax(const __nv_bfloat16* x, float* out, int 
 // Строки [B,S,H,128] → e4m3 той же раскладки + шкала [B,H,S] (·mul).
 // sum != null — вычесть среднее канала (sum/S). Варп = строка.
 extern "C" __global__ void fa8_quant_rows(const __nv_bfloat16* x, const float* sum, unsigned char* out,
-                                          float* sc, int B, int S, int H, float mul) {
+                                          float* sc, int B, int S, int H, float mul, int nsplit) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   long long r = (long long)blockIdx.x * 8 + warp;
   if (r >= (long long)B * S * H) return;
@@ -114,9 +116,13 @@ extern "C" __global__ void fa8_quant_rows(const __nv_bfloat16* x, const float* s
   __nv_bfloat162 lo = *reinterpret_cast<__nv_bfloat162*>(&raw.x), hi = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
   v[0] = __low2float(lo); v[1] = __high2float(lo); v[2] = __low2float(hi); v[3] = __high2float(hi);
   if (sum) {
-    const float* m = sum + ((size_t)b * H + h) * FA8_D + lane * 4;
     float inv_s = 1.0f / (float)S;
-    for (int i = 0; i < 4; i++) v[i] -= m[i] * inv_s;
+    size_t bhs = (size_t)B * H;
+    for (int i = 0; i < 4; i++) {
+      float t = 0.f;
+      for (int k = 0; k < nsplit; k++) t += sum[((size_t)k * bhs + (size_t)b * H + h) * FA8_D + lane * 4 + i];
+      v[i] -= t * inv_s;
+    }
   }
   float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));

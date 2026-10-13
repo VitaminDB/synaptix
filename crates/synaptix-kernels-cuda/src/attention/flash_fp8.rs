@@ -93,8 +93,8 @@ pub fn flash_fp8_bshd(
     let spadi = spad as i32;
 
     // Среднее K по токенам (сумма; деление — в кванте).
-    let mut ksum: CudaSlice<f32> = stream.alloc_zeros(b * h * d).map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
     let split = (skv / 256).clamp(1, 32) as u32;
+    let mut ksum: CudaSlice<f32> = stream.alloc_zeros(split as usize * b * h * d).map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
     let red_cfg = LaunchConfig { grid_dim: ((b * h) as u32, split, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
     {
         let mut lb = stream.launch_builder(&kern.col_sum);
@@ -120,7 +120,8 @@ pub fn flash_fp8_bshd(
         } else {
             lb.arg(&null);
         }
-        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul);
+        let ns = split as i32;
+        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul).arg(&ns);
         unsafe { lb.launch(cfg) }.map_err(launch_err("fa8_quant_rows"))?;
     }
 
