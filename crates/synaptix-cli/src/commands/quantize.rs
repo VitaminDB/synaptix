@@ -25,6 +25,36 @@ pub struct QuantizeArgs {
     pub device: String,
     pub calib: Option<PathBuf>,
     pub include: Vec<String>,
+    pub vision: Option<String>,
+    pub rule: Vec<String>,
+    pub policy: Option<String>,
+}
+
+/// Поле `config.json` бандла (в т. ч. внутри `text_config`).
+fn config_u64(path: &std::path::Path, key: &str) -> Option<u64> {
+    let bytes = synaptix_io::weights::syn_bundle::read_model_file(path, "config.json")?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let get = |v: &serde_json::Value| v.get(key).and_then(|n| n.as_u64());
+    get(&v).or_else(|| v.get("text_config").and_then(get))
+}
+
+fn num_layers(path: &std::path::Path) -> Option<usize> {
+    config_u64(path, "num_hidden_layers").map(|n| n as usize)
+}
+
+
+/// Пресет `llm`: правила крайних слоёв (первый и последний), общих экспертов
+/// и таблиц позиций.
+fn llm_rules(path: &std::path::Path) -> Result<Vec<(String, Option<DType>)>, String> {
+    let n = num_layers(path).ok_or("--policy llm: нет num_hidden_layers в config.json")?;
+    let m = Some(DType::MXFP8);
+    Ok(vec![
+        (".layers.0.".into(), m),
+        (format!(".layers.{}.", n - 1), m),
+        ("shared_expert".into(), m),
+        // таблицы, из которых читают строки, — как есть
+        ("pos_embed".into(), None),
+    ])
 }
 
 fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
@@ -41,7 +71,32 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.input.is_dir() {
         return Err("каталог HF не поддержан: сперва `synaptix convert <dir> model.syn`, затем quantize".into());
     }
-    let main = fmt(&args.format, "--format")?.ok_or("--format обязан быть форматом кванта")?;
+    let llm = match args.policy.as_deref() {
+        None => false,
+        Some("llm") => true,
+        Some(p) => return Err(format!("--policy {p}: известен только `llm`").into()),
+    };
+    let main = if llm { DType::NVFP4 } else { fmt(&args.format, "--format")?.ok_or("--format обязан быть форматом кванта")? };
+    let mx = || Some("mxfp8".to_string());
+    let (attn_a, head_a, embed_a, vision_a) = if llm {
+        // Качество важнее «влезет ли»: размещение — дело движка (оффлоад).
+        (args.attn.clone().or_else(mx), args.lm_head.clone().or_else(mx), args.embed.clone().or_else(mx), args.vision.clone().or_else(mx))
+    } else {
+        (args.attn.clone(), args.lm_head.clone(), args.embed.clone(), args.vision.clone())
+    };
+    let args = QuantizeArgs { attn: attn_a, lm_head: head_a, embed: embed_a, vision: vision_a, ..args };
+    let mut rules: Vec<(String, Option<DType>)> = Vec::new();
+    for r in &args.rule {
+        let (p, f) = r.rsplit_once('=').ok_or_else(|| format!("--rule `{r}`: ожидается ПОДСТРОКА=ФОРМАТ"))?;
+        rules.push((p.to_string(), fmt(f, "--rule")?));
+    }
+    if llm {
+        rules.extend(llm_rules(&args.input)?);
+    }
+    let vision = match &args.vision {
+        Some(v) => fmt(v, "--vision")?,
+        None => None,
+    };
     let attn = match &args.attn {
         Some(a) => fmt(a, "--attn")?,
         None => Some(main),
@@ -63,7 +118,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let experts = if q8 { None } else { Some(main) };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone() };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules };
     let device = if args.device.starts_with("cuda") {
         let ord = args.device.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Device::Cuda(ord)

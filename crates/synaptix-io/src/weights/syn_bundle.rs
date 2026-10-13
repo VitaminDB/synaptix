@@ -370,6 +370,9 @@ impl SynBundleLoader {
         let Some((key, entry)) = self.any_quant_entry(name) else { return Ok(None) };
         let Some(kind) = entry.kind() else { return Ok(None) };
         let dtype = kind.dtype();
+        if matches!(dtype, DType::NVFP4 | DType::MXFP8) {
+            return self.dequant_fp_entry(name, &entry, device, want_dtype).map(Some);
+        }
         if !matches!(dtype, DType::Sq { .. } | DType::Ggml(_) | DType::Q8Row) {
             return Ok(None);
         }
@@ -403,6 +406,40 @@ impl SynBundleLoader {
             _ => t,
         };
         Ok(Some(if device == Device::Cpu { t } else { t.to_device(device).map_err(IoError::Core)? }))
+    }
+
+    /// Плотный тензор из NVFP4/MXFP8-веса бандла: загрузчики, которые читают
+    /// веса плотными (башни зрения, DiT, TTS…), работают и с квантованным
+    /// бандлом. Деквант считается на карте (на CPU-устройство — через
+    /// `cuda:0`) и приводится к запрошенному типу. Повторный квант
+    /// MXFP8 из таких значений даёт те же байты.
+    fn dequant_fp_entry(&self, name: &str, entry: &synaptix_bundle::QuantEntry, device: Device, want_dtype: Option<DType>) -> Result<Tensor> {
+        let gpu = if device.is_cuda() { device } else { Device::Cuda(0) };
+        // BF16: значения MXFP8 (3 бита мантиссы) в нём точны; F16 — если
+        // загрузчик просит именно его.
+        let deq = if want_dtype == Some(DType::F16) { DType::F16 } else { DType::BF16 };
+        let ws = self
+            .load_quant_stack(name, gpu)
+            .ok_or_else(|| IoError::Bundle(format!("`{name}`: квант-вес пропал")))??;
+        let parts: Vec<Tensor> = ws
+            .iter()
+            .map(|w| w.dequantize(deq))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(IoError::Core)?;
+        let t = if parts.len() == 1 {
+            parts.into_iter().next().unwrap()
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 0).map_err(IoError::Core)?
+        };
+        let mut t = t.reshape(entry.shape.clone()).map_err(IoError::Core)?;
+        if let Some(d) = want_dtype.filter(|d| *d != deq) {
+            t = t.to_dtype(d).map_err(IoError::Core)?;
+        }
+        if device != gpu {
+            t = t.to_device(device).map_err(IoError::Core)?;
+        }
+        Ok(t)
     }
 
     /// Манифест квантования; `None` — бандл обычный.
@@ -730,9 +767,11 @@ impl WeightLoader for SynBundleLoader {
         if let Some(g) = &self.gguf {
             return g.contains(name);
         }
+        // Квантованный вес лежит в манифесте, а не в плотном индексе.
         self.index().map(|idx| {
             let key = Self::resolve_key(name, &idx.prefix);
             idx.by_name.contains_key(&key) || idx.by_name.contains_key(name)
         }).unwrap_or(false)
+            || self.quant_entry(name).is_some()
     }
 }

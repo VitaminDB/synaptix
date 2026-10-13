@@ -61,6 +61,12 @@ pub struct TranscodeSpec {
     /// модель квантует их сама, — а писателю полного бандла нужно.
     pub quantize_dense: bool,
     pub include: Vec<String>,
+    /// Башни зрения (`visual.*`, `vision_tower.*`): их матрицы.
+    pub vision: Option<DType>,
+    /// Правила по подстроке имени — первое совпадение сильнее роли
+    /// (`.layers.0.` → MXFP8 у крайних слоёв, `shared_expert` и т. п.).
+    /// `None` — оставить тензор как есть.
+    pub rules: Vec<(String, Option<DType>)>,
 }
 
 impl TranscodeSpec {
@@ -75,6 +81,8 @@ impl TranscodeSpec {
             requant: true,
             quantize_dense: false,
             include: Vec::new(),
+            vision: None,
+            rules: Vec::new(),
         }
     }
 
@@ -87,6 +95,9 @@ impl TranscodeSpec {
         if !self.include.is_empty() && !self.include.iter().any(|p| name.starts_with(p.as_str())) {
             return None;
         }
+        if let Some((_, d)) = self.rules.iter().find(|(p, _)| name.contains(p.as_str())) {
+            return *d;
+        }
         if slices > 1 || name.contains(".experts.") {
             return self.experts;
         }
@@ -95,6 +106,7 @@ impl TranscodeSpec {
             LayerRole::Mlp => self.mlp,
             LayerRole::LmHead => self.lm_head,
             LayerRole::Embedding => self.embed,
+            LayerRole::Vision => self.vision,
             _ => None,
         }
     }
@@ -102,7 +114,7 @@ impl TranscodeSpec {
     /// Строка для ключа кэша и логов: `attn=sq4,mlp=sq4,experts=sq4,lm_head=sq4,requant`.
     pub fn key(&self) -> String {
         let f = |d: Option<DType>| d.map(|d| synaptix_core::precision::dtype_name(d)).unwrap_or_else(|| "-".into());
-        format!(
+        let mut k = format!(
             "attn={},mlp={},experts={},lm_head={},embed={},requant={},dense={}",
             f(self.attn),
             f(self.mlp),
@@ -111,7 +123,14 @@ impl TranscodeSpec {
             f(self.embed),
             self.requant as u8,
             self.quantize_dense as u8
-        )
+        );
+        if self.vision.is_some() {
+            k += &format!(",vision={}", f(self.vision));
+        }
+        for (p, d) in &self.rules {
+            k += &format!(",[{p}]={}", f(*d));
+        }
+        k
     }
 }
 

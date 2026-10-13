@@ -1084,6 +1084,13 @@ impl DecoderModel {
         let qlin = |key: &str, wq: DType| -> Result<QLinear, ModelError> {
             if let Some(prequant) = weights.quant(key, if b_dev == device { device } else { b_dev }) {
                 let qw = prequant?;
+                // NVFP4 из бандла приходит сырым: перемешанную копию строит
+                // первое умножение — уже под активации, и сырой packed в пуле
+                // весов остаётся зарезервированным (резерв ×2, OOM у 27B).
+                // Строим её сразу: packed освобождается и идёт под следующий вес.
+                if qw.dtype() == DType::NVFP4 && qw.device().is_cuda() {
+                    let _ = qw.ensure_shuffled();
+                }
                 return Ok(QLinear::Quant(qw));
             }
             if wq.is_quantized() && quant_on_load(device) {

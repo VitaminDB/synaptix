@@ -47,7 +47,7 @@ impl HybridWeights {
     }
 
     pub fn contains(&self, key: &str) -> bool {
-        self.loader.names().iter().any(|n| *n == key)
+        synaptix_io::weights::WeightLoader::contains(&self.loader, key)
     }
 
     /// Имя тензора внутри бандла: у гибрида языковая часть лежит под

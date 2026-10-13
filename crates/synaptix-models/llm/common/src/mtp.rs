@@ -38,6 +38,19 @@ impl WeightSource for MtpWeights<'_> {
         }
         self.inner.contains(&remap(key))
     }
+    // Слои MTP в квантованном бандле лежат готовыми квантами.
+    fn quant(&self, key: &str, device: Device) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, ModelError>> {
+        if key == "model.embed_tokens.weight" || key == "lm_head.weight" {
+            return None;
+        }
+        self.inner.quant(&remap(key), device)
+    }
+    fn quant_stack(&self, key: &str, device: Device) -> Option<Result<Vec<synaptix_core::tensor::quant::QuantWeight>, ModelError>> {
+        if key == "model.embed_tokens.weight" || key == "lm_head.weight" {
+            return None;
+        }
+        self.inner.quant_stack(&remap(key), device)
+    }
 }
 
 pub fn present(weights: &dyn WeightSource) -> bool {
@@ -113,11 +126,10 @@ impl MtpModule {
             compute
         };
         let wdt = if fc_dtype.is_quantized() { DType::F16 } else { compute };
-        let fc = QLinear::build(
-            weights.tensor("mtp.fc.weight", device, wdt)?,
-            fc_dtype,
-            compute,
-        )?;
+        let fc = match weights.quant("mtp.fc.weight", device) {
+            Some(q) => QLinear::Quant(q?),
+            None => QLinear::build(weights.tensor("mtp.fc.weight", device, wdt)?, fc_dtype, compute)?,
+        };
 
         Ok(Self {
             layers,
