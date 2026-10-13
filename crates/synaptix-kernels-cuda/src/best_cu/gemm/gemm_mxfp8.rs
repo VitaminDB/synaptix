@@ -36,14 +36,15 @@ pub struct RotCfg {
     pub bn: u32,
     pub stages: u32,
     fname: &'static str,
+    fname_ldg: &'static str,
     pub suffix: &'static str,
 }
 
 impl RotCfg {
-    pub const D128: Self = Self { bm: 128, bn: 128, stages: 2, fname: "gn_mxfp8_drot_128x128_s2", suffix: "d128" };
-    pub const D64X128S2: Self = Self { bm: 64, bn: 128, stages: 2, fname: "gn_mxfp8_drot_64x128_s2", suffix: "d64x128s2" };
-    pub const D64X128S3: Self = Self { bm: 64, bn: 128, stages: 3, fname: "gn_mxfp8_drot_64x128_s3", suffix: "d64x128s3" };
-    pub const D64X256S2: Self = Self { bm: 64, bn: 256, stages: 2, fname: "gn_mxfp8_drot_64x256_s2", suffix: "d64x256s2" };
+    pub const D128: Self = Self { bm: 128, bn: 128, stages: 2, fname: "gn_mxfp8_drot_128x128_s2", fname_ldg: "gn_mxfp8_drot_128x128_s2_ldg", suffix: "d128" };
+    pub const D64X128S2: Self = Self { bm: 64, bn: 128, stages: 2, fname: "gn_mxfp8_drot_64x128_s2", fname_ldg: "gn_mxfp8_drot_64x128_s2_ldg", suffix: "d64x128s2" };
+    pub const D64X128S3: Self = Self { bm: 64, bn: 128, stages: 3, fname: "gn_mxfp8_drot_64x128_s3", fname_ldg: "gn_mxfp8_drot_64x128_s3_ldg", suffix: "d64x128s3" };
+    pub const D64X256S2: Self = Self { bm: 64, bn: 256, stages: 2, fname: "gn_mxfp8_drot_64x256_s2", fname_ldg: "gn_mxfp8_drot_64x256_s2_ldg", suffix: "d64x256s2" };
     pub const ALL: [Self; 4] = [Self::D128, Self::D64X128S2, Self::D64X128S3, Self::D64X256S2];
     fn smem(&self) -> u32 {
         self.stages * ((self.bm + self.bn) * (128 + 16)) + 2 * self.stages * 8
@@ -53,6 +54,10 @@ impl RotCfg {
         // гардит сторы (рецепт bf16 BT-ядер).
         m >= 1 && n % self.bn == 0 && k % 512 == 0 && k / 128 >= self.stages
     }
+    /// Как `fits`, но K кратно лишь 128: SF_LDG-вариант (шкалы через cp.async).
+    pub fn fits_ldg(&self, m: u32, n: u32, k: u32) -> bool {
+        m >= 1 && n % self.bn == 0 && k % 128 == 0 && k / 128 >= self.stages
+    }
 }
 
 pub struct GemmMxFp8Kernels {
@@ -61,6 +66,7 @@ pub struct GemmMxFp8Kernels {
     f_rot: CudaFunction,
     f_drot: CudaFunction,
     f_drot_cfgs: [CudaFunction; 4],
+    f_drot_ldg: [CudaFunction; 4],
     f_drot_sk: CudaFunction,
     f_sk_reduce: CudaFunction,
 }
@@ -128,6 +134,19 @@ impl GemmMxFp8Kernels {
         let f_drot_cfgs: [CudaFunction; 4] = f_drot_cfgs
             .try_into()
             .map_err(|_| SynaptixError::Cuda("mxfp8: drot cfgs".into()))?;
+        let mut f_drot_ldg: Vec<CudaFunction> = Vec::with_capacity(4);
+        for cfg in RotCfg::ALL {
+            let fc = load_fn(&module, cfg.fname_ldg)?;
+            fc.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                cfg.smem() as i32,
+            )
+            .map_err(|e| SynaptixError::Cuda(format!("set_attr {}: {e:?}", cfg.fname_ldg)))?;
+            f_drot_ldg.push(fc);
+        }
+        let f_drot_ldg: [CudaFunction; 4] = f_drot_ldg
+            .try_into()
+            .map_err(|_| SynaptixError::Cuda("mxfp8: drot ldg".into()))?;
         let f_drot_sk = load_fn(&module, "gn_mxfp8_drot_128x128_s2_sk")?;
         f_drot_sk
             .set_attribute(
@@ -141,6 +160,7 @@ impl GemmMxFp8Kernels {
             f_rot,
             f_drot,
             f_drot_cfgs,
+            f_drot_ldg,
             f_drot_sk,
             f_sk_reduce,
             _module: module,
@@ -170,14 +190,18 @@ pub fn gemm_mxfp8_rot<T: cudarc::driver::DeviceRepr>(
     use super::gemm_nvfp4::cached_desc_2d;
     use cudarc::driver::sys::CUtensorMapSwizzle;
     use cudarc::driver::DevicePtr;
-    // k%512: SF-окна TMA по 16Б = 16 k32-блоков (K/32 кратно 16).
+    // SF_LDG (по умолчанию; обязательно при K%512≠0 — шаг строки шкал K/32 Б
+    // не кратен 16, TMA не может): шкалы читают producer-варпы drot.
     // Конфиг drot: pick_rot_cfg (data-driven по форме).
+    let ldg = k % 512 != 0 || !tma_sf();
+    let drot = drot || ldg;
     let cfg = if drot {
         pick_rot_cfg(m, n, k)
     } else {
         RotCfg::D128
     };
-    if !cfg.fits(m, n, k) {
+    let ok = if ldg { cfg.fits_ldg(m, n, k) } else { cfg.fits(m, n, k) };
+    if !ok {
         return Err(SynaptixError::Cuda(format!(
             "gemm_mxfp8_rot: {m}x{n}x{k} не подходит"
         )));
@@ -190,11 +214,21 @@ pub fn gemm_mxfp8_rot<T: cudarc::driver::DeviceRepr>(
     const NOSWZ: CUtensorMapSwizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
     let a_desc = cached_desc_2d(stream, a_ptr, m, k, cfg.bm, 128, swz)?;
     let b_desc = cached_desc_2d(stream, b_ptr, n, k, cfg.bn, 128, swz)?;
-    let sfa_desc = cached_desc_2d(stream, sa_ptr, m, k / 32, cfg.bm, 16, NOSWZ)?;
-    let sfb_desc = cached_desc_2d(stream, sb_ptr, n, k / 32, cfg.bn, 16, NOSWZ)?;
+    let (sfa_desc, sfb_desc) = if ldg {
+        (None, None)
+    } else {
+        (
+            Some(cached_desc_2d(stream, sa_ptr, m, k / 32, cfg.bm, 16, NOSWZ)?),
+            Some(cached_desc_2d(stream, sb_ptr, n, k / 32, cfg.bn, 16, NOSWZ)?),
+        )
+    };
     let (kfn, threads) = if drot {
         let idx = RotCfg::ALL.iter().position(|c| *c == cfg).unwrap_or(0);
-        (&kernels.f_drot_cfgs[idx], 384)
+        if ldg {
+            (&kernels.f_drot_ldg[idx], 384)
+        } else {
+            (&kernels.f_drot_cfgs[idx], 384)
+        }
     } else {
         (&kernels.f_rot, 256)
     };
@@ -224,11 +258,16 @@ pub fn gemm_mxfp8_rot<T: cudarc::driver::DeviceRepr>(
     };
     let out_desc = cached_desc_2d(stream, out_ptr, m, n * 2, cfg.bm / 2, wn_bytes, out_swz)?;
     let mut bld = stream.launch_builder(kfn);
-    bld.arg(&*a_desc)
-        .arg(&*b_desc)
-        .arg(&*sfa_desc)
-        .arg(&*sfb_desc)
-        .arg(&mut *y)
+    bld.arg(&*a_desc).arg(&*b_desc);
+    match (&sfa_desc, &sfb_desc) {
+        (Some(da), Some(db)) => {
+            bld.arg(&**da).arg(&**db);
+        }
+        _ => {
+            bld.arg(&sa_ptr).arg(&sb_ptr);
+        }
+    }
+    bld.arg(&mut *y)
         .arg(&m)
         .arg(&n)
         .arg(&k)
@@ -249,6 +288,14 @@ pub fn gemm_mxfp8_rot<T: cudarc::driver::DeviceRepr>(
 // bench/results/retest_mxfp8_cfg_*.txt): малые M — 64-тайлы (грид ×2:
 // attn-32 +25%, ffd-64 +33%, ffd-128 +22%), глубокий K → s3 (конвейер),
 // M=192 — ffd d64x256 +7.8% / ffu s3 +13.2%; M>=256 везде D128.
+/// Шкалы drot по умолчанию читают producer-варпы (SF_LDG): бит-в-бит с TMA-
+/// окнами и на 5–15% быстрее (свип 2026-10-13: 4096³ 322→349 TF, 1024×5120²
+/// 296→334); `SYN_MXFP8_TMA_SF=1` — прежние TMA-окна (только K%512).
+fn tma_sf() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYN_MXFP8_TMA_SF").as_deref(), Ok("1")))
+}
+
 fn pick_rot_cfg(m: u32, n: u32, k: u32) -> RotCfg {
     let deep_k = k >= 16384;
     let cand = if m <= 32 {
@@ -274,7 +321,8 @@ fn pick_rot_cfg(m: u32, n: u32, k: u32) -> RotCfg {
     } else {
         RotCfg::D128
     };
-    if cand.fits(m, n, k) {
+    let fits = if k % 512 == 0 && tma_sf() { cand.fits(m, n, k) } else { cand.fits_ldg(m, n, k) };
+    if fits {
         cand
     } else {
         RotCfg::D128

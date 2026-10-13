@@ -586,6 +586,13 @@ pub fn mxfp8_linear_tiled(
 /// Такие формы уходят в деквант-фолбэк. `K = 128` встречается у узких
 /// проекций (например, MoE-эксперты в тестовых конфигурациях), у боевых
 /// весов `K` заметно больше.
+/// Кратность K для rot-ядра MXFP8: 128 (шкалы через cp.async при K%512≠0);
+/// `SYN_MXFP8_NO_LDG=1` — прежние 512 (K%512≠0 → cp.async-ядро).
+fn mxfp8_rot_k_align() -> u32 {
+    static A: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *A.get_or_init(|| if matches!(std::env::var("SYN_MXFP8_NO_LDG").as_deref(), Ok("1")) { 512 } else { 128 })
+}
+
 fn tiled_shape_ok(n: u32, k: u32) -> bool {
     n % 128 == 0 && k % 128 == 0 && k >= 256
 }
@@ -637,7 +644,7 @@ pub fn mxfp8_linear_tiled_n(
     // xq/sa (fp8-нуль → вклад строки 0).
     let (m_us, mp_us) = (m as usize, m_pad as usize);
     let aligned = m == m_pad;
-    let use_rot = k % 512 == 0 && k / 128 >= 2;
+    let use_rot = k % mxfp8_rot_k_align() == 0 && k / 128 >= 2;
     // rot-путь: TMA зануляет OOB-чтения хвостового M-ряда, эпилог гардит сторы
     // → скретчи ровно на m строк и GEMM ПРЯМО в out при любом m (старый путь
     // m_pad-скретчей+копий стоил ~1GB DRAM/вызов на 26520).
@@ -680,7 +687,7 @@ pub fn mxfp8_linear_prequant(
 ) -> Result<()> {
     let n = w.n() as u32;
     let k = w.k() as u32;
-    let use_rot = n % 128 == 0 && k % 128 == 0 && k % 512 == 0 && k / 128 >= 2;
+    let use_rot = n % 128 == 0 && k % mxfp8_rot_k_align() == 0 && k / 128 >= 2;
     let gk = if out_bf16 { GemmMxFp8Kernels::for_context_bf16(ctx)? } else { GemmMxFp8Kernels::for_context(ctx)? };
     if !use_rot {
         // K не кратен 512 (H3: 5376): cp.async-ядро читает полные 128-строчные

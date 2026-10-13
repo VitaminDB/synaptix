@@ -195,7 +195,7 @@ template <int NREG> __device__ __forceinline__ void mx_setmaxnreg_inc() {
 
 template <unsigned int BM, unsigned int BN, unsigned int WM, unsigned int WN,
           unsigned int STAGES, unsigned int PROD_W = 0u, int RDEC = 0, int RINC = 0,
-          bool SPLITK = false>
+          bool SPLITK = false, bool SF_LDG = false>
 __device__ __forceinline__ void mxfp8_rot_device(
     const void* __restrict__ a_desc,
     const void* __restrict__ b_desc,
@@ -224,7 +224,13 @@ __device__ __forceinline__ void mxfp8_rot_device(
     constexpr unsigned int SFA_SZ = BM * 16u;
     constexpr unsigned int SFB_SZ = BN * 16u;
     constexpr unsigned int STAGE = A_SZ + B_SZ + SFA_SZ + SFB_SZ;
-    constexpr unsigned int TX = STAGE;
+    // SF_LDG (K кратно 128, не 512): шаг строки шкал K/32 Б не кратен 16 —
+    // TMA не может; шкалы стадии (4 Б/строку) кладут потоки producer-варпов
+    // через cp.async с arrive.noinc на тот же full-барьер. sfa/sfb_desc —
+    // тогда сырые указатели natural-шкал [rows, K/32].
+    static_assert(!SF_LDG || PROD_W != 0u, "SF_LDG: нужен выделенный producer");
+    constexpr unsigned int TX = SF_LDG ? A_SZ + B_SZ : STAGE;
+    constexpr unsigned int FULL_CNT = SF_LDG ? 1u + PROD_W * 32u : 1u;
     constexpr unsigned int B_OFF   = A_SZ;
     constexpr unsigned int SFA_OFF = A_SZ + B_SZ;
     constexpr unsigned int SFB_OFF = SFA_OFF + SFA_SZ;
@@ -254,7 +260,7 @@ __device__ __forceinline__ void mxfp8_rot_device(
     if (tid == 0) {
         #pragma unroll
         for (unsigned int s = 0; s < STAGES; s++) {
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(MFULL_A(s)));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(MFULL_A(s)), "r"(FULL_CNT));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
                          :: "r"(MEMPTY_A(s)), "r"(THREADS));
         }
@@ -287,6 +293,7 @@ __device__ __forceinline__ void mxfp8_rot_device(
           " [%0], [%1, {%2, %3}], [%4];\n"
           :: "r"(sbase + buf * STAGE + B_OFF), "l"((unsigned long long)b_desc),
              "r"(kb), "r"(block_n0), "r"(fa) : "memory");
+        if constexpr (SF_LDG) return;
         asm volatile(
           "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
           " [%0], [%1, {%2, %3}], [%4];\n"
@@ -302,6 +309,57 @@ __device__ __forceinline__ void mxfp8_rot_device(
     if constexpr (PROD_W != 0u) {
         if (is_prod) {
             mx_setmaxnreg_dec<RDEC>();
+            if constexpr (SF_LDG) {
+                // Шкалы стадии грузятся в регистры ДО ожидания empty (от него
+                // зависит только запись в smem) — задержка global прячется за
+                // ожиданием. Запись st.shared + обычный arrive (release):
+                // вариант cp.async + arrive.noinc давал редкие расхождения.
+                constexpr unsigned int PT = PROD_W * 32u;
+                constexpr unsigned int NPER = (BM + BN + PT - 1u) / PT;
+                unsigned int pt = tid - CONS_WARPS * 32u;
+                const unsigned char* gsa = (const unsigned char*)sfa_desc;
+                const unsigned char* gsb = (const unsigned char*)sfb_desc;
+                unsigned int kq = K / 32u;
+                for (unsigned int g = 0; g < num_kt; g++) {
+                    unsigned int buf = g % STAGES;
+                    unsigned int pass = g / STAGES;
+                    unsigned int col = (kt0 + g) * (BK / 32u);
+                    unsigned int v[NPER];
+                    #pragma unroll
+                    for (unsigned int j = 0; j < NPER; j++) {
+                        unsigned int i = pt + j * PT;
+                        v[j] = 0u;
+                        if (i < BM + BN) {
+                            bool is_a = i < BM;
+                            unsigned int row = is_a ? block_m0 + i : block_n0 + (i - BM);
+                            if (!is_a || row < M)
+                                v[j] = __ldg((const unsigned int*)((is_a ? gsa : gsb) + (size_t)row * kq + col));
+                        }
+                    }
+                    if (pt == 0) {
+                        issue_chunk(g);
+                    } else if (pass > 0) {
+                        unsigned int ph = (pass - 1u) & 1u;
+                        asm volatile(
+                          "{\n.reg .pred p;\nMWL_%=:\n"
+                          "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+                          "@!p bra MWL_%=;\n}\n" :: "r"(MEMPTY_A(buf)), "r"(ph) : "memory");
+                    }
+                    unsigned int slot = sbase + buf * STAGE + (g & 3u) * 4u;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < NPER; j++) {
+                        unsigned int i = pt + j * PT;
+                        if (i < BM + BN) {
+                            unsigned int dst = slot + (i < BM ? SFA_OFF + i * 16u : SFB_OFF + (i - BM) * 16u);
+                            asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(dst), "r"(v[j]) : "memory");
+                        }
+                    }
+                    unsigned long long stl;
+                    asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];\n"
+                                 : "=l"(stl) : "r"(MFULL_A(buf)) : "memory");
+                }
+                return;
+            }
             if (warp == CONS_WARPS && lane == 0) {
                 for (unsigned int g = 0; g < num_kt; g++)
                     issue_chunk(g);
@@ -579,3 +637,17 @@ extern "C" __global__ __launch_bounds__(384, 1) void gn_mxfp8_drot_64x256_s2(
     const void* out_desc) {
     mxfp8_rot_device<64, 256, 2, 4, 2, 4u, 24, 240>(a_desc, b_desc, sfa_desc, sfb_desc, out, M, N, K, raster_gr, out_desc);
 }
+
+// SF_LDG-варианты drot (K кратно 128, не 512; шкалы — сырые указатели).
+#define MXFP8_DROT_LDG(NAME, BM, BN, ST) \
+extern "C" __global__ __launch_bounds__(384, 1) void NAME( \
+    const void* a_desc, const void* b_desc, const void* sfa, const void* sfb, \
+    syn_out_t* out, unsigned int M, unsigned int N, unsigned int K, unsigned int raster_gr, \
+    const void* out_desc) { \
+    mxfp8_rot_device<BM, BN, 2, 4, ST, 4u, 40, 232, false, true>( \
+        a_desc, b_desc, sfa, sfb, out, M, N, K, raster_gr, out_desc); \
+}
+MXFP8_DROT_LDG(gn_mxfp8_drot_128x128_s2_ldg, 128, 128, 2)
+MXFP8_DROT_LDG(gn_mxfp8_drot_64x128_s2_ldg, 64, 128, 2)
+MXFP8_DROT_LDG(gn_mxfp8_drot_64x128_s3_ldg, 64, 128, 3)
+MXFP8_DROT_LDG(gn_mxfp8_drot_64x256_s2_ldg, 64, 256, 2)
