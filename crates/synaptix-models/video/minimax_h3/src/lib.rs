@@ -8,6 +8,7 @@ pub mod layout;
 pub mod loader;
 pub mod memory;
 pub mod pipeline;
+pub mod prefetch;
 pub mod refs;
 pub mod restyle;
 pub mod rope;

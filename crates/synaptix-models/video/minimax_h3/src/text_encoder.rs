@@ -20,6 +20,12 @@ fn encoder_layers() -> usize {
         .unwrap_or(H3_ENCODER_LAYERS)
 }
 
+/// Номер слоя языковой модели в имени тензора (`….layers.N.…`).
+fn layer_of(name: &str) -> Option<usize> {
+    let i = name.find("layers.")? + "layers.".len();
+    name[i..].split('.').next()?.parse().ok()
+}
+
 impl EncoderHandle {
     pub fn load(
         encoder_dir: impl AsRef<Path>,
@@ -46,15 +52,25 @@ impl EncoderHandle {
         let cfg = src.read("config.json")?;
         let tok = src.read("tokenizer.json")?;
         let weights = std::sync::Arc::new(DirWeights::from_loader(src.loader(device)?));
-        let inner = H3Encoder::from_parts(
-            &cfg,
-            &tok,
-            weights,
-            device,
-            compute,
-            quant,
-            encoder_layers(),
-        )
+        // Пока энкодер грузится (H2D через pinned-конвейер, а не pageable из
+        // mmap), его тензоры подкачиваются с диска в порядке файла.
+        let pre = src.loader(device)?;
+        let layers = encoder_layers();
+        let inner = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let mut ranges: Vec<&[u8]> = pre
+                    .infos()
+                    .filter(|(n, _, _)| layer_of(n).is_none_or(|l| l < layers))
+                    .filter_map(|(n, _, _)| pre.raw_bytes(n).map(|r| r.0))
+                    .collect();
+                ranges.sort_by_key(|r| r.as_ptr() as usize);
+                crate::prefetch::populate(&ranges);
+            });
+            synaptix_core::device::cuda::set_offload_pinned(true);
+            let r = H3Encoder::from_parts(&cfg, &tok, weights, device, compute, quant, layers);
+            synaptix_core::device::cuda::set_offload_pinned(false);
+            r
+        })
         .map_err(|e| H3Error::Load(e.to_string()))?;
         Ok(Self { inner })
     }

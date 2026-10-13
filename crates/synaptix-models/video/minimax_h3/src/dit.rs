@@ -18,6 +18,19 @@ const LIN_CHUNK_ROWS: usize = 16384;
 
 pub struct Lin(QuantLinear);
 
+/// Подкачать с диска страницы mmap весов блока `idx` (кроме adaLN — её
+/// читает свой кэш).
+fn prefetch_block(ckpt: &H3Checkpoint, idx: usize) {
+    let p = format!("blocks.{idx}.");
+    let names = ckpt.names();
+    let ranges: Vec<&[u8]> = names
+        .iter()
+        .filter(|n| n.starts_with(&p) && !n.contains("adaln_proj"))
+        .filter_map(|n| ckpt.raw_bytes(n).map(|r| r.0))
+        .collect();
+    crate::prefetch::populate(&ranges);
+}
+
 impl Lin {
     pub fn load(
         ckpt: &H3Checkpoint,
@@ -1025,7 +1038,19 @@ impl H3Dit {
                     "[h3] VRAM кончилась на блоке {i}/{nblocks} — блоки {i}..{nblocks} на хост, стримятся в forward"
                 );
             }
-            let blk = DiTBlock::load(ckpt, i, &cfg, quant, compute)?;
+            // Сырые bf16-веса блока (~0.5 ГБ) — H2D через pinned-конвейер,
+            // а не pageable-копией из mmap (1.7 ГБ/с на всю загрузку).
+            // Пока блок едет на карту, страницы следующего подкачиваются с
+            // диска в page cache — чтение mmap перекрывается с H2D.
+            let blk = std::thread::scope(|sc| {
+                if i + 1 < nblocks {
+                    sc.spawn(|| prefetch_block(ckpt, i + 1));
+                }
+                synaptix_core::device::cuda::set_offload_pinned(true);
+                let r = DiTBlock::load(ckpt, i, &cfg, quant, compute);
+                synaptix_core::device::cuda::set_offload_pinned(false);
+                r
+            })?;
             if i >= host_from {
                 synaptix_core::device::cuda::set_offload_pinned(true);
                 let host = blk.to_device(Device::Cpu);
