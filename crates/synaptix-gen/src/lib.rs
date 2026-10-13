@@ -4,3 +4,4 @@
 
 pub mod image;
 pub mod music;
+pub mod video;

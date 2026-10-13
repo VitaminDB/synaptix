@@ -18,4 +18,5 @@ synaptix-image-qwen   = { workspace = true }
 synaptix-image-qwen21 = { workspace = true }
 synaptix-music-acestep = { workspace = true }
 synaptix-music-yue2   = { workspace = true }
+synaptix-video-minimax-h3 = { workspace = true }
 serde_json            = { workspace = true }
