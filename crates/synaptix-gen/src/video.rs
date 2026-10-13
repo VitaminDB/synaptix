@@ -104,7 +104,14 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     }
     let variant = if ref_sources.is_empty() { h3::config::H3Variant::Fl2va } else { h3::config::H3Variant::Ref2va };
     let source = h3::H3Source::open(model, variant).map_err(err)?;
-    let frame_count = h3::config::frames_for_duration(req.seconds.filter(|s| *s > 0.0).unwrap_or(5.0));
+    // Звук в референсах (голос для липсинка) задаёт длину ролика.
+    let audio_secs = req
+        .refs
+        .iter()
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("wav" | "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac")))
+        .filter_map(|p| media_seconds(p))
+        .fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
+    let frame_count = h3::config::frames_for_duration(audio_secs.or(req.seconds.filter(|s| *s > 0.0)).unwrap_or(5.0).clamp(1.0, 15.0));
     let geometry = h3::pipeline::Geometry::new(width, height, frame_count);
 
     let encoder_source = match encoder {
@@ -315,7 +322,7 @@ enum LtxMode {
     Frames { first: Option<PathBuf>, last: Option<PathBuf> },
     Retake { video: PathBuf, start: f64, end: f64 },
     Extend { video: PathBuf, last_frame: PathBuf },
-    A2v { audio: PathBuf },
+    A2v { audio: PathBuf, image: Option<PathBuf> },
     Ic { video: PathBuf, canny: bool },
     Lipdub { video: PathBuf, audio: PathBuf },
 }
@@ -451,7 +458,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let (a, b) = req.retake.unwrap_or((0.0, media_seconds(v).unwrap_or(5.0)));
             LtxMode::Retake { video: v.clone(), start: a, end: b }
         }
-        (None, Some(a), None) => LtxMode::A2v { audio: a.clone() },
+        (None, Some(a), None) => LtxMode::A2v { audio: a.clone(), image: req.first_frame.clone() },
         (None, None, None) if req.first_frame.is_some() || req.last_frame.is_some() => LtxMode::Frames { first: req.first_frame.clone(), last: req.last_frame.clone() },
         _ => LtxMode::Text,
     };
@@ -472,11 +479,17 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     }
     // Длительность: у звука, retake и образцов — по исходнику.
     let src_secs = match &mode {
-        LtxMode::A2v { audio } | LtxMode::Lipdub { audio, .. } => media_seconds(audio),
+        LtxMode::A2v { audio, .. } | LtxMode::Lipdub { audio, .. } => media_seconds(audio),
         LtxMode::Retake { video, .. } | LtxMode::Ic { video, .. } => media_seconds(video),
         _ => None,
     };
-    let secs = req.seconds.filter(|s| *s > 0.0).or(src_secs).unwrap_or(5.0).clamp(1.0, 20.0);
+    // От звука (липсинк, LipDub) длина ролика — по звуку; иначе — запрошенная.
+    let secs = match &mode {
+        LtxMode::A2v { .. } | LtxMode::Lipdub { .. } => src_secs.or(req.seconds),
+        _ => req.seconds.filter(|s| *s > 0.0).or(src_secs),
+    }
+    .unwrap_or(5.0)
+    .clamp(1.0, 20.0);
     let width = req.width.filter(|&v| v > 0).unwrap_or(960);
     let height = req.height.filter(|&v| v > 0).unwrap_or(544);
     let (hp, wp) = lp::latent_grid(width, height);
@@ -538,7 +551,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let dit = AvDit::load_with(lora_ckpt.as_ref().unwrap_or(&ckpt), device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
         let (hp1, wp1) = if two_stage { lp::stage1_grid(hp, wp) } else { (hp, wp) };
         let (hp2, wp2) = (hp1 * 2, wp1 * 2);
-        let venc = if matches!(mode, LtxMode::Text | LtxMode::A2v { .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
+        let venc = if matches!(mode, LtxMode::Text | LtxMode::A2v { image: None, .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
         let image_tokens = |img: &Tensor, g: (usize, usize)| -> R<Tensor> {
             let (ph, pw) = (g.0 * 32, g.1 * 32);
             let x = synaptix_io::image::fit_image(img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
@@ -604,7 +617,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let (l, a) = lp::denoise_av_retake(&dit, &v_enc, &a_enc, f_, h_, w_, sigmas, &source, *start, *end, fps, device, seed, &hooks).map_err(err)?;
                     (l, a, None)
                 }
-                LtxMode::A2v { audio } => {
+                LtxMode::A2v { audio, image } => {
                     let fa = lp::audio_token_count(fp, fps);
                     let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
                     let mel = ltx_log_mel(&[ffmpeg_f32(audio, 16000, 1)?], device).map_err(err)?;
@@ -620,7 +633,16 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                         let refs: Vec<&Tensor> = parts.iter().collect();
                         Tensor::cat(&refs, 1).map_err(err)?.contiguous().map_err(err)?
                     };
-                    let (l, _) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, None, None, fps, device, seed, &hooks).map_err(err)?;
+                    // Фото — ключевым кадром в начале: говорит именно этот человек/персонаж.
+                    let key = match image {
+                        Some(p) => {
+                            let img = synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
+                            Some((image_tokens(&img, g)?, lp::keyframe_positions(g.0, g.1, 0, fps)))
+                        }
+                        None => None,
+                    };
+                    let v_app = key.as_ref().map(|(t, pos)| (t, pos.as_slice(), 1.0f32));
+                    let (l, _) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, v_app, None, fps, device, seed, &hooks).map_err(err)?;
                     (l, audio_lat, Some(ffmpeg_f32(audio, 48000, 2)?))
                 }
                 LtxMode::Ic { video, canny } => {
@@ -705,6 +727,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::Frames { .. } => "с первого кадра",
         LtxMode::Retake { .. } => "retake отрезка",
         LtxMode::Extend { .. } => "продление",
+        LtxMode::A2v { image: Some(_), .. } => "по звуку с первого кадра (липсинк)",
         LtxMode::A2v { .. } => "по звуку (липсинк)",
         LtxMode::Ic { canny: true, .. } => "по контурам образца (IC-LoRA)",
         LtxMode::Ic { .. } => "по движению образца (IC-LoRA)",
