@@ -1,4 +1,5 @@
 pub mod adaln;
+pub mod adaln_disk;
 pub mod audio_vae;
 pub mod config;
 pub mod dit;

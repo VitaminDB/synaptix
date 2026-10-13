@@ -1146,36 +1146,64 @@ impl H3Dit {
         let steps = plan.steps();
         let rows = plan.rows();
         let hidden = self.cfg.hidden_size;
-        let t_embs: Vec<Tensor> = plan
+        let nblocks = self.blocks.len();
+        // Шаги, чьи выходы уже на диске, берутся оттуда; веса проекций
+        // читаются, только если недостаёт хоть одного шага.
+        let disk = crate::adaln_disk::DiskCache::open(ckpt, cache_dtype);
+        let mut per_step: Vec<Option<Vec<Tensor>>> = plan
             .timesteps
             .iter()
-            .map(|v| self.time_embed(v).map_err(H3Error::from))
-            .collect::<Result<_, _>>()?;
-
-        let mut blocks = Vec::with_capacity(self.blocks.len());
-        for i in 0..self.blocks.len() {
-            let proj = match self.adaln_blocks.get(i) {
-                Some(p) => p,
-                None => &load_adaln(
-                    ckpt,
-                    &format!("blocks.{i}.adaln_proj"),
-                    &self.cfg,
-                    ADALN_CHUNKS,
-                    crate::config::ADALN_MODALITIES,
-                )?,
-            };
-            let mut per_step = Vec::with_capacity(steps);
-            for t in &t_embs {
-                per_step.push(proj.forward(t)?);
+            .map(|v| disk.as_ref().and_then(|d| d.load(v, nblocks + 1, self.device)))
+            .collect();
+        let missing: Vec<usize> = (0..steps).filter(|&s| per_step[s].is_none()).collect();
+        if !missing.is_empty() {
+            let t_embs: Vec<Tensor> = missing
+                .iter()
+                .map(|&s| self.time_embed(&plan.timesteps[s]).map_err(H3Error::from))
+                .collect::<Result<_, _>>()?;
+            let mut computed: Vec<Vec<Tensor>> = missing.iter().map(|_| Vec::with_capacity(nblocks + 1)).collect();
+            for i in 0..nblocks {
+                // Проекция adaLN блока — 520М параметров (1 ГБ bf16): H2D через
+                // pinned-конвейер (многопоточный memcpy mmap→pinned + async DMA),
+                // а не pageable-копией прямо из mmap (~3.6 ГБ/с).
+                let loaded;
+                let proj = match self.adaln_blocks.get(i) {
+                    Some(p) => p,
+                    None => {
+                        synaptix_core::device::cuda::set_offload_pinned(true);
+                        let r = load_adaln(
+                            ckpt,
+                            &format!("blocks.{i}.adaln_proj"),
+                            &self.cfg,
+                            ADALN_CHUNKS,
+                            crate::config::ADALN_MODALITIES,
+                        );
+                        synaptix_core::device::cuda::set_offload_pinned(false);
+                        loaded = r?;
+                        &loaded
+                    }
+                };
+                for (k, t) in t_embs.iter().enumerate() {
+                    computed[k].push(cast(proj.forward(t)?, cache_dtype)?);
+                }
             }
-            blocks.push(crate::adaln::stack_steps(per_step, cache_dtype)?);
+            for (k, t) in t_embs.iter().enumerate() {
+                computed[k].push(cast(self.adaln_final.forward(t)?, cache_dtype)?);
+            }
+            for (k, out) in computed.into_iter().enumerate() {
+                let s = missing[k];
+                if let Some(d) = &disk {
+                    d.store(&plan.timesteps[s], &out);
+                }
+                per_step[s] = Some(out);
+            }
         }
-
-        let mut per_step = Vec::with_capacity(steps);
-        for t in &t_embs {
-            per_step.push(self.adaln_final.forward(t)?);
-        }
-        let final_layer = crate::adaln::stack_steps(per_step, cache_dtype)?;
+        let per_step: Vec<Vec<Tensor>> = per_step.into_iter().map(|o| o.unwrap_or_default()).collect();
+        let column = |i: usize| -> Result<Tensor, H3Error> {
+            crate::adaln::stack_steps(per_step.iter().map(|v| v[i].clone()).collect(), cache_dtype)
+        };
+        let blocks = (0..nblocks).map(column).collect::<Result<Vec<_>, _>>()?;
+        let final_layer = column(nblocks)?;
 
         Ok(AdalnCache::new(blocks, final_layer, rows, plan.final_rows(), hidden, steps))
     }
@@ -1249,6 +1277,12 @@ impl H3Dit {
         }
         Ok((v, a))
     }
+}
+
+/// Привести выход adaLN к dtype кэша (поэлементно — тот же результат, что
+/// приведение после склейки шагов).
+fn cast(t: Tensor, dtype: DType) -> R<Tensor> {
+    if t.dtype() == dtype { Ok(t) } else { t.to_dtype(dtype) }
 }
 
 fn load_adaln(

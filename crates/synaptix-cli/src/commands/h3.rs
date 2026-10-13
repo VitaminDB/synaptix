@@ -48,6 +48,12 @@ pub struct H3Args {
     pub restyle_strength: f32,
 }
 
+/// Метка времени от старта команды — для разбивки по фазам.
+fn ts() -> String {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    format!("{:.1}с", T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32())
+}
+
 fn random_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,6 +78,7 @@ fn parse_dtype(s: Option<&str>, default: DType, dense: DType) -> Result<DType, S
 }
 
 pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
+    ts();
     if args.list_pipelines {
         for s in h3::spec::registry() {
             let lora = if s.needs_lora { " [нужна Turbo LoRA]" } else { "" };
@@ -171,7 +178,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     let source = h3::H3Source::open(&args.model_dir, variant)?;
     if source.variant() != variant && args.variant.is_some() {
-        eprintln!("[h3] бандл содержит вариант {:?}, запрошен {variant:?}", source.variant());
+        eprintln!("[h3 {}] бандл содержит вариант {:?}, запрошен {variant:?}", ts(), source.variant());
     }
     let steps = if args.steps > 0 {
         args.steps
@@ -206,7 +213,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
             format!("в {} нет энкодера — укажите --encoder", source.path().display())
         })?,
     };
-    eprintln!("[h3] загрузка энкодера Qwen3-VL из {}", encoder_source.path().display());
+    eprintln!("[h3 {}] загрузка энкодера Qwen3-VL из {}", ts(), encoder_source.path().display());
     let encoder = h3::text_encoder::EncoderHandle::load_source(&encoder_source, device, compute, quant_enc)?;
 
     let mut images: Vec<(Tensor, h3::text_encoder::ImageGrid)> = Vec::new();
@@ -229,7 +236,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let ref_media = if ref_sources.is_empty() {
         Vec::new()
     } else {
-        eprintln!("[h3] декодирование референсов");
+        eprintln!("[h3 {}] декодирование референсов", ts());
         let media = h3::refs::decode(
             &ref_sources,
             &h3::refs::RefOptions {
@@ -240,7 +247,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
             },
         )?;
         for (src, m) in ref_sources.iter().zip(&media) {
-            eprintln!("[h3]   {} — {}", src.path().display(), m.describe());
+            eprintln!("[h3 {}]   {} — {}", ts(), src.path().display(), m.describe());
         }
         media
     };
@@ -257,13 +264,13 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         h3::text_encoder::presentation_fl2va(&args.prompt, &grids, merge)
     };
 
-    eprintln!("[h3] кодирование промпта");
+    eprintln!("[h3 {}] кодирование промпта", ts());
     let cond = encoder.encode(&presentation, &images)?;
     let negative = match args.negative_prompt.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(np) if cfg_scale > 1.0 => Some(encoder.encode(&h3::text_encoder::presentation_t2va(np), &[])?),
         _ => {
             if cfg_scale > 1.0 {
-                eprintln!("[h3] [внимание] cfg {cfg_scale} без --negative-prompt: CFG выключен (у H3 нет шаблона пустого негатива)");
+                eprintln!("[h3 {}] [внимание] cfg {cfg_scale} без --negative-prompt: CFG выключен (у H3 нет шаблона пустого негатива)", ts());
             }
             None
         }
@@ -271,12 +278,12 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(encoder);
     h3::memory::trim_pool(device);
 
-    eprintln!("[h3] загрузка DiT ({}, {:?})", source.path().display(), source.variant());
+    eprintln!("[h3 {}] загрузка DiT ({}, {:?})", ts(), source.path().display(), source.variant());
     let mut ckpt = h3::H3Checkpoint::open_source(source.clone(), device, compute)?;
     if let Some(lp) = &args.lora {
         let lw = h3::LoraWeights::open(lp, device, args.lora_strength)?;
         ckpt = ckpt.with_lora(std::sync::Arc::new(lw));
-        eprintln!("[h3] LoRA {} (сила {})", lp.display(), args.lora_strength);
+        eprintln!("[h3 {}] LoRA {} (сила {})", ts(), lp.display(), args.lora_strength);
     }
 
     let mut sched = h3::H3Scheduler::new(
@@ -302,7 +309,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     req.sampler = sampler;
     req.seed = Some(seed);
-    eprintln!("[h3] seed {seed}");
+    eprintln!("[h3 {}] seed {seed}", ts());
     req.keyframes = keyframe_paths
         .iter()
         .map(|(i, _)| h3::layout::Keyframe { resolved_frame_index: *i })
@@ -318,7 +325,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     // Референсы кодируются до загрузки DiT: VAE на кадре 2048 px или на
     // 15-секундном видео нужна свободная карта.
     if !ref_media.is_empty() {
-        eprintln!("[h3] кодирование референсов через VAE");
+        eprintln!("[h3 {}] кодирование референсов через VAE", ts());
         let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device)?;
         let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config()?, device, compute)?;
         let has_audio = ref_media.iter().any(|m| match m {
@@ -349,7 +356,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(ref_media);
 
     if let Some(src_path) = &args.restyle {
-        eprintln!("[h3] restyle: кодирование {} (сила {})", src_path.display(), args.restyle_strength);
+        eprintln!("[h3 {}] restyle: кодирование {} (сила {})", ts(), src_path.display(), args.restyle_strength);
         let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device)?;
         let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config()?, device, compute)?;
         let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device)?;
@@ -359,7 +366,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         drop(aenc);
         h3::memory::trim_pool(device);
         let (tail, v0, a0) = h3::restyle::start(&sched, args.restyle_strength, &src, seed, device, compute)?;
-        eprintln!("[h3] restyle: {} из {} шагов", tail.steps(), sched.steps());
+        eprintln!("[h3 {}] restyle: {} из {} шагов", ts(), tail.steps(), sched.steps());
         sched = tail;
         req.init_video = Some(v0);
         req.init_audio = Some(a0);
@@ -369,7 +376,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let prep = h3::pipeline::prepare(&dit, &req, &sched)?;
 
     if !keyframe_rgb.is_empty() {
-        eprintln!("[h3] кодирование ключевых кадров через VAE");
+        eprintln!("[h3 {}] кодирование ключевых кадров через VAE", ts());
         let vae_cfg = ckpt.vae_config()?;
         let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device)?;
         let enc = h3::vae::VaeEncoder::load(&vw, vae_cfg, device, compute)?;
@@ -403,10 +410,10 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         mode,
         device,
     )?;
-    eprintln!("[h3] {}", plan.summary());
+    eprintln!("[h3 {}] {}", ts(), plan.summary());
 
     let steps = sched.steps();
-    eprintln!("[h3] предвычисление adaLN на {steps} шагов");
+    eprintln!("[h3 {}] предвычисление adaLN на {steps} шагов", ts());
     let cache = h3::pipeline::build_adaln_cache(&dit, &ckpt, &prep, compute)?;
 
     eprintln!(
@@ -414,7 +421,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         if req.negative.is_some() { format!("cfg {cfg_scale}") } else { "без CFG".into() }
     );
     let progress = |p: h3::pipeline::DenoiseProgress| {
-        eprint!("\r[h3] шаг {}/{} sigma {:.4}   ", p.step, p.total, p.sigma);
+        eprint!("\r[h3 {}] шаг {}/{} sigma {:.4}   ", ts(), p.step, p.total, p.sigma);
     };
     let hooks = h3::pipeline::DenoiseHooks {
         progress: Some(&progress),
@@ -422,13 +429,14 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let out = h3::pipeline::denoise_av(&dit, &cache, &prep, &req, &sched, &hooks)?;
     eprintln!();
+    eprintln!("[h3 {}] денойзинг готов", ts());
 
     drop(cache);
     drop(prep);
     drop(dit);
     h3::memory::trim_pool(device);
 
-    eprintln!("[h3] декодирование видео");
+    eprintln!("[h3 {}] декодирование видео", ts());
     let vae_cfg = ckpt.vae_config()?;
     let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device)?;
     let vdec = h3::vae::VaeDecoder::load(&vw, vae_cfg, device, compute)?;
@@ -437,7 +445,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(vw);
     h3::memory::trim_pool(device);
 
-    eprintln!("[h3] декодирование звука");
+    eprintln!("[h3 {}] декодирование звука", ts());
     let acfg = ckpt.audio_vae_config()?;
     let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device)?;
     let adec = h3::audio_vae::AudioVae::load_decoder(&aw, acfg, device, compute)?;
@@ -447,7 +455,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     h3::memory::trim_pool(device);
 
     write_mp4(&rgb, Some(&wave), sample_rate, h3::config::FPS, &args.output, args.keep_wav)?;
-    eprintln!("[h3] записано: {}", args.output.display());
+    eprintln!("[h3 {}] записано: {}", ts(), args.output.display());
     Ok(())
 }
 
