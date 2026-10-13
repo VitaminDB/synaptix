@@ -31,6 +31,7 @@ members = [
     "crates/synaptix-compile",
     "crates/synaptix-distributed",
     "crates/synaptix-cli",
+    "crates/synaptix-gen",
     "crates/synaptix-models/llm/common",
     "crates/synaptix-models/llm/llama",
     "crates/synaptix-models/llm/qwen3",
@@ -186,6 +187,7 @@ synaptix-tokenizer    = { path = "crates/synaptix-tokenizer" }
 synaptix-bundle       = { path = "crates/synaptix-bundle" }
 synaptix-gguf         = { path = "crates/synaptix-gguf" }
 synaptix-io           = { path = "crates/synaptix-io" }
+synaptix-gen          = { path = "crates/synaptix-gen" }
 synaptix-infer        = { path = "crates/synaptix-infer" }
 synaptix-train        = { path = "crates/synaptix-train" }
 synaptix-diffusion    = { path = "crates/synaptix-diffusion" }
