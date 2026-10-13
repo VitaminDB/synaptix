@@ -80,4 +80,12 @@ impl ComponentWeights {
     pub fn contains(&self, name: &str) -> bool {
         self.loader.names().iter().any(|n| *n == name)
     }
+
+    /// Формат весов квантованного бандла (первый найденный квант); `None` —
+    /// бандл плотный. Квантованный файл задаёт формат сам: повторный квант
+    /// деквантованных MXFP8-значений даёт те же байты.
+    pub fn stored_quant(&self) -> Option<DType> {
+        self.loader.infos().map(|(_, d, _)| d).find(|d| d.is_quantized())
+    }
+
 }

@@ -12,6 +12,7 @@ pub mod ggml_tables;
 pub mod calib;
 pub mod q8row;
 pub mod sq;
+pub mod mxfp8;
 
 pub use ggml::GgmlType;
 

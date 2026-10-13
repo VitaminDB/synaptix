@@ -552,6 +552,7 @@ impl Flux2Transformer {
         tokens: usize,
     ) -> Result<Self> {
         let cuda = device.is_cuda();
+        let quant = w.stored_quant().unwrap_or(quant);
         let quant = if cuda { quant } else { compute };
         let _g = memory::weights_guard(device);
         let x_embedder = dense(w, "x_embedder", device, compute)?;

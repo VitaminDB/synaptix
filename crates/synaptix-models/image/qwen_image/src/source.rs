@@ -138,6 +138,14 @@ impl Weights {
         self.loader.infos().map(|(n, _, _)| n.to_string()).collect()
     }
 
+    /// Формат весов квантованного бандла (первый найденный квант); `None` —
+    /// бандл плотный. Квантованный файл задаёт формат сам: повторный квант
+    /// деквантованных MXFP8-значений даёт те же байты.
+    pub fn stored_quant(&self) -> Option<DType> {
+        self.loader.infos().map(|(_, d, _)| d).find(|d| d.is_quantized())
+    }
+
+
     pub fn contains(&self, name: &str) -> bool {
         self.loader.tensor_info(name).is_some()
     }
@@ -151,6 +159,28 @@ impl Weights {
     pub fn raw(&self, name: &str) -> Option<(&[u8], DType, &[usize])> {
         self.loader.raw_bytes(name)
     }
+
+    /// Строки MXFP8-таблицы эмбеддингов квантованного бандла в f32
+    /// (`[ids.len(), hidden]`, `hidden`); `None` — таблица не MXFP8-квант.
+    pub fn mxfp8_rows(&self, name: &str, ids: &[u32]) -> Option<Result<(Vec<f32>, usize), SynaptixError>> {
+        let info = self.loader.tensor_info(name)?;
+        if info.dtype != DType::MXFP8 || info.shape.len() != 2 {
+            return None;
+        }
+        let (vocab, hidden) = (info.shape[0], info.shape[1]);
+        let (p, _, _) = self.loader.raw_bytes(&format!("{name}.qpacked"))?;
+        let (s, _, _) = self.loader.raw_bytes(&format!("{name}.qscales"))?;
+        let mut out = vec![0f32; ids.len() * hidden];
+        for (i, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            if id >= vocab {
+                return Some(Err(SynaptixError::Other(format!("токен {id} вне словаря {vocab}"))));
+            }
+            synaptix_core::quant::mxfp8::row_f32(p, s, hidden, id, &mut out[i * hidden..(i + 1) * hidden]);
+        }
+        Some(Ok((out, hidden)))
+    }
+
 
     /// Суммарный объём тензоров, чьё имя начинается с `prefix`.
     pub fn bytes_with_prefix(&self, prefix: &str) -> u64 {

@@ -242,6 +242,12 @@ impl TextEncoder {
     /// Строки таблицы эмбеддингов прямо из mmap → `[S, hidden]` в `dtype`.
     fn embed(&self, ids: &[u32]) -> Result<Tensor> {
         let name = format!("{}.embed_tokens.weight", self.cfg.prefix());
+        if self.weights.raw(&name).is_none() {
+            if let Some(r) = self.weights.mxfp8_rows(&name, ids) {
+                let (v, hidden) = r?;
+                return Tensor::from_vec(v, (ids.len(), hidden), self.device)?.to_dtype(self.dtype);
+            }
+        }
         let (bytes, sdt, shape) = self
             .weights
             .raw(&name)

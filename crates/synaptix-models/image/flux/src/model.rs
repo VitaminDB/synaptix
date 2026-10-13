@@ -256,8 +256,13 @@ impl FluxModel {
     pub fn load_transformer(&self, tokens: usize) -> Result<FluxTransformer, FluxError> {
         let dev = self.device;
         let dt = self.compute;
-        let is_quant = self.quant.is_quantized();
-        set_load_precision(if is_quant { self.quant } else { dt }, dt);
+        // Квантованный файл задаёт формат сам (MXFP8 из файла — те же байты).
+        let stored = ComponentWeights::from_source(&self.source, FluxComponent::Transformer, dev, dt)
+            .ok()
+            .and_then(|w| w.stored_quant());
+        let quant = stored.unwrap_or(self.quant);
+        let is_quant = quant.is_quantized();
+        set_load_precision(if is_quant { quant } else { dt }, dt);
         // Всё отпущенное прошлыми стадиями — драйверу, иначе замер свободной
         // VRAM ниже занижен, а квантованным весам негде лечь.
         release_pools(dev);
@@ -268,7 +273,7 @@ impl FluxModel {
             // квантуется (~6,6 ГБ NVFP4 / ~12 ГБ MXFP8). На малой карте то,
             // что не влезло с запасом под активации, уезжает пиннованной
             // копией на хост и стримится в forward.
-            eprintln!("[FLUX] quant={:?} compute={dt:?}: квантую трансформер", self.quant);
+            eprintln!("[FLUX] quant={:?} compute={dt:?}: квантую трансформер", quant);
             let w = ComponentWeights::from_source(&self.source, FluxComponent::Transformer, dev, dt)?;
             return Ok(match self.offload {
                 OffloadMode::Resident => FluxTransformer::load(&self.config, &|nm| w.get(nm))?,
@@ -279,7 +284,7 @@ impl FluxModel {
                     // 4 блока (замер MXFP8 1024² в 7 ГБ: с 2 блоками минимум
                     // свободной VRAM падал до 0,03 ГБ).
                     let d = 3072usize;
-                    let blk = match self.quant {
+                    let blk = match quant {
                         DType::NVFP4 => 36 * d * d * 9 / 16,
                         _ => 36 * d * d * 33 / 32,
                     };

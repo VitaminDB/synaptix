@@ -552,6 +552,7 @@ impl QwenImage21Transformer {
         tokens: usize,
     ) -> Result<Self> {
         let cuda = device.is_cuda();
+        let quant = w.stored_quant().unwrap_or(quant);
         let quant = if cuda { quant } else { compute };
         let _g = memory::weights_guard(device);
         let img_in = dense(w, "img_in", device, compute)?;
