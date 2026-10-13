@@ -1062,6 +1062,25 @@ __global__ void FSQ_BOUNDS flash_splitq_bf16_hd128_bshd(
   flash_splitq_impl<__nv_bfloat16, 128>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
 }
 
+// v5 (BM=64/BN=64) в BSHD-раскладке: видео/картинки (H3, LTX, FLUX) — та же
+// схема, что flash_splitq5_*_hd128, без permute q/k/v в BHSD.
+__global__ void FSQ_BOUNDS flash_splitq5_f16_hd128_bshd(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__half, 128, 64, 64, 4, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+__global__ void FSQ_BOUNDS flash_splitq5_bf16_hd128_bshd(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__nv_bfloat16, 128, 64, 64, 4, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+__global__ void FSQ_BOUNDS flash_splitq5_f16_hd128_bshd_facc(
+    const __half* q, const __half* k, const __half* v, __half* out, float scale,
+    int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {
+  flash_splitq_impl<__half, 128, 64, 64, 4, 1, 1>(q, k, v, out, scale, B, NH, NKV, Tq, Tkv, causal, t_stride, 1);
+}
+
 __global__ void FSQ_BOUNDS flash_splitq_f16_hd128_bshd_facc(
     const __half* q, const __half* k, const __half* v, __half* out, float scale,
     int B, int NH, int NKV, int Tq, int Tkv, int causal, int t_stride) {

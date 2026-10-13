@@ -58,6 +58,9 @@ pub struct FlashSplitQKernels {
     bf16_hd256_win_dev: CudaFunction,
     f16_hd128_bshd_facc: CudaFunction,
     f16_hd128_v5_facc: CudaFunction,
+    f16_hd128_v5_bshd: CudaFunction,
+    bf16_hd128_v5_bshd: CudaFunction,
+    f16_hd128_v5_bshd_facc: CudaFunction,
     f16_hd512: CudaFunction,
     bf16_hd512: CudaFunction,
     f16_hd512_dev: CudaFunction,
@@ -108,6 +111,9 @@ impl FlashSplitQKernels {
         let bf16_hd256_win_dev = load_fn(&module, "flash_splitq_bf16_hd256_win_dev")?;
         let f16_hd128_bshd_facc = load_fn(&module, "flash_splitq_f16_hd128_bshd_facc")?;
         let f16_hd128_v5_facc = load_fn(&module, "flash_splitq5_f16_hd128_facc")?;
+        let f16_hd128_v5_bshd = load_fn(&module, "flash_splitq5_f16_hd128_bshd")?;
+        let bf16_hd128_v5_bshd = load_fn(&module, "flash_splitq5_bf16_hd128_bshd")?;
+        let f16_hd128_v5_bshd_facc = load_fn(&module, "flash_splitq5_f16_hd128_bshd_facc")?;
         let f16_hd512 = load_fn(&module, "flash_splitq_f16_hd512")?;
         let bf16_hd512 = load_fn(&module, "flash_splitq_bf16_hd512")?;
         let f16_hd512_dev = load_fn(&module, "flash_splitq_f16_hd512_dev")?;
@@ -122,7 +128,7 @@ impl FlashSplitQKernels {
         }
 
         // v5: smem = 2 (K,V) × 64 × 136 × 2 = 34816 Б < 48 KB, но ставим с запасом.
-        for func in [&f16_hd128_v5, &bf16_hd128_v5, &bf16_hd128_v5_win, &f16_hd128_v5_win, &f16_hd128_v5_facc] {
+        for func in [&f16_hd128_v5, &bf16_hd128_v5, &bf16_hd128_v5_win, &f16_hd128_v5_win, &f16_hd128_v5_facc, &f16_hd128_v5_bshd, &bf16_hd128_v5_bshd, &f16_hd128_v5_bshd_facc] {
             func.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 96 * 1024,
@@ -192,6 +198,9 @@ impl FlashSplitQKernels {
             bf16_hd256_win_dev,
             f16_hd128_bshd_facc,
             f16_hd128_v5_facc,
+            f16_hd128_v5_bshd,
+            bf16_hd128_v5_bshd,
+            f16_hd128_v5_bshd_facc,
             f16_hd512,
             bf16_hd512,
             f16_hd512_dev,
@@ -319,6 +328,11 @@ fn flash_v6_enabled() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("SYN_FLASH_V6").as_deref(), Ok("1")))
 }
 
+fn flash_v5_bshd_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("SYN_FLASH_V5_BSHD").as_deref(), Ok("1")))
+}
+
 fn flash_f16acc_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| matches!(std::env::var("SYN_FLASH_F16ACC").as_deref(), Ok("1")))
@@ -358,10 +372,16 @@ pub fn flash_splitq_u8(
     let use_facc = flash_f16acc_enabled() && dtype == DType::F16 && d == 128 && t_q >= 1024;
     let use_v6 = !use_facc && flash_v6_enabled() && d == 128 && t_q >= 1024;
     let k6;
-    // v5 (BM=64/BN=64, split K/V commit) для large-Tq HD=128.
-    let use_v5 = !use_facc && !use_v6 && !bshd && d == 128 && t_q >= 1024;
+    // v5 (BM=64/BN=64, split K/V commit) для large-Tq HD=128. В BSHD v5 не
+    // быстрее v1 (бенч H3-формы 4316×42×128: v1 87.6, v5 82.2 TF; в составе
+    // DiT обе упираются в лимит мощности) — только по SYN_FLASH_V5_BSHD=1.
+    let use_v5 = !use_facc && !use_v6 && (!bshd || flash_v5_bshd_enabled()) && d == 128 && t_q >= 1024;
     let func = if use_facc {
-        if bshd { &kernels.f16_hd128_bshd_facc } else { &kernels.f16_hd128_v5_facc }
+        match (bshd, flash_v5_bshd_enabled()) {
+            (true, true) => &kernels.f16_hd128_v5_bshd_facc,
+            (true, false) => &kernels.f16_hd128_bshd_facc,
+            (false, _) => &kernels.f16_hd128_v5_facc,
+        }
     } else if use_v6 {
         k6 = FlashSplitQ6Kernels::for_context(&stream.context())?;
         match (dtype, bshd) {
@@ -372,16 +392,18 @@ pub fn flash_splitq_u8(
             _ => return Err(SynaptixError::Unsupported("flash_splitq_u8: dtype (F16/BF16)")),
         }
     } else if use_v5 {
-        match dtype {
-            DType::F16 => &kernels.f16_hd128_v5,
-            DType::BF16 => &kernels.bf16_hd128_v5,
+        match (dtype, bshd) {
+            (DType::F16, false) => &kernels.f16_hd128_v5,
+            (DType::BF16, false) => &kernels.bf16_hd128_v5,
+            (DType::F16, true) => &kernels.f16_hd128_v5_bshd,
+            (DType::BF16, true) => &kernels.bf16_hd128_v5_bshd,
             _ => return Err(SynaptixError::Unsupported("flash_splitq_u8: dtype (F16/BF16)")),
         }
     } else {
         splitq_pick_func(kernels, dtype, d, bshd)?
     };
     let cfg = if use_facc {
-        if bshd {
+        if bshd && !flash_v5_bshd_enabled() {
             splitq_cfg(b, nh, t_q, d)
         } else {
             LaunchConfig {

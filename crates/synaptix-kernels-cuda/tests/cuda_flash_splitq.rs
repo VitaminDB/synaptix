@@ -295,3 +295,58 @@ fn splitq_hd512_f16_noncausal() {
 fn splitq_hd512_small_tq() {
     case_hd512(1, 8, 2, 3, 300, DType::F16, true, 0.03, "f16 tq=3");
 }
+
+/// BHSD [b,h,s,d] → BSHD [b,s,h,d].
+fn to_bshd(x: &[f32], b: usize, h: usize, s: usize, d: usize) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    for bi in 0..b {
+        for hi in 0..h {
+            for si in 0..s {
+                let src = ((bi * h + hi) * s + si) * d;
+                let dst = ((bi * s + si) * h + hi) * d;
+                out[dst..dst + d].copy_from_slice(&x[src..src + d]);
+            }
+        }
+    }
+    out
+}
+
+/// BSHD длинной последовательности (Tq ≥ 1024 → v5-ядро BM=64/BN=64):
+/// сверка с CPU-эталоном (видео/картинки — H3, LTX, FLUX).
+fn case_bshd(nh: usize, tq: usize, tkv: usize, dt: DType, tol: f32, tag: &str) {
+    let Some((ctx, stream)) = setup() else { return };
+    let kernels = FlashSplitQKernels::for_context(&ctx).expect("compile flash_splitq");
+    let (b, d) = (1usize, 128usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let rnd = |v: Vec<f32>| -> Vec<f32> {
+        match dt {
+            DType::F16 => v.iter().map(|x| f16::from_f32(*x).to_f32()).collect(),
+            _ => v.iter().map(|x| bf16::from_f32(*x).to_f32()).collect(),
+        }
+    };
+    let qf = rnd(det_f32(0x41A, b * nh * tq * d, 0.5));
+    let kf = rnd(det_f32(0x42B, b * nh * tkv * d, 0.5));
+    let vf = rnd(det_f32(0x43C, b * nh * tkv * d, 0.5));
+    let exp = to_bshd(&cpu_sdpa(&qf, &kf, &vf, b, nh, nh, tq, tkv, d, scale, false), b, nh, tq, d);
+    let dq = htod_f16(&stream, &to_bshd(&qf, b, nh, tq, d), dt);
+    let dk = htod_f16(&stream, &to_bshd(&kf, b, nh, tkv, d), dt);
+    let dv = htod_f16(&stream, &to_bshd(&vf, b, nh, tkv, d), dt);
+    let out_n = b * nh * tq * d;
+    let mut dout: CudaSlice<u8> = stream.alloc_zeros(out_n * 2).unwrap();
+    flash_splitq_u8(
+        &kernels, &stream, &dq, 0, &dk, 0, &dv, 0, &mut dout, 0, b as u32, nh as u32, nh as u32,
+        tq as u32, tkv as u32, d as u32, scale, false, 0, dt, true,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let got = dtoh_f32(&stream, &dout, out_n, dt);
+    let m = max_abs(&got, &exp);
+    eprintln!("[splitq bshd {tag}] max_abs={m:.5}");
+    assert!(m < tol, "{tag}: max_abs={m}");
+}
+
+#[test]
+fn splitq_bshd_long_v5() {
+    case_bshd(3, 1100, 1100, DType::BF16, 0.02, "bf16 1100");
+    case_bshd(3, 1031, 777, DType::F16, 0.005, "f16 1031×777");
+}
