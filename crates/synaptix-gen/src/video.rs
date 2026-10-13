@@ -262,6 +262,29 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
 }
 
 /// Кадры `[3,H,W]` 0..1 и звук (перемежённые отсчёты) → mp4 через ffmpeg.
+/// Звуковые токены LTX ровно на `fa` кадров: обрезка или повтор последнего.
+fn fit_audio_tokens(enc: Tensor, fa: usize) -> R<Tensor> {
+    let far = enc.dims()[1];
+    if far >= fa {
+        return enc.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err);
+    }
+    let last = enc.narrow(1, far - 1, 1).map_err(err)?.contiguous().map_err(err)?;
+    let mut parts = vec![enc];
+    parts.extend((far..fa).map(|_| last.clone()));
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 1).map_err(err)?.contiguous().map_err(err)
+}
+
+/// Есть ли в файле звуковая дорожка (ffprobe).
+fn has_audio_stream(p: &Path) -> bool {
+    std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(p)
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 pub fn write_mp4(frames: &[Tensor], audio: Option<(&[f32], u32, u16)>, fps: f64, out: &Path) -> R<()> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("synaptix_gen_{}_{nanos}", std::process::id()));
@@ -623,16 +646,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let mel = ltx_log_mel(&[ffmpeg_f32(audio, 16000, 1)?], device).map_err(err)?;
                     let enc = aenc.encode(&mel).map_err(err)?;
                     drop(aenc);
-                    let far = enc.dims()[1];
-                    let audio_lat = if far >= fa {
-                        enc.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err)?
-                    } else {
-                        let last = enc.narrow(1, far - 1, 1).map_err(err)?.contiguous().map_err(err)?;
-                        let mut parts = vec![enc];
-                        parts.extend((far..fa).map(|_| last.clone()));
-                        let refs: Vec<&Tensor> = parts.iter().collect();
-                        Tensor::cat(&refs, 1).map_err(err)?.contiguous().map_err(err)?
-                    };
+                    let audio_lat = fit_audio_tokens(enc, fa)?;
                     // Фото — ключевым кадром в начале: говорит именно этот человек/персонаж.
                     let key = match image {
                         Some(p) => {
@@ -662,17 +676,28 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
                     let (tok, f_, h_, w_) = latent_tokens(&lat)?;
                     let pos = lp::pixel_coords(f_, h_, w_, fps);
-                    let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
-                    let mel = ltx_log_mel(&[ffmpeg_f32(audio, 16000, 1)?], device).map_err(err)?;
-                    let audio_ref = aenc.encode(&mel).map_err(err)?;
-                    drop(aenc);
-                    let (aref, frozen) = match ai {
-                        Some(a) => (a.clone(), true),
-                        None => (audio_ref.clone(), false),
+                    // Новая речь — основной звук, ЗАМОРОЖЕННЫЙ на обеих стадиях: губы
+                    // строятся под неё (кросс-внимание звук→видео при sigma звука 0).
+                    // Раньше на stage1 звук генерировался заново по промпту, губы
+                    // шли за ним, а сверху накладывалась речь пользователя — губы
+                    // не совпадали и копировали исходник. Звуковой референс — звук
+                    // исходного ролика (тембр, как в Dub-It эталона), без него — сама речь.
+                    let fa = lp::audio_token_count(fp, fps);
+                    let (target, aref) = match ai {
+                        Some(a) => (a.clone(), a.clone()),
+                        None => {
+                            let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                            let enc = |p: &Path| -> R<Tensor> { aenc.encode(&ltx_log_mel(&[ffmpeg_f32(p, 16000, 1)?], device).map_err(err)?).map_err(err) };
+                            let target = fit_audio_tokens(enc(audio)?, fa)?;
+                            let orig = if has_audio_stream(video) { enc(video).ok() } else { None };
+                            drop(aenc);
+                            let aref = orig.unwrap_or_else(|| target.clone());
+                            (target, aref)
+                        }
                     };
                     let apos = lp::lipdub_audio_ref_positions(aref.dims()[1]);
-                    let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, if frozen { Some(&aref) } else { None }, frozen, Some((&tok, &pos, 1.0)), Some((&aref, &apos)), fps, device, seed, &hooks).map_err(err)?;
-                    (l, a, Some(ffmpeg_f32(audio, 48000, 2)?))
+                    let (l, _) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&target), true, Some((&tok, &pos, 1.0)), Some((&aref, &apos)), fps, device, seed, &hooks).map_err(err)?;
+                    (l, target, Some(ffmpeg_f32(audio, 48000, 2)?))
                 }
             })
         };

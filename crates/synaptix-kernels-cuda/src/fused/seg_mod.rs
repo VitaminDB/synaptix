@@ -18,6 +18,8 @@ pub struct SegModKernels {
     gate_f16: CudaFunction,
     qk_bf16: CudaFunction,
     qk_f16: CudaFunction,
+    smq_bf16: CudaFunction,
+    smq_f16: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<SegModKernels>)>>> = OnceLock::new();
@@ -36,6 +38,8 @@ impl SegModKernels {
             gate_f16: load_fn(&module, "gate_residual_seg_f16")?,
             qk_bf16: load_fn(&module, "qk_norm_rope_bf16")?,
             qk_f16: load_fn(&module, "qk_norm_rope_f16")?,
+            smq_bf16: load_fn(&module, "silu_mul_quant_mxfp8_bf16")?,
+            smq_f16: load_fn(&module, "silu_mul_quant_mxfp8_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -140,6 +144,44 @@ pub fn qk_norm_rope(
         DType::BF16 => go!(half::bf16, &k.qk_bf16),
         DType::F16 => go!(half::f16, &k.qk_f16),
         _ => return Err(SynaptixError::Unsupported("qk_norm_rope: dtype")),
+    }
+    Ok(())
+}
+
+/// `h [m, 2F]` = `[gate | up]` (T = F16|BF16) → MXFP8 `silu(gate)·up`:
+/// e4m3 `[m, F]` + natural E8M0 `[m, F/32]`.
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_quant_mxfp8(
+    k: &SegModKernels,
+    stream: &Arc<CudaStream>,
+    (h, h_off): (&CudaSlice<u8>, usize),
+    packed: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<u8>,
+    m: usize,
+    f: usize,
+    dtype: DType,
+) -> Result<()> {
+    if f % 32 != 0 {
+        return Err(SynaptixError::Unsupported("silu_mul_quant_mxfp8: F%32 != 0"));
+    }
+    let blocks = m * f / 32;
+    if blocks == 0 {
+        return Ok(());
+    }
+    let cfg = LaunchConfig { grid_dim: (blocks.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let (mi, fi) = (m as i32, f as i32);
+    macro_rules! go {
+        ($t:ty, $fun:expr) => {{
+            let hv = view::<$t>(h, h_off, m * 2 * f, "h")?;
+            let mut b = stream.launch_builder($fun);
+            b.arg(&hv).arg(&mut *packed).arg(&mut *scales).arg(&mi).arg(&fi);
+            unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch silu_mul_quant_mxfp8: {e:?}")))?;
+        }};
+    }
+    match dtype {
+        DType::BF16 => go!(half::bf16, &k.smq_bf16),
+        DType::F16 => go!(half::f16, &k.smq_f16),
+        _ => return Err(SynaptixError::Unsupported("silu_mul_quant_mxfp8: dtype")),
     }
     Ok(())
 }

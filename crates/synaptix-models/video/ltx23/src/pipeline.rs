@@ -1277,9 +1277,14 @@ pub fn denoise_av_append(
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         let v_ts: Vec<f32> = v_mask.iter().map(|&m| m * sigma as f32).collect();
         let a_ts: Vec<f32> = a_mask.iter().map(|&m| m * sigma as f32).collect();
+        // Замороженный звук — условие, а не шумная модальность: его скалярная
+        // сигма (prompt-AdaLN звука и гейты/модуляция кросс-внимания звук→видео)
+        // = 0, как `modality_from_latent_state` эталона при `state.frozen`.
+        // С текущей сигмой модель видела звук «шумным» и почти не двигала губы.
+        let a_sigma = if a_frozen { 0.0 } else { sigma as f32 };
         let (v_vel, a_vel) = dit.forward(
             &v_tok, &v_ts, sigma as f32, &v_pos, &v_ctx,
-            &a_tok, &a_ts, sigma as f32, &a_pos, &a_ctx,
+            &a_tok, &a_ts, a_sigma, &a_pos, &a_ctx,
             None,
         )?;
         let dt = (sigma_next - sigma) as f32;

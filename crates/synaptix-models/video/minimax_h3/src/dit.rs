@@ -440,7 +440,13 @@ impl Mlp {
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let h = self.fc1.0.forward_prequant(packed, scales, *n, out_dt)?;
-            let y = if self.fc2.0.is_nvfp4() {
+            // MXFP8: silu(gate)·up сразу в квант fc2 — без strided-копий
+            // половин h и отдельного кванта (бит-в-бит с цепочкой ниже).
+            let fused_mx = if self.fc2.0.is_mxfp8() { h.silu_mul_quant_mxfp8().ok() } else { None };
+            let y = if let Some((p2, s2)) = fused_mx {
+                drop(h);
+                self.fc2.0.forward_prequant(&p2, &s2, *n, out_dt)?
+            } else if self.fc2.0.is_nvfp4() {
                 match h.silu_mul_quant_nvfp4(1.0 / 32.0) {
                     Ok((p2, s2)) => {
                         drop(h);

@@ -1482,6 +1482,29 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn silu_mul_quant_mxfp8(
+        &self,
+        x: (&Storage, &Layout),
+        packed_out: &mut Storage,
+        scales_out: &mut Storage,
+        m: usize,
+        f: usize,
+        _stream: &Stream,
+    ) -> Result<()> {
+        if !x.1.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let x_buf = x.0.as_cuda().ok_or(SynaptixError::Unsupported("silu_mul_quant_mxfp8: non-cuda"))?;
+        let ord = x_buf.ordinal();
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::fused::seg_mod::SegModKernels::for_context(&ctx)?;
+        let p = packed_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("silu_mul_quant_mxfp8: packed non-cuda"))?;
+        let p_sl = p.slice_mut();
+        let s = scales_out.as_cuda_mut().ok_or(SynaptixError::Unsupported("silu_mul_quant_mxfp8: scales non-cuda"))?;
+        crate::fused::seg_mod::silu_mul_quant_mxfp8(&k, &stream, (x_buf.slice(), x.1.byte_offset()), p_sl, s.slice_mut(), m, f, x.1.dtype())
+    }
+
     fn qk_norm_rope(
         &self,
         x: (&Storage, &Layout),

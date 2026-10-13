@@ -122,3 +122,21 @@ fn qk_norm_rope_bitexact() {
         qk_case(5, 3, 64, 32, 7, dt);
     }
 }
+
+#[test]
+fn silu_mul_quant_mxfp8_bitexact() {
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    for dt in [DType::BF16, DType::F16] {
+        for (m, f) in [(300usize, 1024usize), (7, 64)] {
+            let h = Tensor::from_vec(det(9, m * 2 * f, 3.0), vec![m, 2 * f], dev).unwrap().to_dtype(dt).unwrap();
+            let (pk, sc) = h.silu_mul_quant_mxfp8().unwrap();
+            let gate = h.narrow(1, 0, f).unwrap().contiguous().unwrap();
+            let up = h.narrow(1, f, f).unwrap().contiguous().unwrap();
+            let act = gate.silu_and_mul(&up).unwrap();
+            let (pk_ref, sc_ref) = act.mxfp8_quantize_act().unwrap();
+            assert_eq!(bytes(&pk), bytes(&pk_ref), "packed (m={m} f={f} {dt:?})");
+            assert_eq!(bytes(&sc), bytes(&sc_ref), "scales (m={m} f={f} {dt:?})");
+        }
+    }
+}

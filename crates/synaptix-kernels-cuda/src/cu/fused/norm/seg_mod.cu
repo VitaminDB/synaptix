@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 // Слитые ядра DiT с сегментной модуляцией (MiniMax-H3) и qk-нормой.
 //
@@ -156,3 +157,49 @@ extern "C" __global__ void qk_norm_rope_f16(
     const __half* x, const float* w, const float* cos_t, const float* sin_t,
     __half* out, long long rows, int heads, int d, int rot_dim, int pos_off, float eps)
 { qk_norm_rope_impl<__half>(x, w, cos_t, sin_t, out, rows, heads, d, rot_dim, pos_off, eps); }
+
+// silu(gate)·up → MXFP8 (natural: e4m3 [m, F], E8M0 [m, F/32]) из строки
+// h = [gate | up] ([m, 2F]) одним проходом. Бит-в-бит с narrow+contiguous →
+// silu_and_mul_T (round_T(silu(g)·u)) → mxfp8_quant_natural. Поток = k32-блок.
+__device__ __forceinline__ float smq_silu(float v) { return v / (1.0f + __expf(-v)); }
+
+template <typename T>
+__device__ __forceinline__ void silu_mul_quant_mxfp8_impl(
+    const T* __restrict__ h, unsigned char* __restrict__ out_fp8,
+    unsigned char* __restrict__ out_scales, int rows, int F)
+{
+    const int kb_total = F / 32;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * kb_total) return;
+    const int row = (int)(idx / kb_total);
+    const int kb = (int)(idx % kb_total);
+    const T* g = h + (long)row * 2 * F + (long)kb * 32;
+    const T* u = g + F;
+    float v[32];
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float a = smq_silu(qk_ld(g + i)) * qk_ld(u + i);
+        T at; qk_st(&at, a);
+        v[i] = qk_ld(&at);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    unsigned char sbyte = (unsigned char)((__float_as_uint(__uint_as_float(__float_as_uint(amax) & 0x7F800000u) / 256.0f)) >> 23);
+    float sv = fmaxf(__uint_as_float(((unsigned)sbyte) << 23), 1e-12f);
+    unsigned char ob[32];
+    #pragma unroll
+    for (int i = 0; i < 32; i++)
+        ob[i] = __nv_fp8_e4m3(fminf(fmaxf(v[i] / sv, -448.0f), 448.0f)).__x;
+    uint4* dst = reinterpret_cast<uint4*>(out_fp8 + (long)row * F + (long)kb * 32);
+    dst[0] = *reinterpret_cast<uint4*>(&ob[0]);
+    dst[1] = *reinterpret_cast<uint4*>(&ob[16]);
+    out_scales[(long)row * kb_total + kb] = sbyte;
+}
+
+extern "C" __global__ void silu_mul_quant_mxfp8_bf16(
+    const __nv_bfloat16* h, unsigned char* out_fp8, unsigned char* out_scales, int rows, int F)
+{ silu_mul_quant_mxfp8_impl<__nv_bfloat16>(h, out_fp8, out_scales, rows, F); }
+
+extern "C" __global__ void silu_mul_quant_mxfp8_f16(
+    const __half* h, unsigned char* out_fp8, unsigned char* out_scales, int rows, int F)
+{ silu_mul_quant_mxfp8_impl<__half>(h, out_fp8, out_scales, rows, F); }

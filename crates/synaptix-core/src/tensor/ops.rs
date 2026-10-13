@@ -1086,6 +1086,29 @@ impl Tensor {
         ))
     }
 
+    /// `silu(gate)·up` → MXFP8 одним ядром: `self [.., 2F]` = `[gate | up]`
+    /// (F16|BF16) → `(packed e4m3 [m·F], scales E8M0 [m·F/32])` — вход
+    /// prequant-GEMM. Бит-в-бит с `silu_and_mul` → `mxfp8_quantize_act`.
+    pub fn silu_mul_quant_mxfp8(&self) -> Result<(Tensor, Tensor)> {
+        let dt = self.dtype();
+        let k2 = *self.dims().last().ok_or(SynaptixError::Unsupported("silu_mul_quant_mxfp8: scalar"))?;
+        if !matches!(dt, DType::F16 | DType::BF16) || k2 % 64 != 0 {
+            return Err(SynaptixError::Unsupported("silu_mul_quant_mxfp8: dtype или 2F%64"));
+        }
+        let f = k2 / 2;
+        let m = self.layout.numel() / k2;
+        let x = self.contiguous_view()?;
+        let backend = registry::backend_for(self.device())?;
+        let mut packed_st = backend.alloc_uninit(m * f, self.device())?;
+        let mut scales_st = backend.alloc_uninit(m * f / 32, self.device())?;
+        let stream = Stream::default_for(self.device())?;
+        backend.silu_mul_quant_mxfp8((&x.storage, &x.layout), &mut packed_st, &mut scales_st, m, f, &stream)?;
+        Ok((
+            Tensor::from_parts(Arc::new(packed_st), Layout::contiguous(Shape::new(vec![m * f]), DType::U8)),
+            Tensor::from_parts(Arc::new(scales_st), Layout::contiguous(Shape::new(vec![m * f / 32]), DType::U8)),
+        ))
+    }
+
     /// Gated residual с сегментной модуляцией: `self + y·g[ridx[row]]`
     /// (`self/y [m, d]`, `g` — таблица `[R, d]`, `ridx` I32 `[m]`) одним
     /// запуском; округления = [`Self::fused_gate_residual`] бит-в-бит.
