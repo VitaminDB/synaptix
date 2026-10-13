@@ -141,7 +141,7 @@ pub fn convert_to_syn(
         builder = builder.add_file_path(name, path, FileTag::Inference)?;
     }
 
-    let free = synaptix_bundle::available_space(out.parent().unwrap_or(Path::new(".")))?;
+    let free = synaptix_bundle::available_space(out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     if free < payload_bytes + (payload_bytes / 50) {
         return Err(GgufError::Bundle(format!(
             "недостаточно места: нужно ~{:.1} ГБ, свободно {:.1} ГБ",
