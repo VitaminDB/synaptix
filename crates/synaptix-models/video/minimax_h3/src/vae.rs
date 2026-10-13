@@ -523,9 +523,12 @@ impl VitAttention {
     }
 
     fn forward(&self, x: &Tensor, rope: &RopeTables) -> R<Tensor> {
+        if let Some(y) = self.forward_bshd(x, rope)? {
+            return Ok(y);
+        }
         let s = x.dims()[0];
         let qkv = x
-            .matmul(&self.qkv_w.transpose(0, 1)?.contiguous()?)?
+            .linear(&self.qkv_w)?
             .broadcast_add(&self.qkv_b)?
             .reshape(vec![s, self.heads, 3 * self.dim_head])?;
         let q = qkv.narrow(2, 0, self.dim_head)?.contiguous()?;
@@ -557,8 +560,34 @@ impl VitAttention {
             .transpose(0, 1)?
             .contiguous()?
             .reshape(vec![s, self.heads * self.dim_head])?;
-        attn.matmul(&self.out_w.transpose(0, 1)?.contiguous()?)?
+        attn.linear(&self.out_w)?
             .broadcast_add(&self.out_b)
+    }
+
+    /// CUDA-путь без транспонирований: bias в эпилоге GEMM, qk-норма и RoPE
+    /// одним ядром прямо в BSHD (f32 внутри, без промежуточного округления
+    /// bf16), flash-внимание BSHD, выход сразу `[S, H·D]`. `None` — не умеет.
+    fn forward_bshd(&self, x: &Tensor, rope: &RopeTables) -> R<Option<Tensor>> {
+        if !matches!(x.dtype(), DType::BF16 | DType::F16)
+            || !matches!(x.device(), Device::Cuda(_))
+            || rope.cos.dtype() != DType::F32
+        {
+            return Ok(None);
+        }
+        let s = x.dims()[0];
+        let (h, d) = (self.heads, self.dim_head);
+        let qkv = x
+            .linear_bias_residual(&self.qkv_w, Some(&self.qkv_b), None)?
+            .reshape(vec![1, s, h, 3 * d])?;
+        let ones = Tensor::ones(vec![d], DType::F32, x.device())?;
+        let nr = |t: Tensor| t.qk_norm_rope(&ones, &rope.cos, &rope.sin, 0, rope.rot_dim, self.eps);
+        let Ok(q) = nr(qkv.narrow(3, 0, d)?.contiguous()?) else { return Ok(None) };
+        let k = nr(qkv.narrow(3, d, d)?.contiguous()?)?;
+        let v = qkv.narrow(3, 2 * d, d)?.contiguous()?;
+        drop(qkv);
+        let Ok(attn) = q.flash_attention_bshd(&k, &v, self.scale, false) else { return Ok(None) };
+        let attn = attn.reshape(vec![s, h * d])?;
+        Ok(Some(attn.linear_bias_residual(&self.out_w, Some(&self.out_b), None)?))
     }
 }
 
@@ -610,15 +639,12 @@ impl VitFeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> R<Tensor> {
-        let h = x
-            .matmul(&self.w1.transpose(0, 1)?.contiguous()?)?
-            .broadcast_add(&self.b1)?;
+        let h = x.linear_bias_residual(&self.w1, Some(&self.b1), None)?;
         let gate = h.narrow(1, 0, self.inner)?.contiguous()?;
         let up = h.narrow(1, self.inner, self.inner)?.contiguous()?;
         drop(h);
         let act = gate.silu_and_mul(&up)?;
-        act.matmul(&self.w2.transpose(0, 1)?.contiguous()?)?
-            .broadcast_add(&self.b2)
+        act.linear_bias_residual(&self.w2, Some(&self.b2), None)
     }
 }
 
@@ -841,7 +867,7 @@ impl VaeDecoder {
             .transpose(0, 1)?
             .contiguous()?;
         let mut x = tokens
-            .matmul(&self.x_embed_w.transpose(0, 1)?.contiguous()?)?
+            .linear(&self.x_embed_w)?
             .broadcast_add(&self.x_embed_b)?;
         crate::pipeline::dump_tensor("vit_embed", &x);
 
@@ -869,7 +895,7 @@ impl VaeDecoder {
         let x = x.narrow(0, 0, s)?.contiguous()?;
         let x = x.layer_norm_fused(&self.norm_out_w, Some(&self.norm_out_b), self.vit.eps)?;
         let out = x
-            .matmul(&self.proj_out_w.transpose(0, 1)?.contiguous()?)?
+            .linear(&self.proj_out_w)?
             .broadcast_add(&self.proj_out_b)?;
 
         let oc = self.cfg.out_ch;
