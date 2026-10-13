@@ -243,3 +243,127 @@ pub fn write_mp4(frames: &[Tensor], audio: Option<(&[f32], u32, u16)>, fps: f64,
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
+
+/// Компоненты LTX-2.3: чекпойнт (DiT+VAE+вокодер), Gemma-3 (текст), distilled
+/// LoRA (нужна dev-чекпойнту для дистиллированных сигм).
+pub struct LtxPaths {
+    pub model: PathBuf,
+    pub gemma: PathBuf,
+    pub distilled_lora: Option<PathBuf>,
+}
+
+/// LTX-2.3: видео со звуком одной стадией (дистиллированные сигмы, 8 шагов),
+/// по описанию или с первого кадра (`first_frame`). Порядок — как у
+/// `synaptix video`: Gemma (выгружается) → коннекторы → DiT → VAE → звук.
+pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> R<VideoOutput> {
+    use synaptix_core::precision::PrecisionConfig;
+    use synaptix_llm_gemma3::pipeline::GemmaPipeline;
+    use synaptix_video_ltx23::audio_vae::AudioVaeDecoder;
+    use synaptix_video_ltx23::dit::AvDit;
+    use synaptix_video_ltx23::loader::{LoraWeights, LtxCheckpoint};
+    use synaptix_video_ltx23::pipeline as lp;
+    use synaptix_video_ltx23::text_encoder::{AudioTextConditioner, VideoTextConditioner};
+    use synaptix_video_ltx23::vae::{VaeDecoder, VaeEncoder};
+    use synaptix_video_ltx23::vocoder::VocoderWithBwe;
+    if !device.is_cuda() {
+        return Err("LTX-2.3 работает только на видеокарте".into());
+    }
+    if !req.refs.is_empty() || req.last_frame.is_some() {
+        return Err("LTX-2.3 здесь умеет видео по описанию и с первого кадра; референсы и последний кадр — у MiniMax-H3".into());
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let ord = if let Device::Cuda(o) = device { o } else { 0 };
+    let release = || {
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
+    };
+    let compute = DType::BF16;
+    let quant_dit = compute;
+    let quant_enc = DType::MXFP8;
+    let fps = 24.0;
+    let width = req.width.filter(|&v| v > 0).unwrap_or(960);
+    let height = req.height.filter(|&v| v > 0).unwrap_or(544);
+    let (hp, wp) = lp::latent_grid(width, height);
+    let fp = lp::frames_for_duration(req.seconds.filter(|s| *s > 0.0).unwrap_or(5.0), fps);
+    let seed = Some(req.seed.max(1));
+
+    let ckpt = LtxCheckpoint::open(&paths.model, Device::Cpu, DType::BF16).map_err(|e| format!("LTX: {e}"))?;
+    // Плотный DiT — всегда стриминг блоков с хоста (как у CLI).
+    let offload = true;
+    let pin = synaptix_core::device::cuda::OffloadPinCacheGuard::new_paused(&ckpt.shard_bytes());
+    let distilled_name = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
+    let lora = match (&paths.distilled_lora, distilled_name) {
+        (Some(p), false) => Some(LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
+        _ => None,
+    };
+
+    synaptix_core::device::cuda::set_offload_pinned(true);
+    let (states, mask, nag_states) = {
+        let prec = PrecisionConfig { compute, attn_w: quant_enc, mlp_w: quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
+        let gemma = GemmaPipeline::load_with_precision(&paths.gemma, device, prec, Some(1024)).map_err(|e| format!("Gemma: {e}"))?;
+        pin.resume();
+        let (s, m) = gemma.encode_for_ltx(&req.prompt, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
+        let nag = gemma.encode_for_ltx(lp::DEFAULT_NAG_PROMPT, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
+        (s, m, nag)
+    };
+    release();
+    let (v_enc, a_enc, nag_enc) = {
+        let ckpt_gpu = ckpt.view_on(device);
+        let vtc = VideoTextConditioner::load(&ckpt_gpu, device, compute).map_err(err)?;
+        let v = vtc.forward(&states, &mask).map_err(err)?;
+        let a = AudioTextConditioner::load(&ckpt_gpu, device, compute).map_err(err)?.forward(&states, &mask).map_err(err)?;
+        let n = vtc.forward(&nag_states.0, &nag_states.1).map_err(err)?;
+        (v, a, n)
+    };
+    drop(states);
+    drop(nag_states);
+    synaptix_core::device::cuda::set_offload_pinned(false);
+    let v_nag = Some((&nag_enc, lp::NAG_DEFAULT_SCALE, lp::NAG_DEFAULT_ALPHA, lp::NAG_DEFAULT_TAU));
+
+    let on_step = |p: lp::DenoiseProgress| progress(p.step + 1, p.total);
+    let hooks = lp::DenoiseHooks { progress: Some(&on_step), cancel: Some(cancel) };
+    let (latent, a_tok) = synaptix_core::grad::no_grad(|| -> R<(Tensor, Tensor)> {
+        let lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
+        let dit = AvDit::load_with(lora_ckpt.as_ref().unwrap_or(&ckpt), device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
+        let conds = match &req.first_frame {
+            Some(p) => {
+                let raw = synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
+                let enc = VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
+                let (ph, pw) = (hp * 32, wp * 32);
+                let img = synaptix_io::image::fit_image(&raw, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
+                let lat = enc.encode(&img).map_err(|e| format!("VAE: {e}"))?;
+                vec![(0usize, lp::frame_latent_to_tokens(&lat).map_err(err)?, 1.0f32)]
+            }
+            None => Vec::new(),
+        };
+        let r = lp::denoise_av(&dit, &v_enc, &a_enc, fp, hp, wp, &lp::DISTILLED_SIGMAS, None, None, fps, device, v_nag, &conds, seed, &hooks).map_err(err)?;
+        drop(dit);
+        synaptix_core::tensor::ops::conv_filter_cache_gc();
+        Ok(r)
+    })?;
+    release();
+    let rgb = synaptix_core::grad::no_grad(|| -> R<Tensor> {
+        let vae = VaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
+        vae.decode(&latent).map_err(|e| format!("VAE: {e}"))
+    })?;
+    release();
+    let wave = synaptix_core::grad::no_grad(|| -> R<Tensor> {
+        let avae = AudioVaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+        let voc = VocoderWithBwe::load(&paths.model, device).map_err(|e| format!("вокодер: {e}"))?;
+        lp::decode_audio_tokens(&avae, &voc, &a_tok).map_err(err)
+    })?;
+    release();
+    let frames = lp::rgb_to_frames(&rgb).map_err(err)?;
+    let (ch, l) = (wave.dims()[1], wave.dims()[2]);
+    let planar: Vec<f32> = wave.reshape(vec![ch * l]).map_err(err)?.to_dtype(DType::F32).map_err(err)?.to_vec1::<f32>().map_err(err)?;
+    let mut pcm = Vec::with_capacity(ch * l);
+    for i in 0..l {
+        for c in 0..ch {
+            pcm.push(planar[c * l + i]);
+        }
+    }
+    let n = frames.len();
+    write_mp4(&frames, Some((&pcm, 48_000, ch as u16)), fps, out)?;
+    Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label: format!("LTX-2.3 {}×{}, {:.1} с{}", wp * 32, hp * 32, n as f64 / fps, if req.first_frame.is_some() { ", с первого кадра" } else { "" }) })
+}
