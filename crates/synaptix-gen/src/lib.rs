@@ -3,3 +3,4 @@
 //! `synaptix-cli`, прогресс и отмена.
 
 pub mod image;
+pub mod music;
