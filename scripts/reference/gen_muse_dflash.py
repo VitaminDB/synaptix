@@ -6,7 +6,7 @@
 
 Run:
     systemd-run --user --scope -p MemoryMax=88G \
-      env PYTHONPATH=/run/media/storage/tmp/muse_ref_venv/lib/python3.14/site-packages \
+      env PYTHONPATH=/run/media/storage/Нейросети/Эталоны/muse_ref_venv/lib/python3.14/site-packages \
       /home/master/Temp/LTX-2/.venv/bin/python scripts/reference/gen_muse_dflash.py \
       /run/media/storage/LLM_models/meta-models/Muse-Glimmer-30B \
       /run/media/storage/LLM_models/meta-models/Muse-Glimmer-30B-assistant

@@ -3,7 +3,7 @@
 //! бандла → `LlmGeneration::generate_streaming` (дельты текста, стоп по <|eot|>).
 //!
 //! Запуск:
-//!   SYN_MUSE_BUNDLE=/run/media/storage/syn_models/muse-glimmer-30b.syn \
+//!   SYN_MUSE_BUNDLE=/run/media/storage/Нейросети/Модели/muse-glimmer-30b.syn \
 //!   cargo test -p synaptix --release --test muse_glimmer_facade_smoke -- --nocapture
 
 use synaptix::facade::llm::{load_llm, GenerationOptions, LlmGeneration, Message};

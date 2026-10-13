@@ -3,7 +3,7 @@
 //! бандла → `LlmGeneration::generate_streaming` (дельты текста, стоп по EOS).
 //!
 //! Запуск:
-//!   SYN_QWEN38_BUNDLE=/run/media/storage/syn_models/qwen3.8-27b.syn \
+//!   SYN_QWEN38_BUNDLE=/run/media/storage/Нейросети/Модели/qwen3.8-27b.syn \
 //!   cargo test -p synaptix --release --test qwen38_facade_smoke -- --nocapture
 
 use synaptix::facade::llm::{load_llm, GenerationOptions, LlmGeneration, Message};

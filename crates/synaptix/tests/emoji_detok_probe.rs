@@ -9,7 +9,7 @@ use synaptix_tokenizer::{HfTokenizer, Tokenizer};
 
 #[test]
 fn multi_token_emoji_partial_decode_yields_replacement_char() {
-    let bundle = Path::new("/run/media/storage/syn_models/qwen3.8-27b.syn");
+    let bundle = Path::new("/run/media/storage/Нейросети/Модели/qwen3.8-27b.syn");
     if !bundle.exists() {
         eprintln!("bundle отсутствует — скип");
         return;

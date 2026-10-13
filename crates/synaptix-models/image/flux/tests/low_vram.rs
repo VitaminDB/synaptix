@@ -3,7 +3,7 @@
 //! свободной памяти. Прогон: CLIP + T5 → DiT → денойз → VAE.
 //!
 //! ```sh
-//! FLUX_SYN=~/Storage/syn_models/flux.1-dev.syn FLUX_QUANT=nvfp4 FLUX_SIZE=1024 FLUX_OUT=/tmp/out \
+//! FLUX_SYN=~/Storage/Нейросети/Модели/flux.1-dev.syn FLUX_QUANT=nvfp4 FLUX_SIZE=1024 FLUX_OUT=/tmp/out \
 //!   cargo test --release -p synaptix-image-flux --test low_vram -- --ignored --nocapture
 //! ```
 

@@ -2,7 +2,7 @@
 //! через фасады `facade::embedding` / `facade::rerank` — тем же путём, каким
 //! их грузит synthos.
 //!
-//! Бандлы ищутся в `KB_MODELS_DIR` (по умолчанию `~/Storage/syn_models`); нет
+//! Бандлы ищутся в `KB_MODELS_DIR` (по умолчанию `~/Storage/Нейросети/Модели`); нет
 //! файла — тест пропускается. `KB_DEVICE=cuda` гоняет на GPU (F16), иначе CPU F32.
 //!
 //! ```text

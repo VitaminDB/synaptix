@@ -2,7 +2,7 @@
 //! greedy-токены совпадают, граф быстрее. Гейтед: модели по списку.
 //!
 //! ```sh
-//! GRAPH_MODELS=~/Storage/syn_models/gguf-tests/Qwen3-0.6B-Q8_0.gguf:... \
+//! GRAPH_MODELS=~/Storage/Нейросети/Модели/gguf-tests/Qwen3-0.6B-Q8_0.gguf:... \
 //!   cargo test -p synaptix --release --test graph_decode_parity -- --nocapture --test-threads=1
 //! ```
 //! `GRAPH_NEW_TOKENS` (64) — длина ответа.

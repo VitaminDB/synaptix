@@ -11,7 +11,7 @@ use synaptix_music_acestep::vae::{AceStepVae, ENCODE_CANCELLED};
 fn vae_path() -> Option<PathBuf> {
     [
         PathBuf::from("storage/syn_models/acestep_vae.syn"),
-        PathBuf::from("/home/master/Storage/syn_models/acestep_vae.syn"),
+        PathBuf::from("/home/master/Storage/Нейросети/Модели/acestep_vae.syn"),
     ]
     .into_iter()
     .find(|p| p.exists())

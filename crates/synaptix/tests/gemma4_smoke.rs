@@ -5,7 +5,7 @@
 //! (MoE-ветка, широкие global-слои с V=K, proportional RoPE), а не jinja.
 //!
 //! Запуск:
-//!   SYN_GEMMA4_BUNDLE=/home/master/Storage/syn_models/gemma-4-26b-a4b-it.syn \
+//!   SYN_GEMMA4_BUNDLE=/home/master/Storage/Нейросети/Модели/gemma-4-26b-a4b-it.syn \
 //!   cargo test -p synaptix --release --test gemma4_smoke -- --nocapture --test-threads=1
 
 use synaptix_core::device::Device;

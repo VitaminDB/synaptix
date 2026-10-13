@@ -2,7 +2,7 @@
 //! остаются блоками ggml (`.qpacked` + `quant_manifest.json`,
 //! `required_caps` = `syn-quant-v1`), а читатель бандла отдаёт те же байты и
 //! ту же плотную матрицу, что и прямое чтение `.gguf`. Пропуск, если
-//! эталонного файла нет: `~/Storage/syn_models/gguf-tests/Qwen3-0.6B-Q8_0.gguf`
+//! эталонного файла нет: `~/Storage/Нейросети/Модели/gguf-tests/Qwen3-0.6B-Q8_0.gguf`
 //! (или `SYN_GGUF_KEEP_SRC`). Плотный деквант сверяется на CPU.
 
 use std::path::PathBuf;

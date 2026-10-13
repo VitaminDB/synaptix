@@ -9,7 +9,7 @@
 //! ```sh
 //! cargo test --release -p synaptix-music-sheetsage2 --test model_ref -- --ignored --nocapture
 //! ```
-//! Бандл: `SHEETSAGE2_BUNDLE` (по умолчанию `~/Storage/syn_models/yue2-3b.syn`),
+//! Бандл: `SHEETSAGE2_BUNDLE` (по умолчанию `~/Storage/Нейросети/Модели/yue2-3b.syn`),
 //! устройство: `SHEETSAGE2_DEVICE` = `cuda` | `cpu`.
 
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};

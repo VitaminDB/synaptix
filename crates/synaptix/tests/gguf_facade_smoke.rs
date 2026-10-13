@@ -1,6 +1,6 @@
 //! Прямая загрузка `.gguf` через фасад и жадная генерация на эталонных
 //! файлах llama.cpp (пропуск, если файлов нет):
-//! `~/Storage/syn_models/gguf-tests/*.gguf` (Qwen3-0.6B Q8_0, Gemma-3-1B Q8_0,
+//! `~/Storage/Нейросети/Модели/gguf-tests/*.gguf` (Qwen3-0.6B Q8_0, Gemma-3-1B Q8_0,
 //! Llama-3.2-1B Q4_K_M) и Qwen2 7B Q4_0 из Downloads. Ответ на «столица
 //! Франции» обязан содержать «Париж»/«Paris»; для сырого промпта «The capital
 //! of France is» ожидается « Paris», как у llama-completion.

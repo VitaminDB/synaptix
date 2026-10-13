@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! SDXL_DIR=~/models/stabilityai/stable-diffusion-xl-base-1.0 \
-//! SDXL_SYN=~/Storage/syn_models/sdxl-base-1.0.syn \
+//! SDXL_SYN=~/Storage/Нейросети/Модели/sdxl-base-1.0.syn \
 //!   cargo test --release -p synaptix-image-sdxl --test bundle_source -- --ignored --nocapture
 //! ```
 

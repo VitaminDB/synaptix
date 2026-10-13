@@ -1,5 +1,5 @@
 //! Реальные GGUF-файлы llama.cpp (пропускаются, если файлов нет):
-//! `~/Storage/syn_models/gguf-tests/{Qwen3-0.6B-Q8_0, gemma-3-1b-it-Q8_0,
+//! `~/Storage/Нейросети/Модели/gguf-tests/{Qwen3-0.6B-Q8_0, gemma-3-1b-it-Q8_0,
 //! Llama-3.2-1B-Instruct-Q4_K_M}.gguf` и Qwen2 Q4_0 из Downloads.
 //!
 //! Проверяется: план строится, config.json синтезируется с нужным

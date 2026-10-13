@@ -4,7 +4,7 @@
 //! Фоновый поток ловит минимум свободной памяти.
 //!
 //! ```sh
-//! LLM_MODEL=~/Storage/syn_models/qwen3.8-27b.syn LLM_VRAM_GB=7 \
+//! LLM_MODEL=~/Storage/Нейросети/Модели/qwen3.8-27b.syn LLM_VRAM_GB=7 \
 //!   cargo test -p synaptix --release --test llm_low_vram -- --nocapture
 //! ```
 //! env: `LLM_VRAM_GB` — сколько оставить модели (без него — вся карта),

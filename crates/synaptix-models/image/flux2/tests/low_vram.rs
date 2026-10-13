@@ -4,7 +4,7 @@
 //! референсу, если задан `FLUX2_EDIT`).
 //!
 //! ```sh
-//! FLUX2_MODEL=~/Storage/syn_models/flux.2-klein-4b.syn FLUX2_QUANT=nvfp4 FLUX2_SIZE=1024 \
+//! FLUX2_MODEL=~/Storage/Нейросети/Модели/flux.2-klein-4b.syn FLUX2_QUANT=nvfp4 FLUX2_SIZE=1024 \
 //! FLUX2_OUT=/tmp/out cargo test --release -p synaptix-image-flux2 --test low_vram -- --ignored --nocapture
 //! ```
 

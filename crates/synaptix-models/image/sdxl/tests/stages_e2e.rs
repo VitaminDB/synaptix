@@ -1,7 +1,7 @@
 //! Стадии SDXL на GPU: txt2img 1024² и img2img из результата, отмена.
 //!
 //! ```sh
-//! SDXL_MODEL=~/Storage/syn_models/sdxl-base-1.0.syn SDXL_OUT=/tmp/sdxl \
+//! SDXL_MODEL=~/Storage/Нейросети/Модели/sdxl-base-1.0.syn SDXL_OUT=/tmp/sdxl \
 //!   cargo test --release -p synaptix-image-sdxl --test stages_e2e -- --ignored --nocapture --test-threads=1
 //! ```
 //! `SDXL_QUANT=mxfp8|nvfp4` — квант UNet, `SDXL_STEPS` — шагов (30).
