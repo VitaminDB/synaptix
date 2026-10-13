@@ -53,6 +53,8 @@ pub struct VideoRequest {
     pub control: Option<String>,
     /// LTX: две стадии (половинное разрешение → апскейлер ×2 → доводка).
     pub two_stage: bool,
+    /// H3 restyle: сила перерисовки `source_video` (0..1; по умолчанию 0.6).
+    pub strength: Option<f32>,
 }
 
 /// Квант из настройки; `None` — умолчание пайплайна.
@@ -149,7 +151,7 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     h3::memory::trim_pool(device);
 
     let ckpt = h3::H3Checkpoint::open_source(source.clone(), device, compute).map_err(err)?;
-    let sched = h3::H3Scheduler::new(steps, ckpt.config.sigma_shift_video as f64, ckpt.config.sigma_shift_audio as f64);
+    let mut sched = h3::H3Scheduler::new(steps, ckpt.config.sigma_shift_video as f64, ckpt.config.sigma_shift_audio as f64);
     let conditioning = h3::pipeline::Conditioning { context: cond.hidden, text_tags: cond.tags };
     let mut dreq = h3::pipeline::DenoiseRequest::new(geometry, &conditioning);
     let neg_cond;
@@ -185,7 +187,27 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
         dreq.refs = latents.blocks;
         dreq.cond_rows = latents.cond_rows;
     }
+    let ref_media_empty = ref_media.is_empty();
     drop(ref_media);
+    // Restyle: исходный ролик (видео + звук) → латенты, денойз с середины расписания.
+    if let Some(src_path) = &req.source_video {
+        if !ref_media_empty || !keyframes.is_empty() {
+            return Err("перерисовка ролика не сочетается с референсами и ключевыми кадрами".into());
+        }
+        let strength = req.strength.unwrap_or(0.6).clamp(0.05, 1.0);
+        let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device).map_err(err)?;
+        let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, compute).map_err(err)?;
+        let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device).map_err(err)?;
+        let aenc = h3::audio_vae::AudioVae::load_full(&aw, ckpt.audio_vae_config().map_err(err)?, device, compute).map_err(err)?;
+        let src = h3::restyle::encode_source(src_path, geometry, &enc, &aenc, device).map_err(err)?;
+        drop(enc);
+        drop(aenc);
+        h3::memory::trim_pool(device);
+        let (tail, v0, a0) = h3::restyle::start(&sched, strength, &src, seed, device, compute).map_err(err)?;
+        sched = tail;
+        dreq.init_video = Some(v0);
+        dreq.init_audio = Some(a0);
+    }
     let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit).map_err(err)?;
     let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
     if !keyframes.is_empty() {
