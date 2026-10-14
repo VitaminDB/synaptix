@@ -99,7 +99,7 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
 
 /// Кадры `[3,H,W]` 0..1 и звук (перемежённые отсчёты) → mp4 через ffmpeg.
 /// Звуковые токены LTX ровно на `fa` кадров: обрезка или повтор последнего.
-fn fit_audio_tokens(enc: Tensor, fa: usize) -> R<Tensor> {
+pub(crate) fn fit_audio_tokens(enc: Tensor, fa: usize) -> R<Tensor> {
     let far = enc.dims()[1];
     if far >= fa {
         return enc.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err);
@@ -193,7 +193,7 @@ fn scratch(tag: &str) -> R<PathBuf> {
     Ok(dir)
 }
 
-fn ffmpeg_f32(path: &Path, rate: u32, channels: u32) -> R<Vec<f32>> {
+pub(crate) fn ffmpeg_f32(path: &Path, rate: u32, channels: u32) -> R<Vec<f32>> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
         .arg(path)
