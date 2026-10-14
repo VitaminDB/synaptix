@@ -2757,6 +2757,17 @@ fn ensure_kernels_registered() {
     });
 }
 
+/// Токенизатор и chat-шаблон модели без весов: клиенту службы — считать
+/// токены и собирать промпт так же, как служба.
+pub fn load_llm_tokenizer(path: &Path) -> Result<LlmTokenizer, LlmError> {
+    let tokenizer = build_tokenizer(path)?;
+    let specials = tokenizer.special_tokens().clone();
+    let eos_ids = build_eos_ids(&tokenizer, &specials, path);
+    let template = load_template_source(path).map(|src| ChatTemplate::from_source_with_specials(src, specials.clone()));
+    let reasoning = template.as_ref().and_then(|t| super::sampling::reasoning_levels(detect_llm_arch(path).ok(), t.source()));
+    Ok(LlmTokenizer { tokenizer, template, reasoning, eos_ids })
+}
+
 fn build_facade(
     pipeline: LlmPipeline,
     path: &Path,
