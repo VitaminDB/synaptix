@@ -12,6 +12,7 @@ pub mod device;
 pub mod diarization;
 pub mod embedding;
 pub mod llm;
+pub mod pack;
 pub mod rerank;
 pub mod params;
 pub mod sampling;

@@ -31,7 +31,7 @@ const COPY_CHUNK: usize = 4 * 1024 * 1024;
 /// callback, установленный `with_progress`. Callback вызывается в worker-thread
 /// — потребитель отвечает за переход на UI-поток (например через
 /// `run_on_main_thread`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ProgressEvent {
     /// План: `total_bytes` — объём «работы» (для tensor-источников копирование
     /// идёт в два прохода: stage + pack, поэтому учитывается дважды) — он

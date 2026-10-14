@@ -44,3 +44,4 @@ synaptix-tts-omnivoice = { workspace = true }
 
 hound      = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }

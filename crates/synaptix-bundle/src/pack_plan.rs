@@ -42,7 +42,7 @@ const PRECISION_VARIANTS: &[&str] = &[".fp16", ".fp32", ".bf16", ".fp8", ".f16",
 // ── Результат скана каталога ───────────────────────────────────────────────
 
 /// Что нашлось в папке: либо уже собранный бандл, либо кандидат на упаковку.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FoundItem {
     /// Готовый `.syn`.
     Bundle { path: PathBuf, name: String, bytes: u64 },
@@ -73,7 +73,7 @@ impl FoundItem {
 
 /// Лёгкая карточка модели для списка: ровно то, что нужно нарисовать, без
 /// построения полного плана.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceCandidate {
     /// Каталог модели или одиночный `.safetensors`.
     pub path: PathBuf,
@@ -199,7 +199,7 @@ fn candidate_for_dir(dir: &Path) -> Option<SourceCandidate> {
 // ── План упаковки ──────────────────────────────────────────────────────────
 
 /// Один tensors-чанк будущего бандла.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanComponent {
     /// Суффикс чанка: `main`, `transformer`, `video_vae`.
     pub name: String,
@@ -216,7 +216,7 @@ pub struct PlanComponent {
 }
 
 /// Вспомогательный файл (config.json, tokenizer.json, …).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanFile {
     /// Путь внутри бандла — относительный, с сохранением подкаталогов.
     pub rel: String,
@@ -227,7 +227,7 @@ pub struct PlanFile {
 }
 
 /// Откуда взялась догадка — UI показывает это подписью у поля.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Guess {
     /// `config.json` → `model_type`.
     ConfigJson,
@@ -244,7 +244,7 @@ pub enum Guess {
 }
 
 /// Метаданные будущего бандла с пометками, что откуда взялось.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuessedMeta {
     pub id: String,
     pub version: String,
@@ -256,7 +256,7 @@ pub struct GuessedMeta {
 }
 
 /// Раскладка источника — влияет только на подсказки в UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceKind {
     /// Один `.safetensors`.
     SingleFile,
@@ -267,7 +267,7 @@ pub enum SourceKind {
 }
 
 /// Полный план: что паковать, во что и с какими метаданными.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackPlan {
     pub root: PathBuf,
     pub kind: SourceKind,

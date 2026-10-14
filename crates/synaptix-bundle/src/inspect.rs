@@ -38,7 +38,7 @@ pub struct TensorInfo {
 /// Роль тензора в модели. Порядок проверки в [`classify`] важен: префикс
 /// башни (`visual.`) сильнее внутреннего `attn.`, а LoRA-суффикс сильнее
 /// всего остального.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum LayerRole {
     Embedding,
     LmHead,
@@ -94,7 +94,7 @@ impl LayerRole {
 /// Квант-формат, для которого считается размер. Раскладка задана ядрами
 /// synaptix (`quantize_nvfp4` / `quantize_mxfp8`) и от исходного dtype не
 /// зависит — только от формы.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QuantKind {
     /// 4 бита на вес + блочные E4M3-масштабы. Требует форму `[N, K]` с
     /// `N % 64 == 0` и `K % 64 == 0` (условие `QLinear::build`).
