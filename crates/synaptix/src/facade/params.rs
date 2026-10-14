@@ -211,6 +211,8 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
         spec("min_p", "Min-p", "Отсекать слова вероятностью ниже этой доли от лучшего", float(0.0, 1.0, 0.01, 2), p(|s| s.min_p as f64, 0.0)),
         spec("repeat_penalty", "Штраф за повторы", "1 — без штрафа", float(0.5, 2.0, 0.05, 2), p(|s| s.repetition_penalty as f64, 1.0)),
         spec("presence_penalty", "Штраф за присутствие", "Против повторов уже сказанного; 0 — без штрафа", float(-2.0, 2.0, 0.1, 2), p(|s| s.presence_penalty as f64, 0.0)),
+        spec("frequency_penalty", "Штраф за частоту", "Сильнее против слов, повторённых много раз; 0 — без штрафа", float(-2.0, 2.0, 0.1, 2), f(0.0)),
+        spec("repeat_last_n", "Окно штрафа за повторы, токенов", "Сколько последних токенов учитывают штрафы за повторы", int(0, 4096, 16), i(64)),
     ];
     if template.contains("enable_thinking") {
         out.push(spec("thinking", "Размышления", "Модель сначала рассуждает, потом отвечает — точнее и дольше", ParamKind::Bool, Some(ParamValue::Bool(false))));
