@@ -190,7 +190,8 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                 p.components.extend(ltx_ic.iter().cloned());
                 Some(p)
             }
-            "minimax-h3" => {
+            // `syn-pack` по каталогу Diffusers пишет имя класса из `model_index.json`.
+            "minimax-h3" | "minimaxh3pipeline" => {
                 let mut p = single(f, Task::Video, "minimax_h3", "Видео по кадрам и образцу");
                 p.components.extend(h3_encoder.iter().map(|x| ("encoder".to_string(), x.clone())));
                 Some(p)
