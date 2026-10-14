@@ -172,6 +172,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
             "xlm-roberta" => Some(single(f, Task::Embed, "bge_m3", "Эмбеддинги для поиска по смыслу")),
             "whisper" => Some(single(f, Task::Asr, "whisper", "Распознавание речи")),
             "conformer" => Some(single(f, Task::Asr, "gigaam", "Распознавание русской речи")),
+            "sortformer" => Some(single(f, Task::Diarize, "sortformer", "Кто когда говорит (до 4 голосов)")),
             "omnivoice" => Some(single(f, Task::Tts, "omnivoice", "Многоязычный синтез речи, голос по описанию")),
             "vibevoice" => Some(single(f, Task::Tts, "vibevoice", "Синтез речи и диалогов")),
             "voxcpm2" => Some(single(f, Task::Tts, "voxcpm2", "Синтез речи")),

@@ -11,6 +11,8 @@ pub enum Task {
     Ctc,
     Mfa,
     Embed,
+    /// Кто когда говорит (Sortformer).
+    Diarize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,7 +191,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 ]
             }
         },
-        Task::Ctc | Task::Mfa | Task::Embed => Vec::new(),
+        Task::Ctc | Task::Mfa | Task::Embed | Task::Diarize => Vec::new(),
     }
 }
 
