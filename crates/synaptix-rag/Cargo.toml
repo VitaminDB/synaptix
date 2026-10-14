@@ -16,7 +16,6 @@ doc-processing-pdf = []
 
 [dependencies]
 synaptix-core = { workspace = true }
-synaptix-nn   = { workspace = true }
 thiserror     = { workspace = true }
 
 # Парсинг документов + chunking + folder-walk (модуль `doc`, нативный текст,

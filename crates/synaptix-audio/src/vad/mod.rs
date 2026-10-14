@@ -1,4 +1,6 @@
+#[cfg(feature = "nn")]
 pub mod silero;
+#[cfg(feature = "nn")]
 pub mod ten_vad;
 pub mod webrtc;
 

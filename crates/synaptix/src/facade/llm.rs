@@ -42,6 +42,21 @@ impl From<String> for LlmError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GenerationOptions {
+    pub max_new_tokens: usize,
+    pub max_seq_len: usize,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u64,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: String,

@@ -6,10 +6,16 @@ authors.workspace = true
 license.workspace = true
 description = "Synaptix: audio utilities (mel/VAD/codecs/resample/streaming)."
 
+[features]
+# Нейросетевые детекторы (Silero и TEN VAD, openWakeWord) — на тензорах.
+# Без фичи — только обработка сигнала: ресемплинг, mel, STFT, энергия/WebRTC VAD.
+default = ["nn"]
+nn = ["dep:synaptix-ops", "dep:synaptix-nn"]
+
 [dependencies]
 synaptix-core = { workspace = true }
-synaptix-ops  = { workspace = true }
-synaptix-nn   = { workspace = true }
+synaptix-ops  = { workspace = true, optional = true }
+synaptix-nn   = { workspace = true, optional = true }
 thiserror     = { workspace = true }
 rustfft       = { workspace = true }
 hound         = { workspace = true }

@@ -7,6 +7,7 @@ pub mod resample;
 pub mod stft;
 pub mod streaming;
 pub mod vad;
+#[cfg(feature = "nn")]
 pub mod wake_word;
 pub mod window;
 
