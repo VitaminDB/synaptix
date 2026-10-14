@@ -175,7 +175,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             }
         },
         Task::Music => match arch.as_str() {
-            "yue2" => vec![spec("lyrics", "Текст песни", "Куплеты и припевы", ParamKind::Text { multiline: true }, None), duration(60.0, 300.0), seed()],
+            "yue2" => vec![spec("lyrics", "Текст песни", "Куплеты и припевы", ParamKind::Text { multiline: true }, None), duration(180.0, 300.0), seed()],
             _ => {
                 let (st, cfg) = if id.contains("turbo") {
                     (8, 1.0)
