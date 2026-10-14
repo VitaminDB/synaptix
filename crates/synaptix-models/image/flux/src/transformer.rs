@@ -489,19 +489,9 @@ fn qk_norm(t: &Tensor, w: &Tensor) -> Result<Tensor> {
     rms_norm(t, w, EPS)
 }
 
-/// Слитые qk-норма + RoPE парами одним ядром (CUDA, батч 1): позиции
-/// `pos_off..` в таблицах cos/sin. `None` — нет слитого пути, считать как
-/// раньше (норма, затем RoPE по склеенной последовательности).
+/// Слитые qk-норма + RoPE (общий путь synaptix-ops); `None` — как раньше.
 fn norm_rope(x: &Tensor, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize) -> Result<Option<Tensor>> {
-    if x.dims()[0] != 1 || !x.device().is_cuda() || std::env::var_os("SYN_FLUX_NORM_ROPE_SPLIT").is_some() {
-        return Ok(None);
-    }
-    let w32 = if w.dtype() == DType::F32 { w.clone() } else { w.to_dtype(DType::F32)? };
-    match x.contiguous()?.qk_norm_rope_interleaved(&w32, cos, sin, pos_off, HEAD_DIM, EPS) {
-        Ok(t) => Ok(Some(t)),
-        Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => Ok(None),
-        Err(e) => Err(e),
-    }
+    synaptix_ops::norm::rms_norm_rope_interleaved(x, w, cos, sin, pos_off, EPS)
 }
 
 struct DoubleBlock {

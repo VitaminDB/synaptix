@@ -422,17 +422,20 @@ impl DoubleBlock {
         let (ne, pq_e) = ada_ln_quant(txt, mt.get(1), mt.get(0), eps, self.add_q.quant_dtype())?;
 
         let [q, k, v] = qkv([&self.to_q, &self.to_k, &self.to_v], &nh, pq_h.as_ref())?;
-        let q = rms_norm(&to_heads(&q, h, hd)?, &self.norm_q, eps)?;
-        let k = rms_norm(&to_heads(&k, h, hd)?, &self.norm_k, eps)?;
-        let v = to_heads(&v, h, hd)?;
+        let (q, k, v) = (to_heads(&q, h, hd)?, to_heads(&k, h, hd)?, to_heads(&v, h, hd)?);
         let [eq, ek, ev] = qkv([&self.add_q, &self.add_k, &self.add_v], &ne, pq_e.as_ref())?;
-        let eq = rms_norm(&to_heads(&eq, h, hd)?, &self.norm_aq, eps)?;
-        let ek = rms_norm(&to_heads(&ek, h, hd)?, &self.norm_ak, eps)?;
-        let ev = to_heads(&ev, h, hd)?;
+        let (eq, ek, ev) = (to_heads(&eq, h, hd)?, to_heads(&ek, h, hd)?, to_heads(&ev, h, hd)?);
         drop((nh, ne, pq_h, pq_e));
 
-        let q = apply_rope(&Tensor::cat(&[&eq, &q], 1)?, &c.cos, &c.sin)?;
-        let k = apply_rope(&Tensor::cat(&[&ek, &k], 1)?, &c.cos, &c.sin)?;
+        // qk-норма + RoPE (txt первым) — одним ядром, где есть.
+        let q = match synaptix_ops::norm::rms_norm_rope_cat(&eq, &q, &self.norm_aq, &self.norm_q, &c.cos, &c.sin, eps)? {
+            Some(q) => q,
+            None => apply_rope(&Tensor::cat(&[&rms_norm(&eq, &self.norm_aq, eps)?, &rms_norm(&q, &self.norm_q, eps)?], 1)?, &c.cos, &c.sin)?,
+        };
+        let k = match synaptix_ops::norm::rms_norm_rope_cat(&ek, &k, &self.norm_ak, &self.norm_k, &c.cos, &c.sin, eps)? {
+            Some(k) => k,
+            None => apply_rope(&Tensor::cat(&[&rms_norm(&ek, &self.norm_ak, eps)?, &rms_norm(&k, &self.norm_k, eps)?], 1)?, &c.cos, &c.sin)?,
+        };
         let v = Tensor::cat(&[&ev, &v], 1)?;
         let attn = attention(&q, &k, &v)?;
         drop((q, k, v));
@@ -463,14 +466,20 @@ impl SingleBlock {
         let p = lin_pq(&self.qkv_mlp, &n, pq.as_ref())?; // [1, S, 3·inner + 2·m]
         drop((n, pq));
         let part = |off: usize, len: usize| -> Result<Tensor> { p.narrow(2, off, len)?.contiguous() };
-        let q = rms_norm(&to_heads(&part(0, inner)?, h, hd)?, &self.norm_q, eps)?;
-        let k = rms_norm(&to_heads(&part(inner, inner)?, h, hd)?, &self.norm_k, eps)?;
+        let qr = to_heads(&part(0, inner)?, h, hd)?;
+        let kr = to_heads(&part(inner, inner)?, h, hd)?;
         let v = to_heads(&part(2 * inner, inner)?, h, hd)?;
         let gate = part(3 * inner, m)?;
         let up = part(3 * inner + m, m)?;
         drop(p);
-        let q = apply_rope(&q, &c.cos, &c.sin)?;
-        let k = apply_rope(&k, &c.cos, &c.sin)?;
+        let q = match synaptix_ops::norm::rms_norm_rope_interleaved(&qr, &self.norm_q, &c.cos, &c.sin, 0, eps)? {
+            Some(q) => q,
+            None => apply_rope(&rms_norm(&qr, &self.norm_q, eps)?, &c.cos, &c.sin)?,
+        };
+        let k = match synaptix_ops::norm::rms_norm_rope_interleaved(&kr, &self.norm_k, &c.cos, &c.sin, 0, eps)? {
+            Some(k) => k,
+            None => apply_rope(&rms_norm(&kr, &self.norm_k, eps)?, &c.cos, &c.sin)?,
+        };
         let attn = attention(&q, &k, &v)?;
         drop((q, k, v));
         let act = match gate.silu_and_mul(&up) {

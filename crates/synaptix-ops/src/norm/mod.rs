@@ -20,7 +20,7 @@ pub use layer_norm::{LayerNorm, layer_norm};
 pub use logit_cap::soft_cap;
 pub use pixel_norm::pixel_norm;
 pub use qk_norm::{qk_layer_norm, qk_rms_norm};
-pub use rms_norm::{
+pub use rms_norm::{rms_norm_rope_cat, rms_norm_rope_interleaved, 
     RmsNorm, RmsNormGated, RmsNormQwen, RmsNormSiluGated,
     rms_norm, rms_norm_gated, rms_norm_qwen, rms_norm_silu_gated,
 };

@@ -143,3 +143,29 @@ impl RmsNormSiluGated {
         rms_norm_silu_gated(x, gate, &self.weight, self.eps)
     }
 }
+
+/// qk-норма голов + RoPE парами (2j, 2j+1) одним ядром (CUDA, батч 1):
+/// `x [1, S, H, D]`, таблицы cos/sin F32 `[1, S_total, 1, D]`, позиции
+/// `pos_off..pos_off+S`. Норма и поворот — в F32 без округления между ними.
+/// `None` — слитого пути нет (CPU, батч > 1, `SYN_NORM_ROPE_SPLIT`): считать
+/// как раньше — `rms_norm`, затем RoPE.
+pub fn rms_norm_rope_interleaved(x: &Tensor, weight: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize, eps: f32) -> Result<Option<Tensor>> {
+    let d = x.dims();
+    if d.len() != 4 || d[0] != 1 || !x.device().is_cuda() || std::env::var_os("SYN_NORM_ROPE_SPLIT").is_some() || std::env::var_os("SYN_FLUX_NORM_ROPE_SPLIT").is_some() {
+        return Ok(None);
+    }
+    let w32 = if weight.dtype() == DType::F32 { weight.clone() } else { weight.to_dtype(DType::F32)? };
+    match x.contiguous()?.qk_norm_rope_interleaved(&w32, cos, sin, pos_off, d[3], eps) {
+        Ok(t) => Ok(Some(t)),
+        Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// То же для склейки `[first; second]` по последовательности (txt первым):
+/// каждая часть нормируется своим весом, позиции второй — после первой.
+pub fn rms_norm_rope_cat(first: &Tensor, second: &Tensor, w_first: &Tensor, w_second: &Tensor, cos: &Tensor, sin: &Tensor, eps: f32) -> Result<Option<Tensor>> {
+    let Some(a) = rms_norm_rope_interleaved(first, w_first, cos, sin, 0, eps)? else { return Ok(None) };
+    let Some(b) = rms_norm_rope_interleaved(second, w_second, cos, sin, first.dims()[1], eps)? else { return Ok(None) };
+    Ok(Some(Tensor::cat(&[&a, &b], 1)?))
+}

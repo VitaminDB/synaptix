@@ -374,17 +374,20 @@ impl Block {
         // Общий вход q/k/v квантуется один раз (бит-в-бит с отдельными qf).
         let [qi, ki, vi]: [Tensor; 3] = QuantLinear::forward_many(&ni, &[&self.to_q, &self.to_k, &self.to_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
         let [qt, kt, vt]: [Tensor; 3] = QuantLinear::forward_many(&nt, &[&self.add_q, &self.add_k, &self.add_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
-        let q = rms_norm(&to_heads(&qi, h, hd)?, &self.norm_q, EPS)?;
-        let k = rms_norm(&to_heads(&ki, h, hd)?, &self.norm_k, EPS)?;
-        let v = to_heads(&vi, h, hd)?;
-        let eq = rms_norm(&to_heads(&qt, h, hd)?, &self.norm_aq, EPS)?;
-        let ek = rms_norm(&to_heads(&kt, h, hd)?, &self.norm_ak, EPS)?;
-        let ev = to_heads(&vt, h, hd)?;
+        let (q, k, v) = (to_heads(&qi, h, hd)?, to_heads(&ki, h, hd)?, to_heads(&vi, h, hd)?);
+        let (eq, ek, ev) = (to_heads(&qt, h, hd)?, to_heads(&kt, h, hd)?, to_heads(&vt, h, hd)?);
         drop((qi, ki, vi, qt, kt, vt));
         drop((ni, nt));
 
-        let q = apply_rope(&Tensor::cat(&[&eq, &q], 1)?, cos, sin)?;
-        let k = apply_rope(&Tensor::cat(&[&ek, &k], 1)?, cos, sin)?;
+        // qk-норма + RoPE (txt первым) — одним ядром, где есть.
+        let q = match synaptix_ops::norm::rms_norm_rope_cat(&eq, &q, &self.norm_aq, &self.norm_q, cos, sin, EPS)? {
+            Some(q) => q,
+            None => apply_rope(&Tensor::cat(&[&rms_norm(&eq, &self.norm_aq, EPS)?, &rms_norm(&q, &self.norm_q, EPS)?], 1)?, cos, sin)?,
+        };
+        let k = match synaptix_ops::norm::rms_norm_rope_cat(&ek, &k, &self.norm_ak, &self.norm_k, cos, sin, EPS)? {
+            Some(k) => k,
+            None => apply_rope(&Tensor::cat(&[&rms_norm(&ek, &self.norm_ak, EPS)?, &rms_norm(&k, &self.norm_k, EPS)?], 1)?, cos, sin)?,
+        };
         let v = Tensor::cat(&[&ev, &v], 1)?;
         drop((eq, ek, ev));
         let attn = attention(&q, &k, &v)?;

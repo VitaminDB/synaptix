@@ -119,4 +119,7 @@ FLUX.1 NVFP4 шаг 0.53 → 0.40 с, bf16 53 → 45 с; FLUX.2 base-4b NVFP4
 2. ~~FLUX.1: qk-норма + RoPE одним ядром~~ — сделано; остаются копии
    cat/narrow вокруг внимания (txt+img) и `fa8_quant_rows` (квант Q/K,
    ~8 % — сливать с нормой мешает вычитание среднего K по токенам).
-3. FLUX.2 / Qwen-Image: тот же слитый qk-норма + RoPE (у них свои раскладки).
+3. ~~FLUX.2 / Qwen-Image: слитый qk-норма + RoPE~~ — сделано общим путём
+   `synaptix_ops::norm::rms_norm_rope_{interleaved,cat}` (`SYN_NORM_ROPE_SPLIT=1`
+   — прежний): Qwen-Image 2.1 21.3 → 20.6 с, FLUX.2 klein-9b 6.4 → 6.3 с,
+   визуально равноценно.

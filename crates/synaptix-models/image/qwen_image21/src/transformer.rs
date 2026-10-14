@@ -391,12 +391,20 @@ impl Block {
         let (b, s) = (d[0], d[1]);
         // Общий вход q/k/v квантуется один раз (бит-в-бит с отдельными qf).
         let [qx, kx, vx]: [Tensor; 3] = QuantLinear::forward_many(x, &[&self.to_q, &self.to_k, &self.to_v])?.try_into().map_err(|_| SynaptixError::Other("qkv".into()))?;
-        let q = rms_norm(&to_heads(&qx, h, hd)?, &self.norm_q, cfg.eps)?;
-        let k = rms_norm(&to_heads(&kx, h, hd)?, &self.norm_k, cfg.eps)?;
+        let (qr, kr) = (to_heads(&qx, h, hd)?, to_heads(&kx, h, hd)?);
         let v = to_heads(&vx, h, hd)?;
         drop((qx, kx));
-        let q = heads_first(&apply_rope(&q, cos, sin)?)?;
-        let k = heads_first(&apply_rope(&k, cos, sin)?)?;
+        // qk-норма + RoPE — одним ядром, где есть.
+        let q = match synaptix_ops::norm::rms_norm_rope_interleaved(&qr, &self.norm_q, cos, sin, 0, cfg.eps)? {
+            Some(q) => q,
+            None => apply_rope(&rms_norm(&qr, &self.norm_q, cfg.eps)?, cos, sin)?,
+        };
+        let k = match synaptix_ops::norm::rms_norm_rope_interleaved(&kr, &self.norm_k, cos, sin, 0, cfg.eps)? {
+            Some(k) => k,
+            None => apply_rope(&rms_norm(&kr, &self.norm_k, cfg.eps)?, cos, sin)?,
+        };
+        let q = heads_first(&q)?;
+        let k = heads_first(&k)?;
         let v = heads_first(&v)?;
 
         let out = if decode {
