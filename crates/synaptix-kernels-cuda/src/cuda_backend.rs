@@ -1569,6 +1569,7 @@ impl Backend for CudaBackend {
         rot_dim: usize,
         pos_off: usize,
         eps: f32,
+        interleaved: bool,
         _stream: &Stream,
     ) -> Result<()> {
         for lo in [x.1, w.1, cos.1, sin.1] {
@@ -1601,6 +1602,7 @@ impl Backend for CudaBackend {
             rot_dim,
             pos_off,
             eps,
+            interleaved,
             x.1.dtype(),
         )
     }

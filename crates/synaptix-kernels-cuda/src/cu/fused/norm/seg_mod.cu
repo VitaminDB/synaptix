@@ -10,7 +10,8 @@
 //
 // qk_norm_rope: голова [D] (D % 32 == 0, D ≤ 256) типа T →
 //   n = (w·x)·rms (F32, как rms_norm_f32 c блоком 256: тот же шаффл-порядок
-//   редукции по варпам) → RoPE split-partial (как rope_split_partial_f32) →
+//   редукции по варпам) → RoPE split-partial (как rope_split_partial_f32;
+//   interleaved — парами, как rope_interleaved, таблицы полной ширины) →
 //   round_T. Вместо cast→rms_norm_f32→rope_f32→cast (4 прохода F32/T).
 //   Один варп на строку-голову; позиция = pos_off + row / heads.
 
@@ -73,7 +74,7 @@ __device__ __forceinline__ void qk_norm_rope_impl(
     const T* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ cos_t, const float* __restrict__ sin_t,
     T* __restrict__ out, long long rows, int heads, int d, int rot_dim,
-    int pos_off, float eps)
+    int pos_off, float eps, int interleaved)
 {
     __shared__ float s_n[8][256];
     int warp = threadIdx.x >> 5;
@@ -130,6 +131,13 @@ __device__ __forceinline__ void qk_norm_rope_impl(
             float result;
             if (t >= rot_dim) {
                 result = s_n[warp][t];
+            } else if (interleaved) {
+                // Пары (2j, 2j+1), таблицы полной ширины [S, rot_dim] (FLUX).
+                float c = cos_t[(size_t)s * rot_dim + t];
+                float sn = sin_t[(size_t)s * rot_dim + t];
+                float xn = s_n[warp][t];
+                float xp = s_n[warp][t ^ 1];
+                result = (t & 1) ? (xn * c + xp * sn) : (xn * c - xp * sn);
             } else {
                 int idx = (t < half) ? t : (t - half);
                 float c = cos_t[(size_t)s * half + idx];
@@ -150,13 +158,13 @@ __device__ __forceinline__ void qk_norm_rope_impl(
 
 extern "C" __global__ void qk_norm_rope_bf16(
     const __nv_bfloat16* x, const float* w, const float* cos_t, const float* sin_t,
-    __nv_bfloat16* out, long long rows, int heads, int d, int rot_dim, int pos_off, float eps)
-{ qk_norm_rope_impl<__nv_bfloat16>(x, w, cos_t, sin_t, out, rows, heads, d, rot_dim, pos_off, eps); }
+    __nv_bfloat16* out, long long rows, int heads, int d, int rot_dim, int pos_off, float eps, int interleaved)
+{ qk_norm_rope_impl<__nv_bfloat16>(x, w, cos_t, sin_t, out, rows, heads, d, rot_dim, pos_off, eps, interleaved); }
 
 extern "C" __global__ void qk_norm_rope_f16(
     const __half* x, const float* w, const float* cos_t, const float* sin_t,
-    __half* out, long long rows, int heads, int d, int rot_dim, int pos_off, float eps)
-{ qk_norm_rope_impl<__half>(x, w, cos_t, sin_t, out, rows, heads, d, rot_dim, pos_off, eps); }
+    __half* out, long long rows, int heads, int d, int rot_dim, int pos_off, float eps, int interleaved)
+{ qk_norm_rope_impl<__half>(x, w, cos_t, sin_t, out, rows, heads, d, rot_dim, pos_off, eps, interleaved); }
 
 // silu(gate)·up → MXFP8 (natural: e4m3 [m, F], E8M0 [m, F/32]) из строки
 // h = [gate | up] ([m, 2F]) одним проходом. Бит-в-бит с narrow+contiguous →

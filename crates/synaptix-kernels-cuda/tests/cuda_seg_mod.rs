@@ -161,3 +161,33 @@ fn layer_norm_plain_bitexact() {
         }
     }
 }
+
+/// Режим FLUX: RoPE парами, таблицы полной ширины `[S, D]`, позиция со сдвигом.
+fn qk_il_case(n: usize, heads: usize, off: usize, dt: DType) {
+    let dev = Device::Cuda(0);
+    let d = 128;
+    let s_total = off + n + 3;
+    let x = Tensor::from_vec(det(9, n * heads * d, 4.0), vec![1, n, heads, d], dev).unwrap().to_dtype(dt).unwrap();
+    let w = Tensor::from_vec(det(10, d, 1.0).iter().map(|v| 1.0 + v * 0.3).collect(), vec![d], dev).unwrap();
+    // Таблица как у FLUX: угол пары повторён в обоих элементах.
+    let ang: Vec<f32> = (0..s_total * d).map(|i| ((i / 2) as f32) * 0.011).collect();
+    let cos = Tensor::from_vec(ang.iter().map(|a| a.cos()).collect(), vec![1, s_total, 1, d], dev).unwrap();
+    let sin = Tensor::from_vec(ang.iter().map(|a| a.sin()).collect(), vec![1, s_total, 1, d], dev).unwrap();
+
+    let out = x.qk_norm_rope_interleaved(&w, &cos, &sin, off, d, 1e-6).unwrap();
+    let reference = x
+        .to_dtype(DType::F32).unwrap()
+        .rms_norm_fused(&w, 1e-6, false).unwrap()
+        .rope_interleaved_fused(&cos.narrow(1, off, n).unwrap().contiguous().unwrap(), &sin.narrow(1, off, n).unwrap().contiguous().unwrap()).unwrap()
+        .to_dtype(dt).unwrap();
+    assert_eq!(bytes(&out), bytes(&reference), "qk_norm_rope_interleaved (n={n} h={heads} off={off} {dt:?})");
+}
+
+#[test]
+fn qk_norm_rope_interleaved_bitexact() {
+    synaptix_kernels_cuda::ensure_registered();
+    for dt in [DType::BF16, DType::F16] {
+        qk_il_case(37, 24, 0, dt);
+        qk_il_case(300, 24, 512, dt);
+    }
+}

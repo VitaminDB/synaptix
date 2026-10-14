@@ -64,7 +64,13 @@ pub(crate) fn stored_format(model: &Path) -> Option<DType> {
     let b = synaptix_bundle::Bundle::open(model).ok()?;
     let raw = b.read_file("quant_manifest.json").ok()?;
     let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let fmt = v.get("tensors")?.as_object()?.values().find_map(|t| t.get("format")?.as_str().map(str::to_string))?;
+    // Формат трансформера (энкодер текста бывает квантован и при плотном DiT).
+    let fmt = v
+        .get("tensors")?
+        .as_object()?
+        .iter()
+        .filter(|(k, _)| k.contains("transformer_blocks") || k.starts_with("blocks."))
+        .find_map(|(_, t)| t.get("format")?.as_str().map(str::to_string))?;
     quant_setting(Some(&fmt))
 }
 

@@ -489,6 +489,21 @@ fn qk_norm(t: &Tensor, w: &Tensor) -> Result<Tensor> {
     rms_norm(t, w, EPS)
 }
 
+/// Слитые qk-норма + RoPE парами одним ядром (CUDA, батч 1): позиции
+/// `pos_off..` в таблицах cos/sin. `None` — нет слитого пути, считать как
+/// раньше (норма, затем RoPE по склеенной последовательности).
+fn norm_rope(x: &Tensor, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize) -> Result<Option<Tensor>> {
+    if x.dims()[0] != 1 || !x.device().is_cuda() || std::env::var_os("SYN_FLUX_NORM_ROPE_SPLIT").is_some() {
+        return Ok(None);
+    }
+    let w32 = if w.dtype() == DType::F32 { w.clone() } else { w.to_dtype(DType::F32)? };
+    match x.contiguous()?.qk_norm_rope_interleaved(&w32, cos, sin, pos_off, HEAD_DIM, EPS) {
+        Ok(t) => Ok(Some(t)),
+        Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 struct DoubleBlock {
     norm1: QuantLinear,
     norm1_ctx: QuantLinear,
@@ -566,16 +581,30 @@ impl DoubleBlock {
         dbg_push("ne", &ne);
 
         // проекции + QK-norm (q/k/v шарят prequant nh; add_* — prequant ne)
-        let q = qk_norm(&to_heads(&lin_pq(&self.attn.to_q, &nh, pq_h.as_ref())?)?, &self.attn.norm_q)?;
-        let k = qk_norm(&to_heads(&lin_pq(&self.attn.to_k, &nh, pq_h.as_ref())?)?, &self.attn.norm_k)?;
+        let qr = to_heads(&lin_pq(&self.attn.to_q, &nh, pq_h.as_ref())?)?;
+        let kr = to_heads(&lin_pq(&self.attn.to_k, &nh, pq_h.as_ref())?)?;
         let v = to_heads(&lin_pq(&self.attn.to_v, &nh, pq_h.as_ref())?)?;
-        let eq = qk_norm(&to_heads(&lin_pq(self.attn.add_q.as_ref().unwrap(), &ne, pq_e.as_ref())?)?, self.attn.norm_aq.as_ref().unwrap())?;
-        let ek = qk_norm(&to_heads(&lin_pq(self.attn.add_k.as_ref().unwrap(), &ne, pq_e.as_ref())?)?, self.attn.norm_ak.as_ref().unwrap())?;
+        let eqr = to_heads(&lin_pq(self.attn.add_q.as_ref().unwrap(), &ne, pq_e.as_ref())?)?;
+        let ekr = to_heads(&lin_pq(self.attn.add_k.as_ref().unwrap(), &ne, pq_e.as_ref())?)?;
         let ev = to_heads(&lin_pq(self.attn.add_v.as_ref().unwrap(), &ne, pq_e.as_ref())?)?;
+        let (naq, nak) = (self.attn.norm_aq.as_ref().unwrap(), self.attn.norm_ak.as_ref().unwrap());
 
-        // конкат txt первым + RoPE
-        let q = apply_rope(&Tensor::cat(&[&eq, &q], 1)?, cos, sin)?;
-        let k = apply_rope(&Tensor::cat(&[&ek, &k], 1)?, cos, sin)?;
+        // Конкат txt первым + RoPE: слитым ядром — txt с позиции 0, img с st.
+        let fused = match (norm_rope(&eqr, naq, cos, sin, 0)?, norm_rope(&qr, &self.attn.norm_q, cos, sin, st)?) {
+            (Some(eq), Some(q)) => match (norm_rope(&ekr, nak, cos, sin, 0)?, norm_rope(&kr, &self.attn.norm_k, cos, sin, st)?) {
+                (Some(ek), Some(k)) => Some((Tensor::cat(&[&eq, &q], 1)?, Tensor::cat(&[&ek, &k], 1)?)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (q, k) = match fused {
+            Some(qk) => qk,
+            None => {
+                let (q, k) = (qk_norm(&qr, &self.attn.norm_q)?, qk_norm(&kr, &self.attn.norm_k)?);
+                let (eq, ek) = (qk_norm(&eqr, naq)?, qk_norm(&ekr, nak)?);
+                (apply_rope(&Tensor::cat(&[&eq, &q], 1)?, cos, sin)?, apply_rope(&Tensor::cat(&[&ek, &k], 1)?, cos, sin)?)
+            }
+        };
         let v = Tensor::cat(&[&ev, &v], 1)?;
         let attn = attention(&q, &k, &v)?; // [B, St+Si, 3072]
         dbg_push("attn_raw", &attn);
@@ -657,11 +686,21 @@ impl SingleBlock {
 
         let mlp = prof_t("s_mlp", &dev, || gelu_tanh(&lin_pq(&self.proj_mlp, &nh, pq.as_ref())?))?; // [B,seq,12288]
         let qg = prof_t("s_gemm", &dev, || to_heads(&lin_pq(&self.attn.to_q, &nh, pq.as_ref())?))?;
-        let qn = prof_t("s_qknorm", &dev, || qk_norm(&qg, &self.attn.norm_q))?;
-        let q = prof_t("s_rope", &dev, || apply_rope(&qn, cos, sin))?;
+        let q = match norm_rope(&qg, &self.attn.norm_q, cos, sin, 0)? {
+            Some(q) => q,
+            None => {
+                let qn = prof_t("s_qknorm", &dev, || qk_norm(&qg, &self.attn.norm_q))?;
+                prof_t("s_rope", &dev, || apply_rope(&qn, cos, sin))?
+            }
+        };
         let kg = prof_t("s_gemm", &dev, || to_heads(&lin_pq(&self.attn.to_k, &nh, pq.as_ref())?))?;
-        let kn = prof_t("s_qknorm", &dev, || qk_norm(&kg, &self.attn.norm_k))?;
-        let k = prof_t("s_rope", &dev, || apply_rope(&kn, cos, sin))?;
+        let k = match norm_rope(&kg, &self.attn.norm_k, cos, sin, 0)? {
+            Some(k) => k,
+            None => {
+                let kn = prof_t("s_qknorm", &dev, || qk_norm(&kg, &self.attn.norm_k))?;
+                prof_t("s_rope", &dev, || apply_rope(&kn, cos, sin))?
+            }
+        };
         let v = prof_t("s_gemm", &dev, || to_heads(&lin_pq(&self.attn.to_v, &nh, pq.as_ref())?))?;
         let attn = attention(&q, &k, &v)?; // [B,seq,3072]
 

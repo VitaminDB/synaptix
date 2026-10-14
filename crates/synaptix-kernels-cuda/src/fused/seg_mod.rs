@@ -119,6 +119,7 @@ pub fn qk_norm_rope(
     rot_dim: usize,
     pos_off: usize,
     eps: f32,
+    interleaved: bool,
     dtype: DType,
 ) -> Result<()> {
     if d % 32 != 0 || d > 256 || rot_dim > d || rot_dim % 2 != 0 {
@@ -128,19 +129,19 @@ pub fn qk_norm_rope(
         return Ok(());
     }
     let n = rows * d;
-    let half = rot_dim / 2;
+    let width = if interleaved { rot_dim } else { rot_dim / 2 };
     let wv = view::<f32>(w, w_off, d, "w")?;
-    let cv = view::<f32>(cos, cos_off, table_rows * half, "cos")?;
-    let sv = view::<f32>(sin, sin_off, table_rows * half, "sin")?;
+    let cv = view::<f32>(cos, cos_off, table_rows * width, "cos")?;
+    let sv = view::<f32>(sin, sin_off, table_rows * width, "sin")?;
     let cfg = LaunchConfig { grid_dim: (rows.div_ceil(8) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-    let (rows_l, h, dd, rd, po) = (rows as i64, heads as i32, d as i32, rot_dim as i32, pos_off as i32);
+    let (rows_l, h, dd, rd, po, il) = (rows as i64, heads as i32, d as i32, rot_dim as i32, pos_off as i32, interleaved as i32);
     macro_rules! go {
         ($t:ty, $f:expr) => {{
             let xv = view::<$t>(x, x_off, n, "x")?;
             let mut os = out.slice_mut(0..n * 2);
             let mut ov = unsafe { os.transmute_mut::<$t>(n) }.ok_or_else(|| SynaptixError::Cuda("seg_mod: transmute out".into()))?;
             let mut b = stream.launch_builder($f);
-            b.arg(&xv).arg(&wv).arg(&cv).arg(&sv).arg(&mut ov).arg(&rows_l).arg(&h).arg(&dd).arg(&rd).arg(&po).arg(&eps);
+            b.arg(&xv).arg(&wv).arg(&cv).arg(&sv).arg(&mut ov).arg(&rows_l).arg(&h).arg(&dd).arg(&rd).arg(&po).arg(&eps).arg(&il);
             unsafe { b.launch(cfg) }.map_err(|e| SynaptixError::Cuda(format!("launch qk_norm_rope: {e:?}")))?;
         }};
     }

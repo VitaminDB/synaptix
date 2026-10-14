@@ -1188,6 +1188,17 @@ impl Tensor {
     /// Бит-в-бит с `to_dtype(F32) → rms_norm_fused → rope_split_partial_fused
     /// → to_dtype` (head-строки, rms-блок 256).
     pub fn qk_norm_rope(&self, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize, rot_dim: usize, eps: f32) -> Result<Tensor> {
+        self.qk_norm_rope_impl(w, cos, sin, pos_off, rot_dim, eps, false)
+    }
+
+    /// То же с RoPE парами (2j, 2j+1), как `rope_interleaved_fused` (FLUX):
+    /// таблицы F32 `[S, rot_dim]` полной ширины. Норма и поворот — в F32
+    /// одним проходом (без округления до T между ними).
+    pub fn qk_norm_rope_interleaved(&self, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize, rot_dim: usize, eps: f32) -> Result<Tensor> {
+        self.qk_norm_rope_impl(w, cos, sin, pos_off, rot_dim, eps, true)
+    }
+
+    fn qk_norm_rope_impl(&self, w: &Tensor, cos: &Tensor, sin: &Tensor, pos_off: usize, rot_dim: usize, eps: f32, interleaved: bool) -> Result<Tensor> {
         let dt = self.dtype();
         let dims = self.dims();
         if dims.len() < 2 || !matches!(dt, DType::F16 | DType::BF16) || w.dtype() != DType::F32 || cos.dtype() != DType::F32 || sin.dtype() != DType::F32 {
@@ -1196,7 +1207,7 @@ impl Tensor {
         let d = dims[dims.len() - 1];
         let heads = dims[dims.len() - 2];
         let rows = self.layout.numel() / d.max(1);
-        let half = rot_dim / 2;
+        let half = if interleaved { rot_dim } else { rot_dim / 2 };
         if w.layout.numel() != d || half == 0 || cos.layout.numel() % half != 0 || cos.layout.numel() != sin.layout.numel() {
             return Err(SynaptixError::Unsupported("qk_norm_rope: формы w/cos/sin"));
         }
@@ -1222,6 +1233,7 @@ impl Tensor {
             rot_dim,
             pos_off,
             eps,
+            interleaved,
             &stream,
         )?;
         Ok(Tensor::from_parts(Arc::new(out_st), out_layout))

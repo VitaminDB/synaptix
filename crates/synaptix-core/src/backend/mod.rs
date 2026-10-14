@@ -475,7 +475,8 @@ pub trait Backend: Send + Sync + 'static {
     }
 
     /// qk-норма головы (вес F32) + RoPE split-partial (таблицы F32
-    /// `[table_rows, rot_dim/2]`, позиция `pos_off + row/heads`), вход и выход
+    /// `[table_rows, rot_dim/2]`) или парами (`interleaved`, таблицы
+    /// `[table_rows, rot_dim]`), позиция `pos_off + row/heads`, вход и выход
     /// F16|BF16 `[rows, d]`.
     #[allow(clippy::too_many_arguments)]
     fn qk_norm_rope(
@@ -492,6 +493,7 @@ pub trait Backend: Send + Sync + 'static {
         _rot_dim: usize,
         _pos_off: usize,
         _eps: f32,
+        _interleaved: bool,
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("qk_norm_rope не поддержан этим backend"))

@@ -34,6 +34,8 @@ pub struct ImageModel {
     quant: DType,
     /// Qwen-Image 2.1: разрешение условия (стороны референсов), px.
     resolution: usize,
+    /// Трансформер квантован (запросом или в самом файле) — внимание в FP8.
+    fp8_attention: bool,
     inner: Inner,
 }
 
@@ -213,7 +215,8 @@ pub fn open(path: &Path, device: Device, quant: Option<&str>) -> R<ImageModel> {
             Inner::Qwen21(QwenImage21Model::open(path, device, DType::BF16, quant).map_err(err)?.with_memory(MemoryMode::Auto))
         }
     };
-    Ok(ImageModel { family, path: path.to_path_buf(), quant, resolution: synaptix_image_qwen21::model::DEFAULT_RESOLUTION, inner })
+    let fp8_attention = quant.is_quantized() || crate::video::stored_format(path).is_some_and(|q| q.is_quantized());
+    Ok(ImageModel { family, path: path.to_path_buf(), quant, resolution: synaptix_image_qwen21::model::DEFAULT_RESOLUTION, fp8_attention, inner })
 }
 
 fn size_or(w: usize, h: usize, fallback: (usize, usize), snap: impl Fn(usize) -> usize) -> (usize, usize) {
@@ -246,7 +249,7 @@ impl ImageModel {
     }
 
     pub fn is_quantized(&self) -> bool {
-        self.quant.is_quantized()
+        self.fp8_attention
     }
 
     /// Картинки с диска в память — RGBA для Qwen-Image 2.1, иначе RGB.
@@ -358,7 +361,7 @@ impl ImageModel {
     /// `refs` — правка (у Qwen-Image без них — картинки условия).
     /// `progress(шаг, всего) -> продолжать`.
     pub fn sample(&self, cond: &Cond, latent: Option<&Latent>, refs: Option<&Refs>, o: &SampleOpts, progress: &mut dyn FnMut(usize, usize) -> bool) -> R<Latent> {
-        let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant.is_quantized());
+        let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.fp8_attention);
         let (rw, rh) = latent.map(Latent::size).unwrap_or((0, 0));
         let init = match latent {
             Some(Latent::Image { latent, .. }) => Some(latent),
