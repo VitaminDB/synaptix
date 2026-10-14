@@ -7,4 +7,5 @@ pub mod image;
 pub mod image_stages;
 pub mod ltx_stages;
 pub mod music;
+pub mod music_stages;
 pub mod video;

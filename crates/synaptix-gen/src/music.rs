@@ -36,6 +36,7 @@ pub struct MusicOutput {
 }
 
 /// Компоненты ACE-Step: DiT (сама модель), LM кодов, текстовый энкодер, VAE.
+#[derive(Debug, Clone)]
 pub struct AcePaths {
     pub dit: PathBuf,
     pub lm: PathBuf,
@@ -45,7 +46,7 @@ pub struct AcePaths {
 
 pub fn acestep(paths: &AcePaths, device: Device, req: &MusicRequest, cancel: Arc<AtomicBool>) -> R<MusicOutput> {
     use synaptix_music_acestep::ar::CodesGenOptions;
-    use synaptix_music_acestep::pipeline::{generate_music, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions};
+    use synaptix_music_acestep::pipeline::{generate_music, EditOptions, GenExtras, MusicPaths, SamplerOptions};
     use synaptix_music_acestep::DitVariant;
     for (label, p) in [("DiT", &paths.dit), ("LM", &paths.lm), ("текстовый энкодер", &paths.text_encoder), ("VAE", &paths.vae)] {
         if !p.exists() {
@@ -58,7 +59,7 @@ pub fn acestep(paths: &AcePaths, device: Device, req: &MusicRequest, cancel: Arc
     let steps = req.steps.filter(|&s| s > 0).unwrap_or(variant.default_steps());
     let opts = SamplerOptions { steps, shift: variant.default_shift(), guidance_scale: req.guidance.unwrap_or(variant.default_cfg()), ..Default::default() };
     let copts = CodesGenOptions { seed: req.seed.max(1), ..CodesGenOptions::default() };
-    let extras = GenExtras { norm_mode: NormMode::Peak, ..Default::default() };
+    let extras = GenExtras::ar_on();
     let mp = MusicPaths { lm: &paths.lm, text_encoder: &paths.text_encoder, dit: &paths.dit, vae: &paths.vae };
     let compute = if device.is_cuda() { DType::BF16 } else { DType::F32 };
     let quant = match req.quant.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
