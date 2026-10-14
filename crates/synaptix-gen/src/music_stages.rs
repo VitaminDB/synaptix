@@ -221,7 +221,8 @@ impl AceModel {
             6 => EditMode::Extract,
             _ => EditMode::Text2Music,
         };
-        if mode >= 1 && src.is_none() {
+        // Retake варьирует шум и без записи.
+        if mode >= 2 && src.is_none() {
             return Err(format!("режиму {} нужен латент записи или прошлой генерации", ACE_MODES[mode]));
         }
         // Без LM кодов штатно работает только turbo; extract LM не зовёт.
