@@ -219,11 +219,32 @@ pub mod stream {
         new[i..].join(" ")
     }
 
+    /// Распознавание целого буфера: (PCM, частота, язык) → текст. Исполнитель
+    /// — локальный [`Transcriber`] или, например, служба.
+    pub type TranscribeFn = Arc<dyn Fn(&[f32], u32, Option<&str>) -> Result<String, String> + Send + Sync>;
+
     impl StreamingAsr {
         pub fn start(
             pcm_rx: Receiver<Vec<f32>>,
             sample_rate: u32,
             asr: Arc<Mutex<Option<Transcriber>>>,
+            cfg: StreamingAsrConfig,
+        ) -> Self {
+            let run: TranscribeFn = Arc::new(move |buf, sr, lang| {
+                let mut guard = asr.lock().map_err(|_| "asr mutex poisoned".to_string())?;
+                match guard.as_mut() {
+                    Some(t) => t.transcribe_pcm_text(buf, sr, lang),
+                    None => Err("ASR-модель не загружена".to_string()),
+                }
+            });
+            Self::start_with(pcm_rx, sample_rate, run, cfg)
+        }
+
+        /// Как [`Self::start`], но с любым исполнителем распознавания.
+        pub fn start_with(
+            pcm_rx: Receiver<Vec<f32>>,
+            sample_rate: u32,
+            transcribe: TranscribeFn,
             cfg: StreamingAsrConfig,
         ) -> Self {
             let (tx, rx) = channel();
@@ -240,14 +261,7 @@ pub mod stream {
                     let mut last_len = 0usize;
                     let mut prev_text = String::new();
 
-                    let run = |buf: &[f32]| -> Result<String, String> {
-                        let mut guard =
-                            asr.lock().map_err(|_| "asr mutex poisoned".to_string())?;
-                        match guard.as_mut() {
-                            Some(t) => t.transcribe_pcm_text(buf, sr, lang),
-                            None => Err("ASR-модель не загружена".to_string()),
-                        }
-                    };
+                    let run = |buf: &[f32]| -> Result<String, String> { transcribe(buf, sr, lang) };
 
                     loop {
                         match pcm_rx.recv() {
