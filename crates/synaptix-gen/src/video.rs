@@ -85,7 +85,7 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let cfg_scale = req.guidance.unwrap_or(5.0);
     // Негатив — только при CFG > 1 (без CFG его не кодировать).
     let negative = req.negative.as_deref().filter(|_| cfg_scale > 1.0);
-    let cond = m.encode(size, &req.prompt, negative, req.first_frame.as_deref(), req.last_frame.as_deref(), &req.refs)?;
+    let cond = m.encode(size, &req.prompt, negative, req.first_frame.as_deref(), req.last_frame.as_deref(), &req.refs, st::RefSize::Match)?;
     let keyframes = req.first_frame.is_some() as usize + req.last_frame.is_some() as usize;
     let lat = m.sample(&cond, steps, cfg_scale, req.seed, req.source_video.as_deref(), req.strength, cancel, progress)?;
     drop(cond);

@@ -32,6 +32,8 @@ pub struct ImageModel {
     pub family: Family,
     pub path: PathBuf,
     quant: DType,
+    /// Qwen-Image 2.1: разрешение условия (стороны референсов), px.
+    resolution: usize,
     inner: Inner,
 }
 
@@ -211,7 +213,7 @@ pub fn open(path: &Path, device: Device, quant: Option<&str>) -> R<ImageModel> {
             Inner::Qwen21(QwenImage21Model::open(path, device, DType::BF16, quant).map_err(err)?.with_memory(MemoryMode::Auto))
         }
     };
-    Ok(ImageModel { family, path: path.to_path_buf(), quant, inner })
+    Ok(ImageModel { family, path: path.to_path_buf(), quant, resolution: synaptix_image_qwen21::model::DEFAULT_RESOLUTION, inner })
 }
 
 fn size_or(w: usize, h: usize, fallback: (usize, usize), snap: impl Fn(usize) -> usize) -> (usize, usize) {
@@ -224,6 +226,14 @@ fn load_rgba(p: &Path) -> R<synaptix_image_qwen21::RgbaImage> {
 }
 
 impl ImageModel {
+    /// Qwen-Image 2.1: разрешение условия (0 — по модели, 1024).
+    pub fn with_resolution(mut self, px: usize) -> Self {
+        if px > 0 {
+            self.resolution = px;
+        }
+        self
+    }
+
     /// Название семейства (вариант — для FLUX.2 и Qwen-Image).
     pub fn name(&self) -> String {
         match &self.inner {
@@ -279,7 +289,7 @@ impl ImageModel {
                 let neg = negative.unwrap_or(" ");
                 CondInner::Qwen(m.encode_prompt(prompt, Some(neg), pics.rgb()?).map_err(err)?)
             }
-            Inner::Qwen21(m) => CondInner::Qwen21(m.encode_prompt(prompt, negative, pics.rgba()?, synaptix_image_qwen21::model::DEFAULT_RESOLUTION).map_err(err)?),
+            Inner::Qwen21(m) => CondInner::Qwen21(m.encode_prompt(prompt, negative, pics.rgba()?, self.resolution).map_err(err)?),
         };
         let pics = if matches!(self.family, Family::QwenImage | Family::QwenImage21) { pics } else { Pics::Rgb(Vec::new()) };
         Ok(Cond { prompt: prompt.to_string(), pics, inner })
@@ -315,7 +325,7 @@ impl ImageModel {
                 RefsInner::Flux2(m.encode_references(&fitted).map_err(err)?)
             }
             Inner::Qwen(m) => RefsInner::Qwen(m.encode_references(pics.rgb()?).map_err(err)?),
-            Inner::Qwen21(m) => RefsInner::Qwen21(m.encode_references(pics.rgba()?, synaptix_image_qwen21::model::DEFAULT_RESOLUTION).map_err(err)?),
+            Inner::Qwen21(m) => RefsInner::Qwen21(m.encode_references(pics.rgba()?, self.resolution).map_err(err)?),
             _ => return Err(format!("{}: референсы не поддерживаются (есть у FLUX.2 и Qwen-Image)", self.name())),
         };
         Ok(Refs { pics, sizes, inner })
@@ -448,7 +458,7 @@ impl ImageModel {
                 (lat, width, height, steps, format!("{} {width}×{height}, {steps} шагов", variant.label()))
             }
             (Inner::Qwen21(m), CondInner::Qwen21(c)) => {
-                use synaptix_image_qwen21::model::{snap_side, DEFAULT_RESOLUTION, DEFAULT_STEPS};
+                use synaptix_image_qwen21::model::{snap_side, DEFAULT_STEPS};
                 use synaptix_image_qwen21::{QwenImage21Model, SampleParams};
                 if init.is_some() {
                     return Err("Qwen-Image 2.1: img2img не поддерживается — правка идёт через референсы".into());
@@ -470,7 +480,7 @@ impl ImageModel {
                     Some(r) => r.sizes.clone(),
                     None => cond.pics.sizes(),
                 };
-                let (width, height) = size_or(rw, rh, QwenImage21Model::default_size(&sizes, DEFAULT_RESOLUTION), snap_side);
+                let (width, height) = size_or(rw, rh, QwenImage21Model::default_size(&sizes, self.resolution), snap_side);
                 let steps = steps_or(DEFAULT_STEPS);
                 let cfg = o.guidance.unwrap_or(1.0);
                 let ref_tokens = r.map(|r| r.num_tokens()).unwrap_or(0);

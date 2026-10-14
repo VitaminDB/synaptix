@@ -29,6 +29,8 @@ pub struct H3Model {
     encoder: Option<PathBuf>,
     device: Device,
     quant: DType,
+    /// LoRA поверх DiT (Turbo и т. п.) и её сила.
+    lora: Option<(PathBuf, f32)>,
 }
 
 /// Размер и длительность ролика; 0 — умолчание (1344×768, 5 с).
@@ -37,6 +39,14 @@ pub struct Size {
     pub width: usize,
     pub height: usize,
     pub seconds: f64,
+}
+
+/// Картинки-референсы: под площадь кадра или крупно (2048 по короткой стороне).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum RefSize {
+    #[default]
+    Match,
+    Max,
 }
 
 /// Условие: закодированное описание, ключевые кадры и референсы, геометрия.
@@ -95,7 +105,15 @@ pub fn open(model: &Path, encoder: Option<&Path>, device: Device, quant: Option<
     }
     synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
-    Ok(H3Model { model: model.to_path_buf(), encoder: encoder.map(Path::to_path_buf), device, quant: quant_setting(quant).unwrap_or(DType::NVFP4) })
+    Ok(H3Model { model: model.to_path_buf(), encoder: encoder.map(Path::to_path_buf), device, quant: quant_setting(quant).unwrap_or(DType::NVFP4), lora: None })
+}
+
+impl H3Model {
+    /// LoRA поверх DiT (сила > 0).
+    pub fn with_lora(mut self, path: PathBuf, strength: f32) -> Self {
+        self.lora = (strength > 0.0).then_some((path, strength));
+        self
+    }
 }
 
 fn is_audio(p: &Path) -> bool {
@@ -110,7 +128,8 @@ impl H3Model {
     /// Описание (и негатив) с ключевыми кадрами (FL2VA) или референсами
     /// (Ref2VA: картинки, видео, звук — до 12) в условие. Голос в
     /// референсах задаёт длительность ролика.
-    pub fn encode(&self, size: Size, prompt: &str, negative: Option<&str>, first: Option<&Path>, last: Option<&Path>, refs: &[PathBuf]) -> R<H3Cond> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(&self, size: Size, prompt: &str, negative: Option<&str>, first: Option<&Path>, last: Option<&Path>, refs: &[PathBuf], ref_size: RefSize) -> R<H3Cond> {
         setup()?;
         let device = self.device;
         let snap = |v: usize| (v / 16).max(1) * 16;
@@ -147,7 +166,12 @@ impl H3Model {
         } else {
             h3::refs::decode(
                 &ref_sources,
-                &h3::refs::RefOptions { image_size: h3::refs::RefImageSize::Match, target_width: geometry.width, target_height: geometry.height, frame_count: geometry.frame_count },
+                &h3::refs::RefOptions {
+                    image_size: match ref_size {
+                        RefSize::Match => h3::refs::RefImageSize::Match,
+                        RefSize::Max => h3::refs::RefImageSize::Max,
+                    },
+                    target_width: geometry.width, target_height: geometry.height, frame_count: geometry.frame_count },
             )
             .map_err(err)?
         };
@@ -185,7 +209,11 @@ impl H3Model {
         let steps = if steps > 0 { steps } else { 20 };
         let geometry = c.geometry;
         let source = &c.source;
-        let ckpt = h3::H3Checkpoint::open_source(source.clone(), device, COMPUTE).map_err(err)?;
+        let mut ckpt = h3::H3Checkpoint::open_source(source.clone(), device, COMPUTE).map_err(err)?;
+        if let Some((p, s)) = &self.lora {
+            let lw = h3::LoraWeights::open(p, device, *s).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
+            ckpt = ckpt.with_lora(std::sync::Arc::new(lw));
+        }
         let mut sched = h3::H3Scheduler::new(steps, ckpt.config.sigma_shift_video as f64, ckpt.config.sigma_shift_audio as f64);
         let conditioning = h3::pipeline::Conditioning { context: c.cond.hidden.clone(), text_tags: c.cond.tags.clone() };
         let mut dreq = h3::pipeline::DenoiseRequest::new(geometry, &conditioning);
