@@ -6,6 +6,9 @@ pub struct ThinkParser {
     inside: bool,
     pending: String,
     eat_extraneous_close: bool,
+    /// Блок открыт шаблоном, но модель (Qwen3) всё равно печатает `<think>`:
+    /// ведущий тег — не текст размышлений.
+    skip_open: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -24,12 +27,26 @@ impl ThinkParser {
             inside: true,
             pending: String::new(),
             eat_extraneous_close: true,
+            skip_open: true,
         }
     }
 
     pub fn feed(&mut self, chunk: &str) -> ThinkSplit {
         let mut buf = std::mem::take(&mut self.pending);
         buf.push_str(chunk);
+        if self.skip_open {
+            let t = buf.trim_start();
+            let lower = t.to_ascii_lowercase();
+            if OPEN.starts_with(lower.as_str()) && lower.len() < OPEN.len() {
+                // Пусто или начало тега — ждём следующий кусок.
+                self.pending = buf;
+                return ThinkSplit::default();
+            }
+            if lower.starts_with(OPEN) {
+                buf = t[OPEN.len()..].to_string();
+            }
+            self.skip_open = false;
+        }
 
         let mut out = ThinkSplit::default();
         let mut cursor = 0usize;
@@ -161,6 +178,19 @@ mod tests {
             acc.thinking.push_str(&part.thinking);
         }
         acc
+    }
+
+    /// Шаблон открыл блок, а модель всё равно печатает `<think>` (Qwen3):
+    /// тег не попадает в размышления, и по кускам тоже.
+    #[test]
+    fn implicit_open_drops_echoed_open_tag() {
+        let mut p = ThinkParser::new_implicit_open();
+        let r = split(&mut p, &["<thi", "nk>\nдумаю", "</think>ответ"]);
+        assert_eq!(r.thinking.trim(), "думаю");
+        assert_eq!(r.body, "ответ");
+        let mut p = ThinkParser::new_implicit_open();
+        let r = split(&mut p, &["думаю</think>ответ"]);
+        assert_eq!(r.thinking, "думаю");
     }
 
     #[test]
