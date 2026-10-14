@@ -2576,6 +2576,7 @@ pub fn load_llm(
 
     let _cpu_quant = cpu_quant_request(path, device, &precision);
     let arch = detect_llm_arch(path).map_err(LlmError)?;
+    let _offload = vlm_offload_guard(path, device, arch);
     let pipeline = match arch {
         LlmArch::Qwen3 => Qwen3Pipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Qwen3)
@@ -2618,6 +2619,47 @@ pub fn load_llm(
     };
 
     build_facade(pipeline, path, device, max_seq, precision.compute)
+}
+
+/// Режим размещения на время одной загрузки; при выходе — прежний.
+struct OffloadGuard(synaptix_llm_common::model::OffloadMode);
+
+impl Drop for OffloadGuard {
+    fn drop(&mut self) {
+        synaptix_llm_common::model::set_offload_mode(self.0);
+    }
+}
+
+/// Модель со зрением на карте: башня грузится после весов LLM и должна
+/// поместиться рядом с ними вместе с KV и активациями. Если резидентные веса
+/// займут VRAM почти целиком (MiniCPM-V 4.7 35B-A3B: 23.1 из 24.4 ГБ), башня
+/// упрётся в OOM — тогда эксперты сразу уходят в RAM с кэшем на карте, а
+/// место под башню кэш освобождает при её загрузке
+/// (`HybridPipeline::VISION_RESERVE_BYTES`). Явно выбранный режим не трогаем.
+fn vlm_offload_guard(path: &Path, device: Device, arch: LlmArch) -> Option<OffloadGuard> {
+    use synaptix_llm_common::model::{offload_mode, set_offload_mode, OffloadMode};
+    let Device::Cuda(ord) = device else { return None };
+    if arch != LlmArch::Hybrid || offload_mode() != OffloadMode::Auto {
+        return None;
+    }
+    if !HybridPipeline::bundle_has_vision(path) {
+        return None;
+    }
+    // Квантованный бандл — почти целиком веса, которые лягут на карту как есть.
+    let weights = std::fs::metadata(path).ok()?.len() as usize;
+    let (free, _total) = synaptix_core::device::cuda::mem_info(ord).ok()?;
+    let reserve = synaptix_llm_qwen3_next_hybrid::pipeline::VISION_RESERVE_BYTES + (3usize << 30);
+    if weights.saturating_add(reserve) <= free {
+        return None;
+    }
+    eprintln!(
+        "[synaptix] {}: веса {:.1} ГБ при {:.1} ГБ свободной VRAM не оставят места башне зрения — эксперты в RAM с кэшем на карте",
+        path.display(),
+        weights as f64 / 1e9,
+        free as f64 / 1e9
+    );
+    set_offload_mode(OffloadMode::Offload);
+    Some(OffloadGuard(OffloadMode::Auto))
 }
 
 fn cpu_quant_request(
@@ -2832,6 +2874,16 @@ pub fn set_graph_decode_enabled(on: bool) {
 }
 
 pub fn graph_decode_enabled() -> bool {
+    // `SYN_GRAPH_DECODE=1|0` — принудительно, поверх профиля и настроек
+    // модели (замеры и отладка).
+    if let Ok(v) = std::env::var("SYN_GRAPH_DECODE") {
+        if v == "1" {
+            return true;
+        }
+        if v == "0" {
+            return false;
+        }
+    }
     THREAD_RUNTIME.with(|r| r.get().graph_decode).unwrap_or_else(|| GRAPH_DECODE.load(std::sync::atomic::Ordering::Relaxed))
 }
 static PREFILL_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

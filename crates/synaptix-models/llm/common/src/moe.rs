@@ -829,6 +829,10 @@ impl ExpertStore {
     }
 }
 
+/// Метка отказа сегментного пути: эксперт из кэша не NVFP4 (см.
+/// `forward_chunk_segmented`).
+const NOT_NVFP4_EXPERT: &str = "MoE: эксперт не NVFP4";
+
 pub struct MoeFfn {
     cfg: MoeConfig,
     cache: Option<Arc<ExpertCache>>,
@@ -1838,7 +1842,7 @@ impl MoeFfn {
                         }
                         for e in &held {
                             if !nvfp4_pair(e) {
-                                return Err(ModelError::Forward("MoE: эксперт не NVFP4".into()));
+                                return Err(ModelError::Forward(NOT_NVFP4_EXPERT.into()));
                             }
                             refs.push(e.as_ref());
                         }
@@ -1891,7 +1895,13 @@ impl MoeFfn {
                 let refs: Vec<&Tensor> = parts.iter().collect();
                 Tensor::cat(&refs, 0).map_err(|e| ModelError::Forward(format!("MoE: сборка групп: {e}")))
             }
-        })?;
+        });
+        // Эксперт из кэша оказался не NVFP4 (крайние слои по политике MXFP8):
+        // групповой GEMM ему не подходит — остальные пути считают любой формат.
+        let stacked = match stacked {
+            Err(e) if e.to_string().contains(NOT_NVFP4_EXPERT) => return Ok(None),
+            r => r?,
+        };
         // Взвешивание, обратная перестановка и сумма по слотам — одно ядро.
         let inverse = Tensor::from_vec::<_, u32>(inverse, vec![t * k], self.device)
             .map_err(|e| ModelError::Forward(format!("MoE: обратные индексы: {e}")))?;

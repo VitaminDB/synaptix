@@ -141,7 +141,17 @@ pub fn set_offload_mode(mode: OffloadMode) {
     OFFLOAD_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn offload_mode() -> OffloadMode {
+pub fn offload_mode() -> OffloadMode {
+    // `SYN_OFFLOAD=resident|offload|auto` — принудительно, поверх настройки
+    // процесса (отладка и замеры).
+    if let Ok(v) = std::env::var("SYN_OFFLOAD") {
+        match v.to_ascii_lowercase().as_str() {
+            "resident" | "1" => return OffloadMode::Resident,
+            "offload" | "2" => return OffloadMode::Offload,
+            "auto" | "0" => return OffloadMode::Auto,
+            _ => {}
+        }
+    }
     match OFFLOAD_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         1 => OffloadMode::Resident,
         2 => OffloadMode::Offload,
@@ -259,11 +269,16 @@ impl Ffn {
         }
     }
 
-    /// Выход FFN на входе `[B, S, H]` (у экспертов — обычный путь через
-    /// хостовый роутер).
+    /// Выход FFN на входе `[B, S, H]`. Эксперты: один токен при готовом
+    /// device-пути — роутер и выбор экспертов на карте (без выгрузки логитов
+    /// на хост, это и есть основная цена шага декода MoE), иначе обычный
+    /// путь через хостовый роутер.
     fn forward(&self, h: &Tensor) -> Result<Tensor, ModelError> {
         match self {
             Ffn::Dense(m) => m.forward(h),
+            Ffn::Moe(m) if m.dev_path_ready() && h.dims().iter().product::<usize>() == m.config().hidden_size => {
+                self.forward_decode(h)
+            }
             Ffn::Moe(m) => {
                 let dims = h.dims().to_vec();
                 let hs = dims[dims.len() - 1];

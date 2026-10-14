@@ -83,6 +83,10 @@ fn effective_prefill_chunk(requested: usize) -> usize {
     (c.max(64) / 64) * 64
 }
 
+/// Сколько VRAM оставлять под башню зрения с её активациями при кэше
+/// экспертов в карте (~1.1 ГБ весов F16 у SigLIP-башни MiniCPM-V / Qwen-VL).
+pub const VISION_RESERVE_BYTES: usize = 3 << 29;
+
 pub struct HybridPipeline {
     pub model: DecoderModel,
     pub mtp: Option<synaptix_llm_common::mtp::MtpModule>,
@@ -388,6 +392,16 @@ impl HybridPipeline {
         dtype: DType,
     ) -> Result<bool, PipelineError> {
         let path = path.as_ref();
+        // Эксперты в RAM с кэшем на карте: кэш успел занять всё свободное
+        // (`fit_expert_cache`), башне нужно место — ужимаем его заранее.
+        if let Some(cache) = self.model.expert_cache() {
+            let want = cache
+                .capacity_bytes()
+                .saturating_sub(VISION_RESERVE_BYTES)
+                .max(synaptix_llm_common::moe::MIN_CACHE_BYTES);
+            cache.set_capacity(want);
+            cache.trim_to(want);
+        }
         if synaptix_vlm_minicpm::bundle_has_vision(path) {
             let tower = synaptix_vlm_minicpm::load_from_bundle(path, self.model.device, dtype)
                 .map_err(|e| PipelineError::Load(format!("vision (minicpm): {e}")))?;
@@ -869,6 +883,11 @@ impl HybridPipeline {
             0 => l,
             n => n.max(1),
         };
+        // Эксперты в RAM: кэш на карте под префилл уступает место
+        // активациям чанка, под декод — забирает почти всё (как в текстовом
+        // пути `generate_streaming_resume`; без этого кэш оставался на
+        // минимуме и декод с картинкой шёл в 4 раза медленнее текста).
+        self.model.fit_expert_cache(chunk.min(l - prefix));
         // Точка возврата — на границе, кратной CS=64 GDN-скана (см.
         // `generate_mtp_inner`): разрез посередине его чанка оставляет
         // состояние частичного чанка и расходится с непрерывным префиллом.
