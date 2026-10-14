@@ -1214,6 +1214,8 @@ pub struct Llm {
     model_path: PathBuf,
     /// Compute-dtype, с которым загружены веса: тем же грузится и башня.
     compute_dtype: DType,
+    /// Настройки генерации этой модели (поверх общих флагов процесса).
+    runtime: Mutex<RuntimeOptions>,
 }
 
 impl Llm {
@@ -1261,6 +1263,7 @@ impl Llm {
         ctx_tokens: usize,
         max_new: usize,
     ) -> Result<Option<LlmKvSession>, LlmError> {
+        let _runtime = self.runtime_scope();
         let pipeline = self
             .pipeline
             .lock()
@@ -1394,6 +1397,7 @@ impl Llm {
         cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(), LlmError> {
+        let _runtime = self.runtime_scope();
         let pipeline = self
             .pipeline
             .lock()
@@ -1759,6 +1763,7 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        let _runtime = self.model.runtime_scope();
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
@@ -1815,6 +1820,7 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        let _runtime = self.model.runtime_scope();
         // Сессию могли припарковать в host-RAM на время вложенной генерации
         // (см. [`LlmKvSession::park_to_host`]). Забирать её обратно —
         // обязанность вызывающего, но забыть это дешевле, чем поймать
@@ -2135,6 +2141,7 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        let _runtime = self.model.runtime_scope();
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2322,6 +2329,7 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        let _runtime = self.model.runtime_scope();
         if media.is_empty() {
             return Err(LlmError("generate_streaming_media без вложений".into()));
         }
@@ -2797,6 +2805,7 @@ fn build_facade(
         vocab_size,
         model_path: path.to_path_buf(),
         compute_dtype,
+        runtime: Mutex::new(RuntimeOptions::current()),
     };
     let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids };
     Ok((model, tok))
@@ -2897,8 +2906,21 @@ pub fn load_llm_with_policy(
     policy: QuantPolicy,
     device: &Device,
 ) -> Result<(Llm, LlmTokenizer), LlmError> {
+    load_llm_full(path, policy, device, config_max_seq(path), RuntimeOptions::current())
+}
+
+/// Загрузка по политике квантов с явным окном контекста и настройками
+/// генерации модели (они действуют уже при загрузке — подключать ли
+/// MTP-голову и DFlash-драфтер — и остаются у неё).
+pub fn load_llm_full(
+    path: &Path,
+    policy: QuantPolicy,
+    device: &Device,
+    max_seq: Option<usize>,
+    runtime: RuntimeOptions,
+) -> Result<(Llm, LlmTokenizer), LlmError> {
+    let _scope = RuntimeScope::enter(runtime);
     let precision = policy.to_precision()?;
-    let max_seq = config_max_seq(path);
     // Веса (и транзиенты деквантизации/переквантизации) — в default-пул,
     // отдельно от пула активаций: смешанный пул за один длинный префилл
     // деградирует в «решето» и упирается в OOM при неизменном живом объёме
@@ -2946,6 +2968,84 @@ pub fn transcode_bundle(
     synaptix_io::weights::transcode::write_bundle(src, out, spec, device, progress).map_err(|e| LlmError(e.to_string()))
 }
 
+// ── Настройки генерации одной модели ────────────────────────────────────────
+
+/// Настройки генерации модели поверх общих флагов процесса (`None` — как у
+/// процесса). Служба держит несколько моделей сразу, и у каждой свой
+/// выверенный профиль: на время генерации они ставятся потоку, поэтому
+/// модели в разных потоках друг другу не мешают.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeOptions {
+    /// CUDA-граф на декоде.
+    pub graph_decode: Option<bool>,
+    /// Спекулятивный декод (MTP у гибрида, DFlash у Muse-Glimmer).
+    pub speculation: Option<bool>,
+    pub layer_sync: Option<LayerSyncMode>,
+}
+
+impl RuntimeOptions {
+    /// Всё задано — как в выверенном профиле.
+    pub fn from_profile(p: &OptimalProfile) -> Self {
+        Self { graph_decode: Some(p.graph_decode), speculation: Some(p.speculation), layer_sync: Some(p.layer_sync) }
+    }
+
+    /// Что действует в этом потоке сейчас (для новой модели — её исходное).
+    fn current() -> Self {
+        THREAD_RUNTIME.with(|r| r.get())
+    }
+}
+
+fn layer_sync_code(m: LayerSyncMode) -> u8 {
+    match m {
+        LayerSyncMode::Auto => 0,
+        LayerSyncMode::Off => 1,
+        LayerSyncMode::On => 2,
+    }
+}
+
+thread_local! {
+    static THREAD_RUNTIME: std::cell::Cell<RuntimeOptions> = const {
+        std::cell::Cell::new(RuntimeOptions { graph_decode: None, speculation: None, layer_sync: None })
+    };
+}
+
+/// Настройки модели в потоке до конца области видимости.
+pub struct RuntimeScope {
+    prev: RuntimeOptions,
+    prev_sync: Option<u8>,
+}
+
+impl RuntimeScope {
+    pub fn enter(opts: RuntimeOptions) -> Self {
+        let prev = THREAD_RUNTIME.with(|r| r.replace(opts));
+        let prev_sync = synaptix_core::device::cuda::set_thread_layer_sync_mode(opts.layer_sync.map(layer_sync_code));
+        Self { prev, prev_sync }
+    }
+}
+
+impl Drop for RuntimeScope {
+    fn drop(&mut self) {
+        THREAD_RUNTIME.with(|r| r.set(self.prev));
+        synaptix_core::device::cuda::set_thread_layer_sync_mode(self.prev_sync);
+    }
+}
+
+impl Llm {
+    pub fn runtime(&self) -> RuntimeOptions {
+        *self.runtime.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Поменять настройки генерации. Спекуляция, выключенная при загрузке,
+    /// включится только после перезагрузки (драфтер не загружен).
+    pub fn set_runtime(&self, opts: RuntimeOptions) {
+        *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = opts;
+    }
+
+    fn runtime_scope(&self) -> RuntimeScope {
+        RuntimeScope::enter(self.runtime())
+    }
+}
+
 // ── Рантайм-сеттеры (no-op: нативный synaptix управляет иначе) ───────────────
 
 static MTP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -2955,7 +3055,7 @@ pub fn set_mtp_enabled(on: bool) {
 }
 
 pub fn mtp_enabled() -> bool {
-    MTP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    THREAD_RUNTIME.with(|r| r.get().speculation).unwrap_or_else(|| MTP_ENABLED.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// DFlash — блочный спекулятивный декод Muse-Glimmer на драфтере-ассистенте
@@ -2967,7 +3067,7 @@ pub fn set_dflash_enabled(on: bool) {
 }
 
 pub fn dflash_enabled() -> bool {
-    DFLASH_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    THREAD_RUNTIME.with(|r| r.get().speculation).unwrap_or_else(|| DFLASH_ENABLED.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 static GRAPH_DECODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2977,7 +3077,7 @@ pub fn set_graph_decode_enabled(on: bool) {
 }
 
 pub fn graph_decode_enabled() -> bool {
-    GRAPH_DECODE.load(std::sync::atomic::Ordering::Relaxed)
+    THREAD_RUNTIME.with(|r| r.get().graph_decode).unwrap_or_else(|| GRAPH_DECODE.load(std::sync::atomic::Ordering::Relaxed))
 }
 static PREFILL_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

@@ -741,8 +741,21 @@ mod inner {
         LAYER_SYNC.store(mode, std::sync::atomic::Ordering::Relaxed);
     }
 
+    thread_local! {
+        /// Режим этого потока поверх общего: настройки одной модели на время
+        /// её генерации (две модели в разных потоках друг другу не мешают).
+        static LAYER_SYNC_THREAD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Поставить режим потока (`None` — как у процесса); возвращает прежний.
+    pub fn set_thread_layer_sync_mode(mode: Option<u8>) -> Option<u8> {
+        LAYER_SYNC_THREAD.with(|c| c.replace(mode))
+    }
+
     pub fn layer_sync_mode() -> u8 {
-        LAYER_SYNC.load(std::sync::atomic::Ordering::Relaxed)
+        LAYER_SYNC_THREAD
+            .with(|c| c.get())
+            .unwrap_or_else(|| LAYER_SYNC.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn layer_sync(ordinal: usize, is_prefill: bool) {
