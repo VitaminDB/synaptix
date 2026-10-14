@@ -166,7 +166,8 @@ fn ltx_err(e: synaptix_video_ltx23::LtxError) -> String {
     }
 }
 
-/// Открыть модель. `quant` — DiT (`nvfp4`, `mxfp8`, `bf16`; пусто — плотный);
+/// Открыть модель. `quant` — DiT (`nvfp4`, `mxfp8`, `bf16`; пусто — формат
+/// квантованного бандла, у плотного файла — плотный);
 /// энкодер Gemma — NVFP4 при NVFP4-DiT, иначе MXFP8. `lora` — свой адаптер
 /// поверх DiT (IC-LoRA, distilled), `depth` — каталог Depth Anything V2.
 pub fn open(paths: LtxPaths, device: Device, quant: Option<&str>, lora: Option<(PathBuf, f32)>, depth: Option<PathBuf>) -> R<LtxModel> {
@@ -178,7 +179,7 @@ pub fn open(paths: LtxPaths, device: Device, quant: Option<&str>, lora: Option<(
     }
     synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
-    let quant_dit = crate::video::quant_setting(quant).unwrap_or(COMPUTE);
+    let quant_dit = crate::video::quant_setting(quant).or_else(|| crate::video::stored_format(&paths.model)).unwrap_or(COMPUTE);
     let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
     Ok(LtxModel { paths, device, quant_dit, quant_enc, lora: lora.filter(|(_, s)| *s > 0.0), depth, ckpt: Mutex::new(None), held: Mutex::new(Held::default()) })
 }

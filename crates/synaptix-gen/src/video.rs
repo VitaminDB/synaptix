@@ -56,6 +56,18 @@ pub struct VideoRequest {
     pub strength: Option<f32>,
 }
 
+/// Формат весов, которым квантован бандл (`quant_manifest.json`): у
+/// квантованного файла DiT берёт его же формат — перекодировка в другой
+/// квант (MXFP8 → NVFP4) теряет качество, а плотное чтение деквантует
+/// и стримит вдвое больший вес.
+pub(crate) fn stored_format(model: &Path) -> Option<DType> {
+    let b = synaptix_bundle::Bundle::open(model).ok()?;
+    let raw = b.read_file("quant_manifest.json").ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let fmt = v.get("tensors")?.as_object()?.values().find_map(|t| t.get("format")?.as_str().map(str::to_string))?;
+    quant_setting(Some(&fmt))
+}
+
 /// Квант из настройки; `None` — умолчание пайплайна.
 pub(crate) fn quant_setting(q: Option<&str>) -> Option<DType> {
     match q.unwrap_or("").to_ascii_lowercase().as_str() {
@@ -296,7 +308,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     };
     let fps = 24.0;
     let compute = DType::BF16;
-    let quant_dit = quant_setting(req.quant.as_deref()).unwrap_or(compute);
+    let quant_dit = quant_setting(req.quant.as_deref()).or_else(|| stored_format(&paths.model)).unwrap_or(compute);
     let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_dit.is_quantized());
     let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
     let seed = Some(req.seed.max(1));
