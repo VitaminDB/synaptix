@@ -381,6 +381,21 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
         policy.lm_head_storage = DType::BF16;
         policy.kv_dtype = KvDtypePolicy::BF16;
     }
+    // Маленькие модели (плотный .syn до 4 ГиБ — до ~2B параметров в bf16):
+    // квант на загрузке им вреден, а экономить нечего. NVFP4 ломает речь 1B
+    // (MiniCPM-V 4.7 1B: «искусственный интелм из машиней»), MXFP8 подмешивает
+    // ошибки в факты; плотные веса в compute-типе дают ответ bf16-эталона при
+    // той же скорости графового декода (F16: 203 против 210 ток/с у MXFP8).
+    // Квантованные бандлы и GGUF-блоки идут как есть — правило только для
+    // плотных источников.
+    if dense_small_model(path) {
+        let d = policy.compute;
+        policy.weights_storage = d;
+        policy.attn_storage = None;
+        policy.lm_head_storage = d;
+        policy.embed_storage = d;
+        policy.kv_dtype = if d == DType::BF16 { KvDtypePolicy::BF16 } else { KvDtypePolicy::F16 };
+    }
     let speculation = matches!(arch, Some(LlmArch::MuseGlimmer) | Some(LlmArch::Hybrid));
     // Графовый декод: шаг захватывается целиком, квантованный KV, MXFP8-голова
     // и -эмбеддинги ему не мешают (позиция и токен шага в device-буферах).
@@ -400,6 +415,15 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
         speculation,
         layer_sync: LayerSyncMode::Auto,
     }
+}
+
+/// Плотный `.syn` меньше 4 ГиБ (см. `optimal_profile_blackwell`): веса такой
+/// модели на загрузке не квантуются.
+fn dense_small_model(path: &Path) -> bool {
+    const LIMIT: u64 = 4 << 30;
+    path.extension().is_some_and(|e| e == "syn")
+        && std::fs::metadata(path).is_ok_and(|m| m.len() < LIMIT)
+        && crate::facade::arch::bundle_quant_formats(path).is_empty()
 }
 
 /// `--kv-dtype` → DType KV-кеша. `fp8`/`mxfp8` → MXFP8 (Blackwell block-scale);
