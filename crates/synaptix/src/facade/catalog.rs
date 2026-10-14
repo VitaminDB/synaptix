@@ -168,7 +168,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
             }
             "qwen3" if n.contains("embedding") => Some(single(f, Task::Embed, "qwen3_embedding", "Эмбеддинги для поиска по смыслу")),
             "qwen3" => Some(single(f, Task::Llm, "qwen3", "Языковая модель")),
-            "xlm-roberta" if n.contains("reranker") => None,
+            "xlm-roberta" if n.contains("reranker") => Some(single(f, Task::Rerank, "bge_reranker", "Переранжирование найденного для поиска")),
             "xlm-roberta" => Some(single(f, Task::Embed, "bge_m3", "Эмбеддинги для поиска по смыслу")),
             "whisper" => Some(single(f, Task::Asr, "whisper", "Распознавание речи")),
             "conformer" => Some(single(f, Task::Asr, "gigaam", "Распознавание русской речи")),

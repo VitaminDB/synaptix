@@ -13,6 +13,8 @@ pub enum Task {
     Embed,
     /// Кто когда говорит (Sortformer).
     Diarize,
+    /// Переранжирование найденного (кросс-энкодер).
+    Rerank,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,7 +193,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 ]
             }
         },
-        Task::Ctc | Task::Mfa | Task::Embed | Task::Diarize => Vec::new(),
+        Task::Ctc | Task::Mfa | Task::Embed | Task::Diarize | Task::Rerank => Vec::new(),
     }
 }
 
