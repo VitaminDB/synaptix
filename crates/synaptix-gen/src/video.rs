@@ -11,7 +11,6 @@ use std::sync::atomic::AtomicBool;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
-use synaptix_video_minimax_h3 as h3;
 
 type R<T> = Result<T, String>;
 
@@ -58,7 +57,7 @@ pub struct VideoRequest {
 }
 
 /// Квант из настройки; `None` — умолчание пайплайна.
-fn quant_setting(q: Option<&str>) -> Option<DType> {
+pub(crate) fn quant_setting(q: Option<&str>) -> Option<DType> {
     match q.unwrap_or("").to_ascii_lowercase().as_str() {
         "nvfp4" => Some(DType::NVFP4),
         "mxfp8" | "fp8" => Some(DType::MXFP8),
@@ -75,192 +74,27 @@ pub struct VideoOutput {
     pub label: String,
 }
 
-/// H3: видео в `out` (mp4). `progress(шаг, всего)`.
+/// H3: видео в `out` (mp4). `progress(шаг, всего)`. Стадии
+/// [`crate::h3_stages`] подряд: энкодер → (VAE ключевых кадров) → DiT →
+/// VAE видео → VAE звука, между этапами пулы ужимаются.
 pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoRequest, out: &Path, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> R<VideoOutput> {
-    if !device.is_cuda() {
-        return Err("MiniMax-H3 работает только на видеокарте".into());
-    }
-    synaptix_kernels_cpu::ensure_registered();
-    synaptix_kernels_cuda::ensure_registered();
-    let mode = h3::H3MemoryMode::parse("auto").ok_or("режим памяти")?;
-    mode.install();
-    let compute = DType::BF16;
-    let q = quant_setting(req.quant.as_deref()).unwrap_or(DType::NVFP4);
-    let (quant_dit, quant_enc) = (q, q);
-    // Квантованный DiT — и внимание в FP8 (e4m3 QKᵀ и P·V).
-    let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_dit.is_quantized());
-    h3::runtime::set_sigma_shift(None, None);
-    h3::runtime::set_vae_tile(None);
-    h3::runtime::set_load_reserve_bytes(13 << 29);
-    let snap = |v: usize| (v / 16).max(1) * 16;
-    let width = snap(req.width.filter(|&v| v > 0).unwrap_or(1344));
-    let height = snap(req.height.filter(|&v| v > 0).unwrap_or(768));
+    use crate::h3_stages as st;
+    let m = st::open(model, encoder, device, req.quant.as_deref())?;
+    let size = st::Size { width: req.width.unwrap_or(0), height: req.height.unwrap_or(0), seconds: req.seconds.unwrap_or(0.0) };
     let steps = req.steps.filter(|&s| s > 0).unwrap_or(20);
     let cfg_scale = req.guidance.unwrap_or(5.0);
-    let seed = req.seed;
-
-    let ref_sources = req.refs.iter().map(|p| h3::refs::RefSource::from_path(p, true)).collect::<Result<Vec<_>, _>>().map_err(err)?;
-    h3::refs::validate(&ref_sources).map_err(err)?;
-    if !ref_sources.is_empty() && (req.first_frame.is_some() || req.last_frame.is_some()) {
-        return Err("референсы и ключевые кадры — разные варианты H3 (ref2va и fl2va), вместе не идут".into());
-    }
-    let variant = if ref_sources.is_empty() { h3::config::H3Variant::Fl2va } else { h3::config::H3Variant::Ref2va };
-    let source = h3::H3Source::open(model, variant).map_err(err)?;
-    // Звук в референсах (голос для липсинка) задаёт длину ролика.
-    let audio_secs = req
-        .refs
-        .iter()
-        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("wav" | "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac")))
-        .filter_map(|p| media_seconds(p))
-        .fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
-    let frame_count = h3::config::frames_for_duration(audio_secs.or(req.seconds.filter(|s| *s > 0.0)).unwrap_or(5.0).clamp(1.0, 15.0));
-    let geometry = h3::pipeline::Geometry::new(width, height, frame_count);
-
-    let encoder_source = match encoder {
-        Some(p) => h3::H3EncoderSource::open(p).map_err(err)?,
-        None => h3::H3EncoderSource::from_model(&source).ok_or_else(|| format!("в {} нет энкодера Qwen3-VL", source.path().display()))?,
-    };
-    let encoder = h3::text_encoder::EncoderHandle::load_source(&encoder_source, device, compute, quant_enc).map_err(err)?;
-
-    let mut images: Vec<(Tensor, h3::text_encoder::ImageGrid)> = Vec::new();
-    let mut keyframes: Vec<(usize, Tensor)> = Vec::new();
-    for (idx, p) in [(0usize, &req.first_frame), (geometry.frame_count - 1, &req.last_frame)] {
-        let Some(p) = p else { continue };
-        let raw = synaptix_io::image::png::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
-        let img = synaptix_io::image::fit_image(&raw, geometry.width, geometry.height, true).map_err(err)?;
-        images.push(encoder.prepare_image(&img).map_err(err)?);
-        keyframes.push((idx, img));
-    }
-    let ref_media = if ref_sources.is_empty() {
-        Vec::new()
-    } else {
-        h3::refs::decode(
-            &ref_sources,
-            &h3::refs::RefOptions { image_size: h3::refs::RefImageSize::Match, target_width: geometry.width, target_height: geometry.height, frame_count: geometry.frame_count },
-        )
-        .map_err(err)?
-    };
-    let merge = encoder.merge_size();
-    let grids: Vec<h3::text_encoder::ImageGrid> = images.iter().map(|(_, g)| *g).collect();
-    let presentation = if !ref_media.is_empty() {
-        let inputs = h3::refs::encoder_inputs(&encoder, &ref_media).map_err(err)?;
-        images = inputs.vision;
-        h3::text_encoder::presentation_ref2va(&req.prompt, &inputs.items, merge)
-    } else if grids.is_empty() {
-        h3::text_encoder::presentation_t2va(&req.prompt)
-    } else {
-        h3::text_encoder::presentation_fl2va(&req.prompt, &grids, merge)
-    };
-    let cond = encoder.encode(&presentation, &images).map_err(err)?;
-    let negative = match req.negative.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-        Some(np) if cfg_scale > 1.0 => Some(encoder.encode(&h3::text_encoder::presentation_t2va(np), &[]).map_err(err)?),
-        _ => None,
-    };
-    drop(encoder);
-    h3::memory::trim_pool(device);
-
-    let ckpt = h3::H3Checkpoint::open_source(source.clone(), device, compute).map_err(err)?;
-    let mut sched = h3::H3Scheduler::new(steps, ckpt.config.sigma_shift_video as f64, ckpt.config.sigma_shift_audio as f64);
-    let conditioning = h3::pipeline::Conditioning { context: cond.hidden, text_tags: cond.tags };
-    let mut dreq = h3::pipeline::DenoiseRequest::new(geometry, &conditioning);
-    let neg_cond;
-    if let Some(n) = negative {
-        neg_cond = h3::pipeline::Conditioning { context: n.hidden, text_tags: n.tags };
-        dreq.negative = Some(&neg_cond);
-        dreq.guider = h3::guider::GuiderParams { cfg_scale, rescale: 0.0, skip_steps: 0 };
-    }
-    dreq.seed = Some(seed);
-    dreq.keyframes = keyframes.iter().map(|(i, _)| h3::layout::Keyframe { resolved_frame_index: *i }).collect();
-
-    if !ref_media.is_empty() {
-        if !ckpt.config.supports_references() {
-            return Err(format!("{} — вариант FL2VA, референсы понимает только Ref2VA", source.path().display()));
-        }
-        let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device).map_err(err)?;
-        let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, compute).map_err(err)?;
-        let has_audio = ref_media.iter().any(|m| match m {
-            h3::refs::RefMedia::Audio(_) => true,
-            h3::refs::RefMedia::Video(v) => v.audio.is_some(),
-            h3::refs::RefMedia::Image(_) => false,
-        });
-        let audio_enc = if has_audio {
-            let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device).map_err(err)?;
-            Some(h3::audio_vae::AudioVae::load_full(&aw, ckpt.audio_vae_config().map_err(err)?, device, compute).map_err(err)?)
-        } else {
-            None
-        };
-        let latents = h3::refs::encode_latents(&ref_media, &enc, audio_enc.as_ref(), ckpt.config.patch_size, device, seed).map_err(err)?;
-        drop(enc);
-        drop(audio_enc);
-        h3::memory::trim_pool(device);
-        dreq.refs = latents.blocks;
-        dreq.cond_rows = latents.cond_rows;
-    }
-    let ref_media_empty = ref_media.is_empty();
-    drop(ref_media);
-    // Restyle: исходный ролик (видео + звук) → латенты, денойз с середины расписания.
-    if let Some(src_path) = &req.source_video {
-        if !ref_media_empty || !keyframes.is_empty() {
-            return Err("перерисовка ролика не сочетается с референсами и ключевыми кадрами".into());
-        }
-        let strength = req.strength.unwrap_or(0.6).clamp(0.05, 1.0);
-        let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device).map_err(err)?;
-        let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, compute).map_err(err)?;
-        let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device).map_err(err)?;
-        let aenc = h3::audio_vae::AudioVae::load_full(&aw, ckpt.audio_vae_config().map_err(err)?, device, compute).map_err(err)?;
-        let src = h3::restyle::encode_source(src_path, geometry, &enc, &aenc, device).map_err(err)?;
-        drop(enc);
-        drop(aenc);
-        h3::memory::trim_pool(device);
-        let (tail, v0, a0) = h3::restyle::start(&sched, strength, &src, seed, device, compute).map_err(err)?;
-        sched = tail;
-        dreq.init_video = Some(v0);
-        dreq.init_audio = Some(a0);
-    }
-    let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit).map_err(err)?;
-    let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
-    if !keyframes.is_empty() {
-        let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device).map_err(err)?;
-        let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, compute).map_err(err)?;
-        let mut latents = Vec::with_capacity(keyframes.len());
-        for (_, img) in &keyframes {
-            let d = img.dims().to_vec();
-            let x = img.to_device(device).map_err(err)?.reshape(vec![1, d[0], 1, d[1], d[2]]).map_err(err)?.mul_scalar(2.0).map_err(err)?.add_scalar(-1.0).map_err(err)?;
-            latents.push(enc.encode(&x).map_err(err)?);
-        }
-        drop(enc);
-        h3::memory::trim_pool(device);
-        dreq.cond_rows.video = h3::pipeline::cond_rows_from_keyframe_latents(&latents, dit.cfg.patch_size, None, seed).map_err(err)?;
-    }
-    let _plan = h3::memory::plan(&ckpt, &prep.plan, prep.layout.seq_len, quant_dit, compute, compute, mode, device).map_err(err)?;
-    let cache = h3::pipeline::build_adaln_cache(&dit, &ckpt, &prep, compute).map_err(err)?;
-    let on_step = |p: h3::pipeline::DenoiseProgress| progress(p.step, p.total);
-    let hooks = h3::pipeline::DenoiseHooks { progress: Some(&on_step), cancel: Some(cancel) };
-    let lat = h3::pipeline::denoise_av(&dit, &cache, &prep, &dreq, &sched, &hooks).map_err(err)?;
-    drop(cache);
-    drop(prep);
-    drop(dit);
-    h3::memory::trim_pool(device);
-
-    let vw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::VideoVae, device).map_err(err)?;
-    let vdec = h3::vae::VaeDecoder::load(&vw, ckpt.vae_config().map_err(err)?, device, compute).map_err(err)?;
-    let rgb = vdec.decode(&lat.video_latent).map_err(err)?;
-    drop(vdec);
-    drop(vw);
-    h3::memory::trim_pool(device);
-    let aw = h3::loader::ComponentLoader::open_component(&source, h3::H3Component::AudioVae, device).map_err(err)?;
-    let adec = h3::audio_vae::AudioVae::load_decoder(&aw, ckpt.audio_vae_config().map_err(err)?, device, compute).map_err(err)?;
-    let wave = adec.decode(&lat.audio_latent).map_err(err)?;
-    let sample_rate = adec.sample_rate();
-    drop(adec);
-    h3::memory::trim_pool(device);
-
-    let frames = h3::vae::rgb_to_frames(&rgb).map_err(err)?;
-    let pcm = h3::audio_vae::interleave_stereo(&wave).map_err(err)?;
-    let channels = wave.dims()[1] as u16;
-    write_mp4(&frames, Some((&pcm, sample_rate as u32, channels)), h3::config::FPS, out)?;
-    let label = format!("MiniMax-H3 {width}×{height}, {:.1} с, {steps} шагов{}", geometry.frame_count as f64 / h3::config::FPS, if keyframes.is_empty() { String::new() } else { format!(", ключевых кадров {}", keyframes.len()) }) + &if req.refs.is_empty() { String::new() } else { format!(", референсов {}", req.refs.len()) };
-    Ok(VideoOutput { width, height, frames: geometry.frame_count, fps: h3::config::FPS, label })
+    // Негатив — только при CFG > 1 (без CFG его не кодировать).
+    let negative = req.negative.as_deref().filter(|_| cfg_scale > 1.0);
+    let cond = m.encode(size, &req.prompt, negative, req.first_frame.as_deref(), req.last_frame.as_deref(), &req.refs)?;
+    let keyframes = req.first_frame.is_some() as usize + req.last_frame.is_some() as usize;
+    let lat = m.sample(&cond, steps, cfg_scale, req.seed, req.source_video.as_deref(), req.strength, cancel, progress)?;
+    drop(cond);
+    let frames = m.decode_video(&lat)?;
+    let (pcm, sample_rate, channels) = m.decode_audio(&lat)?;
+    write_mp4(&frames, Some((&pcm, sample_rate, channels)), st::FPS, out)?;
+    let (width, height) = (lat.width, lat.height);
+    let label = format!("MiniMax-H3 {width}×{height}, {:.1} с, {steps} шагов{}", lat.frames as f64 / st::FPS, if keyframes == 0 { String::new() } else { format!(", ключевых кадров {keyframes}") }) + &if req.refs.is_empty() { String::new() } else { format!(", референсов {}", req.refs.len()) };
+    Ok(VideoOutput { width, height, frames: lat.frames, fps: st::FPS, label })
 }
 
 /// Кадры `[3,H,W]` 0..1 и звук (перемежённые отсчёты) → mp4 через ffmpeg.
@@ -427,7 +261,7 @@ fn ic_downscale(lora: Option<&Path>) -> usize {
 }
 
 /// Длительность медиафайла, с (ffprobe).
-fn media_seconds(path: &Path) -> Option<f64> {
+pub(crate) fn media_seconds(path: &Path) -> Option<f64> {
     let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(path).output().ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
