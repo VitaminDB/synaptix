@@ -116,10 +116,21 @@ __device__ __forceinline__ void fa8_col_reduce_impl(const fa8_t* x, float* out, 
 extern "C" __global__ void fa8_col_sum(const fa8_t* x, float* out, int S, int H) { fa8_col_reduce_impl<0>(x, out, S, H); }
 extern "C" __global__ void fa8_col_amax(const fa8_t* x, float* out, int S, int H) { fa8_col_reduce_impl<1>(x, out, S, H); }
 
+// Частичные суммы сплитов → сумма канала [B·H,128], сложенная по порядку
+// сплитов — как раньше в каждой нити кванта, но один раз на канал, а не на
+// каждую строку (результат бит в бит).
+extern "C" __global__ void fa8_col_total(const float* sum, float* total, int BH, int nsplit) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= BH * FA8_D) return;
+  float t = 0.f;
+  for (int k = 0; k < nsplit; k++) t += sum[(size_t)k * BH * FA8_D + i];
+  total[i] = t;
+}
+
 // Строки [B,S,H,128] → e4m3 той же раскладки + шкала [B,H,S] (·mul).
-// sum != null — вычесть среднее канала (sum/S). Варп = строка.
-extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* sum, unsigned char* out,
-                                          float* sc, int B, int S, int H, float mul, int nsplit) {
+// total != null — вычесть среднее канала (сумма [B·H,128] / S). Варп = строка.
+extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* total, unsigned char* out,
+                                          float* sc, int B, int S, int H, float mul) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   long long r = (long long)blockIdx.x * 8 + warp;
   if (r >= (long long)B * S * H) return;
@@ -131,14 +142,10 @@ extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* sum, unsi
   uint2 raw = *reinterpret_cast<const uint2*>(p);
   fa8_t2 lo = *reinterpret_cast<fa8_t2*>(&raw.x), hi = *reinterpret_cast<fa8_t2*>(&raw.y);
   v[0] = __low2float(lo); v[1] = __high2float(lo); v[2] = __low2float(hi); v[3] = __high2float(hi);
-  if (sum) {
+  if (total) {
     float inv_s = 1.0f / (float)S;
-    size_t bhs = (size_t)B * H;
-    for (int i = 0; i < 4; i++) {
-      float t = 0.f;
-      for (int k = 0; k < nsplit; k++) t += sum[((size_t)k * bhs + (size_t)b * H + h) * FA8_D + lane * 4 + i];
-      v[i] -= t * inv_s;
-    }
+    float4 t = *reinterpret_cast<const float4*>(total + ((size_t)b * H + h) * FA8_D + lane * 4);
+    v[0] -= t.x * inv_s; v[1] -= t.y * inv_s; v[2] -= t.z * inv_s; v[3] -= t.w * inv_s;
   }
   float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));

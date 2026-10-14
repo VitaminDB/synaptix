@@ -17,6 +17,7 @@ pub struct FlashFp8Kernels {
     col_sum: CudaFunction,
     col_amax: CudaFunction,
     quant_rows: CudaFunction,
+    col_total: CudaFunction,
     quant_vt: CudaFunction,
     main_qk: CudaFunction,
     main_full: CudaFunction,
@@ -61,6 +62,7 @@ impl FlashFp8Kernels {
             col_sum: load_fn(&module, "fa8_col_sum")?,
             col_amax: load_fn(&module, "fa8_col_amax")?,
             quant_rows: load_fn(&module, "fa8_quant_rows")?,
+            col_total: load_fn(&module, "fa8_col_total")?,
             quant_vt: load_fn(&module, "fa8_quant_vt")?,
             main_qk,
             main_full,
@@ -107,14 +109,23 @@ pub fn flash_fp8_bshd(
     let spad = skv.div_ceil(64) * 64;
     let spadi = spad as i32;
 
-    // Среднее K по токенам (сумма; деление — в кванте).
+    // Среднее K по токенам: частичные суммы сплитов (каждый пишет свою
+    // часть целиком — обнулять нечего), затем одна сумма на канал.
     let split = (skv / 256).clamp(1, 32) as u32;
-    let mut ksum: CudaSlice<f32> = stream.alloc_zeros(split as usize * b * h * d).map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
+    let mut ksum: CudaSlice<f32> = unsafe { stream.alloc(split as usize * b * h * d) }.map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
     let red_cfg = LaunchConfig { grid_dim: ((b * h) as u32, split, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
     {
         let mut lb = stream.launch_builder(&kern.col_sum);
         lb.arg(&kv).arg(&mut ksum).arg(&skvi).arg(&hi);
         unsafe { lb.launch(red_cfg) }.map_err(launch_err("fa8_col_sum"))?;
+    }
+    let mut kmean: CudaSlice<f32> = unsafe { stream.alloc(b * h * d) }.map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
+    {
+        let (bhi, ns) = ((b * h) as i32, split as i32);
+        let cfg = LaunchConfig { grid_dim: ((b * h * d).div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut lb = stream.launch_builder(&kern.col_total);
+        lb.arg(&ksum).arg(&mut kmean).arg(&bhi).arg(&ns);
+        unsafe { lb.launch(cfg) }.map_err(launch_err("fa8_col_total"))?;
     }
     // Квант Q (шкала · scale · log2e) и K (минус среднее).
     let mut qq = alloc(b * sq * h * d)?;
@@ -131,12 +142,11 @@ pub fn flash_fp8_bshd(
         let mut lb = stream.launch_builder(&kern.quant_rows);
         lb.arg(src);
         if sub {
-            lb.arg(&ksum);
+            lb.arg(&kmean);
         } else {
             lb.arg(&null);
         }
-        let ns = split as i32;
-        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul).arg(&ns);
+        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul);
         unsafe { lb.launch(cfg) }.map_err(launch_err("fa8_quant_rows"))?;
     }
 

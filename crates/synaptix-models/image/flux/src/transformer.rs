@@ -663,10 +663,11 @@ impl SingleBlock {
         })
     }
 
-    fn forward(&self, img: &Tensor, txt: &Tensor, temb: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-        let dev = img.device();
-        let st = txt.dims()[1];
-        let hidden = Tensor::cat(&[txt, img], 1)?; // [B, St+Si, 3072]
+    /// Блок над общей последовательностью `[B, St+Si, 3072]` (txt первым):
+    /// одиночные блоки идут подряд, и делить её на txt/img между ними — лишние
+    /// копии на каждом блоке.
+    fn forward_joint(&self, hidden: &Tensor, temb: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let dev = hidden.device();
         let residual = hidden.clone();
         let m = self.norm.forward(&temb.silu()?)?; // [B,9216]
         let (sh, sc, gate) = (chunk(&m, 0, INNER)?, chunk(&m, 1, INNER)?, chunk(&m, 2, INNER)?);
@@ -695,10 +696,7 @@ impl SingleBlock {
         let attn = attention(&q, &k, &v)?; // [B,seq,3072]
 
         let cat = Tensor::cat(&[&attn, &mlp], 2)?; // [B,seq,15360]
-        let hidden = prof_t("s_projout", &dev, || gate_add(&residual, &gate, &self.proj_out.forward(&cat)?))?;
-        let txt_out = hidden.narrow(1, 0, st)?.contiguous()?;
-        let img_out = hidden.narrow(1, st, hidden.dims()[1] - st)?.contiguous()?;
-        Ok((img_out, txt_out))
+        prof_t("s_projout", &dev, || gate_add(&residual, &gate, &self.proj_out.forward(&cat)?))
     }
 }
 
@@ -1113,19 +1111,26 @@ impl FluxTransformer {
         }
         let t_sgl = std::time::Instant::now();
         let rs = if self.stream.is_some() { self.resident_single } else { self.single_blocks.len() };
+        // Одиночные блоки — над общей последовательностью; делится она один
+        // раз, после последнего.
+        let st = txt.dims()[1];
+        let mut hidden = Tensor::cat(&[&txt, &img], 1)?;
+        let split = |h: &Tensor| -> Result<(Tensor, Tensor)> { Ok((h.narrow(1, st, h.dims()[1] - st)?.contiguous()?, h.narrow(1, 0, st)?.contiguous()?)) };
         stream_each(&self.single_blocks, rs, self.stream, SingleBlock::to_device, |i, blk| {
-            let (i2, t2) = blk.forward(&img, &txt, &temb, &cos, &sin)?;
-            img = i2;
-            txt = t2;
-            if i == 0 {
-                grab!("sb0_img", img);
-                grab!("sb0_txt", txt);
-            }
-            if i == 9 || i == 18 || i == 37 {
-                grab!(format!("depthS{i}_img"), img);
+            hidden = blk.forward_joint(&hidden, &temb, &cos, &sin)?;
+            if cap.is_some() && (i == 0 || i == 9 || i == 18 || i == 37) {
+                let (im, tx) = split(&hidden)?;
+                if i == 0 {
+                    grab!("sb0_img", im);
+                    grab!("sb0_txt", tx);
+                }
+                if i != 0 {
+                    grab!(format!("depthS{i}_img"), im);
+                }
             }
             Ok(())
         })?;
+        img = split(&hidden)?.0;
         if prof {
             prof_sync(&dev);
             prof_add("single", t_sgl.elapsed().as_secs_f64());
