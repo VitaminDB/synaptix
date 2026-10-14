@@ -2,6 +2,7 @@ pub mod audio;
 pub mod data;
 pub mod document;
 pub mod error;
+pub mod refs;
 pub mod image;
 pub mod video;
 pub mod weights;

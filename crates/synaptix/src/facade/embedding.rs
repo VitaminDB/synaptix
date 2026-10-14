@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "engine")]
 use synaptix_core::dtype::DType as SynDType;
+#[cfg(feature = "engine")]
 use synaptix_embedding_bge_m3::BgeM3;
 
 pub use super::asr::ComputeDType as DType;
@@ -51,6 +53,7 @@ impl EmbedderConfig {
     }
 }
 
+#[cfg(feature = "engine")]
 fn compute_to_syn(dtype: DType) -> SynDType {
     match dtype {
         DType::BF16 => SynDType::BF16,
@@ -59,11 +62,13 @@ fn compute_to_syn(dtype: DType) -> SynDType {
     }
 }
 
+#[cfg(feature = "engine")]
 struct BgeEmbedder {
     model: BgeM3,
     batch_size: usize,
 }
 
+#[cfg(feature = "engine")]
 impl Embedder for BgeEmbedder {
     fn dim(&self) -> usize {
         self.model.dim()
@@ -86,6 +91,7 @@ impl Embedder for BgeEmbedder {
     }
 }
 
+#[cfg(feature = "engine")]
 pub fn load_embedder(cfg: EmbedderConfig) -> Result<Box<dyn Embedder + Send + Sync>, String> {
     // Идемпотентно: приложение обычно регистрирует ядра на старте, тесты и CLI — нет.
     synaptix_kernels_cpu::ensure_registered();

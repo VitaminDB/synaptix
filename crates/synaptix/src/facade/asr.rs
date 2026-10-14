@@ -2,17 +2,22 @@
 //! synaptix-asr-gigaam). `Transcriber` диспетчит по [`AsrModelKind`]; submodule
 //! [`stream`] даёт streaming-ASR поверх готового `Transcriber`.
 
+#[cfg(feature = "engine")]
 use std::io::Cursor;
 use std::path::PathBuf;
 
+#[cfg(feature = "engine")]
 use synaptix_asr_gigaam::GigaAm;
+#[cfg(feature = "engine")]
 use synaptix_asr_whisper::{Task, WhisperPipeline};
+#[cfg(feature = "engine")]
 use synaptix_audio::resample;
 use synaptix_core::dtype::DType;
 
 pub use synaptix_core::device::Device;
 pub use synaptix_core::dtype::DType as StorageDType;
 
+#[cfg(feature = "engine")]
 const WHISPER_SR: u32 = 16000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,17 +66,20 @@ pub struct AsrConfig {
     pub compute_dtype: ComputeDType,
 }
 
+#[cfg(feature = "engine")]
 enum Engine {
     Whisper(WhisperPipeline),
     GigaAm(GigaAm),
 }
 
+#[cfg(feature = "engine")]
 pub struct Transcriber {
     kind: AsrModelKind,
     engine: Engine,
     language: Option<String>,
 }
 
+#[cfg(feature = "engine")]
 impl Transcriber {
     pub fn load(cfg: AsrConfig) -> Result<Self, String> {
         // Квант-формат хранения → линейные слои квантуются при загрузке
@@ -150,6 +158,7 @@ impl Transcriber {
     }
 }
 
+#[cfg(feature = "engine")]
 fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
     let reader = hound::WavReader::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let spec = reader.spec();
@@ -185,8 +194,11 @@ fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
 /// → `Final`.
 pub mod stream {
     use std::sync::mpsc::{channel, Receiver};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    #[cfg(feature = "engine")]
+    use std::sync::Mutex;
 
+    #[cfg(feature = "engine")]
     use super::Transcriber;
 
     #[derive(Debug, Clone, Default)]
@@ -224,6 +236,7 @@ pub mod stream {
     pub type TranscribeFn = Arc<dyn Fn(&[f32], u32, Option<&str>) -> Result<String, String> + Send + Sync>;
 
     impl StreamingAsr {
+        #[cfg(feature = "engine")]
         pub fn start(
             pcm_rx: Receiver<Vec<f32>>,
             sample_rate: u32,

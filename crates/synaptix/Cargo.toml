@@ -7,41 +7,78 @@ license.workspace = true
 description = "Synaptix: универсальный нейро-фреймворк (фасад)."
 
 [features]
-default = []
+# Без `engine` — только лёгкое: токенизатор и шаблон чата, разбор ответа,
+# профиль сэмплинга, каталог и архитектура по файлу, интерфейсы эмбеддера и
+# реранкера, решения упаковки. Клиентам службы нейросетей (Synthos) этого
+# хватает: ни моделей, ни CUDA-ядер в них не линкуется.
+default = ["engine"]
+engine = [
+    "dep:synaptix-kernels-cuda",
+    "dep:synaptix-nn",
+    "dep:synaptix-ops",
+    "dep:synaptix-infer",
+    "dep:synaptix-runtime",
+    "dep:synaptix-audio",
+    "dep:synaptix-llm-common",
+    "dep:synaptix-llm-qwen3",
+    "dep:synaptix-llm-qwen4-exp",
+    "dep:synaptix-llm-qwen3-next-hybrid",
+    "dep:synaptix-llm-llama",
+    "dep:synaptix-llm-gemma4",
+    "dep:synaptix-llm-gemma3",
+    "dep:synaptix-llm-muse-glimmer",
+    "dep:synaptix-asr-whisper",
+    "dep:synaptix-asr-gigaam",
+    "dep:synaptix-embedding-bge-m3",
+    "dep:synaptix-diarization-sortformer",
+    "dep:synaptix-tts-omnivoice",
+    "dep:hound",
+]
 
 
 
 [dependencies]
 synaptix-core         = { workspace = true }
 synaptix-kernels-cpu  = { workspace = true }
-synaptix-kernels-cuda = { workspace = true }
+synaptix-kernels-cuda = { workspace = true, optional = true }
 synaptix-io = { workspace = true }
-synaptix-nn           = { workspace = true }
-synaptix-ops          = { workspace = true }
-synaptix-infer        = { workspace = true }
+synaptix-nn           = { workspace = true, optional = true }
+synaptix-ops          = { workspace = true, optional = true }
+synaptix-infer        = { workspace = true, optional = true }
 synaptix-bundle       = { workspace = true }
 synaptix-tokenizer    = { workspace = true }
 tracing               = { workspace = true }
-synaptix-runtime      = { workspace = true }
-synaptix-audio        = { workspace = true }
+synaptix-runtime      = { workspace = true, optional = true }
+synaptix-audio        = { workspace = true, optional = true }
 
 # LLM-архитектуры (фасад facade::llm диспетчит по детекции арх).
-synaptix-llm-common   = { workspace = true }
-synaptix-llm-qwen3    = { workspace = true }
-synaptix-llm-qwen4-exp = { workspace = true }
-synaptix-llm-qwen3-next-hybrid = { workspace = true }
-synaptix-llm-llama    = { workspace = true }
-synaptix-llm-gemma4   = { workspace = true }
-synaptix-llm-gemma3   = { workspace = true }
-synaptix-llm-muse-glimmer = { workspace = true }
+synaptix-llm-common   = { workspace = true, optional = true }
+synaptix-llm-qwen3    = { workspace = true, optional = true }
+synaptix-llm-qwen4-exp = { workspace = true, optional = true }
+synaptix-llm-qwen3-next-hybrid = { workspace = true, optional = true }
+synaptix-llm-llama    = { workspace = true, optional = true }
+synaptix-llm-gemma4   = { workspace = true, optional = true }
+synaptix-llm-gemma3   = { workspace = true, optional = true }
+synaptix-llm-muse-glimmer = { workspace = true, optional = true }
 
 # ASR / embeddings / rerank / диаризация / TTS.
-synaptix-asr-whisper  = { workspace = true }
-synaptix-asr-gigaam   = { workspace = true }
-synaptix-embedding-bge-m3 = { workspace = true }
-synaptix-diarization-sortformer = { workspace = true }
-synaptix-tts-omnivoice = { workspace = true }
+synaptix-asr-whisper  = { workspace = true, optional = true }
+synaptix-asr-gigaam   = { workspace = true, optional = true }
+synaptix-embedding-bge-m3 = { workspace = true, optional = true }
+synaptix-diarization-sortformer = { workspace = true, optional = true }
+synaptix-tts-omnivoice = { workspace = true, optional = true }
 
-hound      = { workspace = true }
+hound      = { workspace = true, optional = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+
+[[example]]
+name = "moe_smoke"
+required-features = ["engine"]
+
+[[example]]
+name = "quant_pack_smoke"
+required-features = ["engine"]

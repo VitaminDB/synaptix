@@ -12,6 +12,7 @@ pub use synaptix_core::tensor::shape::{Dim, IntoShape, Shape};
 
 pub fn init() -> Result<()> {
     synaptix_kernels_cpu::ensure_registered();
+    #[cfg(feature = "engine")]
     {
         synaptix_kernels_cuda::ensure_registered();
     }

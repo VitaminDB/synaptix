@@ -28,6 +28,8 @@ use crate::text_encoder::{EncoderHandle, ImageGrid, RefItem, VideoBlock};
 use crate::vae::VaeEncoder;
 use crate::H3Error;
 
+pub use synaptix_io::refs::{has_audio_stream, labels, RefKind};
+
 pub const MAX_IMAGES: usize = 9;
 pub const MAX_VIDEOS: usize = 3;
 pub const MAX_AUDIOS: usize = 3;
@@ -45,39 +47,12 @@ pub const ENCODER_SAMPLE_FPS: f64 = 2.0;
 pub const REF_IMAGE_LIMITS: PreprocessLimits =
     PreprocessLimits { min_pixels: 65_536, max_pixels: 16_777_216 };
 
-const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "heic", "heif", "tif", "tiff"];
-const VIDEO_EXT: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v", "avi"];
-const AUDIO_EXT: &[&str] = &["wav", "mp3", "flac", "ogg", "opus", "m4a", "aac"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefSource {
     Image(PathBuf),
     /// `use_audio` — брать ли дорожку видео как его собственный `<Audio j>`.
     Video { path: PathBuf, use_audio: bool },
     Audio(PathBuf),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefKind {
-    Image,
-    Video,
-    Audio,
-}
-
-impl RefKind {
-    /// Тип референса по расширению файла.
-    pub fn of_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        if IMAGE_EXT.contains(&ext.as_str()) {
-            Some(Self::Image)
-        } else if VIDEO_EXT.contains(&ext.as_str()) {
-            Some(Self::Video)
-        } else if AUDIO_EXT.contains(&ext.as_str()) {
-            Some(Self::Audio)
-        } else {
-            None
-        }
-    }
 }
 
 impl RefSource {
@@ -161,41 +136,6 @@ pub fn validate(sources: &[RefSource]) -> Result<(), H3Error> {
         ));
     }
     Ok(())
-}
-
-/// Метки, под которыми презентация покажет референсы модели, — на них и
-/// ссылается промпт. Вход — тип и «есть дорожка» (для видео: просили звук и
-/// он в файле есть), в порядке списка. Нумерация своя у каждого типа; дорожка
-/// видео занимает очередной `<Audio j>` раньше отдельных аудио после неё.
-pub fn labels(refs: &[(RefKind, bool)]) -> Vec<String> {
-    let (mut img, mut vid, mut aud) = (0usize, 0usize, 0usize);
-    refs.iter()
-        .map(|(kind, with_audio)| match kind {
-            RefKind::Image => {
-                img += 1;
-                format!("<Picture {img}>")
-            }
-            RefKind::Audio => {
-                aud += 1;
-                format!("<Audio {aud}>")
-            }
-            RefKind::Video => {
-                vid += 1;
-                if *with_audio {
-                    aud += 1;
-                    format!("<Video {vid}> + <Audio {aud}>")
-                } else {
-                    format!("<Video {vid}>")
-                }
-            }
-        })
-        .collect()
-}
-
-/// Есть ли в файле аудиопоток. От этого зависит нумерация `<Audio j>`, так
-/// что узнать это надо до прогона — когда пишется промпт.
-pub fn has_audio_stream(path: &Path) -> bool {
-    probe(path).map(|p| p.has_audio).unwrap_or(false)
 }
 
 /// `round()` Питона: половина — к чётному. Эталон округляет им размеры холста.

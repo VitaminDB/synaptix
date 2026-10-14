@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "engine")]
 use synaptix_core::dtype::DType as SynDType;
+#[cfg(feature = "engine")]
 use synaptix_embedding_bge_m3::BgeReranker;
 
 pub use super::asr::ComputeDType as DType;
@@ -44,6 +46,7 @@ impl RerankerConfig {
     }
 }
 
+#[cfg(feature = "engine")]
 fn compute_to_dtype(c: DType) -> SynDType {
     match c {
         DType::BF16 => SynDType::BF16,
@@ -52,11 +55,13 @@ fn compute_to_dtype(c: DType) -> SynDType {
     }
 }
 
+#[cfg(feature = "engine")]
 struct BgeRerankerAdapter {
     inner: BgeReranker,
     max_tokens: usize,
 }
 
+#[cfg(feature = "engine")]
 impl Reranker for BgeRerankerAdapter {
     fn max_tokens(&self) -> usize {
         self.max_tokens
@@ -69,6 +74,7 @@ impl Reranker for BgeRerankerAdapter {
     }
 }
 
+#[cfg(feature = "engine")]
 pub fn load_reranker(cfg: RerankerConfig) -> Result<Box<dyn Reranker + Send + Sync>, String> {
     // Идемпотентно: приложение обычно регистрирует ядра на старте, тесты и CLI — нет.
     synaptix_kernels_cpu::ensure_registered();

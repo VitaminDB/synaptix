@@ -251,12 +251,13 @@ mod tests {
         ];
         let p = plan_parsed(&files);
         let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["ltx-2-3-22b-dev", "ltx-2-3-22b-distilled-1-1", "acestep-v15-xl-turbo", "gemma-4-26b-a4b-it"]);
+        // Реранкер — своя модель (Task::Rerank), а не пропуск.
+        assert_eq!(ids, ["ltx-2-3-22b-dev", "ltx-2-3-22b-distilled-1-1", "acestep-v15-xl-turbo", "bge-reranker-v2-m3", "gemma-4-26b-a4b-it"]);
         let dev = &p.models[0];
         assert!(dev.components.iter().any(|(r, _)| r == "text_encoder"));
         assert!(dev.components.iter().any(|(r, _)| r == "distilled_lora"));
         assert!(!p.models[1].components.iter().any(|(r, _)| r == "distilled_lora"));
         assert_eq!(p.models[2].components.len(), 3);
-        assert_eq!(p.skipped.len(), 1);
+        assert!(p.skipped.is_empty(), "{:?}", p.skipped);
     }
 }
