@@ -17,6 +17,7 @@ synaptix-tokenizer = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-bundle    = { workspace = true }
 synaptix-vlm-qwen3 = { workspace = true }
+synaptix-vlm-minicpm = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

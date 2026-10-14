@@ -146,7 +146,12 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         || args.chat
         || !args.stop.is_empty()
         || (args.image.is_some() && args.video.is_some())
-        || (arch == Arch::Hybrid && args.video.is_some());
+        || (arch == Arch::Hybrid && args.video.is_some())
+        // MiniCPM-V 4.7: заполнитель картинки с миниатюрой и срезами и холстовый
+        // M-RoPE собирает фасад; прямой путь гибрида знает только разметку Qwen-VL.
+        || (arch == Arch::Hybrid
+            && args.image.is_some()
+            && synaptix::facade::arch::arch_key(&args.model).as_deref() == Some("minicpmv4_7"));
     if arch == Arch::Qwen3 && (args.image.is_some() || args.video.is_some()) {
         return Err("qwen3 — текстовая модель: --image/--video не поддержаны".into());
     }

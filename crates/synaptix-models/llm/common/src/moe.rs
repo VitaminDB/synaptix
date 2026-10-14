@@ -1152,7 +1152,6 @@ impl MoeFfn {
     /// CUDA-графа).
     pub fn dev_path_ready(&self) -> bool {
         self.dev_tables.is_some()
-            && self.shared.is_none()
             && self.cfg.norm_topk_prob
             && (self.cfg.per_expert_scale.is_none() == self.per_expert_scale_dev.is_none())
     }
@@ -1162,6 +1161,7 @@ impl MoeFfn {
     /// умеет ядро geglu+квант.
     pub fn fused_ready(&self) -> bool {
         self.dev_path_ready()
+            && self.shared.is_none()
             && self.cfg.activation == Activation::GeluTanh
             && self.dev_tables.as_ref().is_some_and(|(g, d)| !g.is_dense() && !d.is_dense())
     }
@@ -1170,6 +1170,7 @@ impl MoeFfn {
     /// портируемые таблицы экспертов и gelu_tanh.
     pub fn fused_dense_ready(&self) -> bool {
         self.dev_path_ready()
+            && self.shared.is_none()
             && self.cfg.activation == Activation::GeluTanh
             && self.dev_tables.as_ref().is_some_and(|(g, d)| g.is_dense() && d.is_dense())
     }
@@ -1313,7 +1314,17 @@ impl MoeFfn {
             .sum([0usize])
             .and_then(|t| t.reshape(vec![1usize, self.cfg.hidden_size]))
             .map_err(ferr)?;
-        self.to_compute(out)
+        let out = self.to_compute(out)?;
+        // Shared-эксперт (Qwen-MoE): те же device-операции, что у обычного
+        // пути, — ни одной синхронизации с хостом, граф его захватывает.
+        match &self.shared {
+            Some(shared) => {
+                let s = self.shared_forward(shared, x)?;
+                let s = if s.dtype() == out.dtype() { s } else { s.to_dtype(out.dtype()).map_err(ferr)? };
+                out.add(&s).map_err(|e| ModelError::Forward(format!("MoE device-путь: shared expert: {e}")))
+            }
+            None => Ok(out),
+        }
     }
 
     /// Сколько байт весов держит слой — для планирования оффлоада блоков.

@@ -217,15 +217,39 @@ impl LlmTokenizer {
                     }
                     _ => opts = opts.with_var("tools", serde_json::Value::Null),
                 }
-                tmpl.render(&msgs, &opts).map_err(|e| LlmError(e.to_string()))
+                tmpl.render(&msgs, &opts)
+                    .map(|t| number_image_ids(&t))
+                    .map_err(|e| LlmError(e.to_string()))
             }
-            None => Ok(fallback_render(messages, add_generation_prompt)),
+            None => Ok(number_image_ids(&fallback_render(messages, add_generation_prompt))),
         }
     }
 
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
     }
+}
+
+/// Метка номера картинки в заполнителе MiniCPM-V (`<image_id>N</image_id>`):
+/// порядковый номер известен только после сборки всего промпта, поэтому
+/// блок вложения несёт метку, а [`number_image_ids`] при рендере шаблона
+/// заменяет её номером.
+pub const MINICPM_IMAGE_ID_MARK: &str = "<image_id>\u{FFF9}</image_id>";
+
+/// Проставляет номера картинок MiniCPM-V по порядку появления в тексте
+/// промпта (как `_prepend_local_ids` HF-процессора: 0, 1, 2, …).
+pub fn number_image_ids(prompt: &str) -> String {
+    if !prompt.contains(MINICPM_IMAGE_ID_MARK) {
+        return prompt.to_string();
+    }
+    let mut out = String::with_capacity(prompt.len());
+    for (i, piece) in prompt.split(MINICPM_IMAGE_ID_MARK).enumerate() {
+        if i > 0 {
+            out.push_str(&format!("<image_id>{}</image_id>", i - 1));
+        }
+        out.push_str(piece);
+    }
+    out
 }
 
 /// ChatML-fallback, если у модели нет jinja-шаблона.

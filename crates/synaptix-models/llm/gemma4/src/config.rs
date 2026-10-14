@@ -348,6 +348,7 @@ impl Gemma4Config {
                 global_attn,
                 v_rms_norm: true,
                 moe,
+                moe_ffn: None,
                 layer_scalar: true,
                 ple_dim: self.hidden_size_per_layer_input,
                 kv_source: self.kv_sources(),

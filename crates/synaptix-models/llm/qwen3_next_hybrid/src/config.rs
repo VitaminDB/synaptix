@@ -24,6 +24,18 @@ struct RopeParameters {
     scaling: common::rope_scaling::RopeScaling,
 }
 
+/// Спецтокены «холстового» M-RoPE MiniCPM-V 4.7: `<image>`, `</image>`,
+/// `<slice>`, `</slice>` и `\n` между строками срезов — по ним позиции
+/// картинки раскладываются на холсте (см. `synaptix_vlm_minicpm::layout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasTokenIds {
+    pub image_start: u32,
+    pub image_end: u32,
+    pub slice_start: u32,
+    pub slice_end: u32,
+    pub newline: u32,
+}
+
 /// Раскладка M-RoPE (см. `crate::mrope`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MropeSpec {
@@ -62,6 +74,15 @@ struct TextConfigRaw {
     eos_token_id: EosField,
     mtp_num_hidden_layers: usize,
     rope_parameters: RopeParameters,
+    /// Qwen-MoE (Qwen3-Next, Qwen3.5-MoE, MiniCPM-V 4.7 35B-A3B): эксперты
+    /// вместо плотного MLP. `num_experts == 0` — плотная модель.
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    moe_intermediate_size: usize,
+    shared_expert_intermediate_size: usize,
+    norm_topk_prob: bool,
+    mlp_only_layers: Vec<usize>,
+    decoder_sparse_step: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -112,6 +133,13 @@ impl Default for TextConfigRaw {
             bos_token_id: Some(248044),
             eos_token_id: EosField::One(248044),
             mtp_num_hidden_layers: 0,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: 1,
             rope_parameters: RopeParameters {
                 rope_theta: default_rope_theta(),
                 mrope_section: None,
@@ -158,6 +186,12 @@ pub struct HybridConfig {
     pub mrope: Option<MropeSpec>,
     /// Масштабирование RoPE из `rope_parameters` (`None` — `default`).
     pub rope_scaling: Option<common::rope_scaling::RopeScaling>,
+    /// Эксперты вместо плотного MLP (`num_experts > 0`): Qwen3-Next,
+    /// Qwen3.5-MoE, MiniCPM-V 4.7 35B-A3B.
+    pub moe: Option<common::config::MoeFfnSpec>,
+    /// Токены холстового M-RoPE (MiniCPM-V 4.7); `None` — обычный M-RoPE
+    /// Qwen-VL по сеткам блоков.
+    pub canvas: Option<CanvasTokenIds>,
 }
 
 impl HybridConfig {
@@ -209,6 +243,15 @@ impl HybridConfig {
         cfg.vision_start_token_id = id("vision_start_token_id");
         cfg.vision_end_token_id = id("vision_end_token_id");
         cfg.mrope = mrope;
+        cfg.canvas = (|| {
+            Some(CanvasTokenIds {
+                image_start: id("image_start_id")?,
+                image_end: id("image_end_id")?,
+                slice_start: id("slice_start_id")?,
+                slice_end: id("slice_end_id")?,
+                newline: id("newline_id")?,
+            })
+        })();
         Ok(cfg)
     }
 
@@ -271,6 +314,16 @@ impl HybridConfig {
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,
+            canvas: None,
+            moe: (raw.num_experts > 0).then(|| common::config::MoeFfnSpec {
+                num_experts: raw.num_experts,
+                num_experts_per_tok: raw.num_experts_per_tok,
+                moe_intermediate_size: raw.moe_intermediate_size,
+                shared_expert_intermediate_size: raw.shared_expert_intermediate_size,
+                norm_topk_prob: raw.norm_topk_prob,
+                mlp_only_layers: raw.mlp_only_layers.clone(),
+                decoder_sparse_step: raw.decoder_sparse_step.max(1),
+            }),
             rope_scaling: {
                 let rs = &raw.rope_parameters.scaling;
                 let kind = rs.rope_type.to_ascii_lowercase();
@@ -307,6 +360,14 @@ impl HybridConfig {
         }
         if self.hidden_act != "silu" && self.hidden_act != "swish" {
             return Err(ConfigError::Invalid(format!("hidden_act: {}", self.hidden_act)));
+        }
+        if let Some(m) = &self.moe {
+            if m.num_experts_per_tok == 0 || m.num_experts_per_tok > m.num_experts || m.moe_intermediate_size == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "moe: experts={} top_k={} intermediate={}",
+                    m.num_experts, m.num_experts_per_tok, m.moe_intermediate_size
+                )));
+            }
         }
         Ok(())
     }
@@ -364,7 +425,10 @@ impl HybridConfig {
             tie_word_embeddings: self.tie_word_embeddings,
             bos_token_id: self.bos_token_id,
             eos_token_ids: self.eos_ids(),
-            ext: None,
+            ext: self.moe.as_ref().map(|m| common::config::DecoderExt {
+                moe_ffn: Some(m.clone()),
+                ..Default::default()
+            }),
         }
     }
 
@@ -528,6 +592,44 @@ mod tests {
         assert_eq!(cfg.vision_start_token_id, Some(248053));
         let cfg = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
         assert_eq!(cfg.image_token_id, None);
+    }
+
+    #[test]
+    fn reads_canvas_ids() {
+        let plain = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
+        assert!(plain.canvas.is_none());
+        let with = SAMPLE.replace(
+            "\"model_type\": \"qwen3_5\",",
+            "\"model_type\": \"minicpmv4_7\", \"image_token_id\": 248056, \"image_start_id\": 248078, \"image_end_id\": 248079, \"slice_start_id\": 248088, \"slice_end_id\": 248089, \"newline_id\": 198,",
+        );
+        let cfg = HybridConfig::from_hf_bytes(with.as_bytes()).unwrap();
+        assert_eq!(
+            cfg.canvas,
+            Some(CanvasTokenIds { image_start: 248078, image_end: 248079, slice_start: 248088, slice_end: 248089, newline: 198 })
+        );
+    }
+
+    #[test]
+    fn reads_moe_spec() {
+        let plain = HybridConfig::from_hf_bytes(SAMPLE.as_bytes()).unwrap();
+        assert!(plain.moe.is_none());
+        assert!(plain.to_decoder_config().ext.is_none());
+        let moe = SAMPLE.replace(
+            r#""vocab_size": 248320"#,
+            r#""vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
+               "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512"#,
+        );
+        let cfg = HybridConfig::from_hf_bytes(moe.as_bytes()).unwrap();
+        let m = cfg.moe.as_ref().unwrap();
+        assert_eq!((m.num_experts, m.num_experts_per_tok, m.moe_intermediate_size), (256, 8, 512));
+        assert_eq!(m.shared_expert_intermediate_size, 512);
+        assert!(m.norm_topk_prob);
+        let dc = cfg.to_decoder_config();
+        assert!(dc.moe_ffn_at(0).is_some() && dc.moe_ffn_at(3).is_some());
+        assert!(dc.has_moe_ffn());
+        let sparse = moe.replace(r#""num_experts": 256"#, r#""num_experts": 256, "mlp_only_layers": [1], "decoder_sparse_step": 2"#);
+        let dc = HybridConfig::from_hf_bytes(sparse.as_bytes()).unwrap().to_decoder_config();
+        assert!(dc.moe_ffn_at(0).is_none() && dc.moe_ffn_at(1).is_none() && dc.moe_ffn_at(3).is_some());
     }
 
     #[test]

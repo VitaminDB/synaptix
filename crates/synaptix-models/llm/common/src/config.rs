@@ -70,6 +70,35 @@ pub struct MoeBranch {
     pub moe_intermediate_size: usize,
 }
 
+/// Разрежённый FFN в раскладке Qwen-MoE (Qwen3-Next, Qwen3.5-MoE,
+/// MiniCPM-V 4.7 35B-A3B): на слое ВМЕСТО плотного MLP стоят роутер
+/// `mlp.gate`, стопки экспертов `mlp.experts.{gate_up_proj,down_proj}` и
+/// всегда активный `mlp.shared_expert` с sigmoid-гейтом `shared_expert_gate`.
+/// Нормы блока те же, что у плотного слоя.
+#[derive(Debug, Clone)]
+pub struct MoeFfnSpec {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    /// Ширина shared-эксперта; `0` — его нет.
+    pub shared_expert_intermediate_size: usize,
+    /// Делить веса top-k на их сумму (у Qwen3.5-MoE — всегда).
+    pub norm_topk_prob: bool,
+    /// Слои, где вместо экспертов плотный MLP (`mlp_only_layers`).
+    pub mlp_only_layers: Vec<usize>,
+    /// Эксперты стоят на слоях с `(idx + 1) % decoder_sparse_step == 0`.
+    pub decoder_sparse_step: usize,
+}
+
+impl MoeFfnSpec {
+    /// Стоят ли на слое `idx` эксперты (иначе — плотный MLP).
+    pub fn at(&self, idx: usize) -> bool {
+        self.num_experts > 0
+            && !self.mlp_only_layers.contains(&idx)
+            && (idx + 1) % self.decoder_sparse_step.max(1) == 0
+    }
+}
+
 /// Профильные расширения, которых нет у обычного dense-декодера. `None` в
 /// [`DecoderConfig::ext`] — модель без них (весь прежний парк).
 #[derive(Debug, Clone, Default)]
@@ -78,6 +107,8 @@ pub struct DecoderExt {
     /// RMS-норма без веса поверх V (Gemma-4 `v_norm`).
     pub v_rms_norm: bool,
     pub moe: Option<MoeBranch>,
+    /// Разрежённый FFN вместо плотного MLP (Qwen-MoE).
+    pub moe_ffn: Option<MoeFfnSpec>,
     pub layer_scalar: bool,
     pub ple_dim: usize,
     pub kv_source: Vec<Option<usize>>,
@@ -172,6 +203,15 @@ impl DecoderConfig {
     }
     pub fn moe_branch(&self) -> Option<&MoeBranch> {
         self.ext.as_ref()?.moe.as_ref()
+    }
+    /// Спецификация разрежённого FFN слоя `idx`, если на нём эксперты.
+    pub fn moe_ffn_at(&self, idx: usize) -> Option<&MoeFfnSpec> {
+        let spec = self.ext.as_ref()?.moe_ffn.as_ref()?;
+        spec.at(idx).then_some(spec)
+    }
+    /// Есть ли в модели слои с экспертами вместо плотного MLP.
+    pub fn has_moe_ffn(&self) -> bool {
+        (0..self.num_hidden_layers).any(|l| self.moe_ffn_at(l).is_some())
     }
 
     pub fn rope_for(&self, idx: usize) -> &RopeSpec {

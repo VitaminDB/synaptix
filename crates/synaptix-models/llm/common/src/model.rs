@@ -227,6 +227,68 @@ pub struct Mlp {
     activation: Activation,
 }
 
+/// FFN блока: плотный MLP либо разрежённый Qwen-MoE вместо него (роутер,
+/// top-k экспертов, shared-эксперт — см. [`crate::config::MoeFfnSpec`]).
+pub enum Ffn {
+    Dense(Mlp),
+    Moe(crate::moe::MoeFfn),
+}
+
+impl Ffn {
+    /// Плотный MLP, если FFN плотный (слитые пути декода знают только его).
+    pub fn dense(&self) -> Option<&Mlp> {
+        match self {
+            Ffn::Dense(m) => Some(m),
+            Ffn::Moe(_) => None,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Ffn::Dense(m) => m.bytes(),
+            Ffn::Moe(m) => m.bytes(),
+        }
+    }
+
+    fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
+        match self {
+            Ffn::Dense(m) => Ok(Ffn::Dense(m.to_device(dev)?)),
+            Ffn::Moe(_) => Err(ModelError::Build(
+                "host-stream блоков не поддержан для слоёв с экспертами".into(),
+            )),
+        }
+    }
+
+    /// Выход FFN на входе `[B, S, H]` (у экспертов — обычный путь через
+    /// хостовый роутер).
+    fn forward(&self, h: &Tensor) -> Result<Tensor, ModelError> {
+        match self {
+            Ffn::Dense(m) => m.forward(h),
+            Ffn::Moe(m) => {
+                let dims = h.dims().to_vec();
+                let hs = dims[dims.len() - 1];
+                let rows: usize = dims[..dims.len() - 1].iter().product();
+                let flat = h.reshape(vec![rows, hs]).and_then(|x| x.contiguous()).coerr()?;
+                let out = m.forward(&flat)?;
+                out.reshape(dims).coerr()
+            }
+        }
+    }
+
+    /// Шаг декода одного токена: эксперты считаются device-путём (без
+    /// синхронизаций — под захват CUDA-графа), если он готов.
+    fn forward_decode(&self, h: &Tensor) -> Result<Tensor, ModelError> {
+        match self {
+            Ffn::Moe(m) if m.dev_path_ready() && h.dims().iter().product::<usize>() == m.config().hidden_size => {
+                let hs = m.config().hidden_size;
+                let flat = h.reshape(vec![1usize, hs]).and_then(|x| x.contiguous()).coerr()?;
+                m.forward_dev(&flat, None)?.reshape(h.dims().to_vec()).coerr()
+            }
+            _ => self.forward(h),
+        }
+    }
+}
+
 /// MoE-ветка блока: считается ПАРАЛЛЕЛЬНО плотному MLP от одного и того же
 /// входа, выходы складываются под общей пост-нормой (Gemma-4, где плотный MLP
 /// играет роль всегда активного эксперта).
@@ -249,7 +311,7 @@ pub struct Block {
     pre_mlp_norm: Tensor,
     post_mlp_norm: Option<Tensor>,
     mixer: Mixer,
-    mlp: Mlp,
+    mlp: Ffn,
     moe: Option<MoeSide>,
     layer_scalar: Option<f32>,
     ple: Option<BlockPle>,
@@ -1069,7 +1131,7 @@ impl DecoderModel {
         // MoE в оффлоаде: стримить блоки она не умеет (`Block::to_device`), да
         // и незачем — почти весь её вес в экспертах. Блоки остаются на карте,
         // эксперты уходят в RAM и ездят через кэш.
-        let expert_offload = cfg.moe_branch().is_some()
+        let expert_offload = (cfg.moe_branch().is_some() || cfg.has_moe_ffn())
             && matches!(device, Device::Cuda(_))
             && block_device.is_some_and(|d| d.is_cpu());
         let b_dev = if expert_offload { device } else { block_device.unwrap_or(device) };
@@ -1345,11 +1407,44 @@ impl DecoderModel {
             } else {
                 (None, "post_attention_layernorm.weight", None)
             };
-            let mlp = Mlp {
-                gate_proj: qlin(&key("mlp.gate_proj.weight"), mlp_w)?,
-                up_proj: qlin(&key("mlp.up_proj.weight"), mlp_w)?,
-                down_proj: qlin(&key("mlp.down_proj.weight"), mlp_w)?,
-                activation: cfg.activation,
+            let mlp = match cfg.moe_ffn_at(l) {
+                // Qwen-MoE: роутер, стопки экспертов и shared-эксперт под
+                // `model.layers.N.mlp` — вместо плотного MLP.
+                Some(spec) => {
+                    let mcfg = crate::moe::MoeConfig {
+                        hidden_size: cfg.hidden_size,
+                        moe_intermediate_size: spec.moe_intermediate_size,
+                        num_experts: spec.num_experts,
+                        num_experts_per_tok: spec.num_experts_per_tok,
+                        shared_intermediate_size: spec.shared_expert_intermediate_size,
+                        norm_topk_prob: spec.norm_topk_prob,
+                        chunk: crate::moe::prefill_chunk_tokens(2048),
+                        skip_below: 0.0,
+                        router_key: None,
+                        per_expert_scale: None,
+                        activation: cfg.activation,
+                    };
+                    let prefix = format!("model.layers.{l}.mlp");
+                    Ffn::Moe(match &expert_cache {
+                        Some(cache) => crate::moe::MoeFfn::load_offloaded(
+                            weights,
+                            &prefix,
+                            mcfg,
+                            device,
+                            compute,
+                            mlp_w,
+                            cache.clone(),
+                            l,
+                        )?,
+                        None => crate::moe::MoeFfn::load(weights, &prefix, mcfg, device, compute, mlp_w)?,
+                    })
+                }
+                None => Ffn::Dense(Mlp {
+                    gate_proj: qlin(&key("mlp.gate_proj.weight"), mlp_w)?,
+                    up_proj: qlin(&key("mlp.up_proj.weight"), mlp_w)?,
+                    down_proj: qlin(&key("mlp.down_proj.weight"), mlp_w)?,
+                    activation: cfg.activation,
+                }),
             };
             // MoE-ветка: свои нормы, свой роутер. Множитель роутера
             // (`router.scale · hidden^-1/2`) сворачивается в вес нормы — в HF
@@ -2574,6 +2669,11 @@ impl DecoderModel {
                     return no(&format!("MoE слоя {i} без device-пути"));
                 }
             }
+            if let Ffn::Moe(m) = &b.mlp {
+                if !m.dev_path_ready() {
+                    return no(&format!("эксперты слоя {i} без device-пути"));
+                }
+            }
         }
         true
     }
@@ -2648,7 +2748,7 @@ impl DecoderModel {
             let (new_hidden, h_mlp) =
                 fused_add_norm(dev, &mixed, &hidden, &blk.pre_mlp_norm, blk.rms_eps)?;
             hidden = new_hidden;
-            let mlp_out = blk.mlp.forward(&h_mlp)?;
+            let mlp_out = blk.mlp.forward_decode(&h_mlp)?;
             let mlp_out = match &blk.moe {
                 None => mlp_out,
                 Some(moe) => {
@@ -2764,11 +2864,12 @@ impl DecoderModel {
         if fa.attn_output_gate || fa.head_dim % 32 != 0 || fa.head_dim > 1024 {
             return false;
         }
-        if blk.mlp.activation != Activation::GeluTanh
-            || blk.mlp.gate_proj.quant_dtype() != Some(DType::NVFP4)
-            || blk.mlp.up_proj.quant_dtype() != Some(DType::NVFP4)
-            || blk.mlp.down_proj.quant_dtype() != Some(DType::NVFP4)
-            || blk.mlp.gate_proj.quant_weight().map(|w| w.n()) != blk.mlp.up_proj.quant_weight().map(|w| w.n())
+        let Some(mlp) = blk.mlp.dense() else { return false };
+        if mlp.activation != Activation::GeluTanh
+            || mlp.gate_proj.quant_dtype() != Some(DType::NVFP4)
+            || mlp.up_proj.quant_dtype() != Some(DType::NVFP4)
+            || mlp.down_proj.quant_dtype() != Some(DType::NVFP4)
+            || mlp.gate_proj.quant_weight().map(|w| w.n()) != mlp.up_proj.quant_weight().map(|w| w.n())
         {
             return false;
         }
@@ -2809,13 +2910,14 @@ impl DecoderModel {
         if fa.attn_output_gate || fa.head_dim % 32 != 0 || fa.head_dim > 1024 {
             return false;
         }
-        let (g, u) = (blk.mlp.gate_proj.quant_weight(), blk.mlp.up_proj.quant_weight());
+        let Some(mlp) = blk.mlp.dense() else { return false };
+        let (g, u) = (mlp.gate_proj.quant_weight(), mlp.up_proj.quant_weight());
         let (Some(g), Some(u)) = (g, u) else { return false };
-        if blk.mlp.activation != Activation::GeluTanh
+        if mlp.activation != Activation::GeluTanh
             || g.dtype() != u.dtype()
             || g.n() != u.n()
             || g.n() % 32 != 0
-            || blk.mlp.down_proj.quant_weight().is_none()
+            || mlp.down_proj.quant_weight().is_none()
         {
             return false;
         }
@@ -2895,8 +2997,9 @@ impl DecoderModel {
         };
         let (dense, topk) = {
             let DecOut::Quant(mp, ms) = &tails[0] else { unreachable!() };
-            let gate = blk.mlp.gate_proj.quant_weight().expect("gate NVFP4");
-            let up = blk.mlp.up_proj.quant_weight().expect("up NVFP4");
+            let mlp = blk.mlp.dense().expect("слитый путь: плотный MLP");
+            let gate = mlp.gate_proj.quant_weight().expect("gate NVFP4");
+            let up = mlp.up_proj.quant_weight().expect("up NVFP4");
             let inter = gate.n();
             let router = match (&blk.moe, &router_in) {
                 (Some(m), Some(rin)) => Some((m.ffn.router_weight(), rin)),
@@ -2912,7 +3015,7 @@ impl DecoderModel {
                 Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
             })
             .coerr()?;
-            let down = blk.mlp.down_proj.quant_weight().expect("down NVFP4");
+            let down = mlp.down_proj.quant_weight().expect("down NVFP4");
             let (dense, _) = prof(dev, "mlp_down", || Tensor::dec_gemv_grouped(&[down], &dp, &ds, DType::BF16, None)).coerr()?;
             (dense, topk)
         };
@@ -3004,8 +3107,9 @@ impl DecoderModel {
         };
         let mlp_in = bf(&tails[0]);
 
-        let gate = blk.mlp.gate_proj.quant_weight().expect("gate quant");
-        let up = blk.mlp.up_proj.quant_weight().expect("up quant");
+        let mlp = blk.mlp.dense().expect("слитый путь: плотный MLP");
+        let gate = mlp.gate_proj.quant_weight().expect("gate quant");
+        let up = mlp.up_proj.quant_weight().expect("up quant");
         let inter = gate.n();
         let gu = prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped_dense(&[gate, up], &mlp_in)).coerr()?;
         let logits = match &blk.moe {
@@ -3023,7 +3127,7 @@ impl DecoderModel {
             Tensor::dec_geglu((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
         })
         .coerr()?;
-        let down = blk.mlp.down_proj.quant_weight().expect("down quant");
+        let down = mlp.down_proj.quant_weight().expect("down quant");
         let dense = prof(dev, "mlp_down", || Tensor::dec_gemv_grouped_dense(&[down], &act)).coerr()?;
 
         let moe_acc = match (&blk.moe, topk) {
@@ -3146,9 +3250,12 @@ impl DecoderModel {
             hidden = residual.add(&mixed).coerr()?;
 
             let residual2 = hidden.clone();
-            let want_mlp = blk.mlp.gate_proj.quant_dtype();
+            let Ffn::Dense(mlp) = &blk.mlp else {
+                return Err(ModelError::Forward("forward_prefill_dev: слой с экспертами не поддержан".into()));
+            };
+            let want_mlp = mlp.gate_proj.quant_dtype();
             let (h, pq2) = rms_norm_quant(&hidden, &blk.pre_mlp_norm, blk.rms_eps, want_mlp)?;
-            let mlp_out = blk.mlp.forward_pq(&h, pq2.as_ref())?;
+            let mlp_out = mlp.forward_pq(&h, pq2.as_ref())?;
             hidden = residual2.add(&mlp_out).coerr()?;
         }
 

@@ -108,7 +108,8 @@ pub enum LlmArch {
     Qwen4Exp,
 }
 
-/// `qwen3_next`/`qwen3_5`/`qwen3_6` → гибрид (GatedDeltaNet + full-attn);
+/// `qwen3_next`/`qwen3_5`/`qwen3_6`/`qwen3_5_moe`/`minicpmv4_7` → гибрид
+/// (GatedDeltaNet + full-attn, плотный MLP или Qwen-MoE);
 /// `qwen4_exp` → Qwen4Exp (GatedDeltaNet + QSA + MoE + PLE); `llama` → Llama;
 /// `gemma`/`gemma3` → Gemma3; `gemma4` → Gemma4 (MoE + широкие global-слои);
 /// остальное → Qwen3 (dense/MoE).
@@ -116,7 +117,9 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
     let key = arch_key(path)
         .ok_or_else(|| format!("config.json/arch не найдены в {}", path.display()))?;
     Ok(match key.as_str() {
-        "qwen3_next" | "qwen3_5" | "qwen3_6" => LlmArch::Hybrid,
+        // MiniCPM-V 4.7: текст — Qwen3.5-гибрид (`text_config.model_type`
+        // `qwen3_5_text` / `qwen3_5_moe_text`), башня зрения своя.
+        "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" => LlmArch::Hybrid,
         "llama" => LlmArch::Llama,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,
         "gemma4" | "gemma4_text" => LlmArch::Gemma4,

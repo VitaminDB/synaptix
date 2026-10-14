@@ -60,7 +60,7 @@ Native ports, each validated against its upstream reference:
 
 | Domain | Models |
 |---|---|
-| **LLM** | Qwen3 (dense + MoE), Qwen3-Next hybrids (GatedDeltaNet + full attention, `qwen3_5/3_6/3_8`), Qwen4Exp (125B MoE: sparse-attention indexer, gated residuals, PLE n-grams, MTP head), Llama, Gemma-3, Gemma-4 26B A4B, Muse Glimmer 30B |
+| **LLM** | Qwen3 (dense + MoE), Qwen3-Next hybrids (GatedDeltaNet + full attention, `qwen3_5/3_6/3_8`, dense and Qwen-MoE), MiniCPM-V 4.7 (1B and 35B-A3B: Qwen3.5 hybrid + SigLIP window-merger vision tower, canvas M-RoPE), Qwen4Exp (125B MoE: sparse-attention indexer, gated residuals, PLE n-grams, MTP head), Llama, Gemma-3, Gemma-4 26B A4B, Muse Glimmer 30B |
 | **Vision-language** | Qwen3-VL tower (images and video, 3D M-RoPE), Gemma-4 vision tower, Muse Glimmer |
 | **Image** | FLUX.1, FLUX.2 (dev, klein 4B / 9B), Qwen-Image 2.1 (text-to-image, editing by up to ten references, transparent RGBA), Qwen-Image and Qwen-Image-Edit (2509 / 2511: edit an image, or compose up to four references), SDXL (txt2img and img2img), Depth Anything V2 |
 | **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio; image / video / audio references — Ref2VA) |

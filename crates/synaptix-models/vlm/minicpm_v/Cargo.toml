@@ -1,0 +1,23 @@
+[package]
+name = "synaptix-vlm-minicpm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MiniCPM-V 4.7 vision tower (SigLIP NaViT + window merger + 2x2 merger), slicing preprocessor, placeholder and canvas M-RoPE — native Rust port."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-core   = { workspace = true }
+synaptix-ops    = { workspace = true }
+synaptix-io     = { workspace = true, features = ["image"] }
+synaptix-bundle = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

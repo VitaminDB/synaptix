@@ -1296,7 +1296,11 @@ pub struct MediaEmbedding {
     /// Сколько блоков заполнителей в промпте: 1 у картинки, число групп
     /// кадров у видео.
     pub blocks: usize,
+    /// MiniCPM-V 4.7: раскладка картинки (миниатюра и срезы) — для
+    /// холстового M-RoPE; `None` у остальных архитектур и у видео.
+    pub layout: Option<synaptix_llm_qwen3_next_hybrid::vlm_minicpm::ImageLayout>,
 }
+
 
 impl MediaEmbedding {
     /// Сколько токенов контекста займёт вложение.
@@ -1416,6 +1420,24 @@ impl Llm {
                     .map_err(|e| LlmError(format!("image encode: {e}")))?,
                 (0, 0),
             ),
+            // MiniCPM-V 4.7: миниатюра и срезы, заполнитель с меткой номера.
+            LlmPipeline::Hybrid(h) if h.is_minicpm() => {
+                let (embeds, layout) = h
+                    .encode_image_minicpm(path, max_tokens)
+                    .map_err(|e| LlmError(format!("image encode: {e}")))?;
+                let tokens = embeds.dims()[0];
+                let block = h.minicpm_prompt_block(&layout).map_err(|e| LlmError(e.to_string()))?;
+                let prompt_block = format!("{MINICPM_IMAGE_ID_MARK}{block}");
+                return Ok(MediaEmbedding {
+                    kind: MediaKind::Image,
+                    embeds,
+                    tokens,
+                    prompt_block,
+                    grid_hw: (0, 0),
+                    blocks: 1,
+                    layout: Some(layout),
+                });
+            }
             LlmPipeline::Hybrid(h) => h
                 .encode_image_limited_with_grid(path, max_tokens)
                 .map_err(|e| LlmError(format!("image encode: {e}")))?,
@@ -1435,7 +1457,7 @@ impl Llm {
         };
         let tokens = embeds.dims()[0];
         let prompt_block = guard.image_block(tokens);
-        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1 })
+        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None })
     }
 
     /// Кодирует видео: сэмплинг кадров (ffmpeg) → vision-башня. Блок промпта
@@ -1474,6 +1496,7 @@ impl Llm {
             prompt_block,
             grid_hw,
             blocks,
+            layout: None,
         })
     }
 }
@@ -2188,7 +2211,12 @@ fn hybrid_media_inputs(
             .filter(|m| m.kind == kind)
             .flat_map(|m| std::iter::repeat_n(m.grid_hw, m.blocks))
             .collect();
-        inputs.push(MediaInput { pad, embeds, grids });
+        let layouts = media
+            .iter()
+            .filter(|m| m.kind == kind)
+            .filter_map(|m| m.layout.clone())
+            .collect();
+        inputs.push(MediaInput { pad, embeds, grids, layouts });
     }
     Ok(inputs)
 }

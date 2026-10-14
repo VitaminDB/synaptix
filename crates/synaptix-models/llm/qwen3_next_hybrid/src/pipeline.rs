@@ -87,6 +87,10 @@ pub struct HybridPipeline {
     pub model: DecoderModel,
     pub mtp: Option<synaptix_llm_common::mtp::MtpModule>,
     pub vision: Option<synaptix_vlm_qwen3::VisionTower>,
+    /// Башня MiniCPM-V 4.7 (SigLIP с оконным объединителем) — у бандлов
+    /// `minicpmv4_7`; картинка раскладывается на холсте M-RoPE по
+    /// `config.canvas`.
+    pub vision_minicpm: Option<synaptix_vlm_minicpm::MiniCpmVision>,
     pub tokenizer: HfTokenizer,
     pub config: HybridConfig,
     pub add_bos: bool,
@@ -111,6 +115,15 @@ pub struct MediaInput {
     pub pad: u32,
     pub embeds: synaptix_core::tensor::Tensor,
     pub grids: Vec<(usize, usize)>,
+    /// MiniCPM-V 4.7: раскладка каждой картинки (миниатюра и срезы) для
+    /// холстового M-RoPE; пусто у остальных архитектур.
+    pub layouts: Vec<synaptix_vlm_minicpm::ImageLayout>,
+}
+
+impl MediaInput {
+    pub fn new(pad: u32, embeds: synaptix_core::tensor::Tensor, grids: Vec<(usize, usize)>) -> Self {
+        Self { pad, embeds, grids, layouts: Vec::new() }
+    }
 }
 
 impl VideoPromptInfo {
@@ -205,7 +218,7 @@ impl HybridPipeline {
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, dtype, cap)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
-        Ok(Self { model, mtp: None, vision: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
     }
 
     pub fn load_with_precision(
@@ -233,7 +246,7 @@ impl HybridPipeline {
         // model.kv_dtype оставался compute(F16) → MXFP8-KV игнорировался, KV
         // аллоцировался F16 и decode шёл по f16-flash (qwen3-pipeline это делал).
         .with_kv_cache_dtype(precision.kv);
-        Ok(Self { model, mtp: None, vision: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
     }
 
     pub fn load_with_precision_mtp(
@@ -375,6 +388,12 @@ impl HybridPipeline {
         dtype: DType,
     ) -> Result<bool, PipelineError> {
         let path = path.as_ref();
+        if synaptix_vlm_minicpm::bundle_has_vision(path) {
+            let tower = synaptix_vlm_minicpm::load_from_bundle(path, self.model.device, dtype)
+                .map_err(|e| PipelineError::Load(format!("vision (minicpm): {e}")))?;
+            self.vision_minicpm = Some(tower);
+            return Ok(true);
+        }
         if !synaptix_vlm_qwen3::bundle_has_vision(path) {
             return Ok(false);
         }
@@ -385,21 +404,75 @@ impl HybridPipeline {
     }
 
     pub fn has_vision(&self) -> bool {
-        self.vision.is_some()
+        self.vision.is_some() || self.vision_minicpm.is_some()
+    }
+
+    /// Башня MiniCPM-V (холстовая раскладка картинок), а не Qwen-VL.
+    pub fn is_minicpm(&self) -> bool {
+        self.config.canvas.is_some()
     }
 
     /// Есть ли в бандле компонент vision-башни — без её загрузки.
     pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
-        synaptix_vlm_qwen3::bundle_has_vision(path)
+        let path = path.as_ref();
+        synaptix_vlm_qwen3::bundle_has_vision(path) || synaptix_vlm_minicpm::bundle_has_vision(path)
     }
 
     /// Выгружает башню и возвращает её память пулу устройства.
     pub fn release_vision(&mut self) {
-        if self.vision.take().is_some() {
+        let had = self.vision.take().is_some() | self.vision_minicpm.take().is_some();
+        if had {
             if let Device::Cuda(o) = self.model.device {
                 let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
             }
         }
+    }
+
+    /// MiniCPM-V 4.7: картинка → миниатюра и срезы → эмбеддинги всех
+    /// кропов подряд `[Σtokens, hidden]` и раскладка (для заполнителя и
+    /// холстового M-RoPE). `max_tokens` ограничивает число срезов: при
+    /// нехватке бюджета картинка идёт одной миниатюрой.
+    pub fn encode_image_minicpm(
+        &self,
+        path: impl AsRef<Path>,
+        max_tokens: Option<usize>,
+    ) -> Result<(synaptix_core::tensor::Tensor, synaptix_vlm_minicpm::ImageLayout), PipelineError> {
+        use synaptix_core::grad::no_grad;
+        let tower = self
+            .vision_minicpm
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня MiniCPM не загружена".into()))?;
+        let mut limits = synaptix_vlm_minicpm::PreprocessLimits::default();
+        let mf = tower.config.merge_factor();
+        let mut prepared = synaptix_vlm_minicpm::prepare_image(path.as_ref(), &tower.config, limits, self.model.device)
+            .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+        if let Some(n) = max_tokens.filter(|n| *n > 0) {
+            if prepared.layout.tokens(mf) > n && limits.slice_mode {
+                limits.slice_mode = false;
+                prepared = synaptix_vlm_minicpm::prepare_image(path.as_ref(), &tower.config, limits, self.model.device)
+                    .map_err(|e| PipelineError::Load(format!("image: {e}")))?;
+            }
+        }
+        let feats = no_grad(|| tower.forward_image(&prepared))
+            .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        Ok((feats, prepared.layout))
+    }
+
+    /// Строка-заполнитель картинки MiniCPM-V в тексте промпта (миниатюра и
+    /// срезы в `<image>`/`<slice>`). Номер картинки проставляется позже
+    /// ([`synaptix_vlm_minicpm::layout::IMAGE_ID_MARK`] → порядковый номер в
+    /// промпте), здесь — метка.
+    pub fn minicpm_prompt_block(&self, layout: &synaptix_vlm_minicpm::ImageLayout) -> Result<String, PipelineError> {
+        let tower = self
+            .vision_minicpm
+            .as_ref()
+            .ok_or_else(|| PipelineError::Model("vision-башня MiniCPM не загружена".into()))?;
+        Ok(synaptix_vlm_minicpm::placeholder(
+            layout,
+            tower.config.merge_factor(),
+            None,
+            &synaptix_vlm_minicpm::PlaceholderTokens::default(),
+        ))
     }
 
     /// Лимиты препроцессинга под потолок vision-токенов: один токен после
@@ -619,7 +692,7 @@ impl HybridPipeline {
             .config
             .image_token_id
             .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
-        let input = MediaInput { pad, embeds: feats, grids: Vec::new() };
+        let input = MediaInput::new(pad, feats, Vec::new());
         self.generate_with_media(prompt_ids, std::slice::from_ref(&input), gen_cfg, sink)
     }
 
@@ -690,19 +763,55 @@ impl HybridPipeline {
         // M-RoPE: таблицы cos/sin на весь промпт + сдвиг позиций декода.
         // Таблицы индексируются абсолютной позицией, поэтому префилл хвоста
         // с `kv.seq_len` берёт из них ровно свои строки.
-        let mrope_on = mrope_enabled() && inputs.iter().all(|m| !m.grids.is_empty());
+        // MiniCPM-V 4.7: холст — позиции по раскладкам картинок и
+        // спецтокенам `<image>`/`<slice>`; остальные — сетки блоков Qwen-VL.
+        let canvas = self.config.canvas.filter(|_| {
+            mrope_enabled() && !inputs.is_empty() && inputs.iter().all(|m| !m.layouts.is_empty())
+        });
+        let mrope_on = mrope_enabled() && (canvas.is_some() || inputs.iter().all(|m| !m.grids.is_empty()));
         let mrope_tables = match (&self.config.mrope, mrope_on) {
             (Some(spec), true) => {
-                let grids: Vec<Vec<mrope::Grid3>> = inputs
-                    .iter()
-                    .map(|m| m.grids.iter().map(|(h, w)| mrope::Grid3::image(*h, *w)).collect())
-                    .collect();
-                let runs: Vec<mrope::MediaRuns> = inputs
-                    .iter()
-                    .zip(&grids)
-                    .map(|(m, g)| mrope::MediaRuns { pad: m.pad, grids: g })
-                    .collect();
-                let positions = mrope::positions_3d(prompt_ids, &runs).map_err(PipelineError::Forward)?;
+                let positions = match canvas {
+                    Some(c) => {
+                        let image_pad = self
+                            .config
+                            .image_token_id
+                            .ok_or_else(|| PipelineError::Model("config.json без image_token_id".into()))?;
+                        let layouts: Vec<synaptix_vlm_minicpm::ImageLayout> = inputs
+                            .iter()
+                            .filter(|m| m.pad == image_pad)
+                            .flat_map(|m| m.layouts.iter().cloned())
+                            .collect();
+                        let mf = self
+                            .vision_minicpm
+                            .as_ref()
+                            .map(|t| t.config.merge_factor())
+                            .unwrap_or(4);
+                        let ids = synaptix_vlm_minicpm::CanvasIds {
+                            image_token: image_pad,
+                            image_start: c.image_start,
+                            image_end: c.image_end,
+                            slice_start: c.slice_start,
+                            slice_end: c.slice_end,
+                            newline: c.newline,
+                        };
+                        let cp = synaptix_vlm_minicpm::canvas_positions(prompt_ids, &layouts, mf, &ids)
+                            .map_err(PipelineError::Forward)?;
+                        mrope::Positions { pos: cp.pos, max_pos: cp.max_pos }
+                    }
+                    None => {
+                        let grids: Vec<Vec<mrope::Grid3>> = inputs
+                            .iter()
+                            .map(|m| m.grids.iter().map(|(h, w)| mrope::Grid3::image(*h, *w)).collect())
+                            .collect();
+                        let runs: Vec<mrope::MediaRuns> = inputs
+                            .iter()
+                            .zip(&grids)
+                            .map(|(m, g)| mrope::MediaRuns { pad: m.pad, grids: g })
+                            .collect();
+                        mrope::positions_3d(prompt_ids, &runs).map_err(PipelineError::Forward)?
+                    }
+                };
                 let inv = self.config.rope_inv_freqs();
                 let (mut cos, mut sin) = mrope::rope_tables(&positions.pos, &inv, &spec.section, spec.interleaved);
                 // YaRN `attention_factor` — как у обычных таблиц RoPE.
