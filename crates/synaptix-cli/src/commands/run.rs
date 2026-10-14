@@ -180,6 +180,11 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
     let t0 = std::time::Instant::now();
     let (llm, tok) = load_llm(&args.model, device, precision, args.max_seq)?;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    // `SYNAPTIX_LLM_PROF=1` — профиль по операциям (как в службе): префилл и
+    // обычный (неграфовый) декод; отчёт — после статистики.
+    let prof = std::env::var_os("SYNAPTIX_LLM_PROF").is_some();
+    synaptix_llm_common::model::set_prefill_prof(prof);
+    synaptix_llm_common::model::set_decode_prof(prof);
     let mut media = Vec::new();
     if (args.image.is_some() || args.video.is_some()) && !llm.ensure_media_tower()? {
         return Err("в бандле нет башни зрения".into());
@@ -815,4 +820,7 @@ fn print_stats(prompt_tokens: usize, new_tokens: usize, prefill_ms: u128, decode
         prompt_tokens, prefill_ms, prefill_tps,
         new_tokens.saturating_sub(1), decode_ms, decode_tps,
     );
+    if std::env::var_os("SYNAPTIX_LLM_PROF").is_some() {
+        eprintln!("{}", synaptix_llm_common::model::decode_prof_report_and_clear());
+    }
 }
