@@ -394,15 +394,23 @@ impl HybridPipeline {
         dtype: DType,
     ) -> Result<bool, PipelineError> {
         let path = path.as_ref();
-        // Эксперты в RAM с кэшем на карте: кэш успел занять всё свободное
-        // (`fit_expert_cache`), башне нужно место — ужимаем его заранее.
+        // Эксперты в RAM с кэшем на карте: после хода кэш занял всё свободное
+        // (`fit_expert_cache` оставляет лишь свой резерв), башне нужно
+        // `VISION_RESERVE_BYTES` — вытесняем ровно недостающее по факту
+        // свободной VRAM (ёмкость при этом могла быть и выше занятого).
         if let Some(cache) = self.model.expert_cache() {
-            let want = cache
-                .capacity_bytes()
-                .saturating_sub(VISION_RESERVE_BYTES)
-                .max(synaptix_llm_common::moe::MIN_CACHE_BYTES);
-            cache.set_capacity(want);
-            cache.trim_to(want);
+            if let Device::Cuda(o) = self.model.device {
+                if let Ok((free, _)) = synaptix_core::device::cuda::mem_info(o) {
+                    if free < VISION_RESERVE_BYTES {
+                        let want = cache
+                            .used_bytes()
+                            .saturating_sub(VISION_RESERVE_BYTES - free)
+                            .max(synaptix_llm_common::moe::MIN_CACHE_BYTES);
+                        cache.set_capacity(want);
+                        cache.trim_to(want);
+                    }
+                }
+            }
         }
         if synaptix_vlm_minicpm::bundle_has_vision(path) {
             let tower = synaptix_vlm_minicpm::load_from_bundle(path, self.model.device, dtype)
