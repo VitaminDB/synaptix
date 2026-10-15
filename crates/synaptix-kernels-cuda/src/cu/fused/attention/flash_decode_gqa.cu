@@ -8,8 +8,9 @@
 // на каждую из NREP голов, а оконное splitq-ядро держало по одному блоку на
 // голову и 255 регистров — 16 блоков на 82 SM).
 //
-//   q    [nh, HD] bf16 (после нормы и RoPE)
-//   k/v  [nkv, cap, HD] bf16 — предвыделенный кэш; активная длина tkv_ptr[0]
+//   q    [nh, HD] T (bf16/f16, после нормы и RoPE)
+//   k/v  [nkv, cap, HD] T — предвыделенный кэш, либо MXFP8 (e4m3 + E8M0
+//        масштабы [nkv, cap, HD/32]) — деквант при чтении; активная длина tkv_ptr[0]
 //   окно window > 0: ключи j ≥ tkv − window (иначе все от 0)
 //   partials: m/l [nh, S], acc [nh, S, HD] f32, S = splits · WKS
 //
@@ -18,11 +19,15 @@
 
 #define FDG_NEG_INF (__int_as_float(0xFF800000))
 
-__device__ __forceinline__ float fdg_bf(const __nv_bfloat16& v) { return __bfloat162float(v); }
+typedef __nv_bfloat16 fdg_bf16;
 
+__device__ __forceinline__ float fdg_e8m0(unsigned char b) {
+    return fmaxf(__uint_as_float(((unsigned)b) << 23), 1e-12f);
+}
+
+// EPL элементов подряд (8 → uint4, 16 → 2×uint4) → float.
 template <int EPL>
 __device__ __forceinline__ void fdg_load_row(const __nv_bfloat16* __restrict__ p, float* out) {
-    // EPL элементов подряд: 8 → uint4, 16 → 2×uint4.
     const uint4* src = reinterpret_cast<const uint4*>(p);
     #pragma unroll
     for (int c = 0; c < EPL / 8; ++c) {
@@ -38,11 +43,53 @@ __device__ __forceinline__ void fdg_load_row(const __nv_bfloat16* __restrict__ p
     }
 }
 
-template <int HD, int NREP>
+template <int EPL>
+__device__ __forceinline__ void fdg_load_row(const __half* __restrict__ p, float* out) {
+    const uint4* src = reinterpret_cast<const uint4*>(p);
+    #pragma unroll
+    for (int c = 0; c < EPL / 8; ++c) {
+        uint4 u = src[c];
+        __half2 h[4];
+        *reinterpret_cast<uint4*>(h) = u;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float2 f = __half22float2(h[i]);
+            out[c * 8 + 2 * i] = f.x;
+            out[c * 8 + 2 * i + 1] = f.y;
+        }
+    }
+}
+
+// MXFP8-кэш: EPL байт e4m3 (8 → uint2, 16 → uint4), масштаб E8M0 общий на 32
+// элемента — у лейна все EPL элементов внутри одного 32-блока (EPL | 32).
+template <int EPL>
+__device__ __forceinline__ void fdg_load_row_mx(const unsigned char* __restrict__ p, float sc, float* out) {
+    #pragma unroll
+    for (int c = 0; c < EPL / 8; ++c) {
+        uint2 u = reinterpret_cast<const uint2*>(p)[c];
+        unsigned int w[2] = {u.x, u.y};
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                unsigned short pair = (unsigned short)((w[i] >> (16 * j)) & 0xFFFFu);
+                __half2 h = __half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3));
+                float2 f = __half22float2(h);
+                out[c * 8 + i * 4 + j * 2] = f.x * sc;
+                out[c * 8 + i * 4 + j * 2 + 1] = f.y * sc;
+            }
+        }
+    }
+}
+
+// Шаг split: один ключ j — K/V группы прочитаны, обновление online-softmax по головам варпа.
+template <int HD, int NREP, typename T, bool MX>
 __device__ __forceinline__ void fdg_split_impl(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v,
+    const T* __restrict__ q,
+    const void* __restrict__ k,
+    const void* __restrict__ v,
+    const unsigned char* __restrict__ k_scale,
+    const unsigned char* __restrict__ v_scale,
     const unsigned int* __restrict__ tkv_ptr,
     float scale, int window, int cap,
     float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
@@ -54,6 +101,7 @@ __device__ __forceinline__ void fdg_split_impl(
     constexpr int WKS = 4 / WPH;
     static_assert(WPH * WKS == 4, "4 варпа: головы × разбиения ключей");
     static_assert(EPL % 8 == 0, "голова кратна 256");
+    static_assert(!MX || (32 % EPL == 0), "MXFP8: элементы лейна внутри одного 32-блока");
 
     const int kvh = blockIdx.x;
     const int split = blockIdx.y;
@@ -88,13 +136,22 @@ __device__ __forceinline__ void fdg_split_impl(
         #pragma unroll
         for (int i = 0; i < EPL; ++i) acc[hh][i] = 0.f;
     }
-    const __nv_bfloat16* kb = k + (size_t)kvh * cap * HD + lane * EPL;
-    const __nv_bfloat16* vb = v + (size_t)kvh * cap * HD + lane * EPL;
+    const T* kb = reinterpret_cast<const T*>(k) + (size_t)kvh * cap * HD + lane * EPL;
+    const T* vb = reinterpret_cast<const T*>(v) + (size_t)kvh * cap * HD + lane * EPL;
+    const unsigned char* kbm = reinterpret_cast<const unsigned char*>(k) + (size_t)kvh * cap * HD + lane * EPL;
+    const unsigned char* vbm = reinterpret_cast<const unsigned char*>(v) + (size_t)kvh * cap * HD + lane * EPL;
+    const unsigned char* ksb = k_scale + (size_t)kvh * cap * (HD / 32) + (lane * EPL) / 32;
+    const unsigned char* vsb = v_scale + (size_t)kvh * cap * (HD / 32) + (lane * EPL) / 32;
 
     for (int j = j0; j < j1; ++j) {
         float kv[EPL], vv[EPL];
-        fdg_load_row<EPL>(kb + (size_t)j * HD, kv);
-        fdg_load_row<EPL>(vb + (size_t)j * HD, vv);
+        if (MX) {
+            fdg_load_row_mx<EPL>(kbm + (size_t)j * HD, fdg_e8m0(ksb[(size_t)j * (HD / 32)]), kv);
+            fdg_load_row_mx<EPL>(vbm + (size_t)j * HD, fdg_e8m0(vsb[(size_t)j * (HD / 32)]), vv);
+        } else {
+            fdg_load_row<EPL>(kb + (size_t)j * HD, kv);
+            fdg_load_row<EPL>(vb + (size_t)j * HD, vv);
+        }
         #pragma unroll
         for (int hh = 0; hh < HPW; ++hh) {
             float s = 0.f;
@@ -128,14 +185,23 @@ __device__ __forceinline__ void fdg_split_impl(
     }
 }
 
+__device__ __forceinline__ float fdg_rnd(const __nv_bfloat16*, float v) { return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float fdg_rnd(const __half*, float v) { return __half2float(__float2half(v)); }
+__device__ __forceinline__ void fdg_st(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+__device__ __forceinline__ void fdg_st(__half* p, float v) { *p = __float2half(v); }
+__device__ __forceinline__ float fdg_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ float fdg_ld(const __half* p) { return __half2float(*p); }
+
 // Слияние partials: блок = голова, нити по HD (blockDim = HD, кратно 32).
-// Эпилог: bf16-выход и/или MXFP8-квант строки внимания (вход o_proj) —
+// Гейт выхода (attn_output_gate, Qwen3.5): y ·= sigmoid(gate[head·gate_stride + d]).
+// Эпилог: T-выход и/или MXFP8-квант строки внимания (вход o_proj) —
 // natural-раскладка [nh·HD] e4m3 + [nh·HD/32] E8M0, арифметика как у
 // mxfp8_quant_natural (amax по 32 = один варп, shfl).
-template <int HD>
+template <int HD, typename T>
 __device__ __forceinline__ void fdg_merge_impl(
     const float* __restrict__ part_m, const float* __restrict__ part_l, const float* __restrict__ part_acc,
-    __nv_bfloat16* __restrict__ out, unsigned char* __restrict__ mx_packed, unsigned char* __restrict__ mx_scales,
+    const T* __restrict__ gate, int gate_stride,
+    T* __restrict__ out, unsigned char* __restrict__ mx_packed, unsigned char* __restrict__ mx_scales,
     int S)
 {
     __shared__ float s_w[64];
@@ -162,10 +228,14 @@ __device__ __forceinline__ void fdg_merge_impl(
         if (w != 0.f) a = fmaf(w, part_acc[((size_t)head * S + s) * HD + d], a);
     }
     float y = a * inv;
-    __nv_bfloat16 yb = __float2bfloat16(y);
-    if (out) out[(size_t)head * HD + d] = yb;
+    if (gate) {
+        float g = fdg_ld(gate + (size_t)head * gate_stride + d);
+        y *= 1.0f / (1.0f + expf(-g));
+    }
+    float yr = fdg_rnd(out, y);
+    if (out) fdg_st(out + (size_t)head * HD + d, yr);
     if (mx_packed) {
-        float v = __bfloat162float(yb);
+        float v = yr;
         float amax = fabsf(v);
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
@@ -180,29 +250,47 @@ __device__ __forceinline__ void fdg_merge_impl(
 
 extern "C" {
 
-#define FDG_SPLIT(HD, NREP)                                                                 \
-__global__ void __launch_bounds__(128) fdg_split_hd##HD##_r##NREP(                          \
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,                 \
+#define FDG_SPLIT(HD, NREP, T, TN, MX, MXN)                                                 \
+__global__ void __launch_bounds__(128) fdg_split_hd##HD##_r##NREP##_##TN##MXN(               \
+    const T* q, const void* k, const void* v, const unsigned char* ks, const unsigned char* vs, \
     const unsigned int* tkv_ptr, float scale, int window, int cap,                          \
     float* part_m, float* part_l, float* part_acc, int splits) {                            \
-    fdg_split_impl<HD, NREP>(q, k, v, tkv_ptr, scale, window, cap, part_m, part_l, part_acc, splits); \
+    fdg_split_impl<HD, NREP, T, MX>(q, k, v, ks, vs, tkv_ptr, scale, window, cap, part_m, part_l, part_acc, splits); \
 }
 
-FDG_SPLIT(256, 1)
-FDG_SPLIT(256, 2)
-FDG_SPLIT(256, 4)
-FDG_SPLIT(256, 8)
-FDG_SPLIT(512, 2)
-FDG_SPLIT(512, 4)
-FDG_SPLIT(512, 8)
+FDG_SPLIT(256, 1, fdg_bf16, bf16, false, )
+FDG_SPLIT(256, 2, fdg_bf16, bf16, false, )
+FDG_SPLIT(256, 4, fdg_bf16, bf16, false, )
+FDG_SPLIT(256, 8, fdg_bf16, bf16, false, )
+FDG_SPLIT(512, 2, fdg_bf16, bf16, false, )
+FDG_SPLIT(512, 4, fdg_bf16, bf16, false, )
+FDG_SPLIT(512, 8, fdg_bf16, bf16, false, )
+FDG_SPLIT(256, 1, __half, f16, false, )
+FDG_SPLIT(256, 2, __half, f16, false, )
+FDG_SPLIT(256, 4, __half, f16, false, )
+FDG_SPLIT(256, 8, __half, f16, false, )
+FDG_SPLIT(512, 2, __half, f16, false, )
+FDG_SPLIT(512, 4, __half, f16, false, )
+FDG_SPLIT(512, 8, __half, f16, false, )
+FDG_SPLIT(256, 1, __half, f16, true, _mx)
+FDG_SPLIT(256, 2, __half, f16, true, _mx)
+FDG_SPLIT(256, 4, __half, f16, true, _mx)
+FDG_SPLIT(256, 8, __half, f16, true, _mx)
+FDG_SPLIT(256, 1, fdg_bf16, bf16, true, _mx)
+FDG_SPLIT(256, 2, fdg_bf16, bf16, true, _mx)
+FDG_SPLIT(256, 4, fdg_bf16, bf16, true, _mx)
+FDG_SPLIT(256, 8, fdg_bf16, bf16, true, _mx)
 
-__global__ void fdg_merge_hd256(const float* pm, const float* pl, const float* pa, __nv_bfloat16* out,
-                                unsigned char* mxp, unsigned char* mxs, int S) {
-    fdg_merge_impl<256>(pm, pl, pa, out, mxp, mxs, S);
+#define FDG_MERGE(HD, T, TN)                                                                 \
+__global__ void fdg_merge_hd##HD##_##TN(const float* pm, const float* pl, const float* pa,   \
+                                        const T* gate, int gate_stride, T* out,              \
+                                        unsigned char* mxp, unsigned char* mxs, int S) {     \
+    fdg_merge_impl<HD, T>(pm, pl, pa, gate, gate_stride, out, mxp, mxs, S);                  \
 }
-__global__ void fdg_merge_hd512(const float* pm, const float* pl, const float* pa, __nv_bfloat16* out,
-                                unsigned char* mxp, unsigned char* mxs, int S) {
-    fdg_merge_impl<512>(pm, pl, pa, out, mxp, mxs, S);
-}
+
+FDG_MERGE(256, fdg_bf16, bf16)
+FDG_MERGE(512, fdg_bf16, bf16)
+FDG_MERGE(256, __half, f16)
+FDG_MERGE(512, __half, f16)
 
 }  // extern "C"

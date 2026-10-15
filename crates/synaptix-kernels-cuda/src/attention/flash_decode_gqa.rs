@@ -12,10 +12,11 @@ use crate::kernels::compile::{compile_module, load_fn};
 
 pub const FDG_SPLIT_MAX: u32 = 32;
 
+/// Ключ split-ядра: (hd, nrep, f16, kv_mxfp8); merge: (hd, f16).
 pub struct FlashDecodeGqaKernels {
     _module: Arc<CudaModule>,
-    split: HashMap<(u32, u32), CudaFunction>,
-    merge: HashMap<u32, CudaFunction>,
+    split: HashMap<(u32, u32, bool, bool), CudaFunction>,
+    merge: HashMap<(u32, bool), CudaFunction>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashDecodeGqaKernels>)>>> = OnceLock::new();
@@ -35,20 +36,28 @@ impl FlashDecodeGqaKernels {
         let src = include_str!("../cu/fused/attention/flash_decode_gqa.cu");
         let module = compile_module(ctx, src, "flash_decode_gqa.cu")?;
         let mut split = HashMap::new();
-        for (hd, nrep) in [(256u32, 1u32), (256, 2), (256, 4), (256, 8), (512, 2), (512, 4), (512, 8)] {
-            split.insert((hd, nrep), load_fn(&module, &format!("fdg_split_hd{hd}_r{nrep}"))?);
+        for (f16, tn) in [(false, "bf16"), (true, "f16")] {
+            for (hd, nrep) in [(256u32, 1u32), (256, 2), (256, 4), (256, 8), (512, 2), (512, 4), (512, 8)] {
+                split.insert((hd, nrep, f16, false), load_fn(&module, &format!("fdg_split_hd{hd}_r{nrep}_{tn}"))?);
+            }
+            // MXFP8-кэш — голова 256 (как у MXFP8-flash; голова 512 в кэш MXFP8 не идёт).
+            for nrep in [1u32, 2, 4, 8] {
+                split.insert((256, nrep, f16, true), load_fn(&module, &format!("fdg_split_hd256_r{nrep}_{tn}_mx"))?);
+            }
         }
         let mut merge = HashMap::new();
-        for hd in [256u32, 512] {
-            merge.insert(hd, load_fn(&module, &format!("fdg_merge_hd{hd}"))?);
+        for (f16, tn) in [(false, "bf16"), (true, "f16")] {
+            for hd in [256u32, 512] {
+                merge.insert((hd, f16), load_fn(&module, &format!("fdg_merge_hd{hd}_{tn}"))?);
+            }
         }
         let new = Arc::new(Self { split, merge, _module: module });
         cache.lock().push((key, new.clone()));
         Ok(new)
     }
 
-    pub fn supports(&self, hd: u32, nrep: u32) -> bool {
-        self.split.contains_key(&(hd, nrep))
+    pub fn supports(&self, hd: u32, nrep: u32, kv_mx: bool) -> bool {
+        self.split.contains_key(&(hd, nrep, false, kv_mx))
     }
 
     /// Число partials на голову при `splits` сегментах: внутри блока ключи
@@ -62,15 +71,21 @@ impl FlashDecodeGqaKernels {
 
 /// Запуск split + merge. Все указатели — device-адреса; partials — f32
 /// скретчи `[nh, S]`, `[nh, S]`, `[nh, S, hd]` с `S = partials_per_head`.
-/// Выход: bf16 `out` [nh·hd] (0 — не нужен) и/или MXFP8-пара `mx_packed`
-/// [nh·hd] + `mx_scales` [nh·hd/32] — вход o_proj без отдельного кванта.
+/// `f16` — тип q/выхода (иначе bf16); `k_scale`/`v_scale` ≠ 0 — кэш MXFP8
+/// (e4m3 + E8M0 на 32). `gate` ≠ 0 — выходной гейт `[nh, gate_stride]`:
+/// y ·= sigmoid(gate[h·gate_stride + d]). Выход: T `out` [nh·hd] (0 — не
+/// нужен) и/или MXFP8-пара `mx_packed` [nh·hd] + `mx_scales` [nh·hd/32] —
+/// вход o_proj без отдельного кванта.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_decode_gqa(
     k: &FlashDecodeGqaKernels,
     stream: &Arc<CudaStream>,
+    f16: bool,
     q: u64,
     kc: u64,
     vc: u64,
+    k_scale: u64,
+    v_scale: u64,
     tkv_ptr: u64,
     scale: f32,
     window: u32,
@@ -82,6 +97,8 @@ pub fn flash_decode_gqa(
     part_m: u64,
     part_l: u64,
     part_acc: u64,
+    gate: u64,
+    gate_stride: u32,
     out: u64,
     mx_packed: u64,
     mx_scales: u64,
@@ -90,11 +107,12 @@ pub fn flash_decode_gqa(
         return Err(SynaptixError::Cuda(format!("flash_decode_gqa: nh={nh} кратно nkv={nkv}")));
     }
     let nrep = nh / nkv;
+    let kv_mx = k_scale != 0;
     let f = k
         .split
-        .get(&(hd, nrep))
+        .get(&(hd, nrep, f16, kv_mx))
         .ok_or_else(|| SynaptixError::Unsupported("flash_decode_gqa: голова/группа не поддержаны"))?;
-    let mf = k.merge.get(&hd).ok_or(SynaptixError::Unsupported("flash_decode_gqa: merge hd"))?;
+    let mf = k.merge.get(&(hd, f16)).ok_or(SynaptixError::Unsupported("flash_decode_gqa: merge hd"))?;
     if splits == 0 || splits > FDG_SPLIT_MAX {
         return Err(SynaptixError::Cuda(format!("flash_decode_gqa: splits={splits}")));
     }
@@ -105,6 +123,8 @@ pub fn flash_decode_gqa(
         b.arg(&q)
             .arg(&kc)
             .arg(&vc)
+            .arg(&k_scale)
+            .arg(&v_scale)
             .arg(&tkv_ptr)
             .arg(&scale)
             .arg(&wi)
@@ -122,8 +142,9 @@ pub fn flash_decode_gqa(
         }
         .map_err(|e| SynaptixError::Cuda(format!("launch fdg_split: {e:?}")))?;
     }
+    let gs = gate_stride as i32;
     let mut b = stream.launch_builder(mf);
-    b.arg(&part_m).arg(&part_l).arg(&part_acc).arg(&out).arg(&mx_packed).arg(&mx_scales).arg(&s);
+    b.arg(&part_m).arg(&part_l).arg(&part_acc).arg(&gate).arg(&gs).arg(&out).arg(&mx_packed).arg(&mx_scales).arg(&s);
     unsafe {
         b.launch(LaunchConfig {
             grid_dim: (nh, 1, 1),

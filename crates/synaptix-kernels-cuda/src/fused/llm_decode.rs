@@ -26,6 +26,7 @@ pub struct LlmDecodeKernels {
     geglu_f16: CudaFunction,
     geglu_bf16: CudaFunction,
     attn_prep: CudaFunction,
+    attn_prep_f16: CudaFunction,
     geglu_plain_f16: CudaFunction,
     geglu_plain_bf16: CudaFunction,
     router_logits: CudaFunction,
@@ -60,6 +61,7 @@ impl LlmDecodeKernels {
             geglu_f16: load_fn(&module, "dec_geglu_quant_nvfp4_f16")?,
             geglu_bf16: load_fn(&module, "dec_geglu_quant_nvfp4_bf16")?,
             attn_prep: load_fn(&module, "dec_attn_prep_bf16")?,
+            attn_prep_f16: load_fn(&module, "dec_attn_prep_f16")?,
             geglu_plain_f16: load_fn(&module, "dec_geglu_f16")?,
             geglu_plain_bf16: load_fn(&module, "dec_geglu_bf16")?,
             router_logits: load_fn(&module, "dec_router_logits_bf16")?,
@@ -305,11 +307,14 @@ pub fn geglu_quant_nvfp4(
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_geglu_quant_nvfp4", e)).map(|_| ())
 }
 
-/// Нормы голов + RoPE + запись в KV, см. `dec_attn_prep_bf16`.
+/// Нормы голов + RoPE + запись в KV, см. `dec_attn_prep_{bf16,f16}`. `f16` —
+/// тип активаций/таблиц/кэша; `q_stride` — шаг головы в `q_in` (2·hd при
+/// выходном гейте); `k_scale`/`v_scale` ≠ 0 — кэш MXFP8 (квант при записи).
 #[allow(clippy::too_many_arguments)]
 pub fn attn_prep(
     k: &LlmDecodeKernels,
     stream: &Arc<CudaStream>,
+    f16: bool,
     q_in: u64,
     k_in: u64,
     v_in: u64,
@@ -324,23 +329,27 @@ pub fn attn_prep(
     q_out: u64,
     k_cache: u64,
     v_cache: u64,
+    k_scale: u64,
+    v_scale: u64,
     max_seq: u32,
     nh: u32,
     nkv: u32,
     hd: u32,
+    q_stride: u32,
     eps: f32,
 ) -> Result<()> {
     if hd == 0 || hd > 1024 || hd % 32 != 0 {
         return Err(SynaptixError::Cuda(format!("attn_prep: hd={hd} (кратно 32, ≤1024)")));
     }
     let vn: i32 = i32::from(v_norm);
-    let (rd, ms, nhi, nkvi, hdi) = (rotary_dim as i32, max_seq as i32, nh as i32, nkv as i32, hd as i32);
+    let (rd, ms, nhi, nkvi, hdi, qsi) =
+        (rotary_dim as i32, max_seq as i32, nh as i32, nkv as i32, hd as i32, q_stride as i32);
     let cfg = LaunchConfig {
         grid_dim: (nh + 2 * nkv, 1, 1),
         block_dim: (hd, 1, 1),
         shared_mem_bytes: hd * 4,
     };
-    let mut bld = stream.launch_builder(&k.attn_prep);
+    let mut bld = stream.launch_builder(if f16 { &k.attn_prep_f16 } else { &k.attn_prep });
     bld.arg(&q_in)
         .arg(&k_in)
         .arg(&v_in)
@@ -355,10 +364,13 @@ pub fn attn_prep(
         .arg(&q_out)
         .arg(&k_cache)
         .arg(&v_cache)
+        .arg(&k_scale)
+        .arg(&v_scale)
         .arg(&ms)
         .arg(&nhi)
         .arg(&nkvi)
         .arg(&hdi)
+        .arg(&qsi)
         .arg(&eps);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_attn_prep", e)).map(|_| ())
 }

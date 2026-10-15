@@ -754,28 +754,82 @@ extern "C" __global__ void dec_router_logits_f16(
 // ── Подготовка внимания: нормы голов + RoPE + запись в KV ───────────────
 //
 // Блок = одна голова (grid = nh + nkv + nkv), blockDim = hd.
-//   q: bf16(norm_q(q))·RoPE → q_out
-//   k: bf16(norm_k(k))·RoPE → k_cache[(kvh·max_seq + kv_pos)·hd + d]
-//   v: v_norm ? bf16(norm(v)) : v → v_cache[…]   (v_in == null → V = сырой K,
+//   q: T(norm_q(q))·RoPE → q_out        (q_in — голова с шагом q_stride:
+//      2·hd при attn_output_gate — гейт остаётся в буфере GEMV)
+//   k: T(norm_k(k))·RoPE → k_cache[(kvh·max_seq + kv_pos)·hd + d]
+//   v: v_norm ? T(norm(v)) : v → v_cache[…]   (v_in == null → V = сырой K,
 //      снятый ДО нормы и RoPE — `attention_k_eq_v`)
+// Кэш MXFP8 (k_scale != null): строка головы квантуется как у
+// kv_quant_append_mxfp8 — варп = 32-блок, amax → E8M0, E4M3 программным
+// кодером (байты и масштабы бит в бит с отдельным append-ядром).
 // RoPE — как rope_apply_impl: пары (d, d±half) по rotary_dim, таблицы
-// [cap, rotary_dim] bf16, позиция pos_ptr[0].
-extern "C" __global__ void dec_attn_prep_bf16(
-    const bf16_t* __restrict__ q_in,
-    const bf16_t* __restrict__ k_in,
-    const bf16_t* __restrict__ v_in,
-    const bf16_t* __restrict__ q_norm_w,
-    const bf16_t* __restrict__ k_norm_w,
+// [cap, rotary_dim] T, позиция pos_ptr[0].
+
+__device__ __forceinline__ unsigned char dec_fp8_encode_e4m3(float x) {
+    if (isnan(x)) return 0x7F;
+    float v = fminf(fmaxf(x, -448.0f), 448.0f);
+    unsigned int sign = signbit(v) ? 1 : 0;
+    float abs_v = fabsf(v);
+    if (abs_v == 0.0f) return (unsigned char)(sign << 7);
+    int exp_raw = (int)floorf(log2f(abs_v));
+    int exp_biased = exp_raw + 7;
+    if (exp_biased < 1) {
+        int m = (int)nearbyintf(abs_v * 512.0f);
+        m = max(0, min(7, m));
+        return (unsigned char)((sign << 7) | (unsigned int)m);
+    }
+    if (exp_biased > 15) return (unsigned char)((sign << 7) | 0x7E);
+    float pow2 = exp2f((float)exp_raw);
+    int m = (int)nearbyintf(((abs_v / pow2) - 1.0f) * 8.0f);
+    if (m == 8) {
+        m = 0;
+        exp_biased += 1;
+        if (exp_biased > 15) return (unsigned char)((sign << 7) | 0x7E);
+    }
+    if (exp_biased == 15 && m == 7) m = 6;
+    return (unsigned char)((sign << 7) | ((unsigned int)exp_biased << 3) | (unsigned int)(m & 0x07));
+}
+
+// Запись значения в KV-кэш: плотный T либо MXFP8 (e4m3 + E8M0 на 32).
+template <typename T>
+__device__ __forceinline__ void dec_kv_store(
+    T* __restrict__ cache, unsigned char* __restrict__ scales, size_t row, int hd, int d, float y)
+{
+    if (scales == nullptr) {
+        stf(cache + row * hd + d, y);
+        return;
+    }
+    float amax = fabsf(y);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
+    unsigned amax_exp_bits = __float_as_uint(amax) & 0x7F800000u;
+    float scale_f = __uint_as_float(amax_exp_bits) / 256.0f;
+    unsigned char sbyte = (unsigned char)(__float_as_uint(scale_f) >> 23);
+    float sv = fmaxf(__uint_as_float(((unsigned)sbyte) << 23), 1e-12f);
+    unsigned char* bytes = reinterpret_cast<unsigned char*>(cache);
+    bytes[row * hd + d] = dec_fp8_encode_e4m3(y / sv);
+    if ((d & 31) == 0) scales[row * (hd >> 5) + (d >> 5)] = sbyte;
+}
+
+template <typename T>
+__device__ __forceinline__ void attn_prep_impl(
+    const T* __restrict__ q_in,
+    const T* __restrict__ k_in,
+    const T* __restrict__ v_in,
+    const T* __restrict__ q_norm_w,
+    const T* __restrict__ k_norm_w,
     int v_norm,
-    const bf16_t* __restrict__ cos_t,
-    const bf16_t* __restrict__ sin_t,
+    const T* __restrict__ cos_t,
+    const T* __restrict__ sin_t,
     const unsigned int* __restrict__ pos_ptr,
     int rotary_dim,
     const unsigned int* __restrict__ kv_pos_ptr,
-    bf16_t* __restrict__ q_out,
-    bf16_t* __restrict__ k_cache,
-    bf16_t* __restrict__ v_cache,
-    int max_seq, int nh, int nkv, int hd, float eps)
+    T* __restrict__ q_out,
+    T* __restrict__ k_cache,
+    T* __restrict__ v_cache,
+    unsigned char* __restrict__ k_scale,
+    unsigned char* __restrict__ v_scale,
+    int max_seq, int nh, int nkv, int hd, int q_stride, float eps)
 {
     extern __shared__ float smem[];
     float* s_y = smem;  // [hd]
@@ -784,10 +838,10 @@ extern "C" __global__ void dec_attn_prep_bf16(
     int blk = blockIdx.x;
     int kind = blk < nh ? 0 : (blk < nh + nkv ? 1 : 2);  // 0 = q, 1 = k, 2 = v
     int head = kind == 0 ? blk : (kind == 1 ? blk - nh : blk - nh - nkv);
-    const bf16_t* src;
-    const bf16_t* wn;
+    const T* src;
+    const T* wn;
     bool do_norm;
-    if (kind == 0) { src = q_in + (size_t)head * hd; wn = q_norm_w; do_norm = q_norm_w != nullptr; }
+    if (kind == 0) { src = q_in + (size_t)head * q_stride; wn = q_norm_w; do_norm = q_norm_w != nullptr; }
     else if (kind == 1) { src = k_in + (size_t)head * hd; wn = k_norm_w; do_norm = k_norm_w != nullptr; }
     else { src = (v_in ? v_in : k_in) + (size_t)head * hd; wn = nullptr; do_norm = v_norm != 0; }
 
@@ -797,12 +851,12 @@ extern "C" __global__ void dec_attn_prep_bf16(
         float sumsq = block_sum(x * x, red);
         float rms = rsqrtf(sumsq / (float)hd + eps);
         float wv = wn ? ldf(wn + d) : 1.0f;
-        y = rnd_bf16(wv * x * rms);
+        y = rnd_t(src, wv * x * rms);
     }
     if (d >= hd) return;
     if (kind == 2) {
         unsigned int pos = kv_pos_ptr[0];
-        stf(v_cache + ((size_t)head * max_seq + pos) * hd + d, y);
+        dec_kv_store<T>(v_cache, v_scale, (size_t)head * max_seq + pos, hd, d, y);
         return;
     }
     s_y[d] = y;
@@ -823,7 +877,31 @@ extern "C" __global__ void dec_attn_prep_bf16(
         stf(q_out + (size_t)head * hd + d, out);
     } else {
         unsigned int pos = kv_pos_ptr[0];
-        stf(k_cache + ((size_t)head * max_seq + pos) * hd + d, out);
+        dec_kv_store<T>(k_cache, k_scale, (size_t)head * max_seq + pos, hd, d, out);
     }
+}
+
+extern "C" __global__ void dec_attn_prep_bf16(
+    const bf16_t* q_in, const bf16_t* k_in, const bf16_t* v_in,
+    const bf16_t* q_norm_w, const bf16_t* k_norm_w, int v_norm,
+    const bf16_t* cos_t, const bf16_t* sin_t, const unsigned int* pos_ptr, int rotary_dim,
+    const unsigned int* kv_pos_ptr, bf16_t* q_out, bf16_t* k_cache, bf16_t* v_cache,
+    unsigned char* k_scale, unsigned char* v_scale,
+    int max_seq, int nh, int nkv, int hd, int q_stride, float eps)
+{
+    attn_prep_impl<bf16_t>(q_in, k_in, v_in, q_norm_w, k_norm_w, v_norm, cos_t, sin_t, pos_ptr, rotary_dim,
+                           kv_pos_ptr, q_out, k_cache, v_cache, k_scale, v_scale, max_seq, nh, nkv, hd, q_stride, eps);
+}
+
+extern "C" __global__ void dec_attn_prep_f16(
+    const __half* q_in, const __half* k_in, const __half* v_in,
+    const __half* q_norm_w, const __half* k_norm_w, int v_norm,
+    const __half* cos_t, const __half* sin_t, const unsigned int* pos_ptr, int rotary_dim,
+    const unsigned int* kv_pos_ptr, __half* q_out, __half* k_cache, __half* v_cache,
+    unsigned char* k_scale, unsigned char* v_scale,
+    int max_seq, int nh, int nkv, int hd, int q_stride, float eps)
+{
+    attn_prep_impl<__half>(q_in, k_in, v_in, q_norm_w, k_norm_w, v_norm, cos_t, sin_t, pos_ptr, rotary_dim,
+                           kv_pos_ptr, q_out, k_cache, v_cache, k_scale, v_scale, max_seq, nh, nkv, hd, q_stride, eps);
 }
 

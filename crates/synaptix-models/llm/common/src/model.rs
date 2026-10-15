@@ -1890,15 +1890,18 @@ impl DecoderModel {
     /// compute-dtype: иначе `kv_append` получил бы BF16-источник на
     /// MXFP8-буфер и падал с «dtype mismatch src/dst».
     fn layer_kv_mxfp8(&self, l: usize) -> bool {
-        // MXFP8-ядро внимания умеет голову 128 или 256 — голову 512
-        // (global-слои Gemma-4) читать нечем, такой слой держит плотный KV.
-        if self.kv_dtype != DType::MXFP8 || !matches!(self.config.head_dim_at(l), 128 | 256) {
-            return false;
-        }
         match self.blocks.get(l).map(|b| &b.mixer) {
-            Some(Mixer::Full(fa)) => fa.use_flash && fa.sliding_window.is_none(),
+            Some(Mixer::Full(fa)) => self.block_kv_mxfp8(fa),
             _ => false,
         }
+    }
+
+    /// Держит ли слой полного внимания KV в MXFP8 (то же правило, что
+    /// [`Self::layer_kv_mxfp8`], по самому слою).
+    fn block_kv_mxfp8(&self, fa: &FullAttn) -> bool {
+        // MXFP8-ядро внимания умеет голову 128 или 256 — голову 512
+        // (global-слои Gemma-4) читать нечем, такой слой держит плотный KV.
+        self.kv_dtype == DType::MXFP8 && matches!(fa.head_dim, 128 | 256) && fa.use_flash && fa.sliding_window.is_none()
     }
 
     /// Кольцевой KV у sliding-слоёв: буфер размером с окно вместо буфера на
@@ -2997,15 +3000,33 @@ impl DecoderModel {
                 prof(dev, "lin_oproj", || la.out_proj.forward(&out))?
             }
             Mixer::Full(fa) => {
-                let cache_idx_out = fa.forward_decode_dev(h, cache, state)?;
-                cache_idx_out.reshape(vec![1usize, hsz]).coerr()?
+                if fa.fused_hybrid_ready(dev, self.block_kv_mxfp8(fa)) {
+                    let fmt = fa.hybrid_fused_fmt().ok_or_else(|| missing("hybrid_fused_fmt"))?;
+                    let pair = match h_pair {
+                        Some(p) => p,
+                        None => prof(dev, "attn_quant", || match fmt {
+                            DType::MXFP8 => h_row.mxfp8_quantize_act(),
+                            _ => h_row.nvfp4_quantize_act(),
+                        })
+                        .coerr()?,
+                    };
+                    fa.forward_decode_fused(FusedIn::Pair(&pair), cache, state, DType::F16)?
+                } else {
+                    let cache_idx_out = fa.forward_decode_dev(h, cache, state)?;
+                    cache_idx_out.reshape(vec![1usize, hsz]).coerr()?
+                }
             }
         };
         let attn_out = attn_out.reshape(vec![1usize, hsz]).coerr()?;
 
         let next = next_blk.map(|nb| {
             let want_mx = self.fused_hybrid_ok(nb)
-                && matches!(&nb.mixer, Mixer::Linear(la) if la.fused_fmt() == Some(DType::MXFP8));
+                && match &nb.mixer {
+                    Mixer::Linear(la) => la.fused_fmt() == Some(DType::MXFP8),
+                    Mixer::Full(fa) => {
+                        fa.fused_hybrid_ready(dev, self.block_kv_mxfp8(fa)) && fa.hybrid_fused_fmt() == Some(DType::MXFP8)
+                    }
+                };
             (&nb.pre_attn_norm, true, want_mx)
         });
 
@@ -3246,7 +3267,7 @@ impl DecoderModel {
                 .coerr()?
             }
         };
-        let attn_out = fa.forward_decode_fused(FusedIn::Pair(&pair), cache, state)?; // [1, nh·hd]
+        let attn_out = fa.forward_decode_fused(FusedIn::Pair(&pair), cache, state, DType::BF16)?; // [1, nh·hd]
 
         // Хвост после внимания: residual + нормы входов MLP, экспертов, роутера.
         let mut outs: Vec<(&Tensor, DecOutFmt)> = vec![(&blk.pre_mlp_norm, DecOutFmt::Nvfp4)];
@@ -3364,7 +3385,7 @@ impl DecoderModel {
         };
         let hidden_row = hidden.reshape(vec![1usize, hsz]).coerr()?;
         let h_row = h.reshape(vec![1usize, hsz]).coerr()?;
-        let attn_out = fa.forward_decode_fused(FusedIn::Dense(&h_row), cache, state)?;
+        let attn_out = fa.forward_decode_fused(FusedIn::Dense(&h_row), cache, state, DType::BF16)?;
 
         let mut outs: Vec<(&Tensor, DecOutFmt)> = vec![(&blk.pre_mlp_norm, DecOutFmt::Bf16)];
         if let Some(m) = &blk.moe {
@@ -4005,13 +4026,16 @@ impl FullAttn {
     }
 
     /// Внимание декода слитыми ядрами: групповой GEMV q/k/v от готовой
-    /// квант-пары, нормы голов + RoPE + запись K/V одним ядром, flash,
-    /// `o_proj`. Возвращает выход `o_proj` `[1, nh·hd]` (bf16).
+    /// квант-пары, нормы голов + RoPE + запись K/V одним ядром (в кэш MXFP8 —
+    /// с квантом при записи), flash GQA с выходным гейтом в слиянии, `o_proj`.
+    /// `dtype` — тип активаций (bf16 у Gemma, f16 у гибридов Qwen).
+    /// Возвращает выход `o_proj` `[1, nh·hd]`.
     fn forward_decode_fused(
         &self,
         input: FusedIn<'_>,
         cache: &mut LayerCache,
         state: &DecodeState,
+        dtype: DType,
     ) -> Result<Tensor, ModelError> {
         let kvl = match cache {
             LayerCache::Full(k) => k,
@@ -4034,7 +4058,7 @@ impl FullAttn {
         }
         let qkv = match input {
             FusedIn::Pair(pair) => {
-                prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, DType::BF16, None))
+                prof(dev, "attn_qkv", || Tensor::dec_gemv_grouped(&groups, &pair.0, &pair.1, dtype, None))
                     .coerr()?
                     .0
             }
@@ -4045,10 +4069,20 @@ impl FullAttn {
             _ => (&state.rope_cos, &state.rope_sin),
         };
         let kv_pos = if self.sliding_window.is_some() { &state.ring_pos_dev } else { &state.pos_dev };
+        // Выходной гейт (Qwen3.5): q_proj даёт на голову [q | gate] — гейт
+        // остаётся в буфере GEMV и применяется в слиянии flash.
+        let q_stride = if self.attn_output_gate { 2 * hd } else { hd };
         let q_off = 0usize;
-        let k_off = nh * hd;
+        let k_off = nh * q_stride;
         let v_off = k_off + nkv * hd;
+        let kv_mx = kvl.k.dtype() == DType::MXFP8;
+        let KvCacheLayer { k: kc, v: vc, k_scale: ksc, v_scale: vsc, .. } = kvl;
         let q = prof(dev, "attn_prep", || {
+            let scales = match (kv_mx, ksc.as_mut(), vsc.as_mut()) {
+                (true, Some(ks), Some(vs)) => Some((ks, vs)),
+                (true, _, _) => return Err(SynaptixError::Unsupported("MXFP8-KV без масштабов")),
+                _ => None,
+            };
             Tensor::dec_attn_prep(
                 (&qkv, q_off),
                 (&qkv, k_off),
@@ -4061,48 +4095,85 @@ impl FullAttn {
                 &state.pos_dev,
                 self.rotary_dim,
                 kv_pos,
-                &mut kvl.k,
-                &mut kvl.v,
+                kc,
+                vc,
+                scales,
                 nh,
                 nkv,
                 hd,
+                q_stride,
                 self.rms_eps,
             )
         })
         .coerr()?;
+        let gate = self.attn_output_gate.then_some((&qkv, hd, 2 * hd));
         // GQA-ядро читает K/V один раз на группу голов; сегментов больше у
         // global-слоёв — у них KV-голов мало, а контекст длинный. Его merge
         // сразу квантует строку в MXFP8 — вход o_proj без отдельного ядра.
-        let gqa = Tensor::dec_flash_gqa_supported(dev, hd, nh / nkv.max(1));
+        let gqa = Tensor::dec_flash_gqa_supported(dev, hd, nh / nkv.max(1), kv_mx);
         // Квант-выход merge в MXFP8 кормит нативный GEMV o_proj; у плотного
-        // входа (Ada) o_proj — портируемый GEMV над bf16.
+        // входа (Ada) o_proj — портируемый GEMV над строкой.
         let o_mx = matches!(input, FusedIn::Pair(_)) && self.o_proj.quant_dtype() == Some(DType::MXFP8);
         if gqa {
             let (tkv, window, splits) = match self.sliding_window {
                 Some(w) => (&state.ring_len_dev, Some(w), 8),
                 None => (&state.tcache_dev, None, 32),
             };
+            let kv_scales = match (kv_mx, ksc.as_ref(), vsc.as_ref()) {
+                (true, Some(ks), Some(vs)) => Some((ks, vs)),
+                _ => None,
+            };
             let (attn, mx) = prof(dev, "attn_flash", || {
-                q.dec_flash_gqa(&kvl.k, &kvl.v, tkv, self.attn_scale, window, splits, !o_mx, o_mx)
+                q.dec_flash_gqa(kc, vc, kv_scales, tkv, self.attn_scale, window, splits, gate, !o_mx, o_mx)
             })
             .map_err(|e| ModelError::Forward(e.to_string()))?;
             if let Some((p, sc)) = mx {
-                return prof(dev, "attn_oproj", || self.o_proj.forward_prequant(&p, &sc, 1, DType::BF16));
+                return prof(dev, "attn_oproj", || self.o_proj.forward_prequant(&p, &sc, 1, dtype));
             }
-            let attn = attn.expect("bf16-выход").reshape(vec![1usize, nh * hd]).coerr()?;
+            let attn = attn.expect("строка-выход").reshape(vec![1usize, nh * hd]).coerr()?;
             return prof(dev, "attn_oproj", || self.o_proj.forward(&attn));
+        }
+        if kv_mx || gate.is_some() {
+            return Err(ModelError::Forward("слитое внимание: MXFP8-KV и выходной гейт требуют GQA-ядра".into()));
         }
         let attn = match self.sliding_window {
             Some(w) => prof(dev, "attn_flash", || {
-                q.flash_attention_window_dev(&kvl.k, &kvl.v, &state.ring_len_dev, self.attn_scale, (w - 1) as i32, true)
+                q.flash_attention_window_dev(kc, vc, &state.ring_len_dev, self.attn_scale, (w - 1) as i32, true)
             }),
             None => prof(dev, "attn_flash", || {
-                q.flash_attention_dev(&kvl.k, &kvl.v, &state.tcache_dev, self.attn_scale, true)
+                q.flash_attention_dev(kc, vc, &state.tcache_dev, self.attn_scale, true)
             }),
         }
         .map_err(|e| ModelError::Forward(e.to_string()))?;
         let attn = attn.reshape(vec![1usize, nh * hd]).coerr()?;
         prof(dev, "attn_oproj", || self.o_proj.forward(&attn))
+    }
+
+    /// Формат квант-пары входа для слитого внимания гибрида: q/k/v одного
+    /// формата (MXFP8/NVFP4), без смещений, с V, без sliding-окна и общего KV.
+    fn hybrid_fused_fmt(&self) -> Option<DType> {
+        let fmt = self.q_proj.quant_dtype()?;
+        if !matches!(fmt, DType::MXFP8 | DType::NVFP4) {
+            return None;
+        }
+        let same = self.k_proj.quant_dtype() == Some(fmt)
+            && self.v_proj.as_ref().map(|v| v.quant_dtype()) == Some(Some(fmt))
+            && self.o_proj.quant_dtype().is_some();
+        let plain = self.q_bias.is_none()
+            && self.k_bias.is_none()
+            && self.v_bias.is_none()
+            && self.sliding_window.is_none()
+            && !self.kv_shared
+            && self.use_flash;
+        (same && plain).then_some(fmt)
+    }
+
+    /// Готов ли слой к слитому вниманию гибрида на этом устройстве (GQA-ядро
+    /// для головы/группы и типа кэша).
+    fn fused_hybrid_ready(&self, dev: Device, kv_mx: bool) -> bool {
+        self.hybrid_fused_fmt().is_some()
+            && self.num_kv_heads > 0
+            && Tensor::dec_flash_gqa_supported(dev, self.head_dim, self.num_heads / self.num_kv_heads, kv_mx)
     }
 
     /// Device-резидентный prefill-шаг (T = `state.chunk_size`) для CUDA-graph.

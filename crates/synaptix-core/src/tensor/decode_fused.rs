@@ -473,15 +473,18 @@ impl Tensor {
         kv_pos: &Tensor,
         k_cache: &mut Tensor,
         v_cache: &mut Tensor,
+        kv_scales: Option<(&mut Tensor, &mut Tensor)>,
         nh: usize,
         nkv: usize,
         hd: usize,
+        q_stride: usize,
         eps: f32,
     ) -> Result<Tensor> {
         let (qt, qo) = q;
         let (kt, ko) = k;
-        if qt.dtype() != DType::BF16 || kt.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_attn_prep: только BF16"));
+        let dtype = qt.dtype();
+        if !matches!(dtype, DType::BF16 | DType::F16) || kt.dtype() != dtype {
+            return Err(SynaptixError::Unsupported("dec_attn_prep: q/k bf16 либо f16 одного типа"));
         }
         if !qt.is_contiguous() || !kt.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
@@ -490,16 +493,29 @@ impl Tensor {
         if kd.len() != 4 || kd[0] != 1 || kd[1] != nkv || kd[3] != hd || v_cache.dims() != kd.as_slice() {
             return Err(SynaptixError::Unsupported("dec_attn_prep: кэш [1, nkv, max_seq, hd]"));
         }
-        if k_cache.dtype() != DType::BF16 || v_cache.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_attn_prep: кэш BF16"));
-        }
-        if cos.dtype() != DType::BF16 || sin.dtype() != DType::BF16 || pos.dtype() != DType::U32 || kv_pos.dtype() != DType::U32 {
-            return Err(SynaptixError::Unsupported("dec_attn_prep: cos/sin BF16, позиции U32"));
-        }
         let max_seq = kd[2];
+        match &kv_scales {
+            Some((ks, vs)) => {
+                if k_cache.dtype() != DType::MXFP8 || v_cache.dtype() != DType::MXFP8 {
+                    return Err(SynaptixError::Unsupported("dec_attn_prep: масштабы — для кэша MXFP8"));
+                }
+                let sd = [1usize, nkv, max_seq, hd / 32];
+                if ks.dims() != sd || vs.dims() != sd || ks.dtype() != DType::U8 || vs.dtype() != DType::U8 {
+                    return Err(SynaptixError::Unsupported("dec_attn_prep: масштабы [1, nkv, max_seq, hd/32] U8"));
+                }
+            }
+            None => {
+                if k_cache.dtype() != dtype || v_cache.dtype() != dtype {
+                    return Err(SynaptixError::Unsupported("dec_attn_prep: кэш в типе активаций"));
+                }
+            }
+        }
+        if cos.dtype() != dtype || sin.dtype() != dtype || pos.dtype() != DType::U32 || kv_pos.dtype() != DType::U32 {
+            return Err(SynaptixError::Unsupported("dec_attn_prep: cos/sin в типе активаций, позиции U32"));
+        }
         let dev = qt.device();
         let backend = registry::backend_for(dev)?;
-        let mut q_out = alloc(backend, dev, DType::BF16.bytes_for_numel(nh * hd))?;
+        let mut q_out = alloc(backend, dev, dtype.bytes_for_numel(nh * hd))?;
         let esz = 2usize;
         {
             let stream = Stream::default_for(dev)?;
@@ -512,7 +528,21 @@ impl Tensor {
                 .ok_or_else(|| SynaptixError::Other("dec_attn_prep: K-кэш aliased".into()))?;
             let vc = Arc::get_mut(&mut v_cache.storage)
                 .ok_or_else(|| SynaptixError::Other("dec_attn_prep: V-кэш aliased".into()))?;
+            let scales = match kv_scales {
+                Some((ks, vs)) => {
+                    if ks.layout.byte_offset() != 0 || vs.layout.byte_offset() != 0 {
+                        return Err(SynaptixError::NonContiguous);
+                    }
+                    let kss = Arc::get_mut(&mut ks.storage)
+                        .ok_or_else(|| SynaptixError::Other("dec_attn_prep: масштабы K aliased".into()))?;
+                    let vss = Arc::get_mut(&mut vs.storage)
+                        .ok_or_else(|| SynaptixError::Other("dec_attn_prep: масштабы V aliased".into()))?;
+                    Some((kss, vss))
+                }
+                None => None,
+            };
             backend.dec_attn_prep(
+                dtype,
                 (&qt.storage, qt.layout.byte_offset() + qo * esz),
                 (&kt.storage, kt.layout.byte_offset() + ko * esz),
                 v.map(|(t, o)| (&*t.storage, t.layout.byte_offset() + o * esz)),
@@ -527,17 +557,19 @@ impl Tensor {
                 &mut q_out,
                 kc,
                 vc,
+                scales,
                 max_seq,
                 nh,
                 nkv,
                 hd,
+                q_stride,
                 eps,
                 &stream,
             )?;
         }
         Ok(Tensor::from_parts(
             Arc::new(q_out),
-            Layout::contiguous(Shape::new(vec![1usize, nh, 1, hd]), DType::BF16),
+            Layout::contiguous(Shape::new(vec![1usize, nh, 1, hd]), dtype),
         ))
     }
 
@@ -687,39 +719,66 @@ pub fn dec_flash_gqa_partials(nrep: usize, splits: usize) -> usize {
 
 impl Tensor {
     /// Годится ли `dec_flash_gqa` для такой геометрии на этом устройстве.
-    pub fn dec_flash_gqa_supported(dev: crate::device::Device, hd: usize, nrep: usize) -> bool {
-        registry::backend_for(dev).map(|b| b.dec_flash_gqa_supported(hd, nrep)).unwrap_or(false)
+    pub fn dec_flash_gqa_supported(dev: crate::device::Device, hd: usize, nrep: usize, kv_mx: bool) -> bool {
+        registry::backend_for(dev).map(|b| b.dec_flash_gqa_supported(hd, nrep, kv_mx)).unwrap_or(false)
     }
 
-    /// Flash-decode одного запроса с GQA. `self` — q `[1, nh, 1, hd]` bf16,
-    /// `k`/`v` — кэши `[1, nkv, cap, hd]`, `tkv` — U32[1], `window` —
-    /// `Some(w)` для sliding-слоя. Возвращает `[1, nh, 1, hd]`.
-    #[allow(clippy::type_complexity)]
+    /// Flash-decode одного запроса с GQA. `self` — q `[1, nh, 1, hd]` bf16/f16,
+    /// `k`/`v` — кэши `[1, nkv, cap, hd]` того же типа либо MXFP8 с масштабами
+    /// `kv_scales` `[1, nkv, cap, hd/32]` U8, `tkv` — U32[1], `window` —
+    /// `Some(w)` для sliding-слоя. `gate = Some((t, off, stride))` — выходной
+    /// гейт: y[h, d] ·= sigmoid(t[off + h·stride + d]). Возвращает строку
+    /// `[1, nh, 1, hd]` в типе q и/или MXFP8-пару под o_proj.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn dec_flash_gqa(
         &self,
         k: &Tensor,
         v: &Tensor,
+        kv_scales: Option<(&Tensor, &Tensor)>,
         tkv: &Tensor,
         scale: f32,
         window: Option<usize>,
         splits: usize,
-        want_bf16: bool,
+        gate: Option<(&Tensor, usize, usize)>,
+        want_row: bool,
         want_mxfp8: bool,
     ) -> Result<(Option<Tensor>, Option<(Tensor, Tensor)>)> {
-        if self.rank() != 4 || self.dims()[0] != 1 || self.dims()[2] != 1 || self.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_flash_gqa: q [1, nh, 1, hd] bf16"));
+        let dtype = self.dtype();
+        if self.rank() != 4 || self.dims()[0] != 1 || self.dims()[2] != 1 || !matches!(dtype, DType::BF16 | DType::F16) {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: q [1, nh, 1, hd] bf16/f16"));
         }
         let (nh, hd) = (self.dims()[1], self.dims()[3]);
         let kd = k.dims();
-        if kd.len() != 4 || kd[0] != 1 || kd[3] != hd || v.dims() != kd || k.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_flash_gqa: кэш [1, nkv, cap, hd] bf16"));
+        if kd.len() != 4 || kd[0] != 1 || kd[3] != hd || v.dims() != kd {
+            return Err(SynaptixError::Unsupported("dec_flash_gqa: кэш [1, nkv, cap, hd]"));
         }
         let (nkv, cap) = (kd[1], kd[2]);
+        match kv_scales {
+            Some((ks, vs)) => {
+                let sd = [1usize, nkv, cap, hd / 32];
+                if k.dtype() != DType::MXFP8 || v.dtype() != DType::MXFP8 || ks.dims() != sd || vs.dims() != sd {
+                    return Err(SynaptixError::Unsupported("dec_flash_gqa: кэш MXFP8 с масштабами [1, nkv, cap, hd/32]"));
+                }
+                if !ks.is_contiguous() || !vs.is_contiguous() {
+                    return Err(SynaptixError::NonContiguous);
+                }
+            }
+            None => {
+                if k.dtype() != dtype || v.dtype() != dtype {
+                    return Err(SynaptixError::Unsupported("dec_flash_gqa: кэш в типе q"));
+                }
+            }
+        }
         if nkv == 0 || nh % nkv != 0 {
             return Err(SynaptixError::Unsupported("dec_flash_gqa: nh кратно nkv"));
         }
         if !self.is_contiguous() || !k.is_contiguous() || !v.is_contiguous() {
             return Err(SynaptixError::NonContiguous);
+        }
+        if let Some((g, _, _)) = gate {
+            if g.dtype() != dtype || !g.is_contiguous() {
+                return Err(SynaptixError::Unsupported("dec_flash_gqa: гейт в типе q"));
+            }
         }
         let dev = self.device();
         let backend = registry::backend_for(dev)?;
@@ -727,19 +786,22 @@ impl Tensor {
         let mut pm = alloc(backend, dev, nh * s * 4)?;
         let mut pl = alloc(backend, dev, nh * s * 4)?;
         let mut pa = alloc(backend, dev, nh * s * hd * 4)?;
-        if !want_bf16 && !want_mxfp8 {
+        if !want_row && !want_mxfp8 {
             return Err(SynaptixError::Unsupported("dec_flash_gqa: нужен хотя бы один выход"));
         }
         if (nh * hd) % 32 != 0 {
             return Err(SynaptixError::Unsupported("dec_flash_gqa: nh·hd кратно 32"));
         }
-        let mut out = if want_bf16 { Some(alloc(backend, dev, DType::BF16.bytes_for_numel(nh * hd))?) } else { None };
+        let mut out = if want_row { Some(alloc(backend, dev, dtype.bytes_for_numel(nh * hd))?) } else { None };
         let mut mx = if want_mxfp8 { Some((alloc(backend, dev, nh * hd)?, alloc(backend, dev, nh * hd / 32)?)) } else { None };
         let stream = Stream::default_for(dev)?;
+        let esz = 2usize;
         backend.dec_flash_gqa(
+            dtype,
             &self.storage,
             &k.storage,
             &v.storage,
+            kv_scales.map(|(ks, vs)| (&*ks.storage, &*vs.storage)),
             &tkv.storage,
             scale,
             window.unwrap_or(0),
@@ -749,12 +811,13 @@ impl Tensor {
             hd,
             splits,
             (&mut pm, &mut pl, &mut pa),
+            gate.map(|(g, off, stride)| (&*g.storage, g.layout.byte_offset() + off * esz, stride)),
             out.as_mut(),
             mx.as_mut().map(|(p, sc)| (p, sc)),
             &stream,
         )?;
         let out_t = out.map(|o| {
-            Tensor::from_parts(Arc::new(o), Layout::contiguous(Shape::new(vec![1usize, nh, 1, hd]), DType::BF16))
+            Tensor::from_parts(Arc::new(o), Layout::contiguous(Shape::new(vec![1usize, nh, 1, hd]), dtype))
         });
         let mx_t = mx.map(|(p, sc)| {
             (

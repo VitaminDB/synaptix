@@ -1407,6 +1407,7 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     fn dec_attn_prep(
         &self,
+        _dtype: DType,
         _q: (&Storage, usize),
         _k: (&Storage, usize),
         _v: Option<(&Storage, usize)>,
@@ -1421,10 +1422,12 @@ pub trait Backend: Send + Sync + 'static {
         _q_out: &mut Storage,
         _k_cache: &mut Storage,
         _v_cache: &mut Storage,
+        _kv_scales: Option<(&mut Storage, &mut Storage)>,
         _max_seq: usize,
         _nh: usize,
         _nkv: usize,
         _hd: usize,
+        _q_stride: usize,
         _eps: f32,
         _stream: &Stream,
     ) -> Result<()> {
@@ -1481,9 +1484,11 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     fn dec_flash_gqa(
         &self,
+        _dtype: DType,
         _q: &Storage,
         _k: &Storage,
         _v: &Storage,
+        _kv_scales: Option<(&Storage, &Storage)>,
         _tkv: &Storage,
         _scale: f32,
         _window: usize,
@@ -1493,6 +1498,7 @@ pub trait Backend: Send + Sync + 'static {
         _hd: usize,
         _splits: usize,
         _parts: (&mut Storage, &mut Storage, &mut Storage),
+        _gate: Option<(&Storage, usize, usize)>,
         _out: Option<&mut Storage>,
         _out_mx: Option<(&mut Storage, &mut Storage)>,
         _stream: &Stream,
@@ -1501,7 +1507,7 @@ pub trait Backend: Send + Sync + 'static {
     }
 
     /// Поддерживает ли backend [`Self::dec_flash_gqa`] для такой головы и группы.
-    fn dec_flash_gqa_supported(&self, _hd: usize, _nrep: usize) -> bool {
+    fn dec_flash_gqa_supported(&self, _hd: usize, _nrep: usize, _kv_mx: bool) -> bool {
         false
     }
 

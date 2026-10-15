@@ -5260,6 +5260,7 @@ impl Backend for CudaBackend {
     #[allow(clippy::too_many_arguments)]
     fn dec_attn_prep(
         &self,
+        dtype: DType,
         q: (&Storage, usize),
         k: (&Storage, usize),
         v: Option<(&Storage, usize)>,
@@ -5274,19 +5275,31 @@ impl Backend for CudaBackend {
         q_out: &mut Storage,
         k_cache: &mut Storage,
         v_cache: &mut Storage,
+        kv_scales: Option<(&mut Storage, &mut Storage)>,
         max_seq: usize,
         nh: usize,
         nkv: usize,
         hd: usize,
+        q_stride: usize,
         eps: f32,
         _stream: &Stream,
     ) -> Result<()> {
         use crate::fused::llm_decode as ld;
+        let f16 = match dtype {
+            DType::F16 => true,
+            DType::BF16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_attn_prep: тип bf16/f16")),
+        };
         let (ctx, stream) = ctx_stream_of(q.0, "dec_attn_prep")?;
         let kk = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let (ksc, vsc) = match kv_scales {
+            Some((ks, vs)) => (dptr(ks, 0, "dec_attn_prep: k_scale")?, dptr(vs, 0, "dec_attn_prep: v_scale")?),
+            None => (0, 0),
+        };
         ld::attn_prep(
             &kk,
             &stream,
+            f16,
             dptr(q.0, q.1, "dec_attn_prep: q")?,
             dptr(k.0, k.1, "dec_attn_prep: k")?,
             match v {
@@ -5304,10 +5317,13 @@ impl Backend for CudaBackend {
             dptr(q_out, 0, "dec_attn_prep: q_out")?,
             dptr(k_cache, 0, "dec_attn_prep: k_cache")?,
             dptr(v_cache, 0, "dec_attn_prep: v_cache")?,
+            ksc,
+            vsc,
             max_seq as u32,
             nh as u32,
             nkv as u32,
             hd as u32,
+            q_stride as u32,
             eps,
         )
     }
@@ -5477,9 +5493,11 @@ impl Backend for CudaBackend {
     #[allow(clippy::too_many_arguments)]
     fn dec_flash_gqa(
         &self,
+        dtype: DType,
         q: &Storage,
         k: &Storage,
         v: &Storage,
+        kv_scales: Option<(&Storage, &Storage)>,
         tkv: &Storage,
         scale: f32,
         window: usize,
@@ -5489,11 +5507,17 @@ impl Backend for CudaBackend {
         hd: usize,
         splits: usize,
         parts: (&mut Storage, &mut Storage, &mut Storage),
+        gate: Option<(&Storage, usize, usize)>,
         out: Option<&mut Storage>,
         out_mx: Option<(&mut Storage, &mut Storage)>,
         _stream: &Stream,
     ) -> Result<()> {
         use crate::attention::flash_decode_gqa as fg;
+        let f16 = match dtype {
+            DType::F16 => true,
+            DType::BF16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_flash_gqa: тип bf16/f16")),
+        };
         let out_p = match out {
             Some(o) => dptr(o, 0, "dec_flash_gqa: out")?,
             None => 0,
@@ -5505,14 +5529,25 @@ impl Backend for CudaBackend {
         if out_p == 0 && mxp == 0 {
             return Err(SynaptixError::Unsupported("dec_flash_gqa: нужен хотя бы один выход"));
         }
+        let (ksc, vsc) = match kv_scales {
+            Some((ks, vs)) => (dptr(ks, 0, "dec_flash_gqa: k_scale")?, dptr(vs, 0, "dec_flash_gqa: v_scale")?),
+            None => (0, 0),
+        };
+        let (gate_p, gate_stride) = match gate {
+            Some((g, off, stride)) => (dptr(g, off, "dec_flash_gqa: gate")?, stride as u32),
+            None => (0, 0),
+        };
         let (ctx, stream) = ctx_stream_of(q, "dec_flash_gqa")?;
         let kk = fg::FlashDecodeGqaKernels::for_context(&ctx)?;
         fg::flash_decode_gqa(
             &kk,
             &stream,
+            f16,
             dptr(q, 0, "dec_flash_gqa: q")?,
             dptr(k, 0, "dec_flash_gqa: k")?,
             dptr(v, 0, "dec_flash_gqa: v")?,
+            ksc,
+            vsc,
             dptr(tkv, 0, "dec_flash_gqa: tkv")?,
             scale,
             window as u32,
@@ -5524,18 +5559,21 @@ impl Backend for CudaBackend {
             dptr(parts.0, 0, "dec_flash_gqa: m")?,
             dptr(parts.1, 0, "dec_flash_gqa: l")?,
             dptr(parts.2, 0, "dec_flash_gqa: acc")?,
+            gate_p,
+            gate_stride,
             out_p,
             mxp,
             mxs,
         )
     }
 
-    fn dec_flash_gqa_supported(&self, hd: usize, nrep: usize) -> bool {
+    fn dec_flash_gqa_supported(&self, hd: usize, nrep: usize, kv_mx: bool) -> bool {
         let Ok(ctx) = synaptix_core::device::cuda::get(0) else { return false };
         crate::attention::flash_decode_gqa::FlashDecodeGqaKernels::for_context(&ctx)
-            .map(|k| k.supports(hd as u32, nrep as u32))
+            .map(|k| k.supports(hd as u32, nrep as u32, kv_mx))
             .unwrap_or(false)
     }
+
 
     fn embed_gather_mxfp8(
         &self,
