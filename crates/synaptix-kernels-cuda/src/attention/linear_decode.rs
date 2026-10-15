@@ -1,7 +1,8 @@
 //! Оркестратор device-резидентного decode-шага (T=1) GatedDeltaNet linear-attn
-//! для CUDA-graph. Связывает три уже валидированных bit-exact ядра в одну
-//! capture-safe последовательность (нет host round-trip, переменной launch-config
-//! и записи в host-память):
+//! для CUDA-graph. При hk == hv (все гибриды Qwen3.x) — одно ядро
+//! `gdn_decode_step_f16` (блок = k-голова со всеми её v-головами), иначе три
+//! уже валидированных bit-exact ядра одной capture-safe последовательностью
+//! (нет host round-trip, переменной launch-config и записи в host-память):
 //!
 //!   1. `causal_conv1d_update` (state in-place, FIFO) + SiLU → post_conv (F16);
 //!   2. `linear_attn_prep_fused` → β, g (F32) и q/k/v (F32, GQA repeat Q/K);
@@ -84,6 +85,112 @@ pub fn linear_attn_decode_step_u8_dev(
     let aerr = |what: &str, e: cudarc::driver::DriverError| {
         SynaptixError::Cuda(format!("linear_decode alloc {what}: {e:?}"))
     };
+
+    // Одно ядро на слой: свёртка, β/g, нормы, рекуррентный шаг и норма выхода
+    // в блоке k-головы (все её v-головы). Три ядра ниже — для геометрий, где
+    // hk ≠ hv или блок не укладывается в 1024 нити.
+    let fused_ok = std::env::var("SYN_GDN_FUSED").map(|v| v != "0").unwrap_or(true);
+    if fused_ok && hk == hv && hk.is_power_of_two() && (n_rep as usize) * hk <= 1024 {
+        let x_v = unsafe {
+            qkv.0
+                .slice(qkv.1..qkv.1 + conv_dim * tm::<f16>())
+                .transmute::<f16>(conv_dim)
+                .ok_or_else(|| cerr("qkv"))?
+        };
+        let w_v = unsafe {
+            conv_w
+                .0
+                .slice(conv_w.1..conv_w.1 + conv_w_len * tm::<f16>())
+                .transmute::<f16>(conv_w_len)
+                .ok_or_else(|| cerr("conv_w"))?
+        };
+        let a_v = unsafe {
+            a.0.slice(a.1..a.1 + nv * tm::<f16>())
+                .transmute::<f16>(nv)
+                .ok_or_else(|| cerr("a"))?
+        };
+        let b_v = unsafe {
+            b_in.0
+                .slice(b_in.1..b_in.1 + nv * tm::<f16>())
+                .transmute::<f16>(nv)
+                .ok_or_else(|| cerr("b"))?
+        };
+        let dt_v = unsafe {
+            dt_bias
+                .0
+                .slice(dt_bias.1..dt_bias.1 + nv * tm::<f32>())
+                .transmute::<f32>(nv)
+                .ok_or_else(|| cerr("dt_bias"))?
+        };
+        let al_v = unsafe {
+            a_log
+                .0
+                .slice(a_log.1..a_log.1 + nv * tm::<f32>())
+                .transmute::<f32>(nv)
+                .ok_or_else(|| cerr("a_log"))?
+        };
+        let gate_v = unsafe {
+            z.0.slice(z.1..z.1 + value_dim * tm::<f16>())
+                .transmute::<f16>(value_dim)
+                .ok_or_else(|| cerr("z"))?
+        };
+        let nw_v = unsafe {
+            norm_w
+                .0
+                .slice(norm_w.1..norm_w.1 + hv * tm::<f16>())
+                .transmute::<f16>(hv)
+                .ok_or_else(|| cerr("norm_w"))?
+        };
+        let mut cs_s = conv_state
+            .slice_mut(conv_state_off..conv_state_off + state_rows * conv_dim * tm::<f16>());
+        let mut cs_v = unsafe {
+            cs_s.transmute_mut::<f16>(state_rows * conv_dim)
+                .ok_or_else(|| cerr("conv_state"))?
+        };
+        let mut ss_s =
+            ssm_state.slice_mut(ssm_state_off..ssm_state_off + nv * hk * hv * tm::<f32>());
+        let mut ss_v = unsafe {
+            ss_s.transmute_mut::<f32>(nv * hk * hv)
+                .ok_or_else(|| cerr("ssm_state"))?
+        };
+        let mut out_s = out.slice_mut(out_off..out_off + value_dim * tm::<f16>());
+        let mut out_v = unsafe {
+            out_s
+                .transmute_mut::<f16>(value_dim)
+                .ok_or_else(|| cerr("out"))?
+        };
+        let shared = ((2 * hk + 3 * n_rep as usize * hv + 2 * n_rep as usize) * tm::<f32>()) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_k, 1, 1),
+            block_dim: (n_rep * dk, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let gate_mode: u32 = gate_sigmoid as u32;
+        let mut bld = stream.launch_builder(gdr_kernels.decode_step_fn());
+        bld.arg(&x_v)
+            .arg(&mut cs_v)
+            .arg(&w_v)
+            .arg(&a_v)
+            .arg(&b_v)
+            .arg(&dt_v)
+            .arg(&al_v)
+            .arg(&mut ss_v)
+            .arg(&gate_v)
+            .arg(&nw_v)
+            .arg(&mut out_v)
+            .arg(&q_scale)
+            .arg(&eps)
+            .arg(&num_k)
+            .arg(&n_rep)
+            .arg(&dk)
+            .arg(&dv)
+            .arg(&conv_kernel)
+            .arg(&gate_mode);
+        unsafe {
+            bld.launch(cfg).map_err(|e| lerr("gdn_decode_step", e))?;
+        }
+        return Ok(());
+    }
 
     let mut post_conv = stream
         .ws_alloc_zeros::<f16>(conv_dim)
