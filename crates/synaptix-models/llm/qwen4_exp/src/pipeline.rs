@@ -105,6 +105,9 @@ pub struct Qwen4ExpSession {
     /// разных картинок одинаковы, так что промпт с той же разметкой, но
     /// другим вложением на её месте префиксом считаться не должен.
     media: Vec<MediaSig>,
+    /// Где поставить точку возврата этого хода, если не на конце промпта
+    /// (см. [`Self::set_resume_at`]). Действует на один ход.
+    resume_at: Option<usize>,
 }
 
 /// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
@@ -177,6 +180,16 @@ impl Qwen4ExpSession {
 
     pub fn ctx_tokens(&self) -> usize {
         self.cache.max_seq
+    }
+
+    /// Поставить точку возврата следующего хода после `at` токенов промпта,
+    /// а не на его конце. Вызывающий называет конец истории перед
+    /// приглашением к ответу (`<|im_start|>assistant\n<think>\n`): дальше
+    /// следующий промпт может пойти иначе — прерванный ход в историю не
+    /// попадает, и за историей сразу идёт новое сообщение. Граница вне
+    /// хвоста, который ход префиллит, не действует.
+    pub fn set_resume_at(&mut self, at: Option<usize>) {
+        self.resume_at = at;
     }
 
     pub fn cached_tokens(&self) -> usize {
@@ -696,6 +709,7 @@ impl Qwen4ExpPipeline {
             ids: Vec::new(),
             snap: None,
             media: Vec::new(),
+            resume_at: None,
         })
     }
 
@@ -798,6 +812,11 @@ impl Qwen4ExpPipeline {
             .as_deref()
             .map(|s| s.reusable_media(prompt_ids, inputs))
             .unwrap_or(0);
+        // Граница точки возврата внутри хвоста, который предстоит посчитать.
+        let split = session
+            .as_deref_mut()
+            .and_then(|s| s.resume_at.take())
+            .filter(|&at| at > reuse && at < prompt_ids.len());
         // Флаг снимаем заранее: дальше `session` занята заимствованием кэша.
         let want_session = session.is_some();
         let mut owned_cache;
@@ -834,8 +853,6 @@ impl Qwen4ExpPipeline {
         // в кэше сессии. Позиции при этом абсолютные — `cache.seq_len`
         // указывает на границу.
         let fresh = &prompt_ids[reuse..];
-        // Хвосту достаются только те строки медиа, чьи заполнители в нём.
-        let tail_media = media_for_chunk(prompt_ids, media, reuse, fresh.len())?;
         let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
@@ -862,95 +879,30 @@ impl Qwen4ExpPipeline {
         let prefill_start = Instant::now();
         let want_stream = self.mtp.is_some();
         let mut tail_stream: Option<Tensor> = None;
-        // Страховка послойного прохода: оценка чанка по свободной VRAM — лишь
-        // оценка, а OOM посреди слоя иначе роняет весь ход (synthos повторяет
-        // его с тем же чанком). Откатываем кэш к состоянию до префилла и
-        // идём чанком вдвое меньше.
         let mut chunk = chunk;
-        let mut logits = if by_layers {
-            let pre_prefill = cache.snapshot().map_err(PipelineError::from)?;
-            loop {
-                let attempt = no_grad(|| -> Result<_, ModelError> {
-                    let (hidden, stream) = self.model.prefill_by_layers(
-                        fresh,
-                        &tail_media,
-                        cache,
-                        chunk,
-                        prefill_pos,
-                    )?;
-                    if want_stream {
-                        tail_stream = Some(stream);
-                    }
-                    self.model.lm_head_forward(&hidden)
-                });
-                match attempt {
-                    Ok(l) => break l,
-                    Err(e) if chunk > MIN_LAYER_CHUNK && is_oom(&e) => {
-                        cache.restore(&pre_prefill).map_err(PipelineError::from)?;
-                        tail_stream = None;
-                        let next = (chunk / 2).max(MIN_LAYER_CHUNK);
-                        eprintln!(
-                            "[qwen4_exp] OOM в послойном префилле на чанке {chunk} ({e}); \
-                             откат кэша, повтор чанком {next}"
-                        );
-                        if let Some(ec) = self.model.expert_cache() {
-                            ec.clear_scratch();
-                            if let Device::Cuda(ord) = self.model.device {
-                                let _ = synaptix_core::device::cuda::synchronize_all(ord);
-                                let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
-                            }
-                            ec.fit_to_vram(activation_reserve_prefill(
-                                &self.config,
-                                fresh.len().min(next),
-                                fresh.len(),
-                            ));
-                        }
-                        chunk = next;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+        // Точка возврата для следующего хода — до декода. Если вызывающий
+        // назвал границу внутри хвоста (конец истории перед приглашением к
+        // ответу), префилл идёт двумя отрезками и снимок ставится между
+        // ними: следующий промпт может разойтись с этим сразу за историей
+        // (прерванный ход в промпт не попал, вместо ответа модели — новое
+        // сообщение), а снимок на самом конце тогда был бы бесполезен и
+        // ход ушёл бы в полный префилл.
+        let mut boundary = None;
+        let mut logits = match split {
+            Some(at) => {
+                self.prefill_span(prompt_ids, media, cache, reuse..at, by_layers, &mut chunk, &cfg, prefill_pos, sink, None)?;
+                boundary = Some(cache.snapshot().map_err(PipelineError::from)?);
+                let rest = want_stream.then_some(&mut tail_stream);
+                self.prefill_span(prompt_ids, media, cache, at..prompt_ids.len(), by_layers, &mut chunk, &cfg, prefill_pos, sink, rest)?
             }
-        } else {
-            no_grad(|| -> Result<_, ModelError> {
-                let mut last = None;
-                let mut offset = reuse;
-                while offset < prompt_ids.len() {
-                    // Stop посреди длинного префилла: между чанками, а не только
-                    // после первого токена (на 100k+ токенов префилл идёт минутами).
-                    if sink.interrupted() {
-                        return Err(ModelError::Forward(synaptix_llm_common::INTERRUPTED.into()));
-                    }
-                    let take = cfg.prefill_batch.min(prompt_ids.len() - offset);
-                    let chunk = &prompt_ids[offset..offset + take];
-                    let slice = media_for_chunk(prompt_ids, media, offset, take)?;
-                    let done = offset + take >= prompt_ids.len();
-                    if want_stream && done {
-                        let (hidden, stream) = self.model.forward_media_with_stream(
-                            chunk,
-                            &slice,
-                            cache,
-                            prefill_pos,
-                        )?;
-                        tail_stream = Some(last_row(&stream)?);
-                        last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
-                    } else {
-                        last = Some(self.model.forward_media_last(
-                            chunk,
-                            &slice,
-                            cache,
-                            prefill_pos,
-                        )?);
-                    }
-                    offset += take;
-                }
-                last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
-            })?
+            None => {
+                let rest = want_stream.then_some(&mut tail_stream);
+                self.prefill_span(prompt_ids, media, cache, reuse..prompt_ids.len(), by_layers, &mut chunk, &cfg, prefill_pos, sink, rest)?
+            }
         };
-        // Точка возврата для следующего хода — ровно здесь, до декода.
-        let boundary = match want_session {
-            true => Some(cache.snapshot().map_err(PipelineError::from)?),
-            false => None,
-        };
+        if want_session && boundary.is_none() {
+            boundary = Some(cache.snapshot().map_err(PipelineError::from)?);
+        }
         let prefill_ms = prefill_start.elapsed().as_millis();
         if let Some(cache) = self.model.expert_cache() {
             cache.set_scratch_mode(false);
@@ -1073,9 +1025,10 @@ impl Qwen4ExpPipeline {
         // дописать в кэш свои токены; сравнение префикса на следующем ходу
         // идёт по `ids`, откат — по снимку.
         if let (Some(s), Some(snap)) = (session, boundary) {
-            s.ids = prompt_ids.to_vec();
+            let kept = &prompt_ids[..split.unwrap_or(prompt_ids.len())];
+            s.ids = kept.to_vec();
             s.snap = Some(snap);
-            s.media = media_sigs(inputs, prompt_ids)?;
+            s.media = media_sigs(inputs, kept)?;
         }
 
         Ok((
@@ -1088,6 +1041,105 @@ impl Qwen4ExpPipeline {
             },
             reuse,
         ))
+    }
+
+    /// Префилл отрезка `span` промпта поверх `cache` (его `seq_len` стоит на
+    /// `span.start`). Возвращает логиты последней позиции отрезка; `stream`
+    /// — куда положить её поток для MTP-головы (нужен только последнему
+    /// отрезку хода).
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_span(
+        &self,
+        prompt_ids: &[u32],
+        media: &[(u32, Tensor)],
+        cache: &mut ModelCache,
+        span: std::ops::Range<usize>,
+        by_layers: bool,
+        chunk: &mut usize,
+        cfg: &GenerationConfig,
+        pos: RopePositions,
+        sink: &mut dyn StreamSink,
+        mut stream: Option<&mut Option<Tensor>>,
+    ) -> Result<Tensor, PipelineError> {
+        let tokens = &prompt_ids[span.clone()];
+        // Отрезку достаются только те строки медиа, чьи заполнители в нём.
+        let span_media = media_for_chunk(prompt_ids, media, span.start, tokens.len())?;
+        // Короткий отрезок (хвост за точкой возврата) послойно не гоняем:
+        // поднимать ради него всю стопку экспертов незачем.
+        if by_layers && tokens.len() > cfg.prefill_batch {
+            // Страховка послойного прохода: оценка чанка по свободной VRAM —
+            // лишь оценка, а OOM посреди слоя иначе роняет весь ход (synthos
+            // повторяет его с тем же чанком). Откатываем кэш к состоянию до
+            // отрезка и идём чанком вдвое меньше.
+            let pre_prefill = cache.snapshot().map_err(PipelineError::from)?;
+            loop {
+                let attempt = no_grad(|| -> Result<_, ModelError> {
+                    let (hidden, last_stream) =
+                        self.model.prefill_by_layers(tokens, &span_media, cache, *chunk, pos)?;
+                    if let Some(out) = stream.as_deref_mut() {
+                        *out = Some(last_stream);
+                    }
+                    self.model.lm_head_forward(&hidden)
+                });
+                match attempt {
+                    Ok(l) => return Ok(l),
+                    Err(e) if *chunk > MIN_LAYER_CHUNK && is_oom(&e) => {
+                        cache.restore(&pre_prefill).map_err(PipelineError::from)?;
+                        if let Some(out) = stream.as_deref_mut() {
+                            *out = None;
+                        }
+                        let next = (*chunk / 2).max(MIN_LAYER_CHUNK);
+                        eprintln!(
+                            "[qwen4_exp] OOM в послойном префилле на чанке {} ({e}); \
+                             откат кэша, повтор чанком {next}",
+                            *chunk
+                        );
+                        if let Some(ec) = self.model.expert_cache() {
+                            ec.clear_scratch();
+                            if let Device::Cuda(ord) = self.model.device {
+                                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                                let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+                            }
+                            ec.fit_to_vram(activation_reserve_prefill(
+                                &self.config,
+                                tokens.len().min(next),
+                                tokens.len(),
+                            ));
+                        }
+                        *chunk = next;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(no_grad(|| -> Result<_, ModelError> {
+            let mut last = None;
+            let mut offset = span.start;
+            while offset < span.end {
+                // Stop посреди длинного префилла: между чанками, а не только
+                // после первого токена (на 100k+ токенов префилл идёт минутами).
+                if sink.interrupted() {
+                    return Err(ModelError::Forward(synaptix_llm_common::INTERRUPTED.into()));
+                }
+                let take = cfg.prefill_batch.min(span.end - offset);
+                let part = &prompt_ids[offset..offset + take];
+                let slice = media_for_chunk(prompt_ids, media, offset, take)?;
+                let done = offset + take >= span.end;
+                match stream.as_deref_mut().filter(|_| done) {
+                    Some(out) => {
+                        let (hidden, s) =
+                            self.model.forward_media_with_stream(part, &slice, cache, pos)?;
+                        *out = Some(last_row(&s)?);
+                        last = Some(self.model.lm_head_forward(&last_row(&hidden)?)?);
+                    }
+                    None => {
+                        last = Some(self.model.forward_media_last(part, &slice, cache, pos)?);
+                    }
+                }
+                offset += take;
+            }
+            last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))
+        })?)
     }
 }
 

@@ -777,6 +777,8 @@ pub struct LlmKvSession {
     /// другим вложением на её месте префиксом считаться не должен. У
     /// Qwen4Exp то же ведёт сама [`Qwen4ExpSession`].
     media: Vec<MediaSig>,
+    /// Граница точки возврата следующего хода (см. [`Self::set_resume_at`]).
+    resume_at: Option<usize>,
 }
 
 /// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
@@ -850,6 +852,23 @@ impl LlmKvSession {
     /// Сколько токенов контекста рассчитан кэш.
     pub fn ctx_tokens(&self) -> usize {
         self.ctx_tokens
+    }
+
+    /// Поставить точку возврата следующего хода не дальше `at` токенов
+    /// промпта (в токенах, как их отдаёт токенизатор, без BOS). Вызывающий
+    /// называет конец истории перед приглашением к ответу
+    /// (`<|im_start|>assistant\n<think>\n`): следующий промпт может разойтись
+    /// с этим сразу за историей — прерванный ход в историю не попадает, и
+    /// за ней идёт новое сообщение пользователя. Архитектурам с рекуррентным
+    /// состоянием (гибрид, Qwen4Exp) это нужно: их кэш откатывается только
+    /// на точку возврата, и снимок на самом конце промпта в таком случае
+    /// бесполезен — ход уходит в полный префилл. Attention-кэш усекается на
+    /// любой позиции, ему граница не нужна. Действует на один ход.
+    pub fn set_resume_at(&mut self, at: Option<usize>) {
+        match &mut self.kind {
+            SessionKind::Qwen4Exp(s) => s.set_resume_at(at),
+            _ => self.resume_at = at,
+        }
     }
 
     /// Токенов в точке возврата.
@@ -1095,6 +1114,7 @@ fn plain_session(
         ctx_tokens: ctx,
         kind: SessionKind::Plain,
         media: Vec::new(),
+        resume_at: None,
     }))
 }
 
@@ -1184,6 +1204,7 @@ impl Llm {
                     ctx_tokens: ctx,
                     kind: SessionKind::Hybrid { mtp_kv, snap: None, mtp_len: 0, mtp_synced: true },
                     media: Vec::new(),
+                    resume_at: None,
                 }))
             }
             LlmPipeline::MuseGlimmer(p) => {
@@ -1207,6 +1228,7 @@ impl Llm {
                     ctx_tokens: ctx,
                     kind: SessionKind::Muse { dcache },
                     media: Vec::new(),
+                    resume_at: None,
                 }))
             }
             LlmPipeline::Gemma4(p) => {
@@ -1217,6 +1239,7 @@ impl Llm {
                     ctx_tokens: ctx,
                     kind: SessionKind::Plain,
                     media: Vec::new(),
+                    resume_at: None,
                 }))
             }
             // Плотные декодеры на общей модели: сессия — ровно основной KV.
@@ -1235,6 +1258,7 @@ impl Llm {
                     ctx_tokens: ctx,
                     kind: SessionKind::Qwen4Exp(Box::new(session)),
                     media: Vec::new(),
+                    resume_at: None,
                 }))
             }
         }
@@ -1754,6 +1778,8 @@ impl<'a> LlmGeneration<'a> {
                 };
                 // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
                 let ids = p.maybe_prepend_bos(prompt_ids);
+                // Граница — в токенах промпта без BOS.
+                let resume_at = session.resume_at.take().map(|n| n + ids.len() - prompt_ids.len());
                 // Сессия без кэша MTP-головы — ход без спекуляции: тот же
                 // путь, что у медиа-хода, только без вложений.
                 if !(mtp_enabled() && p.has_mtp()) || mtp_kv.layers.is_empty() {
@@ -1785,6 +1811,7 @@ impl<'a> LlmGeneration<'a> {
                         &[],
                         cfg,
                         &mut sink,
+                        resume_at,
                         Some(&mut |at: usize, kv_at: &LlmKvCache| {
                             new_snap = Some(kv_at.snapshot_linear_full()?);
                             new_len = at;
@@ -1842,6 +1869,7 @@ impl<'a> LlmGeneration<'a> {
                     &ids,
                     cfg,
                     &mut sink,
+                    resume_at,
                     &mut |at: usize, kv_at: &LlmKvCache, mtp_at: &LlmKvCache| {
                         new_snap = Some(kv_at.snapshot_linear_full()?);
                         new_mtp_len = mtp_at.seq_len;
@@ -2127,6 +2155,7 @@ impl<'a> LlmGeneration<'a> {
                 let inputs = hybrid_media_inputs(p, media)?;
                 let pairs: Vec<(u32, &Tensor)> = inputs.iter().map(|m| (m.pad, &m.embeds)).collect();
                 let ids = p.maybe_prepend_bos(prompt_ids);
+                let resume_at = session.resume_at.take().map(|n| n + ids.len() - prompt_ids.len());
                 let reuse = session.reusable_media(&ids, &pairs);
                 if reuse > 0 {
                     session.kv.seq_len = reuse;
@@ -2157,6 +2186,7 @@ impl<'a> LlmGeneration<'a> {
                     &inputs,
                     cfg,
                     &mut sink,
+                    resume_at,
                     Some(&mut |at: usize, kv_at: &LlmKvCache| {
                         new_snap = Some(kv_at.snapshot_linear_full()?);
                         new_len = at;

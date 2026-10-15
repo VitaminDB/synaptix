@@ -131,6 +131,7 @@ fn qwen4exp_prefix_kv_survives_media() {
         prompt_block: media.prompt_block.clone(),
         grid_hw: media.grid_hw,
         blocks: media.blocks,
+        layout: media.layout.clone(),
     };
     let (_, t3, reused3) = run(&mut session, &ids2, &other);
     eprintln!("ход 3 (другая картинка): из кэша {reused3} → {t3:?}");

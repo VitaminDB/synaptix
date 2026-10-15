@@ -745,7 +745,7 @@ impl HybridPipeline {
             .model
             .make_kv_cache(1, kv_max)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        self.generate_with_media_resume(&mut kv, prompt_ids, inputs, gen_cfg, sink, None)
+        self.generate_with_media_resume(&mut kv, prompt_ids, inputs, gen_cfg, sink, None, None)
     }
 
     /// Как [`Self::generate_with_media`], но по ГОТОВОМУ кэшу: префилл
@@ -764,6 +764,7 @@ impl HybridPipeline {
     /// Пустой `inputs` — текстовый ход по сессии без MTP-головы (MiniCPM-V
     /// 4.7, гибрид без головы или с выключенным MTP): позиции обычные, путь
     /// тот же — префилл чанками, точка возврата по чанку GDN, device-декод.
+    /// `resume_at` — как у [`Self::generate_mtp_resume`].
     pub fn generate_with_media_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -771,6 +772,7 @@ impl HybridPipeline {
         inputs: &[MediaInput],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
+        resume_at: Option<usize>,
         mut on_prefill: Option<
             &mut dyn FnMut(usize, &synaptix_llm_common::KvCache) -> Result<(), PipelineError>,
         >,
@@ -907,7 +909,7 @@ impl HybridPipeline {
         // `generate_mtp_inner`): разрез посередине его чанка оставляет
         // состояние частичного чанка и расходится с непрерывным префиллом.
         let snap_at = if on_prefill.is_some() {
-            (l / GDN_CHUNK) * GDN_CHUNK
+            (l.min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
         } else {
             0
         };
@@ -1178,7 +1180,7 @@ impl HybridPipeline {
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
         let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
-        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, false, None)
+        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, false, None, None)
     }
 
     pub fn generate_mtp_with_graph(
@@ -1189,7 +1191,7 @@ impl HybridPipeline {
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
         let use_graph = self.mtp_graph_supported();
         let (mut kv, mut mtp_kv) = self.mtp_caches_for(prompt_ids, &gen_cfg)?;
-        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, use_graph, None)
+        self.generate_mtp_inner(&mut kv, &mut mtp_kv, prompt_ids, gen_cfg, sink, use_graph, None, None)
     }
 
     /// MTP-декод по ГОТОВЫМ кэшам: префилл стартует с `kv.seq_len`, то есть
@@ -1200,7 +1202,9 @@ impl HybridPipeline {
     ///
     /// `on_prefill` зовётся сразу после префилла — там вызывающий снимает новую
     /// точку возврата (снапшот GDN + позицию `mtp_kv`), пока декод её не
-    /// продвинул.
+    /// продвинул. `resume_at` — не ставить её дальше этой позиции промпта
+    /// (конец истории перед приглашением к ответу): следующий промпт может
+    /// разойтись с этим сразу за историей.
     pub fn generate_mtp_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -1208,6 +1212,7 @@ impl HybridPipeline {
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
+        resume_at: Option<usize>,
         on_prefill: &mut dyn FnMut(
             usize,
             &synaptix_llm_common::KvCache,
@@ -1215,7 +1220,7 @@ impl HybridPipeline {
         ) -> Result<(), PipelineError>,
     ) -> Result<(Vec<u32>, GenerationStats, MtpStats), PipelineError> {
         let use_graph = self.mtp_graph_supported();
-        self.generate_mtp_inner(kv, mtp_kv, prompt_ids, gen_cfg, sink, use_graph, Some(on_prefill))
+        self.generate_mtp_inner(kv, mtp_kv, prompt_ids, gen_cfg, sink, use_graph, resume_at, Some(on_prefill))
     }
 
     fn mtp_caches_for(
@@ -1238,6 +1243,7 @@ impl HybridPipeline {
         gen_cfg: GenerationConfig,
         sink: &mut dyn StreamSink,
         use_graph: bool,
+        resume_at: Option<usize>,
         mut on_prefill: Option<
             &mut dyn FnMut(
                 usize,
@@ -1302,7 +1308,7 @@ impl HybridPipeline {
         // 47/73/100 — нет). Поэтому хвост промпта после последней кратной
         // границы в кэш-точку не входит и на следующем ходу считается заново.
         let snap_at = if on_prefill.is_some() {
-            (l / GDN_CHUNK) * GDN_CHUNK
+            (l.min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
         } else {
             0
         };

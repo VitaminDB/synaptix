@@ -212,3 +212,78 @@ fn qwen4exp_prefix_kv_matches_full_prefill_on_chat_policy() {
          порча состояния сессии (см. IndexerCache::tail_snapshot)"
     );
 }
+
+/// Прерванный ход: ответ модели в историю не попал, и следующий промпт —
+/// та же история плюс новое сообщение пользователя. Прошлый промпт кончался
+/// приглашением к ответу (`<|im_start|>assistant\n<think>\n`), которого в
+/// новом нет, поэтому точка возврата на конце промпта бесполезна и ход уходил
+/// в полный префилл всей истории. С границей из `history_tokens` точка
+/// стоит на конце истории, и переиспользуется вся история.
+#[test]
+fn qwen4exp_prefix_kv_survives_dropped_turn() {
+    use synaptix::facade::chat::{history_tokens, prompt_for_model};
+    use synaptix::facade::llm::Message;
+
+    let Ok(path) = std::env::var("SYN_QWEN4EXP_BUNDLE") else {
+        eprintln!("SYN_QWEN4EXP_BUNDLE не задан — пропускаем");
+        return;
+    };
+    let policy = optimal_profile(Path::new(&path)).policy;
+    let (model, tok) =
+        load_llm_with_policy(Path::new(&path), policy, &Device::Cuda(0)).expect("load");
+
+    let render = |msgs: &[Message]| -> (Vec<u32>, usize) {
+        let prompt = tok
+            .apply_chat_template_reasoning(msgs, true, true, None, None)
+            .expect("template");
+        let prompt = prompt_for_model(&tok, true, prompt);
+        let ids = tok.encode(&prompt).expect("encode");
+        let history = history_tokens(&tok, msgs, true, None, None, &prompt, &ids)
+            .expect("граница истории");
+        (ids, history)
+    };
+    let tool_result = "src/main.rs src/model/stats.rs src/model/taper.rs \
+                       src/screens/dashboard.rs src/screens/settings.rs Cargo.toml "
+        .repeat(60);
+    let mut msgs = vec![
+        Message::system("You are Syn, a local AI agent. Answer briefly."),
+        Message::user("Осмотри проект /home/master/Projects/quitsmoke."),
+        Message::assistant_turn(
+            "",
+            Some("Начну со списка файлов.".into()),
+            vec![("bash".into(), r#"{"command":"find . -type f"}"#.into())],
+        ),
+        Message::tool_named("bash", tool_result),
+    ];
+
+    let ctx = 16384usize;
+    let max_new = 16usize;
+    let mut session = model
+        .new_kv_session(ctx, max_new)
+        .expect("session")
+        .expect("Qwen4Exp умеет префикс-KV");
+    let turn = |ids: &[u32], history: usize, session: &mut _| -> usize {
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        synaptix::facade::llm::LlmKvSession::set_resume_at(session, Some(history));
+        r.generate_streaming_cached(session, ids, &tok, |_, _| true)
+            .expect("cached turn")
+    };
+
+    // Ход 1: ответ прервали — в историю он не идёт.
+    let (ids1, hist1) = render(&msgs);
+    assert!(hist1 < ids1.len(), "граница внутри промпта");
+    assert_eq!(turn(&ids1, hist1, &mut session), 0);
+
+    // Ход 2: та же история + новое сообщение — переиспользуется вся история.
+    msgs.push(Message::user("Он перезагрузился, продолжай."));
+    let (ids2, hist2) = render(&msgs);
+    assert_eq!(&ids2[..hist1], &ids1[..hist1], "история — префикс нового промпта");
+    assert_ne!(&ids2[..ids1.len()], &ids1[..], "прошлый промпт целиком — не префикс");
+    assert_eq!(turn(&ids2, hist2, &mut session), hist1, "ход 2: переиспользована не вся история");
+
+    // Ход 3: обычный — ответ модели лёг в историю.
+    msgs.push(Message::assistant_turn("Продолжаю.", Some("Ок.".into()), Vec::new()));
+    msgs.push(Message::user("Что дальше?"));
+    let (ids3, hist3) = render(&msgs);
+    assert_eq!(turn(&ids3, hist3, &mut session), hist2, "ход 3: переиспользована не вся история");
+}

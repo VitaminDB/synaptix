@@ -136,6 +136,35 @@ pub fn prompt_for_model(tokenizer: &LlmTokenizer, enable_thinking: bool, prompt:
     }
 }
 
+/// Сколько токенов промпта `ids` занимает история — всё, что стоит до
+/// приглашения к ответу (`<|im_start|>assistant\n<think>\n` у ChatML,
+/// `<start_of_turn>model\n` у Gemma). `prompt` — тот же промпт текстом, как
+/// его собрали из `messages` с `add_generation_prompt` и
+/// [`prompt_for_model`].
+///
+/// Граница для [`crate::facade::llm::LlmKvSession::set_resume_at`]: дальше
+/// неё следующий ход может пойти иначе — прерванный ответ в историю не
+/// попадает, и вместо него в промпте сразу новое сообщение. `None` — шаблон
+/// без приглашения или хвост не лёг на токены отдельно (тогда граница не
+/// нужна или её не найти честно).
+pub fn history_tokens(
+    tokenizer: &LlmTokenizer,
+    messages: &[crate::facade::llm::Message],
+    enable_thinking: bool,
+    effort: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    prompt: &str,
+    ids: &[u32],
+) -> Option<usize> {
+    let history = tokenizer
+        .apply_chat_template_reasoning(messages, false, enable_thinking, effort, tools)
+        .ok()?;
+    let history = prompt_for_model(tokenizer, enable_thinking, history);
+    let tail = prompt.strip_prefix(history.as_str()).filter(|t| !t.is_empty())?;
+    let tail_ids = tokenizer.encode(tail).ok()?;
+    (tail_ids.len() < ids.len() && ids.ends_with(&tail_ids)).then(|| ids.len() - tail_ids.len())
+}
+
 fn gemma4_restore_empty_thinking(prompt: &str) -> String {
     const CLOSE: &str = "<tool_response|>";
     const EMPTY_THOUGHT: &str = "<|channel>thought\n<channel|>";
