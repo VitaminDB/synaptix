@@ -2653,11 +2653,11 @@ fn vlm_offload_guard(path: &Path, device: Device, arch: LlmArch) -> Option<Offlo
     if !HybridPipeline::bundle_has_vision(path) || !crate::facade::arch::has_moe_experts(path) {
         return None;
     }
-    // Квантованный бандл — почти целиком веса; на карте они занимают ~5 %
-    // сверх файла (перемешанные копии NVFP4, слабина пулов): 22.1 ГБ файла →
-    // 23.1 ГБ VRAM у MiniCPM-V 4.7 35B.
+    // Квантованный бандл — почти целиком веса; на карте они занимают ~10 %
+    // сверх файла (перемешанные копии NVFP4, слабина пулов): 22.15 ГБ файла →
+    // 24.2 ГБ VRAM у MiniCPM-V 4.7 35B (23.1 ГиБ по nvidia-smi).
     let weights = std::fs::metadata(path).ok()?.len() as usize;
-    let resident = weights + weights / 20;
+    let resident = weights + weights / 10;
     let (free, _total) = synaptix_core::device::cuda::mem_info(ord).ok()?;
     let reserve = synaptix_llm_qwen3_next_hybrid::pipeline::VISION_RESERVE_BYTES;
     if resident.saturating_add(reserve) <= free {
