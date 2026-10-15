@@ -165,6 +165,8 @@ pub struct ExpertCache {
     scratch_bytes: usize,
     scratch_mode: std::sync::atomic::AtomicBool,
     inner: Mutex<CacheInner>,
+    /// Прогрев после загрузки сделан (один раз на кэш, см. `MoeFfn::warm_cache`).
+    warmed: std::sync::atomic::AtomicBool,
     /// Pinned-зеркало host-весов (`SYN_MOE_PINNED=1`, по умолчанию выключено).
     /// Первая отправка эксперта копирует его в закреплённую память — на слое
     /// 512 экспертов это втрое дороже обычной pageable-копии, — зато повторные
@@ -246,6 +248,7 @@ impl ExpertCache {
             ceiling_bytes: AtomicUsize::new(capacity_bytes),
             scratch_bytes: (capacity_bytes / 4).min(2 << 30),
             scratch_mode: std::sync::atomic::AtomicBool::new(false),
+            warmed: std::sync::atomic::AtomicBool::new(false),
             _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
@@ -490,6 +493,11 @@ impl ExpertCache {
         inner.bytes += bytes;
         inner.order.push_back(key);
         inner.map.insert(key, Resident { expert, used: false, heat: 0, slab });
+    }
+
+    /// Отметить прогрев; `true` — он ещё не делался.
+    pub fn take_warm(&self) -> bool {
+        !self.warmed.swap(true, Ordering::Relaxed)
     }
 
     /// Занято экспертами всего (прогретые + набор префилла).
@@ -1073,6 +1081,32 @@ impl MoeFfn {
     /// Эксперты в RAM с кэшем на карте (шаг декода читает top-k на хосте).
     pub fn offloaded(&self) -> bool {
         self.cache.is_some()
+    }
+
+    /// Поднять эксперта `id` из RAM в кэш на карте под прогрев. `Ok(false)` —
+    /// стопка не в RAM (с диска прогрев стоил бы секунд чтения бандла),
+    /// эксперта нет или он уже резидент.
+    pub fn warm_one(&self, id: usize) -> Result<bool, ModelError> {
+        let (Some(cache), ExpertStore::Resident(all)) = (&self.cache, &self.experts) else {
+            return Ok(false);
+        };
+        if id >= all.len() || cache.contains((self.layer_id, id)) {
+            return Ok(false);
+        }
+        self.resident_expert(id, cache)?;
+        Ok(true)
+    }
+
+    /// Байт на эксперта стопки в RAM (0 — стопка не в RAM).
+    pub fn expert_bytes(&self) -> usize {
+        match &self.experts {
+            ExpertStore::Resident(all) => all.first().map(|e| e.bytes()).unwrap_or(0),
+            ExpertStore::Lazy { .. } => 0,
+        }
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.cfg.num_experts
     }
 
     /// Готов ли слитый декод Qwen-MoE с экспертами в RAM: те же требования,

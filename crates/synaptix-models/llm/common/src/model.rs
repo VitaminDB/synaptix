@@ -2692,6 +2692,56 @@ impl DecoderModel {
         self.graph_decode_ready()
     }
 
+    /// Прогреть кэш экспертов в RAM под декод (один раз за загрузку): ёмкость
+    /// под шаг декода, затем эксперты вразбивку по слоям (i-й эксперт каждого
+    /// слоя, потом i+1-й…) до 85 % ёмкости — так каждому слою достаётся
+    /// доля, а активациям шага остаётся запас (кэш, забитый под ёмкость
+    /// подряд по слоям, оставлял последние слои пустыми и шёл в вытеснения).
+    /// Без оффлоада — ничего.
+    pub fn warm_expert_cache(&self) -> usize {
+        let Some(cache) = &self.expert_cache else { return 0 };
+        if !cache.take_warm() {
+            return 0;
+        }
+        self.fit_expert_cache(1);
+        let started = std::time::Instant::now();
+        let layers: Vec<&crate::moe::MoeFfn> = self
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.mlp {
+                Ffn::Moe(m) => Some(m),
+                Ffn::Dense(_) => b.moe.as_ref().map(|m| &m.ffn),
+            })
+            .filter(|m| m.expert_bytes() > 0)
+            .collect();
+        let budget = cache.capacity_bytes() / 100 * 85;
+        let max_e = layers.iter().map(|m| m.num_experts()).max().unwrap_or(0);
+        let mut n = 0usize;
+        'outer: for id in 0..max_e {
+            for m in &layers {
+                if cache.used_bytes() + m.expert_bytes() > budget {
+                    break 'outer;
+                }
+                match m.warm_one(id) {
+                    Ok(true) => n += 1,
+                    Ok(false) => {}
+                    Err(_) => break 'outer,
+                }
+            }
+        }
+        if n > 0 {
+            if let Some(c) = self.expert_cache_stats() {
+                eprintln!(
+                    "[synaptix] кэш экспертов прогрет: {} экспертов ({:.1} ГБ) за {:.1} с",
+                    n,
+                    c.bytes as f64 / (1u64 << 30) as f64,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
+        n
+    }
+
     /// Статистика кэша экспертов в RAM (`None` — эксперты резидентны).
     pub fn expert_cache_stats(&self) -> Option<crate::moe::ExpertCacheStats> {
         self.blocks.iter().find_map(|b| match &b.mlp {

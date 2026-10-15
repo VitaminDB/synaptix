@@ -1039,6 +1039,10 @@ impl HybridPipeline {
         // (`SYNAPTIX_LLM_PROF`, синхронизирует поток — под захватом нельзя)
         // видел слитый путь декода.
         self.model.fit_expert_cache(1);
+        // Эксперты в RAM: один раз за загрузку поднять их на карту до старта
+        // (первый ход на холодном кэше шёл в 4 раза медленнее); здесь, а не
+        // на загрузке — свободная VRAM уже реальная (веса, MTP, KV на месте).
+        self.model.warm_expert_cache();
         // Без захвата и при экспертах в RAM: слитый шаг читает top-k на хосте.
         let nocapture =
             std::env::var("SYN_GRAPH_NOCAPTURE").as_deref() == Ok("1") || !self.model.graph_decode_ready();
