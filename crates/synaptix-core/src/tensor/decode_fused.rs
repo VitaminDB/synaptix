@@ -76,21 +76,22 @@ impl Tensor {
         if self.layout.numel() != h || hidden_in.layout.numel() != h {
             return Err(SynaptixError::Unsupported("dec_attn_tail: одна строка [.., H]"));
         }
-        if self.dtype() != DType::BF16 || hidden_in.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_attn_tail: только BF16"));
+        let dt = self.dtype();
+        if !matches!(dt, DType::BF16 | DType::F16) || hidden_in.dtype() != dt {
+            return Err(SynaptixError::Unsupported("dec_attn_tail: F16|BF16 одного типа"));
         }
         let dev = self.device();
         let backend = registry::backend_for(dev)?;
         let x = row_tensor(self, "attn_out")?;
         let r = row_tensor(hidden_in, "hidden")?;
         let hidden_layout = hidden_in.layout.clone();
-        let mut hidden_st = alloc(backend, dev, DType::BF16.bytes_for_numel(h))?;
+        let mut hidden_st = alloc(backend, dev, dt.bytes_for_numel(h))?;
 
-        // Буферы выходов по форматам.
+        // Буферы выходов по форматам (`Bf16` — строка в типе счёта).
         let mut bufs: Vec<(Storage, Option<Storage>)> = Vec::with_capacity(outs.len());
         for (_, fmt) in outs {
             match fmt {
-                DecOutFmt::Bf16 => bufs.push((alloc(backend, dev, DType::BF16.bytes_for_numel(h))?, None)),
+                DecOutFmt::Bf16 => bufs.push((alloc(backend, dev, dt.bytes_for_numel(h))?, None)),
                 DecOutFmt::Nvfp4 => {
                     let (pb, sb) = nvfp4_pair_bytes(1, h);
                     bufs.push((alloc(backend, dev, pb)?, Some(alloc(backend, dev, sb)?)));
@@ -111,6 +112,7 @@ impl Tensor {
             }
             let stream = Stream::default_for(dev)?;
             backend.dec_attn_tail(
+                dt,
                 &x.storage,
                 post_w.map(|t| &*t.storage),
                 &r.storage,
@@ -128,7 +130,7 @@ impl Tensor {
             res.push(match (fmt, b) {
                 (DecOutFmt::Bf16, _) => DecOut::Bf16(Tensor::from_parts(
                     Arc::new(a),
-                    Layout::contiguous(Shape::new(vec![1usize, h]), DType::BF16),
+                    Layout::contiguous(Shape::new(vec![1usize, h]), dt),
                 )),
                 (_, Some(s)) => {
                     let (pb, sb) = match fmt {
@@ -146,14 +148,18 @@ impl Tensor {
         Ok((hidden, res))
     }
 
-    /// Хвост FFN-части блока. `self` — выход плотного MLP `[.., H]`;
-    /// `moe_acc` — f32 `[H]` взвешенная сумма экспертов (или `None`);
-    /// `next` — вес нормы входа следующего слоя и нужные форматы (bf16, MXFP8).
-    /// Возвращает `(hidden, next_bf16, next_mxfp8)`.
+    /// Хвост FFN-части блока. `self` — выход плотного MLP (у Qwen-MoE —
+    /// shared-эксперта) `[.., H]`; `moe_acc` — f32 `[H]` взвешенная сумма
+    /// экспертов (или `None`); с пост-нормами веток — раскладка Gemma-4, без
+    /// них — Qwen-MoE: `hidden += acc + self·sigmoid(gate_logit)`, где
+    /// `gate_logit` — (F32-тензор, индекс элемента); `next` — вес нормы входа
+    /// следующего слоя и нужные форматы (строка в типе счёта, MXFP8).
+    /// Возвращает `(hidden, next_row, next_mxfp8)`.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn dec_ffn_tail(
         &self,
         moe_acc: Option<&Tensor>,
+        gate_logit: Option<(&Tensor, usize)>,
         hidden_in: &Tensor,
         w_post_dense: Option<&Tensor>,
         w_post_moe: Option<&Tensor>,
@@ -167,15 +173,21 @@ impl Tensor {
         if self.layout.numel() != h || hidden_in.layout.numel() != h {
             return Err(SynaptixError::Unsupported("dec_ffn_tail: одна строка [.., H]"));
         }
-        if self.dtype() != DType::BF16 || hidden_in.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_ffn_tail: только BF16"));
+        let dt = self.dtype();
+        if !matches!(dt, DType::BF16 | DType::F16) || hidden_in.dtype() != dt {
+            return Err(SynaptixError::Unsupported("dec_ffn_tail: F16|BF16 одного типа"));
         }
         if let Some(acc) = moe_acc {
             if acc.dtype() != DType::F32 || acc.layout.numel() != h {
                 return Err(SynaptixError::Unsupported("dec_ffn_tail: moe_acc — F32[H]"));
             }
-            if w_post_dense.is_none() || w_post_moe.is_none() {
-                return Err(SynaptixError::Unsupported("dec_ffn_tail: MoE-ветке нужны обе пост-нормы"));
+            if w_post_dense.is_some() != w_post_moe.is_some() {
+                return Err(SynaptixError::Unsupported("dec_ffn_tail: пост-нормы веток — обе или ни одной"));
+            }
+        }
+        if let Some((g, i)) = gate_logit {
+            if g.dtype() != DType::F32 || i >= g.numel() || !g.is_contiguous() {
+                return Err(SynaptixError::Unsupported("dec_ffn_tail: gate_logit — элемент F32-тензора"));
             }
         }
         let dev = self.device();
@@ -187,18 +199,20 @@ impl Tensor {
             None => None,
         };
         let hidden_layout = hidden_in.layout.clone();
-        let mut hidden_st = alloc(backend, dev, DType::BF16.bytes_for_numel(h))?;
+        let mut hidden_st = alloc(backend, dev, dt.bytes_for_numel(h))?;
         let (next_w, want_bf16, want_mx) = match next {
             Some((w, b, m)) => (Some(w), b, m),
             None => (None, false, false),
         };
-        let mut nb = if want_bf16 { Some(alloc(backend, dev, DType::BF16.bytes_for_numel(h))?) } else { None };
+        let mut nb = if want_bf16 { Some(alloc(backend, dev, dt.bytes_for_numel(h))?) } else { None };
         let mut nm = if want_mx { Some((alloc(backend, dev, h)?, alloc(backend, dev, h / 32)?)) } else { None };
         {
             let stream = Stream::default_for(dev)?;
             backend.dec_ffn_tail(
+                dt,
                 &x.storage,
                 acc.as_ref().map(|t| &*t.storage),
+                gate_logit.map(|(g, i)| (&*g.storage, g.layout.byte_offset() + i * 4)),
                 &r.storage,
                 w_post_dense.map(|t| &*t.storage),
                 w_post_moe.map(|t| &*t.storage),
@@ -225,17 +239,19 @@ impl Tensor {
         Ok((hidden, next_bf16, next_mx))
     }
 
-    /// `gelu_tanh(gate)·up` → NVFP4-пара `rows × inter`. `gate`/`up` —
-    /// (тензор, смещение в элементах), `stride` — шаг строки в элементах.
-    /// `topk = Some((logits F32[e], pes, k, h))` — тем же запуском top-k
-    /// роутера MoE: вернёт `(idx U32[k], w F32[k], acc F32[h] нулевой)`.
-    #[allow(clippy::type_complexity)]
+    /// `act(gate)·up` → NVFP4-пара `rows × inter` (`silu` — silu вместо
+    /// gelu_tanh). `gate`/`up` — (тензор, смещение в элементах), `stride` —
+    /// шаг строки в элементах. `topk = Some((logits F32[e], pes, k, h))` — тем
+    /// же запуском top-k роутера MoE: вернёт `(idx U32[k], w F32[k], acc F32[h]
+    /// нулевой)`.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn dec_geglu_quant_nvfp4(
         gate: (&Tensor, usize),
         up: (&Tensor, usize),
         stride: usize,
         rows: usize,
         inter: usize,
+        silu: bool,
         topk: Option<(&Tensor, Option<&Tensor>, usize, usize)>,
     ) -> Result<(Tensor, Tensor, Option<(Tensor, Tensor, Tensor)>)> {
         let (g, go) = gate;
@@ -288,6 +304,7 @@ impl Tensor {
                 (&u.storage, u.layout.byte_offset() + uo * esz),
                 stride,
                 dt,
+                silu,
                 &mut packed,
                 &mut scales,
                 rows,
@@ -320,6 +337,7 @@ impl Tensor {
         stride: usize,
         rows: usize,
         inter: usize,
+        silu: bool,
         topk: Option<(&Tensor, Option<&Tensor>, usize, usize)>,
     ) -> Result<(Tensor, Option<(Tensor, Tensor, Tensor)>)> {
         let (g, go) = gate;
@@ -370,6 +388,7 @@ impl Tensor {
                 (&u.storage, u.layout.byte_offset() + uo * esz),
                 stride,
                 dt,
+                silu,
                 &mut out,
                 rows,
                 inter,
@@ -391,8 +410,8 @@ impl Tensor {
     /// Возвращает F32 `[E]`.
     pub fn dec_router_logits(&self, w: &Tensor) -> Result<Tensor> {
         let h = *self.dims().last().ok_or(SynaptixError::Unsupported("dec_router_logits: scalar"))?;
-        if self.layout.numel() != h || self.dtype() != DType::BF16 {
-            return Err(SynaptixError::Unsupported("dec_router_logits: одна bf16-строка"));
+        if self.layout.numel() != h || !matches!(self.dtype(), DType::BF16 | DType::F16) {
+            return Err(SynaptixError::Unsupported("dec_router_logits: одна строка F16|BF16"));
         }
         if w.dtype() != DType::F32 || w.rank() != 2 || w.dims()[1] != h || !w.is_contiguous() || w.layout.byte_offset() != 0 {
             return Err(SynaptixError::Unsupported("dec_router_logits: вес F32 [E, H] подряд"));
@@ -403,7 +422,7 @@ impl Tensor {
         let x = row_tensor(self, "router_in")?;
         let mut out = alloc(backend, dev, e * 4)?;
         let stream = Stream::default_for(dev)?;
-        backend.dec_router_logits(&w.storage, (&x.storage, x.layout.byte_offset()), &mut out, e, h, &stream)?;
+        backend.dec_router_logits(self.dtype(), &w.storage, (&x.storage, x.layout.byte_offset()), &mut out, e, h, &stream)?;
         Ok(Tensor::from_parts(Arc::new(out), Layout::contiguous(Shape::new(vec![e]), DType::F32)))
     }
 

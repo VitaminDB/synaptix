@@ -4897,6 +4897,7 @@ impl Backend for CudaBackend {
     #[allow(clippy::too_many_arguments)]
     fn dec_attn_tail(
         &self,
+        dtype: DType,
         attn_out: &Storage,
         post_w: Option<&Storage>,
         hidden_in: &Storage,
@@ -4911,7 +4912,12 @@ impl Backend for CudaBackend {
         use crate::fused::llm_decode::{self as ld, Nvfp4Out};
         let (ctx, stream) = ctx_stream_of(attn_out, "dec_attn_tail")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
-        // Выходы по позиции: 0 → a, 1 → b (NVFP4-пара или bf16), 2 → c (bf16).
+        let bf16 = match dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_attn_tail: dtype F16|BF16")),
+        };
+        // Выходы по позиции: 0 → a, 1 → b (квант-пара или строка), 2 → c (строка).
         let mut a = Nvfp4Out::default();
         let mut b = Nvfp4Out::default();
         let (mut w_c, mut c_out) = (0u64, 0u64);
@@ -4927,10 +4933,15 @@ impl Backend for CudaBackend {
                     packed: dptr(packed, 0, "dec_attn_tail: packed")?,
                     scales: dptr(scales, 0, "dec_attn_tail: scales")?,
                     bf16: 0,
+                    mx: false,
                 },
-                DecNormOut::Mxfp8 { .. } => {
-                    return Err(SynaptixError::Unsupported("dec_attn_tail: MXFP8-выход не поддержан"))
-                }
+                DecNormOut::Mxfp8 { packed, scales } => Nvfp4Out {
+                    w,
+                    packed: dptr(packed, 0, "dec_attn_tail: mx packed")?,
+                    scales: dptr(scales, 0, "dec_attn_tail: mx scales")?,
+                    bf16: 0,
+                    mx: true,
+                },
             };
             match i {
                 0 => a = slot,
@@ -4947,6 +4958,7 @@ impl Backend for CudaBackend {
         ld::attn_tail(
             &k,
             &stream,
+            bf16,
             dptr(attn_out, 0, "dec_attn_tail: attn_out")?,
             dptr_opt(post_w, "dec_attn_tail: post_w")?,
             dptr(hidden_in, 0, "dec_attn_tail: hidden_in")?,
@@ -4964,8 +4976,10 @@ impl Backend for CudaBackend {
     #[allow(clippy::too_many_arguments)]
     fn dec_ffn_tail(
         &self,
+        dtype: DType,
         dense_out: &Storage,
         moe_acc: Option<&Storage>,
+        gate_logit: Option<(&Storage, usize)>,
         hidden_in: &Storage,
         w_post_dense: Option<&Storage>,
         w_post_moe: Option<&Storage>,
@@ -4983,6 +4997,15 @@ impl Backend for CudaBackend {
         use crate::fused::llm_decode as ld;
         let (ctx, stream) = ctx_stream_of(dense_out, "dec_ffn_tail")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let bf16 = match dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_ffn_tail: dtype F16|BF16")),
+        };
+        let gate = match gate_logit {
+            Some((st, off)) => dptr(st, off, "dec_ffn_tail: gate_logit")?,
+            None => 0,
+        };
         let (mxp, mxs) = match next_mx {
             Some((p, s)) => (dptr(p, 0, "dec_ffn_tail: mx packed")?, dptr(s, 0, "dec_ffn_tail: mx scales")?),
             None => (0, 0),
@@ -4990,8 +5013,10 @@ impl Backend for CudaBackend {
         ld::ffn_tail(
             &k,
             &stream,
+            bf16,
             dptr(dense_out, 0, "dec_ffn_tail: dense")?,
             dptr_opt(moe_acc, "dec_ffn_tail: moe_acc")?,
+            gate,
             dptr(hidden_in, 0, "dec_ffn_tail: hidden_in")?,
             dptr_opt(w_post_dense, "dec_ffn_tail: post_dense")?,
             dptr_opt(w_post_moe, "dec_ffn_tail: post_moe")?,
@@ -5018,6 +5043,7 @@ impl Backend for CudaBackend {
         up: (&Storage, usize),
         stride: usize,
         dtype: DType,
+        silu: bool,
         packed: &mut Storage,
         scales: &mut Storage,
         rows: usize,
@@ -5051,6 +5077,7 @@ impl Backend for CudaBackend {
             &k,
             &stream,
             bf16,
+            silu,
             dptr(gate.0, gate.1, "dec_geglu_quant_nvfp4: gate")?,
             dptr(up.0, up.1, "dec_geglu_quant_nvfp4: up")?,
             stride as u64,
@@ -5068,6 +5095,7 @@ impl Backend for CudaBackend {
         up: (&Storage, usize),
         stride: usize,
         dtype: DType,
+        silu: bool,
         out: &mut Storage,
         rows: usize,
         inter: usize,
@@ -5099,6 +5127,7 @@ impl Backend for CudaBackend {
             &k,
             &stream,
             bf16,
+            silu,
             dptr(gate.0, gate.1, "dec_geglu: gate")?,
             dptr(up.0, up.1, "dec_geglu: up")?,
             stride as u64,
@@ -5111,6 +5140,7 @@ impl Backend for CudaBackend {
 
     fn dec_router_logits(
         &self,
+        dtype: DType,
         w: &Storage,
         x: (&Storage, usize),
         out: &mut Storage,
@@ -5121,9 +5151,15 @@ impl Backend for CudaBackend {
         use crate::fused::llm_decode as ld;
         let (ctx, stream) = ctx_stream_of(w, "dec_router_logits")?;
         let k = ld::LlmDecodeKernels::for_context(&ctx)?;
+        let bf16 = match dtype {
+            DType::BF16 => true,
+            DType::F16 => false,
+            _ => return Err(SynaptixError::Unsupported("dec_router_logits: dtype F16|BF16")),
+        };
         ld::router_logits(
             &k,
             &stream,
+            bf16,
             dptr(w, 0, "dec_router_logits: w")?,
             dptr(x.0, x.1, "dec_router_logits: x")?,
             dptr(out, 0, "dec_router_logits: out")?,

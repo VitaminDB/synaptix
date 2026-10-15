@@ -136,7 +136,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
 
 /// Плотный путь Qwen3 молча загрузил бы MoE-модель (`qwen3_moe`, `qwen2_moe`,
 /// `mixtral`…) без экспертов и упал бы на весах или выдал мусор.
-fn has_moe_experts(path: &Path) -> bool {
+pub fn has_moe_experts(path: &Path) -> bool {
     let Some(bytes) = read_model_file(path, "config.json") else {
         return false;
     };

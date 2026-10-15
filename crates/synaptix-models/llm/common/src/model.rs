@@ -463,6 +463,21 @@ impl FullAttn {
 }
 
 impl LinearAttn {
+    /// Формат квант-активации для слитого декода: все четыре входные проекции
+    /// одного квант-формата (MXFP8|NVFP4) — один групповой GEMV, device-зеркала
+    /// состояния и F16-норма на месте, `out_proj` квантован.
+    fn fused_fmt(&self) -> Option<DType> {
+        let fmt = self.in_proj_qkv.quant_dtype()?;
+        if !matches!(fmt, DType::MXFP8 | DType::NVFP4) {
+            return None;
+        }
+        let same = [&self.in_proj_z, &self.in_proj_a, &self.in_proj_b]
+            .iter()
+            .all(|l| l.quant_dtype() == Some(fmt));
+        let mirrors = self.conv_w_dev.is_some() && self.a_log_dev.is_some() && self.dt_bias_dev.is_some() && self.norm_w_f16.is_some();
+        (same && mirrors && self.out_proj.quant_dtype().is_some() && self.num_v_heads % 16 == 0).then_some(fmt)
+    }
+
     fn bytes(&self) -> usize {
         self.in_proj_qkv.bytes()
             + self.in_proj_a.bytes()
@@ -2732,6 +2747,24 @@ impl DecoderModel {
         let mut h_pair: Option<(Tensor, Tensor)> = None;
         for idx in 0..nb {
             let blk = &self.blocks[idx];
+            if b == 1 && self.fused_hybrid_ok(blk) {
+                let next_blk = if idx + 1 < nb { Some(&self.blocks[idx + 1]) } else { None };
+                let (new_hidden, next_h, next_pair) = self.forward_block_fused_hybrid(
+                    blk,
+                    next_blk,
+                    &h,
+                    h_pair.take(),
+                    &hidden,
+                    &mut kv.layers[idx],
+                    state,
+                )?;
+                hidden = new_hidden;
+                if let Some(nh) = next_h {
+                    h = nh;
+                }
+                h_pair = next_pair;
+                continue;
+            }
             let cache_bf16 = matches!(&kv.layers[idx], LayerCache::Full(l) if l.k.dtype() == DType::BF16 && l.v.dtype() == DType::BF16);
             let dense = !self.fused_block_ok(blk) && self.fused_block_dense_ok(blk);
             if b == 1 && cache_bf16 && (dense || self.fused_block_ok(blk)) {
@@ -2849,6 +2882,231 @@ impl DecoderModel {
     /// BF16-счёт, полное внимание с квант-проекциями одного формата
     /// (MXFP8|NVFP4), плотный MLP NVFP4 с gelu_tanh, плотный BF16-KV, у
     /// MoE-ветки — слитый путь. Qwen/Muse (silu, F16) остаются на прежнем.
+    /// Годится ли блок для слитого шага Qwen-гибрида (`forward_block_fused_hybrid`):
+    /// счёт F16 (GDN-ядро декода F16-нативное), FP4 MMA, без сэндвич-норм, PLE
+    /// и множителя слоя; FFN — Qwen-MoE с готовым слитым путём; линейное
+    /// внимание — с квантованными проекциями одного формата (полное внимание
+    /// идёт прежним device-путём, слитыми остаются хвост и MoE).
+    fn fused_hybrid_ok(&self, blk: &Block) -> bool {
+        if self.dtype != DType::F16 || fused_decode_disabled() || !self.native_fp4() {
+            return false;
+        }
+        if blk.post_attn_norm.is_some() || blk.post_mlp_norm.is_some() || blk.ple.is_some() || blk.layer_scalar.is_some_and(|a| a != 1.0) {
+            return false;
+        }
+        if self.config.hidden_size % 32 != 0 || blk.moe.is_some() {
+            return false;
+        }
+        let ffn_ok = match &blk.mlp {
+            Ffn::Moe(m) => m.fused_qwen_ready(),
+            // Плотный silu-MLP NVFP4 (Qwen3.5/3.6/3.8): gate|up одним GEMV,
+            // silu с квантом, down — три запуска вместо восьми.
+            Ffn::Dense(mlp) => {
+                mlp.activation == Activation::Silu
+                    && mlp.gate_proj.quant_dtype() == Some(DType::NVFP4)
+                    && mlp.up_proj.quant_dtype() == Some(DType::NVFP4)
+                    && mlp.down_proj.quant_dtype() == Some(DType::NVFP4)
+                    && mlp.gate_proj.quant_weight().map(|w| w.n()) == mlp.up_proj.quant_weight().map(|w| w.n())
+            }
+        };
+        if !ffn_ok {
+            return false;
+        }
+        match &blk.mixer {
+            Mixer::Linear(la) => la.fused_fmt().is_some(),
+            Mixer::Full(_) => true,
+        }
+    }
+
+    /// Шаг декода блока Qwen-гибрида слитыми ядрами (F16). Линейное внимание:
+    /// квант-пара входа (от хвоста прошлого слоя либо из `h`) → групповые
+    /// GEMV четырёх проекций (двумя запусками: до трёх весов на запуск) →
+    /// ядро GDN-шага → `out_proj`. Полное внимание — прежний device-путь.
+    /// Хвост после внимания одним ядром: residual + норма входа FFN сразу в
+    /// трёх видах — NVFP4-пара для экспертов, пара формата shared-эксперта и
+    /// F16-строка для роутера. MoE: логиты роутера вместе с логитом sigmoid-
+    /// гейта shared-эксперта (одна матрица `[E + 1, H]`), gate|up shared одним
+    /// GEMV, silu·up + top-k одним ядром, `down` shared, эксперты — индексный
+    /// GEMV gate|up, silu с квантом, индексный GEMV down с f32-суммой; хвост
+    /// FFN: `hidden += acc + shared·sigmoid(gate)` и норма входа следующего
+    /// слоя (строка и MXFP8-пара под его MXFP8-проекции). ~14 запусков на слой
+    /// против ~45 у поэлементного пути.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn forward_block_fused_hybrid(
+        &self,
+        blk: &Block,
+        next_blk: Option<&Block>,
+        h: &Tensor,
+        h_pair: Option<(Tensor, Tensor)>,
+        hidden: &Tensor,
+        cache: &mut LayerCache,
+        state: &mut DecodeState,
+    ) -> Result<(Tensor, Option<Tensor>, Option<(Tensor, Tensor)>), ModelError> {
+        use synaptix_core::tensor::decode_fused::{DecOut, DecOutFmt};
+        let dev = self.device;
+        let hsz = self.config.hidden_size;
+        let hidden_row = hidden.reshape(vec![1usize, hsz]).coerr()?;
+        let h_row = h.reshape(vec![1usize, hsz]).coerr()?;
+
+        // ── внимание ──
+        let attn_out = match &blk.mixer {
+            Mixer::Linear(la) => {
+                let fmt = la.fused_fmt().ok_or_else(|| missing("fused_fmt"))?;
+                let st = match cache {
+                    LayerCache::Linear(s) => s,
+                    LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+                };
+                if st.conv_state_dev.is_none() || st.ssm_state_dev.is_none() {
+                    st.sync_to_device(dev, la.conv_dim, la.conv_k, la.num_v_heads, la.dk, la.dv).coerr()?;
+                }
+                let pair = match h_pair {
+                    Some(p) => p,
+                    None => prof(dev, "attn_quant", || match fmt {
+                        DType::MXFP8 => h_row.mxfp8_quantize_act(),
+                        _ => h_row.nvfp4_quantize_act(),
+                    })
+                    .coerr()?,
+                };
+                let w_qkv = la.in_proj_qkv.quant_weight().ok_or_else(|| missing("in_proj_qkv quant"))?;
+                let w_z = la.in_proj_z.quant_weight().ok_or_else(|| missing("in_proj_z quant"))?;
+                let w_a = la.in_proj_a.quant_weight().ok_or_else(|| missing("in_proj_a quant"))?;
+                let w_b = la.in_proj_b.quant_weight().ok_or_else(|| missing("in_proj_b quant"))?;
+                let (p1, _) = prof(dev, "lin_in_qkv", || {
+                    Tensor::dec_gemv_grouped(&[w_qkv, w_z, w_a], &pair.0, &pair.1, DType::F16, None)
+                })
+                .coerr()?;
+                let (p2, _) = prof(dev, "lin_in_b", || Tensor::dec_gemv_grouped(&[w_b], &pair.0, &pair.1, DType::F16, None)).coerr()?;
+                let nv = la.num_v_heads;
+                let qkv = p1.narrow(1, 0, la.conv_dim).coerr()?;
+                let z = p1.narrow(1, la.conv_dim, la.value_dim).coerr()?;
+                let a = p1.narrow(1, la.conv_dim + la.value_dim, nv).coerr()?;
+                let conv_w = la.conv_w_dev.as_ref().ok_or_else(|| missing("conv_w_dev"))?;
+                let a_log = la.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
+                let dt_bias = la.dt_bias_dev.as_ref().ok_or_else(|| missing("dt_bias_dev"))?;
+                let norm_w = la.norm_w_f16.as_ref().ok_or_else(|| missing("norm_w_f16"))?;
+                let cs = st.conv_state_dev.as_mut().ok_or_else(|| missing("conv_state_dev"))?;
+                let ss = st.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev"))?;
+                let out = prof(dev, "lin_gdr_step", || {
+                    qkv.linear_attn_decode_step(
+                        conv_w, &a, &p2, dt_bias, a_log, &z, norm_w, cs, ss,
+                        la.num_k_heads, la.num_v_heads, la.dk, la.dv, la.conv_k,
+                        la.q_scale, la.rms_eps, false,
+                    )
+                })
+                .coerr()?;
+                prof(dev, "lin_oproj", || la.out_proj.forward(&out))?
+            }
+            Mixer::Full(fa) => {
+                let cache_idx_out = fa.forward_decode_dev(h, cache, state)?;
+                cache_idx_out.reshape(vec![1usize, hsz]).coerr()?
+            }
+        };
+        let attn_out = attn_out.reshape(vec![1usize, hsz]).coerr()?;
+
+        let next = next_blk.map(|nb| {
+            let want_mx = self.fused_hybrid_ok(nb)
+                && matches!(&nb.mixer, Mixer::Linear(la) if la.fused_fmt() == Some(DType::MXFP8));
+            (&nb.pre_attn_norm, true, want_mx)
+        });
+
+        // ── плотный silu-MLP: norm → gate|up → silu·up (NVFP4) → down → хвост ──
+        let m = match &blk.mlp {
+            Ffn::Moe(m) => m,
+            Ffn::Dense(mlp) => {
+                let outs: [(&Tensor, DecOutFmt); 1] = [(&blk.pre_mlp_norm, DecOutFmt::Nvfp4)];
+                let (hidden2, tails) = prof(dev, "attn_tail", || {
+                    attn_out.dec_attn_tail(None, &hidden_row, &outs, blk.post_eps, blk.rms_eps)
+                })
+                .coerr()?;
+                let (mp, ms) = tails[0].pair().ok_or_else(|| missing("пара MLP"))?;
+                let gate = mlp.gate_proj.quant_weight().ok_or_else(|| missing("gate NVFP4"))?;
+                let up = mlp.up_proj.quant_weight().ok_or_else(|| missing("up NVFP4"))?;
+                let down = mlp.down_proj.quant_weight().ok_or_else(|| missing("down NVFP4"))?;
+                let inter = gate.n();
+                let (gu, _) = prof(dev, "mlp_gate_up", || Tensor::dec_gemv_grouped(&[gate, up], mp, ms, DType::F16, None)).coerr()?;
+                let (dp, ds, _) = prof(dev, "mlp_act", || {
+                    Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter, true, None)
+                })
+                .coerr()?;
+                let (dense, _) = prof(dev, "mlp_down", || Tensor::dec_gemv_grouped(&[down], &dp, &ds, DType::F16, None)).coerr()?;
+                let (hidden3, next_h, next_mx) = prof(dev, "ffn_tail", || {
+                    dense.dec_ffn_tail(None, None, &hidden2, None, None, None, 1.0, next, blk.post_eps, blk.rms_eps)
+                })
+                .coerr()?;
+                let hidden3 = hidden3.reshape(vec![1usize, 1, hsz]).coerr()?;
+                let next_h = match next_h {
+                    Some(t) => Some(t.reshape(vec![1usize, 1, hsz]).coerr()?),
+                    None => None,
+                };
+                return Ok((hidden3, next_h, next_mx));
+            }
+        };
+
+        // ── хвост после внимания: residual + норма входа FFN в трёх видах ──
+        let (sh_gate, sh_up, _) = m.shared_quant().ok_or_else(|| missing("shared expert quant"))?;
+        let sh_fmt = match sh_gate.dtype() {
+            DType::MXFP8 => DecOutFmt::Mxfp8,
+            _ => DecOutFmt::Nvfp4,
+        };
+        let outs: [(&Tensor, DecOutFmt); 3] = [
+            (&blk.pre_mlp_norm, DecOutFmt::Nvfp4),
+            (&blk.pre_mlp_norm, sh_fmt),
+            (&blk.pre_mlp_norm, DecOutFmt::Bf16),
+        ];
+        let (hidden2, tails) = prof(dev, "attn_tail", || {
+            attn_out.dec_attn_tail(None, &hidden_row, &outs, blk.post_eps, blk.rms_eps)
+        })
+        .coerr()?;
+        let (ep, es) = tails[0].pair().ok_or_else(|| missing("пара экспертов"))?;
+        let (sp, ss) = tails[1].pair().ok_or_else(|| missing("пара shared"))?;
+        let router_in = match &tails[2] {
+            DecOut::Bf16(t) => t,
+            DecOut::Quant(..) => unreachable!(),
+        };
+
+        // ── MoE: роутер (+ логит гейта shared), shared gate|up, silu + top-k ──
+        let cfg = m.config();
+        let (e, k, inter) = (cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size);
+        let sh_inter = cfg.shared_intermediate_size;
+        let router_gate = m.router_with_gate().ok_or_else(|| missing("router_gate"))?;
+        let logits = prof(dev, "moe_router", || router_in.dec_router_logits(router_gate)).coerr()?;
+        let logits_e = logits.narrow(0, 0, e).coerr()?;
+        let (gu_sh, _) = prof(dev, "moe_shared_gate_up", || {
+            Tensor::dec_gemv_grouped(&[sh_gate, sh_up], sp, ss, DType::F16, None)
+        })
+        .coerr()?;
+        let (h_sh, topk) = prof(dev, "moe_act", || {
+            Tensor::dec_geglu((&gu_sh, 0), (&gu_sh, sh_inter), 2 * sh_inter, 1, sh_inter, true, Some((&logits_e, None, k, hsz)))
+        })
+        .coerr()?;
+        let (idx, w, mut acc) = topk.ok_or_else(|| missing("top-k"))?;
+        let sh_down = m.shared_down().ok_or_else(|| missing("shared down"))?;
+        let dense = prof(dev, "moe_shared_down", || sh_down.forward(&h_sh))?;
+        let dense = dense.reshape(vec![1usize, hsz]).coerr()?;
+
+        // ── эксперты: индексный GEMV gate|up, silu с квантом, down с f32-суммой ──
+        let (gate_up, down) = m.dev_tables().ok_or_else(|| missing("таблицы экспертов"))?;
+        let ferr = |e: SynaptixError| ModelError::Forward(format!("MoE слитый путь: {e}"));
+        let gu = prof(dev, "moe_experts_gate_up", || gate_up.gemv_indexed_rows(&idx, ep, es, false, DType::F16)).map_err(ferr)?;
+        let (hp, hs, _) = prof(dev, "moe_experts_act", || {
+            Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, k, inter, true, None)
+        })
+        .map_err(ferr)?;
+        prof(dev, "moe_experts_down", || down.gemv_indexed_accumulate(&idx, &hp, &hs, true, &w, &mut acc)).map_err(ferr)?;
+
+        // ── хвост FFN: hidden += acc + shared·sigmoid(gate), норма входа следующего слоя ──
+        let (hidden3, next_h, next_mx) = prof(dev, "ffn_tail", || {
+            dense.dec_ffn_tail(Some(&acc), Some((&logits, e)), &hidden2, None, None, None, 1.0, next, blk.post_eps, blk.rms_eps)
+        })
+        .coerr()?;
+        let hidden3 = hidden3.reshape(vec![1usize, 1, hsz]).coerr()?;
+        let next_h = match next_h {
+            Some(t) => Some(t.reshape(vec![1usize, 1, hsz]).coerr()?),
+            None => None,
+        };
+        Ok((hidden3, next_h, next_mx))
+    }
+
     fn fused_block_ok(&self, blk: &Block) -> bool {
         // KV проверяется по факту у слоя (политика может просить MXFP8, а
         // Gemma-4 его не получает ни на одном слое).
@@ -3027,7 +3285,7 @@ impl DecoderModel {
                 _ => None,
             };
             let (dp, ds, topk) = prof(dev, "mlp_act", || {
-                Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
+                Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, inter), 2 * inter, 1, inter, false, topk_req)
             })
             .coerr()?;
             let down = mlp.down_proj.quant_weight().expect("down NVFP4");
@@ -3063,6 +3321,7 @@ impl DecoderModel {
         let (hidden3, next_h, next_mx) = prof(dev, "ffn_tail", || {
             dense.dec_ffn_tail(
                 moe_acc.as_ref(),
+                None,
                 &hidden2,
                 moe_w_dense,
                 moe_w_moe,
@@ -3139,7 +3398,7 @@ impl DecoderModel {
             _ => None,
         };
         let (act, topk) = prof(dev, "mlp_act", || {
-            Tensor::dec_geglu((&gu, 0), (&gu, inter), 2 * inter, 1, inter, topk_req)
+            Tensor::dec_geglu((&gu, 0), (&gu, inter), 2 * inter, 1, inter, false, topk_req)
         })
         .coerr()?;
         let down = mlp.down_proj.quant_weight().expect("down quant");
@@ -3162,6 +3421,7 @@ impl DecoderModel {
         let (hidden3, next_h, _) = prof(dev, "ffn_tail", || {
             dense.dec_ffn_tail(
                 moe_acc.as_ref(),
+                None,
                 &hidden2,
                 moe_w_dense,
                 moe_w_moe,

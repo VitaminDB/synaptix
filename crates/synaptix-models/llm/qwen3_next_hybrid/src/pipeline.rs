@@ -314,6 +314,8 @@ impl HybridPipeline {
             // освобождённую память.
             && self.model.blocks_all_resident()
             && !self.model.embed_on_host()
+            // Эксперты в RAM с кэшем: шаг идёт через хост — графу не годится.
+            && self.model.graph_decode_ready()
     }
 
     /// Захватывать ли MTP-шаг в CUDA-граф. Та же арифметика, что у
@@ -1636,29 +1638,38 @@ impl HybridPipeline {
         let stream = synaptix_core::device::cuda::default_stream(ord)
             .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
 
-        let mut capturer = GraphCapturer::new(3);
-
-        let graph = {
-            let model = &self.model;
-            let state_ref = &mut state;
-            let kv_ref = &mut *kv;
-            no_grad(|| {
-                capturer.capture_with(&stream, |_s| {
-                    model
-                        .forward_decode_dev(state_ref, kv_ref)
-                        .map_err(|e| InferError::Other(e.to_string()))
+        // `SYN_GRAPH_NOCAPTURE=1` — тот же device-шаг без захвата графа:
+        // прямые запуски на каждый токен, чтобы профиль по операциям
+        // (`SYNAPTIX_LLM_PROF`, синхронизирует поток — под захватом нельзя)
+        // видел слитый путь декода.
+        let nocapture = std::env::var("SYN_GRAPH_NOCAPTURE").as_deref() == Ok("1");
+        let graph = if nocapture {
+            None
+        } else {
+            let mut capturer = GraphCapturer::new(3);
+            let graph = {
+                let model = &self.model;
+                let state_ref = &mut state;
+                let kv_ref = &mut *kv;
+                no_grad(|| {
+                    capturer.capture_with(&stream, |_s| {
+                        model
+                            .forward_decode_dev(state_ref, kv_ref)
+                            .map_err(|e| InferError::Other(e.to_string()))
+                    })
                 })
-            })
-        }
-        .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
-        let _ = graph.upload();
+            }
+            .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
+            let _ = graph.upload();
 
-        // Восстановить S0: warmup+capture продвинули dev linear-state (не
-        // идемпотентно), но host-векторы нетронуты → пере-сеять. KV full-слоёв
-        // идемпотентен (slot L переписан tok0), восстановления не требует.
-        self.model
-            .sync_decode_dev_state(&mut *kv)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            // Восстановить S0: warmup+capture продвинули dev linear-state (не
+            // идемпотентно), но host-векторы нетронуты → пере-сеять. KV full-слоёв
+            // идемпотентен (slot L переписан tok0), восстановления не требует.
+            self.model
+                .sync_decode_dev_state(&mut *kv)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            Some(graph)
+        };
 
         // decode_ms измеряет ЧИСТЫЙ replay (steady-state throughput); capture —
         // одноразовая стоимость (warmup×3 + capture + instantiate), не в метрике.
@@ -1675,9 +1686,13 @@ impl HybridPipeline {
                 break;
             }
             state.update(last, pos).map_err(|e| PipelineError::Forward(e.to_string()))?;
-            graph
-                .launch()
-                .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?;
+            match &graph {
+                Some(g) => g
+                    .launch()
+                    .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?,
+                None => no_grad(|| self.model.forward_decode_dev(&mut state, kv))
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?,
+            }
             stream
                 .synchronize()
                 .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;

@@ -1265,6 +1265,7 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     fn dec_attn_tail(
         &self,
+        _dtype: DType,
         _attn_out: &Storage,
         _post_w: Option<&Storage>,
         _hidden_in: &Storage,
@@ -1284,8 +1285,10 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     fn dec_ffn_tail(
         &self,
+        _dtype: DType,
         _dense_out: &Storage,
         _moe_acc: Option<&Storage>,
+        _gate_logit: Option<(&Storage, usize)>,
         _hidden_in: &Storage,
         _w_post_dense: Option<&Storage>,
         _w_post_moe: Option<&Storage>,
@@ -1313,6 +1316,7 @@ pub trait Backend: Send + Sync + 'static {
         _up: (&Storage, usize),
         _stride: usize,
         _dtype: DType,
+        _silu: bool,
         _packed: &mut Storage,
         _scales: &mut Storage,
         _rows: usize,
@@ -1333,6 +1337,7 @@ pub trait Backend: Send + Sync + 'static {
         _up: (&Storage, usize),
         _stride: usize,
         _dtype: DType,
+        _silu: bool,
         _out: &mut Storage,
         _rows: usize,
         _inter: usize,
@@ -1347,6 +1352,7 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     fn dec_router_logits(
         &self,
+        _dtype: DType,
         _w: &Storage,
         _x: (&Storage, usize),
         _out: &mut Storage,

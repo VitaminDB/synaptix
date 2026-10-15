@@ -408,7 +408,12 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
     // — у него свой MTP-граф, от этого флага не зависящий (+11 % на greedy).
     // Пайплайн сам откажется там, где граф невозможен (частичный оффлоад, MoE
     // без device-пути).
-    let graph_decode = matches!(arch, Some(LlmArch::Gemma4) | Some(LlmArch::Qwen3) | Some(LlmArch::Gemma3));
+    // MoE-гибрид (Qwen3.5-MoE, MiniCPM-V 4.7 35B): шаг декода латентный —
+    // 3B активных весов и сотни мелких ядер; слитый device-путь блока под
+    // графом даёт 103 → 120 ток/с (15.10.2026). Плотным гибридам граф по-
+    // прежнему не нужен: они упираются в чтение весов (27B: 30.6 против 30.0).
+    let moe_hybrid = matches!(arch, Some(LlmArch::Hybrid)) && crate::facade::arch::has_moe_experts(path);
+    let graph_decode = matches!(arch, Some(LlmArch::Gemma4) | Some(LlmArch::Qwen3) | Some(LlmArch::Gemma3)) || moe_hybrid;
     OptimalProfile {
         policy,
         graph_decode,
@@ -2642,14 +2647,20 @@ fn vlm_offload_guard(path: &Path, device: Device, arch: LlmArch) -> Option<Offlo
     if arch != LlmArch::Hybrid || offload_mode() != OffloadMode::Auto {
         return None;
     }
-    if !HybridPipeline::bundle_has_vision(path) {
+    // Только эксперты умеют жить в RAM с кэшем; у плотной модели «офлоад» —
+    // это стрим блоков с хоста, в сто раз медленнее резидентной (0.8 против
+    // 38 ток/с у Qwen3.8-27B) — ей лучше упереться в OOM башни, чем в это.
+    if !HybridPipeline::bundle_has_vision(path) || !crate::facade::arch::has_moe_experts(path) {
         return None;
     }
-    // Квантованный бандл — почти целиком веса, которые лягут на карту как есть.
+    // Квантованный бандл — почти целиком веса; на карте они занимают ~5 %
+    // сверх файла (перемешанные копии NVFP4, слабина пулов): 22.1 ГБ файла →
+    // 23.1 ГБ VRAM у MiniCPM-V 4.7 35B.
     let weights = std::fs::metadata(path).ok()?.len() as usize;
+    let resident = weights + weights / 20;
     let (free, _total) = synaptix_core::device::cuda::mem_info(ord).ok()?;
-    let reserve = synaptix_llm_qwen3_next_hybrid::pipeline::VISION_RESERVE_BYTES + (3usize << 30);
-    if weights.saturating_add(reserve) <= free {
+    let reserve = synaptix_llm_qwen3_next_hybrid::pipeline::VISION_RESERVE_BYTES;
+    if resident.saturating_add(reserve) <= free {
         return None;
     }
     eprintln!(

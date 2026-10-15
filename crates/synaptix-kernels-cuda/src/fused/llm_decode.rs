@@ -15,7 +15,10 @@ use crate::kernels::compile::{compile_module, load_fn};
 pub struct LlmDecodeKernels {
     _module: Arc<CudaModule>,
     attn_tail: CudaFunction,
+    attn_tail_f16: CudaFunction,
     ffn_tail: CudaFunction,
+    ffn_tail_f16: CudaFunction,
+    router_logits_f16: CudaFunction,
     geglu_f16: CudaFunction,
     geglu_bf16: CudaFunction,
     attn_prep: CudaFunction,
@@ -42,7 +45,10 @@ impl LlmDecodeKernels {
         let module = compile_module(ctx, src, "llm_decode.cu")?;
         let new = Arc::new(Self {
             attn_tail: load_fn(&module, "dec_attn_tail_bf16")?,
+            attn_tail_f16: load_fn(&module, "dec_attn_tail_f16")?,
             ffn_tail: load_fn(&module, "dec_ffn_tail_bf16")?,
+            ffn_tail_f16: load_fn(&module, "dec_ffn_tail_f16")?,
+            router_logits_f16: load_fn(&module, "dec_router_logits_f16")?,
             geglu_f16: load_fn(&module, "dec_geglu_quant_nvfp4_f16")?,
             geglu_bf16: load_fn(&module, "dec_geglu_quant_nvfp4_bf16")?,
             attn_prep: load_fn(&module, "dec_attn_prep_bf16")?,
@@ -60,29 +66,37 @@ fn launch_err(name: &str, e: cudarc::driver::DriverError) -> SynaptixError {
     SynaptixError::Cuda(format!("launch {name}: {e:?}"))
 }
 
-/// Блок одной строки хвостов: по DEC_MAXE = 4 элемента на нить (строка живёт в
-/// регистрах), до 1024 нитей.
+/// Блок одной строки хвостов: строка живёт в регистрах (DEC_MAXE = 8 на
+/// нить), нитей — H/4 до 4096 (квант-эпилог четвёрками в один проход), выше —
+/// H/8: при 1024 нитях регистров на строку из 8 элементов не хватает
+/// («too many resources requested» у H = 5120).
 fn row_block(h: u32) -> u32 {
-    h.div_ceil(4).next_multiple_of(32).clamp(128, 1024)
+    let per = if h <= 4096 { 4 } else { 8 };
+    h.div_ceil(per).next_multiple_of(32).clamp(128, 1024)
 }
 
-const ROW_MAX_H: u32 = 4 * 1024;
+const ROW_MAX_H: u32 = 8 * 1024;
 
-/// NVFP4-выход нормы: адреса packed и scales (0 — выход выключен).
+/// Выход нормы хвоста: квант-пара (`packed`/`scales`, MXFP8 при `mx`, иначе
+/// NVFP4) либо строка в типе счёта (`row` ≠ 0; `packed`/`scales` тогда 0).
+/// `w == 0` — выход выключен.
 #[derive(Clone, Copy, Default)]
 pub struct Nvfp4Out {
     pub w: u64,
     pub packed: u64,
     pub scales: u64,
-    /// bf16-выход вместо пары (карты без FP4 MMA); `packed`/`scales` тогда 0.
+    /// Строка T вместо пары (карты без FP4 MMA, вход роутера).
     pub bf16: u64,
+    /// Пара MXFP8 (natural), а не NVFP4.
+    pub mx: bool,
 }
 
-/// Хвост после внимания, см. `dec_attn_tail_bf16`.
+/// Хвост после внимания, см. `dec_attn_tail_{bf16,f16}` (`bf16` — тип счёта).
 #[allow(clippy::too_many_arguments)]
 pub fn attn_tail(
     k: &LlmDecodeKernels,
     stream: &Arc<CudaStream>,
+    bf16: bool,
     attn_out: u64,
     post_w: u64,
     hidden_in: u64,
@@ -108,7 +122,8 @@ pub fn attn_tail(
         block_dim: (row_block(h), 1, 1),
         shared_mem_bytes: h * 4,
     };
-    let mut bld = stream.launch_builder(&k.attn_tail);
+    let (a_mx, b_mx) = (i32::from(a.mx), i32::from(b.mx));
+    let mut bld = stream.launch_builder(if bf16 { &k.attn_tail } else { &k.attn_tail_f16 });
     bld.arg(&attn_out)
         .arg(&post_w)
         .arg(&hidden_in)
@@ -117,10 +132,12 @@ pub fn attn_tail(
         .arg(&a.packed)
         .arg(&a.scales)
         .arg(&a.bf16)
+        .arg(&a_mx)
         .arg(&b.w)
         .arg(&b.packed)
         .arg(&b.scales)
         .arg(&b.bf16)
+        .arg(&b_mx)
         .arg(&w_c)
         .arg(&c_out)
         .arg(&hi)
@@ -130,13 +147,16 @@ pub fn attn_tail(
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_attn_tail", e)).map(|_| ())
 }
 
-/// Хвост FFN-части блока, см. `dec_ffn_tail_bf16`.
+/// Хвост FFN-части блока, см. `dec_ffn_tail_{bf16,f16}`. `gate_logit` — адрес
+/// f32-логита sigmoid-гейта shared-эксперта (Qwen-MoE, без пост-норм веток).
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_tail(
     k: &LlmDecodeKernels,
     stream: &Arc<CudaStream>,
+    bf16: bool,
     dense_out: u64,
     moe_acc: u64,
+    gate_logit: u64,
     hidden_in: u64,
     w_post_dense: u64,
     w_post_moe: u64,
@@ -163,9 +183,10 @@ pub fn ffn_tail(
         block_dim: (row_block(h), 1, 1),
         shared_mem_bytes: h * 4,
     };
-    let mut bld = stream.launch_builder(&k.ffn_tail);
+    let mut bld = stream.launch_builder(if bf16 { &k.ffn_tail } else { &k.ffn_tail_f16 });
     bld.arg(&dense_out)
         .arg(&moe_acc)
+        .arg(&gate_logit)
         .arg(&hidden_in)
         .arg(&w_post_dense)
         .arg(&w_post_moe)
@@ -197,14 +218,15 @@ pub struct TopkArgs {
     pub h: u32,
 }
 
-/// gelu_tanh(gate)·up → NVFP4-пара строк, см. `dec_geglu_quant_nvfp4_*`.
-/// `stride` — шаг строки в элементах у gate и up. `topk.e > 0` добавляет блок
-/// с top-k роутера.
+/// act(gate)·up → NVFP4-пара строк, см. `dec_geglu_quant_nvfp4_*`; `silu` —
+/// silu вместо gelu_tanh. `stride` — шаг строки в элементах у gate и up.
+/// `topk.e > 0` добавляет блок с top-k роутера.
 #[allow(clippy::too_many_arguments)]
 pub fn geglu_quant_nvfp4(
     k: &LlmDecodeKernels,
     stream: &Arc<CudaStream>,
     bf16: bool,
+    silu: bool,
     gate: u64,
     up: u64,
     stride: u64,
@@ -235,6 +257,7 @@ pub fn geglu_quant_nvfp4(
         shared_mem_bytes: 0,
     };
     let (te, tk, th) = (topk.e as i32, topk.k as i32, topk.h as i32);
+    let act = i32::from(silu);
     let f = if bf16 { &k.geglu_bf16 } else { &k.geglu_f16 };
     let mut bld = stream.launch_builder(f);
     bld.arg(&gate)
@@ -252,7 +275,8 @@ pub fn geglu_quant_nvfp4(
         .arg(&topk.acc_zero)
         .arg(&te)
         .arg(&tk)
-        .arg(&th);
+        .arg(&th)
+        .arg(&act);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_geglu_quant_nvfp4", e)).map(|_| ())
 }
 
@@ -321,6 +345,7 @@ pub fn geglu_plain(
     k: &LlmDecodeKernels,
     stream: &Arc<CudaStream>,
     bf16: bool,
+    silu: bool,
     gate: u64,
     up: u64,
     stride: u64,
@@ -341,6 +366,7 @@ pub fn geglu_plain(
     let cfg = LaunchConfig { grid_dim: (n.div_ceil(block) + extra, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
     let (ri, ii, stride_i) = (rows as i32, inter as i32, stride as i64);
     let (te, tk, th) = (topk.e as i32, topk.k as i32, topk.h as i32);
+    let act = i32::from(silu);
     let f = if bf16 { &k.geglu_plain_bf16 } else { &k.geglu_plain_f16 };
     let mut bld = stream.launch_builder(f);
     bld.arg(&gate)
@@ -356,19 +382,21 @@ pub fn geglu_plain(
         .arg(&topk.acc_zero)
         .arg(&te)
         .arg(&tk)
-        .arg(&th);
+        .arg(&th)
+        .arg(&act);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_geglu", e)).map(|_| ())
 }
 
-/// Логиты роутера: f32 `w[e, h]` × bf16 `x[h]` → f32 `out[e]`.
-pub fn router_logits(k: &LlmDecodeKernels, stream: &Arc<CudaStream>, w: u64, x: u64, out: u64, e: u32, h: u32) -> Result<()> {
+/// Логиты роутера: f32 `w[e, h]` × `x[h]` (bf16 или f16) → f32 `out[e]`.
+#[allow(clippy::too_many_arguments)]
+pub fn router_logits(k: &LlmDecodeKernels, stream: &Arc<CudaStream>, bf16: bool, w: u64, x: u64, out: u64, e: u32, h: u32) -> Result<()> {
     if h % 4 != 0 {
         return Err(SynaptixError::Cuda(format!("router_logits: H={h} кратно 4")));
     }
     let warps = 8u32;
     let cfg = LaunchConfig { grid_dim: (e.div_ceil(warps), 1, 1), block_dim: (warps * 32, 1, 1), shared_mem_bytes: 0 };
     let (ei, hi) = (e as i32, h as i32);
-    let mut bld = stream.launch_builder(&k.router_logits);
+    let mut bld = stream.launch_builder(if bf16 { &k.router_logits } else { &k.router_logits_f16 });
     bld.arg(&w).arg(&x).arg(&out).arg(&ei).arg(&hi);
     unsafe { bld.launch(cfg) }.map_err(|e| launch_err("dec_router_logits", e)).map(|_| ())
 }

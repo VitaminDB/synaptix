@@ -846,6 +846,9 @@ pub struct MoeFfn {
     /// `[E, H]` в F32: софтмакс роутера считается в полной точности, иначе
     /// на 512 экспертах порядок top-k пляшет от округления.
     router: Tensor,
+    /// Роутер с приписанной строкой sigmoid-гейта shared-эксперта `[E + 1, H]`
+    /// F32 — логиты и гейт одним запуском в слитом декоде Qwen-MoE.
+    router_gate: Option<Tensor>,
     experts: ExpertStore,
     shared: Option<SharedExpert>,
     device: Device,
@@ -971,6 +974,14 @@ impl MoeFfn {
             None
         };
 
+        let router_gate = match &shared {
+            Some(sh) => {
+                let g = sh.router.reshape(vec![1usize, cfg.hidden_size])
+                    .map_err(|e| ModelError::Load(format!("shared_expert_gate: {e}")))?;
+                Some(Tensor::cat(&[&router, &g], 0).map_err(|e| ModelError::Load(format!("роутер с гейтом: {e}")))?)
+            }
+            None => None,
+        };
         Ok(Self {
             cfg,
             cache: None,
@@ -978,11 +989,51 @@ impl MoeFfn {
             dev_tables: None,
             per_expert_scale_dev: None,
             router,
+            router_gate,
             experts: ExpertStore::Resident(Vec::new()),
             shared,
             device,
             compute,
         })
+    }
+
+    /// Таблицы адресов экспертов device-пути `(gate_up, down)`, если готовы.
+    pub fn dev_tables(&self) -> Option<&(ExpertTable, ExpertTable)> {
+        self.dev_tables.as_ref()
+    }
+
+    /// Квант-веса shared-эксперта `(gate, up, down)`; `None` — его нет либо
+    /// он не квантован.
+    pub fn shared_quant(&self) -> Option<(&QuantWeight, &QuantWeight, &QuantWeight)> {
+        let sh = self.shared.as_ref()?;
+        Some((sh.gate.quant_weight()?, sh.up.quant_weight()?, sh.down.quant_weight()?))
+    }
+
+    /// `down` shared-эксперта как слой (для обычного GEMV по строке).
+    pub fn shared_down(&self) -> Option<&QLinear> {
+        self.shared.as_ref().map(|s| &s.down)
+    }
+
+    /// Роутер с приписанной строкой sigmoid-гейта shared-эксперта `[E + 1, H]`.
+    pub fn router_with_gate(&self) -> Option<&Tensor> {
+        self.router_gate.as_ref()
+    }
+
+    /// Готов ли слитый декод Qwen-MoE (`DecoderModel::forward_block_fused_hybrid`):
+    /// нативные NVFP4-таблицы экспертов, silu, shared-эксперт с квантованными
+    /// весами одного формата (gate и up — общим GEMV), нормированный top-k.
+    pub fn fused_qwen_ready(&self) -> bool {
+        let Some((g, d)) = &self.dev_tables else { return false };
+        if g.is_dense() || d.is_dense() || self.cfg.activation != Activation::Silu || !self.cfg.norm_topk_prob {
+            return false;
+        }
+        if self.cfg.per_expert_scale.is_some() || self.router_gate.is_none() {
+            return false;
+        }
+        match self.shared_quant() {
+            Some((sg, su, _)) => sg.dtype() == su.dtype() && matches!(sg.dtype(), DType::NVFP4 | DType::MXFP8),
+            None => false,
+        }
     }
 
     /// Эксперты не материализуются вовсе: роутер и shared expert грузятся как
@@ -1200,7 +1251,7 @@ impl MoeFfn {
         let k = self.cfg.num_experts_per_tok;
         let i = self.cfg.moe_intermediate_size;
         let gu = gate_up.gemv_indexed_dense(idx, x, false).map_err(ferr)?;
-        let (h, _) = Tensor::dec_geglu((&gu, 0), (&gu, i), 2 * i, k, i, None).map_err(ferr)?;
+        let (h, _) = Tensor::dec_geglu((&gu, 0), (&gu, i), 2 * i, k, i, false, None).map_err(ferr)?;
         down.gemv_indexed_dense_acc(idx, &h, true, w, acc).map_err(ferr)
     }
 
@@ -1244,7 +1295,7 @@ impl MoeFfn {
             .gemv_indexed_rows(idx, x.0, x.1, false, DType::F16)
             .map_err(ferr)?;
         let (hp, hs, _) =
-            Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, i), 2 * i, k, i, None).map_err(ferr)?;
+            Tensor::dec_geglu_quant_nvfp4((&gu, 0), (&gu, i), 2 * i, k, i, false, None).map_err(ferr)?;
         down.gemv_indexed_accumulate(idx, &hp, &hs, true, w, acc).map_err(ferr)?;
         Ok(())
     }
