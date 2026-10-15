@@ -985,6 +985,10 @@ impl LinearSnapshot {
 pub struct DecodeState {
     pub input: Tensor,
     pub pos_dev: Tensor,
+    /// Позиция RoPE шага: равна `pos_dev`, кроме декода после M-RoPE-промпта
+    /// (холст картинок MiniCPM/Qwen-VL): там слот KV идёт по токенам, а
+    /// позиция — со сдвигом ([`RopePositions::Shifted`]).
+    pub rope_pos_dev: Tensor,
     pub tcache_dev: Tensor,
     pub ring_pos_dev: Tensor,
     pub ring_len_dev: Tensor,
@@ -1003,8 +1007,20 @@ impl DecodeState {
     }
 
     pub fn update_ring(&mut self, token: u32, pos: u32, ring_start: u32) -> Result<(), ModelError> {
+        self.update_ring_shifted(token, pos, ring_start, 0)
+    }
+
+    /// Как [`Self::update`], но позиция RoPE — `pos + rope_delta` (декод
+    /// после M-RoPE-промпта; слот KV остаётся `pos`).
+    pub fn update_shifted(&mut self, token: u32, pos: u32, rope_delta: i64) -> Result<(), ModelError> {
+        self.update_ring_shifted(token, pos, 0, rope_delta)
+    }
+
+    pub fn update_ring_shifted(&mut self, token: u32, pos: u32, ring_start: u32, rope_delta: i64) -> Result<(), ModelError> {
+        let rope_pos = (pos as i64 + rope_delta).max(0) as u32;
         self.input.write_host_u32(&[token]).coerr()?;
         self.pos_dev.write_host_u32(&[pos]).coerr()?;
+        self.rope_pos_dev.write_host_u32(&[rope_pos]).coerr()?;
         self.tcache_dev.write_host_u32(&[pos + 1]).coerr()?;
         self.ring_pos_dev.write_host_u32(&[pos - ring_start]).coerr()?;
         self.ring_len_dev.write_host_u32(&[pos + 1 - ring_start]).coerr()?;
@@ -1017,6 +1033,7 @@ impl DecodeState {
     pub fn update_batched(&mut self, tokens: &[u32], positions: &[u32]) -> Result<(), ModelError> {
         self.input.write_host_u32(tokens).coerr()?;
         self.pos_dev.write_host_u32(positions).coerr()?;
+        self.rope_pos_dev.write_host_u32(positions).coerr()?;
         let tcache: Vec<u32> = positions.iter().map(|p| p + 1).collect();
         self.tcache_dev.write_host_u32(&tcache).coerr()?;
         Ok(())
@@ -2532,6 +2549,7 @@ impl DecoderModel {
         let dev = self.device;
         let input = Tensor::from_vec(vec![0u32; batch], vec![batch, 1], dev).coerr()?;
         let pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
+        let rope_pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let tcache_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let ring_pos_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
         let ring_len_dev = Tensor::from_vec(vec![0u32; batch], vec![batch], dev).coerr()?;
@@ -2559,6 +2577,7 @@ impl DecoderModel {
         Ok(DecodeState {
             input,
             pos_dev,
+            rope_pos_dev,
             tcache_dev,
             ring_pos_dev,
             ring_len_dev,
@@ -2673,7 +2692,28 @@ impl DecoderModel {
         self.graph_decode_ready()
     }
 
+    /// Статистика кэша экспертов в RAM (`None` — эксперты резидентны).
+    pub fn expert_cache_stats(&self) -> Option<crate::moe::ExpertCacheStats> {
+        self.blocks.iter().find_map(|b| match &b.mlp {
+            Ffn::Moe(m) => m.cache_stats(),
+            Ffn::Dense(_) => b.moe.as_ref().and_then(|m| m.ffn.cache_stats()),
+        })
+    }
+
+    /// Годен ли device-шаг декода ([`Self::forward_decode_dev`]) для захвата
+    /// в CUDA-граф: [`Self::device_step_ready`] и ни одной выгрузки на хост.
     pub fn graph_decode_ready(&self) -> bool {
+        self.device_step_ready_inner(true)
+    }
+
+    /// Годен ли device-шаг декода вообще: как [`Self::graph_decode_ready`],
+    /// но MoE с экспертами в RAM допускается слитым путём (top-k читает
+    /// хост — шаг без захвата графа).
+    pub fn device_step_ready(&self) -> bool {
+        self.device_step_ready_inner(false)
+    }
+
+    fn device_step_ready_inner(&self, capture: bool) -> bool {
         let trace = trace_graph();
         let no = |why: &str| {
             if trace {
@@ -2703,7 +2743,10 @@ impl DecoderModel {
                 }
             }
             if let Ffn::Moe(m) = &b.mlp {
-                if !m.dev_path_ready() {
+                // Без захвата слой с экспертами в RAM годится: слитый путь
+                // читает top-k на хосте, прочие (MXFP8-эксперты крайних
+                // слоёв) идут хост-маршрутизацией внутри device-шага.
+                if !m.dev_path_ready() && (capture || !m.offloaded()) {
                     return no(&format!("эксперты слоя {i} без device-пути"));
                 }
             }
@@ -2719,7 +2762,7 @@ impl DecoderModel {
 
     pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
         let npu = self.npu_decode_ready();
-        if !npu && !self.graph_decode_ready() {
+        if !npu && !self.device_step_ready() {
             return Err(ModelError::Forward(
                 "forward_decode_dev: профиль не поддержан (MoE без device-пути, оффлоад блоков или sliding без ring-KV)".into(),
             ));
@@ -2901,7 +2944,7 @@ impl DecoderModel {
             return false;
         }
         let ffn_ok = match &blk.mlp {
-            Ffn::Moe(m) => m.fused_qwen_ready(),
+            Ffn::Moe(m) => m.fused_qwen_ready() || m.fused_offload_ready(),
             // Плотный silu-MLP NVFP4 (Qwen3.5/3.6/3.8): gate|up одним GEMV,
             // silu с квантом, down — три запуска вместо восьми.
             Ffn::Dense(mlp) => {
@@ -3106,7 +3149,8 @@ impl DecoderModel {
         let dense = dense.reshape(vec![1usize, hsz]).coerr()?;
 
         // ── эксперты: индексный GEMV gate|up, silu с квантом, down с f32-суммой ──
-        let (gate_up, down) = m.dev_tables().ok_or_else(|| missing("таблицы экспертов"))?;
+        let tabs = prof(dev, "moe_experts_tables", || m.fused_expert_tables(&idx))?;
+        let (gate_up, down) = tabs.tables();
         let ferr = |e: SynaptixError| ModelError::Forward(format!("MoE слитый путь: {e}"));
         let gu = prof(dev, "moe_experts_gate_up", || gate_up.gemv_indexed_rows(&idx, ep, es, false, DType::F16)).map_err(ferr)?;
         let (hp, hs, _) = prof(dev, "moe_experts_act", || {
@@ -3943,7 +3987,7 @@ impl FullAttn {
         };
         let q = prof(dev, "attn_qknorm", || apply_opt_head_norm(&q, self.q_norm.as_ref(), self.rms_eps))?;
         let q = if self.rotary_dim > 0 {
-            prof(dev, "attn_rope", || q.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?
+            prof(dev, "attn_rope", || q.rope_apply_dev(rope_cos, rope_sin, &state.rope_pos_dev, self.rotary_dim)).coerr()?
         } else {
             q
         };
@@ -3960,7 +4004,7 @@ impl FullAttn {
             let k = prof(dev, "attn_qknorm", || apply_opt_head_norm(&k, self.k_norm.as_ref(), self.rms_eps))?;
             let v = prof(dev, "attn_vnorm", || apply_opt_head_norm(&v, self.v_norm.as_ref(), self.rms_eps))?;
             let k = if self.rotary_dim > 0 {
-                prof(dev, "attn_rope", || k.rope_apply_dev(rope_cos, rope_sin, &state.pos_dev, self.rotary_dim)).coerr()?
+                prof(dev, "attn_rope", || k.rope_apply_dev(rope_cos, rope_sin, &state.rope_pos_dev, self.rotary_dim)).coerr()?
             } else {
                 k
             };
@@ -4092,7 +4136,7 @@ impl FullAttn {
                 self.v_norm.is_some(),
                 rope_cos,
                 rope_sin,
-                &state.pos_dev,
+                &state.rope_pos_dev,
                 self.rotary_dim,
                 kv_pos,
                 kc,

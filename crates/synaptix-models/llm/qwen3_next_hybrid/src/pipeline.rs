@@ -314,8 +314,9 @@ impl HybridPipeline {
             // освобождённую память.
             && self.model.blocks_all_resident()
             && !self.model.embed_on_host()
-            // Эксперты в RAM с кэшем: шаг идёт через хост — графу не годится.
-            && self.model.graph_decode_ready()
+            // Эксперты в RAM с кэшем: слитый шаг с чтением top-k на хосте —
+            // device-шаг без захвата графа (см. `generate_with_graph_resume`).
+            && self.model.device_step_ready()
     }
 
     /// Захватывать ли MTP-шаг в CUDA-граф. Та же арифметика, что у
@@ -949,6 +950,28 @@ impl HybridPipeline {
         let prefill_ms = t0.elapsed().as_millis();
 
         let mut out: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
+        // Декод device-шагом (слитые ядра, граф при резидентных экспертах):
+        // слот KV — по токенам, позиция RoPE — со сдвигом холста.
+        let device_decode = std::env::var("SYN_GRAPH_DECODE").as_deref() != Ok("0");
+        if device_decode && self.graph_decode_supported() && kv.seq_len == l {
+            let tok0 = sampler.sample(&logits).map_err(PipelineError::from)?;
+            out.push(tok0);
+            let cancelled = !sink.on_token(tok0);
+            let rope_delta = match decode_pos {
+                RopePositions::Shifted(d) => d,
+                _ => 0,
+            };
+            self.model
+                .sync_decode_host_state(kv)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            self.model
+                .sync_decode_dev_state(kv)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let decode_ms =
+                self.decode_device_loop(kv, &mut out, l, rope_delta, &cfg, &eos, &mut sampler, sink, cancelled)?;
+            let new_tokens = out.len();
+            return Ok((out, GenerationStats { prompt_tokens: l, new_tokens, prefill_ms, decode_ms }));
+        }
         let dec_t0 = std::time::Instant::now();
         loop {
             let tok = sampler.sample(&logits).map_err(PipelineError::from)?;
@@ -975,6 +998,133 @@ impl HybridPipeline {
                 decode_ms,
             },
         ))
+    }
+
+    /// Цикл device-декода (общий для текстового и медиа-пути): состояние
+    /// шага, захват графа, когда шаг без выгрузок на хост (иначе прямые
+    /// запуски — эксперты в RAM, `SYN_GRAPH_NOCAPTURE=1`), replay по токену.
+    /// `out` уже держит первый токен (`tok0` на позиции `l`), `rope_delta` —
+    /// сдвиг позиции RoPE после M-RoPE-промпта. Возвращает время декода.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_device_loop(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        out: &mut Vec<u32>,
+        l: usize,
+        rope_delta: i64,
+        gen_cfg: &GenerationConfig,
+        eos: &std::collections::HashSet<u32>,
+        sampler: &mut synaptix_llm_common::generate::TokenSampler,
+        sink: &mut dyn StreamSink,
+        cancelled: bool,
+    ) -> Result<u128, PipelineError> {
+        use synaptix_core::grad::no_grad;
+        use synaptix_infer::graph_capture::GraphCapturer;
+        use synaptix_infer::InferError;
+        let ord = match self.model.device {
+            Device::Cuda(o) => o,
+            _ => return Err(PipelineError::Forward("device-декод требует CUDA".into())),
+        };
+        let tok0 = *out.first().ok_or_else(|| PipelineError::Forward("device-декод без первого токена".into()))?;
+        let mut state = self
+            .model
+            .make_decode_state()
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        state.update_shifted(tok0, l as u32, rope_delta).map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)
+            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
+
+        // `SYN_GRAPH_NOCAPTURE=1` — тот же device-шаг без захвата графа:
+        // прямые запуски на каждый токен, чтобы профиль по операциям
+        // (`SYNAPTIX_LLM_PROF`, синхронизирует поток — под захватом нельзя)
+        // видел слитый путь декода.
+        self.model.fit_expert_cache(1);
+        // Без захвата и при экспертах в RAM: слитый шаг читает top-k на хосте.
+        let nocapture =
+            std::env::var("SYN_GRAPH_NOCAPTURE").as_deref() == Ok("1") || !self.model.graph_decode_ready();
+        let graph = if nocapture {
+            None
+        } else {
+            let mut capturer = GraphCapturer::new(3);
+            let graph = {
+                let model = &self.model;
+                let state_ref = &mut state;
+                let kv_ref = &mut *kv;
+                no_grad(|| {
+                    capturer.capture_with(&stream, |_s| {
+                        model
+                            .forward_decode_dev(state_ref, kv_ref)
+                            .map_err(|e| InferError::Other(e.to_string()))
+                    })
+                })
+            }
+            .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
+            let _ = graph.upload();
+
+            // Восстановить S0: warmup+capture продвинули dev linear-state (не
+            // идемпотентно), но host-векторы нетронуты → пере-сеять. KV full-слоёв
+            // идемпотентен (slot L переписан tok0), восстановления не требует.
+            self.model
+                .sync_decode_dev_state(&mut *kv)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            Some(graph)
+        };
+
+        // decode_ms измеряет ЧИСТЫЙ replay (steady-state throughput); capture —
+        // одноразовая стоимость (warmup×3 + capture + instantiate), не в метрике.
+        let mut cancelled = cancelled;
+        let dec_t0 = std::time::Instant::now();
+        // Replay-loop: обрабатываем out[len-1] на позиции L+len-1 (старт tok0@L),
+        // каждый launch продвигает linear-state на один шаг.
+        while !cancelled && out.len() < gen_cfg.max_new_tokens {
+            let last = *out.last().unwrap();
+            if eos.contains(&last) {
+                break;
+            }
+            let pos = (l + out.len() - 1) as u32;
+            if (pos as usize) >= kv.max_seq {
+                break;
+            }
+            state.update_shifted(last, pos, rope_delta).map_err(|e| PipelineError::Forward(e.to_string()))?;
+            match &graph {
+                Some(g) => g
+                    .launch()
+                    .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?,
+                None => no_grad(|| self.model.forward_decode_dev(&mut state, kv))
+                    .map_err(|e| PipelineError::Forward(e.to_string()))?,
+            }
+            stream
+                .synchronize()
+                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
+            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
+            out.push(tok);
+            cancelled = !sink.on_token(tok);
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+        if synaptix_llm_common::profile::profiling() {
+            let rep = synaptix_llm_common::profile::report();
+            if !rep.is_empty() {
+                eprintln!("[hybrid] этапы MoE:\n{rep}");
+            }
+            if let Some(c) = self.model.expert_cache_stats() {
+                eprintln!(
+                    "[hybrid] кэш экспертов: {} резидентов ({:.2} ГБ), попаданий {}, промахов {}, подкачано {} за {} мс",
+                    c.resident,
+                    c.bytes as f64 / (1u64 << 30) as f64,
+                    c.hits,
+                    c.misses,
+                    c.fetched,
+                    c.fetch_millis
+                );
+            }
+        }
+        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
+        // graph-decode продвинул только device linear-state → вернуть в host, чтобы
+        // следующий ход (prefix-KV-кэш) продолжил host-scan с верного состояния.
+        self.model
+            .sync_decode_host_state(kv)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        Ok(decode_ms)
     }
 
     /// Размеры кэшей MTP-декода под контекст `ctx_tokens` и `max_new` токенов
@@ -1601,6 +1751,10 @@ impl HybridPipeline {
         } else {
             suffix.len().max(1)
         };
+        // Эксперты в RAM: кэш на карте под префилл уступает место активациям
+        // чанка, под декод — забирает почти всё (без этого device-шаг с
+        // кэшем шёл на минимальной ёмкости: 300 резидентов и 75 % промахов).
+        self.model.fit_expert_cache(chunk.min(suffix.len().max(1)));
         let t0 = std::time::Instant::now();
         let mut logits_opt = None;
         let mut off = 0usize;
@@ -1638,83 +1792,8 @@ impl HybridPipeline {
             .sync_decode_dev_state(&mut *kv)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
 
-        let mut state = self
-            .model
-            .make_decode_state()
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        state.update(tok0, l as u32).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)
-            .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
-
-        // `SYN_GRAPH_NOCAPTURE=1` — тот же device-шаг без захвата графа:
-        // прямые запуски на каждый токен, чтобы профиль по операциям
-        // (`SYNAPTIX_LLM_PROF`, синхронизирует поток — под захватом нельзя)
-        // видел слитый путь декода.
-        let nocapture = std::env::var("SYN_GRAPH_NOCAPTURE").as_deref() == Ok("1");
-        let graph = if nocapture {
-            None
-        } else {
-            let mut capturer = GraphCapturer::new(3);
-            let graph = {
-                let model = &self.model;
-                let state_ref = &mut state;
-                let kv_ref = &mut *kv;
-                no_grad(|| {
-                    capturer.capture_with(&stream, |_s| {
-                        model
-                            .forward_decode_dev(state_ref, kv_ref)
-                            .map_err(|e| InferError::Other(e.to_string()))
-                    })
-                })
-            }
-            .map_err(|e| PipelineError::Forward(format!("graph capture: {e}")))?;
-            let _ = graph.upload();
-
-            // Восстановить S0: warmup+capture продвинули dev linear-state (не
-            // идемпотентно), но host-векторы нетронуты → пере-сеять. KV full-слоёв
-            // идемпотентен (slot L переписан tok0), восстановления не требует.
-            self.model
-                .sync_decode_dev_state(&mut *kv)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            Some(graph)
-        };
-
-        // decode_ms измеряет ЧИСТЫЙ replay (steady-state throughput); capture —
-        // одноразовая стоимость (warmup×3 + capture + instantiate), не в метрике.
-        let dec_t0 = std::time::Instant::now();
-        // Replay-loop: обрабатываем out[len-1] на позиции L+len-1 (старт tok0@L),
-        // каждый launch продвигает linear-state на один шаг.
-        while !cancelled && out.len() < gen_cfg.max_new_tokens {
-            let last = *out.last().unwrap();
-            if eos.contains(&last) {
-                break;
-            }
-            let pos = (l + out.len() - 1) as u32;
-            if (pos as usize) >= kv.max_seq {
-                break;
-            }
-            state.update(last, pos).map_err(|e| PipelineError::Forward(e.to_string()))?;
-            match &graph {
-                Some(g) => g
-                    .launch()
-                    .map_err(|e| PipelineError::Forward(format!("graph launch: {e:?}")))?,
-                None => no_grad(|| self.model.forward_decode_dev(&mut state, kv))
-                    .map_err(|e| PipelineError::Forward(e.to_string()))?,
-            }
-            stream
-                .synchronize()
-                .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
-            let tok = sampler.sample(&state.logits).map_err(PipelineError::from)?;
-            out.push(tok);
-            cancelled = !sink.on_token(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-        kv.seq_len = (l + out.len() - 1).min(kv.max_seq);
-        // graph-decode продвинул только device linear-state → вернуть в host, чтобы
-        // следующий ход (prefix-KV-кэш) продолжил host-scan с верного состояния.
-        self.model
-            .sync_decode_host_state(kv)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let decode_ms =
+            self.decode_device_loop(kv, &mut out, l, 0, &gen_cfg, &eos, &mut sampler, sink, cancelled)?;
 
         let stats = GenerationStats {
             prompt_tokens: l,

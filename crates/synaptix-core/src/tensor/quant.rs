@@ -703,6 +703,20 @@ impl ExpertTable {
         Some(Self { w_table, s_table, n, k, count, device, dense: None, _keep: Vec::new() })
     }
 
+    /// Таблица NVFP4 по готовым адресам перемешанных копий и масштабов
+    /// (`[E]`, записи не поднятых экспертов — 0: ядро читает только строки
+    /// выбранных индексов). Для кэша экспертов в RAM: адреса резидентов
+    /// меняются с вытеснением, таблицу перестраивает вызывающий.
+    pub fn from_addrs(n: usize, k: usize, device: Device, w: Vec<i64>, s: Vec<i64>) -> Option<Self> {
+        if w.len() != s.len() || w.is_empty() || !device.is_cuda() {
+            return None;
+        }
+        let count = w.len();
+        let w_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
+        let s_table = Tensor::from_vec::<_, i64>(s, vec![count], device).ok()?;
+        Some(Self { w_table, s_table, n, k, count, device, dense: None, _keep: Vec::new() })
+    }
+
     /// Портируемая таблица: веса любого квант-формата, который умеет
     /// `quant_gemv_indexed` (SQ, типы ggml, NVFP4/MXFP8 движка), считаются по
     /// исходным блобам с плотной активацией. Путь графового декода MoE на

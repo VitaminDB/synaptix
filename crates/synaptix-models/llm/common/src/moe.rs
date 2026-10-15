@@ -833,10 +833,43 @@ impl ExpertStore {
 /// `forward_chunk_segmented`).
 const NOT_NVFP4_EXPERT: &str = "MoE: эксперт не NVFP4";
 
+/// Таблицы адресов экспертов на карте для слоя с кэшем в RAM: записи —
+/// перемешанные копии резидентов кэша. Перед запуском индексных GEMV хост
+/// читает top-k, поднимает промахи и сверяет адреса с зеркалом `addrs`;
+/// расхождение (вытеснение, новая загрузка) перестраивает таблицы. После
+/// прогрева кэша — ни одной пересылки на шаг, кроме чтения top-k.
+pub struct OffloadTables {
+    gate_up: ExpertTable,
+    down: ExpertTable,
+    /// `[E]` — (gate_up: вес, масштабы; down: вес, масштабы), 0 — не поднят.
+    addrs: Vec<[u64; 4]>,
+}
+
+/// Таблицы экспертов под индексные GEMV слитого декода: резидентные либо
+/// собранные по кэшу (держат Arc резидентов до конца запусков).
+pub enum ExpertTables<'a> {
+    Resident(&'a (ExpertTable, ExpertTable)),
+    Offloaded { guard: std::sync::MutexGuard<'a, Option<OffloadTables>>, _keep: Vec<Arc<Expert>> },
+}
+
+impl ExpertTables<'_> {
+    pub fn tables(&self) -> (&ExpertTable, &ExpertTable) {
+        match self {
+            ExpertTables::Resident(t) => (&t.0, &t.1),
+            ExpertTables::Offloaded { guard, .. } => {
+                let t = guard.as_ref().expect("таблицы офлоада построены");
+                (&t.gate_up, &t.down)
+            }
+        }
+    }
+}
+
 pub struct MoeFfn {
     cfg: MoeConfig,
     cache: Option<Arc<ExpertCache>>,
     layer_id: usize,
+    /// Таблицы адресов резидентов кэша (слитый декод с экспертами в RAM).
+    offload_tables: Mutex<Option<OffloadTables>>,
     /// Таблицы адресов экспертов для device-пути (графовый декод). `None` —
     /// путь неприменим: эксперты не резидентны, не NVFP4 либо без
     /// перемешанной копии.
@@ -983,6 +1016,7 @@ impl MoeFfn {
             None => None,
         };
         Ok(Self {
+            offload_tables: Mutex::new(None),
             cfg,
             cache: None,
             layer_id: 0,
@@ -1034,6 +1068,114 @@ impl MoeFfn {
             Some((sg, su, _)) => sg.dtype() == su.dtype() && matches!(sg.dtype(), DType::NVFP4 | DType::MXFP8),
             None => false,
         }
+    }
+
+    /// Эксперты в RAM с кэшем на карте (шаг декода читает top-k на хосте).
+    pub fn offloaded(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    /// Готов ли слитый декод Qwen-MoE с экспертами в RAM: те же требования,
+    /// что у [`Self::fused_qwen_ready`], но эксперты — NVFP4 в кэше на карте
+    /// (таблицы собираются по резидентам, см. [`Self::fused_expert_tables`]).
+    pub fn fused_offload_ready(&self) -> bool {
+        if self.cache.is_none() || self.cfg.activation != Activation::Silu || !self.cfg.norm_topk_prob {
+            return false;
+        }
+        if self.cfg.per_expert_scale.is_some() || self.router_gate.is_none() {
+            return false;
+        }
+        let nvfp4_native = synaptix_core::backend::registry::backend_for(self.device)
+            .map(|b| b.quant_native(DType::NVFP4, self.device))
+            .unwrap_or(false);
+        if !nvfp4_native {
+            return false;
+        }
+        let experts_nvfp4 = match &self.experts {
+            ExpertStore::Resident(all) => all
+                .first()
+                .is_some_and(|e| e.gate_up.quant_dtype() == Some(DType::NVFP4) && e.down.quant_dtype() == Some(DType::NVFP4)),
+            ExpertStore::Lazy { .. } => false,
+        };
+        if !experts_nvfp4 {
+            return false;
+        }
+        match self.shared_quant() {
+            Some((sg, su, _)) => sg.dtype() == su.dtype() && matches!(sg.dtype(), DType::NVFP4 | DType::MXFP8),
+            None => false,
+        }
+    }
+
+    /// Таблицы экспертов под индексные GEMV слитого декода для выбранных
+    /// `idx` (U32 `[k]` на карте). Резидентные эксперты — готовые таблицы;
+    /// с кэшем в RAM — top-k читается на хост, промахи поднимаются, адреса
+    /// резидентов сверяются с зеркалом и при расхождении таблицы собираются
+    /// заново (после прогрева — только чтение top-k).
+    pub fn fused_expert_tables(&self, idx: &Tensor) -> Result<ExpertTables<'_>, ModelError> {
+        let Some(cache) = &self.cache else {
+            return self
+                .dev_tables
+                .as_ref()
+                .map(ExpertTables::Resident)
+                .ok_or_else(|| ModelError::Forward("MoE: нет таблиц экспертов".into()));
+        };
+        use crate::profile::stage;
+        let ids: Vec<u32> = stage("moe:topk_read", || {
+            idx.to_device(Device::Cpu)
+                .and_then(|t| t.to_vec1::<u32>())
+                .map_err(|e| ModelError::Forward(format!("MoE: чтение top-k: {e}")))
+        })?;
+        let ones = vec![1.0f32; ids.len()];
+        stage("moe:prefetch", || self.prefetch(&ids, &ones, true));
+        let mut keep = Vec::with_capacity(ids.len());
+        let mut guard = self
+            .offload_tables
+            .lock()
+            .map_err(|_| ModelError::Forward("MoE: таблицы офлоада отравлены".into()))?;
+        let e = self.cfg.num_experts;
+        let mut dirty = guard.is_none();
+        let mut addrs = match guard.as_ref() {
+            Some(t) => t.addrs.clone(),
+            None => vec![[0u64; 4]; e],
+        };
+        let (mut n_gu, mut k_gu, mut n_dn, mut k_dn) = (0usize, 0usize, 0usize, 0usize);
+        for &id in &ids {
+            let id = id as usize;
+            if id >= e {
+                return Err(ModelError::Forward(format!("MoE: эксперт {id} вне стопки")));
+            }
+            let ex = stage("moe:tables_resident", || self.resident_expert(id, cache))?;
+            let gu = ex.gate_up.quant_weight().ok_or_else(|| ModelError::Forward("MoE: эксперт без кванта".into()))?;
+            let dn = ex.down.quant_weight().ok_or_else(|| ModelError::Forward("MoE: эксперт без кванта".into()))?;
+            stage("moe:tables_shuffle", || -> Result<(), ModelError> {
+                for w in [gu, dn] {
+                    w.ensure_shuffled().map_err(|e| ModelError::Forward(format!("MoE: перемешанная копия: {e}")))?;
+                }
+                Ok(())
+            })?;
+            let (gw, gs) = gu.shuffled_addr().ok_or_else(|| ModelError::Forward("MoE: эксперт без перемешанной копии".into()))?;
+            let (dw, ds) = dn.shuffled_addr().ok_or_else(|| ModelError::Forward("MoE: эксперт без перемешанной копии".into()))?;
+            (n_gu, k_gu, n_dn, k_dn) = (gu.n(), gu.k(), dn.n(), dn.k());
+            let want = [gw, gs, dw, ds];
+            if addrs[id] != want {
+                addrs[id] = want;
+                dirty = true;
+            }
+            keep.push(ex);
+        }
+        if dirty {
+            let _t = stage("moe:tables_build", || ());
+            let gu_w: Vec<i64> = addrs.iter().map(|a| a[0] as i64).collect();
+            let gu_s: Vec<i64> = addrs.iter().map(|a| a[1] as i64).collect();
+            let dn_w: Vec<i64> = addrs.iter().map(|a| a[2] as i64).collect();
+            let dn_s: Vec<i64> = addrs.iter().map(|a| a[3] as i64).collect();
+            let gate_up = ExpertTable::from_addrs(n_gu, k_gu, self.device, gu_w, gu_s)
+                .ok_or_else(|| ModelError::Forward("MoE: таблица gate_up".into()))?;
+            let down = ExpertTable::from_addrs(n_dn, k_dn, self.device, dn_w, dn_s)
+                .ok_or_else(|| ModelError::Forward("MoE: таблица down".into()))?;
+            *guard = Some(OffloadTables { gate_up, down, addrs });
+        }
+        Ok(ExpertTables::Offloaded { guard, _keep: keep })
     }
 
     /// Эксперты не материализуются вовсе: роутер и shared expert грузятся как
