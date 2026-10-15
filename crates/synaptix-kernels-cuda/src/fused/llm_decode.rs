@@ -16,8 +16,12 @@ pub struct LlmDecodeKernels {
     _module: Arc<CudaModule>,
     attn_tail: CudaFunction,
     attn_tail_f16: CudaFunction,
+    attn_tail_w: CudaFunction,
+    attn_tail_f16_w: CudaFunction,
     ffn_tail: CudaFunction,
     ffn_tail_f16: CudaFunction,
+    ffn_tail_w: CudaFunction,
+    ffn_tail_f16_w: CudaFunction,
     router_logits_f16: CudaFunction,
     geglu_f16: CudaFunction,
     geglu_bf16: CudaFunction,
@@ -46,8 +50,12 @@ impl LlmDecodeKernels {
         let new = Arc::new(Self {
             attn_tail: load_fn(&module, "dec_attn_tail_bf16")?,
             attn_tail_f16: load_fn(&module, "dec_attn_tail_f16")?,
+            attn_tail_w: load_fn(&module, "dec_attn_tail_bf16_w")?,
+            attn_tail_f16_w: load_fn(&module, "dec_attn_tail_f16_w")?,
             ffn_tail: load_fn(&module, "dec_ffn_tail_bf16")?,
             ffn_tail_f16: load_fn(&module, "dec_ffn_tail_f16")?,
+            ffn_tail_w: load_fn(&module, "dec_ffn_tail_bf16_w")?,
+            ffn_tail_f16_w: load_fn(&module, "dec_ffn_tail_f16_w")?,
             router_logits_f16: load_fn(&module, "dec_router_logits_f16")?,
             geglu_f16: load_fn(&module, "dec_geglu_quant_nvfp4_f16")?,
             geglu_bf16: load_fn(&module, "dec_geglu_quant_nvfp4_bf16")?,
@@ -66,13 +74,18 @@ fn launch_err(name: &str, e: cudarc::driver::DriverError) -> SynaptixError {
     SynaptixError::Cuda(format!("launch {name}: {e:?}"))
 }
 
-/// Блок одной строки хвостов: строка живёт в регистрах (DEC_MAXE = 8 на
-/// нить), нитей — H/4 до 4096 (квант-эпилог четвёрками в один проход), выше —
-/// H/8: при 1024 нитях регистров на строку из 8 элементов не хватает
-/// («too many resources requested» у H = 5120).
+/// Блок одной строки хвостов: строка живёт в регистрах — по 4 элемента на
+/// нить до H = 4096 (квант-эпилог четвёрками в один проход), выше — ядра
+/// `_w` по 8 на нить на H/8 нитях (1024 нитей по 8 регистровых строк — «too
+/// many resources requested», как у Gemma-4 26B с H = 2816 при E = 8).
 fn row_block(h: u32) -> u32 {
     let per = if h <= 4096 { 4 } else { 8 };
     h.div_ceil(per).next_multiple_of(32).clamp(128, 1024)
+}
+
+/// Широкая строка (H > 4096) — ядро с восемью элементами на нить.
+fn wide(h: u32) -> bool {
+    h > 4096
 }
 
 const ROW_MAX_H: u32 = 8 * 1024;
@@ -123,7 +136,13 @@ pub fn attn_tail(
         shared_mem_bytes: h * 4,
     };
     let (a_mx, b_mx) = (i32::from(a.mx), i32::from(b.mx));
-    let mut bld = stream.launch_builder(if bf16 { &k.attn_tail } else { &k.attn_tail_f16 });
+    let f = match (bf16, wide(h)) {
+        (true, false) => &k.attn_tail,
+        (false, false) => &k.attn_tail_f16,
+        (true, true) => &k.attn_tail_w,
+        (false, true) => &k.attn_tail_f16_w,
+    };
+    let mut bld = stream.launch_builder(f);
     bld.arg(&attn_out)
         .arg(&post_w)
         .arg(&hidden_in)
@@ -183,7 +202,13 @@ pub fn ffn_tail(
         block_dim: (row_block(h), 1, 1),
         shared_mem_bytes: h * 4,
     };
-    let mut bld = stream.launch_builder(if bf16 { &k.ffn_tail } else { &k.ffn_tail_f16 });
+    let f = match (bf16, wide(h)) {
+        (true, false) => &k.ffn_tail,
+        (false, false) => &k.ffn_tail_f16,
+        (true, true) => &k.ffn_tail_w,
+        (false, true) => &k.ffn_tail_f16_w,
+    };
+    let mut bld = stream.launch_builder(f);
     bld.arg(&dense_out)
         .arg(&moe_acc)
         .arg(&gate_logit)

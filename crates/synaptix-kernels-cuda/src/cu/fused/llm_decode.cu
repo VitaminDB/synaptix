@@ -85,8 +85,9 @@ __device__ __forceinline__ void block_sum2(float& a, float& b, float* red) {
 // все векторы грузятся разом в начале ядра — латентности перекрываются, а не
 // выстраиваются в цепочку по фазам. Блок берётся на H/4 нитей (у H=2816 это
 // 704 нити — квант эпилога, четвёрка нитей на группу, укладывается в один
-// проход); запас до 8 на нить — для H до 8192 (Qwen3.8-27B: 5120).
-#define DEC_MAXE 8
+// проход). Хвосты — шаблон по E: 4 до H = 4096, 8 («_w») до 8192
+// (Qwen3.8-27B: 5120) — на H/8 нитях, иначе регистров на блок не хватает.
+#define DEC_MAXE 4
 
 // rms по строке из smem (значения уже f32).
 __device__ __forceinline__ float row_rms(const float* s, int h, float eps, float* red) {
@@ -298,7 +299,7 @@ __device__ __forceinline__ void norm_into(
 // при `*_mx` ≠ 0, иначе NVFP4. Любой выход выключается нулевым указателем
 // веса. T — bf16 (Gemma-4) или f16 (Qwen-гибриды). Один блок; dynamic smem
 // = H·4 байт.
-template <typename T>
+template <typename T, int E>
 __device__ __forceinline__ void attn_tail_impl(
     const T* __restrict__ attn_out,
     const T* __restrict__ post_w,
@@ -316,9 +317,9 @@ __device__ __forceinline__ void attn_tail_impl(
     __shared__ float red[64];
     const int tid = threadIdx.x, bs = blockDim.x;
 
-    float xv[DEC_MAXE], rv[DEC_MAXE], pw[DEC_MAXE], wa[DEC_MAXE], wb[DEC_MAXE], wc[DEC_MAXE];
+    float xv[E], rv[E], pw[E], wa[E], wb[E], wc[E];
     #pragma unroll
-    for (int i = 0; i < DEC_MAXE; ++i) {
+    for (int i = 0; i < E; ++i) {
         int t = tid + i * bs;
         bool ok = t < h;
         xv[i] = ok ? ldf(attn_out + t) : 0.f;
@@ -332,16 +333,16 @@ __device__ __forceinline__ void attn_tail_impl(
     if (post_w) {
         float sq = 0.f;
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) sq += xv[i] * xv[i];
+        for (int i = 0; i < E; ++i) sq += xv[i] * xv[i];
         sq = block_sum(sq, red);
         float rms = rsqrtf(sq / (float)h + eps_post);
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) xv[i] = rnd_t(attn_out, pw[i] * xv[i] * rms);
+        for (int i = 0; i < E; ++i) xv[i] = rnd_t(attn_out, pw[i] * xv[i] * rms);
     }
     // hidden = T(y + residual).
     float sq = 0.f;
     #pragma unroll
-    for (int i = 0; i < DEC_MAXE; ++i) {
+    for (int i = 0; i < E; ++i) {
         int t = tid + i * bs;
         float v = rnd_t(attn_out, xv[i] + rv[i]);
         xv[i] = v;
@@ -355,14 +356,14 @@ __device__ __forceinline__ void attn_tail_impl(
     auto emit = [&](const float* w, unsigned char* packed, unsigned char* scales, T* row, int mx) {
         if (row) {
             #pragma unroll
-            for (int i = 0; i < DEC_MAXE; ++i) {
+            for (int i = 0; i < E; ++i) {
                 int t = tid + i * bs;
                 if (t < h) stf(row + t, w[i] * xv[i] * rms);
             }
             return;
         }
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) {
+        for (int i = 0; i < E; ++i) {
             int t = tid + i * bs;
             if (t < h) s_y[t] = rnd_t(attn_out, w[i] * xv[i] * rms);
         }
@@ -375,32 +376,27 @@ __device__ __forceinline__ void attn_tail_impl(
     if (w_b) emit(wb, b_packed, b_scales, b_row, b_mx);
     if (w_c) {
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) {
+        for (int i = 0; i < E; ++i) {
             int t = tid + i * bs;
             if (t < h) stf(c_out + t, wc[i] * xv[i] * rms);
         }
     }
 }
 
-extern "C" __global__ void dec_attn_tail_bf16(
-    const bf16_t* attn_out, const bf16_t* post_w, const bf16_t* hidden_in, bf16_t* hidden_out,
-    const bf16_t* w_a, unsigned char* a_packed, unsigned char* a_scales, bf16_t* a_row, int a_mx,
-    const bf16_t* w_b, unsigned char* b_packed, unsigned char* b_scales, bf16_t* b_row, int b_mx,
-    const bf16_t* w_c, bf16_t* c_out, int h, float eps_post, float eps, int sf_inner_dim)
-{
-    attn_tail_impl<bf16_t>(attn_out, post_w, hidden_in, hidden_out, w_a, a_packed, a_scales, a_row, a_mx,
-                           w_b, b_packed, b_scales, b_row, b_mx, w_c, c_out, h, eps_post, eps, sf_inner_dim);
+#define DEC_ATTN_TAIL(NAME, T, E) \
+extern "C" __global__ void NAME( \
+    const T* attn_out, const T* post_w, const T* hidden_in, T* hidden_out, \
+    const T* w_a, unsigned char* a_packed, unsigned char* a_scales, T* a_row, int a_mx, \
+    const T* w_b, unsigned char* b_packed, unsigned char* b_scales, T* b_row, int b_mx, \
+    const T* w_c, T* c_out, int h, float eps_post, float eps, int sf_inner_dim) \
+{ \
+    attn_tail_impl<T, E>(attn_out, post_w, hidden_in, hidden_out, w_a, a_packed, a_scales, a_row, a_mx, \
+                         w_b, b_packed, b_scales, b_row, b_mx, w_c, c_out, h, eps_post, eps, sf_inner_dim); \
 }
-
-extern "C" __global__ void dec_attn_tail_f16(
-    const __half* attn_out, const __half* post_w, const __half* hidden_in, __half* hidden_out,
-    const __half* w_a, unsigned char* a_packed, unsigned char* a_scales, __half* a_row, int a_mx,
-    const __half* w_b, unsigned char* b_packed, unsigned char* b_scales, __half* b_row, int b_mx,
-    const __half* w_c, __half* c_out, int h, float eps_post, float eps, int sf_inner_dim)
-{
-    attn_tail_impl<__half>(attn_out, post_w, hidden_in, hidden_out, w_a, a_packed, a_scales, a_row, a_mx,
-                           w_b, b_packed, b_scales, b_row, b_mx, w_c, c_out, h, eps_post, eps, sf_inner_dim);
-}
+DEC_ATTN_TAIL(dec_attn_tail_bf16, bf16_t, 4)
+DEC_ATTN_TAIL(dec_attn_tail_f16, __half, 4)
+DEC_ATTN_TAIL(dec_attn_tail_bf16_w, bf16_t, 8)
+DEC_ATTN_TAIL(dec_attn_tail_f16_w, __half, 8)
 
 // ── Хвост FFN-части блока ────────────────────────────────────────────────
 //
@@ -414,7 +410,7 @@ extern "C" __global__ void dec_attn_tail_f16(
 //            следующего слоя)
 //
 // `moe_acc` — f32-сумма взвешенных выходов экспертов (эпилог индексного GEMV).
-template <typename T>
+template <typename T, int E>
 __device__ __forceinline__ void ffn_tail_impl(
     const T* __restrict__ dense_out,
     const float* __restrict__ moe_acc,
@@ -436,9 +432,9 @@ __device__ __forceinline__ void ffn_tail_impl(
     __shared__ float red[64];
     const int tid = threadIdx.x, bs = blockDim.x;
 
-    float mv[DEC_MAXE], av[DEC_MAXE], hv[DEC_MAXE], wd[DEC_MAXE], wm[DEC_MAXE], wp[DEC_MAXE], wn[DEC_MAXE];
+    float mv[E], av[E], hv[E], wd[E], wm[E], wp[E], wn[E];
     #pragma unroll
-    for (int i = 0; i < DEC_MAXE; ++i) {
+    for (int i = 0; i < E; ++i) {
         int t = tid + i * bs;
         bool ok = t < h;
         mv[i] = ok ? ldf(dense_out + t) : 0.f;
@@ -452,12 +448,12 @@ __device__ __forceinline__ void ffn_tail_impl(
     if (moe_acc && w_post_dense) {
         float sd = 0.f, ss = 0.f;
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) { sd += mv[i] * mv[i]; ss += av[i] * av[i]; }
+        for (int i = 0; i < E; ++i) { sd += mv[i] * mv[i]; ss += av[i] * av[i]; }
         block_sum2(sd, ss, red);
         float rms_d = rsqrtf(sd / (float)h + eps_post);
         float rms_s = rsqrtf(ss / (float)h + eps_post);
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) {
+        for (int i = 0; i < E; ++i) {
             float d = rnd_t(dense_out, wd[i] * mv[i] * rms_d);
             float sv = rnd_t(dense_out, wm[i] * av[i] * rms_s);
             mv[i] = rnd_t(dense_out, d + sv);
@@ -466,7 +462,7 @@ __device__ __forceinline__ void ffn_tail_impl(
         float g = gate_logit ? (1.0f / (1.0f + __expf(-gate_logit[0]))) : 1.0f;
         g = rnd_t(dense_out, g);
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) {
+        for (int i = 0; i < E; ++i) {
             float d = rnd_t(dense_out, mv[i] * g);
             mv[i] = rnd_t(dense_out, av[i] + d);
         }
@@ -474,15 +470,15 @@ __device__ __forceinline__ void ffn_tail_impl(
     if (w_post_mlp) {
         float sq = 0.f;
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) sq += mv[i] * mv[i];
+        for (int i = 0; i < E; ++i) sq += mv[i] * mv[i];
         sq = block_sum(sq, red);
         float rms_m = rsqrtf(sq / (float)h + eps_post);
         #pragma unroll
-        for (int i = 0; i < DEC_MAXE; ++i) mv[i] = rnd_t(dense_out, wp[i] * mv[i] * rms_m);
+        for (int i = 0; i < E; ++i) mv[i] = rnd_t(dense_out, wp[i] * mv[i] * rms_m);
     }
     float sq = 0.f;
     #pragma unroll
-    for (int i = 0; i < DEC_MAXE; ++i) {
+    for (int i = 0; i < E; ++i) {
         int t = tid + i * bs;
         float v = rnd_t(dense_out, hv[i] + mv[i]);
         if (layer_scalar != 1.0f) v = rnd_t(dense_out, v * layer_scalar);
@@ -494,7 +490,7 @@ __device__ __forceinline__ void ffn_tail_impl(
     sq = block_sum(sq, red);
     float rms = rsqrtf(sq / (float)h + eps);
     #pragma unroll
-    for (int i = 0; i < DEC_MAXE; ++i) {
+    for (int i = 0; i < E; ++i) {
         int t = tid + i * bs;
         if (t < h) {
             float y = rnd_t(dense_out, wn[i] * mv[i] * rms);
@@ -508,25 +504,20 @@ __device__ __forceinline__ void ffn_tail_impl(
     }
 }
 
-extern "C" __global__ void dec_ffn_tail_bf16(
-    const bf16_t* dense_out, const float* moe_acc, const float* gate_logit, const bf16_t* hidden_in,
-    const bf16_t* w_post_dense, const bf16_t* w_post_moe, const bf16_t* w_post_mlp, float layer_scalar,
-    bf16_t* hidden_out, const bf16_t* w_next, bf16_t* next_row,
-    unsigned char* next_mx_packed, unsigned char* next_mx_scales, int h, float eps_post, float eps)
-{
-    ffn_tail_impl<bf16_t>(dense_out, moe_acc, gate_logit, hidden_in, w_post_dense, w_post_moe, w_post_mlp,
-                          layer_scalar, hidden_out, w_next, next_row, next_mx_packed, next_mx_scales, h, eps_post, eps);
+#define DEC_FFN_TAIL(NAME, T, E) \
+extern "C" __global__ void NAME( \
+    const T* dense_out, const float* moe_acc, const float* gate_logit, const T* hidden_in, \
+    const T* w_post_dense, const T* w_post_moe, const T* w_post_mlp, float layer_scalar, \
+    T* hidden_out, const T* w_next, T* next_row, \
+    unsigned char* next_mx_packed, unsigned char* next_mx_scales, int h, float eps_post, float eps) \
+{ \
+    ffn_tail_impl<T, E>(dense_out, moe_acc, gate_logit, hidden_in, w_post_dense, w_post_moe, w_post_mlp, \
+                        layer_scalar, hidden_out, w_next, next_row, next_mx_packed, next_mx_scales, h, eps_post, eps); \
 }
-
-extern "C" __global__ void dec_ffn_tail_f16(
-    const __half* dense_out, const float* moe_acc, const float* gate_logit, const __half* hidden_in,
-    const __half* w_post_dense, const __half* w_post_moe, const __half* w_post_mlp, float layer_scalar,
-    __half* hidden_out, const __half* w_next, __half* next_row,
-    unsigned char* next_mx_packed, unsigned char* next_mx_scales, int h, float eps_post, float eps)
-{
-    ffn_tail_impl<__half>(dense_out, moe_acc, gate_logit, hidden_in, w_post_dense, w_post_moe, w_post_mlp,
-                          layer_scalar, hidden_out, w_next, next_row, next_mx_packed, next_mx_scales, h, eps_post, eps);
-}
+DEC_FFN_TAIL(dec_ffn_tail_bf16, bf16_t, 4)
+DEC_FFN_TAIL(dec_ffn_tail_f16, __half, 4)
+DEC_FFN_TAIL(dec_ffn_tail_bf16_w, bf16_t, 8)
+DEC_FFN_TAIL(dec_ffn_tail_f16_w, __half, 8)
 
 // ── top-k роутера MoE одним варпом ───────────────────────────────────────
 //
