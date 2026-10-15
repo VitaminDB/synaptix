@@ -263,16 +263,19 @@ extern "C" __global__ void gated_delta_rule_step_fused_rms_norm_f32_to_f16(
 //
 // causal_conv1d_update (+SiLU) → β/g → L2-нормы q/k → gated delta rule →
 // RmsNormGated — всё в одном блоке. Блок = одна k-голова со всеми её v-головами
-// (GQA repeat n_rep = num_v / num_k): blockDim = n_rep·hk, нить (sub, d) —
-// v-голова `kh·n_rep + sub`, канал d. Свёртка: нить (0, d) считает Q-канал,
-// нить (1, d) — K-канал (при n_rep = 1 обе — нить (0, d)), каждая нить — свой
-// V-канал; состояние свёртки сдвигает нить, которая этот канал посчитала
-// (гонок между блоками нет: столбцы k-головы читает и пишет только её блок).
-// Арифметика и порядок редукций повторяют трёхъядерный путь бит в бит:
-// post_conv округляется в f16, как при записи промежуточного буфера.
+// (GQA repeat n_rep = num_v / num_k); нить (sub, ks, d): v-голова
+// `kh·n_rep + sub`, канал d, группа ks из KS делит диапазон kk состояния
+// (строки kk ≡ ks mod KS) — так в полёте в KS раз больше чтений состояния,
+// иначе 16 блоков по 256 нитей не загружают память (состояние 64 КБ на голову).
+// Свёртка (ks = 0): нить (0, d) считает Q-канал, нить (1, d) — K-канал (при
+// n_rep = 1 обе — нить (0, d)), каждая нить — свой V-канал; состояние свёртки
+// сдвигает нить, которая этот канал посчитала (гонок между блоками нет:
+// столбцы k-головы читает и пишет только её блок). post_conv округляется в
+// f16, как при записи промежуточного буфера трёхъядерного пути; порядок
+// редукций q/k-норм и RmsNorm — тот же, суммы по kk — по группам ks.
 //
-// Требования: hk == hv (степень двойки), n_rep·hk ≤ 1024.
-// Shared: (2·hk + 3·n_rep·hv + 2·n_rep) F32.
+// Требования: hk == hv (степень двойки), KS | hk, n_rep·hv·KS ≤ 1024.
+// Shared: (2·hk + (3 + KS)·n_rep·hv + 2·n_rep) F32.
 
 extern "C" __global__ void gdn_decode_step_f16(
     const __half* __restrict__ x,            // [conv_dim] = Q | K | V (выход in_proj)
@@ -293,13 +296,16 @@ extern "C" __global__ void gdn_decode_step_f16(
     unsigned int hk,
     unsigned int hv,
     unsigned int conv_k,
+    unsigned int ks_n,                       // KS — групп по kk
     unsigned int gate_mode                   // 0: silu(gate), 1: sigmoid(gate)
 ) {
     unsigned int kh = blockIdx.x;
     if (kh >= num_k) return;
     unsigned int tid = threadIdx.x;
-    unsigned int sub = tid / hk;
-    unsigned int d = tid - sub * hk;
+    unsigned int d = tid % hv;
+    unsigned int rest = tid / hv;
+    unsigned int ks = rest % ks_n;
+    unsigned int sub = rest / ks_n;
     if (sub >= n_rep) return;
     unsigned int num_v = num_k * n_rep;
     unsigned int vh = kh * n_rep + sub;
@@ -313,7 +319,8 @@ extern "C" __global__ void gdn_decode_step_f16(
     float* v_sm      = shm + 2u * hk;                // [n_rep·hv]
     float* reduce_sm = v_sm + n_rep * hv;            // [n_rep·hv]
     float* core_sm   = reduce_sm + n_rep * hv;       // [n_rep·hv]
-    float* scal_sm   = core_sm + n_rep * hv;         // [n_rep·2]
+    float* part_sm   = core_sm + n_rep * hv;         // [n_rep·KS·hv]
+    float* scal_sm   = part_sm + n_rep * ks_n * hv;  // [n_rep·2]
 
     // ── свёртка одного канала: окно [state[0..K-2, c], x[c]], сдвиг состояния ──
     auto conv_ch = [&](unsigned int c) -> float {
@@ -330,76 +337,97 @@ extern "C" __global__ void gdn_decode_step_f16(
         return __half2float(__float2half(acc));
     };
 
-    if (sub == 0u) q_sm[d] = conv_ch(kh * hk + d);
-    if (sub == (n_rep > 1u ? 1u : 0u)) k_sm[d] = conv_ch(key_dim + kh * hk + d);
-    v_sm[sub * hv + d] = conv_ch(2u * key_dim + vh * hv + d);
-    if (d == 0u) {
-        float bv = __half2float(b_f16[vh]);
-        scal_sm[sub * 2u + 1u] = 1.0f / (1.0f + __expf(-bv));
-        float av = __half2float(a_f16[vh]);
-        float dt = av + dt_bias[vh];
-        float softplus_dt = __logf(1.0f + __expf(dt));
-        float g = softplus_dt * (-__expf(a_log[vh]));
-        scal_sm[sub * 2u] = __expf(g);
+    if (ks == 0u) {
+        if (sub == 0u) q_sm[d] = conv_ch(kh * hk + d);
+        if (sub == (n_rep > 1u ? 1u : 0u)) k_sm[d] = conv_ch(key_dim + kh * hk + d);
+        v_sm[sub * hv + d] = conv_ch(2u * key_dim + vh * hv + d);
+        if (d == 0u) {
+            float bv = __half2float(b_f16[vh]);
+            scal_sm[sub * 2u + 1u] = 1.0f / (1.0f + __expf(-bv));
+            float av = __half2float(a_f16[vh]);
+            float dt = av + dt_bias[vh];
+            float softplus_dt = __logf(1.0f + __expf(dt));
+            float g = softplus_dt * (-__expf(a_log[vh]));
+            scal_sm[sub * 2u] = __expf(g);
+        }
     }
     __syncthreads();
 
-    // ── L2-нормы q/k (порядок редукции как у трёхъядерного пути) ──
+    // ── L2-нормы q/k (нити sub = 0, ks = 0; порядок редукции как прежде) ──
+    bool lead = (sub == 0u && ks == 0u);
     float qv = q_sm[d];
     float kv = k_sm[d];
-    if (sub == 0u) reduce_sm[d] = qv * qv;
+    if (lead) reduce_sm[d] = qv * qv;
     __syncthreads();
     for (unsigned int s = hk / 2u; s > 0u; s >>= 1) {
-        if (sub == 0u && d < s) reduce_sm[d] += reduce_sm[d + s];
+        if (lead && d < s) reduce_sm[d] += reduce_sm[d + s];
         __syncthreads();
     }
     float sum_q_sq = reduce_sm[0];
     __syncthreads();
-    if (sub == 0u) reduce_sm[d] = kv * kv;
+    if (lead) reduce_sm[d] = kv * kv;
     __syncthreads();
     for (unsigned int s = hk / 2u; s > 0u; s >>= 1) {
-        if (sub == 0u && d < s) reduce_sm[d] += reduce_sm[d + s];
+        if (lead && d < s) reduce_sm[d] += reduce_sm[d + s];
         __syncthreads();
     }
     float sum_k_sq = reduce_sm[0];
     __syncthreads();
-    if (sub == 0u) {
+    if (lead) {
         q_sm[d] = qv * rsqrtf(sum_q_sq + 1e-6f) * q_scale;
         k_sm[d] = kv * rsqrtf(sum_k_sq + 1e-6f);
     }
     __syncthreads();
 
-    // ── gated delta rule: нить = столбец vi состояния своей v-головы ──
+    // ── gated delta rule: нить = столбец vi состояния, строки kk ≡ ks (mod KS) ──
     float g_t = scal_sm[sub * 2u];
     float beta_t = scal_sm[sub * 2u + 1u];
+    unsigned int vi = d;
+    unsigned long long col = (unsigned long long)vh * hk * hv + vi;
+    float* part = part_sm + (sub * ks_n) * hv;       // [KS][hv]
     {
-        unsigned int vi = d;
-        unsigned long long col = (unsigned long long)vh * hk * hv + vi;
         float kv_mem = 0.0f;
-        for (unsigned int kk = 0u; kk < hk; ++kk) {
+        #pragma unroll 8
+        for (unsigned int kk = ks; kk < hk; kk += ks_n) {
             float st = state[col + (unsigned long long)kk * hv] * g_t;
             kv_mem += st * k_sm[kk];
         }
-        float delta = (v_sm[sub * hv + vi] - kv_mem) * beta_t;
+        part[ks * hv + vi] = kv_mem;
+    }
+    __syncthreads();
+    float kv_mem = 0.0f;
+    for (unsigned int j = 0u; j < ks_n; ++j) kv_mem += part[j * hv + vi];
+    float delta = (v_sm[sub * hv + vi] - kv_mem) * beta_t;
+    __syncthreads();
+    {
         float out_acc = 0.0f;
-        for (unsigned int kk = 0u; kk < hk; ++kk) {
+        #pragma unroll 8
+        for (unsigned int kk = ks; kk < hk; kk += ks_n) {
             unsigned long long idx = col + (unsigned long long)kk * hv;
             float new_st = state[idx] * g_t + k_sm[kk] * delta;
             state[idx] = new_st;
             out_acc += new_st * q_sm[kk];
         }
-        core_sm[sub * hv + vi] = out_acc;
+        part[ks * hv + vi] = out_acc;
     }
     __syncthreads();
+    if (ks != 0u) return;
+    {
+        float out_acc = 0.0f;
+        for (unsigned int j = 0u; j < ks_n; ++j) out_acc += part[j * hv + vi];
+        core_sm[sub * hv + vi] = out_acc;
+    }
 
-    // ── RmsNormGated своей v-головы ──
+    // ── RmsNormGated своей v-головы (нити ks = 0: hv на v-голову) ──
+    // Барьеры ниже — только для нитей ks = 0; вышедшие нити в них не участвуют
+    // (named barrier на hv·n_rep нитей).
     float* red = reduce_sm + sub * hv;
     float xv = core_sm[sub * hv + d];
     red[d] = xv * xv;
-    __syncthreads();
+    asm volatile("bar.sync 1, %0;" :: "r"(n_rep * hv));
     for (unsigned int s = hv / 2u; s > 0u; s >>= 1) {
         if (d < s) red[d] += red[d + s];
-        __syncthreads();
+        asm volatile("bar.sync 1, %0;" :: "r"(n_rep * hv));
     }
     float total = red[0];
     float inv = rsqrtf(total / (float)hv + eps);

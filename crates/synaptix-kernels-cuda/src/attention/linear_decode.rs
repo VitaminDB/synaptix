@@ -90,7 +90,15 @@ pub fn linear_attn_decode_step_u8_dev(
     // в блоке k-головы (все её v-головы). Три ядра ниже — для геометрий, где
     // hk ≠ hv или блок не укладывается в 1024 нити.
     let fused_ok = std::env::var("SYN_GDN_FUSED").map(|v| v != "0").unwrap_or(true);
-    if fused_ok && hk == hv && hk.is_power_of_two() && (n_rep as usize) * hk <= 1024 {
+    // Групп по kk: сколько раз блок v-голов укладывается в 1024 нити (≤ 8, делит hk).
+    let ks_n = {
+        let mut k = 1usize;
+        while k < 8 && 2 * k * (n_rep as usize) * hv <= 1024 && hk % (2 * k) == 0 {
+            k *= 2;
+        }
+        k
+    };
+    if fused_ok && hk == hv && hk.is_power_of_two() && (n_rep as usize) * hk * ks_n <= 1024 {
         let x_v = unsafe {
             qkv.0
                 .slice(qkv.1..qkv.1 + conv_dim * tm::<f16>())
@@ -159,12 +167,13 @@ pub fn linear_attn_decode_step_u8_dev(
                 .transmute_mut::<f16>(value_dim)
                 .ok_or_else(|| cerr("out"))?
         };
-        let shared = ((2 * hk + 3 * n_rep as usize * hv + 2 * n_rep as usize) * tm::<f32>()) as u32;
+        let shared = ((2 * hk + (3 + ks_n) * n_rep as usize * hv + 2 * n_rep as usize) * tm::<f32>()) as u32;
         let cfg = LaunchConfig {
             grid_dim: (num_k, 1, 1),
-            block_dim: (n_rep * dk, 1, 1),
+            block_dim: (n_rep * dv * ks_n as u32, 1, 1),
             shared_mem_bytes: shared,
         };
+        let ks_u = ks_n as u32;
         let gate_mode: u32 = gate_sigmoid as u32;
         let mut bld = stream.launch_builder(gdr_kernels.decode_step_fn());
         bld.arg(&x_v)
@@ -185,6 +194,7 @@ pub fn linear_attn_decode_step_u8_dev(
             .arg(&dk)
             .arg(&dv)
             .arg(&conv_kernel)
+            .arg(&ks_u)
             .arg(&gate_mode);
         unsafe {
             bld.launch(cfg).map_err(|e| lerr("gdn_decode_step", e))?;
