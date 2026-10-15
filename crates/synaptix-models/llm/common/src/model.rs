@@ -927,6 +927,19 @@ fn tensor_bytes(t: Option<&Tensor>) -> usize {
     t.map(|t| t.dtype().bytes_for_numel(t.numel())).unwrap_or(0)
 }
 
+/// Дорастить `[b, h, n, d]` по оси `n` до `len` нулями справа, строки `0..n`
+/// — байт в байт (любой dtype, включая MXFP8). Устройство не меняется.
+fn grow_dim2(t: &mut Tensor, len: usize) -> Result<(), ModelError> {
+    let mut dims = t.dims().to_vec();
+    if dims.len() != 4 || len <= dims[2] {
+        return Ok(());
+    }
+    dims[2] = len - dims[2];
+    let pad = Tensor::zeros(dims, t.dtype(), t.device()).coerr()?;
+    *t = Tensor::cat(&[&*t, &pad], 2).coerr()?;
+    Ok(())
+}
+
 fn park_tensor(t: &mut Tensor) -> Result<usize, ModelError> {
     if t.device() == Device::Cpu {
         return Ok(0);
@@ -2096,11 +2109,7 @@ impl DecoderModel {
         for l in 0..self.blocks.len() {
             let lc = match c.layer_kind(l) {
                 LayerKind::Full => {
-                    let cap = match c.window_for(l) {
-                        _ if c.kv_source(l).is_some() => 1,
-                        Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
-                        _ => max_seq,
-                    };
+                    let cap = self.kv_layer_cap(l, max_seq, ring_ok);
                     let n_kv = c.kv_heads_at(l);
                     let hd = c.head_dim_at(l);
                     // Послойно: MXFP8 достаётся только слоям, чей путь чтения —
@@ -2131,6 +2140,48 @@ impl DecoderModel {
             layers.push(lc);
         }
         Ok(KvCache { layers, seq_len: 0, max_seq, decode_graph: DecodeGraphSlot::default() })
+    }
+
+    /// Ёмкость кэша полного слоя `l`: слою с чужим KV — заглушка, sliding-слою
+    /// с кольцом — окно с запасом, остальным — вся длина.
+    fn kv_layer_cap(&self, l: usize, max_seq: usize, ring_ok: bool) -> usize {
+        let c = &self.config;
+        match c.window_for(l) {
+            _ if c.kv_source(l).is_some() => 1,
+            Some(w) if ring_ok => max_seq.min(w + RING_SLACK),
+            _ => max_seq,
+        }
+    }
+
+    /// Расширить кэш из [`Self::make_kv_cache`] до `max_seq` позиций, сохранив
+    /// записанное: слои дорастают нулями до ёмкости, которую дал бы им новый
+    /// кэш на `max_seq`. Кольцо, уже провернувшееся (`start > 0`), и так
+    /// упёрлось в окно — его не трогаем. Позиции, снимки GDN и `seq_len`
+    /// остаются годными; захваченный граф ссылался на старые буферы.
+    pub fn grow_kv_cache(&self, cache: &mut KvCache, max_seq: usize) -> Result<(), ModelError> {
+        if max_seq <= cache.max_seq {
+            return Ok(());
+        }
+        if max_seq > self.rope_capacity {
+            return Err(ModelError::Shape(format!(
+                "grow_kv_cache: max_seq {max_seq} > RoPE capacity {}",
+                self.rope_capacity
+            )));
+        }
+        let ring_ok = self.ring_kv_ok();
+        cache.decode_graph.clear();
+        for (l, lc) in cache.layers.iter_mut().enumerate() {
+            let LayerCache::Full(f) = lc else { continue };
+            let cap = self.kv_layer_cap(l, max_seq, ring_ok);
+            if f.start > 0 || cap <= f.k.dims()[2] {
+                continue;
+            }
+            for t in [Some(&mut f.k), Some(&mut f.v), f.k_scale.as_mut(), f.v_scale.as_mut()].into_iter().flatten() {
+                grow_dim2(t, cap)?;
+            }
+        }
+        cache.max_seq = max_seq;
+        Ok(())
     }
 
     pub fn forward(&self, input_ids: &Tensor, kv_cache: &mut KvCache) -> Result<Tensor, ModelError> {

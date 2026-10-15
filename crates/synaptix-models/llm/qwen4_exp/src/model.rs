@@ -105,6 +105,24 @@ impl ModelCache {
         Ok(())
     }
 
+    /// Расширить кэш до `max_seq` позиций без потери содержимого: KV и ключи
+    /// индексатора дорастают нулями, рекуррентное состояние и PLE от длины
+    /// не зависят. Позиции и снимки, снятые до роста, остаются годными.
+    pub fn grow(&mut self, max_seq: usize) -> Result<(), ModelError> {
+        if max_seq <= self.max_seq {
+            return Ok(());
+        }
+        for l in self.layers.iter_mut() {
+            if let LayerState::Qsa(b) = l {
+                let (kv, idx) = b.as_mut();
+                kv.grow(max_seq)?;
+                idx.grow(max_seq)?;
+            }
+        }
+        self.max_seq = max_seq;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in self.layers.iter_mut() {

@@ -699,6 +699,13 @@ impl Qwen4ExpPipeline {
         })
     }
 
+    /// Расширить кэш сессии до `ctx_tokens` (не выше окна модели), сохранив
+    /// посчитанный префикс и точку возврата. Ошибка — памяти на рост не
+    /// нашлось; сессия при этом остаётся прежней и годной.
+    pub fn grow_session(&self, session: &mut Qwen4ExpSession, ctx_tokens: usize) -> Result<(), PipelineError> {
+        Ok(session.cache.grow(ctx_tokens.min(self.max_seq))?)
+    }
+
     /// Как [`Self::generate_streaming`], но с префикс-KV: всё, что уже лежит
     /// в `session`, не считается заново. Возвращает, сколько токенов промпта
     /// удалось переиспользовать.
@@ -778,9 +785,9 @@ impl Qwen4ExpPipeline {
         // лежит в кэше как у любых токенов, а подмену вложения при тех же
         // токенах ловит отпечаток строк (`reusable_media`).
         if let Some(s) = session.as_deref_mut() {
-            // Ход не влезает в кэш сессии — пересоздаём его под новый
-            // размер, префикс при этом теряется.
-            if budget > s.cache.max_seq {
+            // Ход не влезает в кэш сессии — доращиваем его, префикс
+            // остаётся; не вышло (нет памяти) — пересоздаём заново.
+            if budget > s.cache.max_seq && self.grow_session(s, budget).is_err() {
                 s.cache = self.make_cache(budget)?;
                 s.ids.clear();
                 s.snap = None;

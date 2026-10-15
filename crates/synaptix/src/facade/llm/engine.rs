@@ -854,7 +854,11 @@ impl LlmKvSession {
 
     /// Токенов в точке возврата.
     pub fn cached_tokens(&self) -> usize {
-        self.ids.len()
+        match &self.kind {
+            // У Qwen4Exp счёт токенов — внутри его сессии.
+            SessionKind::Qwen4Exp(s) => s.cached_tokens(),
+            _ => self.ids.len(),
+        }
     }
 
     /// Сколько токенов промпта уже посчитано.
@@ -1121,14 +1125,6 @@ impl Llm {
         &self.device
     }
 
-    /// Сессия префикс-KV на `ctx_tokens` токенов контекста и `max_new` токенов
-    /// ответа (последнее нужно кэшу MTP-головы гибрида: он растёт быстрее
-    /// основного).
-    ///
-    /// `Ok(None)` — архитектура пока не умеет продолжать с готового кэша:
-    /// сегодня это только гибрид Qwen3.6/3.8 без MTP-головы. Остальные —
-    /// гибрид с MTP, Muse-Glimmer (включая DFlash-декод), Gemma-4, Qwen4Exp,
-    /// плотный Qwen3, Llama, Gemma-3 — сессию держат.
     /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
     /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
     /// Все архитектуры с сессией и башней зрения: гибрид Qwen3.6/3.8,
@@ -1148,6 +1144,14 @@ impl Llm {
             .unwrap_or(false)
     }
 
+    /// Сессия префикс-KV на `ctx_tokens` токенов контекста и `max_new` токенов
+    /// ответа (последнее нужно кэшу MTP-головы гибрида: он растёт быстрее
+    /// основного).
+    ///
+    /// `Ok(None)` — архитектура не умеет продолжать с готового кэша. Сегодня
+    /// сессию держат все: гибрид Qwen3.6/3.8 и MiniCPM-V 4.7 (с MTP-головой и
+    /// без), Muse-Glimmer (включая DFlash-декод), Gemma-4, Qwen4Exp, плотный
+    /// Qwen3, Llama, Gemma-3.
     pub fn new_kv_session(
         &self,
         ctx_tokens: usize,
@@ -1161,12 +1165,19 @@ impl Llm {
         let ctx = ctx_tokens.max(2);
         match &*pipeline {
             LlmPipeline::Hybrid(p) => {
-                if !(mtp_enabled() && p.has_mtp()) {
-                    return Ok(None);
-                }
-                let (kv, mtp_kv) = p
-                    .make_mtp_caches(ctx, max_new)
-                    .map_err(|e| LlmError(e.to_string()))?;
+                // Без MTP-головы (MiniCPM-V 4.7, гибрид без головы или с
+                // выключенным MTP) сессия — основной KV со снимком GDN, а кэш
+                // головы — пустой каркас без слоёв: ход идёт обычным путём.
+                let (kv, mtp_kv) = if mtp_enabled() && p.has_mtp() {
+                    p.make_mtp_caches(ctx, max_new)
+                        .map_err(|e| LlmError(e.to_string()))?
+                } else {
+                    let kv = p
+                        .model
+                        .make_kv_cache(1, ctx)
+                        .map_err(|e| LlmError(e.to_string()))?;
+                    (kv, LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx, decode_graph: Default::default() })
+                };
                 Ok(Some(LlmKvSession {
                     kv,
                     ids: Vec::new(),
@@ -1227,6 +1238,61 @@ impl Llm {
                 }))
             }
         }
+    }
+
+    /// Дорастить сессию до `ctx_tokens` контекста, не теряя посчитанного
+    /// префикса: новый ход длиннее, чем сессия рассчитана. Ошибка — памяти
+    /// не нашлось или архитектура не умеет; сессия тогда прежняя и годная,
+    /// а вызывающий решает, заводить ли новую.
+    pub fn grow_kv_session(
+        &self,
+        session: &mut LlmKvSession,
+        ctx_tokens: usize,
+        max_new: usize,
+    ) -> Result<(), LlmError> {
+        if ctx_tokens <= session.ctx_tokens {
+            return Ok(());
+        }
+        let _runtime = self.runtime_scope();
+        let pipeline = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let err = |e: &dyn std::fmt::Display| LlmError(e.to_string());
+        match (&*pipeline, &mut session.kind) {
+            (LlmPipeline::Hybrid(p), SessionKind::Hybrid { mtp_kv, .. }) => {
+                let (kv_max, mtp_cap) = p.mtp_cache_caps(ctx_tokens, max_new);
+                p.model.grow_kv_cache(&mut session.kv, kv_max).map_err(|e| err(&e))?;
+                if let Some(m) = p.mtp.as_ref() {
+                    m.grow_kv_cache(mtp_kv, mtp_cap).map_err(|e| err(&e))?;
+                }
+            }
+            (LlmPipeline::MuseGlimmer(p), SessionKind::Muse { .. }) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens.max(2)).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Gemma4(p), SessionKind::Plain) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Qwen3(p), SessionKind::Plain) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Llama(p), SessionKind::Plain) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Gemma3(p), SessionKind::Plain) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Qwen4Exp(p), SessionKind::Qwen4Exp(s)) => {
+                p.grow_session(s, ctx_tokens).map_err(|e| err(&e))?;
+                session.kv.max_seq = s.ctx_tokens();
+            }
+            _ => return Err(LlmError("префикс-KV: сессия от другой модели".into())),
+        }
+        session.ctx_tokens = match &session.kind {
+            SessionKind::Qwen4Exp(s) => s.ctx_tokens(),
+            _ => ctx_tokens.max(2),
+        };
+        Ok(())
     }
 
     pub fn kv_bytes_per_token(&self) -> usize {
@@ -1683,11 +1749,57 @@ impl<'a> LlmGeneration<'a> {
 
         match &*pipeline {
             LlmPipeline::Hybrid(p) => {
-                if !matches!(session.kind, SessionKind::Hybrid { .. }) {
+                let SessionKind::Hybrid { mtp_kv, .. } = &session.kind else {
                     return Err(LlmError("префикс-KV: сессия от другой модели".into()));
-                }
+                };
                 // Сравнивать префиксы нужно в том виде, в каком промпт видит движок.
                 let ids = p.maybe_prepend_bos(prompt_ids);
+                // Сессия без кэша MTP-головы — ход без спекуляции: тот же
+                // путь, что у медиа-хода, только без вложений.
+                if !(mtp_enabled() && p.has_mtp()) || mtp_kv.layers.is_empty() {
+                    let reuse = if session.media.is_empty() { session.reusable(&ids) } else { 0 };
+                    if reuse > 0 {
+                        session.kv.seq_len = reuse;
+                        let SessionKind::Hybrid { snap, .. } = &session.kind else {
+                            unreachable!("проверено выше")
+                        };
+                        if let Some(sn) = snap.as_ref() {
+                            session
+                                .kv
+                                .restore_linear(sn)
+                                .map_err(|e| LlmError(e.to_string()))?;
+                        }
+                    } else {
+                        session.reset_for_full();
+                    }
+                    let LlmKvSession { kv, ids: sess_ids, kind, .. } = session;
+                    let SessionKind::Hybrid { snap, mtp_synced, .. } = kind else {
+                        unreachable!("проверено выше")
+                    };
+                    *mtp_synced = false;
+                    let mut new_snap: Option<Vec<LinearSnapshot>> = None;
+                    let mut new_len = 0usize;
+                    let res = p.generate_with_media_resume(
+                        kv,
+                        &ids,
+                        &[],
+                        cfg,
+                        &mut sink,
+                        Some(&mut |at: usize, kv_at: &LlmKvCache| {
+                            new_snap = Some(kv_at.snapshot_linear_full()?);
+                            new_len = at;
+                            Ok(())
+                        }),
+                    );
+                    if let Some(sn) = new_snap {
+                        *snap = Some(sn);
+                        *sess_ids = ids[..new_len].to_vec();
+                    }
+                    return match res {
+                        Ok(_) => Ok(reuse),
+                        Err(e) => Err(LlmError(e.to_string())),
+                    };
+                }
                 // Префикс с медиа-строками текстовому промпту не принадлежит,
                 // а после медиа-хода кэш MTP-головы отстал от основного —
                 // в обоих случаях честный полный префилл.

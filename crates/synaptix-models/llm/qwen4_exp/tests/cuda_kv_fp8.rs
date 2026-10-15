@@ -221,3 +221,53 @@ fn mrope_tables_match_sequential_on_text() {
     eprintln!("таблицы M-RoPE против последовательных позиций: rel_l2={rel:.3e}");
     assert!(rel < 1e-6, "M-RoPE сдвинул текстовый путь: {rel:.3e}");
 }
+
+/// Рост KV на карте: записанные строки (плотные и MXFP8 с масштабами)
+/// остаются как были, хвост нулевой.
+#[test]
+fn kv_grow_on_device_keeps_rows() {
+    if !ready() {
+        eprintln!("CUDA недоступна — пропуск");
+        return;
+    }
+    let device = Device::Cuda(0);
+    let (h, d, cap, past) = (2usize, 64usize, 16usize, 11usize);
+    let k: Vec<f32> = (0..h * past * d).map(|i| ((i % 97) as f32 - 48.0) / 17.0).collect();
+    let v: Vec<f32> = k.iter().map(|x| -x * 0.5).collect();
+    let kt = Tensor::from_vec(k, vec![1, h, past, d], device).unwrap().to_dtype(DType::F16).unwrap();
+    let vt = Tensor::from_vec(v, vec![1, h, past, d], device).unwrap().to_dtype(DType::F16).unwrap();
+    for quant in [false, true] {
+        let mut kv = if quant {
+            KvLayer::new_mxfp8(h, d, cap, device).unwrap()
+        } else {
+            KvLayer::new(h, d, cap, device, DType::F16).unwrap()
+        };
+        kv.append(&kt, &vt, 0).unwrap();
+        let snap = |kv: &KvLayer| -> Vec<Vec<u8>> {
+            [Some(&kv.k), Some(&kv.v), kv.k_scale.as_ref(), kv.v_scale.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|t| head_rows(t, past))
+                .collect()
+        };
+        let before = snap(&kv);
+        kv.grow(40).unwrap();
+        assert_eq!(kv.capacity(), 40);
+        assert_eq!(snap(&kv), before, "quant={quant}");
+        let all = head_rows(&kv.k, 40);
+        let row = all.len() / (h * 40);
+        for hh in 0..h {
+            let tail = &all[(hh * 40 + past) * row..(hh + 1) * 40 * row];
+            assert!(tail.iter().all(|b| *b == 0), "quant={quant}");
+        }
+    }
+}
+
+/// Байты строк `0..n` каждой головы тензора `[1, h, cap, …]`.
+fn head_rows(t: &Tensor, n: usize) -> Vec<u8> {
+    let dims = t.dims().to_vec();
+    let bytes = t.to_device(Device::Cpu).unwrap().to_bytes().unwrap();
+    let (h, cap) = (dims[1], dims[2]);
+    let row = bytes.len() / (h * cap);
+    (0..h).flat_map(|hh| bytes[hh * cap * row..(hh * cap + n) * row].to_vec()).collect()
+}

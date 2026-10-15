@@ -79,6 +79,23 @@ impl KvLayer {
         self.k_scale.is_some()
     }
 
+    /// Ёмкость в позициях.
+    pub fn capacity(&self) -> usize {
+        self.k.dims()[2]
+    }
+
+    /// Расширить кэш до `capacity` позиций, сохранив записанные.
+    pub fn grow(&mut self, capacity: usize) -> Result<(), ModelError> {
+        let capacity = capacity.next_multiple_of(8);
+        if capacity <= self.capacity() {
+            return Ok(());
+        }
+        for t in [Some(&mut self.k), Some(&mut self.v), self.k_scale.as_mut(), self.v_scale.as_mut()].into_iter().flatten() {
+            crate::qsa::grow_dim2(t, capacity)?;
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, k: &Tensor, v: &Tensor, past: usize) -> Result<(), ModelError> {
         match (&mut self.k_scale, &mut self.v_scale) {
             (Some(ks), Some(vs)) => {
@@ -854,6 +871,30 @@ fn repeat_kv(x: &Tensor, group: usize) -> Result<Tensor, ModelError> {
 
 #[cfg(test)]
 mod tests {
+    /// Рост сессии: записанные строки KV (и масштабы MXFP8) остаются байт в
+    /// байт, ёмкость округляется до 8, хвост — нули.
+    #[test]
+    fn kv_layer_grow_keeps_rows() {
+        synaptix_kernels_cpu::ensure_registered();
+        let (h, d, cap) = (2, 32, 8);
+        let data: Vec<f32> = (0..h * cap * d).map(|i| i as f32).collect();
+        let mut kv = KvLayer::new(h, d, cap, Device::Cpu, DType::F32).unwrap();
+        kv.k = Tensor::from_vec(data.clone(), vec![1, h, cap, d], Device::Cpu).unwrap();
+        kv.grow(13).unwrap();
+        assert_eq!(kv.capacity(), 16);
+        assert_eq!(kv.v.dims(), &[1, h, 16, d]);
+        let got = kv.k.narrow(2, 0, cap).unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, data);
+        let tail = kv.k.narrow(2, cap, 8).unwrap().contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(tail.iter().all(|x| *x == 0.0));
+
+        let mut q = KvLayer::new_mxfp8(h, d, cap, Device::Cpu).unwrap();
+        q.grow(24).unwrap();
+        assert_eq!(q.k.dims(), &[1, h, 24, d]);
+        assert_eq!(q.k.dtype(), DType::MXFP8);
+        assert_eq!(q.k_scale.as_ref().unwrap().dims(), &[1, h, 24, d / 32]);
+    }
+
     use super::*;
 
     fn rows(spec: Vec<(Vec<u32>, (u32, u32))>) -> (Vec<Vec<u32>>, Vec<(u32, u32)>) {

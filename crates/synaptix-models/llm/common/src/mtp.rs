@@ -151,6 +151,10 @@ impl MtpModule {
         self.layers.make_kv_cache(batch, max_seq)
     }
 
+    pub fn grow_kv_cache(&self, cache: &mut KvCache, max_seq: usize) -> Result<(), ModelError> {
+        self.layers.grow_kv_cache(cache, max_seq)
+    }
+
     pub fn project(
         &self,
         parent: &DecoderModel,

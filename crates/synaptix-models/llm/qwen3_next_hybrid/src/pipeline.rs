@@ -760,6 +760,10 @@ impl HybridPipeline {
     /// [`Self::generate_mtp_resume`]. Кэш MTP-головы этот путь не ведёт:
     /// декод после M-RoPE-промпта идёт по 1D-позициям со сдвигом, и
     /// спекуляция на нём не применяется.
+    ///
+    /// Пустой `inputs` — текстовый ход по сессии без MTP-головы (MiniCPM-V
+    /// 4.7, гибрид без головы или с выключенным MTP): позиции обычные, путь
+    /// тот же — префилл чанками, точка возврата по чанку GDN, device-декод.
     pub fn generate_with_media_resume(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
@@ -777,9 +781,6 @@ impl HybridPipeline {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Tokenize("empty prompt".into()));
         }
-        if inputs.is_empty() {
-            return Err(PipelineError::Model("generate_with_media без медиа".into()));
-        }
         // Промпт в том виде, в каком его видит текстовый путь: сессия
         // сравнивает префиксы именно по нему.
         let prompt = self.maybe_prepend_bos(prompt_ids);
@@ -793,7 +794,10 @@ impl HybridPipeline {
         let canvas = self.config.canvas.filter(|_| {
             mrope_enabled() && !inputs.is_empty() && inputs.iter().all(|m| !m.layouts.is_empty())
         });
-        let mrope_on = mrope_enabled() && (canvas.is_some() || inputs.iter().all(|m| !m.grids.is_empty()));
+        // Без медиа — обычные позиции текстового пути.
+        let mrope_on = mrope_enabled()
+            && !inputs.is_empty()
+            && (canvas.is_some() || inputs.iter().all(|m| !m.grids.is_empty()));
         let mrope_tables = match (&self.config.mrope, mrope_on) {
             (Some(spec), true) => {
                 let positions = match canvas {

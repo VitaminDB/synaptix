@@ -195,6 +195,19 @@ impl IndexerCache {
         self.blocks = 0;
     }
 
+    /// Расширить буфер блоков под `max_seq` позиций (как `make_cache`),
+    /// сохранив собранные блоки и хвост: сессия выросла, а посчитанный
+    /// префикс терять незачем.
+    pub fn grow(&mut self, max_seq: usize) -> Result<(), ModelError> {
+        let capacity_blocks = max_seq.div_ceil(self.ratio) + 1;
+        if capacity_blocks <= self.capacity {
+            return Ok(());
+        }
+        grow_dim2(&mut self.block_keys, capacity_blocks)?;
+        self.capacity = capacity_blocks;
+        Ok(())
+    }
+
     /// Переселить буферы индексатора в host-RAM (см.
     /// `ModelCache::park_to_host`). Позиции (`blocks`, `pending_rows`) не
     /// трогаются — переезжают только данные.
@@ -218,6 +231,20 @@ impl IndexerCache {
             .map(|t| t.dtype().bytes_for_numel(t.numel()))
             .sum()
     }
+}
+
+/// Дорастить тензор `[1, h, n, d]` по оси `n` до `len` нулями справа: строки
+/// `0..n` сохраняются байт в байт (любой dtype, включая MXFP8). Тензор
+/// остаётся на своём устройстве.
+pub(crate) fn grow_dim2(t: &mut Tensor, len: usize) -> Result<(), ModelError> {
+    let mut dims = t.dims().to_vec();
+    if dims.len() != 4 || len <= dims[2] {
+        return Ok(());
+    }
+    dims[2] = len - dims[2];
+    let pad = Tensor::zeros(dims, t.dtype(), t.device()).map_err(|e| ModelError::Forward(e.to_string()))?;
+    *t = coerr(Tensor::cat(&[&*t, &pad], 2))?;
+    Ok(())
 }
 
 /// Общие помощники переезда тензора между картой и host-RAM.
