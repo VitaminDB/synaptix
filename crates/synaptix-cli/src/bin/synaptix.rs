@@ -329,20 +329,68 @@ enum Commands {
         #[arg(long, default_value = "cuda")]
         device: String,
     },
+    /// Дообучение LLM адаптером LoRA. На квантованной базе (по умолчанию
+    /// NVFP4) это QLoRA: база заморожена, учатся только адаптеры. Датасет —
+    /// JSONL с `messages` / `conversations` / `instruction`+`output` /
+    /// `prompt`+`completion` / `text`; лосс — по ответам ассистента.
+    /// Адаптер сохраняется в формате PEFT.
     Train {
+        /// Модель: `.syn` или каталог HF.
         model: PathBuf,
+        /// Датасет `.jsonl` / `.json`.
         data: PathBuf,
+        /// Каталог адаптера.
         output: PathBuf,
-        #[arg(long, default_value_t = 8)]
+        /// Формат весов базы: nvfp4 | mxfp8 | sq1…sq8 | bf16.
+        #[arg(long, default_value = "nvfp4")]
+        quant: String,
+        /// Умножать на квантованную базу ядрами инференса (у NVFP4 — с 4-битной активацией; быстрее, грубее).
+        #[arg(long)]
+        native_quant: bool,
+        #[arg(long, default_value_t = 16)]
         lora_r: usize,
-        #[arg(long, default_value_t = 16.0)]
-        lora_alpha: f32,
-        #[arg(long, default_value_t = 1e-4)]
-        lr: f64,
-        #[arg(long, default_value_t = 3)]
+        /// По умолчанию 2·r.
+        #[arg(long)]
+        lora_alpha: Option<f32>,
+        /// Проекции: all | attn | список через запятую (q_proj,v_proj,…).
+        #[arg(long, default_value = "all")]
+        targets: String,
+        #[arg(long, default_value_t = 2e-4)]
+        lr: f32,
+        #[arg(long, default_value_t = 1)]
         epochs: usize,
+        /// Длина упакованной последовательности.
+        #[arg(long, default_value_t = 2048)]
+        max_len: usize,
+        /// Последовательностей на шаг оптимизатора.
         #[arg(long, default_value_t = 4)]
-        batch_size: usize,
+        grad_accum: usize,
+        /// Доля шагов разогрева.
+        #[arg(long, default_value_t = 0.03)]
+        warmup: f32,
+        #[arg(long, default_value_t = 0.0)]
+        weight_decay: f32,
+        #[arg(long, default_value_t = 1.0)]
+        max_grad_norm: f32,
+        /// Доля примеров на оценку (до 200).
+        #[arg(long, default_value_t = 0.02)]
+        eval_fraction: f32,
+        /// Оценка каждые N шагов (0 — в конце).
+        #[arg(long, default_value_t = 0)]
+        eval_every: usize,
+        /// Чекпойнт каждые N шагов (0 — только в конце).
+        #[arg(long, default_value_t = 0)]
+        save_every: usize,
+        #[arg(long)]
+        max_samples: Option<usize>,
+        /// Шаблон с размышлениями (enable_thinking).
+        #[arg(long)]
+        thinking: bool,
+        /// Продолжить с адаптера.
+        #[arg(long)]
+        resume: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
     /// Квантование/перекодировка модели в `.syn`: плотные матрицы и уже
     /// квантованные веса (`.syn` NVFP4/MXFP8/SQ, `.gguf` ggml) → формат
@@ -1368,11 +1416,13 @@ fn main() -> ExitCode {
             Ok(())
             })()
         }
-        Commands::Train { model, data, output, lora_r, lora_alpha, lr, epochs, batch_size } => {
-            train::run(train::TrainArgs {
-                model, data, output, lora_r, lora_alpha, lr, epochs, batch_size,
-            })
-        }
+        Commands::Train {
+            model, data, output, quant, native_quant, lora_r, lora_alpha, targets, lr, epochs, max_len, grad_accum,
+            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, seed,
+        } => train::run(train::TrainArgs {
+            model, data, output, quant, native_quant, lora_r, lora_alpha, targets, lr, epochs, max_len, grad_accum,
+            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, seed,
+        }),
         Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan } => {
             quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan })
         }

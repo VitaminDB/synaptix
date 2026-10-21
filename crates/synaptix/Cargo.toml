@@ -20,6 +20,7 @@ engine = [
     "dep:synaptix-runtime",
     "dep:synaptix-audio",
     "dep:synaptix-llm-common",
+    "dep:synaptix-llm-train",
     "dep:synaptix-llm-qwen3",
     "dep:synaptix-llm-qwen4-exp",
     "dep:synaptix-llm-qwen3-next-hybrid",
@@ -53,6 +54,7 @@ synaptix-audio        = { workspace = true, optional = true }
 
 # LLM-архитектуры (фасад facade::llm диспетчит по детекции арх).
 synaptix-llm-common   = { workspace = true, optional = true }
+synaptix-llm-train    = { workspace = true, optional = true }
 synaptix-llm-qwen3    = { workspace = true, optional = true }
 synaptix-llm-qwen4-exp = { workspace = true, optional = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true, optional = true }

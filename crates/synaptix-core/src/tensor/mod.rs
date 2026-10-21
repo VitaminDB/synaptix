@@ -16,6 +16,7 @@ pub mod serialize;
 pub mod shape;
 pub mod storage;
 pub mod strides;
+pub mod train;
 pub mod view;
 
 use std::sync::Arc;

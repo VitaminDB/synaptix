@@ -15,6 +15,7 @@ pub mod reduction;
 pub mod scan;
 pub mod ssm;
 pub mod tma;
+pub mod train;
 pub mod wsalloc;
 
 pub use cuda_backend::{cuda_backend, ensure_registered};

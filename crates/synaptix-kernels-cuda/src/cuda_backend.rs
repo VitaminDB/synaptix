@@ -1113,6 +1113,16 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn train_op(
+        &self,
+        op: synaptix_core::backend::train::TrainOp,
+        inputs: &[(&Storage, &Layout)],
+        outputs: &mut [(&mut Storage, &Layout)],
+        _stream: &Stream,
+    ) -> Result<()> {
+        crate::train::run_train_op(op, inputs, outputs)
+    }
+
     fn silu_and_mul(
         &self,
         gate: (&Storage, &Layout),

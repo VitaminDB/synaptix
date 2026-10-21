@@ -19,4 +19,6 @@ pub mod rerank;
 pub mod params;
 pub mod sampling;
 #[cfg(feature = "engine")]
+pub mod train;
+#[cfg(feature = "engine")]
 pub mod tts;

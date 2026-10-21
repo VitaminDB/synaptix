@@ -1,5 +1,6 @@
 pub mod attn;
 pub mod registry;
+pub mod train;
 
 use crate::device::Device;
 use crate::dtype::DType;
@@ -609,6 +610,19 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<()> {
         Err(SynaptixError::Unsupported("rms_norm_residual не поддержан этим backend"))
+    }
+
+    /// Операция обучения ([`train::TrainOp`]): входы и выходы — списками,
+    /// раскладка описана у варианта. Default `Unsupported` — обучение только
+    /// на CUDA.
+    fn train_op(
+        &self,
+        _op: train::TrainOp,
+        _inputs: &[(&Storage, &Layout)],
+        _outputs: &mut [(&mut Storage, &Layout)],
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("train_op не поддержан этим backend"))
     }
 
     /// Fused pointwise `out = silu(gate) * up`. Один kernel-launch вместо двух

@@ -5080,3 +5080,5 @@ fn trace_graph() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     env_flag(&F, "SYN_TRACE_GRAPH")
 }
+
+pub mod train_access;

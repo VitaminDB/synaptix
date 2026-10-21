@@ -33,6 +33,7 @@ members = [
     "crates/synaptix-cli",
     "crates/synaptix-gen",
     "crates/synaptix-models/llm/common",
+    "crates/synaptix-models/llm/train",
     "crates/synaptix-models/llm/llama",
     "crates/synaptix-models/llm/qwen3",
     "crates/synaptix-models/llm/gemma3",
@@ -211,6 +212,7 @@ synaptix-llm-qwen4-exp = { path = "crates/synaptix-models/llm/qwen4_exp" }
 synaptix-vlm-qwen3    = { path = "crates/synaptix-models/vlm/qwen3_vl" }
 synaptix-vlm-minicpm  = { path = "crates/synaptix-models/vlm/minicpm_v" }
 synaptix-llm-common   = { path = "crates/synaptix-models/llm/common" }
+synaptix-llm-train    = { path = "crates/synaptix-models/llm/train" }
 synaptix-asr-whisper  = { path = "crates/synaptix-models/asr/whisper" }
 synaptix-image-sdxl   = { path = "crates/synaptix-models/image/sdxl" }
 synaptix-depth-anything = { path = "crates/synaptix-models/image/depth_anything" }

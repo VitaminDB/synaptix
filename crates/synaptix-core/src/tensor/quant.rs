@@ -642,6 +642,14 @@ impl QuantWeight {
         self.shuffled.get().map(|s| s.as_ref())
     }
 
+    pub(crate) fn shuffled_arc(&self) -> Option<Arc<Storage>> {
+        self.shuffled.get().cloned()
+    }
+
+    pub(crate) fn scales_arc(&self) -> Option<Arc<Storage>> {
+        self.scales.clone()
+    }
+
     pub fn shuffled_or_try_init(
         &self,
         init: impl FnOnce() -> Result<Arc<Storage>>,
