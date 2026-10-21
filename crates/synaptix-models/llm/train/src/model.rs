@@ -9,7 +9,8 @@ use synaptix_core::tensor::Tensor;
 use synaptix_llm_common::DecoderModel;
 use synaptix_ops::norm::rms_norm::rms_norm;
 
-use crate::block::{self, BlockLora, SeqCtx};
+use crate::block::{self, BlockLora, LinConst, SeqCtx};
+use synaptix_llm_common::model::train_access::MixerRefs;
 use crate::error::other;
 use crate::linear::{self, BaseMatmul, Weights};
 use crate::lora::{LoraConfig, LoraLayer};
@@ -76,19 +77,34 @@ impl<'m> TrainModel<'m> {
                     return Ok(None);
                 }
                 let (n, k) = linear::dims(q);
-                let module = format!("model.layers.{i}.{kind}.{name}");
+                let module = format!("{}.{i}.{kind}.{name}", cfg.module_prefix);
                 Ok(Some(LoraLayer::new(module, n, k, &cfg, seed + j, dev)?))
             };
-            let v = b.attn.v_proj.ok_or_else(|| other("обучение: слой без v_proj"))?;
-            lora.push(BlockLora {
-                q: mk("q_proj", "self_attn", b.attn.q_proj, 1)?,
-                k: mk("k_proj", "self_attn", b.attn.k_proj, 2)?,
-                v: mk("v_proj", "self_attn", v, 3)?,
-                o: mk("o_proj", "self_attn", b.attn.o_proj, 4)?,
-                gate: mk("gate_proj", "mlp", b.mlp.gate_proj, 5)?,
-                up: mk("up_proj", "mlp", b.mlp.up_proj, 6)?,
-                down: mk("down_proj", "mlp", b.mlp.down_proj, 7)?,
-            });
+            let mut bl = BlockLora::default();
+            match &b.mixer {
+                MixerRefs::Full(at) => {
+                    let v = at.v_proj.ok_or_else(|| other("обучение: слой без v_proj"))?;
+                    bl.q = mk("q_proj", "self_attn", at.q_proj, 1)?;
+                    bl.k = mk("k_proj", "self_attn", at.k_proj, 2)?;
+                    bl.v = mk("v_proj", "self_attn", v, 3)?;
+                    bl.o = mk("o_proj", "self_attn", at.o_proj, 4)?;
+                }
+                MixerRefs::Linear(la) => {
+                    bl.qkv = mk("in_proj_qkv", "linear_attn", la.in_proj_qkv, 8)?;
+                    bl.z = mk("in_proj_z", "linear_attn", la.in_proj_z, 9)?;
+                    bl.a = mk("in_proj_a", "linear_attn", la.in_proj_a, 10)?;
+                    bl.b = mk("in_proj_b", "linear_attn", la.in_proj_b, 11)?;
+                    bl.out = mk("out_proj", "linear_attn", la.out_proj, 12)?;
+                    if la.dk != 128 || la.dv % 32 != 0 {
+                        return Err(other(format!("GDN: ядро обучения — dk = 128 и dv кратно 32 (у слоя {i}: {} и {})", la.dk, la.dv)));
+                    }
+                    bl.lin = Some(LinConst::new(la, dev)?);
+                }
+            }
+            bl.gate = mk("gate_proj", "mlp", b.mlp.gate_proj, 5)?;
+            bl.up = mk("up_proj", "mlp", b.mlp.up_proj, 6)?;
+            bl.down = mk("down_proj", "mlp", b.mlp.down_proj, 7)?;
+            lora.push(bl);
         }
         Ok(Self { base, lora, cfg, base_matmul: BaseMatmul::default() })
     }

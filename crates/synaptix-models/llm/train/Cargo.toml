@@ -18,3 +18,7 @@ thiserror           = { workspace = true }
 [dev-dependencies]
 synaptix-kernels-cuda = { workspace = true }
 synaptix-llm-qwen3    = { workspace = true }
+synaptix-llm-qwen3-next-hybrid = { workspace = true }
+synaptix-tokenizer    = { workspace = true }
+synaptix-io           = { workspace = true }
+synaptix-kernels-cpu  = { workspace = true }

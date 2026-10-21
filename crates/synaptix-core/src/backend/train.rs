@@ -56,4 +56,21 @@ pub enum TrainOp {
     /// `has_seg`; выходы `[dq F32 [H,T,D], dk F32 [Hkv,Tp,D], dv F32
     /// [Hkv,Tp,D]]`, `Tp = ⌈T/32⌉·32` (хвост за `T` — мусор, отрезается).
     FlashBwd { scale: f32, has_seg: bool },
+    /// GDN, каузальная depthwise-свёртка: входы `[x [T,C] (F32/BF16),
+    /// w [C,K] F32]` и `seg`, если `has_seg` (свёртка не заходит в соседний
+    /// пример); выход `[y [T,C] F32]`.
+    GdnConvFwd { has_seg: bool },
+    /// Обратная свёртка по входу: входы `[dy [T,C] F32, w [C,K] F32]` и
+    /// `seg`; выход `[dx [T,C] F32]`.
+    GdnConvBwd { has_seg: bool },
+    /// GDN-рекуррентность, прямой проход: входы `[q, k [T,Hk,128], v [T,Hv,dv],
+    /// g, beta [T,Hv]]` F32 и `seg`; выходы `[o [T,Hv,dv], ckpt [Hv, ⌈T/64⌉,
+    /// 128, dv]]` F32. `dv` кратно 32.
+    GdnFwd { has_seg: bool },
+    /// GDN, обратный проход: входы `[q, k, v, g, beta, ckpt, dout [T,Hv,dv]]` и
+    /// `seg`; выходы `[dq_p, dk_p [P,T,Hv,128], dg_p, db_p [P,T,Hv], dv
+    /// [T,Hv,dv], scratch [P·Hv·64·128·32]]` F32, `P = dv/32` — частичные суммы
+    /// по блокам столбцов (их сумма по первой оси — градиент; dq/dk ещё
+    /// суммируются по v-головам группы k-головы).
+    GdnBwd { has_seg: bool },
 }

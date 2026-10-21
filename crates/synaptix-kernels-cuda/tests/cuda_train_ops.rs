@@ -401,3 +401,144 @@ fn flash_train_d64_and_d256() {
     let seg: Vec<i32> = (0..90).map(|i| (i / 40) as i32).collect();
     flash_case(4, 2, 90, 256, Some(seg));
 }
+
+/// Эталон GDN на хосте (f64): o [T, Hv, dv].
+#[allow(clippy::too_many_arguments)]
+fn gdn_host(q: &[f64], k: &[f64], v: &[f64], g: &[f64], b: &[f64], seg: &[i32], t: usize, hk: usize, hv: usize, dv: usize) -> Vec<f64> {
+    let dk = 128;
+    let grp = hv / hk;
+    let mut o = vec![0f64; t * hv * dv];
+    for h in 0..hv {
+        let kh = h / grp;
+        let mut s = vec![0f64; dk * dv];
+        for ti in 0..t {
+            let f = if ti == 0 || seg[ti] != seg[ti - 1] { 0.0 } else { g[ti * hv + h].exp() };
+            for x in s.iter_mut() {
+                *x *= f;
+            }
+            let kr = &k[(ti * hk + kh) * dk..(ti * hk + kh + 1) * dk];
+            let qr = &q[(ti * hk + kh) * dk..(ti * hk + kh + 1) * dk];
+            for c in 0..dv {
+                let kv: f64 = (0..dk).map(|r| s[r * dv + c] * kr[r]).sum();
+                let u = b[ti * hv + h] * (v[(ti * hv + h) * dv + c] - kv);
+                for r in 0..dk {
+                    s[r * dv + c] += kr[r] * u;
+                }
+                o[(ti * hv + h) * dv + c] = (0..dk).map(|r| s[r * dv + c] * qr[r]).sum();
+            }
+        }
+    }
+    o
+}
+
+#[test]
+fn gdn_fwd_bwd_match_host() {
+    let Some(d) = dev() else { return };
+    let (t, hk, hv, dv, dk) = (150usize, 2usize, 4usize, 64usize, 128usize);
+    let seg: Vec<i32> = (0..t).map(|i| if i < 90 { 0 } else { 1 }).collect();
+    let norm = |x: Vec<f32>, s: f32| -> Vec<f32> {
+        let mut x = x;
+        for row in x.chunks_mut(dk) {
+            let n: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for v in row.iter_mut() {
+                *v = *v / n * s;
+            }
+        }
+        x
+    };
+    let q = norm(det(40, t * hk * dk, 1.0), 1.0 / (dk as f32).sqrt());
+    let k = norm(det(41, t * hk * dk, 1.0), 1.0);
+    let v = det(42, t * hv * dv, 1.0);
+    let g: Vec<f32> = det(43, t * hv, 1.0).iter().map(|x| -0.05 - 0.3 * x.abs()).collect();
+    let b: Vec<f32> = det(44, t * hv, 1.0).iter().map(|x| 0.3 + 0.5 * x.abs()).collect();
+    let dout = det(45, t * hv * dv, 1.0);
+    let tt = |x: &Vec<f32>, dims: Vec<usize>| Tensor::from_vec(x.clone(), dims, d).unwrap();
+    let (qt, kt, vt, gt, bt) = (tt(&q, vec![t, hk, dk]), tt(&k, vec![t, hk, dk]), tt(&v, vec![t, hv, dv]), tt(&g, vec![t, hv]), tt(&b, vec![t, hv]));
+    let st = Tensor::from_vec(seg.clone(), vec![t], d).unwrap();
+    let nck = t.div_ceil(64);
+    let out = Tensor::train_op(TrainOp::GdnFwd { has_seg: true }, &[&qt, &kt, &vt, &gt, &bt, &st], &[(vec![t, hv, dv], DType::F32), (vec![hv, nck, dk, dv], DType::F32)]).unwrap();
+    let f64v = |x: &[f32]| x.iter().map(|v| *v as f64).collect::<Vec<f64>>();
+    let (qd, kd, vd, gd, bd) = (f64v(&q), f64v(&k), f64v(&v), f64v(&g), f64v(&b));
+    let oref = gdn_host(&qd, &kd, &vd, &gd, &bd, &seg, t, hk, hv, dv);
+    let oh = host(&out[0]);
+    let oref32: Vec<f32> = oref.iter().map(|x| *x as f32).collect();
+    assert!(max_err(&oh, &oref32) < 1e-4, "gdn o: {}", max_err(&oh, &oref32));
+
+    let dt = tt(&dout, vec![t, hv, dv]);
+    let p = dv / 32;
+    let gout = Tensor::train_op(
+        TrainOp::GdnBwd { has_seg: true },
+        &[&qt, &kt, &vt, &gt, &bt, &out[1], &dt, &st],
+        &[
+            (vec![p, t, hv, dk], DType::F32),
+            (vec![p, t, hv, dk], DType::F32),
+            (vec![p, t, hv], DType::F32),
+            (vec![p, t, hv], DType::F32),
+            (vec![t, hv, dv], DType::F32),
+            (vec![p * hv * 64 * dk * 32], DType::F32),
+        ],
+    )
+    .unwrap();
+    let sum_p = |x: &Tensor| host(&x.sum_keepdim(0).unwrap());
+    let (dq_v, dk_v, dg, db, dvv) = (sum_p(&gout[0]), sum_p(&gout[1]), sum_p(&gout[2]), sum_p(&gout[3]), host(&gout[4]));
+    // dq/dk по k-головам: сумма по v-головам группы.
+    let grp = hv / hk;
+    let to_k = |x: &[f32]| -> Vec<f32> {
+        let mut r = vec![0f32; t * hk * dk];
+        for ti in 0..t {
+            for h in 0..hv {
+                for c in 0..dk {
+                    r[(ti * hk + h / grp) * dk + c] += x[(ti * hv + h) * dk + c];
+                }
+            }
+        }
+        r
+    };
+    let (dq, dkk) = (to_k(&dq_v), to_k(&dk_v));
+    let loss = |q: &[f64], k: &[f64], v: &[f64], g: &[f64], b: &[f64]| -> f64 {
+        gdn_host(q, k, v, g, b, &seg, t, hk, hv, dv).iter().zip(&dout).map(|(o, r)| o * *r as f64).sum()
+    };
+    let num = |which: usize, idx: usize| -> f64 {
+        let e = 1e-4;
+        let mut a = [qd.clone(), kd.clone(), vd.clone(), gd.clone(), bd.clone()];
+        a[which][idx] += e;
+        let lp = loss(&a[0], &a[1], &a[2], &a[3], &a[4]);
+        a[which][idx] -= 2.0 * e;
+        let lm = loss(&a[0], &a[1], &a[2], &a[3], &a[4]);
+        (lp - lm) / (2.0 * e)
+    };
+    let check = |name: &str, which: usize, got: &[f32], idxs: &[usize]| {
+        for &i in idxs {
+            let n = num(which, i);
+            assert!((n - got[i] as f64).abs() < 1e-3 * (1.0 + n.abs()), "{name}[{i}]: числ. {n} против {}", got[i]);
+        }
+    };
+    check("dq", 0, &dq, &[0, 5, 300, 128 * 50 + 7, t * hk * dk - 1]);
+    check("dk", 1, &dkk, &[1, 129, 4000, 128 * 91 + 3, t * hk * dk - 2]);
+    check("dv", 2, &dvv, &[0, 63, 64 * 4 * 89 + 5, 64 * 4 * 90 + 1, t * hv * dv - 1]);
+    check("dg", 3, &dg, &[1, 4 * 60 + 2, 4 * 90 + 1, 4 * 91, t * hv - 1]);
+    check("dbeta", 4, &db, &[0, 4 * 63 + 3, 4 * 64, 4 * 90 + 2, t * hv - 1]);
+
+    // Свёртка.
+    let (c, kw) = (37usize, 4usize);
+    let x = det(46, t * c, 1.0);
+    let w = det(47, c * kw, 1.0);
+    let y = host(&Tensor::train_op(TrainOp::GdnConvFwd { has_seg: true }, &[&tt(&x, vec![t, c]), &tt(&w, vec![c, kw]), &st], &[(vec![t, c], DType::F32)]).unwrap()[0]);
+    let dy = det(48, t * c, 1.0);
+    let dx = host(&Tensor::train_op(TrainOp::GdnConvBwd { has_seg: true }, &[&tt(&dy, vec![t, c]), &tt(&w, vec![c, kw]), &st], &[(vec![t, c], DType::F32)]).unwrap()[0]);
+    let mut yr = vec![0f32; t * c];
+    let mut dxr = vec![0f32; t * c];
+    for ti in 0..t {
+        for ch in 0..c {
+            for j in 0..kw {
+                let s = ti as isize - (kw as isize - 1) + j as isize;
+                if s < 0 || seg[s as usize] != seg[ti] {
+                    continue;
+                }
+                yr[ti * c + ch] += w[ch * kw + j] * x[s as usize * c + ch];
+                dxr[s as usize * c + ch] += w[ch * kw + j] * dy[ti * c + ch];
+            }
+        }
+    }
+    assert!(max_err(&y, &yr) < 1e-5 && max_err(&dx, &dxr) < 1e-5, "conv");
+}

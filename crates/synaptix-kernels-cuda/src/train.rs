@@ -17,6 +17,7 @@ use crate::kernels::compile::{compile_module, load_fn};
 pub struct TrainKernels {
     module: Arc<CudaModule>,
     flash: Arc<CudaModule>,
+    gdn: Arc<CudaModule>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<TrainKernels>)>>> = OnceLock::new();
@@ -30,13 +31,18 @@ impl TrainKernels {
         }
         let module = compile_module(ctx, include_str!("cu/train/train.cu"), "train.cu")?;
         let flash = compile_module(ctx, include_str!("cu/train/flash_train.cu"), "flash_train.cu")?;
-        let new = Arc::new(Self { module, flash });
+        let gdn = compile_module(ctx, include_str!("cu/train/gdn_train.cu"), "gdn_train.cu")?;
+        let new = Arc::new(Self { module, flash, gdn });
         cache.lock().push((key, new.clone()));
         Ok(new)
     }
 
     fn f(&self, name: &str) -> Result<CudaFunction> {
         load_fn(&self.module, name)
+    }
+
+    fn gdn_fn(&self, name: &str) -> Result<CudaFunction> {
+        load_fn(&self.gdn, name)
     }
 
     fn flash_fn(&self, name: &str, smem: usize) -> Result<CudaFunction> {
@@ -375,6 +381,97 @@ pub fn run_train_op(
             b.arg(&ti).arg(&tpi).arg(&hi).arg(&hki).arg(&sc);
             let cfg = LaunchConfig { grid_dim: (tp as u32 / 32, hkv as u32, 1), block_dim: (64, 1, 1), shared_mem_bytes: smem as u32 };
             unsafe { b.launch(cfg) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::GdnConvFwd { has_seg } | TrainOp::GdnConvBwd { has_seg } => {
+            let fwd = matches!(op, TrainOp::GdnConvFwd { .. });
+            let (x, xl) = input(ins, 0, "GdnConv: x")?;
+            let (w, wl) = input(ins, 1, "GdnConv: w")?;
+            let seg = if has_seg { Some(input(ins, 2, "GdnConv: seg")?.0) } else { None };
+            need_outs(1)?;
+            expect_dt(wl, DType::F32, "GdnConv: w не F32")?;
+            let c = *xl.dims().last().unwrap();
+            let t = xl.numel() / c;
+            let kk = wl.dims()[wl.dims().len() - 1];
+            if wl.numel() != c * kk {
+                return Err(SynaptixError::Unsupported("GdnConv: w [C, K]"));
+            }
+            let name = if fwd { format!("gdn_conv_fwd_{}", sfx(xl.dtype())?) } else { "gdn_conv_bwd".to_string() };
+            if !fwd {
+                expect_dt(xl, DType::F32, "GdnConvBwd: dy не F32")?;
+            }
+            let f = k.gdn_fn(&name)?;
+            let (ti, ci, ki) = (t as i32, c as i32, kk as i32);
+            let null: u64 = 0;
+            let mut b = stream.launch_builder(&f);
+            b.arg(x).arg(w);
+            match seg {
+                Some(sg) => b.arg(sg),
+                None => b.arg(&null),
+            };
+            b.arg(&mut *out_bufs[0]).arg(&ti).arg(&ci).arg(&ki);
+            unsafe { b.launch(flat_cfg(t * c)) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::GdnFwd { has_seg } => {
+            let (q, ql) = input(ins, 0, "GdnFwd: q")?;
+            let (kb, _) = input(ins, 1, "GdnFwd: k")?;
+            let (v, vl) = input(ins, 2, "GdnFwd: v")?;
+            let (g, _) = input(ins, 3, "GdnFwd: g")?;
+            let (be, _) = input(ins, 4, "GdnFwd: beta")?;
+            let seg = if has_seg { Some(input(ins, 5, "GdnFwd: seg")?.0) } else { None };
+            need_outs(2)?;
+            let (t, hk, dk) = (ql.dims()[0], ql.dims()[1], ql.dims()[2]);
+            let (hv, dv) = (vl.dims()[1], vl.dims()[2]);
+            if dk != 128 || dv % 32 != 0 || hv % hk != 0 {
+                return Err(SynaptixError::Unsupported("GdnFwd: DK = 128, dv кратно 32"));
+            }
+            let f = k.gdn_fn("gdn_fwd")?;
+            let (ti, hki, hvi, dvi) = (t as i32, hk as i32, hv as i32, dv as i32);
+            let null: u64 = 0;
+            let (o0, o1) = out_bufs.split_at_mut(1);
+            let mut b = stream.launch_builder(&f);
+            b.arg(q).arg(kb).arg(v).arg(g).arg(be);
+            match seg {
+                Some(sg) => b.arg(sg),
+                None => b.arg(&null),
+            };
+            b.arg(&mut *o0[0]).arg(&mut *o1[0]).arg(&ti).arg(&hki).arg(&hvi).arg(&dvi);
+            let cfg = LaunchConfig { grid_dim: ((dv / 32) as u32, hv as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err("gdn_fwd"))?;
+        }
+        TrainOp::GdnBwd { has_seg } => {
+            let (q, ql) = input(ins, 0, "GdnBwd: q")?;
+            let (kb, _) = input(ins, 1, "GdnBwd: k")?;
+            let (v, vl) = input(ins, 2, "GdnBwd: v")?;
+            let (g, _) = input(ins, 3, "GdnBwd: g")?;
+            let (be, _) = input(ins, 4, "GdnBwd: beta")?;
+            let (ck, _) = input(ins, 5, "GdnBwd: ckpt")?;
+            let (dout, _) = input(ins, 6, "GdnBwd: dout")?;
+            let seg = if has_seg { Some(input(ins, 7, "GdnBwd: seg")?.0) } else { None };
+            need_outs(6)?;
+            let (t, hk, dk) = (ql.dims()[0], ql.dims()[1], ql.dims()[2]);
+            let (hv, dv) = (vl.dims()[1], vl.dims()[2]);
+            if dk != 128 || dv % 32 != 0 || hv % hk != 0 {
+                return Err(SynaptixError::Unsupported("GdnBwd: DK = 128, dv кратно 32"));
+            }
+            let f = k.gdn_fn("gdn_bwd")?;
+            let (ti, hki, hvi, dvi) = (t as i32, hk as i32, hv as i32, dv as i32);
+            let null: u64 = 0;
+            let (o0, r1) = out_bufs.split_at_mut(1);
+            let (o1, r2) = r1.split_at_mut(1);
+            let (o2, r3) = r2.split_at_mut(1);
+            let (o3, r4) = r3.split_at_mut(1);
+            let (o4, o5) = r4.split_at_mut(1);
+            let mut b = stream.launch_builder(&f);
+            b.arg(q).arg(kb).arg(v).arg(g).arg(be);
+            match seg {
+                Some(sg) => b.arg(sg),
+                None => b.arg(&null),
+            };
+            b.arg(ck).arg(dout);
+            b.arg(&mut *o0[0]).arg(&mut *o1[0]).arg(&mut *o2[0]).arg(&mut *o3[0]).arg(&mut *o4[0]).arg(&mut *o5[0]);
+            b.arg(&ti).arg(&hki).arg(&hvi).arg(&dvi);
+            let cfg = LaunchConfig { grid_dim: ((dv / 32) as u32, hv as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err("gdn_bwd"))?;
         }
     }
     Ok(())

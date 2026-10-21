@@ -287,6 +287,12 @@ pub fn train_lora(
     if opts.train.base_name.is_empty() {
         opts.train.base_name = model.display().to_string();
     }
+    // Имена модулей в адаптере — как у HF-модели: у Qwen3.5+ (общая модель с
+    // башней зрения) слои лежат под `model.language_model`.
+    let multimodal = synaptix_io::weights::read_model_file(model, "config.json")
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|c| c.get("text_config").is_some());
+    opts.lora.module_prefix = if multimodal { "model.language_model.layers".into() } else { "model.layers".into() };
     let out_dir = opts.train.out_dir.clone();
     let run = |base: &synaptix_llm_common::DecoderModel| -> Result<usize, LlmError> {
         let err = |e: synaptix_llm_train::TrainError| LlmError(e.to_string());
@@ -308,7 +314,14 @@ pub fn train_lora(
             drop(_w);
             run(&p.model)?
         }
-        other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 (плотных); у модели {other:?}"))),
+        LlmArch::Hybrid => {
+            let _w = synaptix_core::device::cuda::WeightsAllocGuard::for_device(opts.device);
+            let p = synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline::load_with_precision(model, opts.device, prec, Some(rope))
+                .map_err(|e| LlmError(format!("load hybrid: {e}")))?;
+            drop(_w);
+            run(&p.model)?
+        }
+        other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 и Qwen3.5+ (плотных); у модели {other:?}"))),
     };
     Ok(TrainReport { dataset, eval_samples: eval.len(), trainable_params, adapter_dir: out_dir })
 }

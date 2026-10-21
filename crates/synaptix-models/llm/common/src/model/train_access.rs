@@ -6,7 +6,7 @@
 use synaptix_core::tensor::Tensor;
 use synaptix_ops::pos::rope_cache::RopeCache;
 
-use super::{Block, DecoderModel, Ffn, FullAttn, Mixer, ModelError};
+use super::{Block, DecoderModel, Ffn, FullAttn, LinearAttn, Mixer, ModelError};
 use crate::config::Activation;
 use crate::weights::QLinear;
 
@@ -34,6 +34,37 @@ pub struct AttnRefs<'a> {
     pub rope: &'a RopeCache,
 }
 
+/// Линейное внимание Gated DeltaNet (Qwen3-Next / Qwen3.5+).
+pub struct LinearRefs<'a> {
+    pub in_proj_qkv: &'a QLinear,
+    pub in_proj_a: &'a QLinear,
+    pub in_proj_b: &'a QLinear,
+    pub in_proj_z: &'a QLinear,
+    pub out_proj: &'a QLinear,
+    /// Веса свёртки `[conv_dim, conv_k]`.
+    pub conv_w: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    /// Вес RMSNorm выхода (на голову `dv`), после неё — гейт `silu(z)`.
+    pub norm_weight: &'a Tensor,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub conv_k: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_dim: usize,
+    pub q_scale: f32,
+    pub rms_eps: f32,
+}
+
+/// Смешивание токенов слоя.
+pub enum MixerRefs<'a> {
+    Full(AttnRefs<'a>),
+    Linear(LinearRefs<'a>),
+}
+
 /// Плотный MLP `down(act(gate) · up)`.
 pub struct MlpRefs<'a> {
     pub gate_proj: &'a QLinear,
@@ -42,13 +73,13 @@ pub struct MlpRefs<'a> {
     pub activation: Activation,
 }
 
-/// Слой декодера (пока — полное внимание и плотный MLP).
+/// Слой декодера: полное или линейное внимание и плотный MLP.
 pub struct BlockRefs<'a> {
     pub pre_attn_norm: &'a Tensor,
     pub post_attn_norm: Option<&'a Tensor>,
     pub pre_mlp_norm: &'a Tensor,
     pub post_mlp_norm: Option<&'a Tensor>,
-    pub attn: AttnRefs<'a>,
+    pub mixer: MixerRefs<'a>,
     pub mlp: MlpRefs<'a>,
     pub rms_eps: f32,
     pub post_eps: f32,
@@ -87,6 +118,32 @@ impl FullAttn {
     }
 }
 
+impl LinearAttn {
+    fn refs(&self) -> LinearRefs<'_> {
+        LinearRefs {
+            in_proj_qkv: &self.in_proj_qkv,
+            in_proj_a: &self.in_proj_a,
+            in_proj_b: &self.in_proj_b,
+            in_proj_z: &self.in_proj_z,
+            out_proj: &self.out_proj,
+            conv_w: &self.conv_w,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            norm_weight: &self.norm_weight,
+            num_k_heads: self.num_k_heads,
+            num_v_heads: self.num_v_heads,
+            dk: self.dk,
+            dv: self.dv,
+            conv_k: self.conv_k,
+            key_dim: self.key_dim,
+            value_dim: self.value_dim,
+            conv_dim: self.conv_dim,
+            q_scale: self.q_scale,
+            rms_eps: self.rms_eps,
+        }
+    }
+}
+
 impl Block {
     fn refs<'a>(&'a self, rope: &'a RopeCache) -> Result<BlockRefs<'a>, ModelError> {
         if self.moe.is_some() || self.ple.is_some() {
@@ -95,11 +152,9 @@ impl Block {
         if self.layer_scalar.is_some_and(|a| a != 1.0) {
             return Err(ModelError::Build("обучение: множитель слоя пока не поддержан".into()));
         }
-        let attn = match &self.mixer {
-            Mixer::Full(fa) => fa.refs(rope)?,
-            Mixer::Linear(_) => {
-                return Err(ModelError::Build("обучение: линейное внимание (GDN) пока не поддержано".into()))
-            }
+        let mixer = match &self.mixer {
+            Mixer::Full(fa) => MixerRefs::Full(fa.refs(rope)?),
+            Mixer::Linear(la) => MixerRefs::Linear(la.refs()),
         };
         let mlp = match &self.mlp {
             Ffn::Dense(m) => MlpRefs {
@@ -115,7 +170,7 @@ impl Block {
             post_attn_norm: self.post_attn_norm.as_ref(),
             pre_mlp_norm: &self.pre_mlp_norm,
             post_mlp_norm: self.post_mlp_norm.as_ref(),
-            attn,
+            mixer,
             mlp,
             rms_eps: self.rms_eps,
             post_eps: self.post_eps,

@@ -9,6 +9,7 @@ use synaptix_llm_train::model::{Batch, TrainModel};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
     let dev = Device::Cuda(0);
     let dt = if args.get(2).map(|s| s.as_str()) == Some("f32") { DType::F32 } else { DType::BF16 };

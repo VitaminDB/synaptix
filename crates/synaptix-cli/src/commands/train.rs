@@ -56,13 +56,13 @@ pub fn run(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let base_quant = parse_quant(&args.quant)?;
     let targets: Vec<String> = match args.targets.as_str() {
         "all" => LoraConfig::default().targets,
-        "attn" => ["q_proj", "k_proj", "v_proj", "o_proj"].iter().map(|s| s.to_string()).collect(),
+        "attn" => ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj"].iter().map(|s| s.to_string()).collect(),
         t => t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
     };
     let opts = LoraTrainOptions {
         base_quant,
         base_matmul: if args.native_quant { BaseMatmul::Native } else { BaseMatmul::Dequant },
-        lora: LoraConfig { r: args.lora_r, alpha: args.lora_alpha.unwrap_or(2.0 * args.lora_r as f32), targets, seed: args.seed },
+        lora: LoraConfig { r: args.lora_r, alpha: args.lora_alpha.unwrap_or(2.0 * args.lora_r as f32), targets, seed: args.seed, ..LoraConfig::default() },
         train: TrainConfig {
             lr: args.lr,
             epochs: args.epochs,

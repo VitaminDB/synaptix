@@ -9,6 +9,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
 use synaptix_core::tensor::Tensor;
+use synaptix_tokenizer::Tokenizer as _;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
 use synaptix_llm_train::lora::LoraConfig;
 use synaptix_llm_train::model::{Batch, TrainModel};
@@ -22,6 +23,7 @@ fn main() {
     let model_path = &args[1];
     let out = &args[2];
     let quant = args.get(3).map(|s| s.as_str()).unwrap_or("bf16");
+    synaptix_kernels_cpu::ensure_registered();
     synaptix_kernels_cuda::ensure_registered();
     let dev = Device::Cuda(0);
     let mut prec = PrecisionConfig::dense(if quant == "f32" { DType::F32 } else { DType::BF16 });
@@ -29,9 +31,19 @@ fn main() {
         prec.attn_w = DType::NVFP4;
         prec.mlp_w = DType::NVFP4;
     }
-    let pipe = Qwen3Pipeline::load_with_precision(model_path, dev, prec, Some(4096)).expect("load");
-    let cfg = LoraConfig { r: 8, alpha: 16.0, seed: 7, ..LoraConfig::default() };
-    let mut model = TrainModel::new(&pipe.model, cfg).expect("train model");
+    let config: serde_json::Value = serde_json::from_slice(&synaptix_io::weights::read_model_file(std::path::Path::new(model_path), "config.json").expect("config")).unwrap();
+    let hybrid = config.get("text_config").is_some();
+    let (qwen3, hyb);
+    let (base, enc): (&synaptix_llm_common::DecoderModel, Box<dyn Fn(&str) -> Vec<u32>>) = if hybrid {
+        hyb = synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline::load_with_precision(model_path, dev, prec, Some(4096)).expect("load");
+        (&hyb.model, Box::new(|s: &str| hyb.tokenizer.encode(s, false).unwrap().ids.clone()))
+    } else {
+        qwen3 = Qwen3Pipeline::load_with_precision(model_path, dev, prec, Some(4096)).expect("load");
+        (&qwen3.model, Box::new(|s: &str| qwen3.encode(s).unwrap()))
+    };
+    let prefix = if hybrid { "model.language_model.layers" } else { "model.layers" };
+    let cfg = LoraConfig { r: 8, alpha: 16.0, seed: 7, module_prefix: prefix.into(), ..LoraConfig::default() };
+    let mut model = TrainModel::new(base, cfg).expect("train model");
     // B не нулём: иначе градиент по A равен нулю и сверять нечего.
     let zero_b = std::env::var("GRAD_REF_ZERO_B").is_ok();
     for (i, l) in model.layers_mut().enumerate().filter(|_| !zero_b) {
@@ -42,10 +54,12 @@ fn main() {
 
     let text_a = "Синтаксис Rust строится вокруг владения и заимствования: у каждого значения один владелец, а ссылки проверяются при компиляции.";
     let text_b = "The quick brown fox jumps over the lazy dog while the compiler checks every borrow.";
-    let ta = pipe.encode(text_a).unwrap();
-    let tb = pipe.encode(text_b).unwrap();
+    let ta = enc(text_a);
+    let tb = enc(text_b);
+    // Один пример — для гибрида: HF не сбрасывает состояние GDN на границе упаковки.
+    let seqs: Vec<Vec<u32>> = if std::env::var("GRAD_REF_ONE_SEG").is_ok() { vec![[ta, tb].concat()] } else { vec![ta, tb] };
     let mut batch = Batch::default();
-    for (seg, toks) in [ta, tb].iter().enumerate() {
+    for (seg, toks) in seqs.iter().enumerate() {
         let n = toks.len();
         for t in 0..n {
             batch.tokens.push(toks[t]);

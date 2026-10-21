@@ -9,6 +9,10 @@ use synaptix_core::tensor::Tensor;
 
 use crate::Result;
 
+/// Проекции по умолчанию: внимание, GDN (кроме узких `in_proj_a/b`) и MLP.
+pub const DEFAULT_TARGETS: [&str; 10] =
+    ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj"];
+
 /// Какие проекции учить и с каким рангом.
 #[derive(Debug, Clone)]
 pub struct LoraConfig {
@@ -18,6 +22,9 @@ pub struct LoraConfig {
     /// `gate_proj`, `up_proj`, `down_proj`.
     pub targets: Vec<String>,
     pub seed: u64,
+    /// Префикс путей слоёв в именах PEFT: `model.layers` (Qwen3) или
+    /// `model.language_model.layers` (Qwen3.5+ с башней зрения).
+    pub module_prefix: String,
 }
 
 impl Default for LoraConfig {
@@ -25,11 +32,9 @@ impl Default for LoraConfig {
         Self {
             r: 16,
             alpha: 32.0,
-            targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            targets: DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect(),
             seed: 0,
+            module_prefix: "model.layers".into(),
         }
     }
 }
