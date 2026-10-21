@@ -135,7 +135,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let experts = if q8 { None } else { Some(main) };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone() };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone(), deltas: None };
     if args.plan {
         let items = synaptix_io::weights::transcode::plan(&args.input, &spec)?;
         let mut g: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();

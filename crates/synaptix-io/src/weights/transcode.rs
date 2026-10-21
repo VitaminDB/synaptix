@@ -71,7 +71,42 @@ pub struct TranscodeSpec {
     /// Квантовать только эти компоненты бандла (`transformer`, `main`…);
     /// пусто — все. Остальные компоненты копируются как есть (VAE и т. п.).
     pub components: Vec<String>,
+    /// Слияние адаптеров LoRA: к матрицам из набора прибавляется `s·B·A`
+    /// перед квантом (формат — `deltas.format` или прежний).
+    pub deltas: Option<WeightDeltas>,
 }
+
+/// Добавка LoRA к одной матрице `[n, k]`: `s · B[n, r] · A[r, k]` (F32).
+#[derive(Clone)]
+pub struct WeightDelta {
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub r: usize,
+    pub scale: f32,
+}
+
+/// Набор добавок по именам тензоров бандла (`….weight`).
+#[derive(Clone)]
+pub struct WeightDeltas {
+    pub map: Arc<HashMap<String, WeightDelta>>,
+    /// Формат изменённых матриц: `None` — прежний (квант остаётся квантом
+    /// того же формата, плотная — плотной), иначе — этот (BF16 — плотно).
+    pub format: Option<DType>,
+}
+
+impl std::fmt::Debug for WeightDeltas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WeightDeltas({} матриц, {:?})", self.map.len(), self.format)
+    }
+}
+
+impl PartialEq for WeightDeltas {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.map, &other.map) && self.format == other.format
+    }
+}
+
+impl Eq for WeightDeltas {}
 
 impl TranscodeSpec {
     /// Один формат на attn/mlp/экспертов/голову, эмбеддинг как есть.
@@ -88,6 +123,7 @@ impl TranscodeSpec {
             vision: None,
             rules: Vec::new(),
             components: Vec::new(),
+            deltas: None,
         }
     }
 
@@ -149,6 +185,9 @@ impl TranscodeSpec {
             self.requant as u8,
             self.quantize_dense as u8
         );
+        if let Some(d) = &self.deltas {
+            k.push_str(&format!(",lora={:p}:{:?}", Arc::as_ptr(&d.map), d.format));
+        }
         if self.vision.is_some() {
             k += &format!(",vision={}", f(self.vision));
         }
@@ -303,7 +342,14 @@ struct Item {
     shape: Vec<usize>,
     /// Текущий квант-формат (`None` — плотный).
     current: Option<QuantKind>,
+    /// Цель: квант-формат или плотный тип (BF16/F16/F32 — у слияния LoRA).
     target: DType,
+    /// Добавка LoRA к матрице.
+    delta: Option<WeightDelta>,
+}
+
+fn is_dense(dt: DType) -> bool {
+    matches!(dt, DType::BF16 | DType::F16 | DType::F32)
 }
 
 fn target_ok(target: DType, n: usize, k: usize) -> bool {
@@ -321,7 +367,15 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
         if name.ends_with(".qpacked") || name.ends_with(".qscales") {
             continue;
         }
+        let delta = spec.deltas.as_ref().and_then(|d| d.map.get(name).map(|w| (w.clone(), d.format)));
         if let (Some(kind), Some(dims)) = (loader.quant_kind(name), loader.quant_dims(name)) {
+            if let Some((dw, fmt)) = delta {
+                let target = fmt.unwrap_or(kind.dtype());
+                if dims.0 == 1 && (is_dense(target) || target_ok(target, dims.1, dims.2)) {
+                    out.push(Item { name: name.to_string(), dims, shape: vec![dims.1, dims.2], current: Some(kind), target, delta: Some(dw) });
+                    continue;
+                }
+            }
             if !spec.requant {
                 continue;
             }
@@ -330,8 +384,19 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
                 continue;
             }
             let shape = if dims.0 == 1 { vec![dims.1, dims.2] } else { vec![dims.0, dims.1, dims.2] };
-            out.push(Item { name: name.to_string(), dims, shape, current: Some(kind), target });
+            out.push(Item { name: name.to_string(), dims, shape, current: Some(kind), target, delta: None });
             continue;
+        }
+        if let Some((dw, fmt)) = delta {
+            if let Some((shape, dtype)) = loader.dense_shape(name) {
+                if let [n, k] = shape.as_slice() {
+                    let target = fmt.unwrap_or(dtype);
+                    if is_dense(target) || target_ok(target, *n, *k) {
+                        out.push(Item { name: name.to_string(), dims: (1, *n, *k), shape: shape.clone(), current: None, target, delta: Some(dw) });
+                        continue;
+                    }
+                }
+            }
         }
         if !spec.quantize_dense {
             continue;
@@ -349,9 +414,49 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
         if !target_ok(target, dims.1, dims.2) {
             continue;
         }
-        out.push(Item { name: name.to_string(), dims, shape, current: None, target });
+        out.push(Item { name: name.to_string(), dims, shape, current: None, target, delta: None });
     }
     out
+}
+
+/// Матрица среза в плотном виде на `device` (F16; с добавкой LoRA — F32).
+fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<Tensor> {
+    let (slices, n, k) = item.dims;
+    let dense: Tensor = match item.current {
+        Some(_) => {
+            let qw = loader
+                .load_quant_expert(&item.name, slice, device)
+                .ok_or_else(|| IoError::Bundle(format!("{}: квант-вес пропал из источника", item.name)))??;
+            qw.dequantize(DType::F16).map_err(|e| IoError::Bundle(format!("{}: деквант {:?}: {e}", item.name, qw.dtype())))?
+        }
+        None => {
+            let src_dt = if item.delta.is_some() { DType::F32 } else { DType::F16 };
+            let host = loader.load_to(&item.name, Device::Cpu, src_dt)?;
+            let t = if slices == 1 { host } else { host.narrow(0, slice, 1).map_err(IoError::Core)? };
+            t.to_device(device)
+                .and_then(|t| t.contiguous())
+                .and_then(|t| t.reshape((n, k)))
+                .map_err(|e| IoError::Bundle(format!("{}: срез {slice} на карту: {e}", item.name)))?
+        }
+    };
+    let Some(d) = &item.delta else { return Ok(dense) };
+    let add = || -> synaptix_core::error::Result<Tensor> {
+        let a = Tensor::from_vec(d.a.clone(), vec![d.r, k], device)?;
+        let b = Tensor::from_vec(d.b.clone(), vec![n, d.r], device)?;
+        let delta = b.matmul(&a)?.mul_scalar(d.scale)?;
+        dense.to_dtype(DType::F32)?.add(&delta)
+    };
+    add().map_err(|e| IoError::Bundle(format!("{}: добавка LoRA: {e}", item.name)))
+}
+
+/// Плотные байты матрицы с добавкой (цель — BF16/F16/F32).
+fn dense_bytes(loader: &SynBundleLoader, item: &Item, device: Device) -> Result<Vec<u8>> {
+    dense_slice(loader, item, 0, device)?
+        .to_dtype(item.target)
+        .and_then(|t| t.to_device(Device::Cpu))
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.to_bytes())
+        .map_err(IoError::Core)
 }
 
 /// Байты перекодированного среза: `(packed, scales)`; масштабы пусты у
@@ -381,22 +486,8 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
         let (packed, scales) = synaptix_core::quant::q8row::quantize(&host, n, k, h.as_deref());
         return Ok((packed, synaptix_core::quant::q8row::scales_to_bytes(&scales)));
     }
-    let dense: Tensor = match item.current {
-        Some(_) => {
-            let qw = loader
-                .load_quant_expert(&item.name, slice, device)
-                .ok_or_else(|| IoError::Bundle(format!("{}: квант-вес пропал из источника", item.name)))??;
-            qw.dequantize(DType::F16).map_err(|e| IoError::Bundle(format!("{}: деквант {:?}: {e}", item.name, qw.dtype())))?
-        }
-        None => {
-            let host = loader.load_to(&item.name, Device::Cpu, DType::F16)?;
-            let t = if slices == 1 { host } else { host.narrow(0, slice, 1).map_err(IoError::Core)? };
-            t.to_device(device)
-                .and_then(|t| t.contiguous())
-                .and_then(|t| t.reshape((n, k)))
-                .map_err(|e| IoError::Bundle(format!("{}: срез {slice} на карту: {e}", item.name)))?
-        }
-    };
+    let dense = dense_slice(loader, item, slice, device)?;
+    let dense = if dense.dtype() == DType::F16 { dense } else { dense.to_dtype(DType::F16).map_err(IoError::Core)? };
     let q: QuantWeight = dense
         .quantize_to(item.target)
         .map_err(|e| IoError::Bundle(format!("{}: квант в {:?}: {e}", item.name, item.target)))?;
@@ -424,7 +515,10 @@ fn bytes_of_items(items: &[Item]) -> (u64, u64) {
     let mut before = 0u64;
     let mut after = 0u64;
     for it in items {
-        after += synaptix_bundle::inspect::quantized_bytes(&it.shape, QuantKind::from_dtype(it.target).unwrap()).unwrap_or(0);
+        after += match QuantKind::from_dtype(it.target) {
+            Some(kind) => synaptix_bundle::inspect::quantized_bytes(&it.shape, kind).unwrap_or(0),
+            None => it.target.bytes_for_numel(it.shape.iter().product::<usize>()) as u64,
+        };
         before += match it.current {
             Some(kind) => synaptix_bundle::inspect::quantized_bytes(&it.shape, kind).unwrap_or(0),
             None => it.shape.iter().product::<usize>() as u64 * 2,
@@ -732,6 +826,8 @@ enum Kind {
     /// Квант источника без перекодировки: срезы блобов как есть.
     PassQuant(String, bool),
     Quant(usize, bool),
+    /// Плотная матрица с добавкой LoRA.
+    DenseDelta(usize),
 }
 
 fn st_dtype_of(dt: DType) -> Option<StDtype> {
@@ -759,6 +855,12 @@ impl FullStream {
             }
             if let Some(&i) = by_name.get(name) {
                 let it = &items[i];
+                if is_dense(it.target) {
+                    let st = st_dtype_of(it.target).ok_or_else(|| IoError::Bundle(format!("{name}: тип {:?}", it.target)))?;
+                    plan.push(StreamTensor { name: name.to_string(), dtype: st, shape: it.shape.clone() });
+                    kinds.push(Kind::DenseDelta(i));
+                    continue;
+                }
                 let entry = entry_for(it);
                 let kind = entry.kind().unwrap();
                 manifest.tensors.insert(it.name.clone(), entry.clone());
@@ -821,6 +923,15 @@ impl TensorStream for FullStream {
             Kind::PassQuant(name, is_scales) => {
                 let (packed, scales) = self.loader.quant_blob_slices(name).ok_or_else(|| synaptix_bundle::Error::Safetensors(format!("{name}: блоб кванта пропал")))?.map_err(err)?;
                 w.write_all(if *is_scales { scales } else { packed }).map_err(synaptix_bundle::Error::Io)
+            }
+            Kind::DenseDelta(ii) => {
+                let item = &self.items[*ii];
+                if let Some(p) = &self.progress {
+                    p(self.done, self.items.len(), &item.name);
+                }
+                let bytes = dense_bytes(&self.loader, item, self.device).map_err(err)?;
+                self.done += 1;
+                w.write_all(&bytes).map_err(synaptix_bundle::Error::Io)
             }
             Kind::Quant(ii, true) => {
                 let item = &self.items[*ii];

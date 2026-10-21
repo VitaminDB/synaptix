@@ -55,6 +55,8 @@ synaptix-audio        = { workspace = true, optional = true }
 # LLM-архитектуры (фасад facade::llm диспетчит по детекции арх).
 synaptix-llm-common   = { workspace = true, optional = true }
 synaptix-llm-train    = { workspace = true, optional = true }
+safetensors           = { workspace = true }
+half                  = { workspace = true }
 synaptix-llm-qwen3    = { workspace = true, optional = true }
 synaptix-llm-qwen4-exp = { workspace = true, optional = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true, optional = true }

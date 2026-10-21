@@ -40,6 +40,8 @@ pub struct LoraTrainOptions {
     pub max_samples: Option<usize>,
     /// Продолжить с готового адаптера (те же цели и ранг).
     pub init_adapter: Option<PathBuf>,
+    /// Только оценить лосс на всём датасете (без обучения и сохранения).
+    pub eval_only: bool,
     pub device: Device,
 }
 
@@ -54,6 +56,7 @@ impl Default for LoraTrainOptions {
             eval_fraction: 0.02,
             max_samples: None,
             init_adapter: None,
+            eval_only: false,
             device: Device::Cuda(0),
         }
     }
@@ -75,6 +78,8 @@ pub struct DatasetReport {
 #[derive(Debug, Clone)]
 pub struct TrainReport {
     pub dataset: DatasetReport,
+    /// Лосс на всём датасете в режиме `eval_only`.
+    pub eval_loss: Option<f32>,
     pub eval_samples: usize,
     pub trainable_params: usize,
     pub adapter_dir: PathBuf,
@@ -274,7 +279,7 @@ pub fn train_lora(
     if samples.is_empty() {
         return Err(LlmError(format!("{}: ни одного пригодного примера", data.display())));
     }
-    let (train, eval) = split_eval(samples, opts.eval_fraction);
+    let (train, eval) = if opts.eval_only { (Vec::new(), samples) } else { split_eval(samples, opts.eval_fraction) };
     on_dataset(&dataset, train.len(), eval.len());
 
     let mut prec = PrecisionConfig::dense(DType::BF16);
@@ -294,7 +299,8 @@ pub fn train_lora(
         .is_some_and(|c| c.get("text_config").is_some());
     opts.lora.module_prefix = if multimodal { "model.language_model.layers".into() } else { "model.layers".into() };
     let out_dir = opts.train.out_dir.clone();
-    let run = |base: &synaptix_llm_common::DecoderModel| -> Result<usize, LlmError> {
+    let mut eval_loss = None;
+    let mut run = |base: &synaptix_llm_common::DecoderModel| -> Result<usize, LlmError> {
         let err = |e: synaptix_llm_train::TrainError| LlmError(e.to_string());
         let mut tm = synaptix_llm_train::TrainModel::new(base, opts.lora.clone()).map_err(err)?;
         tm.base_matmul = opts.base_matmul;
@@ -303,7 +309,11 @@ pub fn train_lora(
         }
         let params = tm.num_params();
         let mut trainer = synaptix_llm_train::Trainer::new(opts.train.clone());
-        trainer.run(&mut tm, &train, &eval, progress).map_err(err)?;
+        if opts.eval_only {
+            eval_loss = trainer.evaluate(&tm, &eval).map_err(err)?;
+        } else {
+            trainer.run(&mut tm, &train, &eval, progress).map_err(err)?;
+        }
         Ok(params)
     };
     let trainable_params = match arch {
@@ -323,5 +333,73 @@ pub fn train_lora(
         }
         other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 и Qwen3.5+ (плотных); у модели {other:?}"))),
     };
-    Ok(TrainReport { dataset, eval_samples: eval.len(), trainable_params, adapter_dir: out_dir })
+    Ok(TrainReport { dataset, eval_loss, eval_samples: eval.len(), trainable_params, adapter_dir: out_dir })
+}
+
+/// Влить адаптер PEFT (`adapter_dir`) в веса модели `base` и записать новый
+/// бандл `out`. `format` — формат изменённых матриц: `None` — прежний,
+/// иначе — этот. Добавка LoRA меньше шага 4-битного кванта, поэтому на
+/// NVFP4-базе переквантование в тот же формат теряет бо́льшую часть
+/// адаптера (Qwen3-1.7B, ru_turbo_alpaca: eval 1.118 с адаптером, 1.668
+/// после слияния в NVFP4, 1.124 — в MXFP8, 1.118 — в BF16; база 1.948).
+/// Остальные тензоры и файлы копируются как есть.
+pub fn merge_lora(
+    base: &Path,
+    adapter_dir: &Path,
+    out: &Path,
+    format: Option<DType>,
+    device: Device,
+    progress: Option<synaptix_io::weights::transcode::Progress>,
+) -> Result<usize, LlmError> {
+    use std::collections::HashMap;
+    use synaptix_io::weights::transcode::{TranscodeSpec, WeightDelta, WeightDeltas};
+
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    let e = |m: String| LlmError(m);
+    let cfg: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(adapter_dir.join("adapter_config.json")).map_err(|x| e(format!("adapter_config.json: {x}")))?,
+    )
+    .map_err(|x| e(format!("adapter_config.json: {x}")))?;
+    let r = cfg.get("r").and_then(|v| v.as_u64()).ok_or_else(|| e("adapter_config.json: нет r".into()))? as usize;
+    let alpha = cfg.get("lora_alpha").and_then(|v| v.as_f64()).unwrap_or(r as f64) as f32;
+    let scale = alpha / r as f32;
+    let bytes = std::fs::read(adapter_dir.join("adapter_model.safetensors")).map_err(|x| e(format!("adapter_model.safetensors: {x}")))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|x| e(x.to_string()))?;
+    let read = |name: &str| -> Result<(Vec<usize>, Vec<f32>), LlmError> {
+        let v = st.tensor(name).map_err(|x| e(format!("{name}: {x}")))?;
+        let data: Vec<f32> = match v.dtype() {
+            safetensors::Dtype::F32 => v.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            safetensors::Dtype::BF16 => v.data().chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            safetensors::Dtype::F16 => v.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            d => return Err(e(format!("{name}: тип {d:?}"))),
+        };
+        Ok((v.shape().to_vec(), data))
+    };
+    let mut map = HashMap::new();
+    for name in st.names() {
+        let Some(module) = name.strip_prefix("base_model.model.").and_then(|n| n.strip_suffix(".lora_A.weight")) else { continue };
+        let (ash, a) = read(name)?;
+        let (bsh, b) = read(&format!("base_model.model.{module}.lora_B.weight"))?;
+        if ash.len() != 2 || bsh.len() != 2 || ash[0] != bsh[1] {
+            return Err(e(format!("{module}: формы A {ash:?} и B {bsh:?} не согласованы")));
+        }
+        map.insert(format!("{module}.weight"), WeightDelta { a, b, r: ash[0], scale });
+    }
+    if map.is_empty() {
+        return Err(e(format!("{}: в адаптере нет матриц LoRA", adapter_dir.display())));
+    }
+    // Каждая добавка должна найти свою матрицу.
+    let loader = synaptix_io::weights::syn_bundle::SynBundleLoader::open(base).map_err(|x| e(x.to_string()))?;
+    let have: std::collections::HashSet<String> = synaptix_io::weights::WeightLoader::names(&loader).into_iter().map(|s| s.to_string()).collect();
+    let missing: Vec<&String> = map.keys().filter(|k| !have.contains(*k)).collect();
+    if !missing.is_empty() {
+        return Err(e(format!("в модели нет матриц адаптера: {} (первая: {})", missing.len(), missing[0])));
+    }
+    let n = map.len();
+    let mut spec = TranscodeSpec::keep();
+    spec.deltas = Some(WeightDeltas { map: std::sync::Arc::new(map), format });
+    let _w = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+    synaptix_io::weights::transcode::write_bundle(base, out, &spec, device, progress).map_err(|x| e(x.to_string()))?;
+    Ok(n)
 }

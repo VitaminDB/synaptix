@@ -389,8 +389,26 @@ enum Commands {
         /// Продолжить с адаптера.
         #[arg(long)]
         resume: Option<PathBuf>,
+        /// Только посчитать лосс на всём датасете (с адаптером из --resume или без).
+        #[arg(long)]
+        eval_only: bool,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+    },
+    /// Влить адаптер LoRA (каталог PEFT от `synaptix train`) в веса модели и
+    /// записать новый `.syn`.
+    MergeLora {
+        /// Модель `.syn`, на которой учился адаптер.
+        model: PathBuf,
+        /// Каталог адаптера.
+        adapter: PathBuf,
+        /// Новый `.syn`.
+        output: PathBuf,
+        /// Формат изменённых матриц: mxfp8 (почти без потерь) | bf16 (без потерь; большие плотные
+        /// матрицы инференс квантует при загрузке) | keep (как было; 4-битная база теряет
+        /// бо́льшую часть адаптера при переквантовании) | nvfp4 | sq1…sq8.
+        #[arg(long, default_value = "mxfp8")]
+        format: String,
     },
     /// Квантование/перекодировка модели в `.syn`: плотные матрицы и уже
     /// квантованные веса (`.syn` NVFP4/MXFP8/SQ, `.gguf` ggml) → формат
@@ -1418,11 +1436,12 @@ fn main() -> ExitCode {
         }
         Commands::Train {
             model, data, output, quant, native_quant, lora_r, lora_alpha, targets, lr, epochs, max_len, grad_accum,
-            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, seed,
+            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, eval_only, seed,
         } => train::run(train::TrainArgs {
             model, data, output, quant, native_quant, lora_r, lora_alpha, targets, lr, epochs, max_len, grad_accum,
-            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, seed,
+            warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, eval_only, seed,
         }),
+        Commands::MergeLora { model, adapter, output, format } => train::merge(&model, &adapter, &output, &format),
         Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan } => {
             quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan })
         }

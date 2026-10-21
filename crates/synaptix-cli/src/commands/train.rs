@@ -28,6 +28,7 @@ pub struct TrainArgs {
     pub max_samples: Option<usize>,
     pub thinking: bool,
     pub resume: Option<PathBuf>,
+    pub eval_only: bool,
     pub seed: u64,
 }
 
@@ -81,6 +82,7 @@ pub fn run(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         eval_fraction: args.eval_fraction,
         max_samples: args.max_samples,
         init_adapter: args.resume.clone(),
+        eval_only: args.eval_only,
         ..LoraTrainOptions::default()
     };
     eprintln!("synaptix train: {} ← {}", args.model.display(), args.data.display());
@@ -130,10 +132,34 @@ pub fn run(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             true
         },
     )?;
+    if let Some(l) = report.eval_loss {
+        eprintln!("лосс на датасете ({} примеров): {l:.4}", report.eval_samples);
+        return Ok(());
+    }
     eprintln!(
         "готово: адаптер ({} обучаемых параметров) — {}",
         report.trainable_params,
         report.adapter_dir.display()
     );
+    Ok(())
+}
+
+/// `synaptix merge-lora` — влить адаптер в веса и записать новый бандл.
+pub fn merge(model: &std::path::Path, adapter: &std::path::Path, out: &std::path::Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let fmt = match format {
+        "keep" => None,
+        f => Some(parse_quant(f)?),
+    };
+    eprintln!("synaptix merge-lora: {} + {} → {} (формат изменённых матриц: {format})", model.display(), adapter.display(), out.display());
+    if matches!(fmt, None | Some(DType::NVFP4) | Some(DType::Sq { bits: 1..=4 })) {
+        eprintln!("  внимание: добавка LoRA меньше шага 4-битного кванта — после переквантования теряется бо́льшая часть адаптера (на Qwen3-1.7B: eval 1.12 → 1.67 при базе 1.95); без потерь — --format mxfp8 или bf16");
+    }
+    let progress: synaptix_io::weights::transcode::Progress = std::sync::Arc::new(|done: usize, total: usize, name: &str| {
+        if done % 16 == 0 || done + 1 == total {
+            eprintln!("  {}/{} {name}", done + 1, total);
+        }
+    });
+    let n = synaptix::facade::train::merge_lora(model, adapter, out, fmt, synaptix_core::device::Device::Cuda(0), Some(progress))?;
+    eprintln!("готово: влито матриц — {n}; {}", out.display());
     Ok(())
 }
