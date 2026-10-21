@@ -379,6 +379,8 @@ __global__ void lora_down_f32(const float* x, const float* w, float* out, int T,
 __global__ void lora_down_bf16(const __nv_bfloat16* x, const float* w, float* out, int T, int K, int r) { lora_down(x, w, out, T, K, r); }
 __global__ void lora_up_add_f32(const float* b, const float* z, const float* m, float* o, int T, int N, int r, float s) { lora_up_add(b, z, m, o, T, N, r, s); }
 __global__ void lora_up_add_bf16(const __nv_bfloat16* b, const float* z, const float* m, __nv_bfloat16* o, int T, int N, int r, float s) { lora_up_add(b, z, m, o, T, N, r, s); }
+__global__ void lora_up_add_f16(const __half* b, const float* z, const float* m, __half* o, int T, int N, int r, float s) { lora_up_add(b, z, m, o, T, N, r, s); }
+__global__ void lora_down_f16(const __half* x, const float* w, float* out, int T, int K, int r) { lora_down(x, w, out, T, K, r); }
 __global__ void lora_outer_f32(const float* a, const float* b, float* p, int T, int K, int r) { lora_outer(a, b, p, T, K, r); }
 __global__ void lora_outer_bf16(const float* a, const __nv_bfloat16* b, float* p, int T, int K, int r) { lora_outer(a, b, p, T, K, r); }
 }

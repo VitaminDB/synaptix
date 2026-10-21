@@ -586,6 +586,10 @@ pub struct DecoderModel {
     /// переносе блоков) — ключ годности захваченных графов.
     instance_id: u64,
     weights_gen: u64,
+    /// Адаптеры LoRA при генерации ([`lora`]).
+    lora: lora::LoraState,
+    /// Поколение набора адаптеров (растёт при каждой смене).
+    lora_gen: u64,
     /// MoE, не влезшая на карту: эксперты живут в RAM, на карту едут
     /// выбранные роутером — через этот общий кэш. Блоки (внимание, плотный
     /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
@@ -1658,6 +1662,8 @@ impl DecoderModel {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             weights_gen: 0,
+            lora: lora::LoraState::default(),
+            lora_gen: 0,
             expert_cache,
             ple: model_ple,
             ple_cur: std::sync::Mutex::new(None),
@@ -2825,6 +2831,9 @@ impl DecoderModel {
         if !self.config.graph_decode_ok() {
             return no("профиль конфига");
         }
+        if self.lora_active() {
+            return no("включён адаптер LoRA (слитые ядра читают веса мимо добавки)");
+        }
         if self.config.sliding_window.is_some() && !self.ring_kv_ok() {
             return no("sliding без ring-KV");
         }
@@ -2856,7 +2865,8 @@ impl DecoderModel {
     }
 
     pub fn npu_decode_ready(&self) -> bool {
-        matches!(self.device, Device::Npu(_))
+        !self.lora_active()
+            && matches!(self.device, Device::Npu(_))
             && self.blocks_all_resident()
             && self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Full(_)) && b.moe.is_none())
     }
@@ -3660,6 +3670,9 @@ impl DecoderModel {
     /// `flash_attention_dev` уже T>1-aware — `t = idx % T_seq`, `pos = start_pos + t`,
     /// `q_pos = Tkv - Tq + ti`. Никаких kernel-правок не потребовалось.
     pub fn forward_prefill_dev(&self, state: &mut PrefillState, kv: &mut KvCache) -> Result<(), ModelError> {
+        if self.lora_active() {
+            return Err(ModelError::Forward("forward_prefill_dev: включён адаптер LoRA".into()));
+        }
         if !self.config.graph_prefill_ok() {
             return Err(ModelError::Forward(
                 "forward_prefill_dev: профиль не поддержан (sandwich/sliding/local-rope/hybrid)".into(),
@@ -4842,7 +4855,7 @@ fn proj_shared(
 ) -> Result<Tensor, ModelError> {
     prof(dev, name, || {
         if let Some((p, s, fmt)) = act {
-            if ql.quant_dtype() == Some(*fmt) {
+            if ql.quant_dtype() == Some(*fmt) && !ql.has_lora() {
                 let lead = &h.dims()[..h.rank() - 1];
                 let m: usize = lead.iter().product();
                 let out = ql.forward_prequant(p, s, m, h.dtype())?; // [m, N]
@@ -5081,4 +5094,5 @@ fn trace_graph() -> bool {
     env_flag(&F, "SYN_TRACE_GRAPH")
 }
 
+pub mod lora;
 pub mod train_access;

@@ -31,6 +31,7 @@ use super::super::arch::{config_max_seq, detect_llm_arch, LlmArch};
 
 pub use synaptix_core::device::Device;
 pub use synaptix_llm_common::GenerationConfig as RawGenerationConfig;
+pub use synaptix_llm_common::model::lora::LoraInfo;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,6 +500,31 @@ enum LlmPipeline {
 }
 
 impl LlmPipeline {
+    /// Общий декодер модели — у архитектур на `DecoderModel`.
+    fn decoder_mut(&mut self) -> Option<&mut synaptix_llm_common::DecoderModel> {
+        match self {
+            Self::Qwen3(p) => Some(&mut p.model),
+            Self::Hybrid(p) => Some(&mut p.model),
+            Self::Llama(p) => Some(&mut p.model),
+            Self::Gemma3(p) => Some(&mut p.model),
+            Self::Gemma4(p) => Some(&mut p.model),
+            Self::MuseGlimmer(p) => Some(&mut p.model),
+            Self::Qwen4Exp(_) => None,
+        }
+    }
+
+    fn decoder(&self) -> Option<&synaptix_llm_common::DecoderModel> {
+        match self {
+            Self::Qwen3(p) => Some(&p.model),
+            Self::Hybrid(p) => Some(&p.model),
+            Self::Llama(p) => Some(&p.model),
+            Self::Gemma3(p) => Some(&p.model),
+            Self::Gemma4(p) => Some(&p.model),
+            Self::MuseGlimmer(p) => Some(&p.model),
+            Self::Qwen4Exp(_) => None,
+        }
+    }
+
     fn rope_capacity(&self) -> usize {
         match self {
             Self::Qwen3(p) => p.model.rope_capacity(),
@@ -780,6 +806,8 @@ pub struct LlmKvSession {
     media: Vec<MediaSig>,
     /// Граница точки возврата следующего хода (см. [`Self::set_resume_at`]).
     resume_at: Option<usize>,
+    /// Поколение набора адаптеров LoRA, при котором считался кэш.
+    lora_gen: u64,
 }
 
 /// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
@@ -1116,6 +1144,7 @@ fn plain_session(
         kind: SessionKind::Plain,
         media: Vec::new(),
         resume_at: None,
+        lora_gen: 0,
     }))
 }
 
@@ -1136,6 +1165,50 @@ pub struct Llm {
 impl Llm {
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    fn with_decoder<T>(&self, f: impl FnOnce(&mut synaptix_llm_common::DecoderModel) -> Result<T, synaptix_llm_common::ModelError>) -> Result<T, LlmError> {
+        let mut g = self.pipeline.lock().map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let d = g.decoder_mut().ok_or_else(|| LlmError("LoRA: у этой архитектуры адаптеры не поддержаны".into()))?;
+        f(d).map_err(|e| LlmError(e.to_string()))
+    }
+
+    /// Загрузить адаптер LoRA (каталог PEFT) под именем `name` — включённым.
+    /// Накладывается при генерации поверх весов модели, без слияния.
+    pub fn load_lora(&self, name: &str, dir: &Path) -> Result<LoraInfo, LlmError> {
+        self.with_decoder(|d| d.load_lora(name, dir))
+    }
+
+    /// Включить или выключить загруженный адаптер.
+    pub fn set_lora_enabled(&self, name: &str, enabled: bool) -> Result<(), LlmError> {
+        self.with_decoder(|d| d.set_lora_enabled(name, enabled))
+    }
+
+    /// Сила адаптера (множитель масштаба; 1 — как учился).
+    pub fn set_lora_strength(&self, name: &str, strength: f32) -> Result<(), LlmError> {
+        self.with_decoder(|d| d.set_lora_strength(name, strength))
+    }
+
+    pub fn unload_lora(&self, name: &str) -> Result<bool, LlmError> {
+        self.with_decoder(|d| Ok(d.unload_lora(name)))
+    }
+
+    pub fn loras(&self) -> Vec<LoraInfo> {
+        self.pipeline.lock().ok().and_then(|g| g.decoder().map(|d| d.loras())).unwrap_or_default()
+    }
+
+    /// Поколение набора адаптеров (кэш KV при другом наборе недействителен).
+    pub fn lora_generation(&self) -> u64 {
+        self.pipeline.lock().ok().and_then(|g| g.decoder().map(|d| d.lora_generation())).unwrap_or(0)
+    }
+
+    /// Сбросить сессию, если она считалась при другом наборе адаптеров.
+    fn sync_session_lora(&self, session: &mut LlmKvSession) {
+        let g = self.lora_generation();
+        if session.lora_gen != g {
+            session.invalidate();
+            session.lora_gen = g;
+        }
     }
 
     pub fn config(&self) -> &LlmConfig {
@@ -1206,6 +1279,7 @@ impl Llm {
                     kind: SessionKind::Hybrid { mtp_kv, snap: None, mtp_len: 0, mtp_synced: true },
                     media: Vec::new(),
                     resume_at: None,
+                    lora_gen: 0,
                 }))
             }
             LlmPipeline::MuseGlimmer(p) => {
@@ -1230,6 +1304,7 @@ impl Llm {
                     kind: SessionKind::Muse { dcache },
                     media: Vec::new(),
                     resume_at: None,
+                    lora_gen: 0,
                 }))
             }
             LlmPipeline::Gemma4(p) => {
@@ -1241,6 +1316,7 @@ impl Llm {
                     kind: SessionKind::Plain,
                     media: Vec::new(),
                     resume_at: None,
+                    lora_gen: 0,
                 }))
             }
             // Плотные декодеры на общей модели: сессия — ровно основной KV.
@@ -1260,6 +1336,7 @@ impl Llm {
                     kind: SessionKind::Qwen4Exp(Box::new(session)),
                     media: Vec::new(),
                     resume_at: None,
+                    lora_gen: 0,
                 }))
             }
         }
@@ -1738,6 +1815,7 @@ impl<'a> LlmGeneration<'a> {
         // (см. [`LlmKvSession::park_to_host`]). Забирать её обратно —
         // обязанность вызывающего, но забыть это дешевле, чем поймать
         // device mismatch посреди forward'а.
+        self.model.sync_session_lora(session);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2105,6 +2183,7 @@ impl<'a> LlmGeneration<'a> {
         F: FnMut(u32, &str) -> bool,
     {
         let _runtime = self.model.runtime_scope();
+        self.model.sync_session_lora(session);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }

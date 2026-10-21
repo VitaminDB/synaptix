@@ -273,7 +273,7 @@ pub fn run_train_op(
                 return Err(SynaptixError::Unsupported("LoraUpAdd: формы"));
             }
             let t = bl.numel() / n;
-            let name = format!("lora_up_add_{}", match bl.dtype() { DType::F32 => "f32", DType::BF16 => "bf16", _ => return Err(SynaptixError::Unsupported("LoraUpAdd: base F32/BF16")) });
+            let name = format!("lora_up_add_{}", match bl.dtype() { DType::F32 => "f32", DType::BF16 => "bf16", DType::F16 => "f16", _ => return Err(SynaptixError::Unsupported("LoraUpAdd: base F32/BF16/F16")) });
             let f = k.f(&name)?;
             let (ti, ni, ri, s) = (t as i32, n as i32, r as i32, scale);
             let mut b = stream.launch_builder(&f);

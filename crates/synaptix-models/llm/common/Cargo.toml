@@ -18,6 +18,8 @@ rayon              = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 cudarc             = { workspace = true }
+safetensors        = { workspace = true }
+serde_json         = { workspace = true }
 
 [dev-dependencies]
 serde_json            = { workspace = true }

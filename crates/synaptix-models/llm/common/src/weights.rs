@@ -135,6 +135,16 @@ impl QLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+        let y = self.forward_base(x)?;
+        crate::model::lora::apply(self, x, y).map_err(|e| ModelError::Forward(format!("LoRA: {e}")))
+    }
+
+    /// Есть ли у проекции включённый адаптер LoRA.
+    pub fn has_lora(&self) -> bool {
+        crate::model::lora::has(self)
+    }
+
+    fn forward_base(&self, x: &Tensor) -> Result<Tensor, ModelError> {
         match self {
             QLinear::Dense(l) => {
                 use synaptix_nn::module::Module;
