@@ -17,6 +17,12 @@ pub struct ConvertArgs {
 }
 
 pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Каталог HF (шарды + config/tokenizer/…) — тем же планом, что страница
+    // пакетов Synthos. Расширение у каталога не смотрим: в `Qwen3.8-27B`
+    // точка — часть имени.
+    if args.input.is_dir() {
+        return convert_dir_to_syn(&args);
+    }
     let from_ext = args.input.extension().and_then(|e| e.to_str()).unwrap_or("");
     let to_ext = args.output.extension().and_then(|e| e.to_str()).unwrap_or("");
     match (from_ext, to_ext) {
@@ -113,6 +119,31 @@ fn convert_gguf_to_syn(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Err
     if report.kept_quant > 0 {
         println!("  кванты:     {} тензоров оставлены блоками ggml (quant_manifest.json)", report.kept_quant);
     }
+    Ok(())
+}
+
+fn convert_dir_to_syn(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut plan = synaptix_bundle::pack_plan::PackPlan::scan(&args.input)?;
+    if let Some(id) = &args.id {
+        plan.meta.id = id.clone();
+    }
+    if let Some(arch) = &args.arch {
+        plan.meta.arch = arch.clone();
+    }
+    println!("Converting {} → {}", args.input.display(), args.output.display());
+    println!("  bundle_id:  {}", plan.meta.id);
+    println!("  arch:       {}", plan.meta.arch);
+    for c in plan.components.iter().filter(|c| c.enabled) {
+        println!("  component:  {} ({} шардов)", c.name, c.paths.len());
+    }
+    for f in plan.aux.iter().filter(|f| f.enabled) {
+        println!("  file:       {}", f.rel);
+    }
+    for w in &plan.warnings {
+        println!("  warning:    {w}");
+    }
+    plan.into_builder()?.write(&args.output)?;
+    println!("Done: {}", args.output.display());
     Ok(())
 }
 
