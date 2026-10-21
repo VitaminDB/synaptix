@@ -102,6 +102,7 @@ pub fn run(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         &args.model,
         &args.data,
         opts,
+        Default::default(),
         |d, n_train, n_eval| {
             eprintln!(
                 "  датасет: {} примеров ({} обучение, {} оценка), {} токенов, из них учится {}; пропущено {}, обрезано {}{}",

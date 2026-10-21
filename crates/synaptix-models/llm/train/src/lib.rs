@@ -25,4 +25,4 @@ pub mod trainer;
 pub use error::{Result, TrainError};
 pub use lora::{LoraConfig, LoraLayer};
 pub use model::{Batch, StepStats, TrainModel};
-pub use trainer::{Sample, TrainConfig, TrainProgress, Trainer};
+pub use trainer::{Sample, TrainConfig, TrainHooks, TrainProgress, Trainer};

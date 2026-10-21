@@ -124,15 +124,37 @@ pub fn pack(samples: &[&Sample], max_len: usize) -> Vec<Batch> {
     out
 }
 
+/// Внешнее управление ходом обучения (служба нейросетей).
+#[derive(Default, Clone)]
+pub struct TrainHooks {
+    /// Берётся перед шагом оптимизатора (и оценкой) и отпускается после:
+    /// служба держит так карту, а между шагами её получают другие задачи.
+    pub step_guard: Option<std::sync::Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>>,
+    /// Поднят — обучение останавливается после текущего шага (адаптер
+    /// сохраняется).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl TrainHooks {
+    fn guard(&self) -> Option<Box<dyn std::any::Any>> {
+        self.step_guard.as_ref().map(|g| g())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 pub struct Trainer {
     pub cfg: TrainConfig,
     pub opt: AdamW,
+    pub hooks: TrainHooks,
 }
 
 impl Trainer {
     pub fn new(cfg: TrainConfig) -> Self {
         let opt = AdamW { weight_decay: cfg.weight_decay, ..AdamW::default() };
-        Self { cfg, opt }
+        Self { cfg, opt, hooks: TrainHooks::default() }
     }
 
     /// Средний CE на отложенных примерах.
@@ -178,6 +200,10 @@ impl Trainer {
 
         'outer: for (epoch, batches) in epochs.iter().enumerate() {
             for group in batches.chunks(accum) {
+                if self.hooks.cancelled() {
+                    break 'outer;
+                }
+                let guard = self.hooks.guard();
                 let n_targets: usize = group.iter().map(|b| b.n_targets()).sum();
                 let scale = 1.0 / n_targets.max(1) as f32;
                 let (mut loss_sum, mut n) = (0f64, 0usize);
@@ -206,6 +232,7 @@ impl Trainer {
                 } else {
                     None
                 };
+                drop(guard);
                 let p = TrainProgress {
                     step,
                     total_steps,
@@ -228,6 +255,7 @@ impl Trainer {
             }
         }
         let _ = stop;
+        let _guard = self.hooks.guard();
         adapter::save(model, &cfg.out_dir, &cfg.base_name)
     }
 }

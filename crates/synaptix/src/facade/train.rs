@@ -18,7 +18,7 @@ use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
 
 pub use synaptix_llm_train::linear::BaseMatmul;
-pub use synaptix_llm_train::{LoraConfig, Sample, TrainConfig, TrainProgress};
+pub use synaptix_llm_train::{LoraConfig, Sample, TrainConfig, TrainHooks, TrainProgress};
 
 use super::arch::{detect_llm_arch, LlmArch};
 use super::llm::{load_llm_tokenizer, LlmError, LlmTokenizer, Message};
@@ -63,7 +63,7 @@ impl Default for LoraTrainOptions {
 }
 
 /// Что получилось из датасета.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DatasetReport {
     pub samples: usize,
     pub skipped: usize,
@@ -269,6 +269,7 @@ pub fn train_lora(
     model: &Path,
     data: &Path,
     mut opts: LoraTrainOptions,
+    hooks: TrainHooks,
     on_dataset: impl FnOnce(&DatasetReport, usize, usize),
     progress: impl FnMut(&TrainProgress) -> bool,
 ) -> Result<TrainReport, LlmError> {
@@ -309,6 +310,7 @@ pub fn train_lora(
         }
         let params = tm.num_params();
         let mut trainer = synaptix_llm_train::Trainer::new(opts.train.clone());
+        trainer.hooks = hooks.clone();
         if opts.eval_only {
             eval_loss = trainer.evaluate(&tm, &eval).map_err(err)?;
         } else {
@@ -316,12 +318,14 @@ pub fn train_lora(
         }
         Ok(params)
     };
+    let load_guard = hooks.step_guard.as_ref().map(|g| g());
     let trainable_params = match arch {
         LlmArch::Qwen3 => {
             let _w = synaptix_core::device::cuda::WeightsAllocGuard::for_device(opts.device);
             let p = synaptix_llm_qwen3::pipeline::Qwen3Pipeline::load_with_precision(model, opts.device, prec, Some(rope))
                 .map_err(|e| LlmError(format!("load qwen3: {e}")))?;
             drop(_w);
+            drop(load_guard);
             run(&p.model)?
         }
         LlmArch::Hybrid => {
@@ -329,6 +333,7 @@ pub fn train_lora(
             let p = synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline::load_with_precision(model, opts.device, prec, Some(rope))
                 .map_err(|e| LlmError(format!("load hybrid: {e}")))?;
             drop(_w);
+            drop(load_guard);
             run(&p.model)?
         }
         other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 и Qwen3.5+ (плотных); у модели {other:?}"))),
