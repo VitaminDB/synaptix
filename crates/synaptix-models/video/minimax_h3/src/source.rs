@@ -255,9 +255,30 @@ impl H3EncoderSource {
                 let dir = root.join("text_encoder");
                 dir.is_dir().then(|| H3EncoderSource::Dir(dir))
             }
-            H3Source::Bundle { path, bundle, .. } => bundle_has_component(bundle, "text_encoder")
-                .then(|| Self::from_bundle(path.clone(), bundle.clone())),
+            H3Source::Bundle { path, bundle, .. } => {
+                if bundle_has_component(bundle, "text_encoder") {
+                    return Some(Self::from_bundle(path.clone(), bundle.clone()));
+                }
+                Self::sibling_bundle(path)
+            }
         }
+    }
+
+    /// Энкодер, лежащий отдельным бандлом рядом с моделью (`minimax-h3-qwen3vl-encoder.syn`):
+    /// так раскладывает библиотека моделей, где fl2va и ref2va делят один энкодер.
+    fn sibling_bundle(model: &Path) -> Option<Self> {
+        let dir = model.parent()?;
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p != model)
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                name.ends_with(".syn") && name.contains("h3") && name.contains("encoder")
+            })
+            .collect();
+        found.sort();
+        found.into_iter().find_map(|p| Self::open(&p).ok())
     }
 
     pub fn path(&self) -> &Path {
