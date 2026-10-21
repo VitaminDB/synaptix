@@ -35,4 +35,25 @@ pub enum TrainOp {
     /// Шаг AdamW: входы `[p, g, m, v]` F32 одной длины, выходы `[p', m', v']`.
     /// `bc1`/`bc2` — поправки смещения `1 − βᵗ`.
     AdamW { lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, bc1: f32, bc2: f32 },
+    /// LoRA, сжатие: входы `[x [T,K] (F32/BF16), w [r,K] F32]`, выход
+    /// `[x·wᵀ [T,r] F32]`. `r ≤ 64`.
+    LoraDown,
+    /// LoRA, разжатие с прибавлением: входы `[base [T,N], z [T,r] F32,
+    /// m [N,r] F32]`, выход `[base + scale·z·mᵀ]` того же типа, что `base`
+    /// (F32/BF16).
+    LoraUpAdd { scale: f32 },
+    /// LoRA, градиент: входы `[a [T,r] F32, b [T,K] (F32/BF16)]`, выход —
+    /// частичные суммы `[P, r, K]` F32 по кускам `T` (`P = ⌈T/128⌉`), их
+    /// сумма по первой оси — `aᵀ·b`.
+    LoraOuter,
+    /// Flash-attention (обучение), прямой проход: входы `[q [H,T,D],
+    /// k [Hkv,T,D], v [Hkv,T,D]]` BF16 и, если `has_seg`, `seg I32 [T]`;
+    /// выходы `[o BF16 [H,T,D], lse F32 [H,T]]`. Каузально, внутри примера.
+    /// `D` — 64, 128 или 256.
+    FlashFwd { scale: f32, has_seg: bool },
+    /// Flash-attention, обратный проход: входы `[q, k, v, dout BF16 [H,T,D],
+    /// lse F32 [H,T], delta F32 [H,T] (= Σ dout∘o по D)]` и `seg`, если
+    /// `has_seg`; выходы `[dq F32 [H,T,D], dk F32 [Hkv,Tp,D], dv F32
+    /// [Hkv,Tp,D]]`, `Tp = ⌈T/32⌉·32` (хвост за `T` — мусор, отрезается).
+    FlashBwd { scale: f32, has_seg: bool },
 }

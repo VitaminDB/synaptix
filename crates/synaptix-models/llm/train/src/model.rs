@@ -117,7 +117,7 @@ impl<'m> TrainModel<'m> {
         let positions = Tensor::from_vec(batch.positions.clone(), vec![t], dev)?;
         let multi = batch.seg.iter().any(|&s| s != batch.seg[0]);
         let seg = if multi { Some(Tensor::from_vec(batch.seg.clone(), vec![t], dev)?) } else { None };
-        Ok(SeqCtx { t, positions, seg })
+        Ok(SeqCtx::new(t, positions, seg))
     }
 
     fn embed(&self, batch: &Batch) -> Result<Tensor> {
@@ -173,7 +173,7 @@ impl<'m> TrainModel<'m> {
         for i in 0..n_layers {
             let b = self.base.train_block(i)?;
             inputs.push(x.clone());
-            x = block::forward(&b, &self.lora[i], &x, &ctx, &Weights::new(self.base_matmul))?.0;
+            x = crate::prof::prof(self.base.device, "Σ block_fwd", || block::forward(&b, &self.lora[i], &x, &ctx, &Weights::new(self.base_matmul)))?.0;
         }
         let (stats, dx) = crate::prof::prof(self.base.device, "head", || self.head(&x, &batch.labels, loss_scale, true))?;
         drop(x);
@@ -182,9 +182,9 @@ impl<'m> TrainModel<'m> {
             let b = self.base.train_block(i)?;
             let xi = inputs.pop().unwrap();
             let w = Weights::new(self.base_matmul);
-            let (_, saved) = block::forward(&b, &self.lora[i], &xi, &ctx, &w)?;
+            let (_, saved) = crate::prof::prof(self.base.device, "Σ block_fwd", || block::forward(&b, &self.lora[i], &xi, &ctx, &w))?;
             drop(xi);
-            dx = block::backward(&b, &mut self.lora[i], saved, &dx, &w)?;
+            dx = crate::prof::prof(self.base.device, "Σ block_bwd", || block::backward(&b, &mut self.lora[i], saved, &dx, &w))?;
         }
         Ok(stats)
     }

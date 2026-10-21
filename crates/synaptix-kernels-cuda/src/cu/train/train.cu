@@ -258,3 +258,127 @@ __global__ void ce_fwd_bwd_bf16_bf16(const __nv_bfloat16* x, const int* l, float
 __global__ void ce_fwd_bwd_f16_f32(const __half* x, const int* l, float* loss, float* g, int V, float s) { ce_fwd_bwd(x, l, loss, g, V, s); }
 __global__ void ce_fwd_bwd_f16_bf16(const __half* x, const int* l, float* loss, __nv_bfloat16* g, int V, float s) { ce_fwd_bwd(x, l, loss, g, V, s); }
 }
+
+// ── LoRA: узкие умножения (ранг r ≪ K, N) ───────────────────────────────────
+// Обычная GEMM с тайлами 128×128 на r = 16 простаивает; эти ядра упираются в
+// память: активация читается один раз, узкая матрица — из L2.
+
+#define LORA_RC 16   // каналов ранга за проход
+#define LORA_ROWS 4  // строк активации на блок (общие загрузки весов)
+
+// out[t, j] = Σ_k x[t, k] · w[j, k];  x [T, K], w [r, K] F32, out [T, r] F32.
+template <typename T>
+__device__ void lora_down(const T* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+                          int Tn, int K, int r) {
+    // [варп][строка·канал]: каждый варп сводит свои 64 суммы шаффлами, потом
+    // первые 64 нити складывают варпы.
+    __shared__ float red[32][LORA_ROWS * LORA_RC];
+    int t0 = blockIdx.x * LORA_ROWS;
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int j0 = 0; j0 < r; j0 += LORA_RC) {
+        float acc[LORA_ROWS][LORA_RC];
+#pragma unroll
+        for (int a = 0; a < LORA_ROWS; a++)
+#pragma unroll
+            for (int b = 0; b < LORA_RC; b++) acc[a][b] = 0.f;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            float xv[LORA_ROWS];
+#pragma unroll
+            for (int a = 0; a < LORA_ROWS; a++) xv[a] = (t0 + a < Tn) ? ld(x, (long long)(t0 + a) * K + k) : 0.f;
+#pragma unroll
+            for (int b = 0; b < LORA_RC; b++) {
+                float wv = (j0 + b < r) ? w[(long long)(j0 + b) * K + k] : 0.f;
+#pragma unroll
+                for (int a = 0; a < LORA_ROWS; a++) acc[a][b] += xv[a] * wv;
+            }
+        }
+#pragma unroll
+        for (int a = 0; a < LORA_ROWS; a++)
+#pragma unroll
+            for (int b = 0; b < LORA_RC; b++) {
+                float v = acc[a][b];
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                if (lane == 0) red[wid][a * LORA_RC + b] = v;
+            }
+        __syncthreads();
+        if (threadIdx.x < LORA_ROWS * LORA_RC) {
+            int a = threadIdx.x / LORA_RC, b = threadIdx.x % LORA_RC;
+            float v = 0.f;
+            for (int i = 0; i < nw; i++) v += red[i][threadIdx.x];
+            if (t0 + a < Tn && j0 + b < r) out[(long long)(t0 + a) * r + j0 + b] = v;
+        }
+        __syncthreads();
+    }
+}
+
+// out[t, n] = base[t, n] + s · Σ_j z[t, j] · m[n, j];  z [T, r], m [N, r] F32.
+// Блок — LORA_ROWS строк × 256 столбцов; строка m[n] держится в регистрах.
+template <typename B, typename O>
+__device__ void lora_up_add(const B* __restrict__ base, const float* __restrict__ z, const float* __restrict__ m,
+                            O* __restrict__ out, int Tn, int N, int r, float s) {
+    __shared__ float zs[LORA_ROWS][64];
+    int t0 = blockIdx.y * LORA_ROWS;
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = threadIdx.x; i < LORA_ROWS * r; i += blockDim.x) {
+        int a = i / r, j = i % r;
+        zs[a][j] = (t0 + a < Tn) ? z[(long long)(t0 + a) * r + j] : 0.f;
+    }
+    __syncthreads();
+    if (n >= N) return;
+    float mv[64];
+#pragma unroll 16
+    for (int j = 0; j < r; j++) mv[j] = m[(long long)n * r + j];
+#pragma unroll
+    for (int a = 0; a < LORA_ROWS; a++) {
+        int t = t0 + a;
+        if (t >= Tn) break;
+        float acc = 0.f;
+#pragma unroll 16
+        for (int j = 0; j < r; j++) acc += zs[a][j] * mv[j];
+        long long o = (long long)t * N + n;
+        st(out, o, ld(base, o) + s * acc);
+    }
+}
+
+// part[p, j, k] = Σ_{t ∈ кусок p} a[t, j] · b[t, k];  a [T, r] F32, b [T, K].
+// Кусок — LORA_TCHUNK строк; куски суммирует вызывающий (`[P, r, K]`).
+#define LORA_TCHUNK 128
+template <typename T>
+__device__ void lora_outer(const float* __restrict__ a, const T* __restrict__ b, float* __restrict__ part,
+                           int Tn, int K, int r) {
+    __shared__ float as[LORA_TCHUNK][LORA_RC];
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int p = blockIdx.y;
+    int t0 = p * LORA_TCHUNK;
+    int tn = min(LORA_TCHUNK, Tn - t0);
+    for (int j0 = 0; j0 < r; j0 += LORA_RC) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < LORA_TCHUNK * LORA_RC; i += blockDim.x) {
+            int tt = i / LORA_RC, j = i % LORA_RC;
+            as[tt][j] = (tt < tn && j0 + j < r) ? a[(long long)(t0 + tt) * r + j0 + j] : 0.f;
+        }
+        __syncthreads();
+        if (k < K) {
+            float acc[LORA_RC];
+#pragma unroll
+            for (int j = 0; j < LORA_RC; j++) acc[j] = 0.f;
+            for (int tt = 0; tt < tn; tt++) {
+                float bv = ld(b, (long long)(t0 + tt) * K + k);
+#pragma unroll
+                for (int j = 0; j < LORA_RC; j++) acc[j] += as[tt][j] * bv;
+            }
+#pragma unroll
+            for (int j = 0; j < LORA_RC; j++)
+                if (j0 + j < r) part[((long long)p * r + j0 + j) * K + k] = acc[j];
+        }
+    }
+}
+
+extern "C" {
+__global__ void lora_down_f32(const float* x, const float* w, float* out, int T, int K, int r) { lora_down(x, w, out, T, K, r); }
+__global__ void lora_down_bf16(const __nv_bfloat16* x, const float* w, float* out, int T, int K, int r) { lora_down(x, w, out, T, K, r); }
+__global__ void lora_up_add_f32(const float* b, const float* z, const float* m, float* o, int T, int N, int r, float s) { lora_up_add(b, z, m, o, T, N, r, s); }
+__global__ void lora_up_add_bf16(const __nv_bfloat16* b, const float* z, const float* m, __nv_bfloat16* o, int T, int N, int r, float s) { lora_up_add(b, z, m, o, T, N, r, s); }
+__global__ void lora_outer_f32(const float* a, const float* b, float* p, int T, int K, int r) { lora_outer(a, b, p, T, K, r); }
+__global__ void lora_outer_bf16(const float* a, const __nv_bfloat16* b, float* p, int T, int K, int r) { lora_outer(a, b, p, T, K, r); }
+}

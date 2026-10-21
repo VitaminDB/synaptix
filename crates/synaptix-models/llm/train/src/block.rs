@@ -49,6 +49,15 @@ pub struct SeqCtx {
     pub positions: Tensor,
     /// Номер примера `[T]` I32; `None` — один пример.
     pub seg: Option<Tensor>,
+    /// Таблицы RoPE по позициям — общие для слоёв с одним кэшем
+    /// (ключ — адрес кэша и число поворачиваемых каналов).
+    pub rope_tabs: std::cell::RefCell<Vec<(usize, usize, Tensor, Tensor)>>,
+}
+
+impl SeqCtx {
+    pub fn new(t: usize, positions: Tensor, seg: Option<Tensor>) -> Self {
+        Self { t, positions, seg, rope_tabs: std::cell::RefCell::new(Vec::new()) }
+    }
 }
 
 /// Всё, что прямой проход оставляет обратному.
@@ -61,11 +70,10 @@ pub struct Saved {
     q_raw: Tensor,
     gate_raw: Option<Tensor>,
     k_raw: Tensor,
-    qr: Tensor,
-    kr: Tensor,
-    v: Tensor,
-    p: Tensor,
-    o: Tensor,
+    core: AttnCore,
+    seg: Option<Tensor>,
+    /// Выход внимания до гейта `[T, nh, hd]` F32 — только при гейте.
+    o: Option<Tensor>,
     attn32: Option<Tensor>,
     zo: Option<Tensor>,
     a: Option<Tensor>,
@@ -94,8 +102,9 @@ fn same_dtype(w: &Tensor, as_: &Tensor) -> Result<Tensor> {
 pub fn rms_bwd(x: &Tensor, w: &Tensor, dy: &Tensor, eps: f32) -> Result<Tensor> {
     let w = same_dtype(w, x)?;
     let dy = f32(dy)?;
-    let out = Tensor::train_op(TrainOp::RmsNormBwd { eps }, &[x, &w, &dy], &[(x.dims().to_vec(), DType::F32)])?;
-    Ok(out.into_iter().next().unwrap())
+    crate::prof::prof(x.device(), "norm_bwd", || -> Result<Tensor> {
+        Ok(Tensor::train_op(TrainOp::RmsNormBwd { eps }, &[x, &w, &dy], &[(x.dims().to_vec(), DType::F32)])?.remove(0))
+    })
 }
 
 /// Проекция с адаптером: `(y в compute-типе x, z адаптера)`.
@@ -107,8 +116,7 @@ fn proj(w: &Weights, q: &QLinear, lora: Option<&LoraLayer>, x: &Tensor, x32: Opt
     match lora {
         Some(l) => {
             let x32 = x32.ok_or_else(|| other("proj: нет F32-входа для LoRA"))?;
-            let (z, d) = crate::prof::prof(x.device(), "lora_fwd", || l.forward(x32))?;
-            let y = f32(&y)?.add(&d)?.to_dtype(x.dtype())?;
+            let (z, y) = crate::prof::prof(x.device(), "lora_fwd", || l.forward_add(x32, &y))?;
             Ok((y, Some(z)))
         }
         None => Ok((y, None)),
@@ -121,7 +129,7 @@ fn proj_bwd(w: &Weights, q: &QLinear, lora: Option<&mut LoraLayer>, x32: Option<
     let mut dx = w.backward_input(q, dy)?;
     if let Some(l) = lora {
         let (x32, z) = x32.zip(z).ok_or_else(|| other("proj_bwd: нет сохранённых входов LoRA"))?;
-        dx = dx.add(&crate::prof::prof(dy.device(), "lora_bwd", || l.backward(x32, z, dy))?)?;
+        dx = crate::prof::prof(dy.device(), "lora_bwd", || l.backward_add(x32, z, dy, &dx))?;
     }
     Ok(dx)
 }
@@ -157,6 +165,16 @@ fn sum_groups(x: &Tensor, nkv: usize, group: usize) -> Result<Tensor> {
 }
 
 fn rope_tables(attn: &AttnRefs<'_>, ctx: &SeqCtx) -> Result<(Tensor, Tensor)> {
+    let key = (attn.rope as *const _ as usize, attn.rotary_dim);
+    if let Some((_, _, c, s)) = ctx.rope_tabs.borrow().iter().find(|e| (e.0, e.1) == key) {
+        return Ok((c.clone(), s.clone()));
+    }
+    let (c, s) = rope_tables_build(attn, ctx)?;
+    ctx.rope_tabs.borrow_mut().push((key.0, key.1, c.clone(), s.clone()));
+    Ok((c, s))
+}
+
+fn rope_tables_build(attn: &AttnRefs<'_>, ctx: &SeqCtx) -> Result<(Tensor, Tensor)> {
     let rot = attn.rotary_dim;
     let cos = attn.rope.cos().index_select(0, &ctx.positions)?;
     let sin = attn.rope.sin().index_select(0, &ctx.positions)?;
@@ -182,9 +200,9 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
     }
 
     // ── Внимание ──
-    let n1 = rms_norm(x, b.pre_attn_norm, b.rms_eps)?;
+    let n1 = crate::prof::prof(x.device(), "norm_fwd", || rms_norm(x, b.pre_attn_norm, b.rms_eps))?;
     let any_attn_lora = lora.q.is_some() || lora.k.is_some() || lora.v.is_some();
-    let n1_32 = if any_attn_lora { Some(f32(&n1)?) } else { None };
+    let n1_32 = if any_attn_lora { Some(n1.clone()) } else { None };
     let (qg, zq) = proj(w, at.q_proj, lora.q.as_ref(), &n1, n1_32.as_ref(), at.q_bias)?;
     let (k, zk) = proj(w, at.k_proj, lora.k.as_ref(), &n1, n1_32.as_ref(), at.k_bias)?;
     let (v, zv) = proj(w, v_proj, lora.v.as_ref(), &n1, n1_32.as_ref(), at.v_bias)?;
@@ -197,53 +215,49 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
     };
     let k_raw = k.reshape(vec![t, nkv, hd])?;
     let qn = match at.q_norm {
-        Some(w) => rms_norm(&q_raw, w, at.rms_eps)?,
+        Some(w) => crate::prof::prof(x.device(), "qknorm_fwd", || rms_norm(&q_raw, w, at.rms_eps))?,
         None => q_raw.clone(),
     };
     let kn = match at.k_norm {
-        Some(w) => rms_norm(&k_raw, w, at.rms_eps)?,
+        Some(w) => crate::prof::prof(x.device(), "qknorm_fwd", || rms_norm(&k_raw, w, at.rms_eps))?,
         None => k_raw.clone(),
     };
-    let (cos, sin) = rope_tables(at, ctx)?;
-    let qr = rope(&f32(&qn)?.permute(vec![1, 0, 2])?.contiguous()?, &cos, &sin, at.rotary_dim, false)?;
-    let kr = rope(&f32(&kn)?.permute(vec![1, 0, 2])?.contiguous()?, &cos, &sin, at.rotary_dim, false)?;
-    let vh = f32(&v.reshape(vec![t, nkv, hd])?)?.permute(vec![1, 0, 2])?.contiguous()?;
-
-    let (p, o) = crate::prof::prof(x.device(), "attn_fwd", || -> Result<(Tensor, Tensor)> {
-        let krep = if group > 1 { kr.repeat_interleave(0, group)? } else { kr.clone() };
-        let vrep = if group > 1 { vh.repeat_interleave(0, group)? } else { vh.clone() };
-        let scores = qr.matmul(&krep.t()?)?;
-        let p = softmax(&scores, at.attn_scale, ctx)?;
-        drop(scores);
-        let o = p.matmul(&vrep)?.permute(vec![1, 0, 2])?.contiguous()?; // [T, nh, hd]
-        Ok((p, o))
+    let (cos, sin) = crate::prof::prof(x.device(), "rope_tab", || rope_tables(at, ctx))?;
+    let (qr, kr) = crate::prof::prof(x.device(), "rope", || -> Result<(Tensor, Tensor)> {
+        Ok((
+            rope(&f32(&qn)?.permute(vec![1, 0, 2])?.contiguous()?, &cos, &sin, at.rotary_dim, false)?,
+            rope(&f32(&kn)?.permute(vec![1, 0, 2])?.contiguous()?, &cos, &sin, at.rotary_dim, false)?,
+        ))
     })?;
+    let vh = v.reshape(vec![t, nkv, hd])?.permute(vec![1, 0, 2])?.contiguous()?;
+
+    let (core, o) = crate::prof::prof(x.device(), "attn_fwd", || attn_forward(qr, kr, vh, group, at.attn_scale, ctx))?;
     let og = match &gate_raw {
         Some(g) => o.mul(&f32(g)?.sigmoid()?)?,
         None => o.clone(),
     };
-    let attn_flat = og.reshape(vec![t, nh * hd])?.to_dtype(x.dtype())?;
-    let attn32 = if lora.o.is_some() { Some(f32(&attn_flat)?) } else { None };
+    let attn_flat = crate::prof::prof(x.device(), "o_cast", || og.reshape(vec![t, nh * hd]).and_then(|v| v.to_dtype(x.dtype())))?;
+    let attn32 = if lora.o.is_some() { Some(attn_flat.clone()) } else { None };
     let (a, zo) = proj(w, at.o_proj, lora.o.as_ref(), &attn_flat, attn32.as_ref(), None)?;
     let a2 = match b.post_attn_norm {
         Some(w) => rms_norm(&a, w, b.post_eps)?,
         None => a.clone(),
     };
-    let h = x.add(&same_dtype(&a2, x)?)?;
+    let h = crate::prof::prof(x.device(), "resid_fwd", || -> Result<Tensor> { Ok(x.add(&same_dtype(&a2, x)?)?) })?;
 
     // ── MLP ──
-    let n2 = rms_norm(&h, b.pre_mlp_norm, b.rms_eps)?;
-    let n2_32 = if lora.gate.is_some() || lora.up.is_some() { Some(f32(&n2)?) } else { None };
+    let n2 = crate::prof::prof(x.device(), "norm_fwd", || rms_norm(&h, b.pre_mlp_norm, b.rms_eps))?;
+    let n2_32 = if lora.gate.is_some() || lora.up.is_some() { Some(n2.clone()) } else { None };
     let (g, zg) = proj(w, b.mlp.gate_proj, lora.gate.as_ref(), &n2, n2_32.as_ref(), None)?;
     let (u, zu) = proj(w, b.mlp.up_proj, lora.up.as_ref(), &n2, n2_32.as_ref(), None)?;
-    let m = g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u)))?;
-    let m32 = if lora.down.is_some() { Some(f32(&m)?) } else { None };
+    let m = crate::prof::prof(x.device(), "act_fwd", || g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u))))?;
+    let m32 = if lora.down.is_some() { Some(m.clone()) } else { None };
     let (d, zd) = proj(w, b.mlp.down_proj, lora.down.as_ref(), &m, m32.as_ref(), None)?;
     let d2 = match b.post_mlp_norm {
         Some(w) => rms_norm(&d, w, b.post_eps)?,
         None => d.clone(),
     };
-    let out = h.add(&same_dtype(&d2, &h)?)?;
+    let out = crate::prof::prof(x.device(), "resid_fwd", || -> Result<Tensor> { Ok(h.add(&same_dtype(&d2, &h)?)?) })?;
 
     let saved = Saved {
         x: x.clone(),
@@ -254,11 +268,9 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
         q_raw,
         gate_raw,
         k_raw,
-        qr,
-        kr,
-        v: vh,
-        p,
-        o,
+        core,
+        seg: ctx.seg.clone(),
+        o: if at.attn_output_gate { Some(o) } else { None },
         attn32,
         zo,
         a: b.post_attn_norm.map(|_| a),
@@ -278,13 +290,91 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
     Ok((out, saved))
 }
 
-fn softmax(scores: &Tensor, scale: f32, ctx: &SeqCtx) -> Result<Tensor> {
+/// Что ядро внимания оставляет обратному проходу.
+enum AttnCore {
+    /// Flash-ядро: входы в BF16, выход и log-sum-exp строк.
+    Flash { q: Tensor, k: Tensor, v: Tensor, o: Tensor, lse: Tensor },
+    /// Явная матрица вероятностей `[nh, T, T]` (размеры голов без flash-ядра).
+    Naive { q: Tensor, k: Tensor, v: Tensor, p: Tensor },
+}
+
+fn flash_ok(hd: usize) -> bool {
+    matches!(hd, 64 | 128 | 256) && std::env::var("SYN_TRAIN_FLASH").as_deref() != Ok("0")
+}
+
+fn ctx_seg(seg: &Option<Tensor>) -> Option<&Tensor> {
+    seg.as_ref()
+}
+
+/// `q` — `[nh, T, hd]` F32, `k`/`v` — `[nkv, T, hd]`. Выход `[T, nh, hd]` F32.
+fn attn_forward(q: Tensor, k: Tensor, v: Tensor, group: usize, scale: f32, ctx: &SeqCtx) -> Result<(AttnCore, Tensor)> {
+    let (nh, t, hd) = (q.dims()[0], q.dims()[1], q.dims()[2]);
+    if flash_ok(hd) {
+        let (q, k, v) = (q.to_dtype(DType::BF16)?, k.to_dtype(DType::BF16)?, v.to_dtype(DType::BF16)?);
+        let has_seg = ctx.seg.is_some();
+        let mut ins = vec![&q, &k, &v];
+        if let Some(sg) = &ctx.seg {
+            ins.push(sg);
+        }
+        let mut out = Tensor::train_op(TrainOp::FlashFwd { scale, has_seg }, &ins, &[(vec![nh, t, hd], DType::BF16), (vec![nh, t], DType::F32)])?;
+        let lse = out.pop().unwrap();
+        let o = out.pop().unwrap();
+        let ot = f32(&o)?.permute(vec![1, 0, 2])?.contiguous()?;
+        return Ok((AttnCore::Flash { q, k, v, o, lse }, ot));
+    }
+    let v = f32(&v)?;
+    let krep = if group > 1 { k.repeat_interleave(0, group)? } else { k.clone() };
+    let vrep = if group > 1 { v.repeat_interleave(0, group)? } else { v.clone() };
+    let scores = q.matmul(&krep.t()?)?;
     let dims = scores.dims().to_vec();
-    let out = match &ctx.seg {
-        Some(seg) => Tensor::train_op(TrainOp::CausalSoftmax { scale, has_seg: true }, &[scores, seg], &[(dims, DType::F32)])?,
-        None => Tensor::train_op(TrainOp::CausalSoftmax { scale, has_seg: false }, &[scores], &[(dims, DType::F32)])?,
-    };
-    Ok(out.into_iter().next().unwrap())
+    let p = match &ctx.seg {
+        Some(seg) => Tensor::train_op(TrainOp::CausalSoftmax { scale, has_seg: true }, &[&scores, seg], &[(dims, DType::F32)])?,
+        None => Tensor::train_op(TrainOp::CausalSoftmax { scale, has_seg: false }, &[&scores], &[(dims, DType::F32)])?,
+    }
+    .remove(0);
+    drop(scores);
+    let o = p.matmul(&vrep)?.permute(vec![1, 0, 2])?.contiguous()?;
+    Ok((AttnCore::Naive { q, k, v, p }, o))
+}
+
+/// `d_o` — `[T, nh, hd]` F32. Результат — `(dq [nh,T,hd], dk, dv [nkv,T,hd])` F32.
+fn attn_backward(core: AttnCore, d_o: &Tensor, nkv: usize, group: usize, scale: f32, seg: Option<&Tensor>) -> Result<(Tensor, Tensor, Tensor)> {
+    let doh = d_o.permute(vec![1, 0, 2])?.contiguous()?; // [nh, T, hd]
+    match core {
+        AttnCore::Flash { q, k, v, o, lse } => {
+            let (nh, t, hd) = (q.dims()[0], q.dims()[1], q.dims()[2]);
+            let delta = doh.mul(&f32(&o)?)?.sum_keepdim(2)?.reshape(vec![nh, t])?;
+            let do16 = doh.to_dtype(DType::BF16)?;
+            let mut ins = vec![&q, &k, &v, &do16, &lse, &delta];
+            if let Some(sg) = seg {
+                ins.push(sg);
+            }
+            let tp = t.div_ceil(32) * 32;
+            let mut g = Tensor::train_op(
+                TrainOp::FlashBwd { scale, has_seg: seg.is_some() },
+                &ins,
+                &[(vec![nh, t, hd], DType::F32), (vec![nkv, tp, hd], DType::F32), (vec![nkv, tp, hd], DType::F32)],
+            )?;
+            let dv = g.pop().unwrap();
+            let dk = g.pop().unwrap();
+            let dq = g.pop().unwrap();
+            let cut = |x: Tensor| -> Result<Tensor> { Ok(if tp == t { x } else { x.narrow(1, 0, t)?.contiguous()? }) };
+            Ok((dq, cut(dk)?, cut(dv)?))
+        }
+        AttnCore::Naive { q, k, v, p } => {
+            let krep = if group > 1 { k.repeat_interleave(0, group)? } else { k.clone() };
+            let vrep = if group > 1 { v.repeat_interleave(0, group)? } else { v.clone() };
+            let dp = doh.matmul(&vrep.t()?)?;
+            let dvrep = p.t()?.matmul(&doh)?;
+            drop(vrep);
+            let pdims = p.dims().to_vec();
+            let ds = Tensor::train_op(TrainOp::SoftmaxBwd { scale }, &[&p, &dp], &[(pdims, DType::F32)])?.remove(0);
+            drop(dp);
+            let dq = ds.matmul(&krep)?;
+            let dkrep = ds.t()?.matmul(&q)?;
+            Ok((dq, sum_groups(&dkrep, nkv, group)?, sum_groups(&dvrep, nkv, group)?))
+        }
+    }
 }
 
 /// Обратный проход слоя: `dout` — `[T, H]` F32, результат — `dx` F32.
@@ -320,35 +410,21 @@ pub fn backward(b: &BlockRefs<'_>, lora: &mut BlockLora, s: Saved, dout: &Tensor
             let d_o = dattn.mul(&sg)?;
             // d sigmoid = σ(1 − σ)
             let dsg = sg.mul(&sg.affine(-1.0, 1.0)?)?;
-            let dgate = dattn.mul(&s.o)?.mul(&dsg)?;
+            let o = s.o.as_ref().ok_or_else(|| other("гейт без сохранённого выхода внимания"))?;
+            let dgate = dattn.mul(o)?.mul(&dsg)?;
             (d_o, Some(dgate))
         }
         None => (dattn, None),
     };
     let dev = dout.device();
-    let (dqr, dkr, dv) = crate::prof::prof(dev, "attn_bwd", || -> Result<(Tensor, Tensor, Tensor)> {
-    let doh = d_o.permute(vec![1, 0, 2])?.contiguous()?; // [nh, T, hd]
-    let krep = if group > 1 { s.kr.repeat_interleave(0, group)? } else { s.kr.clone() };
-    let vrep = if group > 1 { s.v.repeat_interleave(0, group)? } else { s.v.clone() };
-    let dp = doh.matmul(&vrep.t()?)?;
-    let dvrep = s.p.t()?.matmul(&doh)?;
-    drop(vrep);
-    let pdims = s.p.dims().to_vec();
-    let ds = Tensor::train_op(TrainOp::SoftmaxBwd { scale: at.attn_scale }, &[&s.p, &dp], &[(pdims, DType::F32)])?
-        .into_iter()
-        .next()
-        .unwrap();
-    drop(dp);
-    let dqr = ds.matmul(&krep)?;
-    let dkrep = ds.t()?.matmul(&s.qr)?;
-    drop(ds);
-    let dkr = sum_groups(&dkrep, nkv, group)?;
-    let dv = sum_groups(&dvrep, nkv, group)?;
-    Ok((dqr, dkr, dv))
-    })?;
+    let (dqr, dkr, dv) = crate::prof::prof(dev, "attn_bwd", || attn_backward(s.core, &d_o, nkv, group, at.attn_scale, ctx_seg(&s.seg)))?;
 
-    let dqn = rope(&dqr, &s.cos, &s.sin, at.rotary_dim, true)?.permute(vec![1, 0, 2])?.contiguous()?;
-    let dkn = rope(&dkr, &s.cos, &s.sin, at.rotary_dim, true)?.permute(vec![1, 0, 2])?.contiguous()?;
+    let (dqn, dkn) = crate::prof::prof(dev, "rope", || -> Result<(Tensor, Tensor)> {
+        Ok((
+            rope(&dqr, &s.cos, &s.sin, at.rotary_dim, true)?.permute(vec![1, 0, 2])?.contiguous()?,
+            rope(&dkr, &s.cos, &s.sin, at.rotary_dim, true)?.permute(vec![1, 0, 2])?.contiguous()?,
+        ))
+    })?;
     let dq_raw = match at.q_norm {
         Some(w) => rms_bwd(&s.q_raw, w, &dqn, at.rms_eps)?,
         None => dqn,

@@ -54,7 +54,7 @@ impl Weights {
         let y = match (q, self.mode) {
             (QLinear::Quant(_), BaseMatmul::Dequant) => {
                 let w = self.dense(q)?;
-                crate::prof::prof(x.device(), "w_fwd", || -> Result<Tensor> { Ok(x.to_dtype(w.dtype())?.matmul(&w.t()?)?) })?
+                crate::prof::prof(x.device(), "w_fwd", || -> Result<Tensor> { Ok(x.to_dtype(w.dtype())?.linear(&w)?) })?
             }
             _ => crate::prof::prof(x.device(), "w_fwd", || q.forward(x))?,
         };

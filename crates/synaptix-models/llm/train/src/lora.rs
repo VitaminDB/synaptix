@@ -2,6 +2,7 @@
 //! `B` — `[N, r]`, оба в F32; `B` стартует нулём, так что до первого шага
 //! модель совпадает с базой.
 
+use synaptix_core::backend::train::TrainOp;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
@@ -71,6 +72,10 @@ fn uniform(seed: u64, n: usize, bound: f32) -> Vec<f32> {
         .collect()
 }
 
+fn op1(op: TrainOp, ins: &[&Tensor], dims: Vec<usize>, dt: DType) -> Result<Tensor> {
+    Ok(Tensor::train_op(op, ins, &[(dims, dt)])?.remove(0))
+}
+
 fn add_into(acc: &mut Option<Tensor>, g: Tensor) -> Result<()> {
     *acc = Some(match acc.take() {
         Some(a) => a.add(&g)?,
@@ -110,23 +115,33 @@ impl LoraLayer {
         self.a.dims()[0]
     }
 
-    /// `x` — `[T, K]` F32. Возвращает `(z = x·Aᵀ, s·z·Bᵀ)`; `z` нужен
-    /// обратному проходу.
-    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let z = x.matmul(&self.a.t()?)?;
-        let y = z.matmul(&self.b.t()?)?.mul_scalar(self.scale)?;
-        Ok((z, y))
+    /// `x` — `[T, K]` (вход проекции), `y` — выход замороженной проекции
+    /// `[T, N]`. Возвращает `(z = x·Aᵀ [T, r] F32, y + s·z·Bᵀ)`; `z` нужен
+    /// обратному проходу. Узкие умножения — своими ядрами (упираются в
+    /// память, а не в тайлы GEMM).
+    pub fn forward_add(&self, x: &Tensor, y: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (t, r) = (x.numel() / x.dims()[x.rank() - 1], self.rank());
+        let z = op1(TrainOp::LoraDown, &[x, &self.a], vec![t, r], DType::F32)?;
+        let out = op1(TrainOp::LoraUpAdd { scale: self.scale }, &[y, &z, &self.b], y.dims().to_vec(), y.dtype())?;
+        Ok((z, out))
     }
 
-    /// Градиенты по `A` и `B` копятся, возвращается вклад в `dx` (`[T, K]`).
-    pub fn backward(&mut self, x: &Tensor, z: &Tensor, dy: &Tensor) -> Result<Tensor> {
-        let dys = dy.mul_scalar(self.scale)?;
-        let gb = dys.t()?.matmul(z)?;
-        let dz = dys.matmul(&self.b)?;
-        let ga = dz.t()?.matmul(x)?;
-        add_into(&mut self.gb, gb)?;
+    /// Градиенты по `A` и `B` копятся (F32); к `dx` (`[T, K]` F32, градиент
+    /// через замороженный вес) прибавляется вклад адаптера.
+    pub fn backward_add(&mut self, x: &Tensor, z: &Tensor, dy: &Tensor, dx: &Tensor) -> Result<Tensor> {
+        let (t, r) = (z.dims()[0], self.rank());
+        let (n, k) = (self.b.dims()[0], self.a.dims()[1]);
+        let bt = self.b.t()?.contiguous()?; // [r, N]
+        let dz = op1(TrainOp::LoraDown, &[dy, &bt], vec![t, r], DType::F32)?.mul_scalar(self.scale)?;
+        let at = self.a.t()?.contiguous()?; // [K, r]
+        let dx = op1(TrainOp::LoraUpAdd { scale: 1.0 }, &[dx, &dz, &at], dx.dims().to_vec(), DType::F32)?;
+        let parts = t.div_ceil(128);
+        let ga = op1(TrainOp::LoraOuter, &[&dz, x], vec![parts, r, k], DType::F32)?.sum_keepdim(0)?.reshape(vec![r, k])?;
+        let gbt = op1(TrainOp::LoraOuter, &[z, dy], vec![parts, r, n], DType::F32)?.sum_keepdim(0)?.reshape(vec![r, n])?;
+        let gb = gbt.t()?.contiguous()?.mul_scalar(self.scale)?;
         add_into(&mut self.ga, ga)?;
-        Ok(dz.matmul(&self.a)?)
+        add_into(&mut self.gb, gb)?;
+        Ok(dx)
     }
 
     pub fn zero_grad(&mut self) {

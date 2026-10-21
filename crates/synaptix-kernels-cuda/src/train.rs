@@ -16,6 +16,7 @@ use crate::kernels::compile::{compile_module, load_fn};
 
 pub struct TrainKernels {
     module: Arc<CudaModule>,
+    flash: Arc<CudaModule>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<TrainKernels>)>>> = OnceLock::new();
@@ -28,13 +29,24 @@ impl TrainKernels {
             return Ok(v.clone());
         }
         let module = compile_module(ctx, include_str!("cu/train/train.cu"), "train.cu")?;
-        let new = Arc::new(Self { module });
+        let flash = compile_module(ctx, include_str!("cu/train/flash_train.cu"), "flash_train.cu")?;
+        let new = Arc::new(Self { module, flash });
         cache.lock().push((key, new.clone()));
         Ok(new)
     }
 
     fn f(&self, name: &str) -> Result<CudaFunction> {
         load_fn(&self.module, name)
+    }
+
+    fn flash_fn(&self, name: &str, smem: usize) -> Result<CudaFunction> {
+        let f = load_fn(&self.flash, name)?;
+        f.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem as i32,
+        )
+        .map_err(|e| SynaptixError::Cuda(format!("set smem {name}: {e:?}")))?;
+        Ok(f)
     }
 }
 
@@ -221,6 +233,148 @@ pub fn run_train_op(
             b.arg(p).arg(g).arg(m).arg(v).arg(&mut *o0[0]).arg(&mut *o1[0]).arg(&mut *o2[0]);
             b.arg(&ni).arg(&lr).arg(&beta1).arg(&beta2).arg(&eps).arg(&weight_decay).arg(&bc1).arg(&bc2);
             unsafe { b.launch(flat_cfg(n)) }.map_err(launch_err("adamw_f32"))?;
+        }
+        TrainOp::LoraDown => {
+            let (x, xl) = input(ins, 0, "LoraDown: x")?;
+            let (w, wl) = input(ins, 1, "LoraDown: w")?;
+            need_outs(1)?;
+            expect_dt(wl, DType::F32, "LoraDown: w не F32")?;
+            let (kk, r) = (*xl.dims().last().unwrap(), wl.dims()[0]);
+            if r > 64 || wl.dims()[1] != kk {
+                return Err(SynaptixError::Unsupported("LoraDown: r ≤ 64, w [r, K]"));
+            }
+            let t = xl.numel() / kk;
+            let name = format!("lora_down_{}", sfx(xl.dtype())?);
+            let f = k.f(&name)?;
+            let (ti, ki, ri) = (t as i32, kk as i32, r as i32);
+            let mut b = stream.launch_builder(&f);
+            b.arg(x).arg(w).arg(&mut *out_bufs[0]).arg(&ti).arg(&ki).arg(&ri);
+            unsafe { b.launch(rows_cfg(t.div_ceil(4), 256)) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::LoraUpAdd { scale } => {
+            let (base, bl) = input(ins, 0, "LoraUpAdd: base")?;
+            let (z, zl) = input(ins, 1, "LoraUpAdd: z")?;
+            let (m, ml) = input(ins, 2, "LoraUpAdd: m")?;
+            need_outs(1)?;
+            expect_dt(zl, DType::F32, "LoraUpAdd: z не F32")?;
+            expect_dt(ml, DType::F32, "LoraUpAdd: m не F32")?;
+            if out_layouts[0].dtype() != bl.dtype() {
+                return Err(SynaptixError::Unsupported("LoraUpAdd: выход другого типа, чем base"));
+            }
+            let n = *bl.dims().last().unwrap();
+            let r = ml.dims()[1];
+            if r > 64 || ml.dims()[0] != n || *zl.dims().last().unwrap() != r {
+                return Err(SynaptixError::Unsupported("LoraUpAdd: формы"));
+            }
+            let t = bl.numel() / n;
+            let name = format!("lora_up_add_{}", match bl.dtype() { DType::F32 => "f32", DType::BF16 => "bf16", _ => return Err(SynaptixError::Unsupported("LoraUpAdd: base F32/BF16")) });
+            let f = k.f(&name)?;
+            let (ti, ni, ri, s) = (t as i32, n as i32, r as i32, scale);
+            let mut b = stream.launch_builder(&f);
+            b.arg(base).arg(z).arg(m).arg(&mut *out_bufs[0]).arg(&ti).arg(&ni).arg(&ri).arg(&s);
+            let cfg = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, t.div_ceil(4) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::LoraOuter => {
+            let (a, al) = input(ins, 0, "LoraOuter: a")?;
+            let (bb, bl) = input(ins, 1, "LoraOuter: b")?;
+            need_outs(1)?;
+            expect_dt(al, DType::F32, "LoraOuter: a не F32")?;
+            let r = *al.dims().last().unwrap();
+            let kk = *bl.dims().last().unwrap();
+            let t = al.numel() / r;
+            if bl.numel() / kk != t || r > 64 {
+                return Err(SynaptixError::Unsupported("LoraOuter: формы"));
+            }
+            let parts = t.div_ceil(128);
+            if out_layouts[0].numel() != parts * r * kk {
+                return Err(SynaptixError::Unsupported("LoraOuter: выход [⌈T/128⌉, r, K]"));
+            }
+            let name = format!("lora_outer_{}", sfx(bl.dtype())?);
+            let f = k.f(&name)?;
+            let (ti, ki, ri) = (t as i32, kk as i32, r as i32);
+            let mut b = stream.launch_builder(&f);
+            b.arg(a).arg(bb).arg(&mut *out_bufs[0]).arg(&ti).arg(&ki).arg(&ri);
+            let cfg = LaunchConfig { grid_dim: (kk.div_ceil(256) as u32, parts as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::FlashFwd { scale, has_seg } => {
+            let (q, ql) = input(ins, 0, "FlashFwd: q")?;
+            let (kb, kl) = input(ins, 1, "FlashFwd: k")?;
+            let (v, _) = input(ins, 2, "FlashFwd: v")?;
+            let seg = if has_seg { Some(input(ins, 3, "FlashFwd: seg")?.0) } else { None };
+            need_outs(2)?;
+            for l in [ql, kl] {
+                expect_dt(l, DType::BF16, "FlashFwd: q/k/v BF16")?;
+            }
+            let (h, t, d) = (ql.dims()[0], ql.dims()[1], ql.dims()[2]);
+            let hkv = kl.dims()[0];
+            if hkv == 0 || h % hkv != 0 || kl.dims()[1] != t || kl.dims()[2] != d {
+                return Err(SynaptixError::Unsupported("FlashFwd: формы q/k"));
+            }
+            let (warps, bc) = match d {
+                64 | 128 => (4usize, 64usize),
+                256 => (2, 32),
+                _ => return Err(SynaptixError::Unsupported("FlashFwd: D — 64, 128 или 256")),
+            };
+            let smem = 2 * bc * d * 2 + warps * 16 * d * 4 + warps * 16 * bc * 4;
+            let name = format!("flash_train_fwd_d{d}");
+            let f = k.flash_fn(&name, smem)?;
+            let (ti, hi, hki, sc) = (t as i32, h as i32, hkv as i32, scale);
+            let null: u64 = 0;
+            let (o0, o1) = out_bufs.split_at_mut(1);
+            let mut b = stream.launch_builder(&f);
+            b.arg(q).arg(kb).arg(v);
+            match seg {
+                Some(sg) => b.arg(sg),
+                None => b.arg(&null),
+            };
+            b.arg(&mut *o0[0]).arg(&mut *o1[0]).arg(&ti).arg(&hi).arg(&hki).arg(&sc);
+            let cfg = LaunchConfig {
+                grid_dim: (t.div_ceil(warps * 16) as u32, h as u32, 1),
+                block_dim: ((warps * 32) as u32, 1, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            unsafe { b.launch(cfg) }.map_err(launch_err(&name))?;
+        }
+        TrainOp::FlashBwd { scale, has_seg } => {
+            let (q, ql) = input(ins, 0, "FlashBwd: q")?;
+            let (kb, kl) = input(ins, 1, "FlashBwd: k")?;
+            let (v, _) = input(ins, 2, "FlashBwd: v")?;
+            let (dout, _) = input(ins, 3, "FlashBwd: dout")?;
+            let (lse, _) = input(ins, 4, "FlashBwd: lse")?;
+            let (delta, _) = input(ins, 5, "FlashBwd: delta")?;
+            let seg = if has_seg { Some(input(ins, 6, "FlashBwd: seg")?.0) } else { None };
+            need_outs(3)?;
+            let (h, t, d) = (ql.dims()[0], ql.dims()[1], ql.dims()[2]);
+            let hkv = kl.dims()[0];
+            let tp = t.div_ceil(32) * 32;
+            if out_layouts[1].numel() != hkv * tp * d || out_layouts[2].numel() != hkv * tp * d {
+                return Err(SynaptixError::Unsupported("FlashBwd: dk/dv — [Hkv, ⌈T/32⌉·32, D]"));
+            }
+            if !matches!(d, 64 | 128 | 256) {
+                return Err(SynaptixError::Unsupported("FlashBwd: D — 64, 128 или 256"));
+            }
+            for ob in out_bufs.iter_mut() {
+                stream.memset_zeros(&mut **ob).map_err(|e| SynaptixError::Cuda(format!("FlashBwd: memset: {e:?}")))?;
+            }
+            let smem = 4 * 32 * d * 2 + 2 * 32 * 4 + 2 * 16 * 32 * 4 + 2 * 2 * 16 * 32 * 2 + 2 * 256 * 4;
+            let name = format!("flash_train_bwd_d{d}");
+            let f = k.flash_fn(&name, smem)?;
+            let (ti, tpi, hi, hki, sc) = (t as i32, tp as i32, h as i32, hkv as i32, scale);
+            let null: u64 = 0;
+            let (o0, rest) = out_bufs.split_at_mut(1);
+            let (o1, o2) = rest.split_at_mut(1);
+            let mut b = stream.launch_builder(&f);
+            b.arg(q).arg(kb).arg(v);
+            match seg {
+                Some(sg) => b.arg(sg),
+                None => b.arg(&null),
+            };
+            b.arg(dout).arg(lse).arg(delta).arg(&mut *o0[0]).arg(&mut *o1[0]).arg(&mut *o2[0]);
+            b.arg(&ti).arg(&tpi).arg(&hi).arg(&hki).arg(&sc);
+            let cfg = LaunchConfig { grid_dim: (tp as u32 / 32, hkv as u32, 1), block_dim: (64, 1, 1), shared_mem_bytes: smem as u32 };
+            unsafe { b.launch(cfg) }.map_err(launch_err(&name))?;
         }
     }
     Ok(())
