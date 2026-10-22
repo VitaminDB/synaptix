@@ -367,7 +367,8 @@ impl HybridPipeline {
     /// графу не мешают: `forward_prefill_dev` пишет и читает MXFP8-кэш по
     /// device-позиции (+11 % к декоду qwen3.8-27b: 41 против 37 ток/с).
     fn mtp_graph_supported(&self) -> bool {
-        self.model.blocks_all_resident() && !self.model.embed_on_host()
+        // MoE-гибрид (Qwen3.5/3.6-MoE) `make_prefill_state` не берёт.
+        self.model.blocks_all_resident() && !self.model.embed_on_host() && self.model.config.graph_prefill_ok()
     }
 
 
