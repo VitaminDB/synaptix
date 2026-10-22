@@ -1252,6 +1252,7 @@ impl Llm {
         max_new: usize,
     ) -> Result<Option<LlmKvSession>, LlmError> {
         let _runtime = self.runtime_scope();
+        self.fit_vram(self.kv_session_bytes(ctx_tokens));
         let pipeline = self
             .pipeline
             .lock()
@@ -1356,6 +1357,7 @@ impl Llm {
             return Ok(());
         }
         let _runtime = self.runtime_scope();
+        self.fit_vram(self.kv_session_bytes(ctx_tokens).saturating_sub(session.device_bytes()));
         let pipeline = self
             .pipeline
             .lock()
@@ -1426,6 +1428,89 @@ impl Llm {
     /// только когда контекст иначе не помещается.
     pub fn set_block_residency(&self, resident: usize) -> Option<usize> {
         self.pipeline.lock().ok().and_then(|mut p| p.set_block_residency(resident))
+    }
+
+    /// Байт VRAM под KV на `ctx_tokens` контекста: ставка на токен плюс
+    /// слои постоянного размера.
+    pub fn kv_session_bytes(&self, ctx_tokens: usize) -> usize {
+        ctx_tokens.max(2) * self.kv_bytes_per_token() + self.kv_fixed_bytes(ctx_tokens.max(2))
+    }
+
+    /// Освободить на карте место под `extra` байт (KV, что вот-вот выделится)
+    /// плюс запас хода (активации, рабочие буферы ядер). Не хватает — хвостовые
+    /// блоки уезжают на хост и дальше стримятся с префетчем; освободилось
+    /// с запасом — возвращаются. Так движок не упирается в OOM посреди хода:
+    /// веса, которые при загрузке заняли карту почти целиком (Qwen3.8-27B —
+    /// 21.6 из 22.3 ГБ свободных), уступают место контексту.
+    ///
+    /// Явно выбранный «всегда резидент» (`SYN_OFFLOAD=resident`) не трогаем.
+    /// Возвращает число блоков на карте после подгонки.
+    pub fn fit_vram(&self, extra: usize) -> Option<usize> {
+        use synaptix_llm_common::model::{offload_mode, OffloadMode};
+        let Device::Cuda(ord) = self.device else { return None };
+        if offload_mode() == OffloadMode::Resident {
+            return None;
+        }
+        let (blk, total) = self.block_offload_shape()?;
+        let resident = self.resident_blocks()?;
+        if blk == 0 || total == 0 {
+            return Some(resident);
+        }
+        let need = extra + vram_turn_reserve();
+        // Блоку с хоста нужен буфер на карте, и следующий едет, пока
+        // считается текущий: при частичном оффлоаде — ещё два блока сверху.
+        let streamed_need = need + 2 * blk;
+        let free = || synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        // Хватает и всё на карте — ничего не трогаем (и пулы не ужимаем:
+        // это стоило бы им повторного роста на каждом ходу).
+        if resident >= total && free() >= need {
+            return Some(resident);
+        }
+        // Удержанное пулами, но не занятое — тоже свободно.
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let f = free();
+        let want = if resident >= total && f >= need {
+            total
+        } else if resident < total && f >= need + (total - resident + 1) * blk {
+            // Влезают все (с запасом в блок) — стрим больше не нужен.
+            total
+        } else if f < streamed_need {
+            resident.saturating_sub((streamed_need - f).div_ceil(blk))
+        } else {
+            // Возвращаем с запасом в блок, чтобы не качаться туда-сюда.
+            let spare = (f - streamed_need) / blk;
+            if spare < 2 { resident } else { (resident + spare - 1).min(total) }
+        };
+        if want == resident {
+            return Some(resident);
+        }
+        let got = self.set_block_residency(want).unwrap_or(resident);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        eprintln!(
+            "[synaptix] VRAM: блоков на карте {resident} → {got} из {total} (свободно было {:.2} ГБ, нужно {:.2}; теперь {:.2})",
+            f as f64 / 1e9,
+            need as f64 / 1e9,
+            free() as f64 / 1e9
+        );
+        Some(got)
+    }
+
+    /// Ход упал по памяти, хотя [`Self::fit_vram`] её планировал (оценка
+    /// запаса мала для этой модели): отдать хосту ещё часть оставшихся
+    /// блоков — восьмую часть, минимум два. `false` — отдавать больше нечего.
+    pub fn shed_blocks(&self) -> bool {
+        let Device::Cuda(ord) = self.device else { return false };
+        let Some(resident) = self.resident_blocks() else { return false };
+        if resident == 0 {
+            return false;
+        }
+        let want = resident.saturating_sub((resident / 8).max(2));
+        let got = self.set_block_residency(want).unwrap_or(resident);
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        eprintln!("[synaptix] VRAM: ход упёрся в память — блоков на карте {resident} → {got}");
+        got < resident
     }
 
     /// Отдать память карты, занятую кэшами модели, не дожидаясь её `Drop`.
@@ -1754,6 +1839,8 @@ impl<'a> LlmGeneration<'a> {
         F: FnMut(u32, &str) -> bool,
     {
         let _runtime = self.model.runtime_scope();
+        let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
+        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens));
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
@@ -1816,6 +1903,8 @@ impl<'a> LlmGeneration<'a> {
         // обязанность вызывающего, но забыть это дешевле, чем поймать
         // device mismatch посреди forward'а.
         self.model.sync_session_lora(session);
+        let parked = if session.is_parked() { self.model.kv_session_bytes(session.ctx_tokens) } else { 0 };
+        self.model.fit_vram(parked);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2184,6 +2273,8 @@ impl<'a> LlmGeneration<'a> {
     {
         let _runtime = self.model.runtime_scope();
         self.model.sync_session_lora(session);
+        let parked = if session.is_parked() { self.model.kv_session_bytes(session.ctx_tokens) } else { 0 };
+        self.model.fit_vram(parked);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2377,6 +2468,8 @@ impl<'a> LlmGeneration<'a> {
         if media.is_empty() {
             return Err(LlmError("generate_streaming_media без вложений".into()));
         }
+        let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
+        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens));
 
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
@@ -2846,6 +2939,18 @@ pub fn load_llm(
     };
 
     build_facade(pipeline, path, device, max_seq, precision.compute)
+}
+
+/// Запас VRAM на ход сверх KV: активации префилла, рабочие буферы ядер
+/// (chunk_scan гибрида, workspace GEMM), кэши дескрипторов. 1.5 ГБ — с
+/// запасом над замером Qwen3.8-27B (префилл 3.7 тыс. токенов кусками прошёл
+/// в 1 ГБ); `SYN_VRAM_RESERVE_MB` — свой.
+fn vram_turn_reserve() -> usize {
+    std::env::var("SYN_VRAM_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb << 20)
+        .unwrap_or(3usize << 29)
 }
 
 /// Режим размещения на время одной загрузки; при выходе — прежний.
