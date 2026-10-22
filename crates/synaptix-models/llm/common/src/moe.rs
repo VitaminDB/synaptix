@@ -172,8 +172,10 @@ pub struct ExpertCache {
     /// 512 экспертов это втрое дороже обычной pageable-копии, — зато повторные
     /// отправки того же эксперта идут DMA без staging. Окупается только при
     /// тесном кэше с частым вытеснением, и ценой второй копии каждого
-    /// отправленного эксперта в RAM.
-    _mirror: Option<synaptix_core::device::cuda::PinMirrorGuard>,
+    /// отправленного эксперта в RAM. Обучение включает его само
+    /// ([`ExpertCache::pin_mirror`]): там каждый шаг обходит все слои, и кэш
+    /// меньше экспертов модели вытесняет постоянно.
+    _mirror: std::sync::OnceLock<synaptix_core::device::cuda::PinMirrorGuard>,
 }
 
 /// Резидент кэша с битом обращения: по нему идёт вытеснение «часами» —
@@ -249,7 +251,13 @@ impl ExpertCache {
             scratch_bytes: (capacity_bytes / 4).min(2 << 30),
             scratch_mode: std::sync::atomic::AtomicBool::new(false),
             warmed: std::sync::atomic::AtomicBool::new(false),
-            _mirror: pinned.then(synaptix_core::device::cuda::PinMirrorGuard::new),
+            _mirror: {
+                let m = std::sync::OnceLock::new();
+                if pinned {
+                    let _ = m.set(synaptix_core::device::cuda::PinMirrorGuard::new());
+                }
+                m
+            },
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
                 order: VecDeque::new(),
@@ -352,6 +360,14 @@ impl ExpertCache {
         let want = room.saturating_sub(reserve).clamp(MIN_CACHE_BYTES, ceiling);
         self.set_capacity(want);
         want
+    }
+
+    /// Включить pinned-зеркало host-весов (см. поле `_mirror`). Насовсем — до
+    /// конца жизни кэша.
+    pub fn pin_mirror(&self) {
+        if matches!(self.device, Device::Cuda(_)) {
+            let _ = self._mirror.get_or_init(synaptix_core::device::cuda::PinMirrorGuard::new);
+        }
     }
 
     pub fn stats(&self) -> ExpertCacheStats {
@@ -2503,7 +2519,7 @@ impl MoeFfn {
                 let host = all
                     .get(expert)
                     .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
-                let pinned = cache._mirror.is_some();
+                let pinned = cache._mirror.get().is_some();
                 if pinned {
                     synaptix_core::device::cuda::set_pin_mirror(true);
                 }

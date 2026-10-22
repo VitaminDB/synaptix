@@ -134,11 +134,31 @@ impl<'m> TrainModel<'m> {
     /// сохранённое одного слоя, голова, адаптеры и их моменты).
     pub fn fit_expert_cache(&self, tokens: usize) {
         if let Some(cache) = self.base.expert_cache() {
+            // Pinned-зеркало экспертов: шаг обходит все слои, и кэш меньше
+            // экспертов модели подкачивает каждый шаг — из закреплённой памяти
+            // это вдвое-втрое быстрее. Цена — вторая копия экспертов в RAM.
+            let host: usize = (0..self.base.config.num_hidden_layers)
+                .filter_map(|i| self.base.train_block(i).ok())
+                .filter_map(|b| match b.mlp {
+                    FfnRefs::Moe(m) => Some(m.expert_bytes() * m.num_experts()),
+                    FfnRefs::Dense(_) => None,
+                })
+                .sum();
+            let avail = mem_available();
+            if host > 0 && avail > host + (8usize << 30) {
+                cache.pin_mirror();
+                eprintln!("[train] эксперты в RAM: {:.1} ГБ, подкачка из закреплённого зеркала", host as f64 / 1e9);
+            }
             let c = &self.base.config;
             let per_token = c.hidden_size * (2 * c.num_hidden_layers + 160);
             let lora = self.num_params() * 4 * 5;
             let reserve = (3usize << 30) + tokens * per_token + lora;
-            let got = cache.fit_to_vram(reserve);
+            let mut got = cache.fit_to_vram(reserve);
+            // `SYN_TRAIN_EXPERT_CACHE_GB` — потолок кэша (замеры подкачки).
+            if let Some(gb) = std::env::var("SYN_TRAIN_EXPERT_CACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()) {
+                got = got.min((gb * 1e9) as usize);
+                cache.set_capacity(got);
+            }
             eprintln!("[train] кэш экспертов на карте: {:.1} ГБ (запас под обучение {:.1} ГБ)", got as f64 / 1e9, reserve as f64 / 1e9);
         }
     }
@@ -318,4 +338,17 @@ impl<'m> TrainModel<'m> {
     pub fn device(&self) -> Device {
         self.base.device
     }
+}
+
+/// Доступная RAM (`MemAvailable`), байт; 0 — не узнать.
+fn mem_available() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .map_or(0, |kb| kb * 1024)
 }
