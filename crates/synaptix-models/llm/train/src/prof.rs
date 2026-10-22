@@ -41,6 +41,37 @@ pub fn prof<T>(dev: Device, name: &'static str, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// Участок до конца области видимости (как [`prof`], но охранником).
+pub struct Span {
+    dev: Device,
+    name: &'static str,
+    t0: Option<Instant>,
+}
+
+impl Span {
+    pub fn new(dev: Device, name: &'static str) -> Self {
+        let t0 = on().then(|| {
+            sync(dev);
+            Instant::now()
+        });
+        Self { dev, name, t0 }
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let Some(t0) = self.t0 else { return };
+        sync(self.dev);
+        let dt = t0.elapsed().as_secs_f64();
+        ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            let e = a.entry(self.name).or_insert((0.0, 0));
+            e.0 += dt;
+            e.1 += 1;
+        });
+    }
+}
+
 pub fn enabled() -> bool {
     on()
 }

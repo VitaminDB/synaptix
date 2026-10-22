@@ -134,6 +134,14 @@ impl Tensor {
     }
 
     fn ones_with_device(shape: Shape, dtype: DType, device: Device) -> Result<Self> {
+        // На карте — нули и прибавка единицы там же: собирать единицы на хосте
+        // и копировать значило гнать по шине весь тензор (67 МБ на [2048,
+        // 8192] F32 — 5 мс на каждый вызов в обучении GDN).
+        if matches!(device, Device::Cuda(_)) && matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            if let Ok(t) = Tensor::zeros(shape.clone(), dtype, device).and_then(|z| z.add_scalar(1.0)) {
+                return Ok(t);
+            }
+        }
         let numel = shape.numel();
         let bytes = fill_bytes_one(dtype, numel)?;
         let storage = match device {

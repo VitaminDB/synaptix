@@ -655,13 +655,13 @@ fn lin_fwd(la: &LinearRefs<'_>, lora: &BlockLora, n1: &Tensor, ctx: &SeqCtx, w: 
 fn lin_bwd(la: &LinearRefs<'_>, lora: &mut BlockLora, s: LinSaved, n1: &Tensor, seg: Option<&Tensor>, da: &Tensor, w: &Weights) -> Result<Tensor> {
     let (t, hk, hv, dk, dv) = (n1.dims()[0], la.num_k_heads, la.num_v_heads, la.dk, la.dv);
     let (kd, vd) = (la.key_dim, la.value_dim);
-    let dy = proj_bwd(w, la.out_proj, lora.out.as_mut(), s.out_in.as_ref(), s.zout.as_ref(), da)?.reshape(vec![t, hv, dv])?;
+    let dy = crate::prof::prof(n1.device(), "g_out", || -> Result<_> { Ok(proj_bwd(w, la.out_proj, lora.out.as_mut(), s.out_in.as_ref(), s.zout.as_ref(), da)?.reshape(vec![t, hv, dv])?) })?;
     // y = silu(z) · on
     let sh = vec![t, hv, dv];
     let mut zg = Tensor::train_op(TrainOp::SiluMulBwd, &[&s.z, &s.on, &dy], &[(sh.clone(), DType::F32), (sh, DType::F32)])?;
     let d_on = zg.pop().unwrap();
     let dz = zg.pop().unwrap().reshape(vec![t, vd])?;
-    let d_o = rms_bwd(&s.o, la.norm_weight, &d_on, la.rms_eps)?;
+    let d_o = crate::prof::prof(n1.device(), "g_norm", || rms_bwd(&s.o, la.norm_weight, &d_on, la.rms_eps))?;
 
     let p = dv / 32;
     let has_seg = seg.is_some();
@@ -686,6 +686,7 @@ fn lin_bwd(la: &LinearRefs<'_>, lora: &mut BlockLora, s: LinSaved, n1: &Tensor, 
     let sum_p = |x: Tensor, rest: Vec<usize>| -> Result<Tensor> {
         Ok(if p == 1 { x.reshape(rest)? } else { x.sum_keepdim(0)?.reshape(rest)? })
     };
+    let _pp = crate::prof::Span::new(n1.device(), "g_post");
     let dbeta = sum_p(gr.pop().unwrap(), vec![t, hv])?;
     let dg = sum_p(gr.pop().unwrap(), vec![t, hv])?;
     let group = hv / hk;
@@ -700,13 +701,21 @@ fn lin_bwd(la: &LinearRefs<'_>, lora: &mut BlockLora, s: LinSaved, n1: &Tensor, 
     let db = dbeta.mul(&s.beta.mul(&s.beta.affine(-1.0, 1.0)?)?)?;
     let da_ = dg.mul(&s.a_dt.sigmoid()?)?.broadcast_mul(&lora.lin.as_ref().unwrap().neg_a)?;
 
+    drop(_pp);
+    let _pp = crate::prof::Span::new(n1.device(), "g_conv");
     let dqf = l2norm_bwd(&s.qf, &s.rq, &dqn, la.q_scale)?;
     let dkf = l2norm_bwd(&s.kf, &s.rk, &dkn, 1.0)?;
+    drop(_pp);
+    let _pp = crate::prof::Span::new(n1.device(), "g_cat");
     let dc = Tensor::cat(&[&dqf.reshape(vec![t, kd])?, &dkf.reshape(vec![t, kd])?, &dv_.reshape(vec![t, vd])?], 1)?;
+    drop(_pp);
+    let _pp = crate::prof::Span::new(n1.device(), "g_silu");
     // c = silu(pre): та же формула, что у silu(gate)·1.
     let ones = Tensor::ones(vec![t, la.conv_dim], DType::F32, n1.device())?;
     let cdims = vec![t, la.conv_dim];
     let dpre = Tensor::train_op(TrainOp::SiluMulBwd, &[&s.pre, &ones, &dc], &[(cdims.clone(), DType::F32), (cdims.clone(), DType::F32)])?.remove(0);
+    drop(_pp);
+    let _pp = crate::prof::Span::new(n1.device(), "g_convk");
     let lc = lora.lin.as_ref().unwrap();
     let mut ins = vec![&dpre, &lc.conv_w];
     if let Some(sg) = seg {
@@ -714,6 +723,8 @@ fn lin_bwd(la: &LinearRefs<'_>, lora: &mut BlockLora, s: LinSaved, n1: &Tensor, 
     }
     let dqkv = Tensor::train_op(TrainOp::GdnConvBwd { has_seg }, &ins, &[(cdims, DType::F32)])?.remove(0);
 
+    drop(_pp);
+    let _pp = crate::prof::Span::new(n1.device(), "g_in");
     Ok(proj_bwd(w, la.in_proj_qkv, lora.qkv.as_mut(), Some(n1), s.zqkv.as_ref(), &dqkv)?
         .add(&proj_bwd(w, la.in_proj_z, lora.z.as_mut(), Some(n1), s.zz.as_ref(), &dz)?)?
         .add(&proj_bwd(w, la.in_proj_a, lora.a.as_mut(), Some(n1), s.za.as_ref(), &da_)?)?
