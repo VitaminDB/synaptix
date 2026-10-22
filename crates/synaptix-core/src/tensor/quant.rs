@@ -399,6 +399,7 @@ impl QuantWeight {
     /// первым умножением.
     pub fn to_device(&self, dev: Device) -> Result<Self> {
         let same_device = self.device == dev;
+        self.preshuffle_host_for(dev)?;
         let moved = |s: &Arc<Storage>| -> Result<Arc<Storage>> {
             if same_device {
                 Ok(s.clone())
@@ -428,6 +429,33 @@ impl QuantWeight {
             out.mark_expert_pool();
         }
         Ok(out)
+    }
+
+    /// Хостовый NVFP4-вес в линейной раскладке едет на карту с FP4-MMA:
+    /// перемешать его один раз здесь, на хосте, и дальше хранить так. Иначе
+    /// стримящийся блок (оффлоад модели) на КАЖДОМ подвозе выделял бы на
+    /// карте вторую копию под перемешивание и гонял repack — лишняя память
+    /// посреди хода и лишнее время на каждом токене.
+    fn preshuffle_host_for(&self, dev: Device) -> Result<()> {
+        if self.dtype != DType::NVFP4
+            || !self.device.is_cpu()
+            || !matches!(dev, Device::Cuda(_))
+            || self.shuffled.get().is_some()
+            || self.n % 16 != 0
+            || self.k % 64 != 0
+        {
+            return Ok(());
+        }
+        if !crate::backend::registry::backend_for(dev).is_ok_and(|b| b.quant_native(DType::NVFP4, dev)) {
+            return Ok(());
+        }
+        let Some(packed) = self.packed_arc() else { return Ok(()) };
+        let Some(src) = packed.as_cpu() else { return Ok(()) };
+        let mut dst = vec![0u8; src.byte_len()];
+        Self::nvfp4_repack_host(src.as_bytes(), &mut dst, self.n, self.k)?;
+        let _ = self.shuffled.set(Arc::new(Storage::Cpu(crate::tensor::storage::CpuBuf::from_vec(dst))));
+        self.release_packed();
+        Ok(())
     }
 
     /// Посчитать сразу несколько NVFP4-GEMV одним запуском: `out[e]` = `W_e ·
