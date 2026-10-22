@@ -574,6 +574,17 @@ impl LlmPipeline {
         }
     }
 
+    fn block_bytes_max(&self) -> usize {
+        match self {
+            Self::Qwen3(p) => p.model.block_bytes_max(),
+            Self::Hybrid(p) => p.model.block_bytes_max(),
+            Self::Llama(p) => p.model.block_bytes_max(),
+            Self::Gemma3(p) => p.model.block_bytes_max(),
+            Self::MuseGlimmer(p) => p.model.block_bytes_max(),
+            Self::Gemma4(_) | Self::Qwen4Exp(_) => 0,
+        }
+    }
+
     fn resident_blocks(&self) -> Option<usize> {
         match self {
             Self::Qwen3(p) => Some(p.model.resident_blocks()),
@@ -1459,7 +1470,8 @@ impl Llm {
         let need = extra + vram_turn_reserve();
         // Блоку с хоста нужен буфер на карте, и следующий едет, пока
         // считается текущий: при частичном оффлоаде — ещё два блока сверху.
-        let streamed_need = need + 2 * blk;
+        let blk_max = self.pipeline.lock().map(|p| p.block_bytes_max()).unwrap_or(blk).max(blk);
+        let streamed_need = need + 2 * blk_max;
         let free = || synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
         // Хватает и всё на карте — ничего не трогаем (и пулы не ужимаем:
         // это стоило бы им повторного роста на каждом ходу).
