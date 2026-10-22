@@ -756,3 +756,169 @@ extern "C" __global__ void __launch_bounds__(128) NAME( \
 GDN_PREP_FUSED(gdn_prep_fused_f16, __half)
 GDN_PREP_FUSED(gdn_prep_fused_bf16, __nv_bfloat16)
 GDN_PREP_FUSED(gdn_prep_fused_f32, float)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_chunk_prep_t64_f32 — внутричанковое внимание вместе с тем, что из
+// него сразу считается (CS=64, HK=HV=128, блок 256 потоков):
+//   attn  = (I + подстановка)(−kβ·kᵀ ∘ decay)      — как compute_chunk_attn_t64
+//   value_proc = attn · vβ,  k_cumdecay = attn · kβe^g — было два bmm_reg
+//   attn_qk    = (q·kᵀ) ∘ decay                    — было bmm_reg + mul_inplace
+// attn и decay живут в shared и в global не уходят. Суммы — в том же
+// порядке, что у bmm_reg_f32 (последовательно по K), запись `acc + 0` — как
+// у него `alpha·acc + beta·prev` при alpha=1, beta=0: побитово как прежде.
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __launch_bounds__(256) compute_chunk_prep_t64_f32(
+    const float* __restrict__ k_beta,    // (BH, NC, 64, 128)
+    const float* __restrict__ key,       // (BH, NC, 64, 128)  k_n
+    const float* __restrict__ g_cumsum,  // (BH, NC, 64)
+    const float* __restrict__ q_n,       // (BH, NC, 64, 128)
+    const float* __restrict__ v_beta,    // (BH, NC, 64, 128)
+    const float* __restrict__ kcdi,      // (BH, NC, 64, 128)
+    float* __restrict__ value_proc,      // (BH, NC, 64, 128)
+    float* __restrict__ k_cumdecay,      // (BH, NC, 64, 128)
+    float* __restrict__ attn_qk,         // (BH, NC, 64, 64)
+    unsigned int bh,
+    unsigned int nc
+) {
+    const unsigned int CS = 64, HK = 128, TK = 32, LD = 33, ALD = 65;
+    unsigned int b = blockIdx.x;
+    unsigned int c = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    if (b >= bh || c >= nc) return;
+
+    __shared__ float g_sm[64];
+    __shared__ float buf[2 * 64 * 33];   // kb_s | key_s, либо B-тайл 64×65
+    __shared__ float attn_sm[64 * 65];
+    float* kb_s = buf;
+    float* key_s = buf + 64 * 33;
+    float* bt = buf;
+
+    unsigned long long base_kv = ((unsigned long long)b * nc + c) * CS * HK;
+    unsigned long long base_g  = ((unsigned long long)b * nc + c) * CS;
+    unsigned long long base_attn = ((unsigned long long)b * nc + c) * CS * CS;
+
+    if (tid < CS) g_sm[tid] = g_cumsum[base_g + tid];
+    unsigned int ty = tid >> 4, tx = tid & 15;
+
+    // A·Bᵀ по d (K=128) тайлами по 32: acc[r][q] для строк ty+16r, столбцов tx+16q.
+    auto abt = [&](const float* A, const float* B, float (&acc)[4][4]) {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[r][q] = 0.0f;
+        for (unsigned int k0 = 0; k0 < HK; k0 += TK) {
+            __syncthreads();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                unsigned int e = p * 256 + tid;
+                unsigned int row = e >> 5, col = e & 31;
+                kb_s[row * LD + col]  = A[base_kv + (unsigned long long)row * HK + k0 + col];
+                key_s[row * LD + col] = B[base_kv + (unsigned long long)row * HK + k0 + col];
+            }
+            __syncthreads();
+            #pragma unroll 8
+            for (unsigned int d = 0; d < TK; ++d) {
+                float a[4], bb[4];
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) a[r] = kb_s[(ty + 16 * r) * LD + d];
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) bb[q] = key_s[(tx + 16 * q) * LD + d];
+                #pragma unroll
+                for (int r = 0; r < 4; ++r)
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q) acc[r][q] += a[r] * bb[q];
+            }
+        }
+        __syncthreads();
+    };
+
+    // ── attn: −kβ·kᵀ ∘ decay (строго ниже диагонали), подстановка, +I.
+    {
+        float acc[4][4];
+        abt(k_beta, key, acc);
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            unsigned int i = ty + 16 * r;
+            float g_i = g_sm[i];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                unsigned int j = tx + 16 * q;
+                float dm = (j <= i) ? __expf(g_i - g_sm[j]) : 0.0f;
+                attn_sm[i * ALD + j] = (j < i) ? -acc[r][q] * dm : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    for (unsigned int row = 1; row < CS; ++row) {
+        float new_val = 0.0f;
+        bool active = (tid < row);
+        if (active) {
+            unsigned int j = tid;
+            float s = 0.0f;
+            for (unsigned int l = 0; l < row; ++l) {
+                s += attn_sm[row * ALD + l] * attn_sm[l * ALD + j];
+            }
+            new_val = attn_sm[row * ALD + j] + s;
+        }
+        __syncthreads();
+        if (active) attn_sm[row * ALD + tid] = new_val;
+        __syncthreads();
+    }
+    if (tid < CS) attn_sm[tid * ALD + tid] += 1.0f;
+    __syncthreads();
+
+    // ── attn · X (X = vβ, затем kβe^g), по половинам каналов 64×64.
+    auto attn_mul = [&](const float* X, float* Y) {
+        for (unsigned int h0 = 0; h0 < HK; h0 += 64) {
+            #pragma unroll
+            for (int p = 0; p < 16; ++p) {
+                unsigned int e = p * 256 + tid;
+                unsigned int u = e >> 6, j = e & 63;
+                bt[u * ALD + j] = X[base_kv + (unsigned long long)u * HK + h0 + j];
+            }
+            __syncthreads();
+            float acc[4][4];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) acc[r][q] = 0.0f;
+            #pragma unroll 8
+            for (unsigned int u = 0; u < CS; ++u) {
+                float a[4], bb[4];
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) a[r] = attn_sm[(ty + 16 * r) * ALD + u];
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) bb[q] = bt[u * ALD + tx + 16 * q];
+                #pragma unroll
+                for (int r = 0; r < 4; ++r)
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q) acc[r][q] += a[r] * bb[q];
+            }
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    Y[base_kv + (unsigned long long)(ty + 16 * r) * HK + h0 + tx + 16 * q] = acc[r][q] + 0.0f;
+            __syncthreads();
+        }
+    };
+    attn_mul(v_beta, value_proc);
+    attn_mul(kcdi, k_cumdecay);
+
+    // ── attn_qk = (q·kᵀ + 0) ∘ decay.
+    {
+        float acc[4][4];
+        abt(q_n, key, acc);
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            unsigned int i = ty + 16 * r;
+            float g_i = g_sm[i];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                unsigned int j = tx + 16 * q;
+                float dm = (j <= i) ? __expf(g_i - g_sm[j]) : 0.0f;
+                attn_qk[base_attn + i * CS + j] = (acc[r][q] + 0.0f) * dm;
+            }
+        }
+    }
+}

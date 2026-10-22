@@ -295,7 +295,7 @@ pub fn clear_chunk_scan_ws() -> usize {
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_gated_delta_rule_prepped(
     cfk: &ChunkFlaKernels,
-    csk: &ChunkScanKernels,
+    _csk: &ChunkScanKernels,
     stream: &Arc<CudaStream>,
     state: &mut CudaSlice<f32>, // (BH, HK, HV) in/out
     out: &mut CudaSlice<f32>,   // (BH, T, HV)
@@ -340,19 +340,11 @@ pub fn chunk_gated_delta_rule_prepped(
         g_cum: &mut *g_cumsum,
     })?;
     let attn = ws.attn.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("attn", e))?;
-    let dm = ws.dm.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("dm", e))?;
     let value_proc = ws.value_proc.fit(stream, bh_u * nc_u * cs_u * hv_u).map_err(|e| werr("value_proc", e))?;
     let k_cumdecay = ws.k_cumdecay.fit(stream, bh_u * nc_u * cs_u * hk_u).map_err(|e| werr("k_cumdecay", e))?;
-
-    cfk.compute_chunk_attn(stream, &*k_beta, &*k_n, &*g_cumsum, &mut *attn, &mut *dm, bh, nc, cs, hk)?;
-    let bnc = bh * nc;
-    csk.bmm(stream, &*attn, 0, &*v_beta, 0, &mut *value_proc, 0, false, false, cs, hv, cs,
-        (cs * cs) as i64, (cs * hv) as i64, (cs * hv) as i64, bnc, 1.0, 0.0)?;
-    csk.bmm(stream, &*attn, 0, &*kcdi, 0, &mut *k_cumdecay, 0, false, false, cs, hk, cs,
-        (cs * cs) as i64, (cs * hk) as i64, (cs * hk) as i64, bnc, 1.0, 0.0)?;
-    csk.bmm(stream, &*q_n, 0, &*k_n, 0, &mut *attn, 0, false, true, cs, cs, hk,
-        (cs * hk) as i64, (cs * hk) as i64, (cs * cs) as i64, bnc, 1.0, 0.0)?;
-    cfk.mul_inplace(stream, &mut *attn, &*dm, (bh_u * nc_u * cs_u * cs_u) as u64)?;
+    // Внутричанковое внимание и всё, что из него сразу следует, — одним ядром.
+    cfk.compute_chunk_prep(stream, &*k_beta, &*k_n, &*g_cumsum, &*q_n, &*v_beta, &*kcdi,
+        &mut *value_proc, &mut *k_cumdecay, &mut *attn, bh, nc)?;
     cfk.gdn_chunk_scan(stream, &*q_scaled, &*k_cumdecay, &*k_dec, &*value_proc, &*attn, &*g_cumsum, state, out, bh, nc, hv)?;
     Ok(())
 }

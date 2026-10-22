@@ -37,6 +37,7 @@ pub struct ChunkFlaKernels {
     mul_inplace: CudaFunction,
     state_decay_from_gcumsum_chunk: CudaFunction,
     gdn_prep_fused_f16: CudaFunction,
+    compute_chunk_prep_t64: CudaFunction,
     gdn_prep_fused_bf16: CudaFunction,
     gdn_prep_fused_f32: CudaFunction,
 }
@@ -85,6 +86,7 @@ impl ChunkFlaKernels {
             mul_inplace: load_fn(&module, "mul_inplace_f32")?,
             state_decay_from_gcumsum_chunk: load_fn(&module, "state_decay_from_gcumsum_chunk_f32")?,
             gdn_prep_fused_f16: load_fn(&module, "gdn_prep_fused_f16")?,
+            compute_chunk_prep_t64: load_fn(&module, "compute_chunk_prep_t64_f32")?,
             gdn_prep_fused_bf16: load_fn(&module, "gdn_prep_fused_bf16")?,
             gdn_prep_fused_f32: load_fn(&module, "gdn_prep_fused_f32")?,
             _module: module,
@@ -353,6 +355,34 @@ impl ChunkFlaKernels {
     /// `k_decayed = k[:, ci, :, :] * exp(g_last - g_cumsum[:, ci, :])`.
     /// k `(BH,NC,CS,HK)`, g_cumsum `(BH,NC,CS)`, k_decayed_out `(BH,CS,HK)`.
     #[allow(clippy::too_many_arguments)]
+    /// Внутричанковое внимание вместе с `attn·vβ`, `attn·kβe^g` и
+    /// `(q·kᵀ)∘decay` одним запуском (CS=64, HK=HV=128); attn и decay в global
+    /// не уходят. Побитово как compute_chunk_attn + три bmm_reg + mul_inplace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_chunk_prep(
+        &self,
+        stream: &Arc<CudaStream>,
+        k_beta: &CudaSlice<f32>,
+        key: &CudaSlice<f32>,
+        g_cumsum: &CudaSlice<f32>,
+        q_n: &CudaSlice<f32>,
+        v_beta: &CudaSlice<f32>,
+        kcdi: &CudaSlice<f32>,
+        value_proc: &mut CudaSlice<f32>,
+        k_cumdecay: &mut CudaSlice<f32>,
+        attn_qk: &mut CudaSlice<f32>,
+        bh: u32,
+        nc: u32,
+    ) -> Result<()> {
+        let cfg = LaunchConfig { grid_dim: (bh, nc, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut b = stream.launch_builder(&self.compute_chunk_prep_t64);
+        b.arg(k_beta).arg(key).arg(g_cumsum).arg(q_n).arg(v_beta).arg(kcdi).arg(value_proc).arg(k_cumdecay).arg(attn_qk).arg(&bh).arg(&nc);
+        unsafe {
+            b.launch(cfg).map_err(|e| SynaptixError::Cuda(format!("launch compute_chunk_prep_t64: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     /// Формы слитой подготовки (`gdn_prep_fused`): CS=64, HK=HV=128.
     pub fn prep_fused_fits(cs: u32, hk: u32, hv: u32) -> bool {
         cs == 64 && hk == 128 && hv == 128
