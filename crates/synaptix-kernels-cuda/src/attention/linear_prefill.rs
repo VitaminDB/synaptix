@@ -154,22 +154,25 @@ pub fn linear_attn_chunk_prefill_u8_dev(
     let cache = WS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock();
     let ws: &mut PrefillWs = guard.entry(ord).or_default();
+    // Хвост [t_in, t_pad) prep_scatter не пишет — там должны быть нули; без
+    // хвоста буферы перезаписываются целиком и memset не нужен.
+    let pad = t_in < t_pad;
     let qe = ws
         .qe
-        .fit_zeros(stream, num_v as usize * tp * hk as usize)
+        .fit_or_zero(pad, stream, num_v as usize * tp * hk as usize)
         .map_err(|e| aerr("qe", e))?;
     let ke = ws
         .ke
-        .fit_zeros(stream, num_v as usize * tp * hk as usize)
+        .fit_or_zero(pad, stream, num_v as usize * tp * hk as usize)
         .map_err(|e| aerr("ke", e))?;
     let vv = ws
         .vv
-        .fit_zeros(stream, num_v as usize * tp * hv as usize)
+        .fit_or_zero(pad, stream, num_v as usize * tp * hv as usize)
         .map_err(|e| aerr("vv", e))?;
-    let g_buf = ws.g_buf.fit_zeros(stream, num_v as usize * tp).map_err(|e| aerr("g", e))?;
+    let g_buf = ws.g_buf.fit_or_zero(pad, stream, num_v as usize * tp).map_err(|e| aerr("g", e))?;
     let beta_buf = ws
         .beta_buf
-        .fit_zeros(stream, num_v as usize * tp)
+        .fit_or_zero(pad, stream, num_v as usize * tp)
         .map_err(|e| aerr("beta", e))?;
 
     // F16 для a/b/dt_bias/a_log — типизированные view'ы.
@@ -223,7 +226,7 @@ pub fn linear_attn_chunk_prefill_u8_dev(
             };
             let post_conv = ws
                 .post_conv_f16
-                .fit_zeros(stream, t * cd)
+                .fit(stream, t * cd)
                 .map_err(|e| aerr("post_conv f16", e))?;
             {
                 let mut post_conv_v = post_conv.as_view_mut();
@@ -284,7 +287,7 @@ pub fn linear_attn_chunk_prefill_u8_dev(
             };
             let post_conv = ws
                 .post_conv_bf16
-                .fit_zeros(stream, t * cd)
+                .fit(stream, t * cd)
                 .map_err(|e| aerr("post_conv bf16", e))?;
             {
                 let mut post_conv_v = post_conv.as_view_mut();
@@ -345,7 +348,7 @@ pub fn linear_attn_chunk_prefill_u8_dev(
             };
             let post_conv = ws
                 .post_conv_f32
-                .fit_zeros(stream, t * cd)
+                .fit(stream, t * cd)
                 .map_err(|e| aerr("post_conv f32", e))?;
             {
                 let mut post_conv_v = post_conv.as_view_mut();
@@ -397,8 +400,9 @@ pub fn linear_attn_chunk_prefill_u8_dev(
     // обязан аллоцировать out с этим size и сам narrow'нуть до t_in).
     let n_state = (num_v * hk * hv) as usize;
     let n_out = (num_v * t_pad * hv) as usize;
-    let state_o = ws.state_o.fit_zeros(stream, n_state).map_err(|e| aerr("ssm_state owned", e))?;
-    let out_o = ws.out_o.fit_zeros(stream, n_out).map_err(|e| aerr("out owned", e))?;
+    // Состояние копируется целиком, выход скан пишет целиком — без memset.
+    let state_o = ws.state_o.fit(stream, n_state).map_err(|e| aerr("ssm_state owned", e))?;
+    let out_o = ws.out_o.fit(stream, n_out).map_err(|e| aerr("out owned", e))?;
     {
         // ssm_state Storage → state_o
         let ss_s_v = ssm_state.slice(ssm_state_off..ssm_state_off + n_state * tm::<f32>());

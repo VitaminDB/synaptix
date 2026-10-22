@@ -118,6 +118,117 @@ __global__ void compute_chunk_attn_f32(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// compute_chunk_attn_t64_f32 — то же для CS=64, HK%32==0, блок 256 потоков.
+// Скалярные произведения k_beta·keyᵀ — тайлами по 32 столбца через shared
+// (коалесцированно, поток считает 4×4 выхода), порядок суммирования по d —
+// прежний, поэтому результат побитово совпадает с compute_chunk_attn_f32.
+// Там поток читал свою строку из global без коалесцирования и перечитывал
+// её для каждого j: 3.3 мс на слой куска 2048 у Qwen3.8-27B (44 % скана).
+// Подстановка (шаг 2) — та же, тем же порядком.
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void __launch_bounds__(256) compute_chunk_attn_t64_f32(
+    const float* __restrict__ k_beta,    // (BH, NC, 64, HK)
+    const float* __restrict__ key,       // (BH, NC, 64, HK)
+    const float* __restrict__ g_cumsum,  // (BH, NC, 64)
+    float* __restrict__ attn_out,        // (BH, NC, 64, 64)
+    float* __restrict__ decay_mask_out,  // (BH, NC, 64, 64)
+    unsigned int bh,
+    unsigned int nc,
+    unsigned int hk
+) {
+    const unsigned int CS = 64, TK = 32, LD = 33, ALD = 65;
+    unsigned int b = blockIdx.x;
+    unsigned int c = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    if (b >= bh || c >= nc) return;
+
+    __shared__ float g_sm[64];
+    __shared__ float kb_s[64 * 33];
+    __shared__ float key_s[64 * 33];
+    __shared__ float attn_sm[64 * 65];
+
+    unsigned long long base_kv = ((unsigned long long)b * nc + c) * CS * hk;
+    unsigned long long base_g  = ((unsigned long long)b * nc + c) * CS;
+    unsigned long long base_attn = ((unsigned long long)b * nc + c) * CS * CS;
+
+    if (tid < CS) g_sm[tid] = g_cumsum[base_g + tid];
+
+    // поток: строки ty + 16·r, столбцы tx + 16·q (r, q = 0..3)
+    unsigned int ty = tid >> 4, tx = tid & 15;
+    float acc[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[r][q] = 0.0f;
+
+    for (unsigned int k0 = 0; k0 < hk; k0 += TK) {
+        __syncthreads();
+        // 64×32 каждой матрицы: 2048 чисел, по 8 на поток, строки подряд
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            unsigned int e = p * 256 + tid;
+            unsigned int row = e >> 5, col = e & 31;
+            kb_s[row * LD + col]  = k_beta[base_kv + (unsigned long long)row * hk + k0 + col];
+            key_s[row * LD + col] = key[base_kv + (unsigned long long)row * hk + k0 + col];
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (unsigned int d = 0; d < TK; ++d) {
+            float a[4], bb[4];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) a[r] = kb_s[(ty + 16 * r) * LD + d];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) bb[q] = key_s[(tx + 16 * q) * LD + d];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) acc[r][q] += a[r] * bb[q];
+        }
+    }
+
+    // decay_mask и строго нижний attn
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        unsigned int i = ty + 16 * r;
+        float g_i = g_sm[i];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            unsigned int j = tx + 16 * q;
+            float dm = (j <= i) ? __expf(g_i - g_sm[j]) : 0.0f;
+            decay_mask_out[base_attn + i * CS + j] = dm;
+            attn_sm[i * ALD + j] = (j < i) ? -acc[r][q] * dm : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Шаг 2: подстановка, как в compute_chunk_attn_f32 (старые значения строки).
+    for (unsigned int row = 1; row < CS; ++row) {
+        float new_val = 0.0f;
+        bool active = (tid < row);
+        if (active) {
+            unsigned int j = tid;
+            float s = 0.0f;
+            for (unsigned int l = 0; l < row; ++l) {
+                s += attn_sm[row * ALD + l] * attn_sm[l * ALD + j];
+            }
+            new_val = attn_sm[row * ALD + j] + s;
+        }
+        __syncthreads();
+        if (active) attn_sm[row * ALD + tid] = new_val;
+        __syncthreads();
+    }
+    if (tid < CS) attn_sm[tid * ALD + tid] += 1.0f;
+    __syncthreads();
+
+    #pragma unroll
+    for (int p = 0; p < 16; ++p) {
+        unsigned int e = p * 256 + tid;
+        unsigned int i = e >> 6, j = e & 63;
+        attn_out[base_attn + e] = attn_sm[i * ALD + j];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // state_update_decay_f32 — state[b,:,:] *= exp(g_last[b]). Grid (BH, HK, *).
 // ─────────────────────────────────────────────────────────────────────────────
 __global__ void state_update_decay_f32(
@@ -352,8 +463,14 @@ __global__ void state_decay_from_gcumsum_chunk_f32(
 
 #define GCS_CS 64
 #define GCS_HK 128
-#define GCS_TILE 64
-#define GCS_BLOCK 256
+// Полоса выходных каналов на блок. 32 вместо 64: скан по чанкам у головы
+// последовательный, и время ядра — это время одного блока; при 64 сетка
+// (48 голов × 2) занимала карту меньше чем одной волной.
+#ifndef GCS_TILE
+#define GCS_TILE 32
+#endif
+#define GCS_BLOCK (GCS_TILE * 4)
+#define GCS_TC (GCS_TILE / 4)   // групп столбцов по четыре
 
 extern "C" __global__ __launch_bounds__(GCS_BLOCK) void gdn_chunk_scan_f32(
     const float* __restrict__ q_scaled,
@@ -372,12 +489,12 @@ extern "C" __global__ __launch_bounds__(GCS_BLOCK) void gdn_chunk_scan_f32(
 
     const unsigned int b = blockIdx.x;
     const unsigned int j0 = blockIdx.y * GCS_TILE;
-    // Сетка потоков 16×16: строки по четыре, столбцы по четыре.
-    const unsigned int rj = (threadIdx.x & 15u) * 4u;
-    const unsigned int ri = (threadIdx.x >> 4) * 4u;
+    // Сетка потоков 16 × GCS_TC: строки по четыре, столбцы по четыре.
+    const unsigned int rj = (threadIdx.x % GCS_TC) * 4u;
+    const unsigned int ri = (threadIdx.x / GCS_TC) * 4u;
     // Для загрузок и пополнения состояния — раскладка «строка × 64 канала».
     const unsigned int lx = threadIdx.x & (GCS_TILE - 1);
-    const unsigned int ly = threadIdx.x >> 6;
+    const unsigned int ly = threadIdx.x / GCS_TILE;
 
     const unsigned long long st_base = (unsigned long long)b * GCS_HK * hv + j0 + lx;
     for (unsigned int d = ly; d < GCS_HK; d += GCS_BLOCK / GCS_TILE) {
@@ -468,7 +585,7 @@ extern "C" __global__ __launch_bounds__(GCS_BLOCK) void gdn_chunk_scan_f32(
         // state = state·exp(g_last) + k_decayed^T @ vp.
         {
             const float decay = __expf(gc[GCS_CS - 1]);
-            const unsigned int d0 = (threadIdx.x >> 4) * 8u;
+            const unsigned int d0 = (threadIdx.x / GCS_TC) * 8u;
             float acc[8][4];
             #pragma unroll
             for (int i = 0; i < 8; ++i)

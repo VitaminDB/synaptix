@@ -331,12 +331,13 @@ pub fn chunk_gated_delta_rule(
         SynaptixError::Cuda(format!("alloc chunk_scan ws {what}: {e:?}"))
     };
 
-    // ── Препроцессинг.
-    let q_n = ws.q_n.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("q_n", e))?;
-    let k_n = ws.k_n.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_n", e))?;
-    let v_beta = ws.v_beta.fit_zeros(stream, bh_u * t_u * hv_u).map_err(|e| werr("v_beta", e))?;
-    let k_beta = ws.k_beta.fit_zeros(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_beta", e))?;
-    let g_cumsum = ws.g_cumsum.fit_zeros(stream, bh_u * t_u).map_err(|e| werr("g_cumsum", e))?;
+    // ── Препроцессинг. Все буферы ниже их ядра перезаписывают целиком —
+    // без memset (`fit`).
+    let q_n = ws.q_n.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("q_n", e))?;
+    let k_n = ws.k_n.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_n", e))?;
+    let v_beta = ws.v_beta.fit(stream, bh_u * t_u * hv_u).map_err(|e| werr("v_beta", e))?;
+    let k_beta = ws.k_beta.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_beta", e))?;
+    let g_cumsum = ws.g_cumsum.fit(stream, bh_u * t_u).map_err(|e| werr("g_cumsum", e))?;
 
     csk.l2norm_scale_lastdim(stream, q_in, &mut *q_n, bh * t, hk, q_scale, 1e-6)?;
     csk.l2norm_scale_lastdim(stream, k_in, &mut *k_n, bh * t, hk, 1.0, 1e-6)?;
@@ -345,25 +346,25 @@ pub fn chunk_gated_delta_rule(
     // g_in (BH, T) = (BH*NC, CS) — cumsum по чанку.
     csk.cumsum_lastdim(stream, g_in, &mut *g_cumsum, bh * nc, cs)?;
 
-    let attn = ws.attn.fit_zeros(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("attn", e))?;
-    let dm = ws.dm.fit_zeros(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("dm", e))?;
+    let attn = ws.attn.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("attn", e))?;
+    let dm = ws.dm.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("dm", e))?;
     let value_proc = ws
         .value_proc
-        .fit_zeros(stream, bh_u * nc_u * cs_u * hv_u)
+        .fit(stream, bh_u * nc_u * cs_u * hv_u)
         .map_err(|e| werr("value_proc", e))?;
     let k_cumdecay = ws
         .k_cumdecay
-        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .fit(stream, bh_u * nc_u * cs_u * hk_u)
         .map_err(|e| werr("k_cumdecay", e))?;
     let k_cumdecay_input = ws
         .k_cumdecay_input
-        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .fit(stream, bh_u * nc_u * cs_u * hk_u)
         .map_err(|e| werr("k_cumdecay_input", e))?;
     let q_scaled = ws
         .q_scaled
-        .fit_zeros(stream, bh_u * nc_u * cs_u * hk_u)
+        .fit(stream, bh_u * nc_u * cs_u * hk_u)
         .map_err(|e| werr("q_scaled", e))?;
-    let v_prime = ws.v_prime.fit_zeros(stream, bh_u * cs_u * hv_u).map_err(|e| werr("v_prime", e))?;
+    let v_prime = ws.v_prime.fit(stream, bh_u * cs_u * hv_u).map_err(|e| werr("v_prime", e))?;
 
     // ── intra-chunk attn + decay_mask.
     cfk.compute_chunk_attn(

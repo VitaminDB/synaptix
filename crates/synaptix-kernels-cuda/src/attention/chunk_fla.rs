@@ -17,9 +17,13 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module, load_fn};
 
+/// Полоса каналов блока `gdn_chunk_scan_f32` (`GCS_TILE` в chunk_fla.cu).
+const GCS_TILE: u32 = 32;
+
 pub struct ChunkFlaKernels {
     _module: Arc<CudaModule>,
     compute_chunk_attn: CudaFunction,
+    compute_chunk_attn_t64: CudaFunction,
     state_update_decay: CudaFunction,
     mul_decay_mask: CudaFunction,
     sub_inplace: CudaFunction,
@@ -52,6 +56,7 @@ impl ChunkFlaKernels {
         let module = compile_module(ctx, src, "chunk_fla.cu")?;
         let new = Arc::new(Self {
             compute_chunk_attn: load_fn(&module, "compute_chunk_attn_f32")?,
+            compute_chunk_attn_t64: load_fn(&module, "compute_chunk_attn_t64_f32")?,
             state_update_decay: load_fn(&module, "state_update_decay_f32")?,
             mul_decay_mask: load_fn(&module, "mul_decay_mask_f32")?,
             sub_inplace: load_fn(&module, "sub_inplace_f32")?,
@@ -87,6 +92,17 @@ impl ChunkFlaKernels {
         cs: u32,
         hk: u32,
     ) -> Result<()> {
+        // CS=64 — плиточное ядро на 256 потоков (результат побитово тот же).
+        if cs == 64 && hk % 32 == 0 {
+            let cfg = LaunchConfig { grid_dim: (bh, nc, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut b = stream.launch_builder(&self.compute_chunk_attn_t64);
+            b.arg(k_beta).arg(key).arg(g_cumsum).arg(attn_out).arg(decay_mask_out).arg(&bh).arg(&nc).arg(&hk);
+            unsafe {
+                b.launch(cfg)
+                    .map_err(|e| SynaptixError::Cuda(format!("launch compute_chunk_attn_t64: {e:?}")))?;
+            }
+            return Ok(());
+        }
         let shared_bytes = ((cs + cs * cs) as usize * std::mem::size_of::<f32>()) as u32;
         let cfg = LaunchConfig {
             grid_dim: (bh, nc, 1),
@@ -321,7 +337,7 @@ impl ChunkFlaKernels {
     #[allow(clippy::too_many_arguments)]
     /// Формы, на которые рассчитан слитый цикл чанк-скана.
     pub fn chunk_scan_fits(cs: u32, hk: u32, hv: u32) -> bool {
-        cs == 64 && hk == 128 && hv % 64 == 0
+        cs == 64 && hk == 128 && hv % GCS_TILE == 0
     }
 
     /// Весь главный цикл чанк-скана одним запуском: блок берёт голову и
@@ -344,8 +360,8 @@ impl ChunkFlaKernels {
         hv: u32,
     ) -> Result<()> {
         let cfg = LaunchConfig {
-            grid_dim: (bh, hv / 64, 1),
-            block_dim: (256, 1, 1),
+            grid_dim: (bh, hv / GCS_TILE, 1),
+            block_dim: (GCS_TILE * 4, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut b = stream.launch_builder(&self.gdn_chunk_scan);

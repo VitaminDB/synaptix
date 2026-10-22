@@ -256,6 +256,32 @@ impl<T: DeviceRepr + ValidAsZeroBits> WsBuf<T> {
         Ok(buf)
     }
 
+    /// Как [`Self::fit_zeros`], но без обнуления уже выделенного блока: для
+    /// буферов, которые ядро перезаписывает целиком (memset на каждом вызове
+    /// стоил GDN-префиллу 1.4 мс на слой куска 2048 — как само ядро скана).
+    /// Новый блок по-прежнему приходит нулевым.
+    pub fn fit(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<&mut CudaSlice<T>, DriverError> {
+        let need = len.max(1);
+        if self.buf.as_ref().is_some_and(|b| b.len() == need) {
+            return Ok(self.buf.as_mut().unwrap());
+        }
+        self.fit_zeros(stream, len)
+    }
+
+    /// `fit_zeros`, если `zero`, иначе `fit`.
+    pub fn fit_or_zero(
+        &mut self,
+        zero: bool,
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<&mut CudaSlice<T>, DriverError> {
+        if zero { self.fit_zeros(stream, len) } else { self.fit(stream, len) }
+    }
+
     /// Байт под блоком (0, если не аллоцирован) — для отчёта в
     /// `release_device_caches`.
     pub fn bytes(&self) -> usize {
