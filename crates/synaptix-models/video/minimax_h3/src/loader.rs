@@ -77,6 +77,29 @@ pub struct LoraWeights {
     strength: f32,
     device: Device,
     prefixes: Vec<String>,
+    /// Имена Diffusers (`transformer_blocks.N.attn.to_q`, `ff.net.0.proj`, …) —
+    /// так выложены Turbo LoRA lightx2v; иначе — имена ComfyUI/H3 (`blocks.N.attn.qkv_proj`).
+    diffusers: bool,
+    /// alpha из метаданных (`alpha` / `training_alpha`): добавка ·alpha/rank.
+    /// Turbo v1.3: alpha 8 при ранге 128 — масштаб 0.0625; без него LoRA
+    /// прибавлялась в 16 раз сильнее и ролик рассыпался в мусор.
+    alpha: Option<f32>,
+}
+
+/// Имя модуля H3 → имя Diffusers (`MiniMaxH3Transformer3DModel`), как в
+/// convert.py InstantX; `fc1` в Diffusers — `[value; gate]` (у H3 `[gate; value]`).
+fn diffusers_name(key: &str) -> String {
+    let mut n = if let Some(r) = key.strip_prefix("token_refiner.blocks.") {
+        format!("token_refiner.refiner_blocks.{r}")
+    } else if let Some(r) = key.strip_prefix("blocks.") {
+        format!("transformer_blocks.{r}")
+    } else {
+        key.to_string()
+    };
+    n = n.replace("final_layer.adaln_proj.linear", "norm_out.linear");
+    n = n.replace(".attn.out_proj", ".attn.to_out.0");
+    n = n.replace(".mlp.fc2", ".ff.net.2");
+    n.replace(".mlp.fc1", ".ff.net.0.proj")
 }
 
 impl LoraWeights {
@@ -91,7 +114,92 @@ impl LoraWeights {
                 prefixes.push(p.to_string());
             }
         }
-        Ok(Self { loader, strength, device, prefixes })
+        let diffusers = names.iter().any(|n| n.contains("transformer_blocks.") || n.contains(".attn.to_q."));
+        let md = loader.metadata();
+        let alpha = ["alpha", "training_alpha", "lora_alpha"]
+            .iter()
+            .find_map(|k| md.get(*k).and_then(|v| v.trim().parse::<f32>().ok()))
+            .filter(|a| *a > 0.0);
+        // ComfyUI-сборка qkv (блочно-диагональная B, rank·3) хранит alpha·3 и
+        // `training_scale` — масштаб берётся прямо из него.
+        let alpha = match md.get("training_scale").and_then(|v| v.trim().parse::<f32>().ok()) {
+            Some(sc) if sc > 0.0 && md.contains_key("qkv_fusion") => Some(-sc),
+            _ => alpha,
+        };
+        // Turbo LoRA для 768p (lightx2v v1.x) учены со сдвигом сигмы 6/3, а не
+        // 12/3 модели; без явного --sigma-shift-* — их сдвиг.
+        let fname = path.as_ref().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if fname.contains("turbo") && fname.contains("768p") {
+            let (v, a) = crate::runtime::sigma_shift();
+            if v.is_none() {
+                crate::runtime::set_sigma_shift(Some(6.0), a.or(Some(3.0)));
+                eprintln!("[h3] Turbo 768p: сдвиг сигмы видео 6, звука {}", a.unwrap_or(3.0));
+            }
+        }
+        eprintln!(
+            "[h3] LoRA: {} имена, alpha {}",
+            if diffusers { "Diffusers" } else { "ComfyUI/H3" },
+            match alpha {
+                Some(a) if a < 0.0 => format!("— training_scale {}", -a),
+                Some(a) => format!("{a} (масштаб alpha/rank)"),
+                None => "нет (масштаб 1)".into(),
+            }
+        );
+        Ok(Self { loader, strength, device, prefixes, diffusers, alpha })
+    }
+
+    fn pair_delta(&self, key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {
+        let Some((ka, kb)) = self.find_pair(key) else {
+            return Ok(None);
+        };
+        let a = self
+            .loader
+            .load_to(&ka, self.device, dtype)
+            .map_err(|e| H3Error::Load(format!("lora {ka}: {e}")))?;
+        let b = self
+            .loader
+            .load_to(&kb, self.device, dtype)
+            .map_err(|e| H3Error::Load(format!("lora {kb}: {e}")))?;
+        let rank = a.dims()[0] as f32;
+        let scale = match self.alpha {
+            Some(a) if a < 0.0 => -a, // готовый training_scale
+            Some(a) => a / rank,
+            None => 1.0,
+        };
+        let bs = b.mul_scalar(self.strength * scale)?;
+        Ok(Some(bs.matmul(&a)?))
+    }
+
+    /// Добавка к общему `qkv_proj` в раскладке весов H3 — по головам
+    /// `[heads, (q,k,v), head_dim]`. LoRA хранят `[все q; все k; все v]`
+    /// (ComfyUI переставляет qkv при загрузке) или три `to_q/to_k/to_v`
+    /// (Diffusers); прежде добавка ComfyUI ложилась на веса без перестановки.
+    pub fn delta_qkv(&self, model_key: &str, heads: usize, head_dim: usize, dtype: DType) -> Result<Option<Tensor>, H3Error> {
+        let fused = if self.diffusers {
+            let base = diffusers_name(model_key.trim_end_matches(".qkv_proj"));
+            let mut parts = Vec::with_capacity(3);
+            for s in ["to_q", "to_k", "to_v"] {
+                match self.pair_delta(&format!("{base}.{s}"), dtype)? {
+                    Some(d) => parts.push(d),
+                    None => return Ok(None),
+                }
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 0)?
+        } else {
+            match self.pair_delta(model_key, dtype)? {
+                Some(d) => d,
+                None => return Ok(None),
+            }
+        };
+        let k = fused.dims()[1];
+        Ok(Some(
+            fused
+                .reshape(vec![3, heads, head_dim, k])?
+                .permute([1, 0, 2, 3])?
+                .contiguous()?
+                .reshape(vec![3 * heads * head_dim, k])?,
+        ))
     }
 
     pub fn strength(&self) -> f32 {
@@ -116,19 +224,81 @@ impl LoraWeights {
     }
 
     pub fn delta(&self, model_key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {
-        let Some((ka, kb)) = self.find_pair(model_key) else {
+        if !self.diffusers {
+            return self.pair_delta(model_key, dtype);
+        }
+        let Some(d) = self.pair_delta(&diffusers_name(model_key), dtype)? else {
             return Ok(None);
         };
-        let a = self
-            .loader
-            .load_to(&ka, self.device, dtype)
-            .map_err(|e| H3Error::Load(format!("lora {ka}: {e}")))?;
-        let b = self
-            .loader
-            .load_to(&kb, self.device, dtype)
-            .map_err(|e| H3Error::Load(format!("lora {kb}: {e}")))?;
-        let bs = b.mul_scalar(self.strength)?;
-        Ok(Some(bs.matmul(&a)?))
+        if model_key.ends_with(".mlp.fc1") {
+            // Diffusers [value; gate] → H3 [gate; value]
+            let half = d.dims()[0] / 2;
+            let (v, g) = (d.narrow(0, 0, half)?.contiguous()?, d.narrow(0, half, half)?.contiguous()?);
+            return Ok(Some(Tensor::cat(&[&g, &v], 0)?.contiguous()?));
+        }
+        Ok(Some(d))
+    }
+
+    /// Пара `(A [r,K], B·масштаб [N,r])` для прибавки при счёте: `y += (x·Aᵀ)·Bᵀ`.
+    /// Вливать LoRA в квантованные веса нельзя: добавка с масштабом alpha/rank
+    /// меньше шага MXFP8/NVFP4 и при повторном кванте почти вся пропадает.
+    fn raw_pair(&self, key: &str, dtype: DType) -> Result<Option<(Tensor, Tensor)>, H3Error> {
+        let Some((ka, kb)) = self.find_pair(key) else {
+            return Ok(None);
+        };
+        let a = self.loader.load_to(&ka, self.device, dtype).map_err(|e| H3Error::Load(format!("lora {ka}: {e}")))?;
+        let b = self.loader.load_to(&kb, self.device, dtype).map_err(|e| H3Error::Load(format!("lora {kb}: {e}")))?;
+        let rank = a.dims()[0] as f32;
+        let scale = match self.alpha {
+            Some(al) if al < 0.0 => -al,
+            Some(al) => al / rank,
+            None => 1.0,
+        };
+        Ok(Some((a, b.mul_scalar(self.strength * scale)?)))
+    }
+
+    /// Пара для модуля H3 `model_key` (`blocks.N.attn.out_proj`, `…mlp.fc1`, …).
+    pub fn pair(&self, model_key: &str, dtype: DType) -> Result<Option<(Tensor, Tensor)>, H3Error> {
+        if !self.diffusers {
+            return self.raw_pair(model_key, dtype);
+        }
+        let Some((a, b)) = self.raw_pair(&diffusers_name(model_key), dtype)? else {
+            return Ok(None);
+        };
+        if model_key.ends_with(".mlp.fc1") {
+            // Diffusers [value; gate] → H3 [gate; value]
+            let half = b.dims()[0] / 2;
+            let (v, g) = (b.narrow(0, 0, half)?.contiguous()?, b.narrow(0, half, half)?.contiguous()?);
+            return Ok(Some((a, Tensor::cat(&[&g, &v], 0)?.contiguous()?)));
+        }
+        Ok(Some((a, b)))
+    }
+
+    /// Пары q, k, v для `…attn.qkv_proj` (строки B — `[голова, dim]`, как у
+    /// проекций H3 после деления qkv по головам).
+    pub fn qkv_pairs(&self, model_key: &str, dtype: DType) -> Result<Option<[(Tensor, Tensor); 3]>, H3Error> {
+        if self.diffusers {
+            let base = diffusers_name(model_key.trim_end_matches(".qkv_proj"));
+            let q = self.raw_pair(&format!("{base}.to_q"), dtype)?;
+            let k = self.raw_pair(&format!("{base}.to_k"), dtype)?;
+            let v = self.raw_pair(&format!("{base}.to_v"), dtype)?;
+            return Ok(match (q, k, v) {
+                (Some(q), Some(k), Some(v)) => Some([q, k, v]),
+                _ => None,
+            });
+        }
+        // ComfyUI: B — [q; k; v] (блочно-диагональная), A общая.
+        let Some((a, b)) = self.raw_pair(model_key, dtype)? else {
+            return Ok(None);
+        };
+        let inner = b.dims()[0] / 3;
+        let part = |i: usize| -> Result<(Tensor, Tensor), H3Error> { Ok((a.clone(), b.narrow(0, i * inner, inner)?.contiguous()?)) };
+        Ok(Some([part(0)?, part(1)?, part(2)?]))
+    }
+
+    /// Сколько модулей H3 эта LoRA задевает (для журнала: 0 — имена не сошлись).
+    pub fn modules(&self) -> usize {
+        self.loader.names().iter().filter(|n| n.contains("lora_A") || n.contains("lora_down")).count()
     }
 
     pub fn diff(&self, model_key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {
@@ -184,6 +354,27 @@ impl H3Checkpoint {
 
     pub fn has_lora(&self) -> bool {
         self.lora.is_some()
+    }
+
+    pub fn lora_pair(&self, key: &str, dtype: DType) -> Result<Option<(Tensor, Tensor)>, H3Error> {
+        match &self.lora {
+            Some(l) => l.pair(key, dtype),
+            None => Ok(None),
+        }
+    }
+
+    pub fn lora_qkv_pairs(&self, key: &str, dtype: DType) -> Result<Option<[(Tensor, Tensor); 3]>, H3Error> {
+        match &self.lora {
+            Some(l) => l.qkv_pairs(key, dtype),
+            None => Ok(None),
+        }
+    }
+
+    pub fn lora_delta_qkv(&self, key: &str, heads: usize, head_dim: usize, dtype: DType) -> Result<Option<Tensor>, H3Error> {
+        match &self.lora {
+            Some(l) => l.delta_qkv(key, heads, head_dim, dtype),
+            None => Ok(None),
+        }
     }
 
     pub fn lora_delta(&self, key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {

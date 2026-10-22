@@ -16,7 +16,9 @@ type R<T> = Result<T, SynaptixError>;
 
 const LIN_CHUNK_ROWS: usize = 16384;
 
-pub struct Lin(QuantLinear);
+/// Линейный слой; `.1` — LoRA, прибавляемая при счёте (`(x·Aᵀ)·Bᵀ`, масштаб
+/// в B), а не влитая в квантованный вес.
+pub struct Lin(QuantLinear, Option<Box<(Tensor, Tensor)>>);
 
 /// Подкачать с диска страницы mmap весов блока `idx` (кроме adaLN — её
 /// читает свой кэш).
@@ -45,11 +47,18 @@ impl Lin {
         // Квантованный бандл: формат веса — как в файле. Без LoRA вес берётся
         // готовым; с LoRA — деквант + дельта + квант тем же форматом.
         let stored = ckpt.quant_dtype(&name);
-        if stored.is_some() && !ckpt.has_lora() {
+        // LoRA к квантованному весу — при счёте: влитая, она тонет в кванте.
+        let pair = if stored.is_some() || qdt.is_quantized() { ckpt.lora_pair(key, compute)? } else { None };
+        let has_diff = ckpt.has_lora() && ckpt.lora_diff(key, compute)?.is_some();
+        if stored.is_some() && (!ckpt.has_lora() || (pair.is_some() && !has_diff)) {
             if let Some(q) = ckpt.load_quant(&name) {
                 let bias = b.map(|t| t.to_dtype(compute)).transpose()?;
-                return Ok(Self(QuantLinear::Quant { w: q?, bias }));
+                return Ok(Self(QuantLinear::Quant { w: q?, bias }, pair.map(Box::new)));
             }
+        }
+        if let (Some(p), false) = (pair, has_diff) {
+            let w = ckpt.get_raw(&name)?;
+            return Ok(Self(QuantLinear::build(w, b, stored.unwrap_or(qdt), compute).map_err(H3Error::from)?, Some(Box::new(p))));
         }
         let mut w = ckpt.get_raw(&name)?;
         if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
@@ -58,7 +67,7 @@ impl Lin {
         if let Some(d) = ckpt.lora_diff(key, w.dtype())? {
             w = w.add(&d)?;
         }
-        Ok(Self(QuantLinear::build(w, b, stored.unwrap_or(qdt), compute).map_err(H3Error::from)?))
+        Ok(Self(QuantLinear::build(w, b, stored.unwrap_or(qdt), compute).map_err(H3Error::from)?, None))
     }
 
     pub fn load_qkv(
@@ -73,8 +82,17 @@ impl Lin {
         // значений и квантуется тем же форматом (MXFP8 — те же байты).
         let qdt = ckpt.quant_dtype(&format!("{key}.weight")).unwrap_or(qdt);
         let mut w = ckpt.get_raw(&format!("{key}.weight"))?;
-        if let Some(d) = ckpt.lora_delta(key, w.dtype())? {
-            w = w.add(&d)?;
+        // Квантованный слой — LoRA при счёте по частям q/k/v; плотный — вливается.
+        let mut pairs: Vec<Option<Box<(Tensor, Tensor)>>> = vec![None, None, None];
+        if qdt.is_quantized() {
+            if let Some(ps) = ckpt.lora_qkv_pairs(key, compute)? {
+                pairs = ps.into_iter().map(|p| Some(Box::new(p))).collect();
+            }
+        }
+        if pairs[0].is_none() {
+            if let Some(d) = ckpt.lora_delta_qkv(key, heads, head_dim, w.dtype())? {
+                w = w.add(&d)?;
+            }
         }
         if let Some(d) = ckpt.lora_diff(key, w.dtype())? {
             w = w.add(&d)?;
@@ -87,7 +105,7 @@ impl Lin {
                 .narrow(1, s, 1)?
                 .contiguous()?
                 .reshape(vec![heads * head_dim, k])?;
-            out.push(Self(QuantLinear::build(ws, None, qdt, compute).map_err(H3Error::from)?));
+            out.push(Self(QuantLinear::build(ws, None, qdt, compute).map_err(H3Error::from)?, pairs[s].take()));
         }
         let [q, kk, v] = <[Self; 3]>::try_from(out).map_err(|_| H3Error::Layout("qkv split".into()))?;
         Ok([q, kk, v])
@@ -107,18 +125,45 @@ impl Lin {
             w = w.add(&d)?;
         }
         let b = if bias { Some(ckpt.get_as(&format!("{key}.bias"), dtype)?) } else { None };
-        Ok(Self(QuantLinear::dense(w, b).map_err(H3Error::from)?))
+        Ok(Self(QuantLinear::dense(w, b).map_err(H3Error::from)?, None))
     }
 
     pub fn from_quant(q: QuantLinear) -> Self {
-        Self(q)
+        Self(q, None)
     }
 
     fn to_device(&self, dev: Device) -> R<Self> {
-        Ok(Self(self.0.to_device(dev)?))
+        let lora = match &self.1 {
+            Some(p) => Some(Box::new((p.0.to_device(dev)?, p.1.to_device(dev)?))),
+            None => None,
+        };
+        Ok(Self(self.0.to_device(dev)?, lora))
+    }
+
+    pub fn has_lora(&self) -> bool {
+        self.1.is_some()
+    }
+
+    /// `y` (строки `off..off+n` выхода) + LoRA от BF16-входа `x` (все строки).
+    fn lora_add(&self, y: Tensor, x: Option<&Tensor>, off: usize, n: usize) -> R<Tensor> {
+        let (Some(p), Some(x)) = (&self.1, x) else { return Ok(y) };
+        let xc = x.narrow(0, off, n)?.contiguous()?;
+        let xc = if xc.dtype() == p.0.dtype() { xc } else { xc.to_dtype(p.0.dtype())? };
+        let lo = xc.linear(&p.0)?.linear(&p.1)?;
+        let lo = if lo.dtype() == y.dtype() { lo } else { lo.to_dtype(y.dtype())? };
+        y.add(&lo)
     }
 
     pub fn forward(&self, x: &Tensor) -> R<Tensor> {
+        let y = self.forward_base(x)?;
+        let Some(p) = &self.1 else { return Ok(y) };
+        let xl = if x.dtype() == p.0.dtype() { x.clone() } else { x.to_dtype(p.0.dtype())? };
+        let lo = xl.linear(&p.0)?.linear(&p.1)?;
+        let lo = if lo.dtype() == y.dtype() { lo } else { lo.to_dtype(y.dtype())? };
+        y.add(&lo)
+    }
+
+    fn forward_base(&self, x: &Tensor) -> R<Tensor> {
         let rows = x.dims()[0];
         if rows <= LIN_CHUNK_ROWS || !self.0.is_quant() {
             return self.0.forward(x);
@@ -297,6 +342,7 @@ impl Attention {
         s: usize,
         rt: &RopeTables,
         out_dt: DType,
+        lin: Option<&Tensor>,
     ) -> R<Tensor> {
         let attn_dt = if runtime::h3_attn_f16() { DType::F16 } else { out_dt };
         let inner = self.heads * self.head_dim;
@@ -306,16 +352,17 @@ impl Attention {
         let mut v_full: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
-            let k = self.k_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape.clone())?;
+            let k = self.k_proj.0.forward_prequant(packed, scales, *n, attn_dt)?;
+            let k = self.k_proj.lora_add(k, lin, *off, *n)?.reshape(shape.clone())?;
             let k = self.norm_rope(k, &k_norm, rt, *off)?;
             let v = if attn_dt == DType::F16 && out_dt != DType::F16 {
-                self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?
+                self.v_proj.lora_add(self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?, lin, *off, *n)?
                     .mul_scalar(1.0 / 16.0)?
                     .clamp(-60000.0, 60000.0)?
                     .to_dtype(DType::F16)?
                     .reshape(shape)?
             } else {
-                self.v_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape)?
+                self.v_proj.lora_add(self.v_proj.0.forward_prequant(packed, scales, *n, attn_dt)?, lin, *off, *n)?.reshape(shape)?
             };
             if k_full.is_none() {
                 k_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], attn_dt, k.device())?);
@@ -330,7 +377,8 @@ impl Attention {
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
-            let q = self.q_proj.0.forward_prequant(packed, scales, *n, attn_dt)?.reshape(shape)?;
+            let q = self.q_proj.0.forward_prequant(packed, scales, *n, attn_dt)?;
+            let q = self.q_proj.lora_add(q, lin, *off, *n)?.reshape(shape)?;
             let q = self.norm_rope(q, &q_norm, rt, *off)?;
             let a = q.flash_attention_bshd(&k_full, &v_full, self.scale, false)?;
             drop(q);
@@ -463,17 +511,19 @@ impl Mlp {
         Tensor::cat(&refs, 0)
     }
 
-    fn forward_prequant(&self, chunks: &[(Tensor, Tensor, usize, usize)], rows: usize, out_dt: DType) -> R<Tensor> {
+    fn forward_prequant(&self, chunks: &[(Tensor, Tensor, usize, usize)], rows: usize, out_dt: DType, lin: Option<&Tensor>) -> R<Tensor> {
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let h = self.fc1.0.forward_prequant(packed, scales, *n, out_dt)?;
+            let h = self.fc1.lora_add(h, lin, *off, *n)?;
             // MXFP8: silu(gate)·up сразу в квант fc2 — без strided-копий
             // половин h и отдельного кванта (бит-в-бит с цепочкой ниже).
-            let fused_mx = if self.fc2.0.is_mxfp8() { h.silu_mul_quant_mxfp8().ok() } else { None };
+            // LoRA у fc2 нужен BF16-вход — тогда через act ниже.
+            let fused_mx = if self.fc2.0.is_mxfp8() && !self.fc2.has_lora() { h.silu_mul_quant_mxfp8().ok() } else { None };
             let y = if let Some((p2, s2)) = fused_mx {
                 drop(h);
                 self.fc2.0.forward_prequant(&p2, &s2, *n, out_dt)?
-            } else if self.fc2.0.is_nvfp4() {
+            } else if self.fc2.0.is_nvfp4() && !self.fc2.has_lora() {
                 match h.silu_mul_quant_nvfp4(1.0 / 32.0) {
                     Ok((p2, s2)) => {
                         drop(h);
@@ -696,7 +746,15 @@ impl DiTBlock {
         let Some(chunks) = self.quant_chunks(x, &mods.scale_msa, &mods.shift_msa, &self.norm1, segments, fmt)? else {
             return Ok(None);
         };
-        let a = self.attn.forward_bshd_prequant(&chunks, s, rope, x.dtype())?;
+        // LoRA при счёте: BF16-вход проекций (норма + модуляция) рядом с квантом.
+        let lora = self.attn.q_proj.has_lora() || self.mlp.fc1.has_lora() || self.mlp.fc2.has_lora();
+        let h1 = if lora {
+            Some(mod_scale_shift(&rms_norm(x, &self.norm1, self.eps)?, &mods.shift_msa, &mods.scale_msa, segments)?)
+        } else {
+            None
+        };
+        let a = self.attn.forward_bshd_prequant(&chunks, s, rope, x.dtype(), h1.as_ref())?;
+        drop(h1);
         drop(chunks);
         let x = mod_gate(x, &a, &mods.gate_msa, segments)?;
         drop(a);
@@ -707,7 +765,13 @@ impl DiTBlock {
             let m = self.mlp.forward(&h)?;
             return Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?));
         };
-        let m = self.mlp.forward_prequant(&chunks, s, x.dtype())?;
+        let h2 = if lora {
+            Some(mod_scale_shift(&rms_norm(&x, &self.norm2, self.eps)?, &mods.shift_mlp, &mods.scale_mlp, segments)?)
+        } else {
+            None
+        };
+        let m = self.mlp.forward_prequant(&chunks, s, x.dtype(), h2.as_ref())?;
+        drop(h2);
         drop(chunks);
         Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?))
     }
@@ -1038,7 +1102,9 @@ impl H3Dit {
         // Место, которое должно остаться после резидентных блоков: два
         // стримящихся блока (текущий + префетч), сырой вес под квантование
         // и запас на хвост модели.
-        let reserve = 2 * blk_q + blk_dense / 2 + (1usize << 30) + runtime::load_reserve_bytes();
+        // LoRA при счёте: её A/B (~27 МБ на блок у Turbo) и BF16-входы проекций.
+        let lora = if ckpt.has_lora() { 2usize << 30 } else { 0 };
+        let reserve = 2 * blk_q + blk_dense / 2 + (1usize << 30) + runtime::load_reserve_bytes() + lora;
         let mut host_from = match mode {
             crate::memory::H3MemoryMode::BlockOffload if cuda => 0,
             _ => nblocks,

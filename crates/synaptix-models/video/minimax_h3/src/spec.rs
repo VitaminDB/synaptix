@@ -36,10 +36,10 @@ pub fn registry() -> Vec<PipelineSpec> {
         },
         PipelineSpec {
             name: "t2va-turbo",
-            desc: "текст → видео + звук, Turbo LoRA, 6 шагов без CFG",
+            desc: "текст → видео + звук, Turbo LoRA (lightx2v), 8 шагов без CFG",
             variant: H3Variant::Fl2va,
             conditioning: Conditioning::None,
-            default_steps: 6,
+            default_steps: 8,
             default_cfg: 1.0,
             needs_lora: true,
             implemented: true,
