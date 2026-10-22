@@ -429,6 +429,17 @@ fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Devi
                 .ok_or_else(|| IoError::Bundle(format!("{}: квант-вес пропал из источника", item.name)))??;
             qw.dequantize(DType::F16).map_err(|e| IoError::Bundle(format!("{}: деквант {:?}: {e}", item.name, qw.dtype())))?
         }
+        None if !matches!(device, Device::Cpu) && loader.mapped_bytes(&item.name).is_some_and(|(_, dt, _)| is_dense(dt)) => {
+            // Срез прямо из отображённого файла — на карту как есть, тип
+            // меняется там: прежний путь читал и переводил на хосте всю
+            // стопку экспертов на каждый срез.
+            let (bytes, dt, _) = loader.mapped_bytes(&item.name).expect("проверено выше");
+            let per = bytes.len() / slices;
+            let src_dt = if item.delta.is_some() { DType::F32 } else { DType::F16 };
+            Tensor::from_raw_slice(&bytes[slice * per..(slice + 1) * per], (n, k), dt, device)
+                .and_then(|t| if dt == src_dt { Ok(t) } else { t.to_dtype(src_dt) })
+                .map_err(|e| IoError::Bundle(format!("{}: срез {slice} на карту: {e}", item.name)))?
+        }
         None => {
             let src_dt = if item.delta.is_some() { DType::F32 } else { DType::F16 };
             let host = loader.load_to(&item.name, Device::Cpu, src_dt)?;
