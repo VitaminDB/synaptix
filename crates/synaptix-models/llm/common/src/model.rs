@@ -4540,14 +4540,18 @@ impl LinearAttn {
     ) -> Result<Tensor, ModelError> {
         const CS: usize = 64;
         let qkv = prof(device, "la_inproj", || self.in_proj_qkv.forward(h))?;
-        let a = self.in_proj_a.forward(h)?;
-        let b = self.in_proj_b.forward(h)?;
+        let a = prof(device, "la_in_a", || self.in_proj_a.forward(h))?;
+        let b = prof(device, "la_in_b", || self.in_proj_b.forward(h))?;
         let conv_w = self.conv_w_dev.as_ref().ok_or_else(|| missing("conv_w_dev"))?;
         let dt_bias = self.dt_bias_dev.as_ref().ok_or_else(|| missing("dt_bias_dev"))?;
         let a_log = self.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
         // prep_scatter ожидает a/b в F16 (как decode-путь); cast если compute другой.
-        let a_f16 = if a.dtype() == DType::F16 { a } else { a.to_dtype(DType::F16).coerr()? };
-        let b_f16 = if b.dtype() == DType::F16 { b } else { b.to_dtype(DType::F16).coerr()? };
+        let (a_f16, b_f16) = prof(device, "la_cast", || -> Result<(Tensor, Tensor), ModelError> {
+            Ok((
+                if a.dtype() == DType::F16 { a.clone() } else { a.to_dtype(DType::F16).coerr()? },
+                if b.dtype() == DType::F16 { b.clone() } else { b.to_dtype(DType::F16).coerr()? },
+            ))
+        })?;
 
         // Device-резидентный стейт: сеем из host один раз (когда зеркало None —
         // первый чанк / свежий KV), дальше переиспользуем между чанками без

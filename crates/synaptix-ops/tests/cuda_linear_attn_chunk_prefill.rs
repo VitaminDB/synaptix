@@ -281,3 +281,52 @@ fn chunk_prefill_f32_realistic_350_pad() {
     // Маленькие dims чтобы тест был быстрым.
     run_case_f32(350, 2, 4, 32, 64, 4, 8, 0x500);
 }
+
+// Формы Qwen3.8-27B (HK=HV=128, CS=64) — слитая подготовка `gdn_prep_fused`.
+#[test]
+fn chunk_prefill_qwen38_fused_tail() {
+    // T=200 — не кратно 64: хвост чанка дополняется нулями.
+    run_case_f32(200, 2, 3, 128, 128, 4, 64, 0x900);
+}
+
+#[test]
+fn chunk_prefill_qwen38_fused_split_carry() {
+    run_split_carry_f32(256, 128, 2, 3, 128, 128, 4, 64, 0xA00);
+}
+
+// Слитая подготовка побитово совпадает с прежней цепочкой ядер (BF16, как в модели).
+#[test]
+fn chunk_prefill_fused_prep_bitexact_bf16() {
+    if synaptix_core::device::cuda::get(0).is_err() {
+        return;
+    }
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    let (t_in, num_k, n_rep, hk, hv, k_size, cs) = (200usize, 2usize, 3usize, 128usize, 128usize, 4usize, 64usize);
+    let num_v = num_k * n_rep;
+    let conv_dim = 2 * num_k * hk + num_v * hv;
+    let qkv = Tensor::from_vec(det_f32(0xB1, t_in * conv_dim, 0.7, 0.0), vec![1, t_in, conv_dim], dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let cw = Tensor::from_vec(det_f32(0xB2, conv_dim * k_size, 0.5, 0.0), vec![conv_dim, k_size], dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let a = Tensor::from_vec(det_f32(0xB3, t_in * num_v, 0.5, 0.0), vec![1, t_in, num_v], dev).unwrap().to_dtype(DType::F16).unwrap();
+    let b = Tensor::from_vec(det_f32(0xB4, t_in * num_v, 0.5, 0.0), vec![1, t_in, num_v], dev).unwrap().to_dtype(DType::F16).unwrap();
+    let dt = Tensor::from_vec(det_f32(0xB5, num_v, 0.2, 0.0), vec![num_v], dev).unwrap();
+    let al = Tensor::from_vec(det_f32(0xB6, num_v, 0.2, 0.0), vec![num_v], dev).unwrap();
+    let ss0 = det_f32(0xB7, num_v * hk * hv, 0.1, 0.0);
+    let run = |fused: bool| {
+        std::env::set_var("SYN_GDN_PREP_FUSED", if fused { "1" } else { "0" });
+        let mut cst = Tensor::zeros(vec![k_size - 1, conv_dim], DType::BF16, dev).unwrap();
+        let mut sst = Tensor::from_vec(ss0.clone(), vec![num_v, hk, hv], dev).unwrap();
+        let out = qkv
+            .linear_attn_chunk_prefill(&cw, &a, &b, &dt, &al, &mut cst, &mut sst, num_k, num_v, hk, hv, k_size, cs, 1.0 / (hk as f32).sqrt(), true)
+            .unwrap();
+        (host_f32(&out), host_f32(&sst))
+    };
+    let (o_old, s_old) = run(false);
+    let (o_new, s_new) = run(true);
+    std::env::remove_var("SYN_GDN_PREP_FUSED");
+    let dif_o = o_old.iter().zip(&o_new).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let dif_s = s_old.iter().zip(&s_new).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    eprintln!("[fused prep bitexact] out: {dif_o} из {} отличаются, state: {dif_s} из {}", o_old.len(), s_old.len());
+    assert_eq!(dif_o, 0, "выход слитой подготовки не совпал побитово");
+    assert_eq!(dif_s, 0, "состояние слитой подготовки не совпало побитово");
+}

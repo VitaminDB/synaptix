@@ -20,7 +20,7 @@ use cudarc::driver::{
 use parking_lot::Mutex;
 use synaptix_core::error::{Result, SynaptixError};
 
-use crate::attention::chunk_fla::ChunkFlaKernels;
+use crate::attention::chunk_fla::{ChunkFlaKernels, GdnPrepBufs};
 use crate::kernels::compile::{compile_module, load_fn};
 use crate::wsalloc::WsBuf;
 
@@ -247,6 +247,7 @@ struct ChunkWs {
     k_cumdecay_input: WsBuf<f32>,
     q_scaled: WsBuf<f32>,
     v_prime: WsBuf<f32>,
+    k_dec: WsBuf<f32>,
 }
 
 impl ChunkWs {
@@ -264,6 +265,7 @@ impl ChunkWs {
             + self.k_cumdecay_input.bytes()
             + self.q_scaled.bytes()
             + self.v_prime.bytes()
+            + self.k_dec.bytes()
     }
 }
 
@@ -286,6 +288,75 @@ pub fn clear_chunk_scan_ws() -> usize {
 /// q/k нормализуются L2 по hk, q·=q_scale, decay g_t=exp(g) накапливается
 /// пер-чанково.
 #[allow(clippy::too_many_arguments)]
+/// Чанк-скан с готовой подготовкой: `prep` заполняет буферы [`GdnPrepBufs`]
+/// (слитое ядро `gdn_prep_fused` прямо из выхода свёртки), дальше — те же шаги,
+/// что у [`chunk_gated_delta_rule`] после препроцессинга. Только для форм
+/// [`ChunkFlaKernels::prep_fused_fits`] и слитого цикла (`chunk_scan_fits`).
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_gated_delta_rule_prepped(
+    cfk: &ChunkFlaKernels,
+    csk: &ChunkScanKernels,
+    stream: &Arc<CudaStream>,
+    state: &mut CudaSlice<f32>, // (BH, HK, HV) in/out
+    out: &mut CudaSlice<f32>,   // (BH, T, HV)
+    bh: u32,
+    t: u32,
+    hk: u32,
+    hv: u32,
+    cs: u32,
+    prep: impl FnOnce(GdnPrepBufs<'_>) -> Result<()>,
+) -> Result<()> {
+    if t % cs != 0 || !ChunkFlaKernels::prep_fused_fits(cs, hk, hv) || !ChunkFlaKernels::chunk_scan_fits(cs, hk, hv) {
+        return Err(SynaptixError::Cuda(format!(
+            "chunk_gated_delta_rule_prepped: форма T={t} cs={cs} hk={hk} hv={hv} не поддержана"
+        )));
+    }
+    let nc = t / cs;
+    let (bh_u, t_u, hk_u, hv_u, cs_u, nc_u) = (bh as usize, t as usize, hk as usize, hv as usize, cs as usize, nc as usize);
+    let ord = stream.context().ordinal();
+    let cache = WS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock();
+    let ws: &mut ChunkWs = guard.entry(ord).or_default();
+    let werr = |what: &str, e: cudarc::driver::DriverError| {
+        SynaptixError::Cuda(format!("alloc chunk_scan ws {what}: {e:?}"))
+    };
+    // Все буферы ниже их ядра перезаписывают целиком — без memset (`fit`).
+    let q_n = ws.q_n.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("q_n", e))?;
+    let k_n = ws.k_n.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_n", e))?;
+    let v_beta = ws.v_beta.fit(stream, bh_u * t_u * hv_u).map_err(|e| werr("v_beta", e))?;
+    let k_beta = ws.k_beta.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_beta", e))?;
+    let g_cumsum = ws.g_cumsum.fit(stream, bh_u * t_u).map_err(|e| werr("g_cumsum", e))?;
+    let kcdi = ws.k_cumdecay_input.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_cumdecay_input", e))?;
+    let q_scaled = ws.q_scaled.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("q_scaled", e))?;
+    let k_dec = ws.k_dec.fit(stream, bh_u * t_u * hk_u).map_err(|e| werr("k_dec", e))?;
+    prep(GdnPrepBufs {
+        q_n: &mut *q_n,
+        q_sc: &mut *q_scaled,
+        k_n: &mut *k_n,
+        k_beta: &mut *k_beta,
+        kcdi: &mut *kcdi,
+        k_dec: &mut *k_dec,
+        v_beta: &mut *v_beta,
+        g_cum: &mut *g_cumsum,
+    })?;
+    let attn = ws.attn.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("attn", e))?;
+    let dm = ws.dm.fit(stream, bh_u * nc_u * cs_u * cs_u).map_err(|e| werr("dm", e))?;
+    let value_proc = ws.value_proc.fit(stream, bh_u * nc_u * cs_u * hv_u).map_err(|e| werr("value_proc", e))?;
+    let k_cumdecay = ws.k_cumdecay.fit(stream, bh_u * nc_u * cs_u * hk_u).map_err(|e| werr("k_cumdecay", e))?;
+
+    cfk.compute_chunk_attn(stream, &*k_beta, &*k_n, &*g_cumsum, &mut *attn, &mut *dm, bh, nc, cs, hk)?;
+    let bnc = bh * nc;
+    csk.bmm(stream, &*attn, 0, &*v_beta, 0, &mut *value_proc, 0, false, false, cs, hv, cs,
+        (cs * cs) as i64, (cs * hv) as i64, (cs * hv) as i64, bnc, 1.0, 0.0)?;
+    csk.bmm(stream, &*attn, 0, &*kcdi, 0, &mut *k_cumdecay, 0, false, false, cs, hk, cs,
+        (cs * cs) as i64, (cs * hk) as i64, (cs * hk) as i64, bnc, 1.0, 0.0)?;
+    csk.bmm(stream, &*q_n, 0, &*k_n, 0, &mut *attn, 0, false, true, cs, cs, hk,
+        (cs * hk) as i64, (cs * hk) as i64, (cs * cs) as i64, bnc, 1.0, 0.0)?;
+    cfk.mul_inplace(stream, &mut *attn, &*dm, (bh_u * nc_u * cs_u * cs_u) as u64)?;
+    cfk.gdn_chunk_scan(stream, &*q_scaled, &*k_cumdecay, &*k_dec, &*value_proc, &*attn, &*g_cumsum, state, out, bh, nc, hv)?;
+    Ok(())
+}
+
 pub fn chunk_gated_delta_rule(
     cfk: &ChunkFlaKernels,
     csk: &ChunkScanKernels,

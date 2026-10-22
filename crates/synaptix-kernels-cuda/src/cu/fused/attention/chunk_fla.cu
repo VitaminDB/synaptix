@@ -1,3 +1,5 @@
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 // Chunk-FLA helper-ядра для Gated DeltaNet prefill (chunked linear attention).
 //
 // Портировано из ai-quant/src/kernels/cu_kernels/chunk_fla.cu (валидировано
@@ -615,3 +617,142 @@ extern "C" __global__ __launch_bounds__(GCS_BLOCK) void gdn_chunk_scan_f32(
         state[st_base + (unsigned long long)d * hv] = st[d][lx];
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gdn_prep_fused_* — вся подготовка чанк-скана одним проходом (CS=64, HK=HV=128).
+// Блок — голова × чанк. Заменяет цепочку prep_scatter → l2norm(q), l2norm(k)
+// → k·β, v·β → cumsum(g) → q·e^g, kβ·e^g → k·e^(g_last−g): семь проходов по
+// буферам в f32 (1.5 мс на слой куска 2048 у Qwen3.8-27B). Арифметика и
+// порядок сумм — те же (норма строки и cumsum — последовательно одним
+// потоком), выходы побитово совпадают с прежней цепочкой.
+//
+//   post_conv (T_in, conv_dim) — [Q | K | V] после свёртки и SiLU, T = f16/bf16/f32
+//   a, b (T_in, num_v) f16; dt_bias, a_log (num_v) f32
+//   выходы (num_v, T_pad, ·) f32: q_n, q_sc, k_n, k_beta, kcdi, k_dec, v_beta; g_cum (num_v, T_pad)
+//   строки t ≥ T_in — нули (как у prep_scatter с alloc_zeros), g = β = 0.
+// ─────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ float gp_ld(const float* p) { return *p; }
+__device__ __forceinline__ float gp_ld(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ float gp_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+
+template <typename T>
+__device__ __forceinline__ void gdn_prep_fused_impl(
+    const T* __restrict__ post_conv,
+    const __half* __restrict__ b_f16, const __half* __restrict__ a_f16,
+    const float* __restrict__ dt_bias, const float* __restrict__ a_log,
+    float* __restrict__ q_n, float* __restrict__ q_sc,
+    float* __restrict__ k_n, float* __restrict__ k_beta,
+    float* __restrict__ kcdi, float* __restrict__ k_dec,
+    float* __restrict__ v_beta, float* __restrict__ g_cum,
+    unsigned int T_in, unsigned int T_pad, unsigned int num_v, unsigned int n_rep,
+    unsigned int key_dim, float q_scale, float eps) {
+  const unsigned int CS = 64, HD = 128, LD = 129;
+  __shared__ float rows[64 * 129];
+  __shared__ float g_sm[64], gc_sm[64], beta_sm[64], inv_sm[64];
+
+  const unsigned int hi = blockIdx.x;
+  const unsigned int c = blockIdx.y;
+  const unsigned int tid = threadIdx.x;   // 0..127
+  const unsigned int h_in = hi / n_rep;
+  const unsigned int conv_dim = 2u * key_dim + num_v * HD;
+  const unsigned int t0 = c * CS;
+
+  // g, β (как prep_scatter), затем cumsum одним потоком (как cumsum_lastdim).
+  if (tid < CS) {
+    unsigned int t = t0 + tid;
+    float g = 0.0f, be = 0.0f;
+    if (t < T_in) {
+      float bv = __half2float(b_f16[t * num_v + hi]);
+      be = 1.0f / (1.0f + __expf(-bv));
+      float av = __half2float(a_f16[t * num_v + hi]);
+      float dt = av + dt_bias[hi];
+      float softplus_dt = __logf(1.0f + __expf(dt));
+      float a_log_neg_exp = -__expf(a_log[hi]);
+      g = softplus_dt * a_log_neg_exp;
+    }
+    g_sm[tid] = g;
+    beta_sm[tid] = be;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < CS; ++i) {
+      acc += g_sm[i];
+      gc_sm[i] = acc;
+    }
+  }
+  __syncthreads();
+  const unsigned long long row0 = (unsigned long long)hi * T_pad + t0;
+  if (tid < CS) g_cum[row0 + tid] = gc_sm[tid];
+  const float g_last = gc_sm[CS - 1];
+
+  // ── Q: строки чанка в shared, норма строки — одним потоком по порядку d.
+  for (unsigned int r = 0; r < CS; ++r) {
+    unsigned int t = t0 + r;
+    rows[r * LD + tid] = (t < T_in) ? gp_ld(post_conv + (unsigned long long)t * conv_dim + h_in * HD + tid) : 0.0f;
+  }
+  __syncthreads();
+  if (tid < CS) {
+    float ss = 0.0f;
+    for (unsigned int d = 0; d < HD; ++d) {
+      float v = rows[tid * LD + d];
+      ss += v * v;
+    }
+    inv_sm[tid] = rsqrtf(ss + eps) * q_scale;
+  }
+  __syncthreads();
+  for (unsigned int r = 0; r < CS; ++r) {
+    unsigned long long o = (row0 + r) * HD + tid;
+    float qn = rows[r * LD + tid] * inv_sm[r];
+    q_n[o] = qn;
+    q_sc[o] = qn * __expf(gc_sm[r]);
+  }
+  __syncthreads();
+
+  // ── K: k_n, k·β, kβ·e^g, k·e^(g_last−g).
+  for (unsigned int r = 0; r < CS; ++r) {
+    unsigned int t = t0 + r;
+    rows[r * LD + tid] = (t < T_in) ? gp_ld(post_conv + (unsigned long long)t * conv_dim + key_dim + h_in * HD + tid) : 0.0f;
+  }
+  __syncthreads();
+  if (tid < CS) {
+    float ss = 0.0f;
+    for (unsigned int d = 0; d < HD; ++d) {
+      float v = rows[tid * LD + d];
+      ss += v * v;
+    }
+    inv_sm[tid] = rsqrtf(ss + eps) * 1.0f;
+  }
+  __syncthreads();
+  for (unsigned int r = 0; r < CS; ++r) {
+    unsigned long long o = (row0 + r) * HD + tid;
+    float kn = rows[r * LD + tid] * inv_sm[r];
+    float kb = kn * beta_sm[r];
+    k_n[o] = kn;
+    k_beta[o] = kb;
+    kcdi[o] = kb * __expf(gc_sm[r]);
+    k_dec[o] = kn * __expf(g_last - gc_sm[r]);
+  }
+
+  // ── V: v·β прямо из post_conv.
+  for (unsigned int r = 0; r < CS; ++r) {
+    unsigned int t = t0 + r;
+    float v = (t < T_in) ? gp_ld(post_conv + (unsigned long long)t * conv_dim + 2u * key_dim + hi * HD + tid) : 0.0f;
+    v_beta[(row0 + r) * HD + tid] = v * beta_sm[r];
+  }
+}
+
+#define GDN_PREP_FUSED(NAME, T) \
+extern "C" __global__ void __launch_bounds__(128) NAME( \
+    const T* post_conv, const __half* b_f16, const __half* a_f16, \
+    const float* dt_bias, const float* a_log, \
+    float* q_n, float* q_sc, float* k_n, float* k_beta, float* kcdi, float* k_dec, \
+    float* v_beta, float* g_cum, \
+    unsigned int T_in, unsigned int T_pad, unsigned int num_v, unsigned int n_rep, \
+    unsigned int key_dim, float q_scale, float eps) { \
+  gdn_prep_fused_impl<T>(post_conv, b_f16, a_f16, dt_bias, a_log, q_n, q_sc, k_n, k_beta, \
+      kcdi, k_dec, v_beta, g_cum, T_in, T_pad, num_v, n_rep, key_dim, q_scale, eps); \
+}
+GDN_PREP_FUSED(gdn_prep_fused_f16, __half)
+GDN_PREP_FUSED(gdn_prep_fused_bf16, __nv_bfloat16)
+GDN_PREP_FUSED(gdn_prep_fused_f32, float)

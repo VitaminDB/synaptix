@@ -36,6 +36,21 @@ pub struct ChunkFlaKernels {
     gdn_chunk_scan: CudaFunction,
     mul_inplace: CudaFunction,
     state_decay_from_gcumsum_chunk: CudaFunction,
+    gdn_prep_fused_f16: CudaFunction,
+    gdn_prep_fused_bf16: CudaFunction,
+    gdn_prep_fused_f32: CudaFunction,
+}
+
+/// Выходы слитой подготовки чанк-скана (`gdn_prep_fused`), все (BH, T_pad, ·) F32.
+pub struct GdnPrepBufs<'a> {
+    pub q_n: &'a mut CudaSlice<f32>,
+    pub q_sc: &'a mut CudaSlice<f32>,
+    pub k_n: &'a mut CudaSlice<f32>,
+    pub k_beta: &'a mut CudaSlice<f32>,
+    pub kcdi: &'a mut CudaSlice<f32>,
+    pub k_dec: &'a mut CudaSlice<f32>,
+    pub v_beta: &'a mut CudaSlice<f32>,
+    pub g_cum: &'a mut CudaSlice<f32>,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<ChunkFlaKernels>)>>> = OnceLock::new();
@@ -69,6 +84,9 @@ impl ChunkFlaKernels {
             gdn_chunk_scan: load_fn(&module, "gdn_chunk_scan_f32")?,
             mul_inplace: load_fn(&module, "mul_inplace_f32")?,
             state_decay_from_gcumsum_chunk: load_fn(&module, "state_decay_from_gcumsum_chunk_f32")?,
+            gdn_prep_fused_f16: load_fn(&module, "gdn_prep_fused_f16")?,
+            gdn_prep_fused_bf16: load_fn(&module, "gdn_prep_fused_bf16")?,
+            gdn_prep_fused_f32: load_fn(&module, "gdn_prep_fused_f32")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -335,6 +353,68 @@ impl ChunkFlaKernels {
     /// `k_decayed = k[:, ci, :, :] * exp(g_last - g_cumsum[:, ci, :])`.
     /// k `(BH,NC,CS,HK)`, g_cumsum `(BH,NC,CS)`, k_decayed_out `(BH,CS,HK)`.
     #[allow(clippy::too_many_arguments)]
+    /// Формы слитой подготовки (`gdn_prep_fused`): CS=64, HK=HV=128.
+    pub fn prep_fused_fits(cs: u32, hk: u32, hv: u32) -> bool {
+        cs == 64 && hk == 128 && hv == 128
+    }
+
+    /// Вся подготовка чанк-скана одним запуском: g/β, нормы q и k, k·β, v·β,
+    /// cumsum g и множители e^g (см. `gdn_prep_fused_impl` в chunk_fla.cu).
+    /// `post_conv` — `[T_in, conv_dim]` (Q|K|V) типа `dtype` (F16/BF16/F32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_prep_fused<T: cudarc::driver::DeviceRepr>(
+        &self,
+        stream: &Arc<CudaStream>,
+        dtype: synaptix_core::dtype::DType,
+        post_conv: &cudarc::driver::CudaView<'_, T>,
+        b: &cudarc::driver::CudaView<'_, half::f16>,
+        a: &cudarc::driver::CudaView<'_, half::f16>,
+        dt_bias: &cudarc::driver::CudaView<'_, f32>,
+        a_log: &cudarc::driver::CudaView<'_, f32>,
+        o: GdnPrepBufs<'_>,
+        t_in: u32,
+        t_pad: u32,
+        num_v: u32,
+        n_rep: u32,
+        key_dim: u32,
+        q_scale: f32,
+    ) -> Result<()> {
+        use synaptix_core::dtype::DType;
+        let f = match dtype {
+            DType::F16 => &self.gdn_prep_fused_f16,
+            DType::BF16 => &self.gdn_prep_fused_bf16,
+            DType::F32 => &self.gdn_prep_fused_f32,
+            other => return Err(SynaptixError::Cuda(format!("gdn_prep_fused: dtype {other:?}"))),
+        };
+        let cfg = LaunchConfig { grid_dim: (num_v, t_pad / 64, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let eps: f32 = 1e-6;
+        let mut bld = stream.launch_builder(f);
+        bld.arg(post_conv)
+            .arg(b)
+            .arg(a)
+            .arg(dt_bias)
+            .arg(a_log)
+            .arg(o.q_n)
+            .arg(o.q_sc)
+            .arg(o.k_n)
+            .arg(o.k_beta)
+            .arg(o.kcdi)
+            .arg(o.k_dec)
+            .arg(o.v_beta)
+            .arg(o.g_cum)
+            .arg(&t_in)
+            .arg(&t_pad)
+            .arg(&num_v)
+            .arg(&n_rep)
+            .arg(&key_dim)
+            .arg(&q_scale)
+            .arg(&eps);
+        unsafe {
+            bld.launch(cfg).map_err(|e| SynaptixError::Cuda(format!("launch gdn_prep_fused: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     /// Формы, на которые рассчитан слитый цикл чанк-скана.
     pub fn chunk_scan_fits(cs: u32, hk: u32, hv: u32) -> bool {
         cs == 64 && hk == 128 && hv % GCS_TILE == 0

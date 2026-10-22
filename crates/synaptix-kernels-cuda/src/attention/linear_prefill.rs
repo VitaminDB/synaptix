@@ -28,8 +28,14 @@ use crate::attention::linear_attn_raw::LinearAttnRawKernels;
 use crate::conv::causal_conv1d::{
     causal_conv1d_chunk_bf16, causal_conv1d_chunk_f16, causal_conv1d_chunk_f32, CausalConv1dKernels,
 };
-use crate::scan::chunk_scan::{chunk_gated_delta_rule, ChunkScanKernels};
+use crate::scan::chunk_scan::{chunk_gated_delta_rule, chunk_gated_delta_rule_prepped, ChunkScanKernels};
 use crate::wsalloc::WsBuf;
+
+/// Слитая подготовка чанк-скана; `SYN_GDN_PREP_FUSED=0` — прежняя цепочка
+/// ядер (A/B-сравнения, тесты побитового совпадения).
+fn fused_prep_on() -> bool {
+    std::env::var("SYN_GDN_PREP_FUSED").as_deref() != Ok("0")
+}
 
 fn tm<T>() -> usize {
     std::mem::size_of::<T>()
@@ -134,6 +140,16 @@ pub fn linear_attn_chunk_prefill_u8_dev(
             "linear_prefill: t_pad={t_pad} not divisible by chunk_size={chunk_size}"
         )));
     }
+    // CS=64, HK=HV=128 — подготовка скана одним слитым ядром прямо из выхода
+    // свёртки (без qe/ke/vv/g/β и шести проходов по ним).
+    if fused_prep_on() && ChunkFlaKernels::prep_fused_fits(chunk_size, hk, hv) && ChunkFlaKernels::chunk_scan_fits(chunk_size, hk, hv) {
+        return linear_attn_chunk_prefill_fused(
+            conv_kernels, cfk, csk, stream, qkv, conv_w, a, b_in, dt_bias, a_log, conv_state,
+            conv_state_off, ssm_state, ssm_state_off, out, out_off, compute_dtype, num_k, num_v, hk,
+            hv, conv_kernel, t_in, t_pad, chunk_size, q_scale, silu,
+        );
+    }
+    let _ = &prep_kernels;
     let n_rep = num_v / num_k;
     let key_dim = num_k * hk;
     let value_dim = num_v * hv;
@@ -450,6 +466,148 @@ pub fn linear_attn_chunk_prefill_u8_dev(
                 .transmute_mut::<f32>(n_out)
                 .ok_or_else(|| cerr("out out"))?
         };
+        stream
+            .memcpy_dtod(&*out_o, &mut out_f)
+            .map_err(|e| SynaptixError::Cuda(format!("linear_prefill memcpy out: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Как [`linear_attn_chunk_prefill_u8_dev`] для форм слитой подготовки
+/// (CS=64, HK=HV=128): свёртка → `gdn_prep_fused` → чанк-скан.
+#[allow(clippy::too_many_arguments)]
+fn linear_attn_chunk_prefill_fused(
+    conv_kernels: &CausalConv1dKernels,
+    cfk: &ChunkFlaKernels,
+    csk: &ChunkScanKernels,
+    stream: &Arc<CudaStream>,
+    qkv: (&CudaSlice<u8>, usize),
+    conv_w: (&CudaSlice<u8>, usize),
+    a: (&CudaSlice<u8>, usize),
+    b_in: (&CudaSlice<u8>, usize),
+    dt_bias: (&CudaSlice<u8>, usize),
+    a_log: (&CudaSlice<u8>, usize),
+    conv_state: &mut CudaSlice<u8>,
+    conv_state_off: usize,
+    ssm_state: &mut CudaSlice<u8>,
+    ssm_state_off: usize,
+    out: &mut CudaSlice<u8>,
+    out_off: usize,
+    compute_dtype: DType,
+    num_k: u32,
+    num_v: u32,
+    hk: u32,
+    hv: u32,
+    conv_kernel: u32,
+    t_in: u32,
+    t_pad: u32,
+    chunk_size: u32,
+    q_scale: f32,
+    silu: bool,
+) -> Result<()> {
+    let n_rep = num_v / num_k;
+    let key_dim = num_k * hk;
+    let conv_dim = key_dim * 2 + num_v * hv;
+    let t = t_in as usize;
+    let cd = conv_dim as usize;
+    let state_rows = (conv_kernel as usize).saturating_sub(1);
+    let conv_w_len = cd * conv_kernel as usize;
+    let aerr = |what: &str, e: cudarc::driver::DriverError| {
+        SynaptixError::Cuda(format!("linear_prefill alloc {what}: {e:?}"))
+    };
+    let cerr = |what: &str| SynaptixError::Cuda(format!("linear_prefill transmute {what}"));
+    let ord = stream.context().ordinal();
+    let cache = WS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock();
+    let ws: &mut PrefillWs = guard.entry(ord).or_default();
+
+    let a_v = unsafe {
+        a.0.slice(a.1..a.1 + t * num_v as usize * tm::<f16>())
+            .transmute::<f16>(t * num_v as usize)
+            .ok_or_else(|| cerr("a"))?
+    };
+    let b_v = unsafe {
+        b_in.0
+            .slice(b_in.1..b_in.1 + t * num_v as usize * tm::<f16>())
+            .transmute::<f16>(t * num_v as usize)
+            .ok_or_else(|| cerr("b"))?
+    };
+    let dt_v = unsafe {
+        dt_bias.0
+            .slice(dt_bias.1..dt_bias.1 + num_v as usize * tm::<f32>())
+            .transmute::<f32>(num_v as usize)
+            .ok_or_else(|| cerr("dt_bias"))?
+    };
+    let al_v = unsafe {
+        a_log.0
+            .slice(a_log.1..a_log.1 + num_v as usize * tm::<f32>())
+            .transmute::<f32>(num_v as usize)
+            .ok_or_else(|| cerr("a_log"))?
+    };
+
+    let n_state = (num_v * hk * hv) as usize;
+    let n_out = (num_v * t_pad * hv) as usize;
+    // Состояние копируется целиком, выход скан пишет целиком — без memset.
+    let state_o = ws.state_o.fit(stream, n_state).map_err(|e| aerr("ssm_state owned", e))?;
+    let out_o = ws.out_o.fit(stream, n_out).map_err(|e| aerr("out owned", e))?;
+    {
+        let ss_s_v = ssm_state.slice(ssm_state_off..ssm_state_off + n_state * tm::<f32>());
+        let ss_f = unsafe { ss_s_v.transmute::<f32>(n_state).ok_or_else(|| cerr("ssm_state in"))? };
+        stream
+            .memcpy_dtod(&ss_f, &mut *state_o)
+            .map_err(|e| SynaptixError::Cuda(format!("linear_prefill memcpy ss in: {e:?}")))?;
+    }
+
+    macro_rules! arm {
+        ($ty:ty, $buf:ident, $conv:ident) => {{
+            let qkv_v = unsafe {
+                qkv.0
+                    .slice(qkv.1..qkv.1 + t * cd * tm::<$ty>())
+                    .transmute::<$ty>(t * cd)
+                    .ok_or_else(|| cerr("qkv"))?
+            };
+            let w_v = unsafe {
+                conv_w.0
+                    .slice(conv_w.1..conv_w.1 + conv_w_len * tm::<$ty>())
+                    .transmute::<$ty>(conv_w_len)
+                    .ok_or_else(|| cerr("conv_w"))?
+            };
+            let mut cs_s = conv_state.slice_mut(conv_state_off..conv_state_off + state_rows * cd * tm::<$ty>());
+            let mut cs_v = unsafe {
+                cs_s.transmute_mut::<$ty>(state_rows * cd).ok_or_else(|| cerr("conv_state"))?
+            };
+            let post_conv = ws.$buf.fit(stream, t * cd).map_err(|e| aerr("post_conv", e))?;
+            {
+                let mut post_conv_v = post_conv.as_view_mut();
+                $conv(conv_kernels, stream, &qkv_v, &mut cs_v, &w_v, &mut post_conv_v, t_in, conv_dim, conv_kernel, silu)?;
+            }
+            let pc = post_conv.as_view();
+            chunk_gated_delta_rule_prepped(cfk, csk, stream, &mut *state_o, &mut *out_o, num_v, t_pad, hk, hv, chunk_size, |bufs| {
+                cfk.gdn_prep_fused(stream, compute_dtype, &pc, &b_v, &a_v, &dt_v, &al_v, bufs, t_in, t_pad, num_v, n_rep, key_dim, q_scale)
+            })?;
+        }};
+    }
+    match compute_dtype {
+        DType::F16 => arm!(f16, post_conv_f16, causal_conv1d_chunk_f16),
+        DType::BF16 => arm!(bf16, post_conv_bf16, causal_conv1d_chunk_bf16),
+        DType::F32 => arm!(f32, post_conv_f32, causal_conv1d_chunk_f32),
+        other => {
+            return Err(SynaptixError::Cuda(format!(
+                "linear_prefill: compute_dtype {other:?} not supported (F32/F16/BF16)"
+            )))
+        }
+    }
+
+    {
+        let mut ss_s = ssm_state.slice_mut(ssm_state_off..ssm_state_off + n_state * tm::<f32>());
+        let mut ss_f = unsafe { ss_s.transmute_mut::<f32>(n_state).ok_or_else(|| cerr("ssm_state out"))? };
+        stream
+            .memcpy_dtod(&*state_o, &mut ss_f)
+            .map_err(|e| SynaptixError::Cuda(format!("linear_prefill memcpy ss out: {e:?}")))?;
+    }
+    {
+        let mut out_s = out.slice_mut(out_off..out_off + n_out * tm::<f32>());
+        let mut out_f = unsafe { out_s.transmute_mut::<f32>(n_out).ok_or_else(|| cerr("out out"))? };
         stream
             .memcpy_dtod(&*out_o, &mut out_f)
             .map_err(|e| SynaptixError::Cuda(format!("linear_prefill memcpy out: {e:?}")))?;
