@@ -55,10 +55,12 @@ fn mrope_enabled() -> bool {
     std::env::var("SYN_HYBRID_MROPE").map(|v| v != "0").unwrap_or(true)
 }
 
-/// Дефолтный chunk префилла гибрида. Ограничивает пик VRAM активаций
-/// (single-shot M>=512 не влезает в 24 ГБ поверх ~18 ГБ весов) при скорости
-/// ~1.6k ток/с (M=256 уже насыщает NVFP4-GEMM'ы).
-pub const DEFAULT_PREFILL_CHUNK: usize = 256;
+/// Дефолтный chunk префилла гибрида. Крупный кусок окупается на длинном
+/// контексте: блоки, отданные хосту, едут по PCIe один раз на кусок, а ядра
+/// внимания и GDN работают на полной сетке (Qwen3.8-27B, 128К: 237 → 147 с
+/// против куска 256). Активации куска (~0.6 МБ на токен у 27B) планирует
+/// `fit_vram` фасада через [`HybridPipeline::prefill_act_bytes`].
+pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 
 /// Границы чанков ОБЯЗАНЫ быть кратны CS=64 GDN-скана: не-кратный разрез
 /// mid-stream оставляет состояние частичного внутреннего чанка, расходящееся
@@ -68,7 +70,7 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 256;
 /// возврата префикс-KV обязаны быть кратны ему.
 pub const GDN_CHUNK: usize = 64;
 
-fn effective_prefill_chunk(requested: usize) -> usize {
+pub fn effective_prefill_chunk(requested: usize) -> usize {
     // `SYN_PREFILL_CHUNK` перебивает и запрос вызывающего — knob для замеров
     // «пик VRAM / скорость» без пересборки хоста.
     static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -208,6 +210,16 @@ fn trace_prefill_mem(device: Device, off: usize, total: usize) {
 }
 
 impl HybridPipeline {
+    /// Пик активаций префилла `tokens` новых токенов сверх весов и KV:
+    /// (байт, кусок). Кусок ограничивает пик — дальше он не растёт.
+    /// Оценка по замеру Qwen3.8-27B: ~0.6 МБ на токен куска при
+    /// hidden + intermediate = 22.5К (прогоны 30К с куском 256 и 2048).
+    pub fn prefill_act_bytes(&self, tokens: usize, requested_chunk: usize) -> (usize, usize) {
+        let chunk = effective_prefill_chunk(requested_chunk);
+        let per_token = (self.model.config.hidden_size + self.model.config.intermediate_size) * 28;
+        (tokens.min(chunk) * per_token, chunk)
+    }
+
     pub fn load(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
         // Веса — в default-пул, отдельно от пула активаций (иначе free-list
         // одного пула деградирует за длинный префилл, см.

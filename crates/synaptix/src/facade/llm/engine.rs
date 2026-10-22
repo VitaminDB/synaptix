@@ -574,6 +574,15 @@ impl LlmPipeline {
         }
     }
 
+    /// Пик активаций префилла `tokens` новых токенов и кусок, которым он
+    /// идёт; (0, 0) — архитектура оценки не даёт (хватает общего запаса).
+    fn prefill_act_bytes(&self, tokens: usize) -> (usize, usize) {
+        match self {
+            Self::Hybrid(p) => p.prefill_act_bytes(tokens, prefill_chunk_size()),
+            _ => (0, 0),
+        }
+    }
+
     fn block_bytes_max(&self) -> usize {
         match self {
             Self::Qwen3(p) => p.model.block_bytes_max(),
@@ -1171,6 +1180,14 @@ pub struct Llm {
     compute_dtype: DType,
     /// Настройки генерации этой модели (поверх общих флагов процесса).
     runtime: Mutex<RuntimeOptions>,
+    /// Запас видеопамяти сверх оценки, выученный на ходах, упавших по памяти
+    /// (`shed_blocks`): без него `fit_vram` следующего хода вернул бы
+    /// отданные блоки на карту, и ход падал бы снова — по кругу.
+    learned_reserve: std::sync::atomic::AtomicUsize,
+    /// То же для активаций префилла — на полный кусок; ход берёт свою долю.
+    learned_act: std::sync::atomic::AtomicUsize,
+    /// Новых токенов у последнего спланированного хода (кому приписать OOM).
+    last_prefill: std::sync::atomic::AtomicUsize,
 }
 
 impl Llm {
@@ -1263,7 +1280,7 @@ impl Llm {
         max_new: usize,
     ) -> Result<Option<LlmKvSession>, LlmError> {
         let _runtime = self.runtime_scope();
-        self.fit_vram(self.kv_session_bytes(ctx_tokens));
+        self.fit_vram(self.kv_session_bytes(ctx_tokens), 0);
         let pipeline = self
             .pipeline
             .lock()
@@ -1368,7 +1385,7 @@ impl Llm {
             return Ok(());
         }
         let _runtime = self.runtime_scope();
-        self.fit_vram(self.kv_session_bytes(ctx_tokens).saturating_sub(session.device_bytes()));
+        self.fit_vram(self.kv_session_bytes(ctx_tokens).saturating_sub(session.device_bytes()), 0);
         let pipeline = self
             .pipeline
             .lock()
@@ -1456,7 +1473,7 @@ impl Llm {
     ///
     /// Явно выбранный «всегда резидент» (`SYN_OFFLOAD=resident`) не трогаем.
     /// Возвращает число блоков на карте после подгонки.
-    pub fn fit_vram(&self, extra: usize) -> Option<usize> {
+    pub fn fit_vram(&self, extra: usize, prefill_tokens: usize) -> Option<usize> {
         use synaptix_llm_common::model::{offload_mode, OffloadMode};
         let Device::Cuda(ord) = self.device else { return None };
         if offload_mode() == OffloadMode::Resident {
@@ -1467,7 +1484,15 @@ impl Llm {
         if blk == 0 || total == 0 {
             return Some(resident);
         }
-        let need = extra + vram_turn_reserve();
+        // Активации префилла растут с куском; выученная добавка — тоже про
+        // них, поэтому и она — в долю куска: короткий ход (декод, пара сотен
+        // новых токенов) не держит ради неё блоки на хосте.
+        let (act, chunk) = self.pipeline.lock().map(|p| p.prefill_act_bytes(prefill_tokens)).unwrap_or((0, 0));
+        use std::sync::atomic::Ordering::Relaxed;
+        self.last_prefill.store(prefill_tokens, Relaxed);
+        let learned_act = self.learned_act.load(Relaxed);
+        let learned_act = if chunk == 0 { learned_act } else { learned_act * prefill_tokens.min(chunk) / chunk };
+        let need = extra + vram_turn_reserve() + act + learned_act + self.learned_reserve.load(Relaxed);
         // Блоку с хоста нужен буфер на карте, и следующий едет, пока
         // считается текущий: при частичном оффлоаде — ещё два блока сверху.
         let blk_max = self.pipeline.lock().map(|p| p.block_bytes_max()).unwrap_or(blk).max(blk);
@@ -1519,6 +1544,20 @@ impl Llm {
         }
         let want = resident.saturating_sub((resident / 8).max(2));
         let got = self.set_block_residency(want).unwrap_or(resident);
+        // Оценке не хватило ровно отданного: дальше планируем с ним. Упал
+        // длинный префилл — недооценены активации куска (в долю куска для
+        // следующих ходов), иначе — общий запас.
+        if let Some((blk, _)) = self.block_offload_shape() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let shed = resident.saturating_sub(got) * blk;
+            let n = self.last_prefill.load(Relaxed);
+            let (_, chunk) = self.pipeline.lock().map(|p| p.prefill_act_bytes(n)).unwrap_or((0, 0));
+            if chunk > 0 && n.min(chunk) * 2 >= chunk {
+                self.learned_act.fetch_add(shed * chunk / n.min(chunk), Relaxed);
+            } else {
+                self.learned_reserve.fetch_add(shed, Relaxed);
+            }
+        }
         let _ = synaptix_core::device::cuda::synchronize_all(ord);
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
         eprintln!("[synaptix] VRAM: ход упёрся в память — блоков на карте {resident} → {got}");
@@ -1852,7 +1891,7 @@ impl<'a> LlmGeneration<'a> {
     {
         let _runtime = self.model.runtime_scope();
         let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
-        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens));
+        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens), prompt_ids.len());
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
@@ -1916,7 +1955,8 @@ impl<'a> LlmGeneration<'a> {
         // device mismatch посреди forward'а.
         self.model.sync_session_lora(session);
         let parked = if session.is_parked() { self.model.kv_session_bytes(session.ctx_tokens) } else { 0 };
-        self.model.fit_vram(parked);
+        let fresh = prompt_ids.len().saturating_sub(session.reusable(prompt_ids));
+        self.model.fit_vram(parked, fresh);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2286,7 +2326,8 @@ impl<'a> LlmGeneration<'a> {
         let _runtime = self.model.runtime_scope();
         self.model.sync_session_lora(session);
         let parked = if session.is_parked() { self.model.kv_session_bytes(session.ctx_tokens) } else { 0 };
-        self.model.fit_vram(parked);
+        let fresh = prompt_ids.len().saturating_sub(session.reusable(prompt_ids));
+        self.model.fit_vram(parked, fresh);
         if session.is_parked() {
             session.unpark_to(self.model.device)?;
         }
@@ -2481,7 +2522,7 @@ impl<'a> LlmGeneration<'a> {
             return Err(LlmError("generate_streaming_media без вложений".into()));
         }
         let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
-        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens));
+        self.model.fit_vram(self.model.kv_session_bytes(kv_tokens), prompt_ids.len());
 
         let cfg = GenerationConfig {
             max_new_tokens: self.opts.max_new_tokens,
@@ -2893,6 +2934,9 @@ fn build_facade(
         model_path: path.to_path_buf(),
         compute_dtype,
         runtime: Mutex::new(RuntimeOptions::current()),
+        learned_reserve: std::sync::atomic::AtomicUsize::new(0),
+        learned_act: std::sync::atomic::AtomicUsize::new(0),
+        last_prefill: std::sync::atomic::AtomicUsize::new(0),
     };
     let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids };
     Ok((model, tok))

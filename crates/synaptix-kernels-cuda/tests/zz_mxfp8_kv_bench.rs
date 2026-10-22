@@ -27,7 +27,7 @@ fn bench(t_q: usize, t_kv: usize, label: &str) {
     let dev = Device::Cuda(0);
     let (b, nh, nkv, hd) = (1usize, 24usize, 4usize, 256usize);
     let nb = hd / 32;
-    let max_seq = 57344usize; // реальный KV-ринг из панели synthos
+    let max_seq = 57344usize.max(t_kv); // реальный KV-ринг из панели synthos
     let scale = 1.0 / (hd as f32).sqrt();
 
     let q = Tensor::from_vec(det(11, b * nh * t_q * hd, 1.0), vec![b, nh, t_q, hd], dev).unwrap();
@@ -103,4 +103,13 @@ fn bench_prefill_tq256_24k() {
 #[ignore]
 fn bench_prefill_tq256_47k() {
     bench(256, 47000, "prefill");
+}
+
+// Произвольная форма: BENCH_TQ / BENCH_TKV (по умолчанию префилл 256 на 128К).
+#[test]
+#[ignore]
+fn bench_env() {
+    let tq = std::env::var("BENCH_TQ").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let tkv = std::env::var("BENCH_TKV").ok().and_then(|v| v.parse().ok()).unwrap_or(131072);
+    bench(tq, tkv, "env");
 }
