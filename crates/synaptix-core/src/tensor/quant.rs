@@ -458,7 +458,10 @@ impl QuantWeight {
             .packed_arc()
             .ok_or(SynaptixError::Unsupported("ensure_shuffled: packed освобождён"))?;
         let stream = Stream::default_for(self.device)?;
-        let bytes = DType::NVFP4.bytes_for_numel(self.n * self.k);
+        // Только данные: repack пишет N·K/2 байт, масштабы остаются в
+        // `scales`. `bytes_for_numel` считает и их — лишняя девятая часть
+        // каждого NVFP4-веса (1 ГБ у Qwen3.8-27B) лежала на карте пустой.
+        let bytes = self.n * self.k / 2;
         // Перемешанная копия — это вес, а не активация: в общем пуле она дробит
         // free-list, из которого потом нечем выделить крупный буфер. У эксперта
         // MoE пул свой — он вытесняется вместе с ним.
