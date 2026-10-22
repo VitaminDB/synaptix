@@ -5890,15 +5890,17 @@ impl Backend for CudaBackend {
                 );
             }
         }
-        // Prefill (Tq>8) + hd∈{128,256}: сперва split-Q v2 (схема flash_splitq
-        // с деквант-fill, sm_120a), фолбэк — старый WMMA-путь (BM=16, серийный
-        // softmax; на 47k давал 135 мс/слой против ~0,5 мс у split-Q).
+        // Prefill (Tq>8) + hd∈{128,256}: split-Q с cp.async-подвозом сырых
+        // тайлов и f16-деквантом в smem; фолбэк — старый WMMA-путь (BM=16,
+        // серийный softmax; на 47k давал 135 мс/слой против ~0,5 мс у split-Q).
         if t_q > 1
             && crate::attention::flash_mxfp8_splitq::splitq_shape_ok(
                 d as u32,
                 q_dtype,
                 k_lo.byte_offset(),
                 v_lo.byte_offset(),
+                ks_lo.byte_offset(),
+                vs_lo.byte_offset(),
             )
         {
             if let Some(k2) =

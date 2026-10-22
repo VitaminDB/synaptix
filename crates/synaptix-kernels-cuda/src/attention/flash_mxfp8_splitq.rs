@@ -1,16 +1,18 @@
-//! MXFP8-KV prefill v2 (sm_80+): схема flash_splitq (FA-2 split-Q,
-//! mma.sync.m16n8k16, online softmax в регистрах) с деквант-fill E4M3+E8M0 →
-//! T прямо в smem аппаратным cvt (см. `flash_mxfp8_splitq.cu`). Заменяет
-//! структурно медленный `flash_mxfp8_prefill` (BM=16, серийный softmax).
+//! MXFP8-KV prefill (sm_80+): FA-2 split-Q (mma.sync.m16n8k16, online
+//! softmax в регистрах); сырые E4M3+E8M0 следующего тайла едут cp.async,
+//! деквант smem → f16 smem (cvt + hmul2), P·V тайла — с f16-накоплением
+//! (см. `flash_mxfp8_splitq.cu`). Заменяет структурно медленный
+//! `flash_mxfp8_prefill` (BM=16, серийный softmax).
 //!
-//! cvt E4M3 → f16 аппаратный с sm_89 (Ada), на sm_80/86 NVRTC эмулирует его
-//! (проверено `SYN_FORCE_ARCH=sm_89/sm_86`). Если модуль всё же не собрался,
-//! [`FlashMxfp8SplitqKernels::try_for_context`] возвращает `None`, диспетчер
-//! остаётся на WMMA-пути. Ограничения: HD ∈ {128,256}, q/out — F16/BF16,
-//! k/v-байты выровнены на 16 (uint4-загрузки).
+//! cvt E4M3 → f16 аппаратный с sm_89 (Ada), на sm_80/86 NVRTC эмулирует его.
+//! Если модуль всё же не собрался, [`FlashMxfp8SplitqKernels::try_for_context`]
+//! возвращает `None`, диспетчер остаётся на WMMA-пути. Ограничения:
+//! HD ∈ {128,256}, q/out — F16/BF16, k/v-байты выровнены на 16, скейлы — на 4
+//! (cp.async).
 
 use std::sync::{Arc, OnceLock};
 
+use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -63,11 +65,21 @@ impl FlashMxfp8SplitqKernels {
         let src = include_str!("../cu/fused/attention/flash_mxfp8_splitq.cu");
         let module =
             compile_module_with_opts(ctx, src, "flash_mxfp8_splitq.cu", &[], None)?;
+        // HD=256 берёт 49.7 КБ smem — больше 48 КБ по умолчанию.
+        let load = |name: &str, d: u32| -> Result<CudaFunction> {
+            let f = load_fn(&module, name)?;
+            f.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem_bytes(d) as i32,
+            )
+            .map_err(|e| SynaptixError::Cuda(format!("set_attr {name}: {e:?}")))?;
+            Ok(f)
+        };
         Ok(Arc::new(Self {
-            f16_hd128: load_fn(&module, "flash_mxfp8_splitq_f16_hd128")?,
-            f16_hd256: load_fn(&module, "flash_mxfp8_splitq_f16_hd256")?,
-            bf16_hd128: load_fn(&module, "flash_mxfp8_splitq_bf16_hd128")?,
-            bf16_hd256: load_fn(&module, "flash_mxfp8_splitq_bf16_hd256")?,
+            f16_hd128: load("flash_mxfp8_splitq_f16_hd128", 128)?,
+            f16_hd256: load("flash_mxfp8_splitq_f16_hd256", 256)?,
+            bf16_hd128: load("flash_mxfp8_splitq_bf16_hd128", 128)?,
+            bf16_hd256: load("flash_mxfp8_splitq_bf16_hd256", 256)?,
             _module: module,
         }))
     }
@@ -87,12 +99,26 @@ impl FlashMxfp8SplitqKernels {
     }
 }
 
+/// smem блока: f16-тайлы K и V (BN×HD), сырые E4M3 K и V, скейлы E8M0.
+fn smem_bytes(d: u32) -> u32 {
+    BN * d * 2 * 2 + BN * d * 2 + 2 * BN * (d / 32)
+}
+
 /// Пригодность формы/типов (без учёта того, собрался ли модуль).
-pub fn splitq_shape_ok(d: u32, q_dtype: DType, k_off: usize, v_off: usize) -> bool {
+pub fn splitq_shape_ok(
+    d: u32,
+    q_dtype: DType,
+    k_off: usize,
+    v_off: usize,
+    ks_off: usize,
+    vs_off: usize,
+) -> bool {
     (d == 128 || d == 256)
         && matches!(q_dtype, DType::F16 | DType::BF16)
         && k_off % 16 == 0
         && v_off % 16 == 0
+        && ks_off % 4 == 0
+        && vs_off % 4 == 0
 }
 
 /// MXFP8-KV prefill (split-Q tensor-core) из untyped storage — сигнатура
@@ -133,8 +159,7 @@ pub fn flash_mxfp8_splitq_u8(
         )));
     }
     let func = kernels.pick(q_dtype, d)?;
-    // KV-строки в smem с паддингом +8 эл. (ldmatrix-банки), T = 2 байта.
-    let smem = 2 * BN * (d + 8) * 2;
+    let smem = smem_bytes(d);
     let cfg = LaunchConfig {
         grid_dim: (t_q.div_ceil(BM), b * nh, 1),
         block_dim: (THREADS, 1, 1),
