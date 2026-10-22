@@ -664,6 +664,30 @@ impl QuantWeight {
 
     /// Адрес перемешанной копии и её масштабов на карте — из них строится
     /// таблица [`ExpertTable`].
+    /// Адреса блоба веса и его масштабов на карте для групповых GEMM
+    /// обучения: исходный блоб, а если его уже нет (NVFP4 оставляет только
+    /// перемешанную копию) — перемешанный; `true` — перемешанная раскладка.
+    /// Адреса годны, пока жив вес.
+    pub fn blob_addrs(&self) -> Option<(u64, u64, bool)> {
+        if !self.device.is_cuda() {
+            return None;
+        }
+        if let Some(packed) = self.packed_arc() {
+            let wa = storage_addr(&packed)?;
+            let sa = match self.scales_opt() {
+                Some(sc) => storage_addr(sc)?,
+                None if matches!(self.dtype, DType::NVFP4 | DType::MXFP8) => return None,
+                None => wa,
+            };
+            return Some((wa, sa, false));
+        }
+        if self.dtype == DType::NVFP4 {
+            let (w, sc) = self.shuffled_addr()?;
+            return Some((w, sc, true));
+        }
+        None
+    }
+
     pub fn shuffled_addr(&self) -> Option<(u64, u64)> {
         let shuf = self.shuffled()?;
         Some((storage_addr(shuf)?, storage_addr(self.scales_opt()?)?))

@@ -473,6 +473,118 @@ pub fn run_train_op(
             let cfg = LaunchConfig { grid_dim: ((dv / 32) as u32, hv as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
             unsafe { b.launch(cfg) }.map_err(launch_err("gdn_bwd"))?;
         }
+        TrainOp::MoeGroupedNt { dtype, shuffled, has_rows } => {
+            let (wt, _) = input(ins, 0, "MoeGroupedNt: w_table")?;
+            let (st, _) = input(ins, 1, "MoeGroupedNt: s_table")?;
+            let (tiles, tl) = input(ins, 2, "MoeGroupedNt: tiles")?;
+            let (x, xl) = input(ins, 3, "MoeGroupedNt: x")?;
+            let rows = if has_rows { Some(input(ins, 4, "MoeGroupedNt: rows")?.0) } else { None };
+            need_outs(1)?;
+            expect_dt(xl, DType::BF16, "MoeGroupedNt: x не BF16")?;
+            expect_dt(&out_layouts[0], DType::BF16, "MoeGroupedNt: y не BF16")?;
+            let kw = *xl.dims().last().unwrap();
+            let nw = *out_layouts[0].dims().last().unwrap();
+            if kw % 64 != 0 || nw % 2 != 0 {
+                return Err(SynaptixError::Unsupported("MoeGroupedNt: K кратно 64, N чётное"));
+            }
+            let n_tiles = tl.numel() / 4;
+            if n_tiles == 0 {
+                return Ok(());
+            }
+            let row_bytes = moe_row_bytes(dtype, kw)?;
+            let f = moe_gg_fn(&ctx, dtype, shuffled, false)?;
+            let (nwi, kwi) = (nw as u32, kw as u32);
+            let null: u64 = 0;
+            let mut b = stream.launch_builder(&f);
+            b.arg(wt).arg(st).arg(tiles).arg(x);
+            match rows {
+                Some(r) => b.arg(r),
+                None => b.arg(&null),
+            };
+            b.arg(&mut *out_bufs[0]).arg(&nwi).arg(&kwi).arg(&row_bytes);
+            let cfg = LaunchConfig { grid_dim: (nwi.div_ceil(64), n_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err("moe_gg_nt"))?;
+        }
+        TrainOp::MoeGroupedNn { dtype, shuffled } => {
+            let (wt, _) = input(ins, 0, "MoeGroupedNn: w_table")?;
+            let (st, _) = input(ins, 1, "MoeGroupedNn: s_table")?;
+            let (tiles, tl) = input(ins, 2, "MoeGroupedNn: tiles")?;
+            let (dy, dyl) = input(ins, 3, "MoeGroupedNn: dy")?;
+            need_outs(1)?;
+            expect_dt(dyl, DType::BF16, "MoeGroupedNn: dy не BF16")?;
+            expect_dt(&out_layouts[0], DType::F32, "MoeGroupedNn: dx не F32")?;
+            let nw = *dyl.dims().last().unwrap();
+            let kw = *out_layouts[0].dims().last().unwrap();
+            if kw % 64 != 0 || nw % 8 != 0 {
+                return Err(SynaptixError::Unsupported("MoeGroupedNn: K кратно 64, N кратно 8"));
+            }
+            let n_tiles = tl.numel() / 4;
+            if n_tiles == 0 {
+                return Ok(());
+            }
+            let row_bytes = moe_row_bytes(dtype, kw)?;
+            let f = moe_gg_fn(&ctx, dtype, shuffled, true)?;
+            let (nwi, kwi) = (nw as u32, kw as u32);
+            let mut b = stream.launch_builder(&f);
+            b.arg(wt).arg(st).arg(tiles).arg(dy).arg(&mut *out_bufs[0]).arg(&nwi).arg(&kwi).arg(&row_bytes);
+            let cfg = LaunchConfig { grid_dim: (kwi.div_ceil(64), n_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(cfg) }.map_err(launch_err("moe_gg_nn"))?;
+        }
     }
     Ok(())
+}
+
+fn moe_row_bytes(dtype: DType, k: usize) -> Result<u32> {
+    match dtype {
+        DType::NVFP4 | DType::MXFP8 => Ok(0),
+        _ => synaptix_core::quant::block_row_bytes(dtype, k)
+            .map(|b| b as u32)
+            .ok_or(SynaptixError::Unsupported("MoE GEMM: K не кратен блоку формата")),
+    }
+}
+
+/// Групповые ядра MoE обучения под формат веса: модуль на (формат,
+/// раскладка, направление) — как групповой GEMM инференса; строка
+/// инстанцирования берётся из строки GEMV-ядра того же формата. `nn` —
+/// обратное ядро (`moe_gg_nn.cu`), иначе прямое (тело инференса
+/// `blockq_gemm_grouped.cu`).
+fn moe_gg_fn(ctx: &Arc<CudaContext>, dtype: DType, shuffled: bool, nn: bool) -> Result<CudaFunction> {
+    type Key = (usize, &'static str, bool, bool);
+    static GG_CACHE: OnceLock<Mutex<Vec<(Key, Arc<CudaModule>)>>> = OnceLock::new();
+    let suf = crate::elementwise::blockq::entry_suffix(dtype).ok_or(SynaptixError::Unsupported("MoE GEMM: формат не квантованный вес"))?;
+    if shuffled && dtype != DType::NVFP4 {
+        return Err(SynaptixError::Unsupported("MoE GEMM: перемешанная раскладка — только NVFP4"));
+    }
+    let key = (Arc::as_ptr(ctx) as usize, suf, shuffled, nn);
+    let name = if nn { "ggn" } else { "gg" };
+    let cache = GG_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some((_, m)) = cache.lock().iter().find(|(k, _)| *k == key) {
+        return load_fn(m, name);
+    }
+    let (blob, syn) = if nn { ("GGN_BLOB(", "GGN_SYN(") } else { ("GG_BLOB(", "GG_SYN(") };
+    let inst = if shuffled {
+        format!("{syn}{name}, deq_nvfp4_shuf)\n")
+    } else {
+        let gemv = include_str!("cu/elementwise/blockq_gemv.cu");
+        let mut inst = None;
+        for (from, to) in [("GEMV_BLOB(", blob), ("GEMV_SYN(", syn)] {
+            let head = format!("{from}gemv_{suf},");
+            if let Some(line) = gemv.lines().find(|l| l.trim_start().starts_with(&head)) {
+                inst = Some(format!("{to}{name},{}\n", &line.trim_start()[head.len()..]));
+            }
+        }
+        inst.ok_or(SynaptixError::Unsupported("MoE GEMM: нет ядра для формата"))?
+    };
+    let body = if nn { include_str!("cu/train/moe_gg_nn.cu") } else { include_str!("cu/elementwise/blockq_gemm_grouped.cu") };
+    let src = format!(
+        "{}\n{}\n{}\n{}",
+        include_str!("cu/elementwise/ggml_tables.cuh"),
+        include_str!("cu/elementwise/blockq_decode.cuh"),
+        body,
+        inst
+    );
+    let tag = if nn { "moe_gg_nn.cu" } else { "moe_gg_nt.cu" };
+    let module = crate::kernels::compile::compile_module_with_opts(ctx, &src, tag, &["-DSYN_ACT_BF16"], None)?;
+    cache.lock().push((key, module.clone()));
+    load_fn(&module, name)
 }

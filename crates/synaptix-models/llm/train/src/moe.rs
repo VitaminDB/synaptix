@@ -16,10 +16,11 @@
 //! не кэшируется: плотная копия всех экспертов слоя — гигабайты.
 
 use synaptix_core::backend::train::TrainOp;
-use synaptix_core::device::{Device, };
+use synaptix_core::device::Device;
+use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
-use synaptix_llm_common::MoeFfn;
+use synaptix_llm_common::{MoeFfn, TrainExpert};
 
 use crate::block::{proj, proj_bwd, BlockLora};
 use crate::error::other;
@@ -46,6 +47,93 @@ pub struct MoeSaved {
     /// Выходы экспертов без веса `[P, H]`, compute-тип.
     y: Tensor,
     shared: Option<SharedSaved>,
+}
+
+/// Адреса весов экспертов слоя под групповые GEMM обучения: запись `j` —
+/// эксперт сегмента `j`.
+struct GroupTable {
+    w: Tensor,
+    s: Tensor,
+    dtype: DType,
+    shuffled: bool,
+    n: usize,
+    k: usize,
+}
+
+impl GroupTable {
+    fn build(ws: &[&QuantWeight], dev: Device) -> Option<Self> {
+        let first = ws.first()?;
+        let (dtype, n, k) = (first.dtype(), first.n(), first.k());
+        if k % 64 != 0 {
+            return None;
+        }
+        let mut w = Vec::with_capacity(ws.len());
+        let mut s = Vec::with_capacity(ws.len());
+        let mut shuffled = None;
+        for q in ws {
+            if q.dtype() != dtype || q.n() != n || q.k() != k {
+                return None;
+            }
+            let (wa, sa, sh) = q.blob_addrs()?;
+            if *shuffled.get_or_insert(sh) != sh {
+                return None;
+            }
+            w.push(wa as i64);
+            s.push(sa as i64);
+        }
+        let len = w.len();
+        Some(Self {
+            w: Tensor::from_vec(w, vec![len], dev).ok()?,
+            s: Tensor::from_vec(s, vec![len], dev).ok()?,
+            dtype,
+            shuffled: shuffled.unwrap_or(false),
+            n,
+            k,
+        })
+    }
+
+    /// `y[r] = x[src(r)] · W_eᵀ` → `[R, N]` BF16.
+    fn nt(&self, x: &Tensor, rows: Option<&Tensor>, tiles: &Tensor, r: usize) -> Result<Tensor> {
+        let op = TrainOp::MoeGroupedNt { dtype: self.dtype, shuffled: self.shuffled, has_rows: rows.is_some() };
+        let mut ins = vec![&self.w, &self.s, tiles, x];
+        if let Some(rw) = rows {
+            ins.push(rw);
+        }
+        Ok(Tensor::train_op(op, &ins, &[(vec![r, self.n], DType::BF16)])?.remove(0))
+    }
+
+    /// `dx[r] = dy[r] · W_e` → `[R, K]` F32; `dy` — `[R, N]` BF16.
+    fn nn(&self, dy: &Tensor, tiles: &Tensor) -> Result<Tensor> {
+        let op = TrainOp::MoeGroupedNn { dtype: self.dtype, shuffled: self.shuffled };
+        let r = dy.dims()[0];
+        Ok(Tensor::train_op(op, &[&self.w, &self.s, tiles, dy], &[(vec![r, self.k], DType::F32)])?.remove(0))
+    }
+}
+
+/// Таблицы (gate_up, down). `None` — групповой путь неприменим (плотная
+/// база, F32-счёт, формат без декодера) — считается поштучно.
+fn grouped_tables(experts: &[TrainExpert<'_>], x: &Tensor) -> Option<(GroupTable, GroupTable)> {
+    if x.dtype() != DType::BF16 || std::env::var("SYN_TRAIN_MOE_GROUPED").as_deref() == Ok("0") {
+        return None;
+    }
+    let gu: Vec<_> = experts.iter().map(|e| e.gate_up().quant_weight()).collect::<Option<Vec<_>>>()?;
+    let dn: Vec<_> = experts.iter().map(|e| e.down().quant_weight()).collect::<Option<Vec<_>>>()?;
+    Some((GroupTable::build(&gu, x.device())?, GroupTable::build(&dn, x.device())?))
+}
+
+/// Тайлы строк по 64: `(эксперт таблицы, начало, конец, 0)` U32.
+fn tiles(segs: &[(usize, usize, usize)], dev: Device) -> Result<Tensor> {
+    let mut t: Vec<u32> = Vec::new();
+    for (j, &(_, a, b)) in segs.iter().enumerate() {
+        let mut r = a;
+        while r < b {
+            let e = (r + 64).min(b);
+            t.extend_from_slice(&[j as u32, r as u32, e as u32, 0]);
+            r = e;
+        }
+    }
+    let n = t.len();
+    Ok(Tensor::from_vec(t, vec![n], dev)?)
 }
 
 struct SharedSaved {
@@ -140,36 +228,50 @@ pub fn forward(moe: &MoeFfn, lora: &BlockLora, x: &Tensor, w: &Weights) -> Resul
     moe.train_prefetch(&ids);
 
     // ── Эксперты ──
-    let xg = take_rows(x, &rows)?; // [P, H]
-    let mut gus = Vec::with_capacity(segs.len());
-    let mut ys = Vec::with_capacity(segs.len());
-    crate::prof::prof(dev, "moe_experts_fwd", || -> Result<()> {
-        for &(ex, a, b) in &segs {
-            let expert = moe.train_expert(ex)?;
-            let xe = xg.narrow(0, a, b - a)?;
-            let wgu = dense_weight(expert.gate_up())?;
-            let gu = xe.to_dtype(wgu.dtype())?.linear(&wgu)?;
-            drop(wgu);
+    let experts: Vec<TrainExpert<'_>> = crate::prof::prof(dev, "moe_take", || segs.iter().map(|s| moe.train_expert(s.0)).collect::<std::result::Result<_, _>>())?;
+    let tables = crate::prof::prof(dev, "moe_tables", || grouped_tables(&experts, x));
+    let (gu, y) = match tables {
+        Some((t_gu, t_dn)) => crate::prof::prof(dev, "moe_experts_fwd", || -> Result<(Tensor, Tensor)> {
+            // Строки токенов собирает само ядро — без копии [P, H].
+            let tl = tiles(&segs, dev)?;
+            let xc = x.contiguous()?;
+            let gu = crate::prof::prof(dev, "gg_gu", || t_gu.nt(&xc, Some(&rows), &tl, p))?;
             let (g, u) = gate_up_split(&gu, inter)?;
-            let hdn = g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u)))?;
-            let wd = dense_weight(expert.down())?;
-            let y = hdn.linear(&wd)?;
-            gus.push(gu);
-            ys.push(y);
+            let hdn = g.silu_and_mul(&u)?;
+            let y = crate::prof::prof(dev, "gg_dn", || t_dn.nt(&hdn, None, &tl, p))?;
+            Ok((gu, y))
+        })?,
+        None => {
+            let xg = take_rows(x, &rows)?; // [P, H]
+            let mut gus = Vec::with_capacity(segs.len());
+            let mut ys = Vec::with_capacity(segs.len());
+            crate::prof::prof(dev, "moe_experts_fwd", || -> Result<()> {
+                for (expert, &(_, a, b)) in experts.iter().zip(&segs) {
+                    let xe = xg.narrow(0, a, b - a)?;
+                    let wgu = dense_weight(expert.gate_up())?;
+                    let gu = xe.to_dtype(wgu.dtype())?.linear(&wgu)?;
+                    drop(wgu);
+                    let (g, u) = gate_up_split(&gu, inter)?;
+                    let hdn = g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u)))?;
+                    let wd = dense_weight(expert.down())?;
+                    let y = hdn.linear(&wd)?;
+                    gus.push(gu);
+                    ys.push(y);
+                }
+                Ok(())
+            })?;
+            let cat = |v: &[Tensor]| -> Result<Tensor> {
+                if v.len() == 1 {
+                    return Ok(v[0].clone());
+                }
+                let r: Vec<&Tensor> = v.iter().collect();
+                Ok(Tensor::cat(&r, 0)?)
+            };
+            (cat(&gus)?, cat(&ys)?)
         }
-        Ok(())
-    })?;
-    let cat = |v: &[Tensor]| -> Result<Tensor> {
-        if v.len() == 1 {
-            return Ok(v[0].clone());
-        }
-        let r: Vec<&Tensor> = v.iter().collect();
-        Ok(Tensor::cat(&r, 0)?)
     };
-    let gu = cat(&gus)?;
-    drop(gus);
-    let y = cat(&ys)?.to_dtype(x.dtype())?;
-    drop(ys);
+    drop(experts);
+    let y = y.to_dtype(x.dtype())?;
 
     let ws = Tensor::from_vec(w_sorted.clone(), vec![p, 1], dev)?.to_dtype(y.dtype())?;
     let mixed = sum_slots(&take_rows(&y.broadcast_mul(&ws)?, &inverse)?, t, k)?;
@@ -216,30 +318,44 @@ pub fn backward(moe: &MoeFfn, lora: &mut BlockLora, s: MoeSaved, dy: &Tensor, w:
     let ws = Tensor::from_vec(s.w_sorted.clone(), vec![p, 1], dev)?;
     let dyw = dyg.broadcast_mul(&ws)?;
     drop(dyg);
-    let mut dxs = Vec::with_capacity(s.segs.len());
-    crate::prof::prof(dev, "moe_experts_bwd", || -> Result<()> {
-        for &(ex, a, b) in &s.segs {
-            let expert = moe.train_expert(ex)?;
-            let n = b - a;
-            let wd = dense_weight(expert.down())?;
-            let dh = backward_input_with(&wd, &dyw.narrow(0, a, n)?.contiguous()?)?; // [n, I]
-            drop(wd);
-            let (g, u) = gate_up_split(&s.gu.narrow(0, a, n)?, inter)?;
+    let experts: Vec<TrainExpert<'_>> = crate::prof::prof(dev, "moe_take", || s.segs.iter().map(|g| moe.train_expert(g.0)).collect::<std::result::Result<_, _>>())?;
+    let tables = crate::prof::prof(dev, "moe_tables", || grouped_tables(&experts, &s.x));
+    let dx_sorted = match tables {
+        Some((t_gu, t_dn)) => crate::prof::prof(dev, "moe_experts_bwd", || -> Result<Tensor> {
+            let tl = tiles(&s.segs, dev)?;
+            let dh = crate::prof::prof(dev, "ggn_dn", || t_dn.nn(&dyw.to_dtype(DType::BF16)?, &tl))?; // [P, I]
+            let (g, u) = gate_up_split(&s.gu, inter)?;
             let shp = g.dims().to_vec();
             let gu = Tensor::train_op(TrainOp::SiluMulBwd, &[&g, &u, &dh], &[(shp.clone(), DType::F32), (shp, DType::F32)])?;
-            let dgu = Tensor::cat(&[&gu[0], &gu[1]], 1)?;
-            let wgu = dense_weight(expert.gate_up())?;
-            dxs.push(backward_input_with(&wgu, &dgu)?); // [n, H]
+            let dgu = Tensor::cat(&[&gu[0], &gu[1]], 1)?.to_dtype(DType::BF16)?;
+            crate::prof::prof(dev, "ggn_gu", || t_gu.nn(&dgu, &tl)) // [P, H]
+        })?,
+        None => {
+            let mut dxs = Vec::with_capacity(s.segs.len());
+            crate::prof::prof(dev, "moe_experts_bwd", || -> Result<()> {
+                for (expert, &(_, a, b)) in experts.iter().zip(&s.segs) {
+                    let n = b - a;
+                    let wd = dense_weight(expert.down())?;
+                    let dh = backward_input_with(&wd, &dyw.narrow(0, a, n)?.contiguous()?)?; // [n, I]
+                    drop(wd);
+                    let (g, u) = gate_up_split(&s.gu.narrow(0, a, n)?, inter)?;
+                    let shp = g.dims().to_vec();
+                    let gu = Tensor::train_op(TrainOp::SiluMulBwd, &[&g, &u, &dh], &[(shp.clone(), DType::F32), (shp, DType::F32)])?;
+                    let dgu = Tensor::cat(&[&gu[0], &gu[1]], 1)?;
+                    let wgu = dense_weight(expert.gate_up())?;
+                    dxs.push(backward_input_with(&wgu, &dgu)?); // [n, H]
+                }
+                Ok(())
+            })?;
+            if dxs.len() == 1 {
+                dxs.pop().unwrap()
+            } else {
+                let r: Vec<&Tensor> = dxs.iter().collect();
+                Tensor::cat(&r, 0)?
+            }
         }
-        Ok(())
-    })?;
-    let dx_sorted = if dxs.len() == 1 {
-        dxs.pop().unwrap()
-    } else {
-        let r: Vec<&Tensor> = dxs.iter().collect();
-        Tensor::cat(&r, 0)?
     };
-    drop(dxs);
+    drop(experts);
     let mut dx = sum_slots(&take_rows(&dx_sorted, &s.inverse)?, t, k)?;
     drop(dx_sorted);
 

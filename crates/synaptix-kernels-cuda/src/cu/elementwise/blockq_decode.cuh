@@ -494,6 +494,26 @@ __device__ __forceinline__ void deq_nvfp4_syn(const uint8_t *packed, const uint8
         }
     }
 }
+/// То же по перемешанной копии под FP4 MMA (`nvfp4_w_repack`): строки
+/// плиткой по 16, внутри плитки — куски по 64 значения (32 байта на строку);
+/// 16 байт под-блока лежат подряд, масштабы — те же. `K` кратно 64.
+__device__ __forceinline__ void deq_nvfp4_shuf(const uint8_t *shuf, const uint8_t *scales, unsigned row,
+                                               unsigned K, unsigned s, float *y) {
+    unsigned sf_inner = ((K + 63u) / 64u) * 4u;
+    const size_t off = (size_t)(row >> 4) * (K >> 6) * 512u + (size_t)(s >> 1) * 512u + (row & 15u) * 32u + (s & 1u) * 16u;
+    const uint4 v = *reinterpret_cast<const uint4 *>(shuf + off);
+    const unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        float sc = syn_decode_e4m3(scales[syn_nvfp4_scale_off(row, s * 2u + h, sf_inner)]);
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            unsigned w = words[h * 2 + q];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) y[h * 16 + q * 8 + j] = syn_decode_e2m1((w >> (4 * j)) & 0xFu) * sc;
+        }
+    }
+}
 // MXFP8 synaptix: e4m3 [N, K] натурально + E8M0 [N, K/32].
 __device__ __forceinline__ float syn_e4m3_to_f32(uint8_t byte) { return syn_decode_e4m3(byte); }
 __device__ __forceinline__ void deq_mxfp8_syn(const uint8_t *packed, const uint8_t *scales, unsigned row,

@@ -73,4 +73,17 @@ pub enum TrainOp {
     /// по блокам столбцов (их сумма по первой оси — градиент; dq/dk ещё
     /// суммируются по v-головам группы k-головы).
     GdnBwd { has_seg: bool },
+    /// Обратный групповой GEMM экспертов MoE: `dx[r] = dy[r] · W_e` для строк
+    /// сегмента эксперта `e` (градиент по входу `y = x · W_eᵀ`). Входы
+    /// `[w_table I64 [E], s_table I64 [E] (адреса весов формата `dtype` и их
+    /// масштабов), tiles U32 [4·T] ((эксперт, начало, конец, 0) по 64 строки),
+    /// dy BF16 [R, N]]`, выход `[dx F32 [R, K]]` (строки вне тайлов не
+    /// пишутся). `K` кратно 32. `shuffled` — NVFP4 в перемешанной раскладке
+    /// под FP4 MMA (`K` кратно 64).
+    MoeGroupedNn { dtype: crate::dtype::DType, shuffled: bool },
+    /// Прямой групповой GEMM экспертов MoE: `y[r] = x[src(r)] · W_eᵀ`, вес
+    /// деквантуется в smem (W4A16). Входы `[w_table, s_table, tiles` (как у
+    /// [`TrainOp::MoeGroupedNn`]) `, x BF16 [·, K]` и, если `has_rows`,
+    /// `rows U32 [R]` (`src(r) = rows[r]`, иначе `r`)`]`, выход `[y BF16 [R, N]]`.
+    MoeGroupedNt { dtype: crate::dtype::DType, shuffled: bool, has_rows: bool },
 }
