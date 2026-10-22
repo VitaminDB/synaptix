@@ -1188,6 +1188,9 @@ pub struct Llm {
     learned_act: std::sync::atomic::AtomicUsize,
     /// Новых токенов у последнего спланированного хода (кому приписать OOM).
     last_prefill: std::sync::atomic::AtomicUsize,
+    /// Последний план отдал хосту блоки только ради активаций префилла:
+    /// декоду того же хода они не мешали бы (см. `generate_streaming_cached`).
+    regrow_after_prefill: std::sync::atomic::AtomicBool,
 }
 
 impl Llm {
@@ -1492,43 +1495,59 @@ impl Llm {
         self.last_prefill.store(prefill_tokens, Relaxed);
         let learned_act = self.learned_act.load(Relaxed);
         let learned_act = if chunk == 0 { learned_act } else { learned_act * prefill_tokens.min(chunk) / chunk };
-        let need = extra + vram_turn_reserve() + act + learned_act + self.learned_reserve.load(Relaxed);
+        let need_dec = extra + vram_turn_reserve() + self.learned_reserve.load(Relaxed);
+        let need = need_dec + act + learned_act;
         // Блоку с хоста нужен буфер на карте, и следующий едет, пока
         // считается текущий: при частичном оффлоаде — ещё два блока сверху.
         let blk_max = self.pipeline.lock().map(|p| p.block_bytes_max()).unwrap_or(blk).max(blk);
-        let streamed_need = need + 2 * blk_max;
         let free = || synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        let set_dec = |n: Option<usize>| self.regrow_after_prefill.store(n.is_some(), Relaxed);
         // Хватает и всё на карте — ничего не трогаем (и пулы не ужимаем:
         // это стоило бы им повторного роста на каждом ходу).
         if resident >= total && free() >= need {
+            set_dec(None);
             return Some(resident);
         }
-        // Удержанное пулами, но не занятое — тоже свободно.
+        // Удержанное пулами, но не занятое — тоже свободно. Короткому ходу
+        // (декод) не нужны и рабочие буферы префилла GDN — до гигабайта.
         let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        if prefill_tokens < 256 {
+            synaptix_kernels_cuda::release_prefill_scratch();
+        }
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
         let f = free();
-        let want = if resident >= total && f >= need {
-            total
-        } else if resident < total && f >= need + (total - resident + 1) * blk {
-            // Влезают все (с запасом в блок) — стрим больше не нужен.
-            total
-        } else if f < streamed_need {
-            resident.saturating_sub((streamed_need - f).div_ceil(blk))
-        } else {
-            // Возвращаем с запасом в блок, чтобы не качаться туда-сюда.
-            let spare = (f - streamed_need) / blk;
-            if spare < 2 { resident } else { (resident + spare - 1).min(total) }
+        // Сколько блоков держать на карте при запасе `need` от нынешнего состояния.
+        let plan = |need: usize| -> usize {
+            let streamed_need = need + 2 * blk_max;
+            if resident >= total && f >= need {
+                total
+            } else if resident < total && f >= need + (total - resident + 1) * blk {
+                // Влезают все (с запасом в блок) — стрим больше не нужен.
+                total
+            } else if f < streamed_need {
+                resident.saturating_sub((streamed_need - f).div_ceil(blk))
+            } else {
+                // Возвращаем с запасом в блок, чтобы не качаться туда-сюда.
+                let spare = (f - streamed_need) / blk;
+                if spare < 2 { resident } else { (resident + spare - 1).min(total) }
+            }
         };
+        let want = plan(need);
+        // Декоду того же хода активации куска не нужны: префилл идёт
+        // отдельным проходом, а план второго (без активаций) вернёт блоки.
+        let want_dec = plan(need_dec);
+        set_dec((want_dec > want).then_some(want_dec));
         if want == resident {
             return Some(resident);
         }
         let got = self.set_block_residency(want).unwrap_or(resident);
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
         eprintln!(
-            "[synaptix] VRAM: блоков на карте {resident} → {got} из {total} (свободно было {:.2} ГБ, нужно {:.2}; теперь {:.2})",
+            "[synaptix] VRAM: блоков на карте {resident} → {got} из {total} (свободно было {:.2} ГБ, нужно {:.2}; теперь {:.2}){}",
             f as f64 / 1e9,
             need as f64 / 1e9,
-            free() as f64 / 1e9
+            free() as f64 / 1e9,
+            if want_dec > want { format!("; на декоде — {want_dec}") } else { String::new() }
         );
         Some(got)
     }
@@ -1939,6 +1958,44 @@ impl<'a> LlmGeneration<'a> {
     /// сообщение, сменили системный prompt) обнаруживается сравнением токенов и
     /// просто приводит к полному префиллу.
     pub fn generate_streaming_cached<F>(
+        &mut self,
+        session: &mut LlmKvSession,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        on_token: F,
+    ) -> Result<usize, LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        // Длинному префиллу план мог отдать хосту блоки только под активации
+        // куска. Тогда префилл — отдельным проходом (первый токен никому не
+        // уходит), и второй проход, найдя промпт в кэше сессии (пересчёт —
+        // хвост до 63 токенов), планирует без активаций и возвращает блоки:
+        // иначе весь ответ этого хода стримил бы их с хоста на каждом токене.
+        let parked = if session.is_parked() { self.model.kv_session_bytes(session.ctx_tokens) } else { 0 };
+        let fresh = prompt_ids.len().saturating_sub(session.reusable(prompt_ids));
+        {
+            let _runtime = self.model.runtime_scope();
+            self.model.fit_vram(parked, fresh);
+        }
+        let split = fresh > 256
+            && self.opts.max_new_tokens > 1
+            && self.model.regrow_after_prefill.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if split {
+            let resume = session.resume_at;
+            let max_new = self.opts.max_new_tokens;
+            self.opts.max_new_tokens = 1;
+            let r = self.generate_streaming_cached_pass(session, prompt_ids, tokenizer, |_, _| false);
+            self.opts.max_new_tokens = max_new;
+            session.resume_at = resume;
+            let reused = r?;
+            self.generate_streaming_cached_pass(session, prompt_ids, tokenizer, on_token)?;
+            return Ok(reused);
+        }
+        self.generate_streaming_cached_pass(session, prompt_ids, tokenizer, on_token)
+    }
+
+    fn generate_streaming_cached_pass<F>(
         &mut self,
         session: &mut LlmKvSession,
         prompt_ids: &[u32],
@@ -2937,6 +2994,7 @@ fn build_facade(
         learned_reserve: std::sync::atomic::AtomicUsize::new(0),
         learned_act: std::sync::atomic::AtomicUsize::new(0),
         last_prefill: std::sync::atomic::AtomicUsize::new(0),
+        regrow_after_prefill: std::sync::atomic::AtomicBool::new(false),
     };
     let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids };
     Ok((model, tok))
