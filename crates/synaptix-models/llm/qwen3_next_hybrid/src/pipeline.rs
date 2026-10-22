@@ -253,6 +253,34 @@ impl HybridPipeline {
         Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
     }
 
+    /// Как [`Self::load_with_precision`], но у MoE-модели эксперты сразу
+    /// уходят в RAM, а на карте остаются блоки и кэш экспертов (без попытки
+    /// резидентной загрузки). Нужна обучению: модель, едва влезающая на карту
+    /// целиком, не оставила бы места активациям.
+    pub fn load_with_experts_in_ram(
+        path: impl AsRef<Path>,
+        device: Device,
+        precision: PrecisionConfig,
+        max_seq: Option<usize>,
+    ) -> Result<Self, PipelineError> {
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+        let weights = HybridWeights::load(path, device, precision.compute)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        let config = weights.config.clone();
+        let tokenizer = HfTokenizer::from_bytes(&weights.tokenizer_json)
+            .map_err(|e| PipelineError::Load(format!("tokenizer: {e}")))?;
+        let cap = max_seq.unwrap_or(config.max_position_embeddings);
+        let dcfg = config.to_decoder_config();
+        let block_device = (dcfg.has_moe_ffn() && device.is_cuda()).then_some(Device::Cpu);
+        let model = DecoderModel::build_ext(
+            &dcfg, &weights, device, block_device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head,
+            precision.embed, cap,
+        )
+        .map_err(|e| PipelineError::Model(e.to_string()))?
+        .with_kv_cache_dtype(precision.kv);
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
+    }
+
     pub fn load_with_precision_mtp(
         path: impl AsRef<Path>,
         device: Device,

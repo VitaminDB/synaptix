@@ -18,6 +18,7 @@ pub mod error;
 pub mod linear;
 pub mod lora;
 pub mod model;
+pub mod moe;
 pub mod optim;
 pub mod prof;
 pub mod trainer;

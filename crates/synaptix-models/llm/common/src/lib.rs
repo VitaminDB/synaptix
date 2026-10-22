@@ -20,5 +20,5 @@ pub use model::{
     CachedDecodeGraph, DecodeGraphSlot,
     DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
 };
-pub use moe::{MoeConfig, MoeFfn};
+pub use moe::{MoeConfig, MoeFfn, SharedRefs, TrainExpert};
 pub use weights::{QLinear, RowSource, WeightSource};

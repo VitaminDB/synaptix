@@ -73,14 +73,20 @@ pub struct MlpRefs<'a> {
     pub activation: Activation,
 }
 
-/// Слой декодера: полное или линейное внимание и плотный MLP.
+/// FFN слоя: плотный MLP или MoE (роутер, эксперты, shared-эксперт).
+pub enum FfnRefs<'a> {
+    Dense(MlpRefs<'a>),
+    Moe(&'a crate::moe::MoeFfn),
+}
+
+/// Слой декодера: полное или линейное внимание и FFN.
 pub struct BlockRefs<'a> {
     pub pre_attn_norm: &'a Tensor,
     pub post_attn_norm: Option<&'a Tensor>,
     pub pre_mlp_norm: &'a Tensor,
     pub post_mlp_norm: Option<&'a Tensor>,
     pub mixer: MixerRefs<'a>,
-    pub mlp: MlpRefs<'a>,
+    pub mlp: FfnRefs<'a>,
     pub rms_eps: f32,
     pub post_eps: f32,
 }
@@ -147,7 +153,7 @@ impl LinearAttn {
 impl Block {
     fn refs<'a>(&'a self, rope: &'a RopeCache) -> Result<BlockRefs<'a>, ModelError> {
         if self.moe.is_some() || self.ple.is_some() {
-            return Err(ModelError::Build("обучение: MoE-ветка и PLE пока не поддержаны".into()));
+            return Err(ModelError::Build("обучение: боковая MoE-ветка (Gemma-4) и PLE пока не поддержаны".into()));
         }
         if self.layer_scalar.is_some_and(|a| a != 1.0) {
             return Err(ModelError::Build("обучение: множитель слоя пока не поддержан".into()));
@@ -157,13 +163,16 @@ impl Block {
             Mixer::Linear(la) => MixerRefs::Linear(la.refs()),
         };
         let mlp = match &self.mlp {
-            Ffn::Dense(m) => MlpRefs {
+            Ffn::Dense(m) => FfnRefs::Dense(MlpRefs {
                 gate_proj: &m.gate_proj,
                 up_proj: &m.up_proj,
                 down_proj: &m.down_proj,
                 activation: m.activation,
-            },
-            Ffn::Moe(_) => return Err(ModelError::Build("обучение: MoE пока не поддержан".into())),
+            }),
+            Ffn::Moe(m) => {
+                m.train_check()?;
+                FfnRefs::Moe(m)
+            }
         };
         Ok(BlockRefs {
             pre_attn_norm: &self.pre_attn_norm,

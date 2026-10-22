@@ -295,9 +295,14 @@ pub fn train_lora(
     }
     // Имена модулей в адаптере — как у HF-модели: у Qwen3.5+ (общая модель с
     // башней зрения) слои лежат под `model.language_model`.
-    let multimodal = synaptix_io::weights::read_model_file(model, "config.json")
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|c| c.get("text_config").is_some());
+    let config = synaptix_io::weights::read_model_file(model, "config.json").and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let multimodal = config.as_ref().is_some_and(|c| c.get("text_config").is_some());
+    // MoE: эксперты — в RAM, на карте их кэш (модель с экспертами на карте
+    // целиком не оставила бы места активациям).
+    let moe = config
+        .as_ref()
+        .and_then(|c| c.get("text_config").unwrap_or(c).get("num_experts").and_then(|v| v.as_u64()))
+        .is_some_and(|n| n > 0);
     opts.lora.module_prefix = if multimodal { "model.language_model.layers".into() } else { "model.layers".into() };
     let out_dir = opts.train.out_dir.clone();
     let mut eval_loss = None;
@@ -330,13 +335,18 @@ pub fn train_lora(
         }
         LlmArch::Hybrid => {
             let _w = synaptix_core::device::cuda::WeightsAllocGuard::for_device(opts.device);
-            let p = synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline::load_with_precision(model, opts.device, prec, Some(rope))
-                .map_err(|e| LlmError(format!("load hybrid: {e}")))?;
+            use synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline;
+            let p = if moe {
+                HybridPipeline::load_with_experts_in_ram(model, opts.device, prec, Some(rope))
+            } else {
+                HybridPipeline::load_with_precision(model, opts.device, prec, Some(rope))
+            }
+            .map_err(|e| LlmError(format!("load hybrid: {e}")))?;
             drop(_w);
             drop(load_guard);
             run(&p.model)?
         }
-        other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 и Qwen3.5+ (плотных); у модели {other:?}"))),
+        other => return Err(LlmError(format!("дообучение пока поддержано для Qwen3 и Qwen3.5/3.6 (плотных и MoE); у модели {other:?}"))),
     };
     Ok(TrainReport { dataset, eval_loss, eval_samples: eval.len(), trainable_params, adapter_dir: out_dir })
 }

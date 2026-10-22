@@ -123,6 +123,10 @@ enum Slot {
     Gate,
     Up,
     Down,
+    /// Shared-эксперт MoE (`mlp.shared_expert.*`).
+    SharedGate,
+    SharedUp,
+    SharedDown,
 }
 
 impl Slot {
@@ -140,6 +144,9 @@ impl Slot {
             ("mlp", "gate_proj") => Slot::Gate,
             ("mlp", "up_proj") => Slot::Up,
             ("mlp", "down_proj") => Slot::Down,
+            ("mlp.shared_expert", "gate_proj") => Slot::SharedGate,
+            ("mlp.shared_expert", "up_proj") => Slot::SharedUp,
+            ("mlp.shared_expert", "down_proj") => Slot::SharedDown,
             _ => return None,
         })
     }
@@ -205,10 +212,11 @@ fn read_adapter(dir: &Path, device: Device, n_layers: usize) -> Result<(usize, f
     let mut total = 0usize;
     for name in st.names() {
         let Some(module) = name.strip_suffix(".lora_A.weight") else { continue };
-        // `…layers.<i>.<kind>.<proj>`
+        // `…layers.<i>.<kind>.<proj>`, `kind` — с точками (`mlp.shared_expert`).
         let Some(pos) = module.rfind("layers.") else { continue };
-        let mut parts = module[pos + "layers.".len()..].split('.');
-        let (Some(i), Some(kind), Some(proj)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let rest = &module[pos + "layers.".len()..];
+        let Some((i, tail)) = rest.split_once('.') else { continue };
+        let Some((kind, proj)) = tail.rsplit_once('.') else { continue };
         let Ok(i) = i.parse::<usize>() else { continue };
         if i >= n_layers {
             return Err(err(format!("{module}: у модели {n_layers} слоёв")));
@@ -262,6 +270,9 @@ impl DecoderModel {
             (_, Slot::Gate) => b.mlp.dense().map(|m| &m.gate_proj),
             (_, Slot::Up) => b.mlp.dense().map(|m| &m.up_proj),
             (_, Slot::Down) => b.mlp.dense().map(|m| &m.down_proj),
+            (_, Slot::SharedGate) => b.mlp.moe().and_then(|m| m.train_shared()).map(|s| s.gate),
+            (_, Slot::SharedUp) => b.mlp.moe().and_then(|m| m.train_shared()).map(|s| s.up),
+            (_, Slot::SharedDown) => b.mlp.moe().and_then(|m| m.train_shared()).map(|s| s.down),
             _ => None,
         }
     }

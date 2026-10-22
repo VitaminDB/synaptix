@@ -24,7 +24,7 @@ model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, att
 names = "q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj"
 rank = d[next(k for k in d if k.endswith(".lora_A"))].shape[0]
 # Только слои языковой модели (у Qwen3.5 есть ещё башня зрения).
-cfg = LoraConfig(r=rank, lora_alpha=2 * rank, target_modules=rf".*layers\.\d+\.(self_attn|linear_attn|mlp)\.({names})",
+cfg = LoraConfig(r=rank, lora_alpha=2 * rank, target_modules=rf".*layers\.\d+\.(self_attn|linear_attn|mlp|mlp\.shared_expert)\.({names})",
                  lora_dropout=0.0, bias="none")
 model = get_peft_model(model, cfg)
 

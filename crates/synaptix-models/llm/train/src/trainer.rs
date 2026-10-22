@@ -163,6 +163,7 @@ impl Trainer {
             return Ok(None);
         }
         let refs: Vec<&Sample> = eval.iter().collect();
+        model.fit_expert_cache(self.cfg.max_len);
         let (mut sum, mut n) = (0f64, 0usize);
         for b in pack(&refs, self.cfg.max_len) {
             let s = model.eval_loss(&b)?;
@@ -184,6 +185,7 @@ impl Trainer {
     ) -> Result<()> {
         let cfg = self.cfg.clone();
         let accum = cfg.grad_accum.max(1);
+        model.fit_expert_cache(cfg.max_len);
         // План всех шагов наперёд: число шагов нужно расписанию.
         let mut epochs: Vec<Vec<Batch>> = Vec::with_capacity(cfg.epochs);
         for e in 0..cfg.epochs {

@@ -10,7 +10,7 @@ use synaptix_llm_common::DecoderModel;
 use synaptix_ops::norm::rms_norm::rms_norm;
 
 use crate::block::{self, BlockLora, LinConst, SeqCtx};
-use synaptix_llm_common::model::train_access::MixerRefs;
+use synaptix_llm_common::model::train_access::{FfnRefs, MixerRefs};
 use crate::error::other;
 use crate::linear::{self, BaseMatmul, Weights};
 use crate::lora::{LoraConfig, LoraLayer};
@@ -101,9 +101,21 @@ impl<'m> TrainModel<'m> {
                     bl.lin = Some(LinConst::new(la, dev)?);
                 }
             }
-            bl.gate = mk("gate_proj", "mlp", b.mlp.gate_proj, 5)?;
-            bl.up = mk("up_proj", "mlp", b.mlp.up_proj, 6)?;
-            bl.down = mk("down_proj", "mlp", b.mlp.down_proj, 7)?;
+            match &b.mlp {
+                FfnRefs::Dense(m) => {
+                    bl.gate = mk("gate_proj", "mlp", m.gate_proj, 5)?;
+                    bl.up = mk("up_proj", "mlp", m.up_proj, 6)?;
+                    bl.down = mk("down_proj", "mlp", m.down_proj, 7)?;
+                }
+                // Роутер и эксперты заморожены; адаптеры — на shared-эксперте.
+                FfnRefs::Moe(moe) => {
+                    if let Some(sh) = moe.train_shared() {
+                        bl.gate = mk("gate_proj", "mlp.shared_expert", sh.gate, 5)?;
+                        bl.up = mk("up_proj", "mlp.shared_expert", sh.up, 6)?;
+                        bl.down = mk("down_proj", "mlp.shared_expert", sh.down, 7)?;
+                    }
+                }
+            }
             lora.push(bl);
         }
         Ok(Self { base, lora, cfg, base_matmul: BaseMatmul::default() })
@@ -115,6 +127,20 @@ impl<'m> TrainModel<'m> {
 
     pub fn layers_mut(&mut self) -> impl Iterator<Item = &mut LoraLayer> {
         self.lora.iter_mut().flat_map(|b| b.layers_mut())
+    }
+
+    /// Эксперты MoE в RAM: кэшу на карте — всё, кроме запаса под обучение
+    /// последовательностью до `tokens` токенов (контрольные точки слоёв,
+    /// сохранённое одного слоя, голова, адаптеры и их моменты).
+    pub fn fit_expert_cache(&self, tokens: usize) {
+        if let Some(cache) = self.base.expert_cache() {
+            let c = &self.base.config;
+            let per_token = c.hidden_size * (2 * c.num_hidden_layers + 160);
+            let lora = self.num_params() * 4 * 5;
+            let reserve = (3usize << 30) + tokens * per_token + lora;
+            let got = cache.fit_to_vram(reserve);
+            eprintln!("[train] кэш экспертов на карте: {:.1} ГБ (запас под обучение {:.1} ГБ)", got as f64 / 1e9, reserve as f64 / 1e9);
+        }
     }
 
     pub fn num_params(&self) -> usize {

@@ -2615,6 +2615,98 @@ impl MoeFfn {
     }
 }
 
+// ── Доступ обучения ─────────────────────────────────────────────────────────
+//
+// Обучающий проход (`synaptix-llm-train`) считает MoE сам: роутер, эксперты и
+// shared-эксперт заморожены, адаптеры — только на shared-эксперте. Отсюда он
+// берёт веса: роутер, shared-эксперта и экспертов по одному (резидентных —
+// займом, при оффлоаде — через кэш на карте).
+
+/// Эксперт на время обучающего прохода.
+pub enum TrainExpert<'a> {
+    Borrowed(&'a Expert),
+    Cached(Arc<Expert>),
+}
+
+impl TrainExpert<'_> {
+    fn expert(&self) -> &Expert {
+        match self {
+            TrainExpert::Borrowed(e) => e,
+            TrainExpert::Cached(e) => e,
+        }
+    }
+
+    /// `[2I, H]`: первые `I` строк — gate, следующие `I` — up.
+    pub fn gate_up(&self) -> &QLinear {
+        &self.expert().gate_up
+    }
+
+    /// `[H, I]`.
+    pub fn down(&self) -> &QLinear {
+        &self.expert().down
+    }
+}
+
+/// Shared-эксперт: SwiGLU-MLP и sigmoid-гейт его выхода.
+pub struct SharedRefs<'a> {
+    pub gate: &'a QLinear,
+    pub up: &'a QLinear,
+    pub down: &'a QLinear,
+    /// `[1, H]` F32.
+    pub gate_w: &'a Tensor,
+}
+
+impl MoeFfn {
+    /// Умеет ли обучающий проход этот слой.
+    pub fn train_check(&self) -> Result<(), ModelError> {
+        if self.cfg.activation != Activation::Silu {
+            return Err(ModelError::Build("обучение: MoE пока только со SwiGLU-экспертами".into()));
+        }
+        if self.cfg.per_expert_scale.is_some() {
+            return Err(ModelError::Build("обучение: множители экспертов (Gemma-4) пока не поддержаны".into()));
+        }
+        if self.experts.count() != self.cfg.num_experts {
+            return Err(ModelError::Build("обучение: число экспертов не совпало с конфигом".into()));
+        }
+        if let ExpertStore::Lazy { .. } = self.experts {
+            if self.cache.is_none() {
+                return Err(ModelError::Build("обучение: ленивые эксперты без кэша".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Роутер `[E, H]` F32.
+    pub fn train_router(&self) -> &Tensor {
+        &self.router
+    }
+
+    pub fn train_shared(&self) -> Option<SharedRefs<'_>> {
+        self.shared.as_ref().map(|s| SharedRefs { gate: &s.gate, up: &s.up, down: &s.down, gate_w: &s.router })
+    }
+
+    /// Эксперт `id` на карте.
+    pub fn train_expert(&self, id: usize) -> Result<TrainExpert<'_>, ModelError> {
+        match (&self.experts, &self.cache) {
+            (ExpertStore::Resident(all), None) => all
+                .get(id)
+                .map(TrainExpert::Borrowed)
+                .ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {id}"))),
+            (_, Some(cache)) => self.resident_expert(id, cache).map(TrainExpert::Cached),
+            (ExpertStore::Lazy { .. }, None) => Err(ModelError::Forward("MoE: ленивые эксперты без кэша".into())),
+        }
+    }
+
+    /// Поднять в кэш сразу всех экспертов из `ids` (одной параллельной
+    /// пачкой). Без оффлоада — ничего.
+    pub fn train_prefetch(&self, ids: &[u32]) {
+        if self.cache.is_some() {
+            let ones = vec![1.0f32; ids.len()];
+            self.prefetch(ids, &ones, false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@ use synaptix_core::backend::train::TrainOp;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
-use synaptix_llm_common::model::train_access::{AttnRefs, BlockRefs, LinearRefs, MixerRefs};
+use synaptix_llm_common::model::train_access::{AttnRefs, BlockRefs, FfnRefs, LinearRefs, MixerRefs, MlpRefs};
 use synaptix_llm_common::{Activation, QLinear};
 use synaptix_ops::norm::rms_norm::rms_norm;
 use synaptix_ops::pos::rope::{apply_rope_with_cossin, RopeLayout};
@@ -155,14 +155,22 @@ pub struct Saved {
     seg: Option<Tensor>,
     a: Option<Tensor>,
     h: Tensor,
-    n2: Option<Tensor>,
-    zg: Option<Tensor>,
-    zu: Option<Tensor>,
-    g: Tensor,
-    u: Tensor,
-    m: Option<Tensor>,
-    zd: Option<Tensor>,
+    ffn: FfnSaved,
     d: Option<Tensor>,
+}
+
+/// Что сохраняет FFN.
+enum FfnSaved {
+    Dense {
+        n2: Option<Tensor>,
+        zg: Option<Tensor>,
+        zu: Option<Tensor>,
+        g: Tensor,
+        u: Tensor,
+        m: Option<Tensor>,
+        zd: Option<Tensor>,
+    },
+    Moe(crate::moe::MoeSaved),
 }
 
 fn f32(t: &Tensor) -> Result<Tensor> {
@@ -183,7 +191,7 @@ pub fn rms_bwd(x: &Tensor, w: &Tensor, dy: &Tensor, eps: f32) -> Result<Tensor> 
 }
 
 /// Проекция с адаптером: `(y в compute-типе x, z адаптера)`.
-fn proj(w: &Weights, q: &QLinear, lora: Option<&LoraLayer>, x: &Tensor, bias: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+pub(crate) fn proj(w: &Weights, q: &QLinear, lora: Option<&LoraLayer>, x: &Tensor, bias: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
     let mut y = w.forward(q, x)?;
     if let Some(b) = bias {
         y = y.broadcast_add(&same_dtype(b, &y)?)?;
@@ -199,7 +207,7 @@ fn proj(w: &Weights, q: &QLinear, lora: Option<&LoraLayer>, x: &Tensor, bias: Op
 
 /// `dx` проекции: замороженный вес плюс вклад адаптера (градиенты адаптера
 /// копятся в нём).
-fn proj_bwd(w: &Weights, q: &QLinear, lora: Option<&mut LoraLayer>, x32: Option<&Tensor>, z: Option<&Tensor>, dy: &Tensor) -> Result<Tensor> {
+pub(crate) fn proj_bwd(w: &Weights, q: &QLinear, lora: Option<&mut LoraLayer>, x32: Option<&Tensor>, z: Option<&Tensor>, dy: &Tensor) -> Result<Tensor> {
     let mut dx = w.backward_input(q, dy)?;
     if let Some(l) = lora {
         let (x32, z) = x32.zip(z).ok_or_else(|| other("proj_bwd: нет сохранённых входов LoRA"))?;
@@ -349,8 +357,10 @@ fn attn_backward(core: AttnCore, d_o: &Tensor, nkv: usize, group: usize, scale: 
 
 /// Прямой проход слоя. `x` — `[T, H]` в compute-типе.
 pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w: &Weights) -> Result<(Tensor, Saved)> {
-    if !matches!(b.mlp.activation, Activation::Silu) {
-        return Err(other("обучение: пока только SwiGLU-MLP"));
+    if let FfnRefs::Dense(m) = &b.mlp {
+        if !matches!(m.activation, Activation::Silu) {
+            return Err(other("обучение: пока только SwiGLU-MLP"));
+        }
     }
     let dev = x.device();
     let n1 = crate::prof::prof(dev, "norm_fwd", || rms_norm(x, b.pre_attn_norm, b.rms_eps))?;
@@ -372,10 +382,13 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
 
     // ── MLP ──
     let n2 = crate::prof::prof(dev, "norm_fwd", || rms_norm(&h, b.pre_mlp_norm, b.rms_eps))?;
-    let (g, zg) = proj(w, b.mlp.gate_proj, lora.gate.as_ref(), &n2, None)?;
-    let (u, zu) = proj(w, b.mlp.up_proj, lora.up.as_ref(), &n2, None)?;
-    let m = crate::prof::prof(dev, "act_fwd", || g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u))))?;
-    let (d, zd) = proj(w, b.mlp.down_proj, lora.down.as_ref(), &m, None)?;
+    let (d, ffn) = match &b.mlp {
+        FfnRefs::Dense(mlp) => dense_fwd(mlp, lora, n2, w)?,
+        FfnRefs::Moe(moe) => {
+            let (d, s) = crate::prof::prof(dev, "moe_fwd", || crate::moe::forward(moe, lora, &n2, w))?;
+            (d, FfnSaved::Moe(s))
+        }
+    };
     let d2 = match b.post_mlp_norm {
         Some(w) => rms_norm(&d, w, b.post_eps)?,
         None => d.clone(),
@@ -389,6 +402,19 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
         seg: ctx.seg.clone(),
         a: b.post_attn_norm.map(|_| a),
         h,
+        ffn,
+        d: b.post_mlp_norm.map(|_| d),
+    };
+    Ok((out, saved))
+}
+
+fn dense_fwd(mlp: &MlpRefs<'_>, lora: &BlockLora, n2: Tensor, w: &Weights) -> Result<(Tensor, FfnSaved)> {
+    let dev = n2.device();
+    let (g, zg) = proj(w, mlp.gate_proj, lora.gate.as_ref(), &n2, None)?;
+    let (u, zu) = proj(w, mlp.up_proj, lora.up.as_ref(), &n2, None)?;
+    let m = crate::prof::prof(dev, "act_fwd", || g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|s| s.mul(&u))))?;
+    let (d, zd) = proj(w, mlp.down_proj, lora.down.as_ref(), &m, None)?;
+    let saved = FfnSaved::Dense {
         n2: (lora.gate.is_some() || lora.up.is_some()).then_some(n2),
         zg,
         zu,
@@ -396,9 +422,8 @@ pub fn forward(b: &BlockRefs<'_>, lora: &BlockLora, x: &Tensor, ctx: &SeqCtx, w:
         u,
         m: lora.down.is_some().then_some(m),
         zd,
-        d: b.post_mlp_norm.map(|_| d),
     };
-    Ok((out, saved))
+    Ok((d, saved))
 }
 
 /// Обратный проход слоя: `dout` — `[T, H]` F32, результат — `dx` F32.
@@ -408,13 +433,20 @@ pub fn backward(b: &BlockRefs<'_>, lora: &mut BlockLora, s: Saved, dout: &Tensor
         (Some(w), Some(d)) => rms_bwd(d, w, dout, b.post_eps)?,
         _ => dout.clone(),
     };
-    let dm = proj_bwd(w, b.mlp.down_proj, lora.down.as_mut(), s.m.as_ref(), s.zd.as_ref(), &dd)?;
-    let shp = s.g.dims().to_vec();
-    let gu = Tensor::train_op(TrainOp::SiluMulBwd, &[&s.g, &s.u, &dm], &[(shp.clone(), DType::F32), (shp, DType::F32)])?;
-    let (dg, du) = (&gu[0], &gu[1]);
-    let dn2 = proj_bwd(w, b.mlp.gate_proj, lora.gate.as_mut(), s.n2.as_ref(), s.zg.as_ref(), dg)?
-        .add(&proj_bwd(w, b.mlp.up_proj, lora.up.as_mut(), s.n2.as_ref(), s.zu.as_ref(), du)?)?;
-    drop(gu);
+    let dn2 = match (&b.mlp, s.ffn) {
+        (FfnRefs::Dense(mlp), FfnSaved::Dense { n2, zg, zu, g, u, m, zd }) => {
+            let dm = proj_bwd(w, mlp.down_proj, lora.down.as_mut(), m.as_ref(), zd.as_ref(), &dd)?;
+            let shp = g.dims().to_vec();
+            let gu = Tensor::train_op(TrainOp::SiluMulBwd, &[&g, &u, &dm], &[(shp.clone(), DType::F32), (shp, DType::F32)])?;
+            let (dg, du) = (&gu[0], &gu[1]);
+            proj_bwd(w, mlp.gate_proj, lora.gate.as_mut(), n2.as_ref(), zg.as_ref(), dg)?
+                .add(&proj_bwd(w, mlp.up_proj, lora.up.as_mut(), n2.as_ref(), zu.as_ref(), du)?)?
+        }
+        (FfnRefs::Moe(moe), FfnSaved::Moe(ms)) => {
+            crate::prof::prof(dout.device(), "moe_bwd", || crate::moe::backward(moe, lora, ms, &dd, w))?
+        }
+        _ => return Err(other("обучение: сохранённое FFN не совпадает с видом слоя")),
+    };
     let dh = dout.add(&rms_bwd(&s.h, b.pre_mlp_norm, &dn2, b.rms_eps)?)?;
 
     // ── Смешивание ──

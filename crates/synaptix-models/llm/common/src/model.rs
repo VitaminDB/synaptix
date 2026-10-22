@@ -72,7 +72,9 @@ fn prof_on() -> bool {
 
 #[inline]
 fn prof<T>(device: Device, name: &'static str, f: impl FnOnce() -> T) -> T {
-    if !prof_on() {
+    // Под захватом графа синхронизация запрещена: она рушит захват, и упавший
+    // захват оставлял поток службы непригодным для всех моделей.
+    if !prof_on() || synaptix_core::device::cuda::graph_capturing() {
         return f();
     }
     if device.is_cuda() {
@@ -250,6 +252,14 @@ impl Ffn {
         match self {
             Ffn::Dense(m) => Some(m),
             Ffn::Moe(_) => None,
+        }
+    }
+
+    /// MoE-слой, если FFN — MoE.
+    pub fn moe(&self) -> Option<&crate::moe::MoeFfn> {
+        match self {
+            Ffn::Moe(m) => Some(m),
+            Ffn::Dense(_) => None,
         }
     }
 
@@ -1675,10 +1685,20 @@ impl DecoderModel {
         self.blocks.len()
     }
 
-    /// Вес одного блока в байтах (по первому — они одинаковы по форме).
-    /// Единица планирования частичного оффлоада.
+    /// Средний вес блока в байтах — единица планирования частичного
+    /// оффлоада. Блоки бывают разными (полное и линейное внимание, MLP в
+    /// MXFP8 у «чувствительных» слоёв против NVFP4 у прочих), поэтому не по
+    /// первому.
     pub fn block_bytes(&self) -> usize {
-        self.blocks.first().map(Block::bytes).unwrap_or(0)
+        if self.blocks.is_empty() {
+            return 0;
+        }
+        self.blocks.iter().map(Block::bytes).sum::<usize>() / self.blocks.len()
+    }
+
+    /// Самый тяжёлый блок: под столько на карте нужен буфер подвоза.
+    pub fn block_bytes_max(&self) -> usize {
+        self.blocks.iter().map(Block::bytes).max().unwrap_or(0)
     }
 
     /// Сколько блоков сейчас живёт на устройстве.
