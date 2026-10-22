@@ -196,7 +196,12 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let frame_count = args
         .frames
         .unwrap_or_else(|| h3::config::frames_for_duration(args.duration));
-    let geometry = h3::pipeline::Geometry::new(args.width, args.height, frame_count);
+    // Кратно 32: VAE ×16 и патч DiT 2×2.
+    let snap = |v: usize| (v / 32).max(1) * 32;
+    if snap(args.width) != args.width || snap(args.height) != args.height {
+        eprintln!("[h3] кадр {}x{} → {}x{} (кратно 32)", args.width, args.height, snap(args.width), snap(args.height));
+    }
+    let geometry = h3::pipeline::Geometry::new(snap(args.width), snap(args.height), frame_count);
     eprintln!(
         "[h3] {}x{} {} кадров ({:.2} с), латент {}x{}x{}, аудио {} латент-кадров",
         geometry.width,

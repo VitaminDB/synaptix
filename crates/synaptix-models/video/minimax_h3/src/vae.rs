@@ -479,11 +479,39 @@ pub fn vit_rope_angles(ids: &[[f32; 3]], rope_dim: usize, theta: f32, suffix: us
     (angles, half)
 }
 
+/// Формат весов резидентных ViT-блоков декодера VAE: MXFP8-GEMM по
+/// умолчанию (720p × 10 с: декод 68.6 → 40.8 с, PSNR 46 дБ к BF16);
+/// `SYN_H3_VAE_QUANT=none` — как есть.
+fn vae_quant() -> Option<DType> {
+    static Q: std::sync::OnceLock<Option<DType>> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| match std::env::var("SYN_H3_VAE_QUANT").as_deref() {
+        Ok("none") | Ok("bf16") | Ok("0") => None,
+        _ => Some(DType::MXFP8),
+    })
+}
+
+/// Квантованные проекции блока (в порядке qkv, out / w1, w2).
+type QPair = Option<Box<[synaptix_nn::quant_linear::QuantLinear; 2]>>;
+
+fn quant_pair(w0: &Tensor, b0: &Tensor, w1: &Tensor, b1: &Tensor, q: DType) -> R<QPair> {
+    use synaptix_nn::quant_linear::QuantLinear;
+    let dt = b0.dtype();
+    let a = QuantLinear::build(w0.clone(), Some(b0.clone()), q, dt)?;
+    let b = QuantLinear::build(w1.clone(), Some(b1.clone()), q, dt)?;
+    Ok((a.is_quant() && b.is_quant()).then(|| Box::new([a, b])))
+}
+
+fn qfwd(l: &synaptix_nn::quant_linear::QuantLinear, x: &Tensor) -> R<Tensor> {
+    use synaptix_nn::module::Module;
+    l.forward(x)
+}
+
 struct VitAttention {
     qkv_w: Tensor,
     qkv_b: Tensor,
     out_w: Tensor,
     out_b: Tensor,
+    q: QPair,
     heads: usize,
     dim_head: usize,
     eps: f32,
@@ -497,6 +525,7 @@ impl VitAttention {
             qkv_b: self.qkv_b.to_dtype(dt)?,
             out_w: self.out_w.to_dtype(dt)?,
             out_b: self.out_b.to_dtype(dt)?,
+            q: None,
             heads: self.heads,
             dim_head: self.dim_head,
             eps: self.eps,
@@ -515,6 +544,7 @@ impl VitAttention {
             qkv_b: w.get_as(&format!("{prefix}.to_qkv.bias"), dtype)?,
             out_w: w.get_as(&format!("{prefix}.to_out.weight"), dtype)?,
             out_b: w.get_as(&format!("{prefix}.to_out.bias"), dtype)?,
+            q: None,
             heads: cfg.heads,
             dim_head: cfg.dim_head,
             eps: cfg.eps,
@@ -576,9 +606,11 @@ impl VitAttention {
         }
         let s = x.dims()[0];
         let (h, d) = (self.heads, self.dim_head);
-        let qkv = x
-            .linear_bias_residual(&self.qkv_w, Some(&self.qkv_b), None)?
-            .reshape(vec![1, s, h, 3 * d])?;
+        let qkv = match &self.q {
+            Some(q) => qfwd(&q[0], x)?,
+            None => x.linear_bias_residual(&self.qkv_w, Some(&self.qkv_b), None)?,
+        }
+        .reshape(vec![1, s, h, 3 * d])?;
         let ones = Tensor::ones(vec![d], DType::F32, x.device())?;
         let nr = |t: Tensor| t.qk_norm_rope(&ones, &rope.cos, &rope.sin, 0, rope.rot_dim, self.eps);
         let Ok(q) = nr(qkv.narrow(3, 0, d)?.contiguous()?) else { return Ok(None) };
@@ -587,7 +619,10 @@ impl VitAttention {
         drop(qkv);
         let Ok(attn) = q.flash_attention_bshd(&k, &v, self.scale, false) else { return Ok(None) };
         let attn = attn.reshape(vec![s, h * d])?;
-        Ok(Some(attn.linear_bias_residual(&self.out_w, Some(&self.out_b), None)?))
+        Ok(Some(match &self.q {
+            Some(q) => qfwd(&q[1], &attn)?,
+            None => attn.linear_bias_residual(&self.out_w, Some(&self.out_b), None)?,
+        }))
     }
 }
 
@@ -612,6 +647,7 @@ struct VitFeedForward {
     b1: Tensor,
     w2: Tensor,
     b2: Tensor,
+    q: QPair,
     inner: usize,
 }
 
@@ -622,6 +658,7 @@ impl VitFeedForward {
             b1: self.b1.to_dtype(dt)?,
             w2: self.w2.to_dtype(dt)?,
             b2: self.b2.to_dtype(dt)?,
+            q: None,
             inner: self.inner,
         })
     }
@@ -634,17 +671,24 @@ impl VitFeedForward {
             b1: w.get_as(&format!("{prefix}.w1.bias"), dtype)?,
             w2: w.get_as(&format!("{prefix}.w2.weight"), dtype)?,
             b2: w.get_as(&format!("{prefix}.w2.bias"), dtype)?,
+            q: None,
             inner,
         })
     }
 
     fn forward(&self, x: &Tensor) -> R<Tensor> {
-        let h = x.linear_bias_residual(&self.w1, Some(&self.b1), None)?;
+        let h = match &self.q {
+            Some(q) => qfwd(&q[0], x)?,
+            None => x.linear_bias_residual(&self.w1, Some(&self.b1), None)?,
+        };
         let gate = h.narrow(1, 0, self.inner)?.contiguous()?;
         let up = h.narrow(1, self.inner, self.inner)?.contiguous()?;
         drop(h);
         let act = gate.silu_and_mul(&up)?;
-        act.linear_bias_residual(&self.w2, Some(&self.b2), None)
+        match &self.q {
+            Some(q) => qfwd(&q[1], &act),
+            None => act.linear_bias_residual(&self.w2, Some(&self.b2), None),
+        }
     }
 }
 
@@ -763,7 +807,20 @@ impl VaeDecoder {
                     break;
                 }
             }
-            blocks.push(VitBlock::load(w, i, &vit, dtype)?);
+            let mut b = VitBlock::load(w, i, &vit, dtype)?;
+            if let Some(q) = vae_quant().filter(|_| device.is_cuda()) {
+                let a = &mut b.attn;
+                a.q = quant_pair(&a.qkv_w, &a.qkv_b, &a.out_w, &a.out_b, q)?;
+                let f = &mut b.ff;
+                f.q = quant_pair(&f.w1, &f.b1, &f.w2, &f.b2, q)?;
+                if a.q.is_some() && f.q.is_some() {
+                    // плотные веса больше не нужны — пустышки вместо них
+                    for t in [&mut a.qkv_w, &mut a.out_w, &mut f.w1, &mut f.w2] {
+                        *t = Tensor::zeros(vec![1], dtype, device)?;
+                    }
+                }
+            }
+            blocks.push(b);
         }
         Ok(Self {
             post_quant: CausalConv3d::load(w, "post_quant_conv", (0, 0, 0), (1, 1, 1), dtype)?,

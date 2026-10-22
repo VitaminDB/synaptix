@@ -132,7 +132,8 @@ impl H3Model {
     pub fn encode(&self, size: Size, prompt: &str, negative: Option<&str>, first: Option<&Path>, last: Option<&Path>, refs: &[PathBuf], ref_size: RefSize) -> R<H3Cond> {
         setup()?;
         let device = self.device;
-        let snap = |v: usize| (v / 16).max(1) * 16;
+        // Кратно 32: VAE ×16 и патч DiT 2×2 (720 → 704; при 16 падало на reshape).
+        let snap = |v: usize| (v / 32).max(1) * 32;
         let width = snap(if size.width > 0 { size.width } else { 1344 });
         let height = snap(if size.height > 0 { size.height } else { 768 });
         let ref_sources = refs.iter().map(|p| h3::refs::RefSource::from_path(p, true)).collect::<Result<Vec<_>, _>>().map_err(err)?;

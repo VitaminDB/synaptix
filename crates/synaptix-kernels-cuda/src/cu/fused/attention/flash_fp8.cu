@@ -65,6 +65,17 @@ __device__ __forceinline__ void fa8_mma_e4m3(float* d, const unsigned* a, unsign
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+// e4m3 с f16-накоплением: на sm_120 вдвое быстрее f32 (473 против 238 TFLOP/s).
+// d[0] — строка g (столбцы 2t, 2t+1), d[1] — строка g+8.
+__device__ __forceinline__ void fa8_mma_e4m3_h(unsigned* d, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ float2 fa8_h2f(unsigned u) {
+  return __half22float2(*reinterpret_cast<__half2*>(&u));
+}
 __device__ __forceinline__ void fa8_mma_bf16(float* d, const unsigned* a, unsigned b0, unsigned b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32." FA8_MMA_T "." FA8_MMA_T ".f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -130,7 +141,8 @@ extern "C" __global__ void fa8_col_total(const float* sum, float* total, int BH,
 // Строки [B,S,H,128] → e4m3 той же раскладки + шкала [B,H,S] (·mul).
 // total != null — вычесть среднее канала (сумма [B·H,128] / S). Варп = строка.
 extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* total, unsigned char* out,
-                                          float* sc, int B, int S, int H, float mul) {
+                                          float* sc, int B, int S, int H, float mul, float qmax, int sstride,
+                                          signed char* ke) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   long long r = (long long)blockIdx.x * 8 + warp;
   if (r >= (long long)B * S * H) return;
@@ -149,9 +161,20 @@ extern "C" __global__ void fa8_quant_rows(const fa8_t* x, const float* total, un
   }
   float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-  float scale = fmaxf(amax / 448.0f, 1e-12f), inv = 1.0f / scale;
+  float scale = fmaxf(amax / qmax, 1e-12f), inv = 1.0f / scale;
+  int e2 = 0;
+  if (ke) {
+    // Шкала — степень двойки (байт экспоненты): |x| ≤ qmax сохраняется,
+    // умножение на шкалу в ядре точное, а буфер шкал в smem вчетверо меньше.
+    e2 = max(-126, min(126, (int)ceilf(log2f(scale))));
+    scale = __int_as_float((e2 + 127) << 23);
+    inv = __int_as_float((127 - e2) << 23);
+  }
   *reinterpret_cast<unsigned*>(out + r * FA8_D + lane * 4) = fa8_pack4(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv);
-  if (lane == 0) sc[((size_t)b * H + h) * S + s] = scale * mul;
+  if (lane == 0) {
+    sc[((size_t)b * H + h) * sstride + s] = scale * mul;
+    if (ke) ke[((size_t)b * H + h) * sstride + s] = (signed char)e2;
+  }
 }
 
 // Ключ на позиции p (0..63) блока для PV8: в группе 16 позиция q = t*4+i ↔
@@ -166,7 +189,7 @@ __device__ __forceinline__ int fa8_perm(int p) {
 // шкала канала = amax/448; vsc[b,h,d] = шкала/448 (масштаб P·448 учтён).
 // Грид (Spad/64, B·H), блок 128 (по d).
 extern "C" __global__ void fa8_quant_vt(const fa8_t* v, const float* amax, unsigned char* vt,
-                                        float* vsc, int S, int H, int Spad) {
+                                        float* vsc, int S, int H, int Spad, float vq, float ps) {
   __shared__ fa8_t tile[FA8_BN][FA8_D + 8];
   int bh = blockIdx.y, b = bh / H, h = bh % H, d = threadIdx.x;
   int s0 = blockIdx.x * FA8_BN;
@@ -178,8 +201,8 @@ extern "C" __global__ void fa8_quant_vt(const fa8_t* v, const float* amax, unsig
   }
   __syncthreads();
   float a = amax[(size_t)bh * FA8_D + d];
-  float scale = fmaxf(a / 448.0f, 1e-12f), inv = 1.0f / scale;
-  if (blockIdx.x == 0) vsc[(size_t)bh * FA8_D + d] = scale / 448.0f;
+  float scale = fmaxf(a / vq, 1e-12f), inv = 1.0f / scale;
+  if (blockIdx.x == 0) vsc[(size_t)bh * FA8_D + d] = scale / ps;
   unsigned w[16];
   for (int k = 0; k < 16; k++) {
     float x[4];
@@ -191,16 +214,26 @@ extern "C" __global__ void fa8_quant_vt(const fa8_t* v, const float* amax, unsig
 }
 
 // ── Главное ядро ──────────────────────────────────────────────────────────
-template <int PV8>
+// ACC16: обе свёртки — e4m3 с f16-накоплением. Чтобы f16 (≤ 65504) не
+// переполнился: Q и K квантуются в |x| ≤ 16 (128 произведений ≤ 32768), P —
+// ·256, V — в |x| ≤ 3.9 (64 ключа плитки ≤ 63898); вклад плитки P·V копится в
+// f32, как и прежде.
+template <int PV8, int ACC16>
 __device__ __forceinline__ void fa8_main_impl(
     const unsigned char* __restrict__ qq, const float* __restrict__ qs,
     const unsigned char* __restrict__ kq, const float* __restrict__ ks,
     const void* __restrict__ vptr, const float* __restrict__ vsc,
     fa8_t* __restrict__ out, int B, int H, int Sq, int Skv, int Spad) {
   extern __shared__ __align__(128) unsigned char smem[];
-  unsigned char* sQ = smem;
-  unsigned char* sK = smem + 8192;
-  unsigned char* sV = smem + 8192 + 16384;
+  // PV8: K 2×8К | V 2×8К | шкалы K 2×256 Б; Q (8К) живёт во втором буфере V
+  // до первой подкачки — 33 КБ на блок, три блока на SM (было 41 КБ и два).
+  // Шкалы ключей приезжают с плиткой K (раньше — ld.global в горячем цикле).
+  unsigned char* sK = PV8 ? smem : smem + 8192;
+  unsigned char* sV = PV8 ? smem + 16384 : smem + 8192 + 16384;
+  unsigned char* sQ = PV8 ? sV + 8192 : smem;
+  float* sKs = reinterpret_cast<float*>(smem + 32768);
+  // ACC16: экспоненты шкал K (байт на ключ), 2×64 Б — блок 32.9 КБ, три на SM.
+  const signed char* sKe = reinterpret_cast<const signed char*>(smem + 32768);
   const int VBUF = PV8 ? 8192 : 16384;
 
   int bh = blockIdx.y, b = bh / H, h = bh % H;
@@ -222,6 +255,14 @@ __device__ __forceinline__ void fa8_main_impl(
       fa8_cp16(fa8_smem(dk + r * 128 + ((ch ^ (r & 7)) << 4)), kbase + (size_t)min(s, Skv - 1) * rs + ch * 16, s < Skv);
     }
     unsigned char* dv = sV + buf * VBUF;
+    if (ACC16) {
+      if (tid < 4)
+        fa8_cp16(fa8_smem(smem + 32768 + buf * 64 + tid * 16),
+                 reinterpret_cast<const unsigned char*>(ks) + (size_t)bh * Spad + k0 + tid * 16, true);
+    } else if (PV8 && tid < 16) {
+      // шкалы K: строка bh шагом Spad (кратно 64) — 16 копий по 16 Б
+      fa8_cp16(fa8_smem(sKs + buf * 64 + tid * 4), ks + (size_t)bh * Spad + k0 + tid * 4, true);
+    }
     if (PV8) {
       const unsigned char* vt = (const unsigned char*)vptr + (size_t)bh * FA8_D * Spad + k0;
       for (int c = tid; c < 512; c += 128) {
@@ -260,6 +301,8 @@ __device__ __forceinline__ void fa8_main_impl(
         int ch = k * 2 + (lane >> 4);
         fa8_ldsm4(qf[k][0], qf[k][1], qf[k][2], qf[k][3], fa8_smem(sQ + r * 128 + ((ch ^ (r & 7)) << 4)));
       }
+      // Q лежит в буфере V №1, куда сейчас поедет следующая плитка.
+      if (PV8) __syncthreads();
     }
     if (j + 1 < nblk) {
       load_kv(j + 1, (j + 1) & 1);
@@ -273,26 +316,59 @@ __device__ __forceinline__ void fa8_main_impl(
 #pragma unroll
     for (int nt = 0; nt < 8; nt++) {
       s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+      unsigned sh[2] = {0u, 0u};
 #pragma unroll
       for (int kp = 0; kp < 2; kp++) {
         int r = nt * 8 + (lane & 7);
         int ch = kp * 4 + (lane >> 3);
         unsigned b0, b1, b2, b3;
         fa8_ldsm4(b0, b1, b2, b3, fa8_smem(cK + r * 128 + ((ch ^ (r & 7)) << 4)));
-        fa8_mma_e4m3(s[nt], qf[kp * 2], b0, b1);
-        fa8_mma_e4m3(s[nt], qf[kp * 2 + 1], b2, b3);
+        if (ACC16) {
+          fa8_mma_e4m3_h(sh, qf[kp * 2], b0, b1);
+          fa8_mma_e4m3_h(sh, qf[kp * 2 + 1], b2, b3);
+        } else {
+          fa8_mma_e4m3(s[nt], qf[kp * 2], b0, b1);
+          fa8_mma_e4m3(s[nt], qf[kp * 2 + 1], b2, b3);
+        }
+      }
+      if (ACC16) {
+        float2 a = fa8_h2f(sh[0]), c = fa8_h2f(sh[1]);
+        s[nt][0] = a.x; s[nt][1] = a.y; s[nt][2] = c.x; s[nt][3] = c.y;
       }
     }
     // Шкалы ключей и маска хвоста.
     float mx0 = FA8_NEG_INF, mx1 = FA8_NEG_INF;
     int kb = j * FA8_BN;
+    if (ACC16) {
+      // s = acc·k̂ (шкала Q > 0 выносится: max(s·q̂) = q̂·max(s)); q̂ входит в
+      // FFMA показателя, множитель P (·256) — в его сдвиг (+8 в log2).
+#pragma unroll
+      for (int nt = 0; nt < 8; nt++) {
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          int col = kb + nt * 8 + t * 2 + e;
+          if (col < Skv) {
+            float kv = __int_as_float(((int)sKe[buf * 64 + nt * 8 + t * 2 + e] + 127) << 23);
+            s[nt][e] *= kv;
+            s[nt][2 + e] *= kv;
+          } else {
+            s[nt][e] = FA8_NEG_INF;
+            s[nt][2 + e] = FA8_NEG_INF;
+          }
+          mx0 = fmaxf(mx0, s[nt][e]);
+          mx1 = fmaxf(mx1, s[nt][2 + e]);
+        }
+      }
+      mx0 *= qsc0;
+      mx1 *= qsc1;
+    } else {
 #pragma unroll
     for (int nt = 0; nt < 8; nt++) {
 #pragma unroll
       for (int e = 0; e < 2; e++) {
         int col = kb + nt * 8 + t * 2 + e;
         if (col < Skv) {
-          float kv = ks[(size_t)bh * Skv + col];
+          float kv = PV8 ? sKs[buf * 64 + nt * 8 + t * 2 + e] : ks[(size_t)bh * Skv + col];
           s[nt][e] *= qsc0 * kv;
           s[nt][2 + e] *= qsc1 * kv;
         } else {
@@ -302,6 +378,7 @@ __device__ __forceinline__ void fa8_main_impl(
         mx0 = fmaxf(mx0, s[nt][e]);
         mx1 = fmaxf(mx1, s[nt][2 + e]);
       }
+    }
     }
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
@@ -314,6 +391,19 @@ __device__ __forceinline__ void fa8_main_impl(
     m1 = mn1;
     l0 *= al0;
     l1 *= al1;
+    if (ACC16) {
+      // p·256 = 2^(s·q̂ − m + 8); l копится в тех же единицах.
+      float o0 = 8.f - sh0, o1 = 8.f - sh1;
+#pragma unroll
+      for (int nt = 0; nt < 8; nt++) {
+        s[nt][0] = fa8_exp2(fmaf(s[nt][0], qsc0, o0));
+        s[nt][1] = fa8_exp2(fmaf(s[nt][1], qsc0, o0));
+        s[nt][2] = fa8_exp2(fmaf(s[nt][2], qsc1, o1));
+        s[nt][3] = fa8_exp2(fmaf(s[nt][3], qsc1, o1));
+        l0 += s[nt][0] + s[nt][1];
+        l1 += s[nt][2] + s[nt][3];
+      }
+    } else {
 #pragma unroll
     for (int nt = 0; nt < 8; nt++) {
       s[nt][0] = fa8_exp2(s[nt][0] - sh0);
@@ -323,6 +413,10 @@ __device__ __forceinline__ void fa8_main_impl(
       l0 += s[nt][0] + s[nt][1];
       l1 += s[nt][2] + s[nt][3];
     }
+    }
+    // Максимум строки обычно уже устоялся — умножение на 1 пропускается
+    // (побитово то же).
+    if (__any_sync(0xffffffffu, al0 != 1.f || al1 != 1.f)) {
 #pragma unroll
     for (int dt = 0; dt < 16; dt++) {
       o[dt][0] *= al0;
@@ -330,16 +424,18 @@ __device__ __forceinline__ void fa8_main_impl(
       o[dt][2] *= al1;
       o[dt][3] *= al1;
     }
+    }
 
     if (PV8) {
       unsigned pa[2][4];
+      const float PS = ACC16 ? 1.f : 448.f;  // ACC16: ·256 уже в экспоненте
 #pragma unroll
       for (int c = 0; c < 2; c++) {
         const float* t0 = s[c * 4], *t1 = s[c * 4 + 1], *t2 = s[c * 4 + 2], *t3 = s[c * 4 + 3];
-        pa[c][0] = fa8_pack4(t0[0] * 448.f, t0[1] * 448.f, t1[0] * 448.f, t1[1] * 448.f);
-        pa[c][1] = fa8_pack4(t0[2] * 448.f, t0[3] * 448.f, t1[2] * 448.f, t1[3] * 448.f);
-        pa[c][2] = fa8_pack4(t2[0] * 448.f, t2[1] * 448.f, t3[0] * 448.f, t3[1] * 448.f);
-        pa[c][3] = fa8_pack4(t2[2] * 448.f, t2[3] * 448.f, t3[2] * 448.f, t3[3] * 448.f);
+        pa[c][0] = fa8_pack4(t0[0] * PS, t0[1] * PS, t1[0] * PS, t1[1] * PS);
+        pa[c][1] = fa8_pack4(t0[2] * PS, t0[3] * PS, t1[2] * PS, t1[3] * PS);
+        pa[c][2] = fa8_pack4(t2[0] * PS, t2[1] * PS, t3[0] * PS, t3[1] * PS);
+        pa[c][3] = fa8_pack4(t2[2] * PS, t2[3] * PS, t3[2] * PS, t3[3] * PS);
       }
 #pragma unroll
       for (int dt = 0; dt < 16; dt++) {
@@ -347,13 +443,24 @@ __device__ __forceinline__ void fa8_main_impl(
         int ch = lane >> 3;
         unsigned b0, b1, b2, b3;
         fa8_ldsm4(b0, b1, b2, b3, fa8_smem(cV + d * 64 + ((ch ^ ((d >> 1) & 3)) << 4)));
-        float ob[4] = {0.f, 0.f, 0.f, 0.f};
-        fa8_mma_e4m3(ob, pa[0], b0, b1);
-        fa8_mma_e4m3(ob, pa[1], b2, b3);
-        o[dt][0] += ob[0];
-        o[dt][1] += ob[1];
-        o[dt][2] += ob[2];
-        o[dt][3] += ob[3];
+        if (ACC16) {
+          unsigned oh[2] = {0u, 0u};
+          fa8_mma_e4m3_h(oh, pa[0], b0, b1);
+          fa8_mma_e4m3_h(oh, pa[1], b2, b3);
+          float2 a = fa8_h2f(oh[0]), c = fa8_h2f(oh[1]);
+          o[dt][0] += a.x;
+          o[dt][1] += a.y;
+          o[dt][2] += c.x;
+          o[dt][3] += c.y;
+        } else {
+          float ob[4] = {0.f, 0.f, 0.f, 0.f};
+          fa8_mma_e4m3(ob, pa[0], b0, b1);
+          fa8_mma_e4m3(ob, pa[1], b2, b3);
+          o[dt][0] += ob[0];
+          o[dt][1] += ob[1];
+          o[dt][2] += ob[2];
+          o[dt][3] += ob[3];
+        }
       }
     } else {
 #pragma unroll
@@ -399,10 +506,15 @@ __device__ __forceinline__ void fa8_main_impl(
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_qk_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
     const fa8_t* v, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
-  fa8_main_impl<0>(qq, qs, kq, ks, v, vsc, out, B, H, Sq, Skv, Spad);
+  fa8_main_impl<0, 0>(qq, qs, kq, ks, v, vsc, out, B, H, Sq, Skv, Spad);
 }
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_full_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
     const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
-  fa8_main_impl<1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
+  fa8_main_impl<1, 0>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
+}
+extern "C" __global__ void __launch_bounds__(128) flash_fp8_a16_hd128_bshd(
+    const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
+    const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
+  fa8_main_impl<1, 1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
 }

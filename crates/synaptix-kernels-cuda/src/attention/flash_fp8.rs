@@ -21,13 +21,36 @@ pub struct FlashFp8Kernels {
     quant_vt: CudaFunction,
     main_qk: CudaFunction,
     main_full: CudaFunction,
+    main_a16: CudaFunction,
+}
+
+/// Режим FP8-внимания.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fa8Mode {
+    /// QKᵀ e4m3, P·V bf16.
+    Qk,
+    /// Обе свёртки e4m3, f32-накопление.
+    Full,
+    /// Обе свёртки e4m3 с f16-накоплением (вдвое быстрее mma на sm_120);
+    /// кванты Q/K/V и P сужены, чтобы f16 не переполнялся.
+    Acc16,
+}
+
+/// `full` → [`Fa8Mode::Acc16`], если не выключено `SYN_FA8_ACC16=0`.
+pub fn full_mode() -> Fa8Mode {
+    static M: OnceLock<Fa8Mode> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("SYN_FA8_ACC16").as_deref() {
+        Ok("0") => Fa8Mode::Full,
+        _ => Fa8Mode::Acc16,
+    })
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashFp8Kernels>)>>> = OnceLock::new();
 static CACHE_F16: OnceLock<Mutex<Vec<(usize, Arc<FlashFp8Kernels>)>>> = OnceLock::new();
 
 const SMEM_QK: u32 = 8192 + 16384 + 32768;
-const SMEM_FULL: u32 = 8192 + 16384 + 16384;
+const SMEM_FULL: u32 = 16384 + 16384 + 512;
+const SMEM_A16: u32 = 16384 + 16384 + 128;
 
 impl FlashFp8Kernels {
     pub fn for_context(ctx: &Arc<CudaContext>) -> Result<Arc<Self>> {
@@ -54,7 +77,8 @@ impl FlashFp8Kernels {
         let module = compile_module_req(ctx, src, name, opts, crate::caps::Feature::Fp8Mma)?;
         let main_qk = load_fn(&module, "flash_fp8_qk_hd128_bshd")?;
         let main_full = load_fn(&module, "flash_fp8_full_hd128_bshd")?;
-        for (f, s) in [(&main_qk, SMEM_QK), (&main_full, SMEM_FULL)] {
+        let main_a16 = load_fn(&module, "flash_fp8_a16_hd128_bshd")?;
+        for (f, s) in [(&main_qk, SMEM_QK), (&main_full, SMEM_FULL), (&main_a16, SMEM_A16)] {
             f.set_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, s as i32)
                 .map_err(|e| SynaptixError::Cuda(format!("flash_fp8 smem: {e:?}")))?;
         }
@@ -66,6 +90,7 @@ impl FlashFp8Kernels {
             quant_vt: load_fn(&module, "fa8_quant_vt")?,
             main_qk,
             main_full,
+            main_a16,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -94,6 +119,30 @@ pub fn flash_fp8_bshd(
     scale: f32,
     full: bool,
 ) -> Result<()> {
+    let mode = if full { full_mode() } else { Fa8Mode::Qk };
+    flash_fp8_bshd_mode(kern, stream, (q, q_off), (k, k_off), (v, v_off), out, b, h, sq, skv, scale, mode)
+}
+
+/// То же с явным режимом.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_fp8_bshd_mode(
+    kern: &FlashFp8Kernels,
+    stream: &Arc<CudaStream>,
+    (q, q_off): (&CudaSlice<u8>, usize),
+    (k, k_off): (&CudaSlice<u8>, usize),
+    (v, v_off): (&CudaSlice<u8>, usize),
+    out: &mut CudaSlice<u8>,
+    b: usize,
+    h: usize,
+    sq: usize,
+    skv: usize,
+    scale: f32,
+    mode: Fa8Mode,
+) -> Result<()> {
+    let full = mode != Fa8Mode::Qk;
+    let a16 = mode == Fa8Mode::Acc16;
+    let qmax: f32 = if a16 { 16.0 } else { 448.0 };
+    let (vq, ps): (f32, f32) = if a16 { (3.9, 1.0) } else { (448.0, 448.0) };
     if b == 0 || h == 0 || sq == 0 || skv == 0 {
         return Ok(());
     }
@@ -131,11 +180,15 @@ pub fn flash_fp8_bshd(
     let mut qq = alloc(b * sq * h * d)?;
     let mut kq = alloc(b * skv * h * d)?;
     let mut qs: CudaSlice<f32> = unsafe { stream.alloc(b * h * sq) }.map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
-    let mut ks: CudaSlice<f32> = unsafe { stream.alloc(b * h * skv) }.map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
+    // Шкалы K шагом spad: ядро PV8 грузит их плитками по 64 (cp.async 16 Б).
+    let ks_stride = if full { spad } else { skv };
+    let mut ks: CudaSlice<f32> = unsafe { stream.alloc(b * h * ks_stride) }.map_err(|e| SynaptixError::Cuda(format!("{e:?}")))?;
     let mul_q = scale * std::f32::consts::LOG2_E;
     let one = 1.0f32;
     let null: u64 = 0;
-    for (src, n_s, dst, sc, mul, sub) in [(&qv, sq, &mut qq, &mut qs, mul_q, false), (&kv, skv, &mut kq, &mut ks, one, true)] {
+    // ACC16: экспоненты шкал K байтами (шаг spad), ядро читает их вместо ks.
+    let mut ke = alloc(if a16 { b * h * spad } else { 1 })?;
+    for (src, n_s, dst, sc, mul, sub, stride) in [(&qv, sq, &mut qq, &mut qs, mul_q, false, sq), (&kv, skv, &mut kq, &mut ks, one, true, ks_stride)] {
         let rows = b * n_s * h;
         let cfg = LaunchConfig { grid_dim: (rows.div_ceil(8) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         let n_si = n_s as i32;
@@ -146,7 +199,13 @@ pub fn flash_fp8_bshd(
         } else {
             lb.arg(&null);
         }
-        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul);
+        let stride = stride as i32;
+        lb.arg(dst).arg(sc).arg(&bi).arg(&n_si).arg(&hi).arg(&mul).arg(&qmax).arg(&stride);
+        if sub && a16 {
+            lb.arg(&mut ke);
+        } else {
+            lb.arg(&null);
+        }
         unsafe { lb.launch(cfg) }.map_err(launch_err("fa8_quant_rows"))?;
     }
 
@@ -166,12 +225,18 @@ pub fn flash_fp8_bshd(
         {
             let cfg = LaunchConfig { grid_dim: ((spad / 64) as u32, (b * h) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
             let mut lb = stream.launch_builder(&kern.quant_vt);
-            lb.arg(&vv).arg(&vmax).arg(&mut vt).arg(&mut vsc).arg(&skvi).arg(&hi).arg(&spadi);
+            lb.arg(&vv).arg(&vmax).arg(&mut vt).arg(&mut vsc).arg(&skvi).arg(&hi).arg(&spadi).arg(&vq).arg(&ps);
             unsafe { lb.launch(cfg) }.map_err(launch_err("fa8_quant_vt"))?;
         }
-        let mut lb = stream.launch_builder(&kern.main_full);
-        lb.arg(&qq).arg(&qs).arg(&kq).arg(&ks).arg(&vt).arg(&vsc).arg(&mut ov).arg(&bi).arg(&hi).arg(&sqi).arg(&skvi).arg(&spadi);
-        unsafe { lb.launch(LaunchConfig { shared_mem_bytes: SMEM_FULL, ..grid }) }.map_err(launch_err("flash_fp8_full"))?;
+        let mut lb = stream.launch_builder(if a16 { &kern.main_a16 } else { &kern.main_full });
+        lb.arg(&qq).arg(&qs).arg(&kq);
+        if a16 {
+            lb.arg(&ke);
+        } else {
+            lb.arg(&ks);
+        }
+        lb.arg(&vt).arg(&vsc).arg(&mut ov).arg(&bi).arg(&hi).arg(&sqi).arg(&skvi).arg(&spadi);
+        unsafe { lb.launch(LaunchConfig { shared_mem_bytes: if a16 { SMEM_A16 } else { SMEM_FULL }, ..grid }) }.map_err(launch_err("flash_fp8_full"))?;
     } else {
         let mut lb = stream.launch_builder(&kern.main_qk);
         lb.arg(&qq).arg(&qs).arg(&kq).arg(&ks).arg(&vv).arg(&null).arg(&mut ov).arg(&bi).arg(&hi).arg(&sqi).arg(&skvi).arg(&spadi);
