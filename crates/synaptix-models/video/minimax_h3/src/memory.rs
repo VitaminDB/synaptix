@@ -161,3 +161,37 @@ pub fn trim_pool(device: Device) {
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
     }
 }
+
+/// MemAvailable из /proc/meminfo, байты (0 — не прочиталось).
+pub fn mem_available() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// Сколько VRAM загрузка DiT оставляет под денойз ([`runtime::set_load_reserve_bytes`]).
+/// Прежде — всегда 6.5 ГБ (под 1344×768 × 5 с): на малых кадрах 14 блоков
+/// лишне стримились с хоста каждый шаг. Теперь — по активациям этой формы
+/// (замер: пик денойза ≤ оценки × 1.2) с запасом. Ключевые кадры кодирует
+/// VAE уже после загрузки DiT, а референсы удлиняют последовательность —
+/// с ними прежний запас.
+pub fn load_reserve_for(
+    g: &crate::pipeline::Geometry,
+    cfg: &crate::config::H3Config,
+    compute: DType,
+    keyframes_or_refs: bool,
+) -> usize {
+    const LEGACY: usize = 13 << 29;
+    if keyframes_or_refs {
+        return LEGACY;
+    }
+    // + текст и служебные строки
+    let seq = g.video_tokens(cfg.patch_size) + g.audio_t + 1024;
+    (activation_bytes(seq, cfg, compute) * 3 / 2 + (1usize << 29)).min(LEGACY)
+}

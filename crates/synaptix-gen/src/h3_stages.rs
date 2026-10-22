@@ -270,6 +270,7 @@ impl H3Model {
             dreq.init_video = Some(v0);
             dreq.init_audio = Some(a0);
         }
+        h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0));
         let dit = h3::dit::H3Dit::load(&ckpt, device, COMPUTE, quant_dit).map_err(err)?;
         let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
         if !c.keyframes.is_empty() {

@@ -106,6 +106,8 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cuda(args.device);
     let compute = parse_dtype(args.compute_dtype.as_deref(), DType::BF16, DType::BF16)?;
     let quant_dit = parse_dtype(args.quant_transformer.as_deref(), DType::NVFP4, compute)?;
+    // Квантованный DiT — внимание в FP8, как у службы (synaptix-gen); `SYN_ATTN_FP8=0` — выкл.
+    let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(quant_dit.is_quantized());
     let quant_enc = parse_dtype(args.quant_encoder.as_deref(), DType::NVFP4, compute)?;
     let keyframe_crop = match args.keyframe_fit.as_str() {
         "stretch" => false,
@@ -372,6 +374,12 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         req.init_audio = Some(a0);
     }
 
+    h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(
+        &geometry,
+        &ckpt.config,
+        compute,
+        !keyframe_paths.is_empty() || !ref_sources.is_empty(),
+    ));
     let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit)?;
     let prep = h3::pipeline::prepare(&dit, &req, &sched)?;
 

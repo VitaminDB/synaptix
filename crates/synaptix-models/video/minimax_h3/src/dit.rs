@@ -999,6 +999,9 @@ pub struct H3Dit {
     stream: Option<Arc<H3Checkpoint>>,
     /// Блоки `host_from..` лежат на хосте и стримятся в forward.
     host_from: usize,
+    /// Pinned-зеркало хостовых блоков: подкачка — DMA прямо из него, без
+    /// копии через staging-буфер на каждом шаге (её делал процессор, ~5 ГБ/с).
+    mirror: Option<synaptix_core::device::cuda::PinMirrorGuard>,
 }
 
 impl H3Dit {
@@ -1041,6 +1044,7 @@ impl H3Dit {
             _ => nblocks,
         };
         let mut blocks = Vec::with_capacity(nblocks);
+        let mut mirror: Option<synaptix_core::device::cuda::PinMirrorGuard> = None;
         for i in 0..nblocks {
             if cuda
                 && host_from == nblocks
@@ -1051,6 +1055,14 @@ impl H3Dit {
                 eprintln!(
                     "[h3] VRAM кончилась на блоке {i}/{nblocks} — блоки {i}..{nblocks} на хост, стримятся в forward"
                 );
+                // Хостовые блоки лежат дважды (pageable и pinned) — зеркало,
+                // только если RAM хватает с запасом.
+                let need = (nblocks - i) * blk_q;
+                if crate::memory::mem_available() > 2 * need + (8usize << 30) {
+                    mirror = Some(synaptix_core::device::cuda::PinMirrorGuard::new());
+                } else {
+                    eprintln!("[h3] RAM мало для pinned-зеркала блоков ({:.1} ГБ) — подкачка через staging", need as f64 / 1e9);
+                }
             }
             // Сырые bf16-веса блока (~0.5 ГБ) — H2D через pinned-конвейер,
             // а не pageable-копией из mmap (1.7 ГБ/с на всю загрузку).
@@ -1071,6 +1083,13 @@ impl H3Dit {
                 synaptix_core::device::cuda::set_offload_pinned(false);
                 blocks.push(host?);
                 drop(blk);
+                if mirror.is_some() {
+                    // Прогрев: копия в зеркало сейчас, а не на первом шаге.
+                    synaptix_core::device::cuda::set_pin_mirror(true);
+                    let warm = blocks[i].to_device(device);
+                    synaptix_core::device::cuda::set_pin_mirror(false);
+                    drop(warm?);
+                }
             } else {
                 blocks.push(blk);
             }
@@ -1118,6 +1137,7 @@ impl H3Dit {
             compute,
             stream: None,
             host_from,
+            mirror,
         })
     }
 
@@ -1149,8 +1169,11 @@ impl H3Dit {
             body(i, b)?;
         }
         let ls = synaptix_core::device::cuda::loader_stream(ord)?;
+        let mirror = self.mirror.is_some();
         synaptix_core::device::cuda::set_offload_pinned(true);
+        synaptix_core::device::cuda::set_pin_mirror(mirror);
         let mut staged = Some(self.blocks[first].to_device(dev));
+        synaptix_core::device::cuda::set_pin_mirror(false);
         let mut result = Ok(());
         for idx in first..n {
             let cur = match staged.take() {
@@ -1167,8 +1190,10 @@ impl H3Dit {
                     sp.spawn(move || {
                         synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
                         synaptix_core::device::cuda::set_offload_pinned(true);
+                        synaptix_core::device::cuda::set_pin_mirror(mirror);
                         let r = self.blocks[idx + 1].to_device(dev);
                         let _ = lsc.synchronize();
+                        synaptix_core::device::cuda::set_pin_mirror(false);
                         synaptix_core::device::cuda::set_offload_pinned(false);
                         synaptix_core::device::cuda::set_alloc_stream(None);
                         r
