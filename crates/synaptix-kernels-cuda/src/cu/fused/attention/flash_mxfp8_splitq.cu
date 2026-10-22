@@ -18,8 +18,11 @@
 // f16 мантисса длиннее bf16 → P и K/V точнее, чем в bf16-варианте).
 // P·V тайла — MMA с f16-накоплением (32 слагаемых, ~5e-4 отн. — ниже
 // округления выхода), тайлы складываются в f32.
+// MMA, чьи результаты нужны сразу (QK по d, P·V по ключам), идут вперемешку
+// с независимыми, чтобы не ждать их задержку; полный тайл — softmax без
+// проверок на −∞.
 // Замер RTX 5090 Laptop, Qwen3.8-27B (24Q/4KV×256), Tq=2048, Tkv=128К:
-// 131 → 75 мс (50 → 87 TFLOP/s), ошибка к эталону f64 1.9e-3 → 1.7e-3.
+// 131 → 66 мс (50 → 100 TFLOP/s), ошибка к эталону f64 1.9e-3 → 1.7e-3.
 //
 //   q/out (B, NH,  Tq,  HD)  row-major, T = f16/bf16
 //   k/v   (B, NKV, Tkv, HD)  row-major, E4M3-байты, физический T-шаг t_stride
@@ -332,9 +335,10 @@ __device__ __forceinline__ void flash_mxfp8_splitq_impl(
     }
     {
       constexpr int QK_ITERS = SN_TILES * (K_STEPS / 2);
+      // n — внутренний индекс: SN_TILES независимых аккумуляторов подряд.
       auto kb_addr = [&](int i) {
-        int n = i / (K_STEPS / 2);
-        int kp = i % (K_STEPS / 2);
+        int n = i % SN_TILES;
+        int kp = i / SN_TILES;
         int r = n * 8 + (lane & 7);
         int c = kp * 4 + ((lane >> 3) & 3);
         return kf_s + (unsigned)fm3_sw<HD>(r, c);
@@ -347,8 +351,8 @@ __device__ __forceinline__ void flash_mxfp8_splitq_impl(
         if (i + 1 < QK_ITERS) {
           fm3_ldmatrix_x4(kb[cur ^ 1][0], kb[cur ^ 1][1], kb[cur ^ 1][2], kb[cur ^ 1][3], kb_addr(i + 1));
         }
-        int n = i / (K_STEPS / 2);
-        int kp = i % (K_STEPS / 2);
+        int n = i % SN_TILES;
+        int kp = i / SN_TILES;
         fm3_mma16x8x16<__half>(s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3],
             q_frag[2 * kp][0], q_frag[2 * kp][1], q_frag[2 * kp][2], q_frag[2 * kp][3],
             kb[cur][0], kb[cur][1], s_frag[n][0], s_frag[n][1], s_frag[n][2], s_frag[n][3]);
@@ -404,15 +408,29 @@ __device__ __forceinline__ void flash_mxfp8_splitq_impl(
     else alpha_hi = fm3_exp2(m_hi - mn_hi);
 
     float rs_lo = 0.0f, rs_hi = 0.0f;
-    #pragma unroll
-    for (int n = 0; n < SN_TILES; ++n) {
-      float p0 = (!fm3_is_finite(mn_lo) || s_frag[n][0] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][0], exp_mul, -mn_lo));
-      float p1 = (!fm3_is_finite(mn_lo) || s_frag[n][1] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][1], exp_mul, -mn_lo));
-      float p2 = (!fm3_is_finite(mn_hi) || s_frag[n][2] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][2], exp_mul, -mn_hi));
-      float p3 = (!fm3_is_finite(mn_hi) || s_frag[n][3] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][3], exp_mul, -mn_hi));
-      s_frag[n][0] = p0; s_frag[n][1] = p1; s_frag[n][2] = p2; s_frag[n][3] = p3;
-      rs_lo += p0 + p1;
-      rs_hi += p2 + p3;
+    if (full_tile) {
+      // Полный тайл без маски: s конечны, максимум конечен — без проверок.
+      #pragma unroll
+      for (int n = 0; n < SN_TILES; ++n) {
+        float p0 = fm3_exp2(fmaf(s_frag[n][0], exp_mul, -mn_lo));
+        float p1 = fm3_exp2(fmaf(s_frag[n][1], exp_mul, -mn_lo));
+        float p2 = fm3_exp2(fmaf(s_frag[n][2], exp_mul, -mn_hi));
+        float p3 = fm3_exp2(fmaf(s_frag[n][3], exp_mul, -mn_hi));
+        s_frag[n][0] = p0; s_frag[n][1] = p1; s_frag[n][2] = p2; s_frag[n][3] = p3;
+        rs_lo += p0 + p1;
+        rs_hi += p2 + p3;
+      }
+    } else {
+      #pragma unroll
+      for (int n = 0; n < SN_TILES; ++n) {
+        float p0 = (!fm3_is_finite(mn_lo) || s_frag[n][0] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][0], exp_mul, -mn_lo));
+        float p1 = (!fm3_is_finite(mn_lo) || s_frag[n][1] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][1], exp_mul, -mn_lo));
+        float p2 = (!fm3_is_finite(mn_hi) || s_frag[n][2] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][2], exp_mul, -mn_hi));
+        float p3 = (!fm3_is_finite(mn_hi) || s_frag[n][3] == FM3_NEG_INF) ? 0.0f : fm3_exp2(fmaf(s_frag[n][3], exp_mul, -mn_hi));
+        s_frag[n][0] = p0; s_frag[n][1] = p1; s_frag[n][2] = p2; s_frag[n][3] = p3;
+        rs_lo += p0 + p1;
+        rs_hi += p2 + p3;
+      }
     }
     rs_lo += __shfl_xor_sync(0xffffffffu, rs_lo, 1);
     rs_lo += __shfl_xor_sync(0xffffffffu, rs_lo, 2);
@@ -444,39 +462,41 @@ __device__ __forceinline__ void flash_mxfp8_splitq_impl(
         pa[kk][2] = fm3_pack2(s_frag[2 * kk + 1][0], s_frag[2 * kk + 1][1], __half{});
         pa[kk][3] = fm3_pack2(s_frag[2 * kk + 1][2], s_frag[2 * kk + 1][3], __half{});
       }
-      auto vb_addr = [&](int i) {
-        int np = i / PV_KSTEPS;
-        int kk = i % PV_KSTEPS;
-        int r = kk * 16 + (lane & 15);
-        int c = np * 2 + ((lane >> 4) & 1);
-        return vf_s + (unsigned)fm3_sw<HD>(r, c);
-      };
-      unsigned int vb[2][4];
-      fm3_ldmatrix_x4_trans(vb[0][0], vb[0][1], vb[0][2], vb[0][3], vb_addr(0));
-      unsigned int h0[2] = {0u, 0u}, h1[2] = {0u, 0u};
+      // Группами по четыре пары n-тайлов: сначала все MMA группы, потом
+      // сложение в f32 — результат MMA не ждём сразу за ним.
+      constexpr int G = 4;
       #pragma unroll
-      for (int i = 0; i < PV_KSTEPS * PV_NP; ++i) {
-        int cur = i & 1;
-        if (i + 1 < PV_KSTEPS * PV_NP) {
-          fm3_ldmatrix_x4_trans(vb[cur ^ 1][0], vb[cur ^ 1][1], vb[cur ^ 1][2], vb[cur ^ 1][3], vb_addr(i + 1));
+      for (int g0 = 0; g0 < PV_NP; g0 += G) {
+        unsigned int h[G][4];
+        #pragma unroll
+        for (int gi = 0; gi < G; ++gi) { h[gi][0] = h[gi][1] = h[gi][2] = h[gi][3] = 0u; }
+        #pragma unroll
+        for (int kk = 0; kk < PV_KSTEPS; ++kk) {
+          #pragma unroll
+          for (int gi = 0; gi < G; ++gi) {
+            int np = g0 + gi;
+            unsigned int vb[4];
+            int r = kk * 16 + (lane & 15);
+            int c = np * 2 + ((lane >> 4) & 1);
+            fm3_ldmatrix_x4_trans(vb[0], vb[1], vb[2], vb[3], vf_s + (unsigned)fm3_sw<HD>(r, c));
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                : "+r"(h[gi][0]), "+r"(h[gi][1])
+                : "r"(pa[kk][0]), "r"(pa[kk][1]), "r"(pa[kk][2]), "r"(pa[kk][3]), "r"(vb[0]), "r"(vb[1]));
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                : "+r"(h[gi][2]), "+r"(h[gi][3])
+                : "r"(pa[kk][0]), "r"(pa[kk][1]), "r"(pa[kk][2]), "r"(pa[kk][3]), "r"(vb[2]), "r"(vb[3]));
+          }
         }
-        int np = i / PV_KSTEPS;
-        int kk = i % PV_KSTEPS;
-        if (kk == 0) { h0[0] = h0[1] = h1[0] = h1[1] = 0u; }
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-            : "+r"(h0[0]), "+r"(h0[1])
-            : "r"(pa[kk][0]), "r"(pa[kk][1]), "r"(pa[kk][2]), "r"(pa[kk][3]), "r"(vb[cur][0]), "r"(vb[cur][1]));
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-            : "+r"(h1[0]), "+r"(h1[1])
-            : "r"(pa[kk][0]), "r"(pa[kk][1]), "r"(pa[kk][2]), "r"(pa[kk][3]), "r"(vb[cur][2]), "r"(vb[cur][3]));
-        if (kk == PV_KSTEPS - 1) {
+        #pragma unroll
+        for (int gi = 0; gi < G; ++gi) {
+          int np = g0 + gi;
           float2 f;
-          f = __half22float2(*reinterpret_cast<__half2*>(&h0[0])); o_acc[2 * np][0] += f.x; o_acc[2 * np][1] += f.y;
-          f = __half22float2(*reinterpret_cast<__half2*>(&h0[1])); o_acc[2 * np][2] += f.x; o_acc[2 * np][3] += f.y;
-          f = __half22float2(*reinterpret_cast<__half2*>(&h1[0])); o_acc[2 * np + 1][0] += f.x; o_acc[2 * np + 1][1] += f.y;
-          f = __half22float2(*reinterpret_cast<__half2*>(&h1[1])); o_acc[2 * np + 1][2] += f.x; o_acc[2 * np + 1][3] += f.y;
+          f = __half22float2(*reinterpret_cast<__half2*>(&h[gi][0])); o_acc[2 * np][0] += f.x; o_acc[2 * np][1] += f.y;
+          f = __half22float2(*reinterpret_cast<__half2*>(&h[gi][1])); o_acc[2 * np][2] += f.x; o_acc[2 * np][3] += f.y;
+          f = __half22float2(*reinterpret_cast<__half2*>(&h[gi][2])); o_acc[2 * np + 1][0] += f.x; o_acc[2 * np + 1][1] += f.y;
+          f = __half22float2(*reinterpret_cast<__half2*>(&h[gi][3])); o_acc[2 * np + 1][2] += f.x; o_acc[2 * np + 1][3] += f.y;
         }
       }
     }
