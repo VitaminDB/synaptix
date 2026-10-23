@@ -384,6 +384,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         &ckpt.config,
         compute,
         !keyframe_paths.is_empty() || !ref_sources.is_empty(),
+        args.lora.is_some(),
     ));
     let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit)?;
     let prep = h3::pipeline::prepare(&dit, &req, &sched)?;

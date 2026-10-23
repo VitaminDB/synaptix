@@ -186,12 +186,16 @@ pub fn load_reserve_for(
     cfg: &crate::config::H3Config,
     compute: DType,
     keyframes_or_refs: bool,
+    lora: bool,
 ) -> usize {
     const LEGACY: usize = 13 << 29;
-    if keyframes_or_refs {
-        return LEGACY;
-    }
     // + текст и служебные строки
     let seq = g.video_tokens(cfg.patch_size) + g.audio_t + 1024;
-    (activation_bytes(seq, cfg, compute) * 3 / 2 + (1usize << 29)).min(LEGACY)
+    // LoRA при счёте: BF16-входы проекций внимания и MLP (два [seq, hidden])
+    // и промежуточные (x·Aᵀ) — сверх обычных активаций.
+    let lora_b = if lora { 2 * seq * cfg.hidden_size * compute.bytes_for_numel(1).max(1) + (1usize << 30) } else { 0 };
+    if keyframes_or_refs {
+        return LEGACY + lora_b;
+    }
+    (activation_bytes(seq, cfg, compute) * 3 / 2 + (1usize << 29)).min(LEGACY) + lora_b
 }
