@@ -9,6 +9,15 @@
 (`qwen3_5`, `qwen3_next`) — плотные и MoE (`qwen3_5_moe`, например Qwen3.6-35B-A3B).
 Скользящее окно, PLE, Gemma и Qwen4Exp (Qwen3.8-Flash-Next) пока не поддержаны.
 
+## Датасет с инструментами
+
+Формат OpenAI: рядом с `messages` — `"tools"` (описания функций), у ассистента —
+`"tool_calls": [{"type": "function", "function": {"name", "arguments"}}]`, результат —
+`{"role": "tool", "name": "…", "content": "…"}`. ShareGPT: реплики `function_call` /
+`observation` и `"tools"` строкой JSON. Описания и вызовы рисует chat-шаблон модели (у Qwen —
+`<tools>` в системном промпте и `<tool_call>` в ответе); учатся все ответы ассистента вместе с
+вызовами, результаты инструментов — нет.
+
 ## Команды
 
 ```sh

@@ -8,6 +8,14 @@
 //! - `{"prompt": "…", "completion": "…"}` (или `response`);
 //! - `{"text": "…"}` — сырой текст, учится целиком.
 //!
+//! Вызовы инструментов (OpenAI): `"tools": [{"type": "function", "function":
+//! {...}}]` рядом с `messages`, у ассистента `"tool_calls": [{"function":
+//! {"name", "arguments"}}]`, результат — `{"role": "tool", "name", "content"}`.
+//! ShareGPT: `{"from": "function_call", "value": "{\"name\", \"arguments\"}"}` и
+//! `{"from": "observation"}`, описания — `"tools"` (массив или строка JSON).
+//! Шаблон модели рендерит описания и вызовы в своём родном формате, вызов
+//! учится как часть ответа ассистента.
+//!
 //! Диалоги рендерятся chat-шаблоном модели, лосс считается только по
 //! ответам ассистента (вместе с токеном конца реплики).
 
@@ -73,6 +81,9 @@ pub struct DatasetReport {
     /// Многоходовые диалоги, где шаблон не префиксно-устойчив (размышления
     /// прошлых ходов вырезаются): учится только последний ответ.
     pub last_turn_only: usize,
+    /// Примеры с инструментами (описания `tools` или вызовы `tool_calls`).
+    #[serde(default)]
+    pub with_tools: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,8 +97,33 @@ pub struct TrainReport {
 }
 
 enum Example {
-    Chat(Vec<Message>),
+    /// Диалог и описания инструментов (`tools` для шаблона).
+    Chat(Vec<Message>, Vec<serde_json::Value>),
     Text(String),
+}
+
+/// Вызов из OpenAI `tool_calls[i]` или ShareGPT `function_call`: (имя, JSON аргументов).
+fn tool_call_of(v: &serde_json::Value) -> Option<(String, String)> {
+    let f = v.get("function").unwrap_or(v);
+    let name = f.get("name")?.as_str()?.to_string();
+    let args = match f.get("arguments").or_else(|| f.get("parameters")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(x) => x.to_string(),
+        None => "{}".into(),
+    };
+    Some((name, args))
+}
+
+/// `tools` примера: массив описаний или строка с JSON-массивом (ShareGPT).
+fn tools_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    match v.get("tools") {
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .and_then(|x| x.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 fn str_field<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -104,22 +140,53 @@ fn parse_example(v: &serde_json::Value) -> Option<Example> {
         }
     };
     if let Some(arr) = v.get("messages").or_else(|| v.get("conversations")).and_then(|m| m.as_array()) {
-        let mut msgs = Vec::new();
+        let mut msgs: Vec<Message> = Vec::new();
         for m in arr {
             let role = str_field(m, &["role", "from"]).unwrap_or("user");
             let content = str_field(m, &["content", "value", "text"]).unwrap_or("");
+            // ShareGPT: вызов отдельной репликой — к предыдущему ответу
+            // ассистента (или новым ответом без текста).
+            if role == "function_call" {
+                let call = serde_json::from_str::<serde_json::Value>(content).ok().and_then(|v| tool_call_of(&v));
+                if let Some(c) = call {
+                    match msgs.last_mut() {
+                        Some(last) if last.role == "assistant" => last.tool_calls.push(c),
+                        _ => {
+                            let mut a = Message::assistant("");
+                            a.tool_calls.push(c);
+                            msgs.push(a);
+                        }
+                    }
+                }
+                continue;
+            }
             let mut msg = match role_of(role) {
                 "system" => Message::system(content),
                 "assistant" => Message::assistant(content),
-                "tool" => Message::tool(content),
+                "tool" => {
+                    // имя функции: `name` или из вызова, на который это ответ
+                    let name = str_field(m, &["name"]).map(str::to_string).or_else(|| {
+                        msgs.iter().rev().find(|x| x.role == "assistant").and_then(|a| a.tool_calls.last().map(|c| c.0.clone()))
+                    });
+                    match name {
+                        Some(n) => Message::tool_named(n, content),
+                        None => Message::tool(content),
+                    }
+                }
                 _ => Message::user(content),
             };
             if msg.role == "assistant" {
                 msg.reasoning = str_field(m, &["reasoning_content", "reasoning", "thinking"]).map(str::to_string);
+                if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) {
+                    msg.tool_calls = calls.iter().filter_map(tool_call_of).collect();
+                }
+                if let Some(c) = m.get("function_call").and_then(tool_call_of) {
+                    msg.tool_calls.push(c);
+                }
             }
             msgs.push(msg);
         }
-        return msgs.iter().any(|m| m.role == "assistant").then_some(Example::Chat(msgs));
+        return msgs.iter().any(|m| m.role == "assistant").then(|| Example::Chat(msgs, tools_of(v)));
     }
     if let Some(out) = str_field(v, &["output", "completion", "response", "answer", "chosen"]) {
         let mut prompt = str_field(v, &["instruction", "prompt", "question", "query"]).unwrap_or("").to_string();
@@ -132,7 +199,7 @@ fn parse_example(v: &serde_json::Value) -> Option<Example> {
         }
         msgs.push(Message::user(prompt));
         msgs.push(Message::assistant(out));
-        return Some(Example::Chat(msgs));
+        return Some(Example::Chat(msgs, Vec::new()));
     }
     str_field(v, &["text", "content"]).map(|t| Example::Text(t.to_string()))
 }
@@ -158,13 +225,17 @@ fn read_examples(path: &Path) -> Result<Vec<serde_json::Value>, LlmError> {
 
 /// Токены диалога и флаги «учить» — по ответам ассистента. `None` — пример
 /// не размечается (шаблон не согласован с токенизацией).
-fn tokenize_chat(tok: &LlmTokenizer, msgs: &[Message], thinking: bool, rep: &mut DatasetReport) -> Result<Option<Sample>, LlmError> {
-    let full_text = tok.apply_chat_template_ex_tools(msgs, false, thinking, None)?;
+fn tokenize_chat(tok: &LlmTokenizer, msgs: &[Message], tools: &[serde_json::Value], thinking: bool, rep: &mut DatasetReport) -> Result<Option<Sample>, LlmError> {
+    let tools = (!tools.is_empty()).then_some(tools);
+    let full_text = tok.apply_chat_template_ex_tools(msgs, false, thinking, tools)?;
     let full = tok.encode(&full_text)?;
+    if let Some(s) = chatml_targets(tok, msgs, &full_text, &full)? {
+        return Ok(Some(s));
+    }
     let mut target = vec![false; full.len()];
     let span = |upto: usize| -> Result<Option<(usize, usize)>, LlmError> {
-        let pre = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..upto], true, thinking, None)?)?;
-        let end = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..=upto], false, thinking, None)?)?;
+        let pre = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..upto], true, thinking, tools)?)?;
+        let end = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..=upto], false, thinking, tools)?)?;
         let ok = pre.len() <= end.len() && end.len() <= full.len() && full[..end.len()] == end[..] && end[..pre.len()] == pre[..];
         Ok(ok.then_some((pre.len(), end.len())))
     };
@@ -182,7 +253,7 @@ fn tokenize_chat(tok: &LlmTokenizer, msgs: &[Message], thinking: bool, rep: &mut
     if spans.is_empty() {
         // Шаблон переписывает прошлые ходы — учим только последний ответ.
         let last = *turns.last().unwrap();
-        let pre = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..last], true, thinking, None)?)?;
+        let pre = tok.encode(&tok.apply_chat_template_ex_tools(&msgs[..last], true, thinking, tools)?)?;
         if pre.len() >= full.len() || full[..pre.len()] != pre[..] {
             return Ok(None);
         }
@@ -197,6 +268,48 @@ fn tokenize_chat(tok: &LlmTokenizer, msgs: &[Message], thinking: bool, rep: &mut
         }
     }
     Ok(Some(Sample { tokens: full, target }))
+}
+
+/// Разметка ответов прямо по тексту ChatML-шаблона (Qwen3/3.5): каждый
+/// `<|im_start|>assistant\n … <|im_end|>` — цель. Шаблон Qwen рисует прошлые
+/// ответы иначе, чем последний (пустой `<think>` только у последнего), и
+/// проверка префиксов отбрасывала все ходы, кроме последнего, — в датасете с
+/// инструментами так не учился сам вызов. Пустой `<think>\n\n</think>\n\n`,
+/// вставленный шаблоном, не учится. `None` — не ChatML или границы токенов не
+/// совпали: прежняя разметка.
+fn chatml_targets(tok: &LlmTokenizer, msgs: &[Message], text: &str, full: &[u32]) -> Result<Option<Sample>, LlmError> {
+    const HEAD: &str = "<|im_start|>assistant\n";
+    const END: &str = "<|im_end|>";
+    const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
+    let n_asst = msgs.iter().filter(|m| m.role == "assistant").count();
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(p) = text[from..].find(HEAD) {
+        let mut start = from + p + HEAD.len();
+        let Some(e) = text[start..].find(END) else { return Ok(None) };
+        let end = start + e + END.len();
+        if text[start..].starts_with(EMPTY_THINK) {
+            start += EMPTY_THINK.len();
+        }
+        spans.push((start, end));
+        from = end;
+    }
+    if spans.len() != n_asst || n_asst == 0 {
+        return Ok(None);
+    }
+    let mut target = vec![false; full.len()];
+    for (a, b) in spans {
+        let ta = tok.encode(&text[..a])?;
+        let tb = tok.encode(&text[..b])?;
+        let ok = ta.len() <= tb.len() && tb.len() <= full.len() && full[..tb.len()] == tb[..] && tb[..ta.len()] == ta[..];
+        if !ok {
+            return Ok(None);
+        }
+        for t in target.iter_mut().take(tb.len()).skip(ta.len()) {
+            *t = true;
+        }
+    }
+    Ok(Some(Sample { tokens: full.to_vec(), target }))
 }
 
 /// Прочитать и разметить датасет.
@@ -214,7 +327,12 @@ pub fn load_samples(
             break;
         }
         let sample = match parse_example(&v) {
-            Some(Example::Chat(msgs)) => tokenize_chat(tok, &msgs, thinking, &mut rep)?,
+            Some(Example::Chat(msgs, tools)) => {
+                if !tools.is_empty() || msgs.iter().any(|m| !m.tool_calls.is_empty()) {
+                    rep.with_tools += 1;
+                }
+                tokenize_chat(tok, &msgs, &tools, thinking, &mut rep)?
+            }
             Some(Example::Text(t)) => {
                 let tokens = tok.encode(&t)?;
                 let target = vec![true; tokens.len()];
