@@ -7,6 +7,7 @@
 
 pub mod gpu;
 pub mod nanovsr;
+pub mod plksr;
 pub mod span;
 pub mod weights;
 
@@ -62,6 +63,7 @@ pub fn open_with(g: Arc<gpu::Gpu>, w: &weights::Weights) -> Result<Box<dyn Upsca
     match w.arch() {
         "nanovsr" => Ok(Box::new(nanovsr::NanoVsr::load(g, w)?)),
         "span" => Ok(Box::new(span::Span::load(g, w)?)),
+        "realplksr" => Ok(Box::new(plksr::RealPlksr::load(g, w)?)),
         a => Err(Error::Unsupported(format!("неизвестная модель «{a}»"))),
     }
 }

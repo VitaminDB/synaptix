@@ -26,6 +26,8 @@ pub struct Gpu {
     layer_norm: CudaFunction,
     group_stats: CudaFunction,
     group_apply: CudaFunction,
+    add_repeat: CudaFunction,
+    dysample: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -60,7 +62,9 @@ impl Gpu {
         let layer_norm = load("layer_norm_px")?;
         let group_stats = load("group_stats")?;
         let group_apply = load("group_apply")?;
-        Ok(Arc::new(Self { ctx, stream, conv, half_acc, rgba2nhwc, copy_ch, layer_norm, group_stats, group_apply, _module: module }))
+        let add_repeat = load("add_repeat_rgba")?;
+        let dysample = load("dysample_rgba")?;
+        Ok(Arc::new(Self { ctx, stream, conv, half_acc, rgba2nhwc, copy_ch, layer_norm, group_stats, group_apply, add_repeat, dysample, _module: module }))
     }
 
     pub fn alloc_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
@@ -142,6 +146,30 @@ impl Gpu {
         Ok(())
     }
 
+    /// `out = f + вход, повторённый по r²` (nc = 3·r² каналов, шаг cs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_repeat(&self, f: &CudaSlice<f16>, src: &CudaSlice<u8>, out: &mut CudaSlice<f16>, pixels: usize, cs: usize, nc: usize, r2: usize) -> Result<()> {
+        let total = (pixels * cs) as u32;
+        let cfg = LaunchConfig { grid_dim: (total.div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let (n, cs, nc, r2) = (pixels as i32, cs as i32, nc as i32, r2 as i32);
+        let mut b = self.stream.launch_builder(&self.add_repeat);
+        b.arg(f).arg(src).arg(out).arg(&n).arg(&cs).arg(&nc).arg(&r2);
+        unsafe { b.launch(cfg) }.map_err(cuda("add_repeat"))?;
+        Ok(())
+    }
+
+    /// DySample + свёртка 1×1 в RGB → RGBA8 `(w·r)×(h·r)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dysample(&self, x: &CudaSlice<f16>, xs: usize, os: &CudaSlice<f16>, oss: usize, init: &CudaSlice<f32>, ew: &CudaSlice<f32>, eb: &CudaSlice<f32>, out: &mut CudaSlice<u8>, h: usize, w: usize, r: usize, groups: usize) -> Result<()> {
+        let ow = (w * r) as u32;
+        let cfg = LaunchConfig { grid_dim: (ow.div_ceil(128), (h * r) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let (xs, oss, h, w, r, gr) = (xs as i32, oss as i32, h as i32, w as i32, r as i32, groups as i32);
+        let mut b = self.stream.launch_builder(&self.dysample);
+        b.arg(x).arg(&xs).arg(os).arg(&oss).arg(init).arg(ew).arg(eb).arg(out).arg(&h).arg(&w).arg(&r).arg(&gr);
+        unsafe { b.launch(cfg) }.map_err(cuda("dysample"))?;
+        Ok(())
+    }
+
     /// GroupNorm по всему кадру + остаток: `y = norm(x)·g + b + skip`. `stats` — [groups·2] f32.
     #[allow(clippy::too_many_arguments)]
     pub fn group_norm(&self, x: &CudaSlice<f16>, skip: &CudaSlice<f16>, y: &mut CudaSlice<f16>, stats: &mut CudaSlice<f32>, g: &CudaSlice<f32>, bta: &CudaSlice<f32>, pixels: usize, cs: usize, c: usize, groups: usize, eps: f32) -> Result<()> {
@@ -173,8 +201,17 @@ impl Gpu {
         };
         // блок 4 строки, если ореол и два буфера отвода помещаются, иначе 2
         // у 1×1 один отвод — второй буфер весов не нужен
-        let nbuf = if k == 1 { 1 } else { 2 };
-        let smem_for = |th: u32| ((th + 2 * p) * (64 + 2 * p) * si + nbuf * nb * si) * 2;
+        let smem_with = |th: u32, nbuf: u32| ((th + 2 * p) * (64 + 2 * p) * si + nbuf * nb * si) * 2;
+        // ядро больше 3×3 — веса строки отводов разом (nbuf = k, режим 0); иначе два буфера отвода,
+        // если помещаются (у 1×1 один отвод — второй не нужен)
+        let (nbuf, wmode) = if k > 3 && smem_with(2, k) <= MAX_SMEM {
+            (k, 0)
+        } else if k > 1 && smem_with(2, 2) <= MAX_SMEM {
+            (2, 2)
+        } else {
+            (1, 1)
+        };
+        let smem_for = |th: u32| smem_with(th, nbuf);
         // блок в 2 строки быстрее (больше блоков на SM); 4 — только по SYNAPTIX_VFX_TH=4 для замеров
         let force4 = std::env::var("SYNAPTIX_VFX_TH").is_ok_and(|v| v == "4");
         let (th, ti) = if force4 && smem_for(4) <= MAX_SMEM { (4u32, 0) } else { (2, 1) };
@@ -183,13 +220,15 @@ impl Gpu {
             return Err(Error::Unsupported(format!("свёртка {k}×{k}: {cin} входных каналов не помещаются в общую память")));
         }
         let f = &self.conv[usize::from(self.half_acc)][ti][ni];
+        let mut a = *a;
+        a.wbuf = wmode;
         let cfg = LaunchConfig {
             grid_dim: ((a.w_ as u32).div_ceil(64), (a.h as u32).div_ceil(th), (a.cout_pad as u32).div_ceil(nb)),
             block_dim: (256, 1, 1),
             shared_mem_bytes: smem,
         };
         let mut b = self.stream.launch_builder(f);
-        b.arg(a);
+        b.arg(&a);
         unsafe { b.launch(cfg) }.map_err(cuda("conv_mma"))?;
         Ok(())
     }
@@ -224,6 +263,7 @@ pub struct ConvArgs {
     pub base_w: i32,
     pub base_h: i32,
     pub out_scale: f32,
+    pub wbuf: i32,
 }
 
 // SAFETY: plain-old-data, раскладка совпадает с C-структурой ядра.

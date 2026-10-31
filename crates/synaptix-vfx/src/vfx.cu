@@ -35,6 +35,7 @@ struct ConvArgs {
     int base_mode;       // 0 билинейная база, 1 ближайший пиксель исходника (повтор по r×r)
     int base_w, base_h;  // размер исходника базы
     float out_scale;     // множитель значения перед записью (1)
+    int wbuf;            // буферов весов отвода: 2 — следующий грузится во время счёта, 1 — по очереди
 };
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* g, bool valid) {
@@ -186,13 +187,8 @@ __device__ __forceinline__ void conv_body(const ConvArgs& a) {
         }
         cp_async_commit();
     };
-    load_w(0, sW);
-    for (int t = 0; t < taps; ++t) {
-        const int dy = t / a.k, dx = t % a.k;
-        __half* cur = sW + (t & 1) * NB * SI;
-        cp_async_wait0();
-        __syncthreads();  // вход и отвод t на месте, буфер t+1 дочитан на прошлом шаге
-        if (t + 1 < taps) load_w(t + 1, sW + ((t + 1) & 1) * NB * SI);
+    // счёт одного отвода (dy, dx) с весами в cur
+    auto tap = [&](const __half* cur, int dy, int dx) {
         for (int k0 = 0; k0 < cin; k0 += 16) {
             unsigned af[MT][4];
 #pragma unroll
@@ -219,7 +215,30 @@ __device__ __forceinline__ void conv_body(const ConvArgs& a) {
                 }
             }
         }
-        __syncthreads();  // текущий буфер дочитан — на шаге t+1 в него пойдёт отвод t+2
+    };
+
+    if (a.wbuf == 0) {
+        // большое ядро: веса целой строки отводов разом — барьер на строку, а не на отвод
+        for (int dy = 0; dy < a.k; ++dy) {
+            if (dy > 0) __syncthreads();  // прошлая строка дочитана
+            for (int dx = 0; dx < a.k; ++dx) load_w(dy * a.k + dx, sW + dx * NB * SI);
+            cp_async_wait0();
+            __syncthreads();
+            for (int dx = 0; dx < a.k; ++dx) tap(sW + dx * NB * SI, dy, dx);
+        }
+    } else {
+        const bool dbl = a.wbuf == 2;
+        load_w(0, sW);
+        for (int t = 0; t < taps; ++t) {
+            const int dy = t / a.k, dx = t % a.k;
+            __half* cur = dbl ? sW + (t & 1) * NB * SI : sW;
+            if (!dbl && t > 0) load_w(t, sW);  // один буфер: прошлый отвод дочитан (барьер в конце шага)
+            cp_async_wait0();
+            __syncthreads();  // вход и отвод t на месте, буфер t+1 дочитан на прошлом шаге
+            if (dbl && t + 1 < taps) load_w(t + 1, sW + ((t + 1) & 1) * NB * SI);
+            tap(cur, dy, dx);
+            __syncthreads();  // текущий буфер дочитан — на шаге t+1 в него пойдёт отвод t+2
+        }
     }
     if constexpr (H16) {
 #pragma unroll
@@ -342,12 +361,32 @@ extern "C" __global__ void layer_norm_px(const __half* x, __half* y, const float
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const __half* p = x + (size_t)i * cs;
+    __half* q = y + (size_t)i * cs;
+    if (c == 64 && cs == 64) {
+        // частый случай RealPLKSR: пиксель целиком в регистры восемью чтениями по 16 байт
+        float v[64];
+        for (int j = 0; j < 8; ++j) {
+            uint4 u = ((const uint4*)p)[j];
+            const __half* h = (const __half*)&u;
+            for (int k = 0; k < 8; ++k) v[j * 8 + k] = __half2float(h[k]);
+        }
+        float m = 0.f, s2 = 0.f;
+        for (int k = 0; k < 64; ++k) m += v[k];
+        m *= (1.f / 64.f);
+        for (int k = 0; k < 64; ++k) { float d = v[k] - m; s2 += d * d; }
+        float r = rsqrtf(s2 * (1.f / 64.f) + eps);
+        for (int j = 0; j < 8; ++j) {
+            __half h[8];
+            for (int k = 0; k < 8; ++k) h[k] = __float2half((v[j * 8 + k] - m) * r * g[j * 8 + k] + b[j * 8 + k]);
+            ((uint4*)q)[j] = *(uint4*)h;
+        }
+        return;
+    }
     float m = 0.f, v = 0.f;
     for (int k = 0; k < c; ++k) m += __half2float(p[k]);
     m /= c;
     for (int k = 0; k < c; ++k) { float d = __half2float(p[k]) - m; v += d * d; }
     float r = rsqrtf(v / c + eps);
-    __half* q = y + (size_t)i * cs;
     for (int k = 0; k < c; ++k) q[k] = __float2half((__half2float(p[k]) - m) * r * g[k] + b[k]);
 }
 
@@ -381,4 +420,52 @@ extern "C" __global__ void group_apply(const __half* x, const __half* skip, __ha
     float v = (__half2float(x[p * cs + k]) - m) * rsqrtf(var + eps) * g[k] + b[k];
     if (skip) v += __half2float(skip[p * cs + k]);
     y[p * cs + k] = __float2half(v);
+}
+
+// RealPLKSR перед DySample: x = признаки (каналов nc = 3·r²) + вход, повторённый по r² (repeat_interleave).
+extern "C" __global__ void add_repeat_rgba(const __half* f, const unsigned char* src, __half* out, int n, int cs, int nc, int r2) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * cs) return;
+    size_t p = i / cs;
+    int c = (int)(i % cs);
+    float v = 0.f;
+    if (c < nc) v = __half2float(f[p * cs + c]) + src[p * 4 + c / r2] * (1.f / 255.f);
+    out[p * cs + c] = __float2half(v);
+}
+
+// DySample (×r, G групп) + конечная свёртка 1×1 в RGB → RGBA8 [H·r, W·r].
+// x [H,W,xs] (nc = 3·r² каналов, по nc/G на группу), os [H,W,oss]: первые 2·G·r² — offset (с bias),
+// следующие 2·G·r² — scope (без bias); смещение = offset·σ(scope)·½ + init. Канал смещения
+// (xy·G + g)·r² + s, s — подпиксель (i·r + j). Выборка — билинейная, координаты прижаты к краю.
+extern "C" __global__ void dysample_rgba(const __half* x, int xs, const __half* os, int oss, const float* init,
+                                         const float* ew, const float* eb, unsigned char* out, int h, int w, int r, int G) {
+    int X = blockIdx.x * blockDim.x + threadIdx.x, Y = blockIdx.y;
+    int ow = w * r;
+    if (X >= ow || Y >= h * r) return;
+    int px = X / r, py = Y / r, s = (Y % r) * r + (X % r);
+    int r2 = r * r, nc = 3 * r2, cg = nc / G, no = 2 * G * r2;
+    const __half* op = os + ((size_t)py * w + px) * oss;
+    float acc[3] = {eb[0], eb[1], eb[2]};
+    for (int g = 0; g < G; ++g) {
+        int cx = (0 * G + g) * r2 + s, cy = (1 * G + g) * r2 + s;
+        float ox = __half2float(op[cx]) / (1.f + __expf(-__half2float(op[no + cx]))) * 0.5f + init[cx];
+        float oy = __half2float(op[cy]) / (1.f + __expf(-__half2float(op[no + cy]))) * 0.5f + init[cy];
+        float fx = fminf(fmaxf(px + ox, 0.f), (float)(w - 1));
+        float fy = fminf(fmaxf(py + oy, 0.f), (float)(h - 1));
+        int x0 = (int)fx, y0 = (int)fy, x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+        float ax = fx - x0, ay = fy - y0;
+        const __half* p00 = x + ((size_t)y0 * w + x0) * xs;
+        const __half* p01 = x + ((size_t)y0 * w + x1) * xs;
+        const __half* p10 = x + ((size_t)y1 * w + x0) * xs;
+        const __half* p11 = x + ((size_t)y1 * w + x1) * xs;
+        for (int k = 0; k < cg; ++k) {
+            int c = g * cg + k;
+            float v = (__half2float(p00[c]) * (1.f - ax) + __half2float(p01[c]) * ax) * (1.f - ay)
+                    + (__half2float(p10[c]) * (1.f - ax) + __half2float(p11[c]) * ax) * ay;
+            for (int o = 0; o < 3; ++o) acc[o] += ew[o * nc + c] * v;
+        }
+    }
+    unsigned char* q = out + ((size_t)Y * ow + X) * 4;
+    for (int o = 0; o < 3; ++o) q[o] = (unsigned char)__float2int_rn(fminf(fmaxf(acc[o], 0.f), 1.f) * 255.f);
+    q[3] = 255;
 }

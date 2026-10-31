@@ -1,7 +1,7 @@
 //! RealPLKSR (neosr, «Partial Large Kernel CNNs for Efficient Super-Resolution»): покадровая модель.
 //! Блок: [LayerNorm] → DCCM (3×3 → Mish → 3×3) → большая свёртка K×K на первых `pdim` каналах →
 //! EA `x·σ(conv3×3(x))` → 1×1 → [GroupNorm по кадру] + вход. Выход — свёртка в 3·r² каналов + вход
-//! (повтор по r×r) и pixel shuffle. DySample не поддерживается.
+//! (повтор по r×r) и pixel shuffle или DySample (выборка по выученным смещениям + свёртка 1×1).
 //! Веса — `tools/plksr_convert.py` (`first`, `b{i}.{cm1,cm2,lk,ea,refine}`, `b{i}.norm.{g,b}` или
 //! `b{i}.ln.{g,b}`, `last`; метаданные `dim`, `blocks`, `k`, `pdim`, `ea`, `groups`, `layer_norm`, `scale`).
 
@@ -39,7 +39,16 @@ struct Bufs {
     host: cudarc::driver::PinnedHostSlice<u8>,
 }
 
+/// DySample: offset и scope — одна свёртка 1×1 (2·2·G·r² выходов), init, конечная 1×1.
+struct Dys {
+    os: Conv,
+    init: CudaSlice<f32>,
+    ew: CudaSlice<f32>,
+    eb: CudaSlice<f32>,
+}
+
 pub struct RealPlksr {
+    dys: Option<Dys>,
     g: std::sync::Arc<Gpu>,
     first: Conv,
     blocks: Vec<Block>,
@@ -80,9 +89,27 @@ impl RealPlksr {
                 gn: if layer_norm { None } else { Some(pair(&format!("{p}.norm"))?) },
             });
         }
-        let last = conv("last", 3 * scale * scale, &[dim], 3, scale)?;
+        let nc = 3 * scale * scale;
+        let dys = if wts.meta.get("dysample").is_some_and(|v| v == "1") {
+            let no = 2 * 4 * scale * scale;
+            let (ow, ob, sw) = (wts.get("dys.offset.w")?, wts.get("dys.offset.b")?, wts.get("dys.scope.w")?);
+            let mut w = ow.to_vec();
+            w.extend_from_slice(sw);
+            let mut b = ob.to_vec();
+            b.resize(2 * no, 0.0);
+            Some(Dys {
+                os: Conv::new(&g, &w, Some(&b), 2 * no, 1, &[nc], 1)?,
+                init: g.upload_f32(wts.get("dys.init_pos")?)?,
+                ew: g.upload_f32(wts.get("dys.end.w")?)?,
+                eb: g.upload_f32(wts.get("dys.end.b")?)?,
+            })
+        } else {
+            None
+        };
+        // с DySample последняя свёртка — в f16 (12 каналов), без pixel shuffle
+        let last = conv("last", nc, &[dim], 3, if dys.is_some() { 1 } else { scale })?;
         let name = wts.meta.get("name").cloned().unwrap_or_else(|| format!("RealPLKSR ×{scale}"));
-        Ok(Self { g, first, blocks, last, dim, pdim, groups, scale, bufs: None, name })
+        Ok(Self { g, dys, first, blocks, last, dim, pdim, groups, scale, bufs: None, name })
     }
 
     fn ensure(&mut self, w: usize, h: usize) -> Result<()> {
@@ -166,7 +193,19 @@ impl Upscaler for RealPlksr {
             }
             std::mem::swap(&mut b.x, &mut b.y);
         }
-        g.run(&self.last, In::one(&b.x), h, w, Act::None, Res::None, self.scale, Out::Rgba { buf: &mut b.out, base: Some((&b.src, w, h)), nearest: true })?;
+        match &self.dys {
+            Some(d) => {
+                let nc = 3 * self.scale * self.scale;
+                let xs = pad16(nc);
+                let oss = pad16(d.os.cout);
+                // признаки (t2) + повтор входа (t3) → смещения (t1) → выборка и 1×1 в RGBA
+                g.run(&self.last, In::one(&b.x), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut b.t2, cs: xs })?;
+                g.add_repeat(&b.t2, &b.src, &mut b.t3, px, xs, nc, self.scale * self.scale)?;
+                g.run(&d.os, In::one(&b.t3), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut b.t1, cs: oss })?;
+                g.dysample(&b.t3, xs, &b.t1, oss, &d.init, &d.ew, &d.eb, &mut b.out, h, w, self.scale, 4)?;
+            }
+            None => g.run(&self.last, In::one(&b.x), h, w, Act::None, Res::None, self.scale, Out::Rgba { buf: &mut b.out, base: Some((&b.src, w, h)), nearest: true })?,
+        }
         let n = w * h * self.scale * self.scale * 4;
         let rgba = g.download(&b.out, &mut b.host, n)?;
         emit(Frame { rgba, width: (w * self.scale) as u32, height: (h * self.scale) as u32 });
