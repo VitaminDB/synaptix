@@ -21,6 +21,7 @@ members = [
     "crates/synaptix-diffusion",
     "crates/synaptix-audio",
     "crates/synaptix-vision",
+    "crates/synaptix-vfx",
     "crates/synaptix-multimodal",
     "crates/synaptix-rag",
     "crates/synaptix-rl",
@@ -187,6 +188,7 @@ synaptix-ops          = { path = "crates/synaptix-ops" }
 synaptix-nn           = { path = "crates/synaptix-nn" }
 synaptix-tokenizer    = { path = "crates/synaptix-tokenizer" }
 synaptix-bundle       = { path = "crates/synaptix-bundle" }
+synaptix-vfx          = { path = "crates/synaptix-vfx" }
 synaptix-gguf         = { path = "crates/synaptix-gguf" }
 synaptix-io           = { path = "crates/synaptix-io" }
 synaptix-gen          = { path = "crates/synaptix-gen" }

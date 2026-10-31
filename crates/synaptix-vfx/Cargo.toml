@@ -1,0 +1,18 @@
+[package]
+name = "synaptix-vfx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Видеофильтры на GPU в реальном времени: повышение разрешения (NanoVSR, SPAN, RealPLKSR, Compact) и интерполяция кадров (RIFE) — свои ядра CUDA, веса в .syn."
+
+[dependencies]
+synaptix-core         = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-bundle       = { workspace = true }
+cudarc                = { workspace = true }
+half                  = { workspace = true }
+safetensors           = { workspace = true }
+memmap2               = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
