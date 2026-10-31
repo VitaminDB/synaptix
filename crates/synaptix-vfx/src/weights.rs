@@ -52,6 +52,10 @@ impl Weights {
         self.tensors.get(name).map(|(s, _)| s.as_slice()).ok_or_else(|| Error::Weights(format!("нет тензора {name}")))
     }
 
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }

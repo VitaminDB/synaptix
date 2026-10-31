@@ -9,6 +9,7 @@ pub mod compact;
 pub mod gpu;
 pub mod nanovsr;
 pub mod plksr;
+pub mod rife;
 pub mod span;
 pub mod weights;
 
