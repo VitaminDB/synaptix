@@ -5,6 +5,7 @@
 //! Поток: кадры RGBA8 по порядку → [`Upscaler::push`] → увеличенные кадры через `emit` (сразу или с
 //! задержкой окна у видеомоделей). Перемотка — [`Upscaler::reset`].
 
+pub mod compact;
 pub mod gpu;
 pub mod nanovsr;
 pub mod plksr;
@@ -64,6 +65,7 @@ pub fn open_with(g: Arc<gpu::Gpu>, w: &weights::Weights) -> Result<Box<dyn Upsca
         "nanovsr" => Ok(Box::new(nanovsr::NanoVsr::load(g, w)?)),
         "span" => Ok(Box::new(span::Span::load(g, w)?)),
         "realplksr" => Ok(Box::new(plksr::RealPlksr::load(g, w)?)),
+        "compact" => Ok(Box::new(compact::Compact::load(g, w)?)),
         a => Err(Error::Unsupported(format!("неизвестная модель «{a}»"))),
     }
 }
