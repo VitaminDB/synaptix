@@ -83,7 +83,9 @@ impl Gpu {
     /// Закреплённая память хоста под выгрузку кадра (вдвое-втрое быстрее обычной).
     pub fn alloc_pinned(&self, n: usize) -> Result<cudarc::driver::PinnedHostSlice<u8>> {
         // SAFETY: память только пишется копией с устройства и читается после синхронизации.
-        unsafe { self.ctx.alloc_pinned::<u8>(n.max(1)) }.map_err(cuda("alloc pinned"))
+        // флаги 0 — обычная кэшируемая закреплённая память: процессор её читает (write-combined —
+        // в десятки раз медленнее на чтение)
+        unsafe { self.ctx.alloc_pinned_with_flags::<u8>(n.max(1), 0) }.map_err(cuda("alloc pinned"))
     }
 
     /// Кадр RGBA с устройства в закреплённую память и срез на него (после синхронизации).

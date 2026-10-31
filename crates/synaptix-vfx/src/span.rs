@@ -24,7 +24,6 @@ struct Bufs {
     b: CudaSlice<f16>,
     o1: CudaSlice<f16>,
     o2: CudaSlice<f16>,
-    cat: CudaSlice<f16>,
     out: CudaSlice<u8>,
     host: cudarc::driver::PinnedHostSlice<u8>,
 }
@@ -82,7 +81,6 @@ impl Span {
             b: g.alloc_f16(px * cs)?,
             o1: g.alloc_f16(px * cs)?,
             o2: g.alloc_f16(px * cs)?,
-            cat: g.alloc_f16(px * cs)?,
             out: g.alloc_u8(px * r2 * 4)?,
             host: g.alloc_pinned(px * r2 * 4)?,
         });
@@ -134,8 +132,9 @@ impl Upscaler for Span {
         spab(&g, &self.blocks[4], &b.a, &mut b.o1, &mut b.o2, &mut b.b, w, h, cs)?;
         spab(&g, &self.blocks[5], &b.b, &mut b.o1, &mut b.o2, &mut b.a, w, h, cs)?;
         g.run(&self.conv2, In::one(&b.a), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut b.b, cs })?;
-        g.run(&self.conv_cat, In::cat(&[&b.f0, &b.b, &b.b1, &b.o1]), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut b.cat, cs })?;
-        g.run(&self.up, In::one(&b.cat), h, w, Act::None, Res::None, self.scale, Out::Rgba { buf: &mut b.out, base: None, nearest: false })?;
+        // a свободен после conv_2 — в него конкатенация
+        g.run(&self.conv_cat, In::cat(&[&b.f0, &b.b, &b.b1, &b.o1]), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut b.a, cs })?;
+        g.run(&self.up, In::one(&b.a), h, w, Act::None, Res::None, self.scale, Out::Rgba { buf: &mut b.out, base: None, nearest: false })?;
         let n = w * h * self.scale * self.scale * 4;
         let rgba = g.download(&b.out, &mut b.host, n)?;
         emit(Frame { rgba, width: (w * self.scale) as u32, height: (h * self.scale) as u32 });

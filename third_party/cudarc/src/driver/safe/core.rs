@@ -1509,6 +1509,27 @@ impl CudaContext {
         let event = self.new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?;
         Ok(PinnedHostSlice { ptr, len, event })
     }
+
+    /// Page locked host memory with explicit `cuMemHostAlloc` flags. `0` gives ordinary cached
+    /// pinned memory — the right choice for device→host copies the CPU reads afterwards
+    /// ([Self::alloc_pinned] is write-combined: fast to write, very slow for the CPU to read).
+    ///
+    /// # Safety
+    /// 1. This is unsafe because the memory is unset after this call.
+    pub unsafe fn alloc_pinned_with_flags<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+        flags: std::ffi::c_uint,
+    ) -> Result<PinnedHostSlice<T>, DriverError> {
+        self.bind_to_thread()?;
+        let ptr = result::malloc_host(len * std::mem::size_of::<T>(), flags)?;
+        let ptr = ptr as *mut T;
+        assert!(!ptr.is_null());
+        assert!(len * std::mem::size_of::<T>() < isize::MAX as usize);
+        assert!(ptr.is_aligned());
+        let event = self.new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?;
+        Ok(PinnedHostSlice { ptr, len, event })
+    }
 }
 
 impl<T> PinnedHostSlice<T> {
