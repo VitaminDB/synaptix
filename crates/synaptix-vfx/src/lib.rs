@@ -7,6 +7,7 @@
 
 pub mod gpu;
 pub mod nanovsr;
+pub mod span;
 pub mod weights;
 
 use std::path::Path;
@@ -60,6 +61,7 @@ pub fn open_upscaler(path: &Path, ordinal: usize) -> Result<Box<dyn Upscaler>> {
 pub fn open_with(g: Arc<gpu::Gpu>, w: &weights::Weights) -> Result<Box<dyn Upscaler>> {
     match w.arch() {
         "nanovsr" => Ok(Box::new(nanovsr::NanoVsr::load(g, w)?)),
+        "span" => Ok(Box::new(span::Span::load(g, w)?)),
         a => Err(Error::Unsupported(format!("неизвестная модель «{a}»"))),
     }
 }

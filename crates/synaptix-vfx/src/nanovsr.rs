@@ -51,7 +51,7 @@ struct Bufs {
     u2: CudaSlice<f16>,
     out: CudaSlice<u8>,
     bw: Vec<CudaSlice<f16>>,
-    host: Vec<u8>,
+    host: cudarc::driver::PinnedHostSlice<u8>,
 }
 
 pub struct NanoVsr {
@@ -71,22 +71,22 @@ impl NanoVsr {
     pub fn load(g: std::sync::Arc<Gpu>, wts: &Weights) -> Result<Self> {
         let c = wts.meta_usize("num_feat")?;
         let nb = wts.meta_usize("num_blocks")?;
-        let conv = |n: &str, cout: usize, cin: usize, k: usize, split: usize, shuffle: usize| -> Result<Conv> {
-            Conv::new(&g, wts.get(&format!("{n}.w"))?, wts.get(&format!("{n}.b"))?, cout, cin, k, split, shuffle)
+        let conv = |n: &str, cout: usize, splits: &[usize], k: usize, shuffle: usize| -> Result<Conv> {
+            Conv::new(&g, wts.get(&format!("{n}.w"))?, Some(wts.get(&format!("{n}.b"))?), cout, k, splits, shuffle)
         };
-        let feat = conv("feat", c, 3, 3, 3, 1)?;
+        let feat = conv("feat", c, &[3], 3, 1)?;
         let mut fwd = Vec::new();
         let mut bwd = Vec::new();
         for i in 0..nb {
-            fwd.push(conv(&format!("fwd.{i}"), c, c, 3, c, 1)?);
-            bwd.push(conv(&format!("bwd.{i}"), c, c, 3, c, 1)?);
+            fwd.push(conv(&format!("fwd.{i}"), c, &[c], 3, 1)?);
+            bwd.push(conv(&format!("bwd.{i}"), c, &[c], 3, 1)?);
         }
-        let fusion = conv("fusion", c, 2 * c, 1, c, 1)?;
-        let up1 = conv("up1", 4 * c, c, 3, c, 2)?;
+        let fusion = conv("fusion", c, &[c, c], 1, 1)?;
+        let up1 = conv("up1", 4 * c, &[c], 3, 2)?;
         let up2_out = wts.shape("up2.w")?[0];
-        let up2 = conv("up2", up2_out, c, 3, c, 2)?;
+        let up2 = conv("up2", up2_out, &[c], 3, 2)?;
         let last_in = up2_out / 4;
-        let last = conv("last", 3, last_in, 3, last_in, 1)?;
+        let last = conv("last", 3, &[last_in], 3, 1)?;
         let a1 = wts.get("up1.prelu")?[0];
         let a2 = wts.get("up2.prelu")?[0];
         let name = format!("NanoVSR-{}", wts.meta.get("name").cloned().unwrap_or_else(|| format!("{c}x{nb}")));
@@ -130,7 +130,7 @@ impl NanoVsr {
             u2: g.alloc_f16(px * 16 * up2_cs)?,
             out: g.alloc_u8(px * 16 * 4)?,
             bw,
-            host: vec![0u8; px * 16 * 4],
+            host: g.alloc_pinned(px * 16 * 4)?,
         });
         Ok(())
     }
@@ -142,8 +142,8 @@ impl NanoVsr {
             let last = i + 1 == n;
             // вход: feat(+prop) или прошлый блок (a/b по очереди)
             match (i, last) {
-                (0, true) => g.run(c, In { x: feat, add: prop, cat: None }, h, w, LRELU, Res::None, 1, Out::F16 { buf: dst, cs })?,
-                (0, false) => g.run(c, In { x: feat, add: prop, cat: None }, h, w, LRELU, Res::None, 1, Out::F16 { buf: a, cs })?,
+                (0, true) => g.run(c, In::sum(feat, prop), h, w, LRELU, Res::None, 1, Out::F16 { buf: dst, cs })?,
+                (0, false) => g.run(c, In::sum(feat, prop), h, w, LRELU, Res::None, 1, Out::F16 { buf: a, cs })?,
                 (i, true) if i % 2 == 1 => g.run(c, In::one(a), h, w, LRELU, Res::None, 1, Out::F16 { buf: dst, cs })?,
                 (_, true) => g.run(c, In::one(b), h, w, LRELU, Res::None, 1, Out::F16 { buf: dst, cs })?,
                 (i, false) if i % 2 == 1 => g.run(c, In::one(a), h, w, LRELU, Res::None, 1, Out::F16 { buf: b, cs })?,
@@ -177,14 +177,13 @@ impl NanoVsr {
             Self::blocks(&g, &net.fwd, &self.pending[i].feat, prop, &mut bufs.a, &mut bufs.b, &mut bufs.fnext, w, h, cs)?;
             std::mem::swap(&mut bufs.fprop, &mut bufs.fnext);
             self.fvalid = true;
-            g.run(&net.fusion, In { x: &bufs.fprop, add: None, cat: Some(&bufs.bw[i]) }, h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut bufs.fused, cs })?;
+            g.run(&net.fusion, In::cat(&[&bufs.fprop, &bufs.bw[i]]), h, w, Act::None, Res::None, 1, Out::F16 { buf: &mut bufs.fused, cs })?;
             g.run(&net.up1, In::one(&bufs.fused), h, w, Act::PRelu(net.a1), Res::None, 2, Out::F16 { buf: &mut bufs.u1, cs })?;
             g.run(&net.up2, In::one(&bufs.u1), 2 * h, 2 * w, Act::PRelu(net.a2), Res::None, 2, Out::F16 { buf: &mut bufs.u2, cs: up2_cs })?;
             let src = &self.pending[i].rgba;
-            g.run(&net.last, In::one(&bufs.u2), 4 * h, 4 * w, Act::None, Res::None, 1, Out::Rgba { buf: &mut bufs.out, base: Some((src, w, h)) })?;
-            g.stream.memcpy_dtoh(&bufs.out, &mut bufs.host).map_err(|e| Error::Cuda(format!("download: {e:?}")))?;
-            g.sync()?;
-            emit(Frame { rgba: &bufs.host, width: 4 * w as u32, height: 4 * h as u32 });
+            g.run(&net.last, In::one(&bufs.u2), 4 * h, 4 * w, Act::None, Res::None, 1, Out::Rgba { buf: &mut bufs.out, base: Some((src, w, h)), nearest: false })?;
+            let rgba = g.download(&bufs.out, &mut bufs.host, w * h * 16 * 4)?;
+            emit(Frame { rgba, width: 4 * w as u32, height: 4 * h as u32 });
         }
         for _ in 0..out_n {
             if let Some(s) = self.pending.pop_front() {
