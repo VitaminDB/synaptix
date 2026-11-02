@@ -67,4 +67,16 @@ impl AdamW {
     }
 
     pub fn zero_grad(&mut self) {}
+
+    /// Моменты (m, v) по параметрам — для чекпойнта; пусто до первого шага.
+    pub fn moments(&self) -> (&[Tensor], &[Tensor]) {
+        (&self.m, &self.v)
+    }
+
+    /// Восстановить моменты и номер шага (продолжение с чекпойнта).
+    pub fn set_moments(&mut self, m: Vec<Tensor>, v: Vec<Tensor>, step: usize) {
+        self.m = m;
+        self.v = v;
+        self.step = step;
+    }
 }

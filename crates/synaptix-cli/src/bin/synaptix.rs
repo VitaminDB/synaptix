@@ -328,6 +328,16 @@ enum Commands {
         seed: u64,
         #[arg(long, default_value = "cuda")]
         device: String,
+        /// Чекпойнт (веса, AdamW, шаг, порядок примеров) в <out>/checkpoint
+        /// каждые N шагов; 0 — только в конце.
+        #[arg(long, default_value_t = 500)]
+        save_every: usize,
+        /// Продолжить с <out>/checkpoint (те же манифест и --freeze-below).
+        #[arg(long)]
+        resume: bool,
+        /// Не собирать <out>/model.syn (F16) при сохранении.
+        #[arg(long)]
+        no_bundle: bool,
     },
     /// Дообучение LLM адаптером LoRA. На квантованной базе (по умолчанию
     /// NVFP4) это QLoRA: база заморожена, учатся только адаптеры. Датасет —
@@ -1418,6 +1428,7 @@ fn main() -> ExitCode {
         Commands::FinetuneCtc {
             base, train, out, dev, vocab, head_init, lr, head_lr, warmup, steps, accumulate,
             freeze_below, max_seconds, eval_every, eval_max, max_grad_norm, weight_decay, seed, device,
+            save_every, resume, no_bundle,
         } => {
             (|| -> Result<(), Box<dyn std::error::Error>> {
             let head_init = match head_init {
@@ -1429,6 +1440,7 @@ fn main() -> ExitCode {
                 device: synaptix_cli::commands::device::resolve(&device),
                 lr, head_lr, warmup, steps, accumulate, freeze_below, max_seconds,
                 eval_every, eval_max, max_grad_norm, weight_decay, seed,
+                save_every, resume, bundle: !no_bundle,
             };
             synaptix_asr_wav2vec2::finetune::run(&cfg)?;
             Ok(())
