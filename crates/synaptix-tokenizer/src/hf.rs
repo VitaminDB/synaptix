@@ -63,6 +63,32 @@ impl HfTokenizer {
         hf
     }
 
+    /// Байты каждого токена словаря — для ограниченной генерации (маска по
+    /// грамматике). `None` — спецтокен (в тексте ответа не бывает).
+    /// Byte-level BPE (GPT-2/Qwen) — обратная таблица байтов; SentencePiece
+    /// (Gemma, Llama-2) — `▁` → пробел и `<0xHH>` → байт.
+    pub fn token_bytes_table(&self) -> Vec<Option<Vec<u8>>> {
+        let n = self.inner.get_vocab_size(true);
+        let byte_level = matches!(self.inner.get_decoder(), Some(tokenizers::DecoderWrapper::ByteLevel(_)));
+        (0..n as u32)
+            .map(|id| {
+                if let Some(a) = self.added.id_to_token(id) {
+                    return (!a.special).then(|| a.content.as_bytes().to_vec());
+                }
+                let tok = self.inner.id_to_token(id)?;
+                if byte_level {
+                    return crate::byte_level::string_to_bytes(&tok).ok();
+                }
+                if tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>') {
+                    if let Ok(b) = u8::from_str_radix(&tok[3..5], 16) {
+                        return Some(vec![b]);
+                    }
+                }
+                Some(tok.replace('\u{2581}', " ").into_bytes())
+            })
+            .collect()
+    }
+
     fn sync_added_vocab(&mut self) {
         // bulk-extend: один rebuild матчера (add() на каждый токен = O(N²)
         // DFA-построений — 13s на 6415 added-токенах Gemma).

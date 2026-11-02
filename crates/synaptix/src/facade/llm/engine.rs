@@ -719,7 +719,7 @@ impl LlmPipeline {
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
             LlmPipeline::MuseGlimmer(p) => {
-                if cfg.temperature == 0.0 && dflash_enabled() && p.has_dflash() {
+                if cfg.temperature == 0.0 && cfg.constraint.is_none() && dflash_enabled() && p.has_dflash() {
                     return p
                         .generate_dflash_streaming(prompt_ids, cfg, sink)
                         .map(|_| ())
@@ -742,7 +742,7 @@ impl LlmPipeline {
                     .map_err(|e| LlmError(e.to_string()))
             }
             LlmPipeline::Hybrid(p) => {
-                if mtp_enabled() && p.has_mtp() {
+                if cfg.constraint.is_none() && mtp_enabled() && p.has_mtp() {
                     {
                         return p
                             .generate_mtp_with_graph(prompt_ids, cfg, sink)
@@ -1874,11 +1874,17 @@ pub struct LlmGeneration<'a> {
     stop_sequences: Vec<String>,
     stop_tokens: Vec<u32>,
     interrupt: Option<Box<dyn Fn() -> bool + 'a>>,
+    constraint: Option<synaptix_llm_common::generate::SharedConstraint>,
 }
 
 impl<'a> LlmGeneration<'a> {
     pub fn new(model: &'a Llm, opts: GenerationOptions) -> Self {
-        Self { model, opts, stop_sequences: Vec::new(), stop_tokens: Vec::new(), interrupt: None }
+        Self { model, opts, stop_sequences: Vec::new(), stop_tokens: Vec::new(), interrupt: None, constraint: None }
+    }
+
+    /// Вывод строго по грамматике (см. [`super::super::llm::json_constraint`]).
+    pub fn set_constraint(&mut self, m: synaptix_infer::structured::GrammarMatcher) {
+        self.constraint = Some(synaptix_llm_common::generate::SharedConstraint::new(m));
     }
 
     /// Флаг прерывания, который движок опрашивает между чанками префилла
@@ -1911,7 +1917,7 @@ impl<'a> LlmGeneration<'a> {
         let _runtime = self.model.runtime_scope();
         let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
         self.model.fit_vram(self.model.kv_session_bytes(kv_tokens), prompt_ids.len());
-        let cfg = GenerationConfig {
+        let cfg = GenerationConfig { constraint: self.constraint.clone(),
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
             top_k: self.opts.top_k,
@@ -2022,7 +2028,7 @@ impl<'a> LlmGeneration<'a> {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let cfg = GenerationConfig {
+        let cfg = GenerationConfig { constraint: self.constraint.clone(),
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
             top_k: self.opts.top_k,
@@ -2059,7 +2065,8 @@ impl<'a> LlmGeneration<'a> {
                 let resume_at = session.resume_at.take().map(|n| n + ids.len() - prompt_ids.len());
                 // Сессия без кэша MTP-головы — ход без спекуляции: тот же
                 // путь, что у медиа-хода, только без вложений.
-                if !(mtp_enabled() && p.has_mtp()) || mtp_kv.layers.is_empty() {
+                // Под грамматикой — тоже без спекуляции (черновые токены мимо маски).
+                if !(mtp_enabled() && p.has_mtp()) || mtp_kv.layers.is_empty() || cfg.constraint.is_some() {
                     let reuse = if session.media.is_empty() { session.reusable(&ids) } else { 0 };
                     if reuse > 0 {
                         session.kv.seq_len = reuse;
@@ -2183,7 +2190,7 @@ impl<'a> LlmGeneration<'a> {
                 };
                 // Путь декода выбирается так же, как в `generate_streaming`.
                 let dflash_path =
-                    cfg.temperature == 0.0 && dflash_enabled() && p.has_dflash();
+                    cfg.temperature == 0.0 && cfg.constraint.is_none() && dflash_enabled() && p.has_dflash();
                 let SessionKind::Muse { dcache } = &mut session.kind else {
                     unreachable!("проверено выше")
                 };
@@ -2393,7 +2400,7 @@ impl<'a> LlmGeneration<'a> {
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
-        let cfg = GenerationConfig {
+        let cfg = GenerationConfig { constraint: self.constraint.clone(),
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
             top_k: self.opts.top_k,
@@ -2581,7 +2588,7 @@ impl<'a> LlmGeneration<'a> {
         let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
         self.model.fit_vram(self.model.kv_session_bytes(kv_tokens), prompt_ids.len());
 
-        let cfg = GenerationConfig {
+        let cfg = GenerationConfig { constraint: self.constraint.clone(),
             max_new_tokens: self.opts.max_new_tokens,
             temperature: self.opts.temperature,
             top_k: self.opts.top_k,
@@ -2996,7 +3003,7 @@ fn build_facade(
         last_prefill: std::sync::atomic::AtomicUsize::new(0),
         regrow_after_prefill: std::sync::atomic::AtomicBool::new(false),
     };
-    let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids };
+    let tok = LlmTokenizer { tokenizer, template, reasoning, eos_ids, grammar_vocab: Default::default() };
     Ok((model, tok))
 }
 
@@ -3413,4 +3420,29 @@ pub fn cuda_trim_pool(ordinal: i32) -> u64 {
         return 0;
     }
     (free_of().saturating_sub(before) / (1024 * 1024)) as u64
+}
+
+impl LlmTokenizer {
+    /// Ограничитель вывода JSON-схемой (`null`/`{}` — любой JSON). `trigger`
+    /// — строка, после которой включается грамматика (`</think>` у думающих
+    /// моделей с включёнными размышлениями).
+    pub fn json_constraint(&self, schema: &serde_json::Value, trigger: Option<&str>) -> Result<synaptix_infer::structured::GrammarMatcher, LlmError> {
+        use synaptix_infer::structured::{json_schema_grammar, GrammarMatcher, TokenVocab};
+        let g = json_schema_grammar(schema).map_err(|e| LlmError(format!("JSON-схема: {e}")))?;
+        let any = self.grammar_vocab.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let v = TokenVocab::new(self.tokenizer.token_bytes_table(), self.eos_ids.clone());
+            tracing::info!("словарь для грамматики: {} токенов за {:.0} мс", v.len(), t0.elapsed().as_secs_f64() * 1e3);
+            std::sync::Arc::new(std::sync::Arc::new(v))
+        });
+        let vocab = any.downcast_ref::<std::sync::Arc<TokenVocab>>().expect("словарь грамматики").clone();
+        let m = GrammarMatcher::new(std::sync::Arc::new(g), vocab);
+        Ok(match trigger {
+            Some(t) => match self.tokenizer.token_to_id(t) {
+                Some(id) => m.with_trigger_token(id),
+                None => m.with_trigger(t),
+            },
+            None => m,
+        })
+    }
 }

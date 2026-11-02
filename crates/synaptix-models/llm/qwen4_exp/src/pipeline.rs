@@ -921,7 +921,7 @@ impl Qwen4ExpPipeline {
 
         let decode_start = Instant::now();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
-        let mut spec = match (&self.mtp, tail_stream) {
+        let mut spec = match (self.mtp.as_ref().filter(|_| cfg.constraint.is_none()), tail_stream) {
             (Some(head), Some(stream)) => Some(Speculation {
                 head,
                 cache: head

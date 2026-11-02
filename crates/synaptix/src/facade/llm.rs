@@ -156,6 +156,9 @@ pub struct LlmTokenizer {
     /// [`super::sampling::reasoning_levels`]).
     pub(crate) reasoning: Option<ReasoningLevels>,
     pub(crate) eos_ids: Vec<u32>,
+    /// Словарь для маски грамматики (строится при первом запросе по схеме;
+    /// тип — `synaptix_infer::structured::TokenVocab`, без `engine` его нет).
+    pub(crate) grammar_vocab: std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl LlmTokenizer {
@@ -328,6 +331,6 @@ pub fn load_llm_tokenizer(path: &Path) -> Result<LlmTokenizer, LlmError> {
     let eos_ids = build_eos_ids(&tokenizer, &specials, path);
     let template = load_template_source(path).map(|src| ChatTemplate::from_source_with_specials(src, specials.clone()));
     let reasoning = template.as_ref().and_then(|t| super::sampling::reasoning_levels(detect_llm_arch(path).ok(), t.source()));
-    Ok(LlmTokenizer { tokenizer, template, reasoning, eos_ids })
+    Ok(LlmTokenizer { tokenizer, template, reasoning, eos_ids, grammar_vocab: Default::default() })
 }
 

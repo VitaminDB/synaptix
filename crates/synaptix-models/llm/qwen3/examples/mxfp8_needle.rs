@@ -46,7 +46,7 @@ fn main() {
     let pipe = Qwen3Pipeline::load_with_precision(&path, Device::Cuda(0), precision, Some(4096))
         .expect("load");
     let im_end = pipe.tokenizer.token_to_id("<|im_end|>");
-    let cfg = GenerationConfig {
+    let cfg = GenerationConfig { constraint: None,
         max_new_tokens: 64, temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0,
         repetition_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0,
         frequency_penalty: 0.0, seed: 1, eos_token_id: None,

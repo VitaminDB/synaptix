@@ -33,6 +33,29 @@ pub struct GenerationConfig {
     pub eos_token_ids: Vec<u32>,
     pub max_seq: Option<usize>,
     pub prefill_batch: usize,
+    /// Ограничение вывода грамматикой (JSON-схема): недопустимые токены
+    /// не выбираются. С ним спекулятивные пути (MTP, драфт) выключены.
+    pub constraint: Option<SharedConstraint>,
+}
+
+/// Общий ограничитель грамматики: сэмплер сдвигает его по каждому токену.
+#[derive(Clone)]
+pub struct SharedConstraint(pub std::sync::Arc<std::sync::Mutex<synaptix_infer::structured::GrammarMatcher>>);
+
+impl SharedConstraint {
+    pub fn new(m: synaptix_infer::structured::GrammarMatcher) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(m)))
+    }
+
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, synaptix_infer::structured::GrammarMatcher> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl std::fmt::Debug for SharedConstraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedConstraint")
+    }
 }
 
 impl Default for GenerationConfig {
@@ -52,6 +75,7 @@ impl Default for GenerationConfig {
             eos_token_ids: Vec::new(),
             max_seq: None,
             prefill_batch: 0,
+            constraint: None,
         }
     }
 }
@@ -107,6 +131,8 @@ pub struct TokenSampler {
     /// `ProcessorContext` на каждом шаге декода: на промпте агента в 30k
     /// токенов это 120 КБ memcpy и 30k итераций штрафа на каждый токен.
     penalty_window: Option<usize>,
+    constraint: Option<SharedConstraint>,
+    eos: Vec<u32>,
 }
 
 impl TokenSampler {
@@ -121,6 +147,8 @@ impl TokenSampler {
             context: prompt_ids.to_vec(),
             step: 0,
             penalty_window: penalties_on.then_some(cfg.repeat_last_n),
+            constraint: cfg.constraint.clone(),
+            eos: cfg.eos_token_ids.iter().copied().chain(cfg.eos_token_id).collect(),
         }
     }
 
@@ -144,16 +172,50 @@ impl TokenSampler {
             step: self.step,
             batch_idx: 0,
         };
-        self.pipeline
-            .process(&mut v, &ctx)
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
-        let tok = self
-            .sampler
-            .sample(&v, &mut self.rng)
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let tok = match self.constraint.clone() {
+            None => self.process_and_sample(&mut v, &ctx)?,
+            Some(c) => {
+                let mut m = c.lock();
+                if m.finished() {
+                    // Разбор окончен — только стоп-токен.
+                    self.eos.first().copied().unwrap_or(0)
+                } else {
+                    // Сначала — как обычно; маска (проход по словарю) только
+                    // если выбранный токен грамматике не подходит.
+                    let raw = v.clone();
+                    let mut tok = self.process_and_sample(&mut v, &ctx)?;
+                    if !m.allows(tok) {
+                        v = raw;
+                        m.mask_logits(&mut v);
+                        if v.iter().all(|x| *x == f32::NEG_INFINITY) {
+                            tok = self.eos.first().copied().unwrap_or(0);
+                        } else {
+                            let masked = v.clone();
+                            tok = self.process_and_sample(&mut v, &ctx)?;
+                            if !m.allows(tok) {
+                                // Процессоры (top-k/p) отсекли все допустимые —
+                                // берём лучший допустимый по маске.
+                                tok = argmax_finite(&masked).unwrap_or(tok);
+                            }
+                        }
+                    }
+                    m.advance(tok);
+                    tok
+                }
+            }
+        };
         self.context.push(tok);
         self.step += 1;
         Ok(tok)
+    }
+
+    fn process_and_sample(&mut self, v: &mut Vec<f32>, ctx: &ProcessorContext) -> Result<u32, ModelError> {
+        self.pipeline
+            .process(v, ctx)
+            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        self.sampler
+            .sample(v, &mut self.rng)
+            .map_err(|e| ModelError::Forward(e.to_string()))
     }
 
     pub fn probs(&mut self, logits: &Tensor) -> Result<Vec<f32>, ModelError> {
@@ -209,6 +271,14 @@ impl TokenSampler {
         self.context.push(tok);
         self.step += 1;
     }
+}
+
+fn argmax_finite(v: &[f32]) -> Option<u32> {
+    v.iter()
+        .enumerate()
+        .filter(|(_, x)| x.is_finite())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
 }
 
 pub fn eos_set(cfg: &GenerationConfig) -> HashSet<u32> {

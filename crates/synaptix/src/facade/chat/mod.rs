@@ -41,6 +41,17 @@ impl StreamParser {
         }
     }
 
+    /// После какой строки ответа включать грамматику вывода (JSON-схему):
+    /// конец размышлений. `None` — с первого токена (у channel-моделей
+    /// размышления под грамматикой не поддержаны — их выключает вызывающий).
+    pub fn grammar_trigger(&self, thinking: bool) -> Option<&'static str> {
+        match self {
+            Self::Gemma(_) if thinking => Some("<channel|>"),
+            Self::ChatML { .. } if thinking => Some("</think>"),
+            _ => None,
+        }
+    }
+
     pub fn is_channel(&self) -> bool {
         matches!(self, Self::Channel(_))
     }

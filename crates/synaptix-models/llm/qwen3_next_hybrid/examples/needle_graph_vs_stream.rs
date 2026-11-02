@@ -70,7 +70,7 @@ fn main() {
 
     let im_end = pipe.tokenizer.token_to_id("<|im_end|>");
     let eos_ids: Vec<u32> = im_end.into_iter().collect();
-    let base_cfg = GenerationConfig {
+    let base_cfg = GenerationConfig { constraint: None,
         max_new_tokens: 80,
         temperature: 0.0, // greedy → детерминизм
         top_k: 0,
