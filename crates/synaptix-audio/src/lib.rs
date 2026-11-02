@@ -5,6 +5,7 @@ pub mod mel;
 pub mod mfcc;
 pub mod resample;
 pub mod stft;
+pub mod tempo;
 pub mod streaming;
 pub mod vad;
 #[cfg(feature = "nn")]

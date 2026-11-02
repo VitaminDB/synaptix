@@ -161,3 +161,26 @@ impl TtsPipeline {
         24_000
     }
 }
+
+/// Темп речи без смены высоты и деление текста на куски для потока.
+#[cfg(feature = "engine")]
+pub use synaptix_audio::tempo::{speech_chunks, time_stretch};
+
+/// Готовые голоса-персонажи для диалогов: имя → (описание для OmniVoice,
+/// описание для VoxCPM, зерно). Зерно закрепляет тембр: один и тот же
+/// персонаж звучит одинаково от фразы к фразе и между запусками.
+pub const SPEAKERS: &[(&str, &str, &str, u64)] = &[
+    ("female_young", "female, young adult, moderate pitch, american accent", "A young woman in her twenties, clear bright friendly voice, natural conversational pace.", 1101),
+    ("female_adult", "female, middle-aged, low pitch, british accent", "A middle-aged woman, warm calm low-pitched voice, professional and articulate.", 2203),
+    ("female_elderly", "female, elderly, low pitch", "An elderly woman, soft gentle slightly husky voice, kind and unhurried.", 3307),
+    ("male_young", "male, young adult, moderate pitch, american accent", "A young man in his twenties, clear energetic voice, casual and friendly.", 4409),
+    ("male_adult", "male, middle-aged, low pitch, british accent", "A middle-aged man, deep calm confident voice, like a professional interviewer.", 5501),
+    ("male_elderly", "male, elderly, very low pitch", "An elderly man, deep slightly raspy voice, slow and thoughtful.", 6607),
+    ("girl", "female, child, high pitch", "A little girl, about 8 years old, high-pitched cheerful childish voice.", 7703),
+    ("boy", "male, child, high pitch", "A little boy, about 8 years old, high-pitched playful childish voice.", 8807),
+];
+
+/// Персонаж по имени (без учёта регистра).
+pub fn speaker(name: &str) -> Option<(&'static str, &'static str, u64)> {
+    SPEAKERS.iter().find(|s| s.0.eq_ignore_ascii_case(name.trim())).map(|s| (s.1, s.2, s.3))
+}
