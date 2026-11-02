@@ -15,7 +15,7 @@ pub mod spm;
 pub use config::GigaAmConfig;
 pub use loader::GigaAmWeights;
 pub use model::GigaAmModel;
-pub use pipeline::GigaAm;
+pub use pipeline::{CtcWord, GigaAm};
 pub use spm::SpmDecoder;
 
 pub type Result<T> = std::result::Result<T, GigaAmError>;

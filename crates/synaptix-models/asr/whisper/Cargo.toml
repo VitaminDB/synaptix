@@ -28,3 +28,4 @@ synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-npu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
 synaptix-test-utils   = { workspace = true }
+synaptix-align-mfa    = { workspace = true }

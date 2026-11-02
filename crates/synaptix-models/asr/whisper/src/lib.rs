@@ -11,11 +11,13 @@ pub mod loader;
 pub mod mel;
 pub mod model;
 pub mod pipeline;
+pub mod words;
 
 pub use config::{GenerationConfig, WhisperConfig};
 pub use loader::WhisperWeights;
 pub use model::{WhisperDecoder, WhisperEncoder, WhisperModel};
-pub use pipeline::{Task, TsSegment, WhisperPipeline};
+pub use pipeline::{Task, TsSegment, WhisperPipeline, WordOptions, WordsResult, VERBATIM_PROMPT};
+pub use words::WordTiming;
 
 pub type Result<T> = std::result::Result<T, WhisperError>;
 

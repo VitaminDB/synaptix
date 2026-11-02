@@ -96,6 +96,8 @@ pub struct GenerationConfig {
     pub suppress_tokens: Vec<u32>,
     pub begin_suppress_tokens: Vec<u32>,
     pub is_multilingual: bool,
+    /// Головы cross-attn `(слой, голова)` для выравнивания слов по времени.
+    pub alignment_heads: Vec<(usize, usize)>,
 }
 
 impl GenerationConfig {
@@ -105,4 +107,30 @@ impl GenerationConfig {
             .map_err(|e| WhisperError::Bundle(e.to_string()))?;
         serde_json::from_slice(&bytes).map_err(|e| WhisperError::Config(e.to_string()))
     }
+}
+
+/// Головы выравнивания: из `generation_config.json`, иначе по известным моделям
+/// (как `_ALIGNMENT_HEADS` openai/whisper), иначе — все головы второй половины
+/// слоёв декодера (запасной вариант openai).
+pub fn alignment_heads(cfg: &WhisperConfig, gen: &GenerationConfig) -> Vec<(usize, usize)> {
+    let ok = |v: &[(usize, usize)]| {
+        !v.is_empty() && v.iter().all(|&(l, h)| l < cfg.decoder_layers && h < cfg.decoder_attention_heads)
+    };
+    if ok(&gen.alignment_heads) {
+        return gen.alignment_heads.clone();
+    }
+    let known: &[(usize, usize)] = match (cfg.d_model, cfg.decoder_layers, cfg.vocab_size) {
+        // tiny (многоязычная)
+        (384, 4, 51865) => &[(2, 2), (3, 0), (3, 2), (3, 3), (3, 4), (3, 5)],
+        // large-v3-turbo
+        (1280, 4, 51866) => &[(2, 4), (2, 11), (3, 3), (3, 6), (3, 11), (3, 14)],
+        // large-v3
+        (1280, 32, 51866) => &[(7, 0), (10, 17), (12, 18), (13, 12), (16, 1), (17, 14), (19, 11), (21, 4), (24, 1), (25, 6)],
+        _ => &[],
+    };
+    if ok(known) {
+        return known.to_vec();
+    }
+    let n = cfg.decoder_layers;
+    (n / 2..n).flat_map(|l| (0..cfg.decoder_attention_heads).map(move |h| (l, h))).collect()
 }

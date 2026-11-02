@@ -294,6 +294,30 @@ impl DecoderLayer {
         Ok(residual.add(&h)?)
     }
 
+    /// Как [`Self::forward`], плюс сырые cross-attn оценки `QK·scale` всех голов
+    /// `[1, H, S, T_enc]` (F32) — для выравнивания слов по времени.
+    fn forward_qk(&self, x: &Tensor, enc_out: &Tensor, causal: &Tensor) -> Result<(Tensor, Tensor)> {
+        let residual = x;
+        let h = self.self_attn_ln.forward(x)?;
+        let h = self.self_attn.forward(&h, &h, Some(causal))?;
+        let x = residual.add(&h)?;
+
+        let residual = &x;
+        let h = self.encoder_attn_ln.forward(&x)?;
+        let a = &self.encoder_attn;
+        let q = a.q_heads(&h)?;
+        let (k, v) = a.kv_heads(enc_out)?;
+        let kt = k.to_dtype(DType::F32)?.transpose(2, 3)?.contiguous()?;
+        let qk = q.to_dtype(DType::F32)?.matmul(&kt)?.mul_scalar(a.scale)?;
+        let h = a.attend(&q, &k, &v, None)?;
+        let x = residual.add(&h)?;
+
+        let residual = &x;
+        let h = self.final_ln.forward(&x)?;
+        let h = self.fc2.forward(&gelu_exact(&self.fc1.forward(&h)?)?)?;
+        Ok((residual.add(&h)?, qk))
+    }
+
     /// Device-резидентный decode-шаг слоя (CUDA-graph): self-attn через
     /// preallocated KV-буфер + device-позицию/длину, cross-attn по фикс. K/V.
     #[allow(clippy::too_many_arguments)]
@@ -398,6 +422,45 @@ impl WhisperDecoder {
         }
         let h = self.final_ln.forward(&h)?;
         Ok(self.lm_head.forward(&h)?)
+    }
+
+    /// Teacher-forced прогон с cross-attn оценками выбранных голов `(слой, голова)`:
+    /// логиты `[1, S, vocab]` и по каждой голове `QK·scale` `[S × T_enc]` (F32, host),
+    /// в порядке `heads`. Слои без нужных голов идут обычным путём.
+    pub fn forward_prefix_attn(
+        &self,
+        token_ids: &[u32],
+        enc_out: &Tensor,
+        heads: &[(usize, usize)],
+    ) -> Result<(Tensor, Vec<Vec<f32>>)> {
+        let device = enc_out.device();
+        let seq = token_ids.len();
+        let mut h = self.embed(token_ids, 0, device)?;
+        let causal = causal_mask(seq, device)?;
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); heads.len()];
+        for (li, layer) in self.layers.iter().enumerate() {
+            if !heads.iter().any(|&(l, _)| l == li) {
+                h = layer.forward(&h, enc_out, &causal)?;
+                continue;
+            }
+            let (nh, qk) = layer.forward_qk(&h, enc_out, &causal)?;
+            h = nh;
+            for (i, &(l, hd)) in heads.iter().enumerate() {
+                if l == li {
+                    out[i] = qk.narrow(1, hd, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                }
+            }
+        }
+        let h = self.final_ln.forward(&h)?;
+        Ok((self.lm_head.forward(&h)?, out))
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn num_heads(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.encoder_attn.num_heads)
     }
 
     fn d_model(&self) -> usize {

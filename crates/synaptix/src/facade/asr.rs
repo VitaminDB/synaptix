@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[cfg(feature = "engine")]
 use synaptix_asr_gigaam::GigaAm;
 #[cfg(feature = "engine")]
-use synaptix_asr_whisper::{Task, WhisperPipeline};
+use synaptix_asr_whisper::{Task, WhisperPipeline, WordOptions};
 #[cfg(feature = "engine")]
 use synaptix_audio::resample;
 use synaptix_core::dtype::DType;
@@ -64,6 +64,42 @@ pub struct AsrConfig {
     pub device: Device,
     pub storage_dtype: StorageDType,
     pub compute_dtype: ComputeDType,
+}
+
+/// Слово распознавания: текст, таймкоды (секунды от начала записи) и
+/// уверенность модели (среднее вероятностей токенов слова, 0..1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsrWord {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+    pub prob: f32,
+}
+
+/// Итог распознавания со словами.
+#[derive(Debug, Clone, Default)]
+pub struct AsrResult {
+    pub text: String,
+    /// Код языка (заданный или определённый); для GigaAM — "ru".
+    pub language: String,
+    pub words: Vec<AsrWord>,
+}
+
+/// Опции распознавания со словами (действуют для Whisper).
+#[derive(Debug, Clone)]
+pub struct AsrWordsOptions {
+    /// Подсказка с «umm, like, hmm» — Whisper реже выбрасывает заполнители пауз.
+    pub verbatim: bool,
+    /// Своя подсказка (перекрывает `verbatim`).
+    pub initial_prompt: Option<String>,
+    /// Подтягивать границы слов к паузам по энергии сигнала.
+    pub snap_to_pauses: bool,
+}
+
+impl Default for AsrWordsOptions {
+    fn default() -> Self {
+        Self { verbatim: false, initial_prompt: None, snap_to_pauses: true }
+    }
 }
 
 #[cfg(feature = "engine")]
@@ -148,6 +184,55 @@ impl Transcriber {
             // GigaAM — русский CTC; язык фиксирован, ресэмпл внутри transcribe_pcm.
             Engine::GigaAm(gigaam) => {
                 gigaam.transcribe_pcm(pcm, sample_rate).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Распознавание со словами, таймкодами и уверенностью по слову. Whisper —
+    /// DTW по cross-attn голов выравнивания; GigaAM — по выравниванию greedy-CTC.
+    pub fn transcribe_pcm_words(
+        &mut self,
+        pcm: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        opts: &AsrWordsOptions,
+    ) -> Result<AsrResult, String> {
+        match &self.engine {
+            Engine::Whisper(whisper) => {
+                let resampled;
+                let audio: &[f32] = if sample_rate == WHISPER_SR {
+                    pcm
+                } else {
+                    resampled = resample(pcm, sample_rate, WHISPER_SR).map_err(|e| e.to_string())?;
+                    &resampled
+                };
+                let lang = language.or(self.language.as_deref());
+                let wo = WordOptions {
+                    verbatim: opts.verbatim,
+                    initial_prompt: opts.initial_prompt.clone(),
+                    snap_to_pauses: opts.snap_to_pauses,
+                };
+                let r = whisper.transcribe_words(audio, lang, &wo).map_err(|e| e.to_string())?;
+                Ok(AsrResult {
+                    text: r.text,
+                    language: r.language,
+                    words: r
+                        .words
+                        .into_iter()
+                        .map(|w| AsrWord { text: w.text, start: w.start, end: w.end, prob: w.prob })
+                        .collect(),
+                })
+            }
+            Engine::GigaAm(gigaam) => {
+                let (text, words) = gigaam.transcribe_pcm_words(pcm, sample_rate).map_err(|e| e.to_string())?;
+                Ok(AsrResult {
+                    text,
+                    language: "ru".to_string(),
+                    words: words
+                        .into_iter()
+                        .map(|w| AsrWord { text: w.text, start: w.start, end: w.end, prob: w.prob })
+                        .collect(),
+                })
             }
         }
     }
