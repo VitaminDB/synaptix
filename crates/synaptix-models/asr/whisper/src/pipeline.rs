@@ -266,10 +266,14 @@ impl WhisperPipeline {
             let mut v = logits_to_f32(&logits.take().unwrap())?;
             self.suppress(&mut v, out.is_empty());
             let next = argmax(&v) as u32;
-            if next == self.special.eot || pos >= max_len {
+            // Место под eot: выравнивание слов прогоняет префикс + текст + eot.
+            if next == self.special.eot || pos + 1 >= max_len {
                 break;
             }
             out.push(next);
+            if cut_loop(&mut out) {
+                break;
+            }
             logits = Some(self.model.decoder.decode_step(next, pos, &mut cache)?);
             pos += 1;
         }
@@ -293,10 +297,13 @@ impl WhisperPipeline {
         loop {
             self.suppress(&mut logits, out.is_empty());
             let next = argmax(&logits) as u32;
-            if next == self.special.eot || pos >= max_target {
+            if next == self.special.eot || pos + 1 >= max_target {
                 break;
             }
             out.push(next);
+            if cut_loop(&mut out) {
+                break;
+            }
             state.update(next, pos as u32)?;
             self.model.decoder.forward_decode_dev(&mut state, &mut cache)?;
             logits = logits_to_f32(&state.logits)?;
@@ -343,10 +350,13 @@ impl WhisperPipeline {
         loop {
             self.suppress(&mut cur_logits, out.is_empty());
             let next = argmax(&cur_logits) as u32;
-            if next == self.special.eot || pos >= max_target {
+            if next == self.special.eot || pos + 1 >= max_target {
                 break;
             }
             out.push(next);
+            if cut_loop(&mut out) {
+                break;
+            }
 
             // Продвигаем шаг: вход = next на позиции pos.
             state.update(next, pos as u32)?;
@@ -406,10 +416,13 @@ impl WhisperPipeline {
             let mut v = logits_to_f32(&logits.take().unwrap())?;
             self.apply_timestamp_rules(&mut v, &out_ids);
             let next = argmax(&v) as u32;
-            if next == self.special.eot || pos >= max_len {
+            if next == self.special.eot || pos + 1 >= max_len {
                 break;
             }
             out_ids.push(next);
+            if cut_loop(&mut out_ids) {
+                break;
+            }
             logits = Some(self.model.decoder.decode_step(next, pos, &mut cache)?);
             pos += 1;
         }
@@ -758,6 +771,8 @@ impl WhisperPipeline {
     /// → DTW → слова (время от начала окна), вероятности токенов, no_speech.
     fn align_window(&self, enc: &Tensor, prefix: &[u32], text: &[u32], frames: usize, lang: &str) -> Result<WindowAlign> {
         let eot = self.special.eot;
+        // Предел позиций декодера: лишний хвост текста не выравнивается.
+        let text = &text[..text.len().min(self.config.max_target_positions.saturating_sub(prefix.len() + 1))];
         let mut tokens = prefix.to_vec();
         tokens.extend_from_slice(text);
         tokens.push(eot);
@@ -968,5 +983,48 @@ impl WhisperPipeline {
             }
         }
         Ok(res)
+    }
+}
+
+/// Зацикливание декода («…діңіздіңіздіңіз…» до предела позиций): хвост —
+/// один и тот же кусок из 1–16 токенов, повторённый подряд много раз.
+/// Повторы, кроме первого, отрезаются; `true` — декод пора остановить.
+pub(crate) fn cut_loop(out: &mut Vec<u32>) -> bool {
+    let n = out.len();
+    for period in 1..=16usize {
+        if n < period * 4 {
+            break;
+        }
+        let tail = &out[n - period..];
+        let mut reps = 1;
+        while (reps + 1) * period <= n && &out[n - (reps + 1) * period..n - reps * period] == tail {
+            reps += 1;
+        }
+        // Короткий кусок — много раз (пунктуация «...» бывает и законно).
+        let need = if period == 1 { 12 } else { (24 / period).max(4) };
+        if reps >= need {
+            out.truncate(n - (reps - 1) * period);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::cut_loop;
+
+    #[test]
+    fn cuts_repeats() {
+        let mut v: Vec<u32> = vec![1, 2, 3];
+        for _ in 0..12 {
+            v.extend([7, 8]);
+        }
+        assert!(cut_loop(&mut v));
+        assert_eq!(v, vec![1, 2, 3, 7, 8]);
+        let mut ok: Vec<u32> = (0..100).collect();
+        assert!(!cut_loop(&mut ok));
+        let mut few = vec![5, 6, 5, 6, 5, 6];
+        assert!(!cut_loop(&mut few));
     }
 }
