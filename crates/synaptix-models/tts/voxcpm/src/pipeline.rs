@@ -73,6 +73,31 @@ fn normalize_level(mut w: Waveform) -> Waveform {
     w
 }
 
+/// Текст как у upstream (`VoxCPM._generate`): переводы строк — пробелы, подряд
+/// идущие пробельные символы — один пробел; пробел в начале убирается
+/// (LlamaTokenizerFast upstream его не кодирует, сырой tokenizer.json дал бы
+/// «▁▁»). Без этого «\n», двойные и ведущие пробелы дают токены, которых
+/// модель при обучении не видела.
+pub fn clean_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.trim_start().chars() {
+        if c.is_whitespace() {
+            space = true;
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(c);
+        }
+    }
+    if space {
+        out.push(' ');
+    }
+    out
+}
+
 /// Предел длительности фразы по тексту (секунды).
 pub fn duration_limit(text: &str, opts: &GenerateOptions) -> f32 {
     spoken_chars(text) as f32 * opts.max_sec_per_char + opts.extra_sec
@@ -260,6 +285,7 @@ impl VoxCpmPipeline {
     }
 
     pub fn synthesize(&self, text: &str, opts: &GenerateOptions) -> Result<Waveform, VoxError> {
+        let text = &clean_text(text);
         let mut ids = self.tokenizer.encode(text)?;
         ids.push(AUDIO_START);
         let seg = self.text_segment(&ids)?;
@@ -290,6 +316,7 @@ impl VoxCpmPipeline {
     }
 
     fn synthesize_with_reference_feat(&self, text: &str, ref_feat: Tensor, opts: &GenerateOptions) -> Result<Waveform, VoxError> {
+        let text = &clean_text(text);
         let mut ids = self.tokenizer.encode(text)?;
         ids.push(AUDIO_START);
         let segments = vec![
@@ -326,6 +353,7 @@ impl VoxCpmPipeline {
     }
 
     fn synthesize_continuation_feat(&self, target_text: &str, prompt_text: &str, prompt_feat: Tensor, opts: &GenerateOptions) -> Result<Waveform, VoxError> {
+        let target_text = &clean_text(target_text);
         let a = prompt_feat.dims()[0];
         let context_len = opts.streaming_prefix_len.saturating_sub(1).min(a);
         let text = format!("{prompt_text}{target_text}");
@@ -343,6 +371,7 @@ impl VoxCpmPipeline {
         reference_wav: &str,
         opts: &GenerateOptions,
     ) -> Result<Waveform, VoxError> {
+        let target_text = &clean_text(target_text);
         let ref_feat = self.encode_wav(reference_wav, PadMode::Right)?;
         let prompt_feat = self.encode_wav(prompt_wav, PadMode::Left)?;
         let a = prompt_feat.dims()[0];
@@ -358,5 +387,19 @@ impl VoxCpmPipeline {
             self.audio_segment(prompt_feat)?,
         ];
         self.run(segments, context_len, target_text, opts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_text;
+
+    #[test]
+    fn clean_text_as_upstream() {
+        // re.sub(r"\s+", " ", text.replace("\n", " ")); ведущий пробел upstream
+        // съедает токенизатор, хвостовой остаётся.
+        assert_eq!(clean_text("  double  spaces and\nnewline "), "double spaces and newline ");
+        assert_eq!(clean_text("(A calm voice)Hello,\n\tworld."), "(A calm voice)Hello, world.");
+        assert_eq!(clean_text("plain"), "plain");
     }
 }
