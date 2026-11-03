@@ -511,8 +511,26 @@ pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Stor
         // Как `clone_htod`, но аллокация — из staging-пула (см.
         // `cuda::alloc_bytes_uninit`): байты весов не должны оседать в пуле
         // рядом с готовыми квантованными весами.
-        let mut dst = unsafe { crate::device::cuda::alloc_bytes_uninit(&stream, bytes.len()) }
-            .map_err(|e| SynaptixError::Cuda(format!("alloc H2D({} bytes): {e:?}", bytes.len())))?;
+        // Нехватка: sync+trim и отдаваемая память реестра (служба выгружает
+        // простаивающие модели), затем ещё раз — как у аллокатора активаций.
+        let mut dst = match unsafe { crate::device::cuda::alloc_bytes_uninit(&stream, bytes.len()) } {
+            Ok(d) => d,
+            Err(first) => {
+                let mut got = Err(first);
+                for attempt in 1..=3usize {
+                    let _ = crate::device::cuda::synchronize_all(ord);
+                    let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                    crate::memory::reclaim::reclaim(device, bytes.len().max(512 << 20).saturating_mul(attempt));
+                    let _ = crate::device::cuda::synchronize_all(ord);
+                    let _ = crate::memory::cuda_pool::trim_pools_on_oom(ord);
+                    got = unsafe { crate::device::cuda::alloc_bytes_uninit(&stream, bytes.len()) };
+                    if got.is_ok() {
+                        break;
+                    }
+                }
+                got.map_err(|e| SynaptixError::Cuda(format!("alloc H2D({} bytes): {e:?}", bytes.len())))?
+            }
+        };
         stream
             .memcpy_htod(bytes, &mut dst)
             .map_err(|e| SynaptixError::Cuda(format!("memcpy_htod({} bytes): {e:?}", bytes.len())))?;

@@ -1654,6 +1654,31 @@ mod inner {
         ctx.mem_get_info()
             .map_err(|e| SynaptixError::Cuda(format!("mem_get_info({ordinal}): {e:?}")))
     }
+
+    /// Свободная видеопамять с попыткой освободить её до `want` байт: пока
+    /// свободно меньше, просит отдаваемую память у реестра
+    /// [`crate::memory::reclaim`] (служба выгружает простаивающие модели, MoE
+    /// ужимает кэш экспертов). Для решений «резидентно или стримить с хоста».
+    pub fn free_for(ordinal: usize, want: usize) -> usize {
+        let free = || mem_info(ordinal).map(|(f, _)| f).unwrap_or(0);
+        let mut f = free();
+        while f < want {
+            if crate::memory::reclaim::reclaim(crate::device::Device::Cuda(ordinal), want - f) == 0 {
+                break;
+            }
+            let _ = synchronize_all(ordinal);
+            let _ = crate::memory::cuda_pool::hard_trim_all_pools_device(ordinal);
+            let g = free();
+            if g <= f {
+                // Освобождённое не дошло до драйвера — дальше выгружать
+                // бесполезно.
+                f = g;
+                break;
+            }
+            f = g;
+        }
+        f
+    }
 }
 
 pub use inner::*;

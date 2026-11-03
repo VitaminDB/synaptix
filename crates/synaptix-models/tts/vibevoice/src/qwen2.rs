@@ -216,6 +216,12 @@ impl Qwen2Model {
             // Запас — два стримящихся слоя сверх заказанного.
             if host_from == n && i > 0 && dev.is_cuda() && free() < reserve + 3 * blk {
                 trim();
+                // Остаток слоёв с запасом: сначала просим службу выгрузить
+                // простаивающие модели, на хост — только если не помогло.
+                let rest = (n - i) * blk + reserve + 2 * blk;
+                if let Device::Cuda(o) = dev {
+                    let _ = synaptix_core::device::cuda::free_for(o, rest);
+                }
                 if free() < reserve + 3 * blk {
                     host_from = i;
                     eprintln!("[vibevoice] VRAM: слои LM {i}..{n} на хост, стримятся в forward");
