@@ -36,6 +36,7 @@ pub struct SamplerGraph {
     x_in: Tensor,
     cond_in: Tensor,
     out: Tensor,
+    noise_in: Option<Tensor>,
     _temb: Tensor,
     steps: usize,
     cfg_bits: u32,
@@ -43,8 +44,8 @@ pub struct SamplerGraph {
 }
 
 impl SamplerGraph {
-    pub fn matches(&self, batch: usize, steps: usize, cfg_scale: f32) -> bool {
-        self.batch == batch && self.steps == steps && self.cfg_bits == cfg_scale.to_bits()
+    pub fn matches(&self, batch: usize, steps: usize, cfg_scale: f32, sde: bool) -> bool {
+        self.batch == batch && self.steps == steps && self.cfg_bits == cfg_scale.to_bits() && self.noise_in.is_some() == sde
     }
 
     pub fn build(
@@ -53,6 +54,7 @@ impl SamplerGraph {
         batch: usize,
         steps: usize,
         cfg_scale: f32,
+        sde: bool,
     ) -> Result<Self> {
         let device = model.device;
         let dtype = model.dtype;
@@ -64,8 +66,13 @@ impl SamplerGraph {
         let x_in = Tensor::zeros(vec![batch, vae], dtype, device).map_err(err)?;
         let cond_in = Tensor::zeros(vec![batch * 2, hidden], dtype, device).map_err(err)?;
         let mut out = Tensor::zeros(vec![batch, vae], dtype, device).map_err(err)?;
+        let noise_in = if sde {
+            Some(Tensor::zeros(vec![steps * batch, vae], dtype, device).map_err(err)?)
+        } else {
+            None
+        };
 
-        let plan = scheduler.plan(steps);
+        let plan = scheduler.plan_with(steps, sde);
         let timesteps = scheduler.timesteps.clone();
         let mut temb_rows: Vec<Tensor> = Vec::with_capacity(steps);
         for t in &timesteps {
@@ -88,6 +95,7 @@ impl SamplerGraph {
             let ci = &cond_in;
             let dst = &mut out;
             let plan_ref = &plan;
+            let ni = noise_in.as_ref();
             capturer
                 .capture_with(&stream, |_s| {
                     let mut x = xi.clone();
@@ -105,7 +113,15 @@ impl SamplerGraph {
                             .map_err(|e| infer_err(&e.to_string()))?;
                         let guided = guide(&eps, cfg_scale, batch)
                             .map_err(|e| infer_err(&e.to_string()))?;
-                        let (next, m0) = apply_plan_step(p, &guided, &x, prev.as_ref())
+                        let z = match ni {
+                            Some(n) => Some(
+                                n.narrow(0, i * batch, batch)
+                                    .and_then(|t| t.contiguous())
+                                    .map_err(|e| infer_err(&e.to_string()))?,
+                            ),
+                            None => None,
+                        };
+                        let (next, m0) = apply_plan_step(p, &guided, &x, prev.as_ref(), z.as_ref())
                             .map_err(|e| infer_err(&e.to_string()))?;
                         x = next;
                         prev = Some(m0);
@@ -124,6 +140,7 @@ impl SamplerGraph {
             x_in,
             cond_in,
             out,
+            noise_in,
             _temb: temb_all,
             steps,
             cfg_bits: cfg_scale.to_bits(),
@@ -131,8 +148,11 @@ impl SamplerGraph {
         })
     }
 
-    pub fn run(&mut self, init_noise: &Tensor, cond: &Tensor) -> Result<Tensor> {
+    pub fn run(&mut self, init_noise: &Tensor, cond: &Tensor, step_noise: Option<&Tensor>) -> Result<Tensor> {
         self.x_in.copy_from(init_noise).map_err(err)?;
+        if let (Some(buf), Some(z)) = (self.noise_in.as_mut(), step_noise) {
+            buf.copy_from(z).map_err(err)?;
+        }
         self.cond_in.copy_from(cond).map_err(err)?;
         let g = self
             .capturer

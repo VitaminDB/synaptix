@@ -23,6 +23,7 @@ pub struct PodcastArgs {
     pub max_length_times: f32,
     pub zero_noise: bool,
     pub max_new_tokens: Option<usize>,
+    pub ode: bool,
 }
 
 pub fn run(args: PodcastArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -74,6 +75,7 @@ pub fn run(args: PodcastArgs) -> Result<(), Box<dyn std::error::Error>> {
         seed: args.seed,
         zero_noise: args.zero_noise,
         max_new_tokens: args.max_new_tokens,
+        sde: !args.ode,
     };
     let speakers = script
         .lines()

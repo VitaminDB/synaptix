@@ -649,7 +649,7 @@ enum Commands {
         #[arg(long, default_value_t = 1.3)]
         cfg: f32,
         /// Число шагов DPM-Solver++ на один акустический кадр.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 10)]
         steps: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -661,6 +661,10 @@ enum Commands {
         zero_noise: bool,
         #[arg(long, help = "Жёсткий потолок новых токенов")]
         max_new_tokens: Option<usize>,
+        /// Детерминированный решатель DPM-Solver++ (ODE) вместо SDE, как в
+        /// demo/inference_from_file.py upstream (чаще досочиняет слова).
+        #[arg(long, default_value_t = false)]
+        ode: bool,
     },
     /// Песня целиком (YuE2): стиль и лирика → партитура → музыка → WAV 48 кГц стерео.
     Song {
@@ -1502,10 +1506,10 @@ fn main() -> ExitCode {
         }),
         Commands::Podcast {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
-            max_length_times, zero_noise, max_new_tokens,
+            max_length_times, zero_noise, max_new_tokens, ode,
         } => podcast::run(podcast::PodcastArgs {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,
-            max_length_times, zero_noise, max_new_tokens,
+            max_length_times, zero_noise, max_new_tokens, ode,
         }),
         Commands::Song {
             style, output, lyrics, lyrics_file, models, model, vae, cot, abc_file, cover,

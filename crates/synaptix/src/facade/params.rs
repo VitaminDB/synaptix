@@ -111,7 +111,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
     match task {
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
-            "vibevoice" => vec![ref_audio(), steps(Some(20), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
+            "vibevoice" => vec![ref_audio(), steps(Some(10), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
             "voxcpm" | "voxcpm2" => vec![
                 spec(
                     "voice",

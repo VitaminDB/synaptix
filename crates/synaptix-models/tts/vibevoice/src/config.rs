@@ -207,17 +207,26 @@ pub struct GenerationConfig {
     pub max_new_tokens: Option<usize>,
     pub seed: u64,
     pub zero_noise: bool,
+    /// Стохастический решатель SDE-DPMSolver++ (по умолчанию, как gradio-демо
+    /// upstream), иначе детерминированный DPMSolver++ (ODE, как
+    /// demo/inference_from_file.py). На 12 фразах × 6 зёрен (whisper): ODE —
+    /// WER 2,7 %, лишние слова и «убегания» до 15 с; SDE — WER 0,6 %, без них.
+    pub sde: bool,
 }
 
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
             cfg_scale: 1.3,
-            ddpm_inference_steps: 20,
+            // Как gradio-демо upstream: SDE-DPMSolver++, 10 шагов, CFG 1.3.
+            // Детерминированный ODE-решатель (20 шагов из конфига модели)
+            // чаще «досочиняет» слова и уходит в бормотание.
+            ddpm_inference_steps: 10,
             max_length_times: 2.0,
             max_new_tokens: None,
             seed: 0,
             zero_noise: false,
+            sde: true,
         }
     }
 }

@@ -42,6 +42,8 @@ pub struct PlanStep {
     pub cb: f32,
     pub cc: f32,
     pub r0_inv: f32,
+    /// Множитель шума шага (SDE-DPMSolver++: σ_t·√(1−e^{−2h})), у ODE — 0.
+    pub cn: f32,
 }
 
 pub fn apply_plan_step(
@@ -49,6 +51,7 @@ pub fn apply_plan_step(
     eps: &Tensor,
     sample: &Tensor,
     prev: Option<&Tensor>,
+    noise: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     let m0 = sample
         .mul_scalar(p.convert_alpha)
@@ -73,6 +76,9 @@ pub fn apply_plan_step(
             .and_then(|d| d.mul_scalar(p.r0_inv))
             .map_err(err)?;
         x = x.add(&d1.mul_scalar(p.cc).map_err(err)?).map_err(err)?;
+    }
+    if let (Some(z), true) = (noise, p.cn != 0.0) {
+        x = x.add(&z.mul_scalar(p.cn).map_err(err)?).map_err(err)?;
     }
     Ok((x, m0))
 }
@@ -216,6 +222,14 @@ impl DpmSolverMultistep {
     }
 
     pub fn plan(&mut self, num_inference_steps: usize) -> Vec<PlanStep> {
+        self.plan_with(num_inference_steps, false)
+    }
+
+    /// План шагов DPM-Solver++ 2-го порядка (midpoint, последний шаг — 1-го,
+    /// конечная σ = 0). `sde` — стохастический вариант (`sde-dpmsolver++`, им
+    /// сэмплирует gradio-демо VibeVoice): x_t = σ_t/σ_s·e^{−h}·x + α_t(1−e^{−2h})·(D0 + D1/2)
+    /// + σ_t√(1−e^{−2h})·z; ODE: x_t = σ_t/σ_s·x − α_t(e^{−h}−1)·(D0 + D1/2).
+    pub fn plan_with(&mut self, num_inference_steps: usize, sde: bool) -> Vec<PlanStep> {
         self.set_timesteps(num_inference_steps);
         let last = self.timesteps.len() - 1;
         let mut out = Vec::with_capacity(self.timesteps.len());
@@ -226,7 +240,12 @@ impl DpmSolverMultistep {
             let lambda_t = alpha_t.ln() - sigma_t.ln();
             let lambda_s0 = alpha_s0.ln() - sigma_s0.ln();
             let h = lambda_t - lambda_s0;
-            let base = alpha_t * ((-h).exp() - 1.0);
+            // ODE: cb = −α_t(e^{−h}−1); SDE: cb = α_t(1−e^{−2h}).
+            let base = if sde {
+                -(alpha_t * (1.0 - (-2.0 * h).exp()))
+            } else {
+                alpha_t * ((-h).exp() - 1.0)
+            };
             let first_order = i == 0 || i == last;
             let (cc, r0_inv) = if first_order {
                 (0.0, 0.0)
@@ -236,14 +255,21 @@ impl DpmSolverMultistep {
                 let h0 = lambda_s0 - lambda_s1;
                 (-0.5 * base, h / h0)
             };
+            let (ca, cn) = if sde {
+                let cn = sigma_t * (1.0 - (-2.0 * h).exp()).max(0.0).sqrt();
+                (sigma_t / sigma_s0 * (-h).exp(), if cn.is_finite() { cn } else { 0.0 })
+            } else {
+                (sigma_t / sigma_s0, 0.0)
+            };
             out.push(PlanStep {
                 convert_alpha: alpha_i as f32,
                 convert_sigma: sigma_i as f32,
                 first_order,
-                ca: (sigma_t / sigma_s0) as f32,
+                ca: ca as f32,
                 cb: (-base) as f32,
                 cc: cc as f32,
                 r0_inv: r0_inv as f32,
+                cn: cn as f32,
             });
         }
         out
@@ -253,5 +279,32 @@ impl DpmSolverMultistep {
         self.model_outputs = vec![None; self.solver_order];
         self.lower_order_nums = 0;
         self.step_index = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SDE-план: шум на всех шагах, кроме последнего (σ = 0 → x = x̂0, как
+    /// у ODE); ODE — без шума. Коэффициенты первого шага — по формуле
+    /// sde-dpmsolver++ из diffusers.
+    #[test]
+    fn sde_plan_matches_formula() {
+        let mut s = DpmSolverMultistep::new(1000, "cosine").unwrap();
+        let ode = s.plan_with(10, false);
+        assert!(ode.iter().all(|p| p.cn == 0.0));
+        let sde = s.plan_with(10, true);
+        let last = sde.last().unwrap();
+        assert_eq!(last.cn, 0.0);
+        assert!(last.ca.abs() < 1e-6 && (last.cb - 1.0).abs() < 1e-6);
+        assert!(sde[..9].iter().all(|p| p.cn > 0.0));
+        let (a_t, s_t) = DpmSolverMultistep::alpha_sigma(s.sigmas[1]);
+        let (a_s, s_s) = DpmSolverMultistep::alpha_sigma(s.sigmas[0]);
+        let h = (a_t.ln() - s_t.ln()) - (a_s.ln() - s_s.ln());
+        let p = sde[0];
+        assert!((p.ca as f64 - s_t / s_s * (-h).exp()).abs() < 1e-6);
+        assert!((p.cb as f64 - a_t * (1.0 - (-2.0 * h).exp())).abs() < 1e-6);
+        assert!((p.cn as f64 - s_t * (1.0 - (-2.0 * h).exp()).sqrt()).abs() < 1e-6);
     }
 }

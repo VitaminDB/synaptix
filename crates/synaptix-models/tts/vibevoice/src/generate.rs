@@ -73,6 +73,7 @@ pub fn sample_latent_plan(
     cfg_scale: f32,
     batch: usize,
     init_noise: &Tensor,
+    step_noise: Option<&Tensor>,
 ) -> Result<Tensor> {
     let mut x = init_noise.clone();
     let mut prev: Option<Tensor> = None;
@@ -82,7 +83,11 @@ pub fn sample_latent_plan(
         let temb = model.head.time_embeddings(&ts)?;
         let eps = model.head.forward_with_temb(&combined, &temb, cond)?;
         let guided = guide(&eps, cfg_scale, batch)?;
-        let (next, m0) = apply_plan_step(p, &guided, &x, prev.as_ref())?;
+        let z = match step_noise {
+            Some(n) => Some(n.narrow(0, i * batch, batch).and_then(|t| t.contiguous()).map_err(err)?),
+            None => None,
+        };
+        let (next, m0) = apply_plan_step(p, &guided, &x, prev.as_ref(), z.as_ref())?;
         x = next;
         prev = Some(m0);
     }
@@ -248,6 +253,21 @@ impl<'a> SpeechGenerator<'a> {
         steps: usize,
         init_noise: &Tensor,
     ) -> Result<Tensor> {
+        self.sample_latent_with(positive, negative, cfg_scale, steps, init_noise, None)
+    }
+
+    /// Латент речи диффузионной головой с CFG. `step_noise` (`[steps·batch, D]`) —
+    /// стохастический решатель SDE-DPMSolver++ (шум каждого шага), `None` — ODE.
+    pub fn sample_latent_with(
+        &mut self,
+        positive: &Tensor,
+        negative: &Tensor,
+        cfg_scale: f32,
+        steps: usize,
+        init_noise: &Tensor,
+        step_noise: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let sde = step_noise.is_some();
         let condition = Tensor::cat(&[positive, negative], 0).map_err(err)?;
         let cond = self.model.head.project_condition(&condition)?;
         let batch = init_noise.dims()[0];
@@ -255,9 +275,9 @@ impl<'a> SpeechGenerator<'a> {
             let need_build = !self
                 .sampler_graph
                 .as_ref()
-                .is_some_and(|g| g.matches(batch, steps, cfg_scale));
+                .is_some_and(|g| g.matches(batch, steps, cfg_scale, sde));
             if need_build {
-                match SamplerGraph::build(self.model, &mut self.scheduler, batch, steps, cfg_scale) {
+                match SamplerGraph::build(self.model, &mut self.scheduler, batch, steps, cfg_scale, sde) {
                     Ok(g) => self.sampler_graph = Some(g),
                     Err(e) => {
                         if std::env::var("SYN_VV_GRAPH_DEBUG").is_ok() {
@@ -268,12 +288,12 @@ impl<'a> SpeechGenerator<'a> {
                 }
             }
             if let Some(g) = self.sampler_graph.as_mut() {
-                return g.run(init_noise, &cond);
+                return g.run(init_noise, &cond, step_noise);
             }
         }
-        let plan = self.scheduler.plan(steps);
+        let plan = self.scheduler.plan_with(steps, sde);
         let timesteps = self.scheduler.timesteps.clone();
-        sample_latent_plan(self.model, &plan, &timesteps, &cond, cfg_scale, batch, init_noise)
+        sample_latent_plan(self.model, &plan, &timesteps, &cond, cfg_scale, batch, init_noise, step_noise)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -402,13 +422,20 @@ impl<'a> SpeechGenerator<'a> {
                     }
                 };
 
+                // Шум — в порядке upstream: начальный, затем по шагу решателя.
                 let init = self.randn(vec![1usize, vae_dim])?;
-                let latent = self.sample_latent(
+                let step_noise = if cfg.sde {
+                    Some(self.randn(vec![cfg.ddpm_inference_steps, vae_dim])?)
+                } else {
+                    None
+                };
+                let latent = self.sample_latent_with(
                     &last_hidden,
                     &neg_last,
                     cfg.cfg_scale,
                     cfg.ddpm_inference_steps,
                     &init,
+                    step_noise.as_ref(),
                 )?;
                 let latent3 = latent.reshape(vec![1usize, 1usize, vae_dim]).map_err(err)?;
                 let scaled = model.unscale_latents(&latent3)?;
