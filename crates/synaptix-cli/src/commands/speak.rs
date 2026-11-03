@@ -110,6 +110,7 @@ fn speak_voxcpm(
         min_len: args.min_len.unwrap_or(defaults.min_len),
         retry_ratio_threshold: args.retry_ratio.unwrap_or(defaults.retry_ratio_threshold),
         streaming_prefix_len: args.streaming_prefix_len.unwrap_or(defaults.streaming_prefix_len),
+        ..defaults
     };
     let t1 = std::time::Instant::now();
     let wav = match (args.reference.as_ref(), args.prompt_wav.as_ref(), args.prompt_text.as_ref()) {

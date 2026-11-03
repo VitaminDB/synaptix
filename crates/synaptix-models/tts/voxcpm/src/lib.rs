@@ -14,7 +14,7 @@ pub mod tokenizer;
 pub use config::VoxConfig;
 pub use loader::VoxCheckpoint;
 pub use model::VoxCpmModel;
-pub use pipeline::{GenerateOptions, VoxCpmPipeline, Waveform};
+pub use pipeline::{duration_limit, spoken_chars, GenerateOptions, VoxCpmPipeline, Waveform};
 
 use synaptix_core::error::SynaptixError;
 

@@ -17,6 +17,14 @@ pub struct GenerateOptions {
     pub seed: u64,
     pub streaming_prefix_len: usize,
     pub retry_ratio_threshold: f32,
+    /// Защита от «убегания» (модель не ставит стоп и бормочет): звук длиннее
+    /// `символы × max_sec_per_char + extra_sec` (символы — без описания
+    /// голоса в скобках) — брак; сегмент синтезируется заново с другим
+    /// зерном, до `retries` раз, иначе берётся самый короткий вариант.
+    /// Генерация обрывается на полуторном пределе.
+    pub max_sec_per_char: f32,
+    pub extra_sec: f32,
+    pub retries: usize,
 }
 
 impl Default for GenerateOptions {
@@ -29,6 +37,9 @@ impl Default for GenerateOptions {
             seed: 1988,
             streaming_prefix_len: 4,
             retry_ratio_threshold: 6.0,
+            max_sec_per_char: 0.2,
+            extra_sec: 1.5,
+            retries: 3,
         }
     }
 }
@@ -36,6 +47,35 @@ impl Default for GenerateOptions {
 pub struct Waveform {
     pub pcm: Vec<f32>,
     pub sample_rate: usize,
+}
+
+/// Число произносимых символов: без описания голоса `(…)` в начале и пробелов
+/// по краям.
+pub fn spoken_chars(text: &str) -> usize {
+    let mut t = text.trim_start();
+    if t.starts_with('(') {
+        if let Some(e) = t.find(')') {
+            t = &t[e + 1..];
+        }
+    }
+    t.trim().chars().count()
+}
+
+/// Тихий результат — громче: некоторые голоса (и все клоны с тихой опорной
+/// записи) выходят с пиком около −30 дБ, и проверка «есть ли речь» принимает
+/// их за тишину. Только усиление, до пика 0.9, не больше чем в 40 раз.
+fn normalize_level(mut w: Waveform) -> Waveform {
+    let peak = w.pcm.iter().fold(0f32, |m, x| m.max(x.abs()));
+    if peak > 1e-6 && peak < 0.5 {
+        let g = (0.9 / peak).min(40.0);
+        w.pcm.iter_mut().for_each(|x| *x *= g);
+    }
+    w
+}
+
+/// Предел длительности фразы по тексту (секунды).
+pub fn duration_limit(text: &str, opts: &GenerateOptions) -> f32 {
+    spoken_chars(text) as f32 * opts.max_sec_per_char + opts.extra_sec
 }
 
 struct Segment {
@@ -134,12 +174,12 @@ impl VoxCpmPipeline {
         Ok(feat)
     }
 
-    fn assemble(&self, segments: Vec<Segment>) -> Result<(Tensor, Tensor, Tensor, Tensor), VoxError> {
+    fn assemble(&self, segments: &[Segment]) -> Result<(Tensor, Tensor, Tensor, Tensor), VoxError> {
         let mut tokens: Vec<u32> = Vec::new();
         let mut tmask: Vec<f32> = Vec::new();
         let mut amask: Vec<f32> = Vec::new();
         let mut feats: Vec<Tensor> = Vec::new();
-        for seg in &segments {
+        for seg in segments {
             tokens.extend_from_slice(&seg.tokens);
             tmask.extend_from_slice(&seg.text_mask);
             amask.extend_from_slice(&seg.audio_mask);
@@ -160,24 +200,52 @@ impl VoxCpmPipeline {
         target_text: &str,
         opts: &GenerateOptions,
     ) -> Result<Waveform, VoxError> {
-        let (token_t, tmask_t, amask_t, feat_t) = self.assemble(segments)?;
-
-        let target_len = self.tokenizer.encode(target_text)?.len();
-        let max_len = ((target_len as f32 * opts.retry_ratio_threshold) as usize + 10).min(opts.max_len);
-
-        let infer = InferOptions {
-            min_len: opts.min_len,
-            max_len,
-            n_timesteps: opts.n_timesteps,
-            cfg_value: opts.cfg_value,
-            seed: opts.seed,
-        };
-        let (latent, ctx) = self
-            .model
-            .infer(&token_t, &tmask_t, &feat_t, &amask_t, context_len, &infer)?;
+        let (token_t, tmask_t, amask_t, feat_t) = self.assemble(&segments)?;
 
         let cfg = &self.model.config.audio_vae_config;
-        let decoded = self.model.audio_vae.decode(&latent)?;
+        let patch_samples = self.model.config.patch_size * cfg.decode_chunk_size();
+        let patch_sec = patch_samples as f32 / cfg.out_sample_rate as f32;
+        let limit = duration_limit(target_text, opts);
+        let target_len = self.tokenizer.encode(target_text)?.len();
+        let max_len = ((target_len as f32 * opts.retry_ratio_threshold) as usize + 10)
+            .min((limit * 1.5 / patch_sec) as usize + 4)
+            .min(opts.max_len)
+            .max(opts.min_len + 2);
+
+        let mut best: Option<Waveform> = None;
+        for attempt in 0..=opts.retries {
+            let infer = InferOptions {
+                min_len: opts.min_len,
+                max_len,
+                n_timesteps: opts.n_timesteps,
+                cfg_value: opts.cfg_value,
+                // Другое зерно на повторе; первая попытка — заданное.
+                seed: opts.seed.wrapping_add(attempt as u64 * 0x9E37_79B9),
+            };
+            let (latent, ctx) = self.model.infer(&token_t, &tmask_t, &feat_t, &amask_t, context_len, &infer)?;
+            let generated = latent.dims()[2] / self.model.config.patch_size - ctx;
+            let w = self.decode(&latent, ctx)?;
+            let dur = w.pcm.len() as f32 / w.sample_rate as f32;
+            let runaway = generated >= max_len || dur > limit;
+            if !runaway {
+                return Ok(normalize_level(w));
+            }
+            tracing::warn!(
+                "voxcpm: брак сегмента ({dur:.1} с при пределе {limit:.1} с{}), попытка {}/{}",
+                if generated >= max_len { ", без стопа" } else { "" },
+                attempt + 1,
+                opts.retries + 1
+            );
+            if best.as_ref().is_none_or(|b| w.pcm.len() < b.pcm.len()) {
+                best = Some(w);
+            }
+        }
+        Ok(normalize_level(best.expect("хотя бы одна попытка")))
+    }
+
+    fn decode(&self, latent: &Tensor, ctx: usize) -> Result<Waveform, VoxError> {
+        let cfg = &self.model.config.audio_vae_config;
+        let decoded = self.model.audio_vae.decode(latent)?;
         let samples = decoded.dims()[2];
         let decode_patch_len = self.model.config.patch_size * cfg.decode_chunk_size();
         let trim = decode_patch_len * ctx;

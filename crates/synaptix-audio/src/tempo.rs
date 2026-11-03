@@ -69,7 +69,8 @@ pub fn time_stretch(pcm: &[f32], sample_rate: u32, rate: f32) -> Vec<f32> {
 
 /// Текст для потокового синтеза: по предложениям (`.!?…` и переводы
 /// строк), короткие склеиваются со следующими до `min_chars`; первый кусок
-/// может быть короче — раньше начнётся звук.
+/// может быть короче (от `min_chars / 3`, не больше 20 символов) — раньше
+/// начнётся звук.
 pub fn speech_chunks(text: &str, min_chars: usize) -> Vec<String> {
     let mut sentences: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -102,7 +103,14 @@ pub fn speech_chunks(text: &str, min_chars: usize) -> Vec<String> {
     for s in sentences {
         // Первый кусок — отдельно (раньше звук), дальше короткие склеиваются.
         let n = out.len();
+        // Первый кусок — короткий, но не совсем: из пары слов («Good
+        // morning.») синтез без контекста часто выговаривает невнятно.
+        let first_min = (min_chars / 3).min(20);
         match out.last_mut() {
+            Some(last) if n == 1 && last.chars().count() < first_min => {
+                last.push(' ');
+                last.push_str(&s);
+            }
             Some(last) if n >= 2 && last.chars().count() < min_chars => {
                 last.push(' ');
                 last.push_str(&s);
@@ -142,5 +150,7 @@ mod tests {
         assert!(c.last().unwrap().ends_with("Ok."));
         let c = speech_chunks("Сәлем! Қалың қалай?\nЖақсы.", 4);
         assert_eq!(c, vec!["Сәлем!", "Қалың қалай?", "Жақсы."]);
+        let c = speech_chunks("Good morning. Please take a seat. I am the examiner today, nice to meet you.", 60);
+        assert_eq!(c[0], "Good morning. Please take a seat.");
     }
 }

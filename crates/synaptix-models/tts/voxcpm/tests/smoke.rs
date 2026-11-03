@@ -63,7 +63,7 @@ fn synthesize_tiny() {
     let Some(path) = bundle() else { return };
     synaptix_kernels_cpu::ensure_registered();
     let pipe = VoxCpmPipeline::from_bundle(&path, Device::Cpu, DType::F32).expect("pipeline");
-    let opts = GenerateOptions { min_len: 2, max_len: 4, n_timesteps: 2, ..GenerateOptions::default() };
+    let opts = GenerateOptions { min_len: 2, max_len: 4, n_timesteps: 2, retries: 0, ..GenerateOptions::default() };
     let wav = pipe.synthesize("Hello world.", &opts).expect("synthesize");
     eprintln!("[voxcpm] pcm len={} sr={}", wav.pcm.len(), wav.sample_rate);
     assert!(!wav.pcm.is_empty());
