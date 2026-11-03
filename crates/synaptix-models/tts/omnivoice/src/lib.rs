@@ -19,6 +19,7 @@ pub mod masked_decode;
 pub mod pipeline;
 pub mod prompt;
 pub mod text;
+pub mod voice_design;
 
 pub use audio_codec::CodecDecoder;
 pub use audio_encode::CodecEncoder;
@@ -26,6 +27,7 @@ pub use config::{HiggsAudioConfig, OmniVoiceConfig, OmniVoiceGenerationConfig};
 pub use pipeline::OmniVoicePipeline;
 pub use prompt::{add_punctuation, create_voice_clone_prompt, remove_silence, VoiceClonePrompt};
 pub use text::{combine_text, DurationEstimator, PreparedInputs, TextFrontend};
+pub use voice_design::{resolve_instruct, resolve_language};
 
 pub type Result<T> = std::result::Result<T, OmniVoiceError>;
 

@@ -300,7 +300,14 @@ pub struct OmniVoiceGenerationConfig {
     pub seed: Option<u64>,
     pub denoise: bool,
     pub preprocess_prompt: bool,
+    /// Обработка результата как upstream `_post_process_audio`: длинные паузы
+    /// (> 0,5 с) и края тишины убираются, громкость — по образцу (без образца —
+    /// пик 0,5), затем плавные края `fade_duration` и тишина `pad_duration`.
     pub postprocess_output: bool,
+    /// Тишина по краям, с (0 — без неё).
+    pub pad_duration: f32,
+    /// Плавное нарастание и затухание по краям, с (0 — без него).
+    pub fade_duration: f32,
     pub audio_chunk_duration: f32,
     pub audio_chunk_threshold: f32,
 }
@@ -318,6 +325,8 @@ impl Default for OmniVoiceGenerationConfig {
             denoise: true,
             preprocess_prompt: true,
             postprocess_output: true,
+            pad_duration: 0.1,
+            fade_duration: 0.1,
             audio_chunk_duration: 15.0,
             audio_chunk_threshold: 30.0,
         }

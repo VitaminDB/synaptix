@@ -1,14 +1,16 @@
-//! Высокоуровневый пайплайн OmniVoice (e2e auto-режим: текст → волна).
+//! Высокоуровневый пайплайн OmniVoice: текст → волна 24 кГц.
 //!
 //! `from_syn`/`from_unpacked` грузят config + tokenizer + lm/codec-веса, строят
-//! `Backbone` + `TextFrontend` + `CodecDecoder`. `generate` (auto, без ref):
-//! duration → num_target_tokens → text-frontend → masked_decode → codes →
-//! codec.decode → wav. Источник: `~/Temp/OmniVoice/omnivoice/models/omnivoice.py`
-//! (`generate`, `_preprocess_all`, `_generate_iterative`, `_decode_and_post_process`).
-//! См. SPEC.md «План порта» п.8.
+//! `Backbone` + `TextFrontend` + `CodecDecoder`. [`OmniVoicePipeline::synthesize`]
+//! — как `OmniVoice.generate` upstream (`~/…/OmniVoice/omnivoice/models/omnivoice.py`:
+//! `generate`, `_preprocess_all`, `_generate_iterative`, `_decode_and_post_process`):
+//! язык и описание голоса приводятся к виду обучения (`voice_design`),
+//! длительность по тексту → masked_decode → codec.decode → постобработка
+//! (`_post_process_audio`: паузы, громкость, края). `*_with_target` — без
+//! постобработки, для сверки кодов и волны с эталоном.
 //!
-//! Voice-clone путь (`create_voice_clone_prompt` + `generate_clone`) реализован.
-//! Postprocess / chunking / synthos-нода — TODO (см. отчёт).
+//! Нет: деление длинного (> 30 с) текста на куски (`_generate_chunked`) —
+//! текст делит вызывающий (служба режет его на фразы).
 
 use std::path::Path;
 
@@ -238,9 +240,7 @@ impl OmniVoicePipeline {
         speed: f64,
         gen: &OmniVoiceGenerationConfig,
     ) -> Result<Vec<f32>> {
-        let target_len =
-            self.duration.estimate_target_tokens(text, None, None, speed);
-        self.generate_styled_with_target(text, lang, instruct, target_len, gen)
+        self.synthesize(text, None, lang, instruct, speed, None, gen)
     }
 
     /// e2e auto-режим с явным `target_len` (детерминированно убирает зависимость
@@ -314,15 +314,21 @@ impl OmniVoicePipeline {
     /// [`Self::synthesize_codes`]): следующие фразы выйдут тем же голосом.
     pub fn prompt_from_generated(&self, codes: &Tensor, text: &str, wav: &[f32]) -> Result<VoiceClonePrompt> {
         let ref_audio_tokens = codes.to_device(Device::Cpu).and_then(|c| c.to_dtype(DType::I64)).map_err(err)?;
-        Ok(VoiceClonePrompt { ref_audio_tokens, ref_text: crate::prompt::add_punctuation(text), ref_rms: crate::prompt::rms_f32(wav) })
+        // Громкость образца — «неизвестна» (0): результат нормируется по пику,
+        // как upstream озвучивает длинный текст кусками без образца (первый
+        // кусок — образец остальных, `ref_rms` = None).
+        let _ = wav;
+        Ok(VoiceClonePrompt { ref_audio_tokens, ref_text: crate::prompt::add_punctuation(text), ref_rms: 0.0 })
     }
 
     /// Озвучка текста фразами одним голосом. `voice` — референс из
     /// предыдущих фраз: `None` — голос выбирается по `instruct` (или
     /// случайно) и запоминается, иначе фраза синтезируется как продолжение
-    /// референса, а `instruct` уже не нужен (описание голоса в промпте
-    /// модель порой читает вслух). Референс дополняется фразами до
-    /// `max_ref_sec` секунд.
+    /// референса — и с тем же `instruct`, как upstream озвучивает длинный
+    /// текст кусками (`_generate_chunked`: первый кусок — образец, описание
+    /// остаётся). Без описания продолжение уводит тембр: мужской голос на
+    /// вопросах уходил к 160–250 Гц (upstream так же: 40 % вопросов против
+    /// 0 % с описанием). Референс дополняется фразами до `max_ref_sec` секунд.
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_continuing(
         &self,
@@ -335,16 +341,14 @@ impl OmniVoicePipeline {
         max_ref_sec: f32,
     ) -> Result<Vec<f32>> {
         let (wav, codes) = match voice.as_ref() {
-            Some(p) => self.synthesize_codes(text, Some(p), lang, None, speed, None, gen)?,
+            Some(p) => self.synthesize_codes(text, Some(p), lang, instruct, speed, None, gen)?,
             None => self.synthesize_codes(text, None, lang, instruct, speed, None, gen)?,
         };
         let part = self.prompt_from_generated(&codes, text, &wav)?;
-        // Кадров в секунду — по самим кодам: `frame_rate` (24000/320 = 75) втрое
-        // больше реальных 25 кадров/с кодов, и «12 с» референса были 36 с —
-        // вход рос с каждой фразой, синтез замедлялся на любом устройстве.
-        let sec = wav.len() as f32 / self.output_sample_rate() as f32;
-        let t = codes.dims().last().copied().unwrap_or(0);
-        let fps = if sec > 0.1 && t > 0 { t as f32 / sec } else { self.frame_rate as f32 };
+        // Кадров в секунду — sample_rate / hop (24000/960 = 25): `frame_rate`
+        // (24000/320 = 75) втрое больше реальных 25 кадров/с кодов, и «12 с»
+        // референса были 36 с — вход рос с каждой фразой.
+        let fps = self.sample_rate as f32 / self.hop_length.max(1) as f32;
         let max_tokens = (max_ref_sec.max(0.0) * fps) as usize;
         match voice {
             Some(p) => {
@@ -368,6 +372,10 @@ impl OmniVoicePipeline {
         target_len: Option<usize>,
         gen: &OmniVoiceGenerationConfig,
     ) -> Result<(Vec<f32>, Tensor)> {
+        // Язык и описание — к виду, на котором обучена модель (как `generate`).
+        let lang = crate::voice_design::resolve_language(lang);
+        let instruct = crate::voice_design::resolve_instruct_for(instruct, text)?;
+        let instruct = instruct.as_deref();
         let target_len = target_len.unwrap_or_else(|| match prompt {
             Some(p) => self.estimate_target_tokens_clone(text, p, speed),
             None => self.duration.estimate_target_tokens(text, None, None, speed),
@@ -390,7 +398,36 @@ impl OmniVoicePipeline {
         if timing {
             eprintln!("omnivoice: декод {:.2} с ({} шагов, T={target_len}), кодек {:.2} с", (t1 - t0).as_secs_f32(), gen.num_step, t1.elapsed().as_secs_f32());
         }
-        Ok((out, codes))
+        let ref_rms = prompt.map(|p| p.ref_rms).filter(|r| *r > 0.0);
+        Ok((self.post_process(out, ref_rms, gen), codes))
+    }
+
+    /// Порт `_post_process_audio`: при `postprocess_output` — убрать паузы
+    /// длиннее 0,5 с и края тишины (оставив по 0,1 с); громкость: с образцом
+    /// тише 0,1 RMS — в его пропорции (образец перед кодированием поднимался
+    /// до 0,1), без образца — пик 0,5; плавные края и тишина по краям.
+    pub fn post_process(&self, mut wav: Vec<f32>, ref_rms: Option<f32>, gen: &OmniVoiceGenerationConfig) -> Vec<f32> {
+        let sr = self.sample_rate;
+        if gen.postprocess_output {
+            // Вся запись тише −50 дБ — брак генерации; пустой результат хуже
+            // тихого (upstream вернул бы пустой), оставляем как есть.
+            let trimmed = crate::prompt::remove_silence(&wav, sr, 500, 100, 100);
+            if !trimmed.is_empty() {
+                wav = trimmed;
+            }
+        }
+        match ref_rms {
+            Some(r) if r < 0.1 => wav.iter_mut().for_each(|x| *x *= r / 0.1),
+            Some(_) => {}
+            None => {
+                let peak = wav.iter().fold(0f32, |m, x| m.max(x.abs()));
+                if peak > 1e-6 {
+                    wav.iter_mut().for_each(|x| *x = *x / peak * 0.5);
+                }
+            }
+        }
+        fade_and_pad(&mut wav, (gen.fade_duration.max(0.0) * sr as f32) as usize, (gen.pad_duration.max(0.0) * sr as f32) as usize);
+        wav
     }
 
     /// Доступ к encode-пути нейро-кодека (ref-аудио → коды). Для гейтов/дебага.
@@ -452,14 +489,7 @@ impl OmniVoicePipeline {
         speed: f64,
         gen: &OmniVoiceGenerationConfig,
     ) -> Result<Vec<f32>> {
-        let target_len = self.estimate_target_tokens_clone(text, prompt, speed);
-        self.generate_clone_with_target(
-            text,
-            &prompt.ref_audio_tokens,
-            &prompt.ref_text,
-            target_len,
-            gen,
-        )
+        self.synthesize(text, Some(prompt), None, None, speed, None, gen)
     }
 
     /// Voice-clone с явными ref_audio_tokens / ref_text / target_len (детерминизм
@@ -500,5 +530,30 @@ impl OmniVoicePipeline {
             .and_then(|w| w.flatten_all())
             .and_then(|w| w.to_vec1::<f32>())
             .map_err(err)
+    }
+}
+
+/// Порт `fade_and_pad_audio`: линейные нарастание и затухание по `fade`
+/// отсчётов (не больше половины записи), затем по `pad` отсчётов тишины с
+/// каждой стороны.
+fn fade_and_pad(wav: &mut Vec<f32>, fade: usize, pad: usize) {
+    if wav.is_empty() {
+        return;
+    }
+    let k = fade.min(wav.len() / 2);
+    if k > 0 {
+        // np.linspace(0, 1, k): i / (k − 1)
+        let step = if k > 1 { 1.0 / (k - 1) as f32 } else { 0.0 };
+        let n = wav.len();
+        for i in 0..k {
+            let w = i as f32 * step;
+            wav[i] *= w;
+            wav[n - 1 - i] *= w;
+        }
+    }
+    if pad > 0 {
+        let mut out = vec![0f32; wav.len() + 2 * pad];
+        out[pad..pad + wav.len()].copy_from_slice(wav);
+        *wav = out;
     }
 }

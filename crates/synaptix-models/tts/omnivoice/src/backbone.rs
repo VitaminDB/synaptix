@@ -98,6 +98,8 @@ pub struct Backbone {
     rope: RopeCache,
     cfg: OmniVoiceConfig,
     device: Device,
+    /// Последняя норма и головы — в F32 (вход приводится к F32).
+    head_f32: bool,
 }
 
 impl Backbone {
@@ -134,9 +136,16 @@ impl Backbone {
         };
 
         let embed_tokens = get("llm.embed_tokens.weight")?;
-        let final_norm = get("llm.norm.weight")?;
+        // Головы в F32 (см. `loader::head_f32`): вес уже F32 из загрузчика.
+        let head_f32 = crate::loader::head_f32(device, dtype) && weights.get("audio_heads.weight")?.dtype() == DType::F32;
+        let (final_norm, audio_heads) = if head_f32 {
+            let f = |n: &str| weights.get(n).and_then(|t| t.to_dtype(DType::F32).map_err(err));
+            let w = f("audio_heads.weight")?;
+            (f("llm.norm.weight")?, Lin::Dense(w, "audio_heads.weight".to_string()))
+        } else {
+            (get("llm.norm.weight")?, lin("audio_heads.weight")?)
+        };
         let audio_embeddings = get("audio_embeddings.weight")?;
-        let audio_heads = lin("audio_heads.weight")?;
 
         let cbo = weights.get("codebook_layer_offsets")?;
         let codebook_layer_offsets = cbo
@@ -181,6 +190,7 @@ impl Backbone {
             rope,
             cfg: cfg.clone(),
             device,
+            head_f32,
         })
     }
 
@@ -390,6 +400,7 @@ impl Backbone {
             hidden = residual2.add(&mlp_out).map_err(err)?;
         }
 
+        let hidden = if self.head_f32 { hidden.to_dtype(DType::F32).map_err(err)? } else { hidden };
         let hidden = rms_norm(&hidden, &self.final_norm, eps).map_err(err)?;
         let n_cb = self.cfg.num_audio_codebook;
         let av = self.cfg.audio_vocab_size;
@@ -472,6 +483,7 @@ impl Backbone {
         if upto.is_some() {
             return Ok(hidden);
         }
+        let hidden = if self.head_f32 { hidden.to_dtype(DType::F32).map_err(err)? } else { hidden };
         let hidden = rms_norm(&hidden, &self.final_norm, eps).map_err(err)?;
         let logits = self.audio_heads.forward(&hidden)?;
         logits

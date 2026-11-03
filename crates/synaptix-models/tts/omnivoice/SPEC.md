@@ -119,3 +119,19 @@ chat_template.jinja, audio_tokenizer/{config,preprocessor_config}.json.
 
 Конвенции порта — как `tts/voxcpm`, `music/acestep` (loader=synaptix-bundle, слои через Tensor/synaptix-nn).
 ```
+
+## Сверка с upstream (аудит, k2-fsa/OmniVoice 08be0b4)
+
+- Ядро (бэкбон, CFG, расписание, раскрытие, кодек) на CPU F32 при температурах 0 совпадает с
+  upstream побитово по кодам (100 % / 99,8 %), волна после постобработки — до 5·10⁻⁵
+  (`examples/audit_run.rs`, эталон — `up_run.py` из аудита).
+- `synthesize`/`generate_styled` = `generate` upstream: `resolve_language`/`resolve_instruct`
+  (`voice_design.rs`, таблица языков `lang_map.tsv` из `docs/lang_id_name_map.tsv`),
+  постобработка `_post_process_audio` (паузы > 0,5 с, пик 0,5 без образца, края 0,1 с).
+- Веса длительности — по общей категории Unicode (как `unicodedata.category`).
+- BF16/F16: последняя норма и аудио-головы считаются в F32 (`loader::head_f32`): в BF16
+  argmax CFG совпадал с F32 лишь на 57–69 % позиций, с F32-головами — 93–97 %
+  (`examples/logit_prec.rs`).
+- `synthesize_continuing` сохраняет описание голоса при продолжении (как `_generate_chunked`).
+- Нет: деление текста > 30 с на куски (`_generate_chunked`), нормализация чисел (`normalize_text`,
+  в upstream по умолчанию выключена), авто-распознавание текста образца.

@@ -55,6 +55,17 @@ fn tensor_from_st(
 }
 
 /// Веса `lm`-компонента OmniVoice (F32, на одном устройстве).
+/// Последняя норма и аудио-головы — в F32 при счёте в BF16/F16 (CPU и
+/// CUDA): логиты BF16 у этих голов грубы (шаг 0,125 у значений 16–32), а
+/// CFG `c + g·(c − u)` и оценки уверенности, по которым раскрываются токены,
+/// умножают эту ошибку. Головы — 8200×1024, в F32 это 33 МБ и доли процента
+/// времени. `SYNAPTIX_OV_HEAD_F32=0` — как раньше (всё в `dtype`).
+pub const HEAD_F32_NAMES: [&str; 2] = ["audio_heads.weight", "llm.norm.weight"];
+
+pub fn head_f32(device: Device, dtype: DType) -> bool {
+    dtype != DType::F32 && !matches!(device, Device::Npu(_)) && std::env::var("SYNAPTIX_OV_HEAD_F32").as_deref() != Ok("0")
+}
+
 pub struct OmniVoiceLmWeights {
     tensors: HashMap<String, Tensor>,
     quant: HashMap<String, synaptix_core::tensor::quant::QuantWeight>,
@@ -114,6 +125,7 @@ impl OmniVoiceLmWeights {
             .map_err(|e| OmniVoiceError::Load(format!("deserialize lm st: {e}")))?;
         let names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
         let keep_quant = matches!(device, Device::Npu(_));
+        let head_f32 = head_f32(device, dtype);
         let mut tensors = HashMap::with_capacity(names.len());
         let mut quant = HashMap::new();
         synaptix_core::backend::with_param_upload(|| -> Result<(), OmniVoiceError> {
@@ -145,13 +157,20 @@ impl OmniVoiceLmWeights {
                             }
                             let dev = if host_names.contains(&base) { Device::Cpu } else { device };
                             let t = Tensor::from_vec(out, vec![n, k], dev)?;
-                            let t = if t.dtype() == dtype { t } else { t.to_dtype(dtype)? };
+                            let want = if head_f32 && HEAD_F32_NAMES.contains(&base) { DType::F32 } else { dtype };
+                            let t = if t.dtype() == want { t } else { t.to_dtype(want)? };
                             tensors.insert(base.to_string(), t);
                         }
                         continue;
                     }
                 }
-                let want = if name == "codebook_layer_offsets" { DType::I64 } else { dtype };
+                let want = if name == "codebook_layer_offsets" {
+                    DType::I64
+                } else if head_f32 && HEAD_F32_NAMES.contains(&name.as_str()) {
+                    DType::F32
+                } else {
+                    dtype
+                };
                 let dev = if host_names.contains(&name.as_str()) { Device::Cpu } else { device };
                 let t = tensor_from_st(&st, &name, dev, want)?;
                 tensors.insert(name, t);

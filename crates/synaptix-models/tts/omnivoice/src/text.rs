@@ -421,40 +421,23 @@ enum UCat {
     Other,
 }
 
-/// Грубая категоризация unicode для duration-весов. Покрывает категории, которые
-/// проверяет upstream (`startswith("M"/"P"/"S"/"Z"/"N")`) для ASCII + общих
-/// диапазонов; для не-ASCII-букв возвращает Other (далее идёт block-lookup).
+/// Общая категория Unicode для duration-весов — как `unicodedata.category`
+/// upstream: M — метка, P и S — пунктуация, Z — разделитель, N — цифра.
+/// Раньше не-ASCII знаки («», —, …, ’) падали в поиск по блокам и весили как
+/// кана (2,2 вместо 0,5), а `\t` считался пробелом (в Python это Cc).
 fn unicode_category(c: char) -> UCat {
-    let code = c as u32;
-    // ASCII-пунктуация и символы.
-    if code < 0x80 {
-        if c.is_ascii_digit() {
-            return UCat::Number;
-        }
-        if c == ' ' || c == '\t' {
-            return UCat::Separator;
-        }
-        if c.is_ascii_punctuation() {
-            return UCat::Punct;
-        }
-        return UCat::Other;
+    use unicode_categories::UnicodeCategories;
+    if c.is_mark() {
+        UCat::Mark
+    } else if c.is_punctuation() || c.is_symbol() {
+        UCat::Punct
+    } else if c.is_separator() {
+        UCat::Separator
+    } else if c.is_number() {
+        UCat::Number
+    } else {
+        UCat::Other
     }
-    // Combining diacritical marks (0300-036F), и расширения.
-    if (0x0300..=0x036F).contains(&code)
-        || (0x1AB0..=0x1AFF).contains(&code)
-        || (0x1DC0..=0x1DFF).contains(&code)
-        || (0x20D0..=0x20FF).contains(&code)
-        || (0xFE20..=0xFE2F).contains(&code)
-    {
-        return UCat::Mark;
-    }
-    // Прочие пробелы (Zs/Zl/Zp).
-    if c.is_whitespace() {
-        return UCat::Separator;
-    }
-    // Полноширинные/прочие цифры покрываются block-lookup'ом (digit=3.5) — но
-    // upstream ловит их раньше через category "N"; для частых кейсов достаточно.
-    UCat::Other
 }
 
 /// Вес unicode-блока (порт таблицы `self.ranges` + bisect). Возвращает None,
@@ -558,4 +541,27 @@ fn block_weight(code: u32) -> Option<f64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DurationEstimator;
+
+    /// Веса и оценка длительности — как `RuleDurationEstimator` upstream
+    /// (значения сняты с Python): не-ASCII знаки — пунктуация, `\t` — Cc.
+    #[test]
+    fn duration_weights_like_upstream() {
+        let cases = [
+            ("Привет — это «тест»… Да?", 18.3, 43.2883133653679),
+            ("I\u{2019}m here, aren\u{2019}t I?", 14.6, 40.14867836239812),
+            ("Цена 100 $ и 5 €.", 21.5, 45.67723305481539),
+            ("a\tb", 3.0, 23.691581537935726),
+            ("你好，世界！", 13.0, 38.62496382317474),
+        ];
+        let d = DurationEstimator::new();
+        for (t, w, est) in cases {
+            assert!((DurationEstimator::total_weight(t) - w).abs() < 1e-9, "{t}: {}", DurationEstimator::total_weight(t));
+            assert!((d.estimate_duration(t, "Nice to meet you.", 25.0) - est).abs() < 1e-9, "{t}");
+        }
+    }
 }
