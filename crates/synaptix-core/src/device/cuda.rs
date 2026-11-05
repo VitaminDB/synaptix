@@ -25,9 +25,21 @@ mod inner {
             const { std::cell::RefCell::new(None) };
     }
 
+    /// Драйвер NVIDIA загружается (libcuda есть). Проверяется один раз.
+    pub fn driver_present() -> bool {
+        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // SAFETY: только пробная загрузка библиотеки.
+        *PRESENT.get_or_init(|| unsafe { cudarc::driver::sys::is_culib_present() })
+    }
+
     pub fn get(ordinal: usize) -> Result<Arc<CudaContext>> {
         if let Some(ctx) = REGISTRY.read().get(&ordinal).cloned() {
             return Ok(ctx);
+        }
+        // Без драйвера NVIDIA cudarc (динамическая загрузка) не возвращает ошибку, а паникует —
+        // служба на компьютере без видеокарты NVIDIA падала вместо работы на процессоре.
+        if !driver_present() {
+            return Err(SynaptixError::Cuda("драйвер NVIDIA (libcuda) не найден".into()));
         }
         let mut w = REGISTRY.write();
         if let Some(ctx) = w.get(&ordinal).cloned() {

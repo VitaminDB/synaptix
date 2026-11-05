@@ -283,6 +283,9 @@ static CACHE: OnceLock<Mutex<Vec<(usize, Arc<DeviceCaps>)>>> = OnceLock::new();
 
 /// Число CUDA-карт; 0 — драйвера нет.
 pub fn device_count() -> usize {
+    if !synaptix_core::device::cuda::driver_present() {
+        return 0;
+    }
     CudaContext::device_count().map(|n| n.max(0) as usize).unwrap_or(0)
 }
 
