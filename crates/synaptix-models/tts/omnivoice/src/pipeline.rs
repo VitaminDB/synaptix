@@ -214,7 +214,7 @@ impl OmniVoicePipeline {
     }
 
     /// Оценка числа target-токенов авто-режима для `text` (порт
-    /// `_estimate_target_tokens` с fallback ref="Nice to meet you.", num_ref=25).
+    /// `_estimate_target_tokens`, опора — [`crate::text::AUTO_REF_TOKENS`]).
     pub fn estimate_target_tokens(&self, text: &str) -> usize {
         self.duration.estimate_target_tokens(text, None, None, 1.0)
     }

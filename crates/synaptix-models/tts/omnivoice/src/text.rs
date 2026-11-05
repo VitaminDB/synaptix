@@ -311,6 +311,13 @@ fn strip_spaces_around_cjk(s: &str) -> String {
         .collect()
 }
 
+/// Длина опорной «Nice to meet you.» (кадров по 25/с) для темпа без образца.
+/// В upstream — 25 (1 с, ≈ 17 знаков/с): речь заметно быстрее обычной,
+/// а в службе этот темп наследуют все фразы голоса (опора озвучивается без
+/// образца). 30 (1,2 с) — обычный темп чтения: ≈ 14 знаков/с по-английски,
+/// ≈ 13 по-русски. Сверка с upstream задаёт длину явно и не меняется.
+pub const AUTO_REF_TOKENS: f64 = 30.0;
+
 /// Порт `RuleDurationEstimator` (utils/duration.py): оценка длительности по
 /// фонетическим весам символов.
 pub struct DurationEstimator;
@@ -391,8 +398,9 @@ impl DurationEstimator {
         }
     }
 
-    /// Порт `_estimate_target_tokens` (auto-fallback ref="Nice to meet you.",
-    /// num_ref=25 если ref-текста/аудио нет). Возвращает `max(1, int(est/speed))`.
+    /// Порт `_estimate_target_tokens`: без образца голоса темп берётся от
+    /// «Nice to meet you.» длиной [`AUTO_REF_TOKENS`] кадров. Возвращает
+    /// `max(1, int(est/speed))`.
     pub fn estimate_target_tokens(
         &self,
         text: &str,
@@ -402,7 +410,7 @@ impl DurationEstimator {
     ) -> usize {
         let (rt, num_ref): (String, f64) = match (num_ref_audio_tokens, ref_text) {
             (Some(n), Some(r)) if !r.is_empty() => (r.to_string(), n as f64),
-            _ => ("Nice to meet you.".to_string(), 25.0),
+            _ => ("Nice to meet you.".to_string(), AUTO_REF_TOKENS),
         };
         let mut est = self.estimate_duration(text, &rt, num_ref);
         if speed > 0.0 && speed != 1.0 {
@@ -546,6 +554,17 @@ fn block_weight(code: u32) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::DurationEstimator;
+
+    /// Без образца — обычный темп чтения (12–15 знаков/с), а не 17 как в upstream.
+    #[test]
+    fn auto_tempo_is_natural() {
+        let d = DurationEstimator::new();
+        for t in ["The weather is lovely today, so let's go for a walk in the park.", "Сегодня хорошая погода, давай погуляем в парке."] {
+            let sec = d.estimate_target_tokens(t, None, None, 1.0) as f64 / 25.0;
+            let cps = t.chars().count() as f64 / sec;
+            assert!((12.0..15.0).contains(&cps), "{t}: {cps:.1} знаков/с");
+        }
+    }
 
     /// Веса и оценка длительности — как `RuleDurationEstimator` upstream
     /// (значения сняты с Python): не-ASCII знаки — пунктуация, `\t` — Cc.

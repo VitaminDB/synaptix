@@ -26,7 +26,7 @@ pub use audio_encode::CodecEncoder;
 pub use config::{HiggsAudioConfig, OmniVoiceConfig, OmniVoiceGenerationConfig};
 pub use pipeline::OmniVoicePipeline;
 pub use prompt::{add_punctuation, create_voice_clone_prompt, remove_silence, VoiceClonePrompt};
-pub use text::{combine_text, DurationEstimator, PreparedInputs, TextFrontend};
+pub use text::{combine_text, DurationEstimator, PreparedInputs, TextFrontend, AUTO_REF_TOKENS};
 pub use voice_design::{resolve_instruct, resolve_language};
 
 pub type Result<T> = std::result::Result<T, OmniVoiceError>;
