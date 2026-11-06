@@ -275,6 +275,20 @@ impl SileroPipeline {
         Ok(out)
     }
 
+    /// Один кусок с разметкой: символы последовательности (с sos/eos — `|`, `~`), выход сети
+    /// (длительности символов — в кадрах по 12,5 мс), звук.
+    pub fn infer_marked(&self, text: &str, o: &Options) -> Result<(Vec<String>, NetOut)> {
+        let spk = self.speaker_id(&o.speaker)?;
+        let (seq, extra) = self.inputs(text, o)?;
+        let id2s: std::collections::HashMap<i64, &str> = self.pkg().symbol_to_id.iter().map(|(k, &v)| (v, k.as_str())).collect();
+        let syms = seq.iter().map(|i| id2s.get(i).copied().unwrap_or("?").to_string()).collect();
+        let out = self.net.forward(&seq, spk, &extra, o.sample_rate, o.rate, o.pitch)?;
+        Ok((syms, out))
+    }
+
+    /// Секунд в кадре длительности (hop 600 при 48 кГц).
+    pub const FRAME_S: f32 = 600.0 / 48_000.0;
+
     /// Вокодер отдельно (сверка): мел `[каналы × кадры]`.
     pub fn vocode(&self, mel: &[f32], channels: usize, sr: u32) -> Result<Vec<f32>> {
         self.net.vocode(mel, channels, sr)

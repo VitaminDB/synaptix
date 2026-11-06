@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 
 use synaptix_cli::commands::{
     bench, chat, convert, device, diff, h3, imagine, inspect, music, podcast, quantize, run as run_cmd, sheet, song,
-    speak,
+    speak, speak_batch,
     train, transcribe, video,
 };
 
@@ -569,6 +569,29 @@ enum Commands {
         device: String,
         #[arg(long)]
         compute_dtype: Option<String>,
+    },
+    /// Пакетный синтез Silero: jsonl {"id","text","voice","english","rate","pitch"} → DIR/<id>.wav + meta.jsonl
+    /// (символы и длительности каждого символа в секундах).
+    SpeakBatch {
+        /// Бандл Silero (.syn).
+        bundle: PathBuf,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// Фраз одновременно (потоки-воркеры).
+        #[arg(long, alias = "batch", default_value_t = 8)]
+        workers: usize,
+        /// Частота WAV: 48000 / 24000 / 8000 — родные, прочие (16000) — ресемпл из 48 кГц.
+        #[arg(long, default_value_t = 16000)]
+        sr: u32,
+        #[arg(long, default_value_t = false)]
+        list_voices: bool,
+        /// Не пересинтезировать уже готовые <id>.wav.
+        #[arg(long, default_value_t = false)]
+        skip_existing: bool,
     },
     /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3, Leokani, F5-TTS, Silero): TEXT → WAV.
     Speak {
@@ -1496,6 +1519,9 @@ fn main() -> ExitCode {
             synaptix_cli::commands::embed::run_rerank(synaptix_cli::commands::embed::RerankArgs {
                 model, query, docs, file, top_k, max_tokens, json, device, compute_dtype,
             })
+        }
+        Commands::SpeakBatch { bundle, input, out_dir, device, workers, sr, list_voices, skip_existing } => {
+            speak_batch::run(speak_batch::BatchArgs { bundle, input, out_dir, device, workers, sr, list_voices, skip_existing })
         }
         Commands::Speak {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,

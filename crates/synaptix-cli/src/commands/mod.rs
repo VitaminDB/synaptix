@@ -19,6 +19,7 @@ pub mod run;
 pub mod sheet;
 pub mod song;
 pub mod speak;
+pub mod speak_batch;
 pub mod train;
 pub mod transcribe;
 pub mod video;
