@@ -43,6 +43,7 @@ enum Engine {
     Supertonic,
     Leokani,
     F5,
+    Silero,
 }
 
 fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
@@ -53,12 +54,16 @@ fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
         "supertonic" => return Ok(Engine::Supertonic),
         "leokani" => return Ok(Engine::Leokani),
         "f5" => return Ok(Engine::F5),
+        "silero" => return Ok(Engine::Silero),
         "auto" => {}
-        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic | leokani | f5, а не `{o}`")),
+        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic | leokani | f5 | silero, а не `{o}`")),
     }
     let id = synaptix_bundle::Bundle::open(bundle).map(|b| b.id().to_lowercase()).unwrap_or_default();
     let name = bundle.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |k: &str| id.contains(k) || name.contains(k);
+    if has("silero") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "silero-tts").unwrap_or(false) {
+        return Ok(Engine::Silero);
+    }
     if has("f5-tts") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "f5-tts").unwrap_or(false) {
         return Ok(Engine::F5);
     }
@@ -103,6 +108,7 @@ pub fn run(args: SpeakArgs) -> Result<(), Box<dyn std::error::Error>> {
         Engine::Supertonic => speak_supertonic(&args, dev, t0)?,
         Engine::Leokani => speak_leokani(&args, dev, t0)?,
         Engine::F5 => speak_f5(&args, dev, t0)?,
+        Engine::Silero => speak_silero(&args, dev, t0)?,
     };
     write_wav_mono_f32(&args.output, &pcm, rate)?;
     eprintln!("synaptix speak: wrote {}", args.output.display());
@@ -113,6 +119,23 @@ fn report(pcm: &[f32], rate: u32, t: std::time::Instant) {
     let infer = t.elapsed().as_secs_f32();
     let dur = pcm.len() as f32 / rate as f32;
     eprintln!("synaptix speak: {:.2}s audio in {:.2}s (RTF={:.3})", dur, infer, infer / dur.max(1e-6));
+}
+
+/// Silero TTS v5: `--voice` — голос пакета (xenia, aidar, kaz_zhazira …), `--speed` — темп,
+/// `--language` — язык замены алфавита (пакеты СНГ), частота — 48 кГц.
+fn speak_silero(args: &SpeakArgs, dev: Device, t0: std::time::Instant) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    use synaptix_tts_silero::{Options, SileroPipeline};
+    let pipe = SileroPipeline::from_syn(&args.bundle, dev)?;
+    eprintln!("synaptix speak: loaded in {:.2}s; голоса: {}", t0.elapsed().as_secs_f32(), pipe.speakers().join(", "));
+    let speaker = args.voice.clone().unwrap_or_else(|| {
+        let sp = pipe.speakers();
+        ["xenia", "ru_zhazira"].iter().find(|d| sp.iter().any(|s| s == *d)).map(|s| s.to_string()).unwrap_or_else(|| sp[0].clone())
+    });
+    let o = Options { speaker, rate: args.speed as f32, lang: args.language.clone(), ..Options::default() };
+    let t1 = std::time::Instant::now();
+    let pcm = pipe.synthesize(&args.text, &o)?;
+    report(&pcm, o.sample_rate, t1);
+    Ok((pcm, o.sample_rate))
 }
 
 /// F5-TTS (русские версии): голос — образец `--reference` и его точный текст `--prompt-text`;

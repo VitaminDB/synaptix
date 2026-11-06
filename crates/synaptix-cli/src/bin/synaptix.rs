@@ -570,7 +570,7 @@ enum Commands {
         #[arg(long)]
         compute_dtype: Option<String>,
     },
-    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3, Leokani, F5-TTS): TEXT → WAV.
+    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3, Leokani, F5-TTS, Silero): TEXT → WAV.
     Speak {
         /// Бандл (.syn) модели синтеза речи.
         bundle: PathBuf,
@@ -603,7 +603,7 @@ enum Commands {
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
-        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8 | supertonic | leokani | f5")]
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8 | supertonic | leokani | f5 | silero")]
         engine: String,
         #[arg(long, help = "VoxCPM: минимум шагов генерации (2)")]
         min_len: Option<usize>,
@@ -625,7 +625,7 @@ enum Commands {
         no_denoise: bool,
         #[arg(long, help = "OmniVoice: явная длина в аудио-токенах (75 на секунду)")]
         target_tokens: Option<usize>,
-        #[arg(long, help = "Готовый голос: Supertonic F1…F5, M1…M5; Leokani dala | pono")]
+        #[arg(long, help = "Готовый голос: Supertonic F1…F5, M1…M5; Leokani dala | pono; Silero xenia, aidar, kaz_zhazira …")]
         voice: Option<String>,
     },
     /// Многоголосый длинный синтез (VibeVoice): SCRIPT → WAV (24 кГц).

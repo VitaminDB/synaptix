@@ -1,0 +1,22 @@
+[package]
+name = "synaptix-tts-silero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Silero TTS v5: русские (ударения, омографы, интонация вопросов), СНГ, кавказские и тюркские голоса; FastPitch-подобная сеть + Vocos 48 кГц."
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-io        = { workspace = true }
+rustfft            = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }

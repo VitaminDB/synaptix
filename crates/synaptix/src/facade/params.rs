@@ -105,6 +105,14 @@ fn language(hint: &'static str) -> ParamSpec {
     spec("language", "Язык", hint, ParamKind::Text { multiline: false }, None)
 }
 
+/// Голоса Silero из `config.json` бандла.
+pub fn silero_speakers(path: &Path) -> Vec<String> {
+    let Ok(b) = synaptix_bundle::Bundle::open(path) else { return Vec::new() };
+    let Ok(c) = b.read_file("config.json") else { return Vec::new() };
+    let v: serde_json::Value = serde_json::from_slice(&c).unwrap_or_default();
+    v["packages"][0]["speakers"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
 pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Vec<ParamSpec> {
     let arch = arch.to_ascii_lowercase();
     let id = id.to_ascii_lowercase();
@@ -120,6 +128,16 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 guidance(2.0, "Guidance (CFG)"),
                 seed(),
             ],
+            "silero" => {
+                let speakers = path.map(silero_speakers).unwrap_or_default();
+                let def = ["xenia", "kaz_zhazira", "ru_zhazira"].iter().find(|d| speakers.iter().any(|s| s == *d)).map(|s| s.to_string()).or_else(|| speakers.first().cloned());
+                vec![
+                    spec("voice", "Голос", "Готовый голос модели (у пакетов СНГ — префикс языка: kaz_, tat_, ukr_ …; ru_ — тот же голос по-русски)", ParamKind::Choice { options: speakers }, def.map(ParamValue::Text)),
+                    spec("speed", "Скорость речи", "1 — обычная (длительности звуков делятся на неё)", float(0.5, 2.0, 0.05, 2), f(1.0)),
+                    spec("pitch", "Высота голоса", "1 — родная; больше — выше, меньше — ниже", float(0.5, 1.5, 0.05, 2), f(1.0)),
+                    spec("accents", "Ударения автоматически", "Ударения, «ё» и омографы (русские версии); вручную — «+» перед ударной гласной", ParamKind::Bool, Some(ParamValue::Bool(true))),
+                ]
+            }
             "leokani" => vec![
                 spec(
                     "voice",

@@ -55,6 +55,7 @@ members = [
     "crates/synaptix-models/tts/supertonic",
     "crates/synaptix-models/tts/leokani",
     "crates/synaptix-models/tts/f5",
+    "crates/synaptix-models/tts/silero",
     "crates/synaptix-models/music/acestep",
     "crates/synaptix-models/music/yue2",
     "crates/synaptix-models/music/sheetsage2",
@@ -248,6 +249,7 @@ synaptix-tts-audio8 = { path = "crates/synaptix-models/tts/audio8" }
 synaptix-tts-supertonic = { path = "crates/synaptix-models/tts/supertonic" }
 synaptix-tts-leokani = { path = "crates/synaptix-models/tts/leokani" }
 synaptix-tts-f5 = { path = "crates/synaptix-models/tts/f5" }
+synaptix-tts-silero = { path = "crates/synaptix-models/tts/silero" }
 
 
 [profile.release]

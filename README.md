@@ -48,6 +48,7 @@ synaptix music "lofi piano, rain" -o track.wav --models ./syn_models --duration 
 synaptix speak voxcpm.syn "Hello there" -o out.wav --reference voice.wav
 synaptix speak omnivoice.syn "Привет" --instruct "female, low pitch" --language ru
 synaptix speak f5-tts-ru-accent.syn "Молок+о на столе." --reference voice.wav --prompt-text "exact words of voice.wav"
+synaptix speak silero-tts-v5-6-ru.syn "Замок на двери был старый." --voice xenia --device cpu
 synaptix podcast vibevoice.syn "Speaker 1: hi\nSpeaker 2: hey" -o show.wav
 synaptix transcribe whisper.syn talk.mp3 --format srt -o talk.srt   # or gigaam.syn
 synaptix diarize sortformer.syn meeting.wav --format rttm
