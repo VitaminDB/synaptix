@@ -4,6 +4,7 @@ pub mod document;
 pub mod error;
 pub mod refs;
 pub mod image;
+pub mod onnx;
 pub mod video;
 pub mod weights;
 

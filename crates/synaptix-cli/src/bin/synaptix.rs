@@ -570,7 +570,7 @@ enum Commands {
         #[arg(long)]
         compute_dtype: Option<String>,
     },
-    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS): TEXT → WAV.
+    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3): TEXT → WAV.
     Speak {
         /// Бандл (.syn) модели синтеза речи.
         bundle: PathBuf,
@@ -603,7 +603,7 @@ enum Commands {
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
-        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8")]
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8 | supertonic")]
         engine: String,
         #[arg(long, help = "VoxCPM: минимум шагов генерации (2)")]
         min_len: Option<usize>,
@@ -625,6 +625,8 @@ enum Commands {
         no_denoise: bool,
         #[arg(long, help = "OmniVoice: явная длина в аудио-токенах (75 на секунду)")]
         target_tokens: Option<usize>,
+        #[arg(long, help = "Supertonic: готовый голос (F1…F5, M1…M5)")]
+        voice: Option<String>,
     },
     /// Многоголосый длинный синтез (VibeVoice): SCRIPT → WAV (24 кГц).
     Podcast {
@@ -1498,11 +1500,11 @@ fn main() -> ExitCode {
         Commands::Speak {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,
             cfg, steps, seed, max_len, engine, min_len, retry_ratio, streaming_prefix_len, language,
-            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens,
+            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens, voice,
         } => speak::run(speak::SpeakArgs {
             bundle, text, output, reference, prompt_wav, prompt_text, device, compute_dtype,
             cfg, steps, seed, max_len, engine, min_len, retry_ratio, streaming_prefix_len, language,
-            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens,
+            instruct, speed, t_shift, layer_penalty, no_denoise, target_tokens, voice,
         }),
         Commands::Podcast {
             bundle, script, script_file, output, voices, device, compute_dtype, cfg, steps, seed,

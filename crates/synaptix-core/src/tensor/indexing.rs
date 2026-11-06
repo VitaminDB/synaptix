@@ -294,6 +294,34 @@ impl Tensor {
         // O(S) memcpy-launch'ей на КАЖДЫЙ из ~112 apply_rope-вызовов.
         let contiguous_range =
             idx_numel > 0 && idx_vec.iter().enumerate().all(|(k, &r)| r == idx_vec[0] + k);
+        // Разрозненные индексы: одним ядром сбора строк (`embed_gather` бэкенда)
+        // по виду `[outer·dim, inner]` вместо memcpy на каждый индекс — при
+        // десятках тысяч индексов (относительное внимание, gather по плоскому
+        // тензору) запуски копий занимали десятки миллисекунд.
+        if !contiguous_range
+            && outer * idx_numel >= 16
+            && matches!(src.dtype(), DType::F32 | DType::F16 | DType::BF16)
+            && outer * src_dim_size <= u32::MAX as usize
+        {
+            let rows: Vec<u32> = (0..outer)
+                .flat_map(|o| idx_vec.iter().map(move |&r| (o * src_dim_size + r) as u32))
+                .collect();
+            let n = rows.len();
+            let table = src.reshape(vec![outer * src_dim_size, inner])?;
+            let ids = Tensor::from_vec(rows, vec![n], device)?;
+            match table.embed_gather(&ids) {
+                Ok(g) => {
+                    let mut out = g.reshape(out_shape.dims().to_vec())?;
+                    crate::grad::try_attach_grad_fn(
+                        crate::grad::GradOp::IndexSelect { input: self, indices, dim },
+                        &mut out,
+                    )?;
+                    return Ok(out);
+                }
+                Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
+                Err(e) => return Err(e),
+            }
+        }
         {
             let out_buf = out_storage
                 .as_cuda_mut()

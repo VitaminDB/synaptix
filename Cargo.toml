@@ -52,6 +52,7 @@ members = [
     "crates/synaptix-models/tts/vibevoice",
     "crates/synaptix-models/tts/voxcpm",
     "crates/synaptix-models/tts/audio8",
+    "crates/synaptix-models/tts/supertonic",
     "crates/synaptix-models/music/acestep",
     "crates/synaptix-models/music/yue2",
     "crates/synaptix-models/music/sheetsage2",
@@ -240,6 +241,7 @@ synaptix-diarization-sortformer = { path = "crates/synaptix-models/diarization/s
 synaptix-tts-omnivoice = { path = "crates/synaptix-models/tts/omnivoice" }
 synaptix-tts-vibevoice = { path = "crates/synaptix-models/tts/vibevoice" }
 synaptix-tts-audio8 = { path = "crates/synaptix-models/tts/audio8" }
+synaptix-tts-supertonic = { path = "crates/synaptix-models/tts/supertonic" }
 
 
 [profile.release]

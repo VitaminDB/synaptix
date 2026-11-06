@@ -32,6 +32,7 @@ pub struct SpeakArgs {
     pub layer_penalty: Option<f32>,
     pub no_denoise: bool,
     pub target_tokens: Option<usize>,
+    pub voice: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ enum Engine {
     VoxCpm,
     OmniVoice,
     Audio8,
+    Supertonic,
 }
 
 fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
@@ -46,12 +48,16 @@ fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
         "voxcpm" => return Ok(Engine::VoxCpm),
         "omnivoice" => return Ok(Engine::OmniVoice),
         "audio8" => return Ok(Engine::Audio8),
+        "supertonic" => return Ok(Engine::Supertonic),
         "auto" => {}
-        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8, а не `{o}`")),
+        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic, а не `{o}`")),
     }
     let id = synaptix_bundle::Bundle::open(bundle).map(|b| b.id().to_lowercase()).unwrap_or_default();
     let name = bundle.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |k: &str| id.contains(k) || name.contains(k);
+    if has("supertonic") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "supertonic").unwrap_or(false) {
+        return Ok(Engine::Supertonic);
+    }
     if has("audio8") || synaptix::facade::arch::model_type(bundle).as_deref() == Some("arktts") {
         return Ok(Engine::Audio8);
     }
@@ -84,6 +90,7 @@ pub fn run(args: SpeakArgs) -> Result<(), Box<dyn std::error::Error>> {
         Engine::VoxCpm => speak_voxcpm(&args, dev, dtype, t0)?,
         Engine::OmniVoice => speak_omnivoice(&args, dev, dtype, t0)?,
         Engine::Audio8 => speak_audio8(&args, dev, dtype, t0)?,
+        Engine::Supertonic => speak_supertonic(&args, dev, t0)?,
     };
     write_wav_mono_f32(&args.output, &pcm, rate)?;
     eprintln!("synaptix speak: wrote {}", args.output.display());
@@ -94,6 +101,25 @@ fn report(pcm: &[f32], rate: u32, t: std::time::Instant) {
     let infer = t.elapsed().as_secs_f32();
     let dur = pcm.len() as f32 / rate as f32;
     eprintln!("synaptix speak: {:.2}s audio in {:.2}s (RTF={:.3})", dur, infer, infer / dur.max(1e-6));
+}
+
+/// Supertonic 3: `--voice` — готовый голос (F1…F5, M1…M5), `--language` —
+/// код языка (по умолчанию по письму: ru/en), `--steps` (8), `--speed` — темп.
+fn speak_supertonic(args: &SpeakArgs, dev: Device, t0: std::time::Instant) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    use synaptix_tts_supertonic::{Options, SupertonicPipeline};
+    let pipe = SupertonicPipeline::from_syn(&args.bundle, dev)?;
+    eprintln!("synaptix speak: loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    let name = args.voice.clone().unwrap_or_else(|| "M1".into());
+    let voice = pipe.voice(&name).ok_or_else(|| format!("голос {name}: есть {}", pipe.voice_names().join(", ")))?.clone();
+    let lang = args.language.clone().unwrap_or_else(|| {
+        let cyr = args.text.chars().filter(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё')).count();
+        if cyr * 2 > args.text.chars().filter(|c| c.is_alphabetic()).count() { "ru".into() } else { "en".into() }
+    });
+    let opts = Options { steps: args.steps.unwrap_or(8), speed: 1.05 * args.speed as f32, seed: args.seed, ..Options::default() };
+    let t1 = std::time::Instant::now();
+    let pcm = pipe.synthesize(&args.text, &lang, &voice, &opts)?;
+    report(&pcm, pipe.sample_rate(), t1);
+    Ok((pcm, pipe.sample_rate()))
 }
 
 /// Audio8-TTS: `--reference` — образец голоса, `--prompt-text` — его точная

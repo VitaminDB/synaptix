@@ -112,6 +112,19 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
             "vibevoice" => vec![ref_audio(), steps(Some(10), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
+            "supertonic" => vec![
+                language("Код языка (ru, en, de, …: 31 язык); пусто — по письму текста (ru/en)"),
+                spec(
+                    "voice",
+                    "Голос",
+                    "Готовый голос: F1…F5 — женские, M1…M5 — мужские",
+                    ParamKind::Choice { options: ["F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5"].iter().map(|s| s.to_string()).collect() },
+                    Some(ParamValue::Text("M1".into())),
+                ),
+                spec("speed", "Скорость речи", "1 — обычная (длительность по модели)", float(0.5, 2.0, 0.05, 2), f(1.0)),
+                steps(Some(8), "Шаги flow matching (как в оригинале — 8)"),
+                seed(),
+            ],
             "audio8" => vec![
                 ref_audio(),
                 spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово. Для клона по образцу обязателен: без него Audio8 голос не клонирует", ParamKind::Text { multiline: true }, None),
