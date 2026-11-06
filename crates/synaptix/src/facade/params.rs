@@ -114,7 +114,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             "vibevoice" => vec![ref_audio(), steps(Some(10), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
             "audio8" => vec![
                 ref_audio(),
-                ref_text(),
+                spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово. Для клона по образцу обязателен: без него Audio8 голос не клонирует", ParamKind::Text { multiline: true }, None),
                 spec("speed", "Скорость речи", "1 — обычная (растяжение времени после синтеза)", float(0.25, 4.0, 0.05, 2), f(1.0)),
                 spec("temperature", "Температура", "Выше — живее и разнообразнее, ниже — ровнее (как в оригинале — 0.7)", float(0.1, 1.5, 0.05, 2), f(0.7)),
                 spec("top_p", "Top-p", "Доля вероятности, из которой выбирается токен (0.9)", float(0.1, 1.0, 0.05, 2), f(0.9)),
