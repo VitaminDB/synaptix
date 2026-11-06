@@ -335,3 +335,224 @@ pub fn quantize_q4_0(x: &[f32], n: usize, k: usize) -> Vec<u8> {
     }
     out
 }
+
+#[inline]
+fn nearest_int(v: f32) -> i32 {
+    v.round() as i32
+}
+
+/// `make_qkx2_quants` ggml: шкала и минимум блока по взвешенному МНК с перебором `nstep` сдвигов.
+#[allow(clippy::too_many_arguments)]
+fn make_qkx2_quants(x: &[f32], w: &[f32], nmax: i32, l: &mut [u8], laux: &mut [u8], rmin: f32, rdelta: f32, nstep: i32) -> (f32, f32) {
+    let n = x.len();
+    let (mut min, mut max) = (x[0], x[0]);
+    let (mut sum_w, mut sum_x) = (w[0], w[0] * x[0]);
+    for i in 1..n {
+        min = min.min(x[i]);
+        max = max.max(x[i]);
+        sum_w += w[i];
+        sum_x += w[i] * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        l[..n].iter_mut().for_each(|v| *v = 0);
+        return (0.0, -min);
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best = 0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+        l[i] = q as u8;
+        let d = scale * q as f32 + min - x[i];
+        best += w[i] * d * d;
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let (mut sl, mut sl2, mut sxl) = (0f32, 0f32, 0f32);
+        for i in 0..n {
+            let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = q as u8;
+            let q = q as f32;
+            sl += w[i] * q;
+            sl2 += w[i] * q * q;
+            sxl += w[i] * q * x[i];
+        }
+        let dd = sum_w * sl2 - sl * sl;
+        if dd > 0.0 {
+            let mut this_scale = (sum_w * sxl - sum_x * sl) / dd;
+            let mut this_min = (sl2 * sum_x - sl * sxl) / dd;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sxl / sl2;
+            }
+            let mut mad = 0f32;
+            for i in 0..n {
+                let d = this_scale * laux[i] as f32 + this_min - x[i];
+                mad += w[i] * d * d;
+            }
+            if mad < best {
+                l[..n].copy_from_slice(&laux[..n]);
+                best = mad;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
+/// Шкала и минимум подблока `j` суперблока Q4_K/Q5_K (6 бит, `get_scale_min_k4` ggml).
+#[inline]
+pub fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+    }
+}
+
+/// Кодировщик Q4_K (как `quantize_row_q4_K_ref` ggml): суперблок 256 = f16 `d`, f16 `dmin`,
+/// 12 байт 6-битных шкал/минимумов восьми подблоков по 32 и 128 байт полубайтов (в каждой
+/// четверти по 64: младшие — первые 32 значения, старшие — вторые); вес `d·sc·q − dmin·m`.
+/// `x` — матрица `[n, k]`, `k % 256 == 0`. `imp` — важность столбцов (E[x²] входа из калибровки,
+/// как imatrix ggml): ошибка взвешивается `imp·√(σ² + w²)`, без неё — `rms + |w|`.
+pub fn quantize_q4_k(x: &[f32], n: usize, k: usize, imp: Option<&[f32]>) -> Vec<u8> {
+    quantize_k(x, n, k, imp, false)
+}
+
+/// Кодировщик Q5_K (`quantize_row_q5_K_ref` ggml): как Q4_K, но 5 бит — плюс 32 байта `qh`
+/// (пятый бит: для четверти c значения 0..31 — бит 2c, 32..63 — бит 2c + 1); 176 байт на 256.
+pub fn quantize_q5_k(x: &[f32], n: usize, k: usize, imp: Option<&[f32]>) -> Vec<u8> {
+    quantize_k(x, n, k, imp, true)
+}
+
+fn quantize_k(x: &[f32], n: usize, k: usize, imp: Option<&[f32]>, five: bool) -> Vec<u8> {
+    const QK_K: usize = 256;
+    // Калибровка (imatrix) — только для 4 бит. LFM3-1.7B, средняя KL к эталону по 628 позициям:
+    // Q4_K 0,150 → 0,086 (калибровка MLP), а Q5_K 0,037 → 0,120 (выбросы на отдельных позициях).
+    let imp = if five { None } else { imp.filter(|h| h.len() == k) };
+    let nb = k / QK_K;
+    let bb = if five { 176 } else { 144 };
+    let nmax = if five { 31 } else { 15 };
+    let mut out = vec![0u8; n * nb * bb];
+    use rayon::prelude::*;
+    out.par_chunks_mut(nb * bb).enumerate().for_each(|(r, orow)| {
+        let mut l = [0u8; QK_K];
+        let mut laux = [0u8; 32];
+        let mut w = [0f32; 32];
+        for b in 0..nb {
+            let xb = &x[r * k + b * QK_K..r * k + (b + 1) * QK_K];
+            let y = &mut orow[b * bb..(b + 1) * bb];
+            let (mut scales, mut mins) = ([0f32; 8], [0f32; 8]);
+            let (mut max_scale, mut max_min) = (0f32, 0f32);
+            let sigma2 = 2.0 * xb.iter().map(|v| v * v).sum::<f32>() / QK_K as f32;
+            for j in 0..8 {
+                let xs = &xb[32 * j..32 * j + 32];
+                let (s, m) = match imp {
+                    Some(h) => {
+                        let hb = &h[b * QK_K + 32 * j..b * QK_K + 32 * j + 32];
+                        for ((wi, &v), &q) in w.iter_mut().zip(xs).zip(hb) {
+                            *wi = q * (sigma2 + v * v).sqrt();
+                        }
+                        make_qkx2_quants(xs, &w, nmax, &mut l[32 * j..32 * j + 32], &mut laux, -0.9, 0.05, 36)
+                    }
+                    None => {
+                        let av = (xs.iter().map(|v| v * v).sum::<f32>() / 32.0).sqrt();
+                        for (wi, &v) in w.iter_mut().zip(xs) {
+                            *wi = av + v.abs();
+                        }
+                        let (rmin, nstep) = if five { (-0.5, 15) } else { (-1.0, 20) };
+                        make_qkx2_quants(xs, &w, nmax, &mut l[32 * j..32 * j + 32], &mut laux, rmin, 0.1, nstep)
+                    }
+                };
+                scales[j] = s;
+                mins[j] = m;
+                max_scale = max_scale.max(s);
+                max_min = max_min.max(m);
+            }
+            let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+            let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+            let sc = &mut y[4..16];
+            sc.iter_mut().for_each(|v| *v = 0);
+            for j in 0..8 {
+                let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
+                let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
+                if j < 4 {
+                    sc[j] = ls;
+                    sc[j + 4] = lm;
+                } else {
+                    sc[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                    sc[j - 4] |= (ls >> 4) << 6;
+                    sc[j] |= (lm >> 4) << 6;
+                }
+            }
+            let d = half::f16::from_f32(max_scale / 63.0);
+            let dmin = half::f16::from_f32(max_min / 63.0);
+            y[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+            y[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+            let scb: [u8; 12] = y[4..16].try_into().unwrap();
+            for j in 0..8 {
+                let (s, m) = q4k_scale_min(j, &scb);
+                let dd = d.to_f32() * s as f32;
+                if dd == 0.0 {
+                    continue;
+                }
+                let dm = dmin.to_f32() * m as f32;
+                for ii in 0..32 {
+                    l[32 * j + ii] = nearest_int((xb[32 * j + ii] + dm) / dd).clamp(0, nmax) as u8;
+                }
+            }
+            if five {
+                let (qh, q) = y[16..176].split_at_mut(32);
+                qh.iter_mut().for_each(|v| *v = 0);
+                for c in 0..4 {
+                    for t in 0..32 {
+                        let (mut l1, mut l2) = (l[c * 64 + t], l[c * 64 + t + 32]);
+                        if l1 > 15 {
+                            l1 -= 16;
+                            qh[t] |= 1 << (2 * c);
+                        }
+                        if l2 > 15 {
+                            l2 -= 16;
+                            qh[t] |= 1 << (2 * c + 1);
+                        }
+                        q[c * 32 + t] = l1 | (l2 << 4);
+                    }
+                }
+            } else {
+                let q = &mut y[16..144];
+                for c in 0..4 {
+                    for t in 0..32 {
+                        q[c * 32 + t] = l[c * 64 + t] | (l[c * 64 + t + 32] << 4);
+                    }
+                }
+            }
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod q4k_tests {
+    use super::*;
+
+    #[test]
+    fn q4k_roundtrip_beats_q4_0() {
+        let (n, k) = (4usize, 512usize);
+        let x: Vec<f32> = (0..n * k).map(|i| ((i as f32 * 0.37).sin() * 0.05) + if i % 97 == 0 { 0.3 } else { 0.0 }).collect();
+        let deq = |t: GgmlType, b: &[u8]| {
+            let mut y = vec![0f32; n * k];
+            crate::quant::ggml_dequant::dequantize(t, b, n * k, &mut y).unwrap();
+            y
+        };
+        let err = |y: &[f32]| (x.iter().zip(y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / x.iter().map(|a| a * a).sum::<f32>()).sqrt();
+        let e4k = err(&deq(GgmlType::Q4K, &quantize_q4_k(&x, n, k, None)));
+        let e40 = err(&deq(GgmlType::Q4_0, &quantize_q4_0(&x, n, k)));
+        let e5k = err(&deq(GgmlType::Q5K, &quantize_q5_k(&x, n, k, None)));
+        assert!(e4k < 0.1 && e4k < e40, "Q4_K {e4k} против Q4_0 {e40}");
+        assert!(e5k < e4k * 0.7, "Q5_K {e5k} против Q4_K {e4k}");
+    }
+}

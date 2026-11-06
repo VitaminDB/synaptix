@@ -26,4 +26,5 @@ libc        = { workspace = true }
 
 [dev-dependencies]
 proptest            = { workspace = true }
+safetensors         = { workspace = true }
 synaptix-test-utils = { workspace = true }

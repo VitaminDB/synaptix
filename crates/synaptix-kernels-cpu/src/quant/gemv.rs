@@ -42,12 +42,43 @@ fn i8mm_on() -> bool {
 pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
     let (n, k) = (view.n, view.k);
     debug_assert_eq!(out.len(), m * n);
+    if m >= PREFILL_M && k % super::q8dot::QK == 0 && matches!(view.dtype, DType::Ggml(_)) && i8mm_on() {
+        // Префилл ggml-кванта: полоса весов переквантуется в int8 построчно — и в SMMLA.
+        super::q8mm::gemm(view, xf, m, out);
+        return;
+    }
     if view.dtype == DType::Q8Row && k % super::q8dot::QK == 0 {
         if m >= PREFILL_M && i8mm_on() {
             super::q8mm::gemm(view, xf, m, out);
             return;
         }
         gemm_q8row(view, xf, m, out);
+        return;
+    }
+    // Q4_K/Q5_K на декоде: активации int8 блоками по 32 и их суммы (минимумы подблоков).
+    let q5k = view.dtype == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q5K);
+    // (только ARM: на x86 у K-квантов нет целочисленного ядра — там деквант строки и F32-dot)
+    if cfg!(target_arch = "aarch64") && m < PREFILL_M && (q5k || view.dtype == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K)) && k % super::q4kdot::QK_K == 0 {
+        use super::q8dot::{quantize_act, QK};
+        let nb = k / QK;
+        let mut xq = vec![0i8; m * k];
+        let mut xs = vec![0f32; m * nb];
+        let mut xsum = vec![0f32; m * nb];
+        for i in 0..m {
+            quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * nb..(i + 1) * nb]);
+            super::q4kdot::block_sums(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], &mut xsum[i * nb..(i + 1) * nb]);
+        }
+        let op = blocked::SendPtr::new(out.as_mut_ptr());
+        par_chunks_cost(n, k * (m + 1) / 16, |n0, n1| {
+            for j in n0..n1 {
+                let w = view.row_bytes_of(j);
+                for i in 0..m {
+                    let (xq, xs, xsum) = (&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], &xsum[i * nb..(i + 1) * nb]);
+                    let v = if q5k { super::q5kdot::dot(xq, xs, xsum, w) } else { super::q4kdot::dot(xq, xs, xsum, w) };
+                    unsafe { *op.ptr().add(i * n + j) = v };
+                }
+            }
+        });
         return;
     }
     // Q4_0 на декоде: активации в int8 блоками по 32, целочисленный dot с полубайтами.
@@ -203,7 +234,7 @@ pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage,
     let packed = w.packed_arc().ok_or(SynaptixError::Unsupported("cpu linear_quant: packed освобождён"))?;
     let view = weight_view(w, &packed, w.scales_opt())?;
     let xb = cpu(x_st, "cpu linear_quant: x не на CPU")?.as_bytes();
-    if view.dtype == DType::Q8Row && m >= PREFILL_M && w.k() % super::q8dot::QK == 0 && i8mm_on() {
+    if (view.dtype == DType::Q8Row || matches!(view.dtype, DType::Ggml(_))) && m >= PREFILL_M && w.k() % super::q8dot::QK == 0 && i8mm_on() {
         // Префилл i8mm: строки читаются и выход пишется прямо в типе тензора — без
         // промежуточных F32-буферов всей матрицы.
         let (k, n, xoff, ooff) = (w.k(), w.n(), x_lo.offset(), o_lo.offset());

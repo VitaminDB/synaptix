@@ -6,6 +6,8 @@ pub mod ggml_simd;
 pub mod fp8_e4m3;
 pub mod mxfp8;
 pub mod q4dot;
+pub mod q4kdot;
+pub mod q5kdot;
 pub mod q8dot;
 pub mod q8mm;
 

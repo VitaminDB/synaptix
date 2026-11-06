@@ -53,12 +53,18 @@ fn pack_act(row: &(dyn Fn(usize, &mut [f32]) + Sync), m: usize, k: usize) -> (Ve
     (xq, xs)
 }
 
-/// Полоса весов `[j0, j1)` парами строк (хвост до кратного 4 — нули).
-fn pack_w(view: &WeightView, j0: usize, j1: usize, buf: &mut Vec<i8>) {
+/// Полоса весов `[j0, j1)` парами строк (хвост до кратного 4 — нули) и шкалы строк.
+/// Q8Row копируется как есть; прочие форматы деквантуются в F32 и квантуются в int8 по строке.
+fn pack_w(view: &WeightView, j0: usize, j1: usize, buf: &mut Vec<i8>, ws: &mut Vec<f32>) {
     let k = view.k;
     let rows = (j1 - j0).div_ceil(4) * 4;
     buf.clear();
     buf.resize(rows * k, 0);
+    ws.clear();
+    ws.resize(rows, 0.0);
+    let q8 = view.dtype == synaptix_core::dtype::DType::Q8Row;
+    let mut rf = if q8 { Vec::new() } else { vec![0f32; k] };
+    let mut rq = if q8 { Vec::new() } else { vec![0i8; k] };
     for pr in 0..rows / 2 {
         let dst = &mut buf[pr * 2 * k..(pr + 1) * 2 * k];
         for r in 0..2 {
@@ -66,11 +72,24 @@ fn pack_w(view: &WeightView, j0: usize, j1: usize, buf: &mut Vec<i8>) {
             if j >= j1 {
                 continue;
             }
-            let src = view.row_bytes_of(j);
-            for st in 0..k / 8 {
-                let d = &mut dst[st * 16 + r * 8..st * 16 + r * 8 + 8];
+            let src: &[i8] = if q8 {
+                ws[2 * pr + r] = view.q8_scale(j);
+                let b = view.row_bytes_of(j);
                 // SAFETY: u8 → i8 той же ширины.
-                d.copy_from_slice(unsafe { std::slice::from_raw_parts(src.as_ptr().add(st * 8) as *const i8, 8) });
+                unsafe { std::slice::from_raw_parts(b.as_ptr() as *const i8, k) }
+            } else {
+                view.row(j, &mut rf);
+                let amax = rf.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = amax / 127.0;
+                let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+                for (q, &v) in rq.iter_mut().zip(&rf) {
+                    *q = (v * inv).round() as i8;
+                }
+                ws[2 * pr + r] = d;
+                &rq
+            };
+            for st in 0..k / 8 {
+                dst[st * 16 + r * 8..st * 16 + r * 8 + 8].copy_from_slice(&src[st * 8..st * 8 + 8]);
             }
         }
     }
@@ -151,11 +170,10 @@ pub fn gemm_with(view: &WeightView, m: usize, row: &(dyn Fn(usize, &mut [f32]) +
         let mp = m.div_ceil(MT) * MT;
         // Полоса весов задачи в L2: ~128 КБ.
         let band = ((128 << 10) / k).clamp(4, 64) / 4 * 4;
-        (0..n.div_ceil(band)).into_par_iter().for_each_init(Vec::new, |wbuf, bi| {
+        (0..n.div_ceil(band)).into_par_iter().for_each_init(|| (Vec::new(), Vec::new()), |(wbuf, ws), bi| {
             let (j0, j1) = (bi * band, ((bi + 1) * band).min(n));
-            pack_w(view, j0, j1, wbuf);
+            pack_w(view, j0, j1, wbuf, ws);
             let rows = (j1 - j0).div_ceil(4) * 4;
-            let ws: Vec<f32> = (0..rows).map(|r| if j0 + r < j1 { view.q8_scale(j0 + r) } else { 0.0 }).collect();
             for it in 0..mp / MT {
                 let xp = unsafe { xq.as_ptr().add(it * MT * k) };
                 let xsp = unsafe { xs.as_ptr().add(it * (MT / 2) * nb * 4) };

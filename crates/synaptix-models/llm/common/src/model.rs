@@ -2363,6 +2363,12 @@ impl DecoderModel {
         out.add(&y).coerr()
     }
 
+    /// Логиты всех позиций `hidden [B, S, H]` → `[B, S, V]` (оценка качества кванта).
+    pub fn head_all(&self, hidden: &Tensor) -> Result<Tensor, ModelError> {
+        let normed = rms_norm(hidden, &self.final_norm, self.config.rms_norm_eps).coerr()?;
+        self.lm_head_forward(&normed)
+    }
+
     pub fn normed_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
         let dev = self.device;
         let normed = prof(dev, "norm", || {

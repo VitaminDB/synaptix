@@ -36,6 +36,21 @@ fn main() {
         let b: Vec<u8> = lg.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&a[i + 1], b).unwrap();
     }
+    if let Some(i) = a.iter().position(|x| x == "--all-logits") {
+        // логиты всех позиций промпта [S, vocab] → f32 LE (средняя KL против эталона)
+        let mut kv = p.model.make_kv_cache(1, ids.len() + 1).unwrap();
+        let t = synaptix_core::tensor::Tensor::from_vec(ids.clone(), vec![1usize, ids.len()], Device::Cpu).unwrap();
+        let h = synaptix_core::grad::no_grad(|| p.model.forward_trunk(&t, &mut kv)).unwrap();
+        let mut b: Vec<u8> = Vec::new();
+        for s in (0..ids.len()).step_by(64) {
+            let e = (s + 64).min(ids.len());
+            let hs = h.narrow(1, s, e - s).unwrap();
+            let lg = p.model.head_all(&hs).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            b.extend(lg.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        std::fs::write(&a[i + 1], b).unwrap();
+        return;
+    }
     if std::env::var_os("LFM_PPROF").is_some() {
         // профиль префилла по операциям (отдельный прогон промпта)
         for _ in 0..2 {

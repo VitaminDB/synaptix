@@ -358,6 +358,7 @@ fn target_ok(target: DType, n: usize, k: usize) -> bool {
         DType::MXFP8 | DType::Sq { .. } => k % 32 == 0,
         DType::Q8Row => n > 0 && k > 0,
         DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0) => k % 32 == 0,
+        DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K | synaptix_core::quant::ggml::GgmlType::Q5K) => k % 256 == 0,
         _ => false,
     }
 }
@@ -476,7 +477,9 @@ fn dense_bytes(loader: &SynBundleLoader, item: &Item, device: Device) -> Result<
 fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
     let (slices, n, k) = item.dims;
     let q4_0 = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0);
-    if item.target == DType::Q8Row || q4_0 {
+    let q4_k = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K);
+    let q5_k = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q5K);
+    if item.target == DType::Q8Row || q4_0 || q4_k || q5_k {
         let host: Vec<f32> = match item.current {
             Some(_) => {
                 let qw = loader
@@ -497,6 +500,11 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
         };
         if q4_0 {
             return Ok((synaptix_core::quant::ggml::quantize_q4_0(&host, n, k), Vec::new()));
+        }
+        if q4_k || q5_k {
+            let h = synaptix_core::quant::calib::table_get(&item.name);
+            let f = if q5_k { synaptix_core::quant::ggml::quantize_q5_k } else { synaptix_core::quant::ggml::quantize_q4_k };
+            return Ok((f(&host, n, k, h.as_deref()), Vec::new()));
         }
         let h = synaptix_core::quant::calib::table_get(&item.name);
         let (packed, scales) = synaptix_core::quant::q8row::quantize(&host, n, k, h.as_deref());

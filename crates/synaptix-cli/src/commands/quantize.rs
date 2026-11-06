@@ -65,9 +65,12 @@ fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
         "none" | "keep" | "-" => Ok(None),
         // Q4_0 ggml: кодируется на CPU, на ARM-процессоре — целочисленный dot (телефон)
         "q4_0" | "q40" => Ok(Some(DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0))),
+        // Q4_K ggml (суперблок 256, шкала и минимум на 32): точнее Q4_0 при том же объёме
+        "q4_k" | "q4k" => Ok(Some(DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K))),
+        "q5_k" | "q5k" => Ok(Some(DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q5K))),
         other => match parse_dtype(other) {
             Some(d) if d.is_quantized() && !matches!(d, DType::Ggml(_)) => Ok(Some(d)),
-            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | q8row | q4_0 | none")),
+            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | q8row | q4_0 | q4_k | q5_k | none")),
         },
     }
 }
