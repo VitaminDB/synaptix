@@ -10,7 +10,7 @@ fn main() {
     synaptix_kernels_cpu::ensure_registered();
     if dev.is_cuda() { synaptix_kernels_cuda::ensure_registered(); }
     let l = synaptix_io::SafetensorsLoader::open(Path::new(&a[1])).expect("weights");
-    let w = W { l: &l, prefix: String::new(), device: dev };
+    let w = W { l: &l, prefix: String::new(), device: dev, dtype: synaptix_core::dtype::DType::F32 };
     let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&a[3]).unwrap()).unwrap();
     let vocab = cfg["vocab"].as_object().unwrap();
     let mut ids = vec![0i64];
@@ -19,12 +19,12 @@ fn main() {
     }
     ids.push(0);
     let ac = Acoustic::load(&w, 100).unwrap();
-    let voc = Vocoder::load(&w, 8).unwrap();
+    let voc = Vocoder::load(&w, 8, 100).unwrap();
     let speed: f32 = get("--speed").map(|s| s.parse().unwrap()).unwrap_or(1.0);
     let t = std::time::Instant::now();
-    let mel = ac.forward(&ids, speed).unwrap();
-    let pcm = voc.forward(&mel).unwrap();
-    eprintln!("ids {}, кадров {}, звук {:.2} с за {:.3} с", ids.len(), mel.dims()[2], pcm.len() as f32 / 24000.0, t.elapsed().as_secs_f64());
+    let mel = ac.forward(&ids, speed, false).unwrap();
+    let pcm = voc.forward(&mel, mel.len() / 100).unwrap();
+    eprintln!("ids {}, кадров {}, звук {:.2} с за {:.3} с", ids.len(), mel.len() / 100, pcm.len() as f32 / 24000.0, t.elapsed().as_secs_f64());
     if let Some(r) = get("--ref") {
         let b = std::fs::read(r).unwrap();
         let rf: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();

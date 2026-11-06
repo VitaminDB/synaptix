@@ -31,6 +31,8 @@ pub struct Timings {
 
 pub struct LeokaniPipeline {
     g2p: LeokaniG2P,
+    /// Добивать фонемы и кадры до корзин длины (NPU: один граф на корзину).
+    buckets: bool,
     vocab: BTreeMap<String, i64>,
     voices: BTreeMap<String, Voice>,
     last: std::sync::Mutex<Timings>,
@@ -38,7 +40,14 @@ pub struct LeokaniPipeline {
 
 impl LeokaniPipeline {
     /// Голоса — компоненты бандла `dala` (женский) и `pono` (мужской); G2P — на CPU.
+    /// На `Device::Npu` счёт F16 и корзины длины, иначе F32 точно по длине
+    /// (`SYN_LEOKANI_BUCKETS=1` — корзины и на CPU/CUDA, для сверки).
     pub fn from_syn(path: &Path, device: Device) -> Result<Self> {
+        let npu = matches!(device, Device::Npu(_));
+        // SYN_LEOKANI_F16=1 — счёт F16 и вне NPU (оценка точности NPU-пути на ПК).
+        let f16 = npu || std::env::var("SYN_LEOKANI_F16").as_deref() == Ok("1");
+        let dtype = if f16 { DType::F16 } else { DType::F32 };
+        let buckets = npu || std::env::var("SYN_LEOKANI_BUCKETS").as_deref() == Ok("1");
         let b = synaptix_bundle::Bundle::open(path).map_err(|e| LkError::Load(e.to_string()))?;
         let read = |n: &str| b.read_file(n).map(|c| c.into_owned()).map_err(|e| LkError::Load(format!("{n}: {e}")));
         let cfg: serde_json::Value = serde_json::from_slice(&read("config.json")?).map_err(|e| LkError::Load(e.to_string()))?;
@@ -62,13 +71,13 @@ impl LeokaniPipeline {
             if l.names().is_empty() {
                 continue;
             }
-            let w = W { l: &l, prefix: String::new(), device };
-            voices.insert(name.to_string(), Voice { acoustic: Acoustic::load(&w, n_mels)?, vocoder: Vocoder::load(&w, blocks)? });
+            let w = W { l: &l, prefix: String::new(), device, dtype };
+            voices.insert(name.to_string(), Voice { acoustic: Acoustic::load(&w, n_mels)?, vocoder: Vocoder::load(&w, blocks, n_mels)? });
         }
         if voices.is_empty() {
             return Err(LkError::Load("в бандле нет голосов (dala/pono)".into()));
         }
-        Ok(Self { g2p, vocab, voices, last: Default::default() })
+        Ok(Self { g2p, buckets, vocab, voices, last: Default::default() })
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -137,8 +146,10 @@ impl LeokaniPipeline {
         x.push(0);
         x.extend_from_slice(ids);
         x.push(0);
-        let mel = v.acoustic.forward(&x, speed)?;
-        v.vocoder.forward(&mel)
+        let mel = v.acoustic.forward(&x, speed, self.buckets)?;
+        let t = mel.len() / 100;
+        let tb = if self.buckets { crate::model::bucket(t, &crate::model::FRAME_BUCKETS) } else { t };
+        v.vocoder.forward(&mel, tb)
     }
 
     /// Английский текст → PCM 24 кГц. `speed` — темп (1 — обычный).

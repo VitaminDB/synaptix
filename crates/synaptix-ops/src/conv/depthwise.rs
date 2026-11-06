@@ -32,8 +32,42 @@ pub fn depthwise_conv(
         Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
         Err(e) => return Err(e),
     }
-    // Decompose-фоллбэк: канал-за-каналом через conv1d.
     let c = input.dims()[1];
+    // Шаг 1 (почти все depthwise в моделях): сумма по отводам ядра —
+    // y = Σ_k w[:, k] · x[:, :, k .. k + L_out] + b: K срезов, K умножений и
+    // K−1 сложений вместо C отдельных свёрток. На NPU поканальный путь давал
+    // тысячи узлов графа (вокодер Leokani: ~100 сегментов на фразу), на CPU —
+    // C свёрток по одному каналу.
+    if stride.max(1) == 1 {
+        let x = if padding > 0 {
+            let d = input.dims();
+            let z = Tensor::zeros(vec![d[0], c, padding], input.dtype(), input.device())?;
+            Tensor::cat(&[&z, input, &z], 2)?
+        } else {
+            input.clone()
+        };
+        let k = weight.dims()[2];
+        let l = x.dims()[2];
+        if l + 1 < k {
+            return Err(SynaptixError::Unsupported("depthwise_conv: ядро длиннее входа"));
+        }
+        let l_out = l + 1 - k;
+        let mut acc: Option<Tensor> = None;
+        for j in 0..k {
+            let wj = weight.narrow(2, j, 1)?.contiguous()?.reshape(vec![1usize, c, 1])?;
+            let term = x.narrow(2, j, l_out)?.contiguous()?.broadcast_mul(&wj)?;
+            acc = Some(match acc {
+                Some(a) => a.add(&term)?,
+                None => term,
+            });
+        }
+        let mut y = acc.ok_or(SynaptixError::Unsupported("depthwise_conv: пустое ядро"))?;
+        if let Some(b) = bias {
+            y = y.broadcast_add(&b.reshape(vec![1usize, c, 1])?)?;
+        }
+        return Ok(y);
+    }
+    // Шаг > 1: канал-за-каналом через conv1d.
     let mut out_channels: Vec<Tensor> = Vec::with_capacity(c);
     for ci in 0..c {
         // narrow на канал-измерении (1) даёт non-contiguous view; conv1d

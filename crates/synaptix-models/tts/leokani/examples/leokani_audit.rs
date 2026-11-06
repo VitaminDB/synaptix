@@ -6,9 +6,10 @@ use synaptix_tts_leokani::LeokaniPipeline;
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let get = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
-    let dev = if get("--device").as_deref() == Some("cuda") { Device::Cuda(0) } else { Device::Cpu };
+    let dev = match get("--device").as_deref() { Some("cuda") => Device::Cuda(0), Some("npu") => Device::Npu(0), _ => Device::Cpu };
     synaptix_kernels_cpu::ensure_registered();
     if dev.is_cuda() { synaptix_kernels_cuda::ensure_registered(); }
+    if matches!(dev, Device::Npu(_)) { let i = synaptix_kernels_npu::register().expect("npu"); eprintln!("NPU: {i:?}"); }
     let t = std::time::Instant::now();
     let p = LeokaniPipeline::from_syn(Path::new(&a[1]), dev).expect("load");
     eprintln!("загрузка {:.2} с, голоса {:?}", t.elapsed().as_secs_f64(), p.voice_names());

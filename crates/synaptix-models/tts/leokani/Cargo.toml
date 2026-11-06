@@ -22,4 +22,5 @@ unicode-properties = { workspace = true }
 [dev-dependencies]
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+synaptix-kernels-npu  = { workspace = true }
 synaptix-audio        = { workspace = true }
