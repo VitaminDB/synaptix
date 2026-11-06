@@ -989,33 +989,53 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
     let t0 = std::time::Instant::now();
     if let Err(e) = cg.run(&binds) {
         // QNN 1002/1003 при исполнении (нет памяти / системная ошибка DSP при
-        // переполненных PD): отпустить давнюю половину графов, заново открыть этот
-        // и повторить — а не уходить на CPU навсегда (служба так откатывала модели).
-        let m = e.to_string();
-        if !(m.contains("graphExecute") && (m.contains("QNN 1002") || m.contains("QNN 1003"))) {
+        // переполненных PD — две wav2vec2-large резидентны, корзина 12 с не влезает):
+        // отпустить давнюю половину графов и повторить; снова сбой — отпустить все
+        // остальные графы; и только потом ошибка (служба уходила на CPU навсегда).
+        let transient = |m: &str| m.contains("graphExecute") && (m.contains("QNN 1002") || m.contains("QNN 1003"));
+        let mut m = e.to_string();
+        if !transient(&m) {
             return Err(err(e));
         }
-        eprintln!("npu: {m} — освобождаю графы и повторяю");
         drop(cg);
-        {
-            let mut g = GRAPHS.lock();
-            g.remove(hash);
-            g.evict_half();
-        }
-        let c: Arc<dyn CompiledGraph> = loop {
-            match npu.compile("synaptix", &b.g) {
-                Ok(c) => break Arc::from(c),
-                Err(synaptix_npu::NpuError::NoSpace(m)) => {
-                    if !GRAPHS.lock().evict_half() {
-                        return Err(err(synaptix_npu::NpuError::NoSpace(m)));
+        let mut done = None;
+        for step in 0..2 {
+            eprintln!("npu: {m} — освобождаю {} графы и повторяю", if step == 0 { "давние" } else { "все прочие" });
+            {
+                let mut g = GRAPHS.lock();
+                g.remove(hash);
+                if step == 0 {
+                    g.evict_half();
+                } else {
+                    while g.evict_half() {}
+                }
+            }
+            let c: Arc<dyn CompiledGraph> = loop {
+                match npu.compile("synaptix", &b.g) {
+                    Ok(c) => break Arc::from(c),
+                    Err(synaptix_npu::NpuError::NoSpace(m)) => {
+                        if !GRAPHS.lock().evict_half() {
+                            return Err(err(synaptix_npu::NpuError::NoSpace(m)));
+                        }
+                    }
+                    Err(e) => return Err(err(e)),
+                }
+            };
+            GRAPHS.lock().insert(hash, c.clone(), b.static_bytes);
+            match c.run(&binds) {
+                Ok(_) => {
+                    done = Some(c);
+                    break;
+                }
+                Err(e2) => {
+                    m = e2.to_string();
+                    if !transient(&m) || step == 1 {
+                        return Err(err(e2));
                     }
                 }
-                Err(e) => return Err(err(e)),
             }
-        };
-        GRAPHS.lock().insert(hash, c.clone(), b.static_bytes);
-        c.run(&binds).map_err(err)?;
-        cg = c;
+        }
+        cg = done.expect("повтор удался");
     }
     if log {
         eprintln!(
