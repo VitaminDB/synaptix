@@ -199,6 +199,8 @@ pub struct FullAttn {
     use_flash: bool,
     sliding_window: Option<usize>,
     kv_shared: bool,
+    /// Sigmoid-гейт на голову (LFM3 `gate_proj`: `[heads, hidden]`).
+    head_gate: Option<QLinear>,
 }
 
 pub struct LinearAttn {
@@ -230,6 +232,26 @@ pub struct LinearAttn {
 pub enum Mixer {
     Full(FullAttn),
     Linear(LinearAttn),
+    Conv(ShortConv),
+}
+
+/// Короткая каузальная свёртка LFM (`Lfm2/3ShortConv`): `in_proj` → B, C, x
+/// (по трети каналов), `y = C · conv_k(B · x)` (depthwise, каузальная, без смещения),
+/// `out_proj`. Состояние — последние `k − 1` входов свёртки ([`ConvState`]).
+pub struct ShortConv {
+    in_proj: QLinear,
+    out_proj: QLinear,
+    /// Отводы свёртки: `k` тензоров `[1, 1, H]` (вес отвода j — для входа t − (k−1) + j).
+    taps: Vec<Tensor>,
+    /// Все отводы одним тензором `[1, k, H]` — шаг декода одной операцией.
+    taps_all: Tensor,
+    k: usize,
+    hidden: usize,
+}
+
+/// Состояние короткой свёртки: последние `k − 1` входов `[B, k−1, H]`.
+pub struct ConvState {
+    pub state: Tensor,
 }
 
 pub struct Mlp {
@@ -372,6 +394,10 @@ impl FullAttn {
                 None => None,
             },
             o_proj: self.o_proj.to_device(dev)?,
+            head_gate: match &self.head_gate {
+                Some(p) => Some(p.to_device(dev)?),
+                None => None,
+            },
             q_norm: ot(&self.q_norm)?,
             k_norm: ot(&self.k_norm)?,
             v_norm: ot(&self.v_norm)?,
@@ -516,6 +542,7 @@ impl Block {
         let mixer = match &self.mixer {
             Mixer::Full(fa) => fa.bytes(),
             Mixer::Linear(la) => la.bytes(),
+            Mixer::Conv(sc) => sc.bytes(),
         };
         mixer
             + self.mlp.bytes()
@@ -546,6 +573,7 @@ impl Block {
         let mixer = match &self.mixer {
             Mixer::Full(fa) => Mixer::Full(fa.to_device(dev)?),
             Mixer::Linear(la) => Mixer::Linear(la.to_device(dev)?),
+            Mixer::Conv(sc) => Mixer::Conv(sc.to_device(dev)?),
         };
         Ok(Self {
             pre_attn_norm: t(&self.pre_attn_norm)?,
@@ -626,6 +654,7 @@ pub const RING_SLACK: usize = 2048;
 pub enum LayerCache {
     Full(KvCacheLayer),
     Linear(GatedDeltaNetState),
+    Conv(ConvState),
 }
 
 pub struct KvCache {
@@ -824,7 +853,7 @@ impl KvCache {
             .iter()
             .filter_map(|l| match l {
                 LayerCache::Full(f) => Some(f.start),
-                LayerCache::Linear(_) => None,
+                LayerCache::Linear(_) | LayerCache::Conv(_) => None,
             })
             .max()
             .unwrap_or(0)
@@ -836,6 +865,11 @@ impl KvCache {
             match l {
                 LayerCache::Linear(s) => s.reset(),
                 LayerCache::Full(f) => f.start = 0,
+                LayerCache::Conv(c) => {
+                    if let Ok(z) = Tensor::zeros(c.state.dims().to_vec(), c.state.dtype(), c.state.device()) {
+                        c.state = z;
+                    }
+                }
             }
         }
     }
@@ -882,6 +916,7 @@ impl KvCache {
                     st.conv_state_dev = None;
                     st.ssm_state_dev = None;
                 }
+                LayerCache::Conv(c) => moved += park_tensor(&mut c.state)?,
             }
         }
         Ok(moved)
@@ -892,6 +927,10 @@ impl KvCache {
         self.decode_graph.clear();
         let mut moved = 0;
         for l in self.layers.iter_mut() {
+            if let LayerCache::Conv(c) = l {
+                moved += unpark_tensor(&mut c.state, device)?;
+                continue;
+            }
             let LayerCache::Full(f) = l else { continue };
             moved += unpark_tensor(&mut f.k, device)?;
             moved += unpark_tensor(&mut f.v, device)?;
@@ -910,6 +949,7 @@ impl KvCache {
         self.layers.iter().any(|l| match l {
             LayerCache::Full(f) => f.k.device() == Device::Cpu,
             LayerCache::Linear(_) => false,
+            LayerCache::Conv(c) => c.state.device() == Device::Cpu,
         })
     }
 
@@ -930,6 +970,11 @@ impl KvCache {
                 LayerCache::Linear(st) => {
                     total += tensor_bytes(st.conv_state_dev.as_ref());
                     total += tensor_bytes(st.ssm_state_dev.as_ref());
+                }
+                LayerCache::Conv(c) => {
+                    if c.state.device() != Device::Cpu {
+                        total += tensor_bytes(Some(&c.state));
+                    }
                 }
             }
         }
@@ -1424,6 +1469,31 @@ impl DecoderModel {
                         use_flash: flash_ok(hd),
                         sliding_window: cfg.window_for(l),
                         kv_shared: cfg.kv_source(l).is_some(),
+                        head_gate: if cfg.head_gate() { Some(qlin(&key("self_attn.head_gate.weight"), attn_w)?) } else { None },
+                    })
+                }
+                LayerKind::ShortConv => {
+                    let k = cfg.ext.as_ref().map_or(3, |e| e.short_conv_kernel).max(2);
+                    let hid = cfg.hidden_size;
+                    // [H, 1, k] → отвод j: [1, 1, H]
+                    let w = host_f32(&key("short_conv.conv.weight"))?;
+                    let taps = (0..k)
+                        .map(|j| {
+                            let col: Vec<f32> = (0..hid).map(|c| w[c * k + j]).collect();
+                            Tensor::from_vec(col, vec![1usize, 1, hid], Device::Cpu)
+                                .and_then(|t| t.to_dtype(compute))
+                                .and_then(|t| t.to_device(b_dev))
+                                .map_err(|e| ModelError::Load(e.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let taps_all = Tensor::cat(&taps.iter().collect::<Vec<_>>(), 1).map_err(|e| ModelError::Load(e.to_string()))?;
+                    Mixer::Conv(ShortConv {
+                        in_proj: qlin(&key("short_conv.in_proj.weight"), attn_w)?,
+                        out_proj: qlin(&key("short_conv.out_proj.weight"), attn_w)?,
+                        taps,
+                        taps_all,
+                        k,
+                        hidden: hid,
                     })
                 }
                 LayerKind::Linear => {
@@ -2162,6 +2232,10 @@ impl DecoderModel {
                         lin.conv_dim(), lin.conv_kernel, lin.num_value_heads, lin.key_head_dim, lin.value_head_dim,
                     ))
                 }
+                LayerKind::ShortConv => {
+                    let k = c.ext.as_ref().map_or(3, |e| e.short_conv_kernel).max(2);
+                    LayerCache::Conv(ConvState { state: Tensor::zeros(vec![batch, k - 1, c.hidden_size], self.dtype, self.device).coerr()? })
+                }
             };
             layers.push(lc);
         }
@@ -2450,6 +2524,7 @@ impl DecoderModel {
             let mixed = match &blk.mixer {
                 Mixer::Full(fa) => prof(dev, "attn_full", || fa.forward(&h, &mut kv_cache.layers[cache_idx], past, s, batch, self.rope_at(idx), self.kv_dtype, self.device, self.dtype, None, rope_pos, spans))?,
                 Mixer::Linear(la) => prof(dev, "attn_linear", || la.forward(&h, &mut kv_cache.layers[idx], s, self.device, self.dtype))?,
+                Mixer::Conv(sc) => prof(dev, "short_conv", || sc.forward(&h, &mut kv_cache.layers[idx]))?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
             let hidden = prof(dev, "residual", || residual.add(&mixed).coerr())?;
@@ -2578,6 +2653,7 @@ impl DecoderModel {
                     &h, &mut kv.layers[idx], 0, s, batch, self.rope_at(idx),
                     self.kv_dtype, dev, self.dtype, pad_ref, RopePositions::Sequential, &[],
                 )?,
+                Mixer::Conv(sc) => sc.forward(&h, &mut kv.layers[idx])?,
                 Mixer::Linear(_) => {
                     return Err(ModelError::Forward(
                         "forward_hidden_states: linear-слои не поддержаны (только full-attention)".into(),
@@ -2968,6 +3044,7 @@ impl DecoderModel {
             let mixed = match &blk.mixer {
                 Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[cache_idx], state)?,
                 Mixer::Linear(la) => la.forward_decode_dev(&h, &mut kv.layers[idx])?,
+                Mixer::Conv(sc) => sc.forward(&h, &mut kv.layers[idx])?,
             };
             let mixed = apply_opt_norm(&mixed, blk.post_attn_norm.as_ref(), blk.post_eps)?;
             let (new_hidden, h_mlp) =
@@ -3092,6 +3169,7 @@ impl DecoderModel {
         match &blk.mixer {
             Mixer::Linear(la) => la.fused_fmt().is_some(),
             Mixer::Full(_) => true,
+            Mixer::Conv(_) => false,
         }
     }
 
@@ -3127,11 +3205,12 @@ impl DecoderModel {
 
         // ── внимание ──
         let attn_out = match &blk.mixer {
+            Mixer::Conv(_) => return Err(ModelError::Forward("short-conv: слитый путь гибрида не поддержан".into())),
             Mixer::Linear(la) => {
                 let fmt = la.fused_fmt().ok_or_else(|| missing("fused_fmt"))?;
                 let st = match cache {
                     LayerCache::Linear(s) => s,
-                    LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+                    LayerCache::Full(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
                 };
                 if st.conv_state_dev.is_none() || st.ssm_state_dev.is_none() {
                     st.sync_to_device(dev, la.conv_dim, la.conv_k, la.num_v_heads, la.dk, la.dv).coerr()?;
@@ -3197,6 +3276,7 @@ impl DecoderModel {
             let want_mx = self.fused_hybrid_ok(nb)
                 && match &nb.mixer {
                     Mixer::Linear(la) => la.fused_fmt() == Some(DType::MXFP8),
+                    Mixer::Conv(_) => false,
                     Mixer::Full(fa) => {
                         fa.fused_hybrid_ready(dev, self.block_kv_mxfp8(fa)) && fa.hybrid_fused_fmt() == Some(DType::MXFP8)
                     }
@@ -3720,6 +3800,7 @@ impl DecoderModel {
                 Mixer::Linear(la) => la
                     .forward_prefill_dev(&h, &mut kv.layers[idx])
                     .map_err(|e| ModelError::Forward(format!("prefill_dev linear[{idx}]: {e}")))?,
+                Mixer::Conv(sc) => sc.forward(&h, &mut kv.layers[idx])?,
             };
             hidden = residual.add(&mixed).coerr()?;
 
@@ -3799,7 +3880,7 @@ impl FullAttn {
     ) -> Result<Tensor, ModelError> {
         let kv = match cache {
             LayerCache::Full(k) => k,
-            LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
+            LayerCache::Linear(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
 
@@ -4082,6 +4163,14 @@ impl FullAttn {
             Some(g) => attn.mul(&g.sigmoid().coerr()?).coerr()?,
             None => attn,
         };
+        // LFM3: одно число на голову — sigmoid(gate_proj(h)) `[B, S, nh, 1]`
+        let attn = match &self.head_gate {
+            Some(gp) => {
+                let g = gp.forward(h)?.reshape(vec![batch, s, nh, 1]).coerr()?.sigmoid().coerr()?;
+                attn.broadcast_mul(&g).coerr()?
+            }
+            None => attn,
+        };
         let attn = attn.reshape(vec![batch, s, nh * hd]).coerr()?;
         prof(device, "attn_oproj", || self.o_proj.forward(&attn))
     }
@@ -4098,7 +4187,7 @@ impl FullAttn {
     ) -> Result<Tensor, ModelError> {
         let kvl = match cache {
             LayerCache::Full(k) => k,
-            LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
+            LayerCache::Linear(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
         let dev = h.device();
         let b = h.dims()[0];
@@ -4217,7 +4306,7 @@ impl FullAttn {
     ) -> Result<Tensor, ModelError> {
         let kvl = match cache {
             LayerCache::Full(k) => k,
-            LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
+            LayerCache::Linear(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
         let dev = match input {
             FusedIn::Pair(p) => p.0.device(),
@@ -4373,7 +4462,7 @@ impl FullAttn {
     ) -> Result<Tensor, ModelError> {
         let kvl = match cache {
             LayerCache::Full(k) => k,
-            LayerCache::Linear(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
+            LayerCache::Linear(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("full layer got linear cache".into())),
         };
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let t = state.chunk_size;
@@ -4454,7 +4543,7 @@ impl LinearAttn {
             }
             let state = match cache {
                 LayerCache::Linear(s) => s,
-                LayerCache::Full(_) => {
+                LayerCache::Full(_) | LayerCache::Conv(_) => {
                     return Err(ModelError::Shape("linear layer got full cache".into()))
                 }
             };
@@ -4462,7 +4551,7 @@ impl LinearAttn {
         }
         let state = match cache {
             LayerCache::Linear(s) => s,
-            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+            LayerCache::Full(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
         };
 
         // CPU path (host-mix): полная host цепочка, как раньше.
@@ -4621,7 +4710,7 @@ impl LinearAttn {
     fn forward_decode_dev(&self, h: &Tensor, cache: &mut LayerCache) -> Result<Tensor, ModelError> {
         let state = match cache {
             LayerCache::Linear(s) => s,
-            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+            LayerCache::Full(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
         };
         let conv_w = self.conv_w_dev.as_ref().ok_or_else(|| missing("conv_w_dev"))?;
         let a_log = self.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
@@ -4682,7 +4771,7 @@ impl LinearAttn {
         }
         let state = match cache {
             LayerCache::Linear(s) => s,
-            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+            LayerCache::Full(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
         };
         self.forward_cuda_chunk_prefill(
             h, state, s, self.dk, self.dv, self.num_v_heads, self.num_k_heads, self.conv_dim,
@@ -4728,7 +4817,7 @@ impl LinearAttn {
         }
         let state = match cache {
             LayerCache::Linear(st) => st,
-            LayerCache::Full(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
+            LayerCache::Full(_) | LayerCache::Conv(_) => return Err(ModelError::Shape("linear layer got full cache".into())),
         };
         let conv_w = self.conv_w_dev.as_ref().ok_or_else(|| missing("conv_w_dev"))?;
         let a_log = self.a_log_dev.as_ref().ok_or_else(|| missing("a_log_dev"))?;
@@ -5120,3 +5209,55 @@ fn trace_graph() -> bool {
 
 pub mod lora;
 pub mod train_access;
+
+
+impl ShortConv {
+    fn bytes(&self) -> usize {
+        self.in_proj.bytes() + self.out_proj.bytes() + self.taps.iter().map(|t| tensor_bytes(Some(t))).sum::<usize>()
+    }
+
+    fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
+        Ok(Self {
+            in_proj: self.in_proj.to_device(dev)?,
+            out_proj: self.out_proj.to_device(dev)?,
+            taps: self.taps.iter().map(|t| t.to_device(dev).coerr()).collect::<Result<_, _>>()?,
+            taps_all: self.taps_all.to_device(dev).coerr()?,
+            k: self.k,
+            hidden: self.hidden,
+        })
+    }
+
+    /// `h` `[B, S, H]` → `[B, S, H]`; состояние сдвигается на S шагов.
+    fn forward(&self, h: &Tensor, cache: &mut LayerCache) -> Result<Tensor, ModelError> {
+        let LayerCache::Conv(st) = cache else {
+            return Err(ModelError::Shape("short-conv слой получил не свой кэш".into()));
+        };
+        let (b, s, hid) = (h.dims()[0], h.dims()[1], self.hidden);
+        let bcx = self.in_proj.forward(h)?; // [B, S, 3H]
+        let part = |i: usize| -> Result<Tensor, ModelError> { bcx.narrow(2, i * hid, hid).coerr()?.contiguous().coerr() };
+        let (bg, cg, x) = (part(0)?, part(1)?, part(2)?);
+        let bx = bg.mul(&x).coerr()?;
+        // окно: [прошлые k−1 | новые S]
+        let win = Tensor::cat(&[&st.state.to_dtype(bx.dtype()).coerr()?, &bx], 1).coerr()?; // [B, k−1+S, H]
+        if s == 1 {
+            // декод: окно [B, k, H] · отводы [1, k, H] → сумма по k
+            let y = win.broadcast_mul(&self.taps_all).coerr()?.sum_keepdim(1).coerr()?;
+            st.state = win.narrow(1, 1, self.k - 1).coerr()?.contiguous().coerr()?;
+            let out = cg.mul(&y).coerr()?;
+            return self.out_proj.forward(&out);
+        }
+        let mut y: Option<Tensor> = None;
+        for (j, w) in self.taps.iter().enumerate() {
+            let term = win.narrow(1, j, s).coerr()?.broadcast_mul(w).coerr()?;
+            y = Some(match y {
+                Some(a) => a.add(&term).coerr()?,
+                None => term,
+            });
+        }
+        let y = y.ok_or_else(|| ModelError::Shape("свёртка без отводов".into()))?;
+        st.state = win.narrow(1, s, self.k - 1).coerr()?.contiguous().coerr()?;
+        let _ = b;
+        let out = cg.mul(&y).coerr()?;
+        self.out_proj.forward(&out)
+    }
+}

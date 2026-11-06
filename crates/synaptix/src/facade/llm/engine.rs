@@ -18,6 +18,7 @@ use synaptix_llm_common::{
 use synaptix_llm_gemma3::pipeline::GemmaPipeline;
 use synaptix_llm_gemma4::pipeline::{Gemma4Pipeline, MediaInput as Gemma4MediaInput};
 use synaptix_llm_llama::pipeline::LlamaPipeline;
+use synaptix_llm_lfm3::pipeline::Lfm3Pipeline;
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
@@ -494,6 +495,7 @@ enum LlmPipeline {
     Qwen4Exp(Qwen4ExpPipeline),
     Hybrid(HybridPipeline),
     Llama(LlamaPipeline),
+    Lfm3(Lfm3Pipeline),
     Gemma3(GemmaPipeline),
     Gemma4(Gemma4Pipeline),
     MuseGlimmer(MusePipeline),
@@ -506,6 +508,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => Some(&mut p.model),
             Self::Hybrid(p) => Some(&mut p.model),
             Self::Llama(p) => Some(&mut p.model),
+            Self::Lfm3(p) => Some(&mut p.model),
             Self::Gemma3(p) => Some(&mut p.model),
             Self::Gemma4(p) => Some(&mut p.model),
             Self::MuseGlimmer(p) => Some(&mut p.model),
@@ -518,6 +521,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => Some(&p.model),
             Self::Hybrid(p) => Some(&p.model),
             Self::Llama(p) => Some(&p.model),
+            Self::Lfm3(p) => Some(&p.model),
             Self::Gemma3(p) => Some(&p.model),
             Self::Gemma4(p) => Some(&p.model),
             Self::MuseGlimmer(p) => Some(&p.model),
@@ -531,6 +535,7 @@ impl LlmPipeline {
             Self::Qwen4Exp(p) => p.rope_capacity(),
             Self::Hybrid(p) => p.model.rope_capacity(),
             Self::Llama(p) => p.model.rope_capacity(),
+            Self::Lfm3(p) => p.model.rope_capacity(),
             Self::Gemma3(p) => p.model.rope_capacity(),
             Self::Gemma4(p) => p.model.rope_capacity(),
             Self::MuseGlimmer(p) => p.model.rope_capacity(),
@@ -551,6 +556,7 @@ impl LlmPipeline {
             Self::Qwen4Exp(p) => p.kv_bytes_per_token(),
             Self::Hybrid(p) => p.model.kv_bytes_per_token(),
             Self::Llama(p) => p.model.kv_bytes_per_token(),
+            Self::Lfm3(p) => p.model.kv_bytes_per_token(),
             Self::Gemma3(p) => p.model.kv_bytes_per_token(),
             Self::Gemma4(p) => p.model.kv_bytes_per_token(),
             Self::MuseGlimmer(p) => p.model.kv_bytes_per_token(),
@@ -565,6 +571,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => Some((p.model.block_bytes(), p.model.block_count())),
             Self::Hybrid(p) => Some((p.model.block_bytes(), p.model.block_count())),
             Self::Llama(p) => Some((p.model.block_bytes(), p.model.block_count())),
+            Self::Lfm3(p) => Some((p.model.block_bytes(), p.model.block_count())),
             Self::Gemma3(p) => Some((p.model.block_bytes(), p.model.block_count())),
             // Ветка MoE блок целиком на хост не переносит — оффлоада блоков нет.
             Self::Gemma4(_) => None,
@@ -588,6 +595,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => p.model.block_bytes_max(),
             Self::Hybrid(p) => p.model.block_bytes_max(),
             Self::Llama(p) => p.model.block_bytes_max(),
+            Self::Lfm3(p) => p.model.block_bytes_max(),
             Self::Gemma3(p) => p.model.block_bytes_max(),
             Self::MuseGlimmer(p) => p.model.block_bytes_max(),
             Self::Gemma4(_) | Self::Qwen4Exp(_) => 0,
@@ -599,6 +607,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => Some(p.model.resident_blocks()),
             Self::Hybrid(p) => Some(p.model.resident_blocks()),
             Self::Llama(p) => Some(p.model.resident_blocks()),
+            Self::Lfm3(p) => Some(p.model.resident_blocks()),
             Self::Gemma3(p) => Some(p.model.resident_blocks()),
             Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.resident_blocks()),
@@ -611,6 +620,7 @@ impl LlmPipeline {
             Self::Qwen3(p) => Some(p.model.set_block_residency(resident)),
             Self::Hybrid(p) => Some(p.model.set_block_residency(resident)),
             Self::Llama(p) => Some(p.model.set_block_residency(resident)),
+            Self::Lfm3(p) => Some(p.model.set_block_residency(resident)),
             Self::Gemma3(p) => Some(p.model.set_block_residency(resident)),
             Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.set_block_residency(resident)),
@@ -624,6 +634,7 @@ impl LlmPipeline {
             Self::Qwen4Exp(p) => p.kv_fixed_bytes(batch, max_seq),
             Self::Hybrid(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Llama(p) => p.model.kv_fixed_bytes(batch, max_seq),
+            Self::Lfm3(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Gemma3(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Gemma4(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::MuseGlimmer(p) => p.model.kv_fixed_bytes(batch, max_seq),
@@ -775,6 +786,10 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
+            LlmPipeline::Lfm3(p) => p
+                .generate_streaming(prompt_ids, cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
             // У Gemma-4 стрим нативный: общий декодер умеет token-by-token.
             // Шаг декода захватывается CUDA-графом, когда профиль позволяет:
             // MoE считается целиком на карте, поэтому выгрузок внутри шага нет.
@@ -1354,6 +1369,7 @@ impl Llm {
             // Плотные декодеры на общей модели: сессия — ровно основной KV.
             LlmPipeline::Qwen3(p) => plain_session(&p.model, ctx),
             LlmPipeline::Llama(p) => plain_session(&p.model, ctx),
+            LlmPipeline::Lfm3(p) => plain_session(&p.model, ctx),
             LlmPipeline::Gemma3(p) => plain_session(&p.model, ctx),
             LlmPipeline::Qwen4Exp(p) => {
                 // Весь кэш этой модели (KV+индексатор QSA, рекуррентное
@@ -1412,6 +1428,9 @@ impl Llm {
                 p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
             }
             (LlmPipeline::Llama(p), SessionKind::Plain) => {
+                p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
+            }
+            (LlmPipeline::Lfm3(p), SessionKind::Plain) => {
                 p.model.grow_kv_cache(&mut session.kv, ctx_tokens).map_err(|e| err(&e))?
             }
             (LlmPipeline::Gemma3(p), SessionKind::Plain) => {
@@ -2314,6 +2333,24 @@ impl<'a> LlmGeneration<'a> {
                     Err(e) => Err(LlmError(e.to_string())),
                 }
             }
+            LlmPipeline::Lfm3(p) => {
+                if !matches!(session.kind, SessionKind::Plain) {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                }
+                // Состояние коротких свёрток не откатывается: кэш годен, только если новый
+                // промпт продолжает его целиком; иначе — с нуля.
+                let reuse = session.reusable(prompt_ids);
+                let reuse = if reuse > 0 && reuse == session.kv.seq_len { reuse } else { 0 };
+                if reuse == 0 {
+                    session.reset_for_full();
+                }
+                let res = p.generate_streaming_resume(&mut session.kv, prompt_ids, cfg, &mut sink).map(|_| ());
+                session.ids = if res.is_ok() { kv_ids(prompt_ids, &sink.acc, session.kv.seq_len) } else { Vec::new() };
+                match res {
+                    Ok(()) => Ok(reuse),
+                    Err(e) => Err(LlmError(e.to_string())),
+                }
+            }
             LlmPipeline::Llama(p) => {
                 if !matches!(session.kind, SessionKind::Plain) {
                     return Err(LlmError("префикс-KV: сессия от другой модели".into()));
@@ -3039,6 +3076,9 @@ pub fn load_llm(
         LlmArch::Llama => LlamaPipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Llama)
             .map_err(|e| LlmError(format!("load llama: {e}")))?,
+        LlmArch::Lfm3 => Lfm3Pipeline::load_with_precision(path, device, precision, max_seq)
+            .map(LlmPipeline::Lfm3)
+            .map_err(|e| LlmError(format!("load lfm3: {e}")))?,
         LlmArch::Gemma3 => GemmaPipeline::load_with_precision(path, device, precision, max_seq)
             .map(LlmPipeline::Gemma3)
             .map_err(|e| LlmError(format!("load gemma3: {e}")))?,

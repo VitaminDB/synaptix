@@ -352,6 +352,7 @@ impl Gemma4Config {
                 layer_scalar: true,
                 ple_dim: self.hidden_size_per_layer_input,
                 kv_source: self.kv_sources(),
+                ..Default::default()
             }),
         }
     }

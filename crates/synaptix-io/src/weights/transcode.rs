@@ -357,6 +357,7 @@ fn target_ok(target: DType, n: usize, k: usize) -> bool {
         DType::NVFP4 => n % 64 == 0 && k % 64 == 0,
         DType::MXFP8 | DType::Sq { .. } => k % 32 == 0,
         DType::Q8Row => n > 0 && k > 0,
+        DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0) => k % 32 == 0,
         _ => false,
     }
 }
@@ -474,7 +475,8 @@ fn dense_bytes(loader: &SynBundleLoader, item: &Item, device: Device) -> Result<
 /// одноблобных форматов. Считается на `device`, возвращается на хосте.
 fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
     let (slices, n, k) = item.dims;
-    if item.target == DType::Q8Row {
+    let q4_0 = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0);
+    if item.target == DType::Q8Row || q4_0 {
         let host: Vec<f32> = match item.current {
             Some(_) => {
                 let qw = loader
@@ -493,6 +495,9 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
                 t.contiguous().and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?
             }
         };
+        if q4_0 {
+            return Ok((synaptix_core::quant::ggml::quantize_q4_0(&host, n, k), Vec::new()));
+        }
         let h = synaptix_core::quant::calib::table_get(&item.name);
         let (packed, scales) = synaptix_core::quant::q8row::quantize(&host, n, k, h.as_deref());
         return Ok((packed, synaptix_core::quant::q8row::scales_to_bytes(&scales)));

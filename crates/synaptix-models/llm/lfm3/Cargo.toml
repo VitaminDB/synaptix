@@ -1,0 +1,26 @@
+[package]
+name = "synaptix-llm-lfm3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "LiquidAI LFM3 (короткие свёртки + full/sliding внимание, сэндвич-нормы) на общем декодере synaptix."
+
+[features]
+default = []
+
+[dependencies]
+synaptix-llm-common = { workspace = true }
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-infer     = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+rayon              = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }

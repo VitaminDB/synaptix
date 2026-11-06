@@ -305,3 +305,33 @@ mod tests {
         assert_eq!(GgmlType::Q4K.bytes_for(257), 288);
     }
 }
+
+/// Кодировщик Q4_0 (как `quantize_row_q4_0_ref` ggml): блок 32 — `d = max/−8` по значению с
+/// наибольшим модулем (со знаком), `q = min(15, x/d + 8.5)`; f16 `d` + 16 байт (младший полубайт —
+/// значение j, старший — j + 16). `x` — матрица `[n, k]`, `k % 32 == 0`.
+pub fn quantize_q4_0(x: &[f32], n: usize, k: usize) -> Vec<u8> {
+    let nb = k / 32;
+    let mut out = vec![0u8; n * nb * 18];
+    for r in 0..n {
+        for b in 0..nb {
+            let v = &x[r * k + b * 32..r * k + b * 32 + 32];
+            let (mut amax, mut max) = (0f32, 0f32);
+            for &e in v {
+                if e.abs() > amax {
+                    amax = e.abs();
+                    max = e;
+                }
+            }
+            let d = max / -8.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            let o = (r * nb + b) * 18;
+            out[o..o + 2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            for j in 0..16 {
+                let q0 = ((v[j] * id + 8.5) as i32).clamp(0, 15) as u8;
+                let q1 = ((v[j + 16] * id + 8.5) as i32).clamp(0, 15) as u8;
+                out[o + 2 + j] = q0 | (q1 << 4);
+            }
+        }
+    }
+    out
+}

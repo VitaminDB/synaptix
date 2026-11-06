@@ -25,6 +25,7 @@ engine = [
     "dep:synaptix-llm-qwen4-exp",
     "dep:synaptix-llm-qwen3-next-hybrid",
     "dep:synaptix-llm-llama",
+    "dep:synaptix-llm-lfm3",
     "dep:synaptix-llm-gemma4",
     "dep:synaptix-llm-gemma3",
     "dep:synaptix-llm-muse-glimmer",
@@ -61,6 +62,7 @@ synaptix-llm-qwen3    = { workspace = true, optional = true }
 synaptix-llm-qwen4-exp = { workspace = true, optional = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true, optional = true }
 synaptix-llm-llama    = { workspace = true, optional = true }
+synaptix-llm-lfm3 = { workspace = true, optional = true }
 synaptix-llm-gemma4   = { workspace = true, optional = true }
 synaptix-llm-gemma3   = { workspace = true, optional = true }
 synaptix-llm-muse-glimmer = { workspace = true, optional = true }

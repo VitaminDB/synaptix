@@ -5,6 +5,7 @@ pub mod gemv;
 pub mod ggml_simd;
 pub mod fp8_e4m3;
 pub mod mxfp8;
+pub mod q4dot;
 pub mod q8dot;
 
 pub use fp8_blocks::{dequantize_fp8_to_f32, quantize_f32_to_fp8, FP8_BLOCK_SIZE};

@@ -1,0 +1,364 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use synaptix_core::device::Device;
+use synaptix_core::dtype::DType;
+use synaptix_core::precision::PrecisionConfig;
+use synaptix_core::tensor::Tensor;
+use synaptix_tokenizer::hf::HfTokenizer;
+use synaptix_tokenizer::Tokenizer;
+
+use crate::config::Lfm3Config;
+use crate::loader::Lfm3Weights;
+use crate::model::{DecoderModel, ModelError};
+
+pub struct Lfm3Pipeline {
+    pub model: DecoderModel,
+    pub tokenizer: HfTokenizer,
+    pub config: Lfm3Config,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationConfig {
+    pub max_new_tokens: usize,
+    pub temperature: f32,
+    pub seed: u64,
+    /// Override EOS. `None` → берётся `config.eos_ids()` (Llama-3 имеет несколько).
+    pub eos_token_id: Option<u32>,
+    pub max_seq: Option<usize>,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self { max_new_tokens: 64, temperature: 0.0, seed: 0, eos_token_id: None, max_seq: None }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationStats {
+    pub prompt_tokens: usize,
+    pub new_tokens: usize,
+    pub prefill_ms: u128,
+    pub decode_ms: u128,
+}
+
+impl GenerationStats {
+    fn from_common(st: synaptix_llm_common::GenerationStats) -> Self {
+        Self {
+            prompt_tokens: st.prompt_tokens,
+            new_tokens: st.new_tokens,
+            prefill_ms: st.prefill_ms,
+            decode_ms: st.decode_ms,
+        }
+    }
+}
+
+impl Lfm3Pipeline {
+    pub fn load(model_dir: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+        Self::load_with_max_seq(model_dir, device, dtype, None)
+    }
+
+    pub fn load_with_max_seq(
+        model_dir: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        max_seq: Option<usize>,
+    ) -> Result<Self, PipelineError> {
+        Self::load_with_opts(model_dir, device, dtype, max_seq, dtype)
+    }
+
+    pub fn load_with_opts(
+        model_dir: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+        max_seq: Option<usize>,
+        kv_dtype: DType,
+    ) -> Result<Self, PipelineError> {
+        let mut precision = PrecisionConfig::dense(dtype);
+        precision.kv = kv_dtype;
+        Self::load_with_precision(model_dir, device, precision, max_seq)
+    }
+
+    /// Per-component precision (NVFP4-квант весов attn/mlp, compute=F16 и т.д.).
+    /// MLX int4-веса дектвантятся в `precision.compute`; при NVFP4 затем
+    /// реквантуются (см. [`crate::model::QLinear`]).
+    pub fn load_with_precision(
+        model_dir: impl AsRef<Path>,
+        device: Device,
+        precision: PrecisionConfig,
+        max_seq: Option<usize>,
+    ) -> Result<Self, PipelineError> {
+        // Веса — в default-пул, отдельно от пула активаций (иначе free-list
+        // одного пула деградирует за длинный префилл, см.
+        // `synaptix_core::device::cuda::activations_pool`).
+        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+        precision.validate().map_err(PipelineError::Load)?;
+        let dir: PathBuf = model_dir.as_ref().to_path_buf();
+        let weights = Lfm3Weights::load(&dir, device)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        let config = weights.config.clone();
+        let tok_bytes = synaptix_io::weights::read_model_file(&dir, "tokenizer.json")
+            .ok_or_else(|| PipelineError::Load("tokenizer.json: нет файла".into()))?;
+        let tokenizer = HfTokenizer::from_bytes(&tok_bytes)
+            .map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
+        let dcfg = config.to_decoder_config();
+        let rope_capacity = max_seq.unwrap_or(dcfg.max_position_embeddings);
+        let model = DecoderModel::build(
+            &dcfg, &weights, device, precision.compute, precision.attn_w, precision.mlp_w, precision.lm_head, precision.embed, rope_capacity,
+        )
+        .map_err(|e| PipelineError::Model(e.to_string()))?
+        .with_kv_cache_dtype(precision.kv);
+        Ok(Self { model, tokenizer, config })
+    }
+
+    pub fn encode(&self, prompt: &str) -> Result<Vec<u32>, PipelineError> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| PipelineError::Tokenize(e.to_string()))?;
+        Ok(enc.ids.clone())
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String, PipelineError> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| PipelineError::Tokenize(e.to_string()))
+    }
+
+    fn eos_set(&self, override_eos: Option<u32>) -> HashSet<u32> {
+        match override_eos {
+            Some(e) => HashSet::from([e]),
+            None => self.config.eos_ids().into_iter().collect(),
+        }
+    }
+
+    /// Greedy/temperature generate. Возвращает только новые токены (без prompt).
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+
+        let eos = self.eos_set(gen_cfg.eos_token_id);
+        let device = self.model.device;
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let mut rng_state = gen_cfg.seed;
+
+        let prompt_tensor =
+            Tensor::from_vec(prompt_ids.to_vec(), vec![1usize, prompt_ids.len()], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let t0 = std::time::Instant::now();
+        let logits = synaptix_core::grad::no_grad(|| self.model.forward(&prompt_tensor, &mut kv))
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        let prefill_ms = t0.elapsed().as_millis();
+
+        let mut new_tokens = Vec::with_capacity(gen_cfg.max_new_tokens);
+        let mut tok = sample_logits(&logits, gen_cfg.temperature, &mut rng_state)?;
+        new_tokens.push(tok);
+
+        let dec_t0 = std::time::Instant::now();
+        for _ in 1..gen_cfg.max_new_tokens {
+            if eos.contains(&tok) {
+                break;
+            }
+            let next = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            let logits = synaptix_core::grad::no_grad(|| self.model.forward(&next, &mut kv))
+                .map_err(|e| PipelineError::Forward(e.to_string()))?;
+            tok = sample_logits(&logits, gen_cfg.temperature, &mut rng_state)?;
+            new_tokens.push(tok);
+        }
+        let decode_ms = dec_t0.elapsed().as_millis();
+
+        let stats = GenerationStats {
+            prompt_tokens: prompt_ids.len(),
+            new_tokens: new_tokens.len(),
+            prefill_ms,
+            decode_ms,
+        };
+        Ok((new_tokens, stats))
+    }
+
+    /// Стоп-токены общего декодера: если вызывающий их не задал — все EOS
+    /// конфига (у Llama-3 их несколько).
+    fn common_cfg_with_eos(
+        &self,
+        mut cfg: synaptix_llm_common::GenerationConfig,
+    ) -> synaptix_llm_common::GenerationConfig {
+        if cfg.eos_token_id.is_none() && cfg.eos_token_ids.is_empty() {
+            cfg.eos_token_ids = self.config.eos_ids();
+        }
+        cfg
+    }
+
+    /// Стрим token-by-token общим декодером — с полным сэмплером
+    /// (top-k/top-p/min-p/штрафы), в отличие от [`Self::generate`].
+    pub fn generate_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_streaming(&self.model, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+
+    /// Как [`Self::generate_streaming`], но префилл стартует с `kv.seq_len`
+    /// (префикс-KV): история прошлого хода не считается заново. Вызывающий
+    /// отвечает за то, что `prompt_ids[..kv.seq_len]` — ровно те токены, что
+    /// лежат в кэше.
+    pub fn generate_streaming_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+
+    pub fn generate_text(
+        &self,
+        prompt: &str,
+        gen_cfg: GenerationConfig,
+    ) -> Result<(String, GenerationStats), PipelineError> {
+        let ids = self.encode(prompt)?;
+        let (new_ids, stats) = self.generate(&ids, gen_cfg)?;
+        let text = self.decode(&new_ids)?;
+        Ok((text, stats))
+    }
+
+    /// CUDA-graph decode: шаг захватывается и реплеится (общий цикл
+    /// `generate_graph_streaming_resume`, в т.ч. с MXFP8-KV).
+    pub fn generate_with_graph(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: GenerationConfig,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let cfg = synaptix_llm_common::GenerationConfig {
+            max_new_tokens: gen_cfg.max_new_tokens,
+            temperature: gen_cfg.temperature,
+            seed: gen_cfg.seed,
+            eos_token_id: gen_cfg.eos_token_id,
+            max_seq: gen_cfg.max_seq,
+            ..Default::default()
+        };
+        let mut noop = |_: u32| true;
+        self.generate_with_graph_streaming(prompt_ids, cfg, &mut noop)
+    }
+
+    /// Годится ли модель для графового декода.
+    pub fn graph_decode_supported(&self) -> bool {
+        self.model.graph_decode_supported()
+    }
+
+    /// Графовый декод со свежим кэшем.
+    pub fn generate_with_graph_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
+        let mut kv = self
+            .model
+            .make_kv_cache(1, kv_max)
+            .map_err(|e| PipelineError::Forward(e.to_string()))?;
+        self.generate_with_graph_resume(&mut kv, prompt_ids, gen_cfg, sink)
+    }
+
+    /// Как [`Self::generate_streaming_resume`], но шаг декода — CUDA-граф.
+    pub fn generate_with_graph_resume(
+        &self,
+        kv: &mut synaptix_llm_common::KvCache,
+        prompt_ids: &[u32],
+        gen_cfg: synaptix_llm_common::GenerationConfig,
+        sink: &mut dyn synaptix_llm_common::StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Tokenize("empty prompt".into()));
+        }
+        let cfg = self.common_cfg_with_eos(gen_cfg);
+        synaptix_llm_common::generate::generate_graph_streaming_resume(&self.model, kv, prompt_ids, &cfg, sink)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
+    }
+}
+
+fn sample_logits(logits: &Tensor, temperature: f32, rng_state: &mut u64) -> Result<u32, PipelineError> {
+    let l = logits
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+    if temperature <= 0.0 {
+        let (am, _) = l
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(ai, av), (i, &v)| if v > av { (i, v) } else { (ai, av) });
+        return Ok(am as u32);
+    }
+    let inv_t = 1.0 / temperature;
+    let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = l.iter().map(|&v| ((v - max) * inv_t).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    let inv_sum = 1.0 / sum.max(1.0e-30);
+    for p in &mut probs {
+        *p *= inv_sum;
+    }
+    let u = next_uniform(rng_state);
+    let mut cum = 0.0_f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cum += p;
+        if u < cum {
+            return Ok(i as u32);
+        }
+    }
+    Ok((probs.len() - 1) as u32)
+}
+
+fn next_uniform(state: &mut u64) -> f32 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let r = (*state >> 11) as u64;
+    (r as f32) / (1u64 << 53) as f32
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    #[error("load: {0}")]
+    Load(String),
+    #[error("model: {0}")]
+    Model(String),
+    #[error("tokenize: {0}")]
+    Tokenize(String),
+    #[error("forward: {0}")]
+    Forward(String),
+}
+
+impl From<ModelError> for PipelineError {
+    fn from(e: ModelError) -> Self { Self::Model(e.to_string()) }
+}
+

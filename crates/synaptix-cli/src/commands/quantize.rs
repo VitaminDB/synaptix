@@ -63,9 +63,11 @@ fn llm_rules(path: &std::path::Path) -> Result<Vec<(String, Option<DType>)>, Str
 fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
     match s.to_ascii_lowercase().as_str() {
         "none" | "keep" | "-" => Ok(None),
+        // Q4_0 ggml: кодируется на CPU, на ARM-процессоре — целочисленный dot (телефон)
+        "q4_0" | "q40" => Ok(Some(DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0))),
         other => match parse_dtype(other) {
             Some(d) if d.is_quantized() && !matches!(d, DType::Ggml(_)) => Ok(Some(d)),
-            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | q8row | none")),
+            _ => Err(format!("{what}: `{s}` — ожидается nvfp4 | mxfp8 | sq1…sq8 | q8row | q4_0 | none")),
         },
     }
 }
@@ -118,7 +120,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(a) => fmt(a, "--attn")?,
         None => Some(main),
     };
-    let q8 = main == DType::Q8Row;
+    let q8 = matches!(main, DType::Q8Row | DType::Ggml(_));
     let lm_head = match &args.lm_head {
         Some(a) => fmt(a, "--lm-head")?,
         None if q8 => None,

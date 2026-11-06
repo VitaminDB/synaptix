@@ -102,6 +102,7 @@ pub enum LlmArch {
     Qwen3,
     Hybrid,
     Llama,
+    Lfm3,
     Gemma3,
     Gemma4,
     MuseGlimmer,
@@ -121,6 +122,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         // `qwen3_5_text` / `qwen3_5_moe_text`), башня зрения своя.
         "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" => LlmArch::Hybrid,
         "llama" => LlmArch::Llama,
+        "lfm3" => LlmArch::Lfm3,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,
         "gemma4" | "gemma4_text" => LlmArch::Gemma4,
         "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,

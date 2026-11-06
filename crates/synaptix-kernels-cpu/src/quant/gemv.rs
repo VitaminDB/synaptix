@@ -41,6 +41,27 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
         gemm_q8row(view, xf, m, out);
         return;
     }
+    // Q4_0 на декоде: активации в int8 блоками по 32, целочисленный dot с полубайтами.
+    if m < PREFILL_M && view.dtype == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0) && k % super::q8dot::QK == 0 {
+        use super::q8dot::{quantize_act, QK};
+        let nb = k / QK;
+        let mut xq = vec![0i8; m * k];
+        let mut xs = vec![0f32; m * nb];
+        for i in 0..m {
+            quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * nb..(i + 1) * nb]);
+        }
+        let op = blocked::SendPtr::new(out.as_mut_ptr());
+        par_chunks_cost(n, k * (m + 1) / 16, |n0, n1| {
+            for j in n0..n1 {
+                let w = view.row_bytes_of(j);
+                for i in 0..m {
+                    let v = super::q4dot::dot(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], w);
+                    unsafe { *op.ptr().add(i * n + j) = v };
+                }
+            }
+        });
+        return;
+    }
     if m < PREFILL_M && view.dtype == DType::Q8Row {
         let op = blocked::SendPtr::new(out.as_mut_ptr());
         par_chunks_cost(n, k * (m + 1) / 8, |n0, n1| {

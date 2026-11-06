@@ -448,6 +448,9 @@ pub fn classify(name: &str) -> LayerRole {
         || n.contains("encoder_attn.")
         || n.contains(".attn.")
         || n.contains("attention.")
+        // короткая свёртка LFM2/LFM3: проекции микшера (сама depthwise `conv.conv` — нет)
+        || n.contains(".conv.in_proj.")
+        || n.contains(".conv.out_proj.")
     {
         return LayerRole::Attention;
     }
@@ -693,6 +696,8 @@ mod tests {
         assert_eq!(classify("model.embed_tokens.weight"), LayerRole::Embedding);
         assert_eq!(classify("lm_head.weight"), LayerRole::LmHead);
         assert_eq!(classify("model.layers.3.self_attn.q_proj.weight"), LayerRole::Attention);
+        assert_eq!(classify("model.layers.0.conv.in_proj.weight"), LayerRole::Attention);
+        assert_ne!(classify("model.layers.0.conv.conv.weight"), LayerRole::Attention);
         assert_eq!(classify("model.layers.3.mlp.gate_proj.weight"), LayerRole::Mlp);
         assert_eq!(classify("model.layers.3.input_layernorm.weight"), LayerRole::Norm);
         assert_eq!(classify("model.layers.3.self_attn.q_norm.weight"), LayerRole::Norm);

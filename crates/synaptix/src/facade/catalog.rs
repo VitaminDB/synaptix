@@ -92,6 +92,7 @@ fn pretty(stem: &str) -> String {
         ("gemma-4-e2b-it", "Gemma 4 E2B"),
         ("gemma-4-e4b-it", "Gemma 4 E4B"),
         ("qwen3-1.7b", "Qwen3 1.7B"),
+        ("lfm3-1.7b", "LFM3 1.7B"),
         ("muse-glimmer-30b", "Muse Glimmer 30B"),
         ("qwen3.8-27b", "Qwen3.8 27B"),
         ("qwen3.8-flash-next", "Qwen3.8 Flash Next"),
@@ -180,7 +181,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
         }
         let n = name(f);
         let plan = match f.arch.as_str() {
-            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" if !n.contains("embedding") => {
+            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" | "lfm3" if !n.contains("embedding") => {
                 Some(single(f, Task::Llm, &f.arch, "Языковая модель"))
             }
             "qwen3" if n.contains("embedding") => Some(single(f, Task::Embed, "qwen3_embedding", "Эмбеддинги для поиска по смыслу")),

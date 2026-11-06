@@ -289,7 +289,38 @@ impl serde_json::ser::Formatter for PySeparatorFormatter {
     }
 }
 
+/// `{% generation %}…{% endgeneration %}` — тег transformers для маски ответа ассистента при
+/// обучении (LFM3, SmolLM3 …); на текст промпта не влияет. minijinja его не знает — заменяем на
+/// `{% if true %}…{% endif %}`, сохраняя управление пробелами (`-`).
+fn strip_generation_tags(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while let Some(i) = rest.find("{%") {
+        let Some(j) = rest[i..].find("%}") else { break };
+        let tag = &rest[i..i + j + 2];
+        let inner = tag[2..tag.len() - 2].trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        out.push_str(&rest[..i]);
+        let repl = match inner {
+            "generation" => Some("if true"),
+            "endgeneration" => Some("endif"),
+            _ => None,
+        };
+        match repl {
+            Some(r) => {
+                let lead = if tag[2..].starts_with('-') { "-" } else { "" };
+                let trail = if tag[..tag.len() - 2].ends_with('-') { "-" } else { "" };
+                out.push_str(&format!("{{%{lead} {r} {trail}%}}"));
+            }
+            None => out.push_str(tag),
+        }
+        rest = &rest[i + j + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn preprocess(template: &str) -> String {
+    let template = &strip_generation_tags(template);
     const METHODS: &[&str] = &[
         "startswith",
         "endswith",
@@ -610,6 +641,12 @@ mod tests {
     fn rewrite_with_inner_call() {
         let r = preprocess("{{ x.replace(other.lower(), '') }}");
         assert_eq!(r, "{{ replace(x, lower(other), '') }}");
+    }
+
+    #[test]
+    fn generation_tags() {
+        assert_eq!(strip_generation_tags("a{%- generation -%}b{% endgeneration %}c"), "a{%- if true -%}b{% endif %}c");
+        assert_eq!(strip_generation_tags("{% if x %}y{% endif %}"), "{% if x %}y{% endif %}");
     }
 
     #[test]

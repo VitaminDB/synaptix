@@ -161,6 +161,7 @@ impl Block {
         let mixer = match &self.mixer {
             Mixer::Full(fa) => MixerRefs::Full(fa.refs(rope)?),
             Mixer::Linear(la) => MixerRefs::Linear(la.refs()),
+            Mixer::Conv(_) => return Err(ModelError::Build("обучение: short-conv (LFM) пока не поддержан".into())),
         };
         let mlp = match &self.mlp {
             Ffn::Dense(m) => FfnRefs::Dense(MlpRefs {

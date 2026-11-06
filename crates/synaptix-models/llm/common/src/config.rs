@@ -14,6 +14,8 @@ pub enum Activation {
 pub enum LayerKind {
     Full,
     Linear,
+    /// Короткая каузальная свёртка LFM: `in_proj` → B, C, x; y = C · conv(B · x); `out_proj`.
+    ShortConv,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,12 @@ pub struct DecoderExt {
     pub layer_scalar: bool,
     pub ple_dim: usize,
     pub kv_source: Vec<Option<usize>>,
+    /// Sigmoid-гейт на голову внимания (`self_attn.head_gate`: `[heads, hidden]`, LFM3).
+    pub head_gate: bool,
+    /// Явная раскладка sliding-слоёв (LFM3: `layer_types`); пусто — по `sliding_window_pattern`.
+    pub sliding_layers: Vec<bool>,
+    /// Ширина короткой свёртки (`conv_L_cache` LFM).
+    pub short_conv_kernel: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +177,9 @@ impl DecoderConfig {
     pub fn is_global_layer(&self, idx: usize) -> bool {
         if self.sliding_window.is_none() {
             return true;
+        }
+        if let Some(sl) = self.ext.as_ref().map(|e| &e.sliding_layers).filter(|v| !v.is_empty()) {
+            return !sl.get(idx).copied().unwrap_or(false);
         }
         let p = self.sliding_window_pattern;
         p <= 1 || (idx + 1) % p == 0
@@ -247,7 +258,7 @@ impl DecoderConfig {
     /// таблиц на тип слоя. Готовность MoE-ветки проверяет уже модель
     /// (`DecoderModel::graph_decode_ready`) — конфиг про веса не знает.
     pub fn graph_decode_ok(&self) -> bool {
-        self.ple_dim() == 0 && !self.has_kv_sharing()
+        self.ple_dim() == 0 && !self.has_kv_sharing() && !self.has_short_conv() && !self.head_gate()
     }
 
     pub fn ple_dim(&self) -> usize {
@@ -256,6 +267,14 @@ impl DecoderConfig {
 
     pub fn kv_source(&self, idx: usize) -> Option<usize> {
         self.ext.as_ref()?.kv_source.get(idx).copied().flatten()
+    }
+
+    pub fn head_gate(&self) -> bool {
+        self.ext.as_ref().is_some_and(|e| e.head_gate)
+    }
+
+    pub fn has_short_conv(&self) -> bool {
+        self.layer_kinds.contains(&LayerKind::ShortConv)
     }
 
     pub fn has_kv_sharing(&self) -> bool {
@@ -269,6 +288,7 @@ impl DecoderConfig {
     /// MTP-verify гибрида.
     pub fn graph_prefill_ok(&self) -> bool {
         self.ext.is_none()
+            && !self.has_short_conv()
             && !self.sandwich_norms
             && self.sliding_window.is_none()
             && self.rope_local.is_none()
