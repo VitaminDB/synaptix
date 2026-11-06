@@ -56,14 +56,20 @@ struct Pooled {
 
 const POOL_MAX_BUF: usize = 32 << 20;
 const POOL_MAX_TOTAL: usize = 256 << 20;
+/// Предел числа буферов в пуле: каждый держит открытый fd и mmap в процессе демона
+/// (регистрация не снимается). Без него мелкие буферы (4 КБ) копились тысячами и
+/// исчерпывали лимит дескрипторов демона: ядро отбрасывало fd следующего
+/// MEM_REGISTER, и демон отвечал «нужны fd и размер» (Leokani на телефоне).
+const POOL_MAX_COUNT: usize = 256;
 
 struct Pool {
     free: std::collections::HashMap<usize, Vec<Pooled>>,
     total: usize,
+    count: usize,
 }
 
 static POOL: std::sync::LazyLock<parking_lot::Mutex<Pool>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Pool { free: std::collections::HashMap::new(), total: 0 }));
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Pool { free: std::collections::HashMap::new(), total: 0, count: 0 }));
 
 fn pool_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -115,6 +121,7 @@ impl NpuBuffer {
             let mut pool = POOL.lock();
             if let Some(b) = pool.free.get_mut(&len).and_then(Vec::pop) {
                 pool.total -= len;
+                pool.count -= 1;
                 return Ok(Self {
                     fd: std::mem::ManuallyDrop::new(b.fd),
                     ptr: b.ptr as *mut u8,
@@ -218,10 +225,11 @@ impl Drop for NpuBuffer {
     fn drop(&mut self) {
         if pool_enabled() && self.len <= POOL_MAX_BUF {
             let mut pool = POOL.lock();
-            if pool.total + self.len <= POOL_MAX_TOTAL {
+            if pool.total + self.len <= POOL_MAX_TOTAL && pool.count < POOL_MAX_COUNT {
                 let fd = unsafe { std::mem::ManuallyDrop::take(&mut self.fd) };
                 let regs = std::mem::take(self.regs.get_mut());
                 pool.total += self.len;
+                pool.count += 1;
                 pool.free.entry(self.len).or_default().push(Pooled { fd, ptr: self.ptr as usize, dmabuf: self.dmabuf, regs });
                 return;
             }

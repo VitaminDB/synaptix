@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -876,6 +877,9 @@ void serve(int sock) {
         if (got <= 0) break;
         for (cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
+        // Ядро отбрасывает переданный fd, если у процесса кончились дескрипторы
+        // (MSG_CTRUNC): не путать с запросом без fd.
+        bool fd_lost = (m.msg_flags & MSG_CTRUNC) != 0 && fd < 0;
         if (size_t(got) < sizeof h && !read_full(sock, (uint8_t*)&h + got, sizeof h - got)) break;
         if (h.magic != SYNNPU_MAGIC || h.len > (1ull << 32)) { logf("плохой заголовок"); break; }
         std::vector<uint8_t> body(h.len);
@@ -888,7 +892,9 @@ void serve(int sock) {
         try {
             switch (h.op) {
             case SYNNPU_HELLO: s.hello(r, w); break;
-            case SYNNPU_MEM_REGISTER: s.mem_register(r, w, fd); fd = -1; break;
+            case SYNNPU_MEM_REGISTER:
+                if (fd_lost) fail(SYNNPU_IO_ERROR, "MEM_REGISTER: fd буфера потерян (MSG_CTRUNC) — у демона кончились дескрипторы");
+                s.mem_register(r, w, fd); fd = -1; break;
             case SYNNPU_MEM_FREE: s.mem_free(r, w); break;
             case SYNNPU_GRAPH_OPEN: s.graph_open(r, w); break;
             case SYNNPU_GRAPH_BUILD: s.graph_build(r, w); break;
@@ -956,6 +962,15 @@ int build_child(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // Каждый зарегистрированный буфер клиента — открытый fd: мягкий лимит (1024)
+    // поднимается до жёсткого.
+    {
+        rlimit rl{};
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
     setvbuf(stderr, nullptr, _IOLBF, 0);
