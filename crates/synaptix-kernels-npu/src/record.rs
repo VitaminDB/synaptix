@@ -170,6 +170,21 @@ pub fn stats() -> Stats {
     STATS.lock().clone()
 }
 
+/// Отпустить все резидентные графы (контексты NPU в ОЗУ) — для службы, когда ей
+/// нужна память под новую модель: графы откроются снова из кэша на диске (~1 с),
+/// а выгружать ради них модели незачем. Возвращает освобождённые байты.
+pub fn release_graphs() -> usize {
+    let mut g = GRAPHS.lock();
+    let before = g.total;
+    while g.evict_half() {}
+    before - g.total
+}
+
+/// Байты резидентных графов NPU.
+pub fn resident_bytes() -> usize {
+    GRAPHS.lock().total
+}
+
 pub fn note_cpu_fallback() {
     STATS.lock().cpu_fallbacks += 1;
 }

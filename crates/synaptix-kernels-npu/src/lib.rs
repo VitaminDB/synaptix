@@ -8,7 +8,7 @@ use synaptix_core::device::DeviceKind;
 use synaptix_npu::{Npu, NpuInfo};
 
 pub use backend::NpuBackend;
-pub use record::{flush, stats, Stats};
+pub use record::{flush, release_graphs, resident_bytes, stats, Stats};
 
 static NPU: OnceCell<Box<dyn Npu>> = OnceCell::new();
 static BACKEND: NpuBackend = NpuBackend { ordinal: 0 };
