@@ -135,6 +135,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 let def = speakers.iter().find(|s| *s == "xenia").cloned();
                 vec![
                     spec("voice", "Голос", "Готовый голос модели (у пакетов СНГ — префикс языка: kaz_, tat_, ukr_ …; ru_ — тот же голос по-русски). Пусто — по языку текста и полу персонажа", ParamKind::Choice { options: speakers }, def.map(ParamValue::Text)),
+                    language("Код языка (ru, kk, uk, tt …) — выбирает голоса пакета СНГ и замену алфавита; пусто — по письму текста"),
                     spec("speed", "Скорость речи", "1 — обычная (длительности звуков делятся на неё)", float(0.5, 2.0, 0.05, 2), f(1.0)),
                     spec("pitch", "Высота голоса", "1 — родная; больше — выше, меньше — ниже", float(0.5, 1.5, 0.05, 2), f(1.0)),
                     spec("accents", "Ударения автоматически", "Ударения, «ё» и омографы (русские версии); вручную — «+» перед ударной гласной", ParamKind::Bool, Some(ParamValue::Bool(true))),
