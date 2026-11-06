@@ -130,9 +130,11 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             ],
             "silero" => {
                 let speakers = path.map(silero_speakers).unwrap_or_default();
-                let def = ["xenia", "kaz_zhazira", "ru_zhazira"].iter().find(|d| speakers.iter().any(|s| s == *d)).map(|s| s.to_string()).or_else(|| speakers.first().cloned());
+                // У пакетов СНГ (голоса с префиксом языка) голос по умолчанию не задаётся: его выбирает
+                // язык текста; у русских — xenia.
+                let def = speakers.iter().find(|s| *s == "xenia").cloned();
                 vec![
-                    spec("voice", "Голос", "Готовый голос модели (у пакетов СНГ — префикс языка: kaz_, tat_, ukr_ …; ru_ — тот же голос по-русски)", ParamKind::Choice { options: speakers }, def.map(ParamValue::Text)),
+                    spec("voice", "Голос", "Готовый голос модели (у пакетов СНГ — префикс языка: kaz_, tat_, ukr_ …; ru_ — тот же голос по-русски). Пусто — по языку текста и полу персонажа", ParamKind::Choice { options: speakers }, def.map(ParamValue::Text)),
                     spec("speed", "Скорость речи", "1 — обычная (длительности звуков делятся на неё)", float(0.5, 2.0, 0.05, 2), f(1.0)),
                     spec("pitch", "Высота голоса", "1 — родная; больше — выше, меньше — ниже", float(0.5, 1.5, 0.05, 2), f(1.0)),
                     spec("accents", "Ударения автоматически", "Ударения, «ё» и омографы (русские версии); вручную — «+» перед ударной гласной", ParamKind::Bool, Some(ParamValue::Bool(true))),
