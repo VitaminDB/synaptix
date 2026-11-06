@@ -32,11 +32,14 @@ pub struct Options {
     pub lang: Option<String>,
     /// Числа словами (русский голос): в алфавите модели цифр нет.
     pub numbers: bool,
+    /// Латиница — английское произношение (G2P) любым голосом: английский с акцентом голоса.
+    /// `None` — да, кроме голосов aze_/uzb_ (у них латиница — родная письменность).
+    pub english: Option<bool>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { speaker: String::new(), sample_rate: 48_000, rate: 1.0, pitch: 1.0, accents: true, lang: None, numbers: true }
+        Self { speaker: String::new(), sample_rate: 48_000, rate: 1.0, pitch: 1.0, accents: true, lang: None, numbers: true, english: None }
     }
 }
 
@@ -137,17 +140,42 @@ impl SileroPipeline {
 
     /// Текст после омографов и ударений (то, что видит модель, без sos/eos).
     pub fn accentuate(&self, text: &str, lang: Option<&str>, accents: bool) -> Result<String> {
-        // латиница в русском тексте — кириллицей (в алфавите модели её нет)
+        let english = !lang.is_some_and(|l| l == "aze" || l == "uzb");
+        let t = self.english_text(text, english);
+        self.accentuate_prepared(&t, lang, accents)
+    }
+
+    /// Латиница → кириллица по английскому произношению; текст преимущественно английский —
+    /// сначала нормализация английского G2P (числа, сокращения, деньги — по-английски).
+    fn english_text(&self, text: &str, english: bool) -> String {
+        if !english || !text.chars().any(|c| c.is_ascii_alphabetic()) {
+            return text.to_string();
+        }
+        match &self.en {
+            // английский текст целиком: G2P сам читает числа, сокращения, деньги, время
+            Some(g) if english_dominant(text) => {
+                let ipa = g.phonemize(text);
+                ipa.split_whitespace()
+                    .map(|tok| {
+                        let p = |c: char| ".,!?;:—–-\"'«»()…".contains(c);
+                        let head: String = tok.chars().take_while(|&c| p(c)).collect();
+                        let rest: String = tok.chars().skip(head.chars().count()).collect();
+                        let tail_n = rest.chars().rev().take_while(|&c| p(c)).count();
+                        let core: String = rest.chars().take(rest.chars().count() - tail_n).collect();
+                        let tail: String = rest.chars().skip(rest.chars().count() - tail_n).collect();
+                        format!("{head}{}{tail}", crate::english::ipa_to_cyrillic(&core))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            _ => self.latin(text),
+        }
+    }
+
+    /// Подготовка, затем ударения и омографы — только русские (в пакетах СНГ — для голосов ru_).
+    fn accentuate_prepared(&self, text: &str, lang: Option<&str>, accents: bool) -> Result<String> {
         let ru = lang.is_none_or(|l| l == "ru");
-        let translit;
-        let text = if ru && text.chars().any(|c| c.is_ascii_alphabetic()) {
-            translit = self.latin(text);
-            translit.as_str()
-        } else {
-            text
-        };
         let s = frontend::prepare(self.pkg(), text, lang)?;
-        // ударения и омографы — только русские (в пакетах СНГ — для голосов ru_)
         if !accents || !ru {
             return Ok(s);
         }
@@ -204,14 +232,17 @@ impl SileroPipeline {
     /// Входы сети для одного куска: последовательность и доп. входы.
     pub fn inputs(&self, text: &str, o: &Options) -> Result<(Vec<i64>, Extra)> {
         let lang = o.lang.clone().or_else(|| o.speaker.split('_').next().filter(|_| o.speaker.contains('_')).map(String::from));
+        let english = o.english.unwrap_or(!lang.as_deref().is_some_and(|l| l == "aze" || l == "uzb"));
+        let eng_text = english && english_dominant(text);
         let expanded;
-        let text = if o.numbers && text.chars().any(|c| c.is_ascii_digit()) && lang.as_deref().is_none_or(|l| l == "ru") {
+        let text = if o.numbers && !eng_text && text.chars().any(|c| c.is_ascii_digit()) && lang.as_deref().is_none_or(|l| l == "ru") {
             expanded = crate::numbers::expand(text);
             expanded.as_str()
         } else {
             text
         };
-        let acc = self.accentuate(text, lang.as_deref(), o.accents)?;
+        let t = self.english_text(text, english);
+        let acc = self.accentuate_prepared(&t, lang.as_deref(), o.accents)?;
         let seq = frontend::sequence(self.pkg(), &acc)?;
         let extra = match self.types {
             TypeMode::None => Extra::default(),
@@ -268,6 +299,13 @@ impl SileroPipeline {
         }
         Ok(out)
     }
+}
+
+/// Латинских букв больше, чем кириллических — текст английский.
+pub fn english_dominant(text: &str) -> bool {
+    let lat = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let cyr = text.chars().filter(|c| ('\u{0400}'..='\u{04FF}').contains(c)).count();
+    lat > cyr
 }
 
 /// G2P английского: `SYN_SILERO_EN_G2P` или `leokani-tts-7m.syn` рядом с бандлом Silero.
