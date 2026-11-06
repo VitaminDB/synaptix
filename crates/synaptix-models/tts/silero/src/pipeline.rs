@@ -134,8 +134,18 @@ impl SileroPipeline {
 
     /// Текст после омографов и ударений (то, что видит модель, без sos/eos).
     pub fn accentuate(&self, text: &str, lang: Option<&str>, accents: bool) -> Result<String> {
+        // латиница в русском тексте — кириллицей (в алфавите модели её нет)
+        let ru = lang.is_none_or(|l| l == "ru");
+        let translit;
+        let text = if ru && text.chars().any(|c| c.is_ascii_alphabetic()) {
+            translit = crate::translit::to_cyrillic(text);
+            translit.as_str()
+        } else {
+            text
+        };
         let s = frontend::prepare(self.pkg(), text, lang)?;
-        if !accents {
+        // ударения и омографы — только русские (в пакетах СНГ — для голосов ru_)
+        if !accents || !ru {
             return Ok(s);
         }
         let s = match &self.homo {

@@ -11,6 +11,7 @@ pub mod homosolver;
 pub mod model;
 pub mod numbers;
 pub mod pipeline;
+pub mod translit;
 
 pub use pipeline::{Options, SileroPipeline};
 
