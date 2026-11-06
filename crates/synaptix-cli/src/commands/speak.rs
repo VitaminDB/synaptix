@@ -38,18 +38,23 @@ pub struct SpeakArgs {
 enum Engine {
     VoxCpm,
     OmniVoice,
+    Audio8,
 }
 
 fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
     match requested {
         "voxcpm" => return Ok(Engine::VoxCpm),
         "omnivoice" => return Ok(Engine::OmniVoice),
+        "audio8" => return Ok(Engine::Audio8),
         "auto" => {}
-        o => return Err(format!("--engine: auto | voxcpm | omnivoice, а не `{o}`")),
+        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8, а не `{o}`")),
     }
     let id = synaptix_bundle::Bundle::open(bundle).map(|b| b.id().to_lowercase()).unwrap_or_default();
     let name = bundle.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |k: &str| id.contains(k) || name.contains(k);
+    if has("audio8") || synaptix::facade::arch::model_type(bundle).as_deref() == Some("arktts") {
+        return Ok(Engine::Audio8);
+    }
     if has("vibevoice") {
         return Err("VibeVoice — многоголосый синтез: используйте `synaptix podcast`".into());
     }
@@ -78,6 +83,7 @@ pub fn run(args: SpeakArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (pcm, rate) = match engine {
         Engine::VoxCpm => speak_voxcpm(&args, dev, dtype, t0)?,
         Engine::OmniVoice => speak_omnivoice(&args, dev, dtype, t0)?,
+        Engine::Audio8 => speak_audio8(&args, dev, dtype, t0)?,
     };
     write_wav_mono_f32(&args.output, &pcm, rate)?;
     eprintln!("synaptix speak: wrote {}", args.output.display());
@@ -88,6 +94,43 @@ fn report(pcm: &[f32], rate: u32, t: std::time::Instant) {
     let infer = t.elapsed().as_secs_f32();
     let dur = pcm.len() as f32 / rate as f32;
     eprintln!("synaptix speak: {:.2}s audio in {:.2}s (RTF={:.3})", dur, infer, infer / dur.max(1e-6));
+}
+
+/// Audio8-TTS: `--reference` — образец голоса, `--prompt-text` — его точная
+/// расшифровка (без неё клон невозможен); `--speed` — растяжение времени.
+fn speak_audio8(
+    args: &SpeakArgs,
+    dev: Device,
+    dtype: DType,
+    t0: std::time::Instant,
+) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    use synaptix_tts_audio8::{Audio8Pipeline, GenerateOptions as A8Options};
+    let pipe = Audio8Pipeline::from_syn_quant(&args.bundle, dev, dtype, None)?;
+    eprintln!("synaptix speak: loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    let opts = A8Options { seed: args.seed, ..pipe.default_options() };
+    let t1 = std::time::Instant::now();
+    let voice = match (args.reference.as_ref(), args.prompt_text.as_ref()) {
+        (Some(r), Some(t)) => {
+            let (pcm, sr) = synaptix_audio::io::read_wav_mono_f32(r)?;
+            Some(pipe.voice_prompt(&pcm, sr, t)?)
+        }
+        (Some(_), None) => return Err("Audio8: для клона голоса нужен --prompt-text — точная расшифровка --reference".into()),
+        _ => None,
+    };
+    let mut pcm = pipe.synthesize(&args.text, voice.as_ref(), &opts)?;
+    if (args.speed - 1.0).abs() > 1e-3 {
+        pcm = synaptix_audio::tempo::time_stretch(&pcm, pipe.sample_rate(), args.speed as f32);
+    }
+    let tm = pipe.last_timings();
+    eprintln!(
+        "synaptix speak: {} кадров ({:.1} кадр/с), EOS {}, кодек {:.2}s",
+        tm.frames,
+        tm.frames as f64 / tm.decode_s.max(1e-9),
+        tm.finished,
+        tm.codec_s
+    );
+    report(&pcm, pipe.sample_rate(), t1);
+    Ok((pcm, pipe.sample_rate()))
 }
 
 fn speak_voxcpm(

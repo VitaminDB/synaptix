@@ -570,9 +570,9 @@ enum Commands {
         #[arg(long)]
         compute_dtype: Option<String>,
     },
-    /// Синтез речи (VoxCPM2 TTS): TEXT → WAV (48 кГц).
+    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS): TEXT → WAV.
     Speak {
-        /// Бандл voxcpm2.syn.
+        /// Бандл (.syn) модели синтеза речи.
         bundle: PathBuf,
         /// Текст для озвучивания.
         text: String,
@@ -603,7 +603,7 @@ enum Commands {
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
-        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice")]
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8")]
         engine: String,
         #[arg(long, help = "VoxCPM: минимум шагов генерации (2)")]
         min_len: Option<usize>,

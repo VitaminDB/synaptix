@@ -1,0 +1,24 @@
+[package]
+name = "synaptix-tts-audio8"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Audio8-TTS (DualAR, Fish-S2-подобная): медленный AR по семантике + быстрый AR по кодбукам + кодек 44.1 кГц."
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-audio     = { workspace = true }
+synaptix-io        = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+hound = { workspace = true }
