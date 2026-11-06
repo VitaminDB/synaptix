@@ -381,10 +381,7 @@ impl Npu for QnnNpu {
                 continue; // кто-то уже открыл новое соединение — попробовать и его
             }
             if guard.len() >= self.max_lanes {
-                return Err(NpuError::Driver {
-                    driver: "qualcomm",
-                    msg: format!("{last_full}; занято {} PD (SYNNPU_MAX_PD)", guard.len()),
-                });
+                return Err(NpuError::NoSpace(format!("{last_full}; занято {} PD (SYNNPU_MAX_PD)", guard.len())));
             }
             guard.push(Lane::open()?.0);
         }

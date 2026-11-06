@@ -75,6 +75,28 @@ impl GraphCache {
             .unwrap_or(1 << 30)
     }
 
+    /// Отпустить давнюю половину графов (не меньше одного): PD ограничены и по
+    /// числу контекстов, а не только по байтам, — мелкие графы моделей с корзинами
+    /// (Leokani: сотни контекстов по 0,1–2 МБ) занимали все PD при малом объёме.
+    /// `false` — отпускать нечего.
+    fn evict_half(&mut self) -> bool {
+        if self.map.is_empty() {
+            return false;
+        }
+        let mut by_age: Vec<(u64, u64)> = self.map.iter().map(|(h, (_, _, last))| (*last, *h)).collect();
+        by_age.sort_unstable();
+        let n = by_age.len().div_ceil(2);
+        for (_, h) in by_age.into_iter().take(n) {
+            if let Some((_, b, _)) = self.map.remove(&h) {
+                self.total -= b;
+            }
+        }
+        if std::env::var_os("SYNAPTIX_NPU_LOG").is_some() {
+            eprintln!("npu: нет места в PD — отпущено {n} давних графов");
+        }
+        true
+    }
+
     fn get(&mut self, hash: u64) -> Option<Arc<dyn CompiledGraph>> {
         self.tick += 1;
         let tick = self.tick;
@@ -901,7 +923,18 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
         }
         None => {
             let t0 = std::time::Instant::now();
-            let c: Arc<dyn CompiledGraph> = Arc::from(npu.compile("synaptix", &b.g).map_err(err)?);
+            // Нет места в PD — отпустить давние графы и повторить.
+            let c: Arc<dyn CompiledGraph> = loop {
+                match npu.compile("synaptix", &b.g) {
+                    Ok(c) => break Arc::from(c),
+                    Err(synaptix_npu::NpuError::NoSpace(m)) => {
+                        if !GRAPHS.lock().evict_half() {
+                            return Err(err(synaptix_npu::NpuError::NoSpace(m)));
+                        }
+                    }
+                    Err(e) => return Err(err(e)),
+                }
+            };
             let mut s = STATS.lock();
             s.compiles += 1;
             s.compile_ms += t0.elapsed().as_secs_f64() * 1e3;

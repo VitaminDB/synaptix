@@ -24,6 +24,10 @@ pub enum NpuError {
     Graph(String),
     #[error("{0} не поддерживается моделью NPU {1}")]
     Unsupported(String, &'static str),
+    /// Новый контекст не помещается: все соединения (PD) заняты. Клиент может
+    /// отпустить давние графы и повторить.
+    #[error("нет места на NPU: {0}")]
+    NoSpace(String),
 }
 
 pub type Result<T> = std::result::Result<T, NpuError>;
