@@ -1,6 +1,7 @@
 //! Пакетный синтез Silero: jsonl → WAV + meta.jsonl (символы и их длительности — разметка без выравнивателя).
 //!
-//! Вход — строки `{"id","text","voice","english","rate","pitch"}`. Параллелизм — по фразам: воркеры
+//! Вход — строки `{"id","text","voice","english","rate","pitch","accents"}`
+//! (`accents: false` — без автоматических ударений и омографов: только «+» из текста). Параллелизм — по фразам: воркеры
 //! (потоки) с общей моделью; сеть маленькая (~23M), батч 1 упирается в запуски ядер, поэтому
 //! пропускная способность набирается числом одновременно синтезируемых фраз.
 
@@ -33,6 +34,7 @@ struct Item {
     english: Option<bool>,
     rate: Option<f32>,
     pitch: Option<f32>,
+    accents: Option<bool>,
 }
 
 fn write_wav16(path: &Path, pcm: &[f32], sr: u32) -> std::io::Result<()> {
@@ -107,6 +109,7 @@ pub fn run(a: BatchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     rate: it.rate.unwrap_or(1.0),
                     pitch: it.pitch.unwrap_or(1.0),
                     english: it.english,
+                    accents: it.accents.unwrap_or(true),
                     ..Options::default()
                 };
                 let r = pipe.infer_marked(&it.text, &o).map_err(|e| e.to_string()).and_then(|(syms, net)| {
