@@ -6,33 +6,33 @@ pub struct MultinomialSampler;
 
 impl Sampler for MultinomialSampler {
     fn sample(&mut self, logits: &[f32], rng: &mut Philox4x32) -> Result<u32> {
-        let probs = softmax(logits);
+        // После top-k почти весь словарь — −inf: exp и накопление — только по конечным.
+        let finite: Vec<(u32, f32)> = logits.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, &v)| (i as u32, v)).collect();
+        if finite.is_empty() {
+            return Err(crate::error::InferError::Sampling("все вероятности нулевые или NaN".into()));
+        }
+        let max = finite.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f64> = finite.iter().map(|p| ((p.1 - max) as f64).exp()).collect();
         // Накопление в f64 и `u` из [0, 1): у словаря в 150–250k сумма в f32
         // не добирала до 1, `u` мог быть ровно 1.0 — и срабатывал запасной
         // выход «последний токен словаря» (замаскированный/служебный).
-        let u = next_unit(rng) * probs.iter().map(|&p| p as f64).sum::<f64>();
+        let u = next_unit(rng) * exps.iter().sum::<f64>();
         let mut cumsum = 0.0f64;
-        for (i, &p) in probs.iter().enumerate() {
-            cumsum += p as f64;
+        for (p, &e) in finite.iter().zip(&exps) {
+            cumsum += e;
             if u < cumsum {
-                return Ok(i as u32);
+                return Ok(p.0);
             }
         }
-        // Погрешность на последнем шаге — берём последний токен с p > 0.
-        probs
+        // Погрешность на последнем шаге — последний токен с p > 0.
+        finite
             .iter()
-            .rposition(|&p| p > 0.0)
-            .map(|i| i as u32)
+            .zip(&exps)
+            .rev()
+            .find(|(_, &e)| e > 0.0)
+            .map(|(p, _)| p.0)
             .ok_or_else(|| crate::error::InferError::Sampling("все вероятности нулевые или NaN".into()))
     }
-}
-
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    for e in exps.iter_mut() { *e /= sum; }
-    exps
 }
 
 /// Равномерное в [0, 1): делитель 2^32, а не `u32::MAX` (тот давал ровно 1.0).
