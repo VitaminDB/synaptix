@@ -29,3 +29,4 @@ synaptix-autograd = { workspace = true }
 synaptix-train = { workspace = true }
 synaptix-kernels-cpu = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+synaptix-kernels-npu = { workspace = true }

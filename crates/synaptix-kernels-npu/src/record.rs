@@ -70,9 +70,29 @@ impl GraphCache {
         }
         // Intel NPU работает в общей памяти: графы держатся в ОЗУ процесса,
         // бюджет — весь `session_bytes` (VoxCPM2: префилл и шаг — ~7 ГБ весов).
-        crate::info()
-            .map(|i| if i.model.vendor == synaptix_npu::models::Vendor::Intel { i.model.session_bytes as usize * 2 } else { i.model.session_bytes as usize / 2 })
-            .unwrap_or(1 << 30)
+        // Qualcomm: не меньше половины сессии, а при свободной памяти — до 40 %
+        // доступной ОЗУ (телефон 12 ГБ: ~2,8 ГБ). Иначе две модели с корзинами длины
+        // (wav2vec2-large: ~620 МБ весов на корзину) вытесняли друг друга, и каждый
+        // вызов заново открывал графы (~1 с) при исполнении 0,1–0,2 с.
+        static B: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| {
+            crate::info()
+                .map(|i| {
+                    if i.model.vendor == synaptix_npu::models::Vendor::Intel {
+                        i.model.session_bytes as usize * 2
+                    } else {
+                        let half = i.model.session_bytes as usize / 2;
+                        half.max(mem_available() / 10 * 4)
+                    }
+                })
+                .unwrap_or(1 << 30)
+        });
+        *B
+    }
+
+    fn remove(&mut self, hash: u64) {
+        if let Some((_, b, _)) = self.map.remove(&hash) {
+            self.total -= b;
+        }
     }
 
     /// Отпустить давнюю половину графов (не меньше одного): PD ограничены и по
@@ -121,6 +141,15 @@ impl GraphCache {
         self.total += bytes;
         self.map.insert(hash, (g, bytes, self.tick));
     }
+}
+
+/// `MemAvailable` из /proc/meminfo (байты; нет — 0).
+fn mem_available() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<usize>().ok()))
+        .map(|kb| kb << 10)
+        .unwrap_or(0)
 }
 
 static GRAPHS: Lazy<Mutex<GraphCache>> = Lazy::new(|| Mutex::new(GraphCache::default()));
@@ -916,7 +945,7 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
     let t_seg = std::time::Instant::now();
     let cached = GRAPHS.lock().get(hash);
     let was_cached = cached.is_some();
-    let cg = match cached {
+    let mut cg = match cached {
         Some(c) => {
             STATS.lock().cache_hits += 1;
             c
@@ -958,7 +987,36 @@ fn run_segment(mut b: Builder, live: Vec<(TensorId, ValueRef)>, n_nodes: usize) 
     }
     let t_prep = t_seg.elapsed();
     let t0 = std::time::Instant::now();
-    cg.run(&binds).map_err(err)?;
+    if let Err(e) = cg.run(&binds) {
+        // QNN 1002/1003 при исполнении (нет памяти / системная ошибка DSP при
+        // переполненных PD): отпустить давнюю половину графов, заново открыть этот
+        // и повторить — а не уходить на CPU навсегда (служба так откатывала модели).
+        let m = e.to_string();
+        if !(m.contains("graphExecute") && (m.contains("QNN 1002") || m.contains("QNN 1003"))) {
+            return Err(err(e));
+        }
+        eprintln!("npu: {m} — освобождаю графы и повторяю");
+        drop(cg);
+        {
+            let mut g = GRAPHS.lock();
+            g.remove(hash);
+            g.evict_half();
+        }
+        let c: Arc<dyn CompiledGraph> = loop {
+            match npu.compile("synaptix", &b.g) {
+                Ok(c) => break Arc::from(c),
+                Err(synaptix_npu::NpuError::NoSpace(m)) => {
+                    if !GRAPHS.lock().evict_half() {
+                        return Err(err(synaptix_npu::NpuError::NoSpace(m)));
+                    }
+                }
+                Err(e) => return Err(err(e)),
+            }
+        };
+        GRAPHS.lock().insert(hash, c.clone(), b.static_bytes);
+        c.run(&binds).map_err(err)?;
+        cg = c;
+    }
     if log {
         eprintln!(
             "npu: сегмент {:016x}: {} узлов, веса {:.0} МБ, {} {:.0} мс, исполнение {:.1} мс",
