@@ -12,6 +12,7 @@ synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-bundle    = { workspace = true }
 synaptix-io        = { workspace = true }
+synaptix-tts-leokani = { workspace = true }
 rustfft            = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }

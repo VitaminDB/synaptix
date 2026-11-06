@@ -55,6 +55,8 @@ pub struct SileroPipeline {
     homo: Option<HomoSolver>,
     /// Типы предложений: нет, по символам текста (v5_4/v5_5), по токенам (v5_6).
     types: TypeMode,
+    /// Английское произношение латиницы (G2P Leokani из бандла рядом); нет — транслитерация по буквам.
+    en: Option<synaptix_tts_leokani::g2p::LeokaniG2P>,
     last: std::sync::Mutex<Timings>,
 }
 
@@ -107,7 +109,8 @@ impl SileroPipeline {
             (true, RootKind::Emph) => TypeMode::Tokens,
             (true, RootKind::Classic) => TypeMode::Chars,
         };
-        Ok(Self { config, net, accentor, homo, types, last: Default::default() })
+        let en = english_g2p(path);
+        Ok(Self { config, net, accentor, homo, types, en, last: Default::default() })
     }
 
     fn pkg(&self) -> &PackageConfig {
@@ -138,7 +141,7 @@ impl SileroPipeline {
         let ru = lang.is_none_or(|l| l == "ru");
         let translit;
         let text = if ru && text.chars().any(|c| c.is_ascii_alphabetic()) {
-            translit = crate::translit::to_cyrillic(text);
+            translit = self.latin(text);
             translit.as_str()
         } else {
             text
@@ -156,6 +159,34 @@ impl SileroPipeline {
             Some(a) => a.apply(&s),
             None => Ok(s),
         }
+    }
+
+    /// Латинские слова → русская запись английского произношения (с ударением `+`), иначе — по буквам.
+    pub fn latin(&self, text: &str) -> String {
+        let Some(g) = &self.en else { return crate::translit::to_cyrillic(text) };
+        let c: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < c.len() {
+            if c[i].is_ascii_alphabetic() {
+                let mut j = i;
+                while j < c.len() && (c[j].is_ascii_alphabetic() || (c[j] == '\'' && c.get(j + 1).is_some_and(|x| x.is_ascii_alphabetic()))) {
+                    j += 1;
+                }
+                let w: String = c[i..j].iter().collect();
+                let cyr = crate::english::ipa_to_cyrillic(&g.phonemize(&w));
+                if cyr.chars().any(|x| x.is_alphabetic()) {
+                    out.push_str(&cyr);
+                } else {
+                    out.push_str(&crate::translit::to_cyrillic(&w));
+                }
+                i = j;
+            } else {
+                out.push(c[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     /// Омографы и ударения на готовой строке (как `accentor(text)` оригинала, без подготовки).
@@ -237,6 +268,15 @@ impl SileroPipeline {
         }
         Ok(out)
     }
+}
+
+/// G2P английского: `SYN_SILERO_EN_G2P` или `leokani-tts-7m.syn` рядом с бандлом Silero.
+fn english_g2p(path: &Path) -> Option<synaptix_tts_leokani::g2p::LeokaniG2P> {
+    let p = std::env::var_os("SYN_SILERO_EN_G2P").map(std::path::PathBuf::from).or_else(|| path.parent().map(|d| d.join("leokani-tts-7m.syn")))?;
+    if !p.exists() {
+        return None;
+    }
+    synaptix_tts_leokani::g2p::LeokaniG2P::from_syn(&p).ok()
 }
 
 /// Куски не длиннее `max` символов по границам предложений (`.!?…` + пробел), иначе — по пробелам.

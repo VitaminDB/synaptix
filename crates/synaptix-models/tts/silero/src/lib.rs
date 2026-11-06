@@ -6,6 +6,7 @@
 
 pub mod accentor;
 pub mod config;
+pub mod english;
 pub mod frontend;
 pub mod homosolver;
 pub mod model;

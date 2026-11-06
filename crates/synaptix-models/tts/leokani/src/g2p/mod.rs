@@ -246,6 +246,24 @@ pub struct LeokaniG2P {
 }
 
 impl LeokaniG2P {
+    /// Только G2P из бандла Leokani (`leokani-g2p.json` + сети `g2p_nets_*`), без голосов — английское
+    /// произношение для других движков (Silero: латиница в русском тексте).
+    pub fn from_syn(path: &std::path::Path) -> Result<Self> {
+        use synaptix_core::{device::Device, dtype::DType};
+        use synaptix_io::weights::{syn_bundle::SynBundleLoader, WeightLoader};
+        let b = synaptix_bundle::Bundle::open(path).map_err(|e| LkError::Load(e.to_string()))?;
+        let doc = b.read_file("leokani-g2p.json").map_err(|e| LkError::Load(format!("leokani-g2p.json: {e}")))?.into_owned();
+        let nets: std::collections::BTreeMap<&str, SynBundleLoader> = [("context", "g2p_nets_context"), ("enc", "g2p_nets_enc"), ("dec", "g2p_nets_dec")]
+            .into_iter()
+            .map(|(p, c)| Ok((p, SynBundleLoader::open(path).map_err(|e| LkError::Load(e.to_string()))?.with_component(c).with_device(Device::Cpu))))
+            .collect::<Result<_>>()?;
+        let get = |n: &str| -> Result<Tensor> {
+            let l = n.split('.').next().and_then(|p| nets.get(p)).ok_or_else(|| LkError::Load(format!("{n}: нет сети G2P")))?;
+            l.load_to(n, Device::Cpu, DType::F32).map_err(|e| LkError::Load(format!("{n}: {e}")))
+        };
+        Self::new(&doc, &get)
+    }
+
     /// doc_json — содержимое leokani-g2p.json; get — вес сети по полному имени (с префиксом), F32 на CPU.
     pub fn new(doc_json: &[u8], get: &dyn Fn(&str) -> Result<Tensor>) -> Result<Self> {
         let doc: Doc = serde_json::from_slice(doc_json).map_err(|e| LkError::Load(format!("leokani-g2p.json: {e}")))?;

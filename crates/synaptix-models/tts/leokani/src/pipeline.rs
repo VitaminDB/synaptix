@@ -55,16 +55,7 @@ impl LeokaniPipeline {
         let n_mels = cfg["acoustic"]["n_mels"].as_u64().unwrap_or(100) as usize;
         let blocks = cfg["vocoder"]["blocks"].as_u64().unwrap_or(8) as usize;
         let open = |c: &str, d: Device| -> Result<SynBundleLoader> { Ok(SynBundleLoader::open(path).map_err(|e| LkError::Load(e.to_string()))?.with_component(c).with_device(d)) };
-        // Сети G2P — компоненты g2p_nets_{context,enc,dec}; имена весов с префиксом сети.
-        let nets: BTreeMap<&str, SynBundleLoader> = [("context", "g2p_nets_context"), ("enc", "g2p_nets_enc"), ("dec", "g2p_nets_dec")]
-            .into_iter()
-            .map(|(p, c)| Ok((p, open(c, Device::Cpu)?)))
-            .collect::<Result<_>>()?;
-        let get = |n: &str| -> Result<synaptix_core::tensor::Tensor> {
-            let l = n.split('.').next().and_then(|p| nets.get(p)).ok_or_else(|| LkError::Load(format!("{n}: нет сети G2P")))?;
-            l.load_to(n, Device::Cpu, DType::F32).map_err(|e| LkError::Load(format!("{n}: {e}")))
-        };
-        let g2p = LeokaniG2P::new(&read("leokani-g2p.json")?, &get)?;
+        let g2p = LeokaniG2P::from_syn(path)?;
         let mut voices = BTreeMap::new();
         for name in ["dala", "pono"] {
             let l = open(name, device)?;
