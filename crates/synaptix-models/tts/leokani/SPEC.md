@@ -1,0 +1,33 @@
+# Leokani-tts 7M (milliwattlabs/leokani-tts-7M) — нативный порт в synaptix
+
+Источник: HF rev ba0beb24 — `leokani.py` (модель, фронтенд), `g2p/leokani_g2p.py` (Leokani G2P 1.2.0, MIT;
+веса и словарь CC BY 4.0), веса `leokani-tts.safetensors` (Dala) и `pono/leokani-tts.safetensors` (Pono).
+Лицензия модели — CC BY-NC 4.0 (только некоммерческое использование).
+
+## Бандл `leokani-tts-7m.syn` (88 МБ, arch `leokani`)
+Компоненты `dala`, `pono` (acoustic.* + vocoder.*, F32), `g2p_nets_context`, `g2p_nets_enc`, `g2p_nets_dec`
+(веса ONNX-сетей G2P через `onnx_dump --weights … --prefix context|enc|dec`); файлы `config.json` (vocab фонем),
+`leokani-g2p.json` (распакованный словарь 575 тыс. слов, атомы чисел, варианты), лицензии.
+
+## Модель
+- Акустика (3.4M): эмбеддинг 192 → 3× (conv k5 → GELU → LN 1e-5) → двунаправленный MLGRU 256 → Linear → LN →
+  log-длительности; кадров на фонему 2·max(1, round_even((e^d − 1)/speed)) при 80 Гц; декодер: e[фонема] ‖
+  позиция внутри фонемы → Linear 384 → 2× (x + MLGRU(LN x)) → conv k5 → GELU → голова (первые 100 — log-mel).
+  MLGRU: f = σ, c = SiLU, h = f·h + (1−f)·c, o = Wo(σ(g)·h); скан — на хосте.
+- Вокодер (3.6M, Vocos): replicate-паддинг 4/2, conv k7 → LN → 8 ConvNeXt (каузальная dw k7 нулями, ×3) → LN →
+  1026 = log|S| (≤ e^… ≤ 100) + фаза → обратный rFFT матрицами cos/sin с окном Ханна → overlap-add (hop 300)
+  / Σw² → «same»-обрезка 362 → 300 семплов на кадр, 24 кГц.
+- Текст: `phonemize_chunks` G2P → id по кластерам (символ + комбинирующие знаки) → куски ≤ 400 id (деление у
+  середины по запятой/пробелу) → `[0, ids…, 0]` → склейка без пауз.
+
+## G2P (`src/g2p/`)
+Построчный порт `leokani_g2p.py`: нормализатор (числа, деньги, время, телефоны, сокращения, буквы, римские,
+омографы), чтение чисел, строковый фронтенд, сети (context: признаки слов → форма/стык; OOV: трансформер-энкодер
+и жадный декодер d=160) простыми циклами на CPU с f64-накоплением. Таблицы правил — `tables.json`
+(`reference/export_tables.py`). Тест `g2p_goldens`: pieces 399/399, lines 439/439, edge 1673/1673.
+
+## Сверка и скорость
+- По фонемам: Dala CPU 1.5e-4, CUDA 4e-5; Pono (темп 0.9) 3.7e-5 к `leokani.py` (torch fp32).
+- По тексту (G2P + модель): 10.5 с речи, отн. 4.7e-5 к `leokani.py --g2p leokani`.
+- CPU (1 поток модели): 10.5 с речи за 48 мс (G2P 6 мс), RTF ≈ 0.0045; загрузка 0.27 с.
+- Эталон: `reference/leokani_ref.py` (`--phonemes` или `--text`), пример `examples/leokani_audit.rs`.

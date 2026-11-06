@@ -112,6 +112,16 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
             "vibevoice" => vec![ref_audio(), steps(Some(10), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
+            "leokani" => vec![
+                spec(
+                    "voice",
+                    "Голос",
+                    "Dala — женский, Pono — мужской (американский английский)",
+                    ParamKind::Choice { options: vec!["dala".into(), "pono".into()] },
+                    Some(ParamValue::Text("dala".into())),
+                ),
+                spec("speed", "Скорость речи", "1 — обычная (длительности фонем делятся на неё)", float(0.5, 2.0, 0.05, 2), f(1.0)),
+            ],
             "supertonic" => vec![
                 language("Код языка (ru, en, de, …: 31 язык); пусто — по письму текста (ru/en)"),
                 spec(

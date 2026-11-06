@@ -53,6 +53,7 @@ members = [
     "crates/synaptix-models/tts/voxcpm",
     "crates/synaptix-models/tts/audio8",
     "crates/synaptix-models/tts/supertonic",
+    "crates/synaptix-models/tts/leokani",
     "crates/synaptix-models/music/acestep",
     "crates/synaptix-models/music/yue2",
     "crates/synaptix-models/music/sheetsage2",
@@ -172,6 +173,8 @@ regex = "1.10"
 # Разбиение текста перед BPE в токенизаторе YuE2 (паттерн Qwen с lookahead
 # `\s+(?!\S)` — обычный `regex` его не умеет).
 fancy-regex = "0.16"
+# Категории Unicode (Mn/So/L*…) — порт str-методов Python в G2P Leokani.
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-normalization = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false }
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
@@ -242,6 +245,7 @@ synaptix-tts-omnivoice = { path = "crates/synaptix-models/tts/omnivoice" }
 synaptix-tts-vibevoice = { path = "crates/synaptix-models/tts/vibevoice" }
 synaptix-tts-audio8 = { path = "crates/synaptix-models/tts/audio8" }
 synaptix-tts-supertonic = { path = "crates/synaptix-models/tts/supertonic" }
+synaptix-tts-leokani = { path = "crates/synaptix-models/tts/leokani" }
 
 
 [profile.release]

@@ -1,0 +1,4711 @@
+{
+"ONES": [
+"zero",
+"one",
+"two",
+"three",
+"four",
+"five",
+"six",
+"seven",
+"eight",
+"nine",
+"ten",
+"eleven",
+"twelve",
+"thirteen",
+"fourteen",
+"fifteen",
+"sixteen",
+"seventeen",
+"eighteen",
+"nineteen"
+],
+"TENS": [
+"_",
+"_",
+"twenty",
+"thirty",
+"forty",
+"fifty",
+"sixty",
+"seventy",
+"eighty",
+"ninety"
+],
+"ORDINAL_WORDS": {
+"one": "first",
+"two": "second",
+"three": "third",
+"five": "fifth",
+"eight": "eighth",
+"nine": "ninth",
+"twelve": "twelfth"
+},
+"MONTHS": [
+"January",
+"February",
+"March",
+"April",
+"May",
+"June",
+"July",
+"August",
+"September",
+"October",
+"November",
+"December"
+],
+"MONTH_ABBR": {
+"jan": 1,
+"feb": 2,
+"mar": 3,
+"apr": 4,
+"jun": 6,
+"jul": 7,
+"aug": 8,
+"sep": 9,
+"sept": 9,
+"oct": 10,
+"nov": 11,
+"dec": 12
+},
+"DAY_ABBR": {
+"mon": "Monday",
+"tue": "Tuesday",
+"tues": "Tuesday",
+"wed": "Wednesday",
+"thu": "Thursday",
+"thur": "Thursday",
+"thurs": "Thursday",
+"fri": "Friday",
+"sat": "Saturday",
+"sun": "Sunday"
+},
+"TITLE_ABBR": {
+"ms": "Miz",
+"prof": "Professor",
+"mt": "Mount",
+"ft": "Fort",
+"sgt": "Sergeant",
+"capt": "Captain",
+"lt": "Lieutenant",
+"gen": "General",
+"gov": "Governor",
+"sen": "Senator",
+"rep": "Representative",
+"rev": "Reverend",
+"col": "Colonel",
+"cpl": "Corporal",
+"adm": "Admiral",
+"pres": "President",
+"supt": "Superintendent",
+"hon": "Honorable"
+},
+"STREET_ABBR": {
+"st": "Street",
+"dr": "Drive",
+"ave": "Avenue",
+"av": "Avenue",
+"blvd": "Boulevard",
+"rd": "Road",
+"ln": "Lane",
+"ct": "Court",
+"pl": "Place",
+"pkwy": "Parkway",
+"hwy": "Highway",
+"sq": "Square",
+"ter": "Terrace",
+"cir": "Circle",
+"jr": "Junior",
+"sr": "Senior"
+},
+"WORD_ABBR": {
+"vs": "versus",
+"e.g": "for example",
+"approx": "approximately",
+"apt": "apartment",
+"dept": "department",
+"est": "established",
+"fig": "figure",
+"vol": "volume",
+"ch": "chapter",
+"pp": "pages",
+"ca": "circa",
+"cf": "compare",
+"corp": "corporation",
+"inc": "incorporated",
+"ltd": "limited",
+"govt": "government",
+"intl": "international",
+"misc": "miscellaneous",
+"dept.": "department",
+"yr": "year",
+"yrs": "years",
+"mo": "month",
+"mos": "months",
+"wk": "week",
+"wks": "weeks",
+"hr": "hour",
+"hrs": "hours",
+"min": "minute",
+"mins": "minutes",
+"sec": "second",
+"secs": "seconds",
+"tsp": "teaspoon",
+"tbsp": "tablespoon",
+"oz": "ounce",
+"lb": "pound",
+"lbs": "pounds",
+"pt": "pint",
+"qt": "quart",
+"gal": "gallon",
+"in": "inch",
+"ft": "foot",
+"yd": "yard",
+"mi": "mile"
+},
+"UNITS": {
+"km": [
+"kilometer",
+"kilometers"
+],
+"cm": [
+"centimeter",
+"centimeters"
+],
+"mm": [
+"millimeter",
+"millimeters"
+],
+"m": [
+"meter",
+"meters"
+],
+"kg": [
+"kilogram",
+"kilograms"
+],
+"g": [
+"gram",
+"grams"
+],
+"mg": [
+"milligram",
+"milligrams"
+],
+"lb": [
+"pound",
+"pounds"
+],
+"lbs": [
+"pound",
+"pounds"
+],
+"oz": [
+"ounce",
+"ounces"
+],
+"ft": [
+"foot",
+"feet"
+],
+"mi": [
+"mile",
+"miles"
+],
+"yd": [
+"yard",
+"yards"
+],
+"yds": [
+"yard",
+"yards"
+],
+"mph": [
+"mile per hour",
+"miles per hour"
+],
+"kph": [
+"kilometer per hour",
+"kilometers per hour"
+],
+"km/h": [
+"kilometer per hour",
+"kilometers per hour"
+],
+"ml": [
+"milliliter",
+"milliliters"
+],
+"mL": [
+"milliliter",
+"milliliters"
+],
+"L": [
+"liter",
+"liters"
+],
+"gal": [
+"gallon",
+"gallons"
+],
+"qt": [
+"quart",
+"quarts"
+],
+"tsp": [
+"teaspoon",
+"teaspoons"
+],
+"tbsp": [
+"tablespoon",
+"tablespoons"
+],
+"Tbsp": [
+"tablespoon",
+"tablespoons"
+],
+"kWh": [
+"kilowatt hour",
+"kilowatt hours"
+],
+"Wh": [
+"watt hour",
+"watt hours"
+],
+"W": [
+"watt",
+"watts"
+],
+"kW": [
+"kilowatt",
+"kilowatts"
+],
+"MW": [
+"megawatt",
+"megawatts"
+],
+"mW": [
+"milliwatt",
+"milliwatts"
+],
+"V": [
+"volt",
+"volts"
+],
+"mV": [
+"millivolt",
+"millivolts"
+],
+"kV": [
+"kilovolt",
+"kilovolts"
+],
+"mA": [
+"milliamp",
+"milliamps"
+],
+"mAh": [
+"milliamp hour",
+"milliamp hours"
+],
+"Hz": [
+"hertz",
+"hertz"
+],
+"kHz": [
+"kilohertz",
+"kilohertz"
+],
+"MHz": [
+"megahertz",
+"megahertz"
+],
+"GHz": [
+"gigahertz",
+"gigahertz"
+],
+"KB": [
+"kilobyte",
+"kilobytes"
+],
+"kB": [
+"kilobyte",
+"kilobytes"
+],
+"MB": [
+"megabyte",
+"megabytes"
+],
+"GB": [
+"gigabyte",
+"gigabytes"
+],
+"TB": [
+"terabyte",
+"terabytes"
+],
+"Mbps": [
+"megabit per second",
+"megabits per second"
+],
+"Gbps": [
+"gigabit per second",
+"gigabits per second"
+],
+"ms": [
+"millisecond",
+"milliseconds"
+],
+"sec": [
+"second",
+"seconds"
+],
+"secs": [
+"second",
+"seconds"
+],
+"min": [
+"minute",
+"minutes"
+],
+"mins": [
+"minute",
+"minutes"
+],
+"hr": [
+"hour",
+"hours"
+],
+"hrs": [
+"hour",
+"hours"
+],
+"µm": [
+"micrometer",
+"micrometers"
+],
+"μm": [
+"micrometer",
+"micrometers"
+],
+"nm": [
+"nanometer",
+"nanometers"
+],
+"µs": [
+"microsecond",
+"microseconds"
+],
+"μs": [
+"microsecond",
+"microseconds"
+],
+"ns": [
+"nanosecond",
+"nanoseconds"
+],
+"µg": [
+"microgram",
+"micrograms"
+],
+"mcg": [
+"microgram",
+"micrograms"
+],
+"µA": [
+"microamp",
+"microamps"
+],
+"uA": [
+"microamp",
+"microamps"
+],
+"dB": [
+"decibel",
+"decibels"
+],
+"rpm": [
+"R P M",
+"R P M"
+],
+"psi": [
+"P S I",
+"P S I"
+]
+},
+"CURRENCY": {
+"$": [
+"dollar",
+"dollars",
+"cent",
+"cents"
+],
+"€": [
+"euro",
+"euros",
+"cent",
+"cents"
+],
+"£": [
+"pound",
+"pounds",
+"penny",
+"pence"
+],
+"¥": [
+"yen",
+"yen",
+"",
+""
+],
+"₹": [
+"rupee",
+"rupees",
+"",
+""
+]
+},
+"SCALES": {
+"k": "thousand",
+"K": "thousand",
+"m": "million",
+"M": "million",
+"mm": "million",
+"b": "billion",
+"B": "billion",
+"bn": "billion",
+"t": "trillion",
+"T": "trillion"
+},
+"SCALE_WORDS": [
+"billion",
+"million",
+"thousand",
+"trillion"
+],
+"ATTRIBUTIVE": [
+"bag",
+"bet",
+"bill",
+"bills",
+"bonus",
+"bottle",
+"box",
+"budget",
+"card",
+"cards",
+"charge",
+"check",
+"cheque",
+"coin",
+"coins",
+"coupon",
+"credit",
+"deal",
+"deposit",
+"discount",
+"donation",
+"fare",
+"fee",
+"fine",
+"gift",
+"increase",
+"item",
+"items",
+"kit",
+"loan",
+"meal",
+"membership",
+"minimum",
+"note",
+"notes",
+"order",
+"piece",
+"pieces",
+"plan",
+"pledge",
+"prize",
+"purchase",
+"raise",
+"reward",
+"subscription",
+"surcharge",
+"ticket",
+"tickets",
+"tip",
+"toll",
+"value",
+"voucher"
+],
+"PER_UNIT": {
+"month": "a month",
+"mo": "a month",
+"year": "a year",
+"yr": "a year",
+"week": "a week",
+"wk": "a week",
+"day": "a day",
+"hour": "an hour",
+"hr": "an hour",
+"night": "a night",
+"person": "a person",
+"head": "a head",
+"kg": "a kilo",
+"lb": "a pound",
+"unit": "a unit",
+"user": "a user",
+"seat": "a seat",
+"share": "a share",
+"gallon": "a gallon",
+"mile": "a mile",
+"minute": "a minute"
+},
+"VERSION_CUE": [
+"android",
+"blender",
+"bluetooth",
+"build",
+"chrome",
+"clang",
+"claude",
+"cuda",
+"debian",
+"django",
+"fedora",
+"firefox",
+"firmware",
+"gcc",
+"gemini",
+"go",
+"gpt",
+"http",
+"ios",
+"ipados",
+"java",
+"kernel",
+"kotlin",
+"linux",
+"llama",
+"llvm",
+"macos",
+"mistral",
+"mysql",
+"node",
+"npm",
+"numpy",
+"opengl",
+"openssl",
+"osx",
+"perl",
+"php",
+"pip",
+"postgres",
+"python",
+"pytorch",
+"qwen",
+"rails",
+"react",
+"release",
+"ruby",
+"rust",
+"safari",
+"ssl",
+"swift",
+"tls",
+"torch",
+"tvos",
+"typescript",
+"ubuntu",
+"unity",
+"update",
+"usb",
+"v",
+"version",
+"visionos",
+"vulkan",
+"watchos",
+"windows",
+"xcode"
+],
+"ACRONYM_WORDS": [
+"ACK",
+"AIDS",
+"API",
+"ASAP",
+"BAM",
+"BRB",
+"CAD",
+"CAP",
+"CERN",
+"CON",
+"COVID",
+"DEV",
+"DOS",
+"FAQ",
+"FEMA",
+"GEN",
+"GIF",
+"GUI",
+"HAL",
+"HUD",
+"IKEA",
+"JPEG",
+"LAN",
+"LASER",
+"LIT",
+"LOL",
+"MAD",
+"MAG",
+"MAX",
+"MET",
+"MIA",
+"MIN",
+"MOMA",
+"NASA",
+"NAT",
+"NATO",
+"NOW",
+"OK",
+"OMG",
+"OPEC",
+"OPS",
+"PAC",
+"PEG",
+"PIN",
+"POW",
+"PRO",
+"RADAR",
+"RAM",
+"ROM",
+"SAC",
+"SAG",
+"SARS",
+"SAT",
+"SCUBA",
+"SIM",
+"SWAT",
+"TBA",
+"TED",
+"UNESCO",
+"UNICEF",
+"VAC",
+"VAT",
+"WAN",
+"WASP",
+"WOW",
+"YES",
+"ZIP"
+],
+"SHORTHAND": {
+"imo": "in my opinion",
+"imho": "in my humble opinion",
+"eod": "end of day",
+"btw": "by the way",
+"tbd": "to be determined",
+"tba": "to be announced",
+"pls": "please",
+"plz": "please",
+"thx": "thanks",
+"pw": "password",
+"re": "regarding",
+"dept": "department",
+"pts": "points",
+"approx": "approximately"
+},
+"SHORTHAND_CASED": {
+"IMO": "in my opinion",
+"IMHO": "in my humble opinion",
+"EOD": "end of day",
+"BTW": "by the way",
+"TBD": "to be determined",
+"TBA": "to be announced",
+"OT": "overtime",
+"TDs": "touchdowns",
+"INTs": "interceptions"
+},
+"ZONES": {
+"ET": "Eastern Time",
+"PT": "Pacific Time",
+"CT": "Central Time",
+"MT": "Mountain Time",
+"HST": "Hawaii time",
+"UTC": "U T C",
+"GMT": "G M T"
+},
+"LETTER_CUE": [
+"appendix",
+"block",
+"building",
+"class",
+"concourse",
+"exhibit",
+"gate",
+"grade",
+"group",
+"item",
+"level",
+"list",
+"lot",
+"model",
+"option",
+"part",
+"phase",
+"plan",
+"platform",
+"row",
+"section",
+"series",
+"side",
+"team",
+"terminal",
+"tier",
+"track",
+"type",
+"unit",
+"vitamin",
+"wing",
+"zone"
+],
+"NUMBER_WORDS": [
+"dozen",
+"eight",
+"eleven",
+"five",
+"four",
+"hundred",
+"nine",
+"seven",
+"six",
+"ten",
+"three",
+"twelve",
+"twenty",
+"two"
+],
+"MINUTE_NOUNS": [
+"amount",
+"amounts",
+"bubble",
+"bubbles",
+"change",
+"changes",
+"crack",
+"cracks",
+"crystal",
+"crystals",
+"detail",
+"details",
+"difference",
+"differences",
+"dose",
+"doses",
+"flaw",
+"flaws",
+"fraction",
+"fragment",
+"fragments",
+"grain",
+"grains",
+"hole",
+"holes",
+"leak",
+"particle",
+"particles",
+"quantities",
+"quantity",
+"scratch",
+"scratches",
+"speck",
+"specks",
+"tear",
+"trace",
+"traces"
+],
+"DIRECTIONS": {
+"n": "North",
+"s": "South",
+"e": "East",
+"w": "West",
+"ne": "Northeast",
+"nw": "Northwest",
+"se": "Southeast",
+"sw": "Southwest"
+},
+"STREET_WORDS": [
+"ave",
+"avenue",
+"blvd",
+"boulevard",
+"box",
+"cir",
+"circle",
+"court",
+"ct",
+"dr",
+"drive",
+"highway",
+"hwy",
+"lane",
+"ln",
+"loop",
+"parkway",
+"pkwy",
+"pl",
+"place",
+"rd",
+"road",
+"row",
+"sq",
+"square",
+"st",
+"street",
+"ter",
+"terrace",
+"trail",
+"trl",
+"way"
+],
+"STATES": {
+"AL": "Alabama",
+"AK": "Alaska",
+"AZ": "Arizona",
+"AR": "Arkansas",
+"CA": "California",
+"CO": "Colorado",
+"CT": "Connecticut",
+"DE": "Delaware",
+"FL": "Florida",
+"GA": "Georgia",
+"HI": "Hawaii",
+"ID": "Idaho",
+"IL": "Illinois",
+"IN": "Indiana",
+"IA": "Iowa",
+"KS": "Kansas",
+"KY": "Kentucky",
+"LA": "Louisiana",
+"ME": "Maine",
+"MD": "Maryland",
+"MA": "Massachusetts",
+"MI": "Michigan",
+"MN": "Minnesota",
+"MS": "Mississippi",
+"MO": "Missouri",
+"MT": "Montana",
+"NE": "Nebraska",
+"NV": "Nevada",
+"NH": "New Hampshire",
+"NJ": "New Jersey",
+"NM": "New Mexico",
+"NY": "New York",
+"NC": "North Carolina",
+"ND": "North Dakota",
+"OH": "Ohio",
+"OK": "Oklahoma",
+"OR": "Oregon",
+"PA": "Pennsylvania",
+"RI": "Rhode Island",
+"SC": "South Carolina",
+"SD": "South Dakota",
+"TN": "Tennessee",
+"TX": "Texas",
+"UT": "Utah",
+"VT": "Vermont",
+"VA": "Virginia",
+"WA": "Washington",
+"WV": "West Virginia",
+"WI": "Wisconsin",
+"WY": "Wyoming",
+"DC": "D C"
+},
+"TLDS": [
+"ai",
+"am",
+"app",
+"art",
+"at",
+"au",
+"be",
+"biz",
+"blog",
+"ca",
+"cc",
+"ch",
+"chat",
+"cloud",
+"co",
+"com",
+"de",
+"design",
+"dev",
+"edu",
+"email",
+"es",
+"eu",
+"fi",
+"fm",
+"fr",
+"games",
+"gg",
+"global",
+"gov",
+"health",
+"ie",
+"in",
+"info",
+"int",
+"io",
+"it",
+"jp",
+"live",
+"ly",
+"me",
+"mil",
+"net",
+"news",
+"nl",
+"no",
+"nz",
+"online",
+"org",
+"page",
+"se",
+"sh",
+"site",
+"so",
+"store",
+"studio",
+"tech",
+"to",
+"today",
+"tv",
+"uk",
+"us",
+"world",
+"xyz"
+],
+"TLD_SAY": {
+"com": "com",
+"org": "org",
+"net": "net",
+"gov": "gov",
+"co": "co",
+"info": "info",
+"app": "app",
+"dev": "dev",
+"me": "me",
+"blog": "blog",
+"news": "news",
+"tech": "tech",
+"site": "site",
+"online": "online",
+"store": "store",
+"page": "page",
+"cloud": "cloud",
+"health": "health",
+"art": "art",
+"design": "design",
+"studio": "studio",
+"games": "games",
+"live": "live",
+"chat": "chat",
+"email": "email",
+"global": "global",
+"today": "today",
+"world": "world",
+"biz": "biz",
+"mil": "mil"
+},
+"SEP_WORDS": {
+".": "dot",
+"_": "underscore",
+"-": "dash",
+"+": "plus",
+"/": "slash",
+"~": "tilde",
+"=": "equals",
+"?": "question mark",
+"&": "and",
+"#": "hash",
+":": "colon",
+"%": "percent"
+},
+"REGNAL": [
+"adrian",
+"albert",
+"alexander",
+"alfonso",
+"anne",
+"baldwin",
+"benedict",
+"boniface",
+"carl",
+"carlos",
+"catherine",
+"charles",
+"christian",
+"clement",
+"constantine",
+"david",
+"dmitry",
+"edward",
+"elizabeth",
+"felipe",
+"ferdinand",
+"francis",
+"frederick",
+"frederik",
+"george",
+"gregory",
+"gustav",
+"haakon",
+"hadrian",
+"harald",
+"henri",
+"henry",
+"innocent",
+"ivan",
+"james",
+"john",
+"joseph",
+"juan",
+"julius",
+"kamehameha",
+"leo",
+"leopold",
+"louis",
+"ludwig",
+"malcolm",
+"margrethe",
+"martin",
+"mary",
+"napoleon",
+"nicholas",
+"olaf",
+"otto",
+"paul",
+"pedro",
+"peter",
+"philip",
+"pius",
+"rama",
+"ramses",
+"richard",
+"robert",
+"rudolf",
+"sancho",
+"sebastian",
+"sixtus",
+"stephen",
+"umberto",
+"urban",
+"victor",
+"wilhelm",
+"willem",
+"william"
+],
+"ROMAN_CUE": [
+"act",
+"amendment",
+"apollo",
+"appendix",
+"army",
+"article",
+"book",
+"bowl",
+"canto",
+"category",
+"chapter",
+"class",
+"clause",
+"corps",
+"council",
+"division",
+"episode",
+"fleet",
+"game",
+"gemini",
+"grade",
+"lesson",
+"level",
+"mark",
+"mission",
+"mk",
+"module",
+"olympiad",
+"operation",
+"paragraph",
+"part",
+"phase",
+"psalm",
+"round",
+"rule",
+"scene",
+"schedule",
+"season",
+"section",
+"series",
+"stage",
+"step",
+"symphony",
+"tier",
+"title",
+"tome",
+"track",
+"type",
+"unit",
+"vatican",
+"vol",
+"volume",
+"war"
+],
+"ROMAN_AMBIGUOUS": [
+"CD",
+"CI",
+"CIV",
+"CL",
+"CV",
+"DC",
+"DIV",
+"IL",
+"IV",
+"IX",
+"LI",
+"LV",
+"LX",
+"LXX",
+"MC",
+"MCC",
+"MD",
+"MIX",
+"VI",
+"VL",
+"XI",
+"XL",
+"XX",
+"XXL",
+"XXX",
+"XXXL"
+],
+"SAY_AS": {
+"haumea": "hWmˈAə",
+"leokani": "lˌAOkˈɑni",
+"mahalo": "məhˈɑlO",
+"kamehameha": "kəmˌAəmˈAhə",
+"waikiki": "wˌIkɪkˈi",
+"kauai": "kəwˈI",
+"kolea": "kOlˈAə",
+"mauna": "mˈWnə",
+"kea": "kˈAə",
+"molokai": "mˌOlOkˈI",
+"lanai": "lənˈI",
+"hilo": "hˈilO",
+"pele": "pˈɛlA",
+"kahului": "kˌɑhulˈui",
+"wahine": "wɑhˈinA",
+"nguyen": "wˈɪn",
+"joaquin": "wɑkˈin",
+"nietzsche": "nˈiʧə",
+"ballets": "bælˈAz",
+"milliwatt": "mˈɪlɪwˌɑt",
+"xochitl": "sˈOʧil",
+"oaxaca": "wəhˈɑkə",
+"lanikai": "lˌɑnikˈI",
+"niamh": "nˈiv",
+"saoirse": "sˈɪɹʃə",
+"przybylski": "ʃəbˈɪlski",
+"keanu": "kAˈɑnu",
+"versailles": "vəɹsˈI",
+"haagen-dazs": "hˈɑɡən dˈɑz",
+"nescafe": "nˈɛskəfˌA",
+"moet": "mOˈɛt",
+"huawei": "wˈɑwA",
+"aoife": "ˈifə",
+"quinoa": "kˈinwɑ",
+"sriracha": "sɹˈiɹɑʧə",
+"gnocchi": "nˈjɑki",
+"xavier": "zˈAviəɹ",
+"haleakala": "hˌɑlAˌɑkəlˈɑ",
+"kalapana": "kˌɑləpˈɑnə",
+"ngozi": "əŋɡˈOzi",
+"okonkwo": "OkˈɔŋkwO",
+"waimea": "wˌImˈAə",
+"briain": "bɹˈiən",
+"hermes": "ɛɹmˈɛz",
+"nike": "nˈIki",
+"adidas": "ədˈidəs",
+"hyundai": "hˈʌndA",
+"ioniq": "Iˈɑnɪk",
+"xiaomi": "ʃˈWmi",
+"lebron": "ləbɹˈɑn",
+"porsche": "pˈɔɹʃə"
+},
+"SAY_AS_CASED": {
+"LaTeX": "lˈAtɛk",
+"iOS": "ˌIˌOˈɛs",
+"macOS": "mˌækˌOˈɛs",
+"watchOS": "wˌɑʧˌOˈɛs",
+"tvOS": "tˌivˌiˌOˈɛs",
+"iPadOS": "ˈIpˌædˌOˈɛs",
+"Wi-Fi": "wˈIfˌI",
+"WiFi": "wˈIfˌI",
+"SQL": "sˈikwᵊl",
+"RAM": "ɹˈæm",
+"ETA": "ˌiˌtiˈA",
+"YoY": "jˈɪɹ ˌOvəɹ jˈɪɹ",
+"IKEA": "Ikˈiə",
+"MacBook": "mˈækbʊk",
+"FEMA": "fˈimə",
+"ZIP": "zˈɪp",
+"eSIM": "ˈi sˈɪm",
+"eSIMs": "ˈi sˈɪmz"
+},
+"VERB_BEFORE": [
+"also",
+"always",
+"can",
+"could",
+"did",
+"didn't",
+"do",
+"don't",
+"eye",
+"i",
+"i'll",
+"just",
+"let's",
+"may",
+"might",
+"must",
+"never",
+"often",
+"people",
+"please",
+"should",
+"still",
+"they",
+"they'll",
+"to",
+"we",
+"we'll",
+"who",
+"will",
+"won't",
+"would",
+"you",
+"you'll"
+],
+"ADJ_FORMS": {
+"minute": "mInˈut",
+"content": "kəntˈɛnt"
+},
+"VERB_FORMS": {
+"present": "pɹɪzˈɛnt",
+"convict": "kənvˈɪkt",
+"subject": "səbʤˈɛkt",
+"insult": "ɪnsˈʌlt",
+"decrease": "dᵻkɹˈis",
+"live": "lˈɪv"
+},
+"SUBJECTS": [
+"eye",
+"he",
+"i",
+"it",
+"she",
+"they",
+"we",
+"who",
+"you"
+],
+"OBJECTS": [
+"a",
+"all",
+"an",
+"down",
+"everything",
+"her",
+"him",
+"his",
+"it",
+"its",
+"me",
+"my",
+"off",
+"our",
+"out",
+"that",
+"the",
+"their",
+"them",
+"these",
+"this",
+"those",
+"up",
+"us",
+"your"
+],
+"CASED_SAY": {
+"IEEE": "I triple E",
+"WWI": "World War one",
+"WWII": "World War two",
+"WW1": "World War one",
+"WW2": "World War two",
+"PhD": "P H D",
+"PhDs": "P H Ds",
+"ZIP+4": "zip plus four",
+"A-OK": "A O K",
+"AAA": "triple A",
+"NAACP": "N double A C P",
+"NCAA": "N C double A"
+},
+"CODE_CUE": [
+"#",
+"access",
+"account",
+"acct",
+"badge",
+"booking",
+"case",
+"claim",
+"code",
+"confirmation",
+"coupon",
+"id",
+"invoice",
+"member",
+"membership",
+"number",
+"order",
+"otp",
+"package",
+"parcel",
+"passcode",
+"pin",
+"pnr",
+"policy",
+"promo",
+"receipt",
+"ref",
+"reference",
+"routing",
+"security",
+"serial",
+"shipment",
+"sn",
+"ticket",
+"tracking",
+"transaction",
+"verification",
+"voucher"
+],
+"ONSETS": [
+"",
+"b",
+"bl",
+"br",
+"c",
+"ch",
+"chr",
+"cl",
+"cr",
+"d",
+"dr",
+"dw",
+"f",
+"fl",
+"fr",
+"g",
+"gl",
+"gn",
+"gr",
+"h",
+"j",
+"k",
+"kl",
+"kn",
+"kr",
+"l",
+"m",
+"n",
+"p",
+"ph",
+"phr",
+"pl",
+"pr",
+"ps",
+"q",
+"qu",
+"r",
+"s",
+"sc",
+"sch",
+"scr",
+"sh",
+"shr",
+"sk",
+"sl",
+"sm",
+"sn",
+"sp",
+"sph",
+"spl",
+"spr",
+"squ",
+"st",
+"str",
+"sw",
+"t",
+"th",
+"thr",
+"tr",
+"tw",
+"v",
+"w",
+"wh",
+"wr",
+"x",
+"y",
+"z"
+],
+"CODAS": [
+"",
+"b",
+"c",
+"ch",
+"ck",
+"ct",
+"d",
+"ds",
+"f",
+"ff",
+"ft",
+"g",
+"gh",
+"ght",
+"h",
+"k",
+"ks",
+"l",
+"lch",
+"ld",
+"lf",
+"lk",
+"ll",
+"lls",
+"lm",
+"lp",
+"lse",
+"lt",
+"m",
+"mb",
+"mp",
+"mps",
+"n",
+"nce",
+"nch",
+"nd",
+"nds",
+"ng",
+"nk",
+"ns",
+"nt",
+"nts",
+"p",
+"ps",
+"r",
+"rb",
+"rc",
+"rch",
+"rd",
+"rf",
+"rg",
+"rk",
+"rks",
+"rl",
+"rm",
+"rn",
+"rp",
+"rs",
+"rse",
+"rst",
+"rt",
+"rth",
+"s",
+"sh",
+"sk",
+"sp",
+"ss",
+"st",
+"t",
+"tch",
+"th",
+"ts",
+"v",
+"w",
+"wd",
+"wk",
+"wl",
+"wn",
+"ws",
+"x",
+"y",
+"z",
+"zz"
+],
+"SENTENCE_START": [
+"a",
+"after",
+"also",
+"an",
+"and",
+"at",
+"before",
+"but",
+"finally",
+"first",
+"he",
+"how",
+"i",
+"if",
+"in",
+"it",
+"my",
+"next",
+"now",
+"on",
+"our",
+"please",
+"she",
+"so",
+"that",
+"the",
+"then",
+"there",
+"they",
+"this",
+"we",
+"what",
+"when",
+"why",
+"you"
+],
+"HG_CLASSES": {
+"DET": "the a an this that these those my your his her its our their no any some every each another which what whose one two three several many few more most such either neither",
+"MODAL": "will would can could should must may might shall can't won't wouldn't couldn't shouldn't cannot i'll you'll we'll they'll he'll she'll it'll i'd you'd we'd they'd he'd she'd",
+"DO": "do does did don't doesn't didn't",
+"SUBJ": "i you we they he she who eye",
+"BE": "am is are was were be been being isn't aren't wasn't weren't it's that's there's he's she's what's",
+"HAVE": "have has had having haven't hasn't hadn't i've you've we've they've",
+"PREP": "of in on at for with from by into onto about under over through after before during without against between among near behind across around toward towards upon within like",
+"ADV": "not never also always often still just really usually already even soon then now quickly carefully rarely sometimes probably finally actually",
+"OBJ": "the a an your my our his her their its it this that these those them him me us you everything something anything everyone someone some all both",
+"DETN": "the a an my your his her its our their this these those no any some every each another which whose several many few most such what",
+"DETX": "the a an your my our his their its this these those",
+"SUBJX": "i you we they he she who anyone everyone someone nobody people",
+"IMPN": "the a an your my our his her their its it this that these those them him me us everything something all both between along into out up with off from across through over around down",
+"NOTPL": "this his is was has does as us plus thus less always perhaps sometimes its yes lots whereas afterwards besides towards upwards news means series species politics physics"
+},
+"HOMOGRAPHS": {
+"address": [
+[
+"",
+[
+"p1=^",
+"N=address|addresss"
+]
+],
+[
+"",
+[
+"p2=address|addresss",
+"p3=^"
+]
+],
+[
+"ˈædɹɛs",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ədɹˈɛs",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ədɹˈɛs",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"aged": [
+[
+"ˈAʤᵻd",
+[
+"p1=the|an|@DETN",
+"n1=and|or|$|who|are|were|people|parents|mother|father|man|woman|couple|relatives|population|care|home|homes|patients|grandmother|grandfather|relative"
+]
+]
+],
+"alternate": [
+[
+"ɔltˈɜɹnət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɔltˈɜɹnət",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ˈɔltəɹnˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"appropriate": [
+[
+"əpɹˈOpɹɪjət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"əpɹˈOpɹɪjət",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"əpɹˈOpɹɪˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"associate": [
+[
+"",
+[
+"p1=^",
+"N=associate|associates"
+]
+],
+[
+"",
+[
+"p2=associate|associates",
+"p3=^"
+]
+],
+[
+"əsˈOsiət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"əsˈOsɪˌAt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"attribute": [
+[
+"",
+[
+"p1=^",
+"N=attribute|attributes"
+]
+],
+[
+"",
+[
+"p2=attribute|attributes",
+"p3=^"
+]
+],
+[
+"ˈætɹɪbjˌut",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ətɹˈɪbjut",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"axes": [
+[
+"ˈæksiz",
+[
+"P=graph|graphs|chart|plot|logarithmic|coordinate|coordinates|both|x|y|z|horizontal|vertical|principal|rotation|label|labels|labeled|scale|scales|grid|symmetry|cartesian|plotted|axis|figure|three|two"
+]
+],
+[
+"ˈæksiz",
+[
+"N=graph|graphs|chart|plot|labeled|symmetry|rotation|grid|x|y|z"
+]
+]
+],
+"bases": [
+[
+"bˈAsiz",
+[
+"n1=for"
+]
+],
+[
+"bˈAsiz",
+[
+"P=no|legal|theoretical|factual|scientific|moral|ethical|constitutional|statutory|logical|empirical|valid|solid|sound|possible|several|multiple|various"
+]
+]
+],
+"blessed": [
+[
+"blˈɛsᵻd",
+[
+"p1=every|a|this|that|the|most|thrice|holy|ever|our|your|his|her|my|truly|so|such",
+"n1!=with|by|to|$|and"
+]
+]
+],
+"bow": [
+[
+"bˈW",
+[
+"n1=of",
+"N=ship|boat|vessel|yacht|canoe|ferry|tanker|liner|kayak|freighter|ships|boats"
+]
+],
+[
+"bˈO",
+[
+"P=rosined|rosin|violin|cello|viola|fiddle|arrow|arrows|archer|archery|ribbon|tied|tie|pink|red|silk|velvet|hair|bright|cross"
+]
+],
+[
+"bˈW",
+[
+"p1=@SUBJX|@MODAL|to|and|then|please|^",
+"n1=to|down|before|deeply|low|his|her|their|our|in|politely|slightly|respectfully|out"
+]
+]
+],
+"bows": [
+[
+"bˈWz",
+[
+"p1!=@DETN",
+"n1=his|her|their|to|down|before|deeply|low|politely|slightly|respectfully|out|in"
+]
+]
+],
+"buffet": [
+[
+"bˈʌfɪt",
+[
+"p1!=@DETN",
+"n1=@OBJ"
+]
+],
+[
+"bəfˈA",
+[
+"P=@DETN|chinese|breakfast|lunch|dinner|salad|seafood|dessert|hotel|brunch|cold|hot|all-you-can-eat|indian|italian"
+]
+]
+],
+"compound": [
+[
+"",
+[
+"p1=^",
+"N=compound|compounds"
+]
+],
+[
+"",
+[
+"p2=compound|compounds",
+"p3=^"
+]
+],
+[
+"kˈɑmpWnd",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kɑmpˈWnd",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"conduct": [
+[
+"",
+[
+"p1=^",
+"N=conduct|conducts"
+]
+],
+[
+"",
+[
+"p2=conduct|conducts",
+"p3=^"
+]
+],
+[
+"kˈɑndʌkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kəndˈʌkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kəndˈʌkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"conflict": [
+[
+"",
+[
+"p1=^",
+"N=conflict|conflicts"
+]
+],
+[
+"",
+[
+"p2=conflict|conflicts",
+"p3=^"
+]
+],
+[
+"kˈɑnflɪkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kənflˈɪkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kənflˈɪkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"console": [
+[
+"",
+[
+"p1=^",
+"N=console|consoles"
+]
+],
+[
+"",
+[
+"p2=console|consoles",
+"p3=^"
+]
+],
+[
+"kˈɑnsOl",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kənsˈOl",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kənsˈOl",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kənsˈOl",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kənsˈOl",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kənsˈOl",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kənsˈOl",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kənsˈOl",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"contract": [
+[
+"",
+[
+"p1=^",
+"N=contract|contracts"
+]
+],
+[
+"",
+[
+"p2=contract|contracts",
+"p3=^"
+]
+],
+[
+"kˈɑntɹækt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kəntɹˈækt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kəntɹˈækt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"convict": [
+[
+"",
+[
+"p1=^",
+"N=convict|convicts"
+]
+],
+[
+"",
+[
+"p2=convict|convicts",
+"p3=^"
+]
+],
+[
+"kˈɑnvɪkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"kənvˈɪkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"kənvˈɪkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"deliberate": [
+[
+"dᵻlˈɪbəɹɹət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"dᵻlˈɪbəɹɹət",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"dᵻlˈɪbəɹɹˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"desert": [
+[
+"",
+[
+"p1=^",
+"N=desert|deserts"
+]
+],
+[
+"",
+[
+"p2=desert|deserts",
+"p3=^"
+]
+],
+[
+"dˈɛzəɹt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"dᵻzˈɜɹt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"digest": [
+[
+"dˈIʤɛst",
+[
+"cap"
+]
+],
+[
+"dˈIʤɛst",
+[
+"p1=weekly|daily|monthly|news|email|reader's"
+]
+],
+[
+"",
+[
+"p1=^",
+"N=digest|digests"
+]
+],
+[
+"",
+[
+"p2=digest|digests",
+"p3=^"
+]
+],
+[
+"dˈIʤɛst",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p1=@SUBJX"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"dIʤˈɛst",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"dIʤˈɛst",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"does": [
+[
+"dˈOz",
+[
+"p1=take|hunt|hunting|shoot|shot|killed|only|bucks|young|female|wild|pregnant|two|three|several|many|the|some",
+"n1=in|and|or|$|were|are|grazed|graze|grazing|at|from|during|with|on|that|which"
+]
+]
+],
+"dove": [
+[
+"dˈʌv",
+[
+"p1=@DETN|white|mourning|peace|turtle|rock"
+]
+],
+[
+"dˈOv",
+[
+"n1=after|into|in|under|off|for|down|through|onto|deep|headfirst|back|to|from|nearly|sharply|below|toward|towards|behind|out|overboard|percent"
+]
+]
+],
+"entrance": [
+[
+"",
+[
+"p1=^",
+"N=entrance|entrances"
+]
+],
+[
+"",
+[
+"p2=entrance|entrances",
+"p3=^"
+]
+],
+[
+"ˈɛntɹəns",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɛntɹˈæns",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"estimate": [
+[
+"",
+[
+"p1=^",
+"N=estimate|estimates"
+]
+],
+[
+"",
+[
+"p2=estimate|estimates",
+"p3=^"
+]
+],
+[
+"ˈɛstᵻmət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ˈɛstᵻmˌAt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"excuse": [
+[
+"",
+[
+"n1=me|us"
+]
+],
+[
+"",
+[
+"p1=^",
+"N=excuse|excuses"
+]
+],
+[
+"",
+[
+"p2=excuse|excuses",
+"p3=^"
+]
+],
+[
+"ɛkskjˈus",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɛkskjˈuz",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"graduate": [
+[
+"",
+[
+"p1=^",
+"N=graduate|graduates"
+]
+],
+[
+"",
+[
+"p2=graduate|graduates",
+"p3=^"
+]
+],
+[
+"ɡɹˈæʤuət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɡɹˈæʤuˌAt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"house": [
+[
+"",
+[
+"p1=^",
+"N=house|houses"
+]
+],
+[
+"",
+[
+"p2=house|houses",
+"p3=^"
+]
+],
+[
+"hˈWs",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"hˈWz",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"hˈWz",
+[
+"p1=@SUBJX"
+]
+],
+[
+"hˈWz",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"hˈWz",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"hˈWz",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"hˈWz",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"hˈWz",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"incense": [
+[
+"",
+[
+"p1=^",
+"N=incense|incenses"
+]
+],
+[
+"",
+[
+"p2=incense|incenses",
+"p3=^"
+]
+],
+[
+"ˈɪnsɛns",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɪnsˈɛns",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"increase": [
+[
+"",
+[
+"p1=^",
+"N=increase|increases"
+]
+],
+[
+"",
+[
+"p2=increase|increases",
+"p3=^"
+]
+],
+[
+"ˈɪŋkɹis",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɪŋkɹˈis",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"insert": [
+[
+"",
+[
+"p1=^",
+"N=insert|inserts"
+]
+],
+[
+"",
+[
+"p2=insert|inserts",
+"p3=^"
+]
+],
+[
+"ˈɪnsɜɹt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɪnsˈɜɹt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"invalid": [
+[
+"ˈɪnvəlɪd",
+[
+"p1=an|the|as",
+"n1=$|who|and|for|in|at|with"
+]
+]
+],
+"lead": [
+[
+"lˈɛd",
+[
+"p1=pencil|graphite|mechanical|soft|hard|sharpened|sharp|toxic|molten|white|red"
+]
+],
+[
+"lˈɛd",
+[
+"n1=pipes|pipe|paint|poisoning|levels|contamination|exposure|bullet|bullets|shot|weight|weights|crystal|solder|acetate|oxide|apron|shielding|ore|mine|mines|pencil|pencils|piping|sinker|sinkers|balloon"
+]
+]
+],
+"learned": [
+[
+"lˈɜɹnᵻd",
+[
+"p1=@DETN",
+"n1!=@DETX|to|from|that|how|about"
+]
+]
+],
+"live": [
+[
+"lˈIv",
+[
+"n1=music|broadcast|broadcasts|show|shows|concert|concerts|wire|wires|audience|stream|streams|streaming|performance|performances|television|tv|coverage|event|events|bait|ammunition|rounds|feed|version|album|recording|recordings|action|animals|oak|chat|demo|video|videos|update|updates|band|bands|theater|theatre|sports|footage|cattle|webinar|session|sessions|blog|vote|grenade|round|wire's|q&a"
+]
+],
+[
+"lˈIv",
+[
+"p1=still|go|goes|went|going|gone|be|is|was|are|were|being|it's|now",
+"n1=$|on|from|at|tonight|now|in|with|and|right|today|this|across|for"
+]
+]
+],
+"moderate": [
+[
+"mˈɑdəɹɹət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"mˈɑdəɹɹət",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"mˈɑdəɹɹˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"number": [
+[
+"nˈʌməɹ",
+[
+"n1=$|than|and",
+"P=feel|felt|feels|feeling|grew|growing|getting|became|become|went|gone|seemed|seems|looked"
+]
+]
+],
+"object": [
+[
+"",
+[
+"p1=^",
+"N=object|objects"
+]
+],
+[
+"",
+[
+"p2=object|objects",
+"p3=^"
+]
+],
+[
+"ˈɑbʤɛkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɑbʤˈɛkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"perfect": [
+[
+"pˈɜɹfɛkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pˈɜɹfɛkt",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pəɹfˈɛkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"permit": [
+[
+"",
+[
+"p1=^",
+"N=permit|permits"
+]
+],
+[
+"",
+[
+"p2=permit|permits",
+"p3=^"
+]
+],
+[
+"pˈɜɹmɪt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"pəɹmˈɪt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"present": [
+[
+"pɹˈɛzənt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pɹˈɛzənt",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pɹɪzˈɛnt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"primer": [
+[
+"pɹˈIməɹ",
+[
+"P=makeup|paint|painting|paints|foundation|skin|face|wall|walls|wood|metal|coat|coats|apply|applied|applying|spray|priming|eyeshadow|lipstick|sealant|drywall|surface|surfaces|rust|dna|pcr|sequencing|eye|lip|grip"
+]
+],
+[
+"pɹˈIməɹ",
+[
+"N=makeup|paint|painting|foundation|skin|face|wall|walls|wood|metal|coat|coats|dries|dry|spray|sealant|drywall|surface|surfaces|rust|dna|pcr|sequencing|eyeshadow|lipstick|helps|first"
+]
+]
+],
+"produce": [
+[
+"pɹˈOdus",
+[
+"p1=all|fresh|local|organic|farm|seasonal|frozen|canned|wash|washed|our|your"
+]
+],
+[
+"",
+[
+"p1=^",
+"N=produce|produces"
+]
+],
+[
+"",
+[
+"p2=produce|produces",
+"p3=^"
+]
+],
+[
+"pɹˈOdus",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pɹədˈus",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pɹədˈus",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pɹədˈus",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pɹədˈus",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pɹədˈus",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pɹədˈus",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"pɹədˈus",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"progress": [
+[
+"",
+[
+"p1=^",
+"N=progress|progresss"
+]
+],
+[
+"",
+[
+"p2=progress|progresss",
+"p3=^"
+]
+],
+[
+"pɹˈɑɡɹɛs",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"pɹəɡɹˈɛs",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"project": [
+[
+"",
+[
+"p1=^",
+"N=project|projects"
+]
+],
+[
+"",
+[
+"p2=project|projects",
+"p3=^"
+]
+],
+[
+"pɹˈɑʤɛkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"pɹəʤˈɛkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"putting": [
+[
+"pˈʌɾɪŋ",
+[
+"p1=his|her|my|your|their|our|the|whose",
+"n1!=@OBJ|up|on|off|out|away|down|in|together|back|it|them|forward|aside|through"
+]
+]
+],
+"rebel": [
+[
+"",
+[
+"p1=^",
+"N=rebel|rebels"
+]
+],
+[
+"",
+[
+"p2=rebel|rebels",
+"p3=^"
+]
+],
+[
+"ɹˈɛbᵊl",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɹᵻbˈɛl",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"record": [
+[
+"",
+[
+"p1=^",
+"N=record|records"
+]
+],
+[
+"",
+[
+"p2=record|records",
+"p3=^"
+]
+],
+[
+"ɹˈɛkəɹd",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɹᵻkˈɔɹd",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"refuse": [
+[
+"ɹˈɛfjus",
+[
+"p1=of|household|kitchen|garden|industrial|domestic|municipal|human|toxic",
+"n1!=to|@OBJ"
+]
+],
+[
+"ɹˈɛfjus",
+[
+"p1=the",
+"n1!=to|@OBJ|@SUBJX"
+]
+],
+[
+"",
+[
+"p1=^",
+"N=refuse|refuses"
+]
+],
+[
+"",
+[
+"p2=refuse|refuses",
+"p3=^"
+]
+],
+[
+"ɹˈɛfjus",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p1=@SUBJX"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"ɹᵻfjˈuz",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"resume": [
+[
+"ɹˈɛzumˌA",
+[
+"p1=@DETN|updated|polished|strong|attach|send|submit|upload|email|new|current|one-page|two-page"
+]
+]
+],
+"row": [
+[
+"ɹˈW",
+[
+"p1=a|the|huge|big|blazing|furious|bitter|public|family|another|political|diplomatic|major|heated|massive",
+"n1=in|over|about|with|between|erupted|broke|has|had|after|among|within|that"
+]
+]
+],
+"résumé": [
+[
+"ɹˈɛzumˌA",
+[]
+]
+],
+"separate": [
+[
+"sˈɛpɹət",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"sˈɛpɹət",
+[
+"p1=@BE|very|more|most|less|quite|so|too|perfectly|entirely|completely|fully|highly|rather|not|seem|seems|seemed|look|looks|looked|feel|feels|felt|become|became"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"sˈɛpəɹɹˌAt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+]
+],
+"sewer": [
+[
+"sˈOəɹ",
+[
+"P=skilled|talented|expert|experienced|keen|avid|amateur|seamstress"
+]
+],
+[
+"sˈOəɹ",
+[
+"N=quilting|sewing|clothes|fabric|quilts|quilt|dresses|stitch|stitches|thread|needle|patterns|seams|hems"
+]
+]
+],
+"sow": [
+[
+"sˈW",
+[
+"p1=@DETN|prize|pregnant|old|breeding|fat",
+"n1!=@DETX|seeds|seed|the"
+]
+]
+],
+"subject": [
+[
+"",
+[
+"p1=^",
+"N=subject|subjects"
+]
+],
+[
+"",
+[
+"p2=subject|subjects",
+"p3=^"
+]
+],
+[
+"sˈʌbʤɛkt",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p1=@SUBJX"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"səbʤˈɛkt",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"survey": [
+[
+"",
+[
+"p1=^",
+"N=survey|surveys"
+]
+],
+[
+"",
+[
+"p2=survey|surveys",
+"p3=^"
+]
+],
+[
+"sˈɜɹvA",
+[
+"p1=@DETN",
+"n1!=@DETX"
+]
+],
+[
+"səɹvˈA",
+[
+"p1=@MODAL|@DO|to|please|let's|let"
+]
+],
+[
+"səɹvˈA",
+[
+"p1=@SUBJX"
+]
+],
+[
+"səɹvˈA",
+[
+"p1=^|please",
+"n1=@IMPN"
+]
+],
+[
+"səɹvˈA",
+[
+"p2=@MODAL|@DO|to",
+"p1=@ADV|@SUBJX|all|both"
+]
+],
+[
+"səɹvˈA",
+[
+"p1~s",
+"p1!~'s|ss|us|is|ous|ics|ness",
+"p1!=@NOTPL|@DETN|@BE|@HAVE|@PREP|@ADV",
+"n1!=of|is|was|are|were|and|or|$|to|for|that|which|who|in|on|at|with|by|as|but|has|had|have|will|would"
+]
+],
+[
+"səɹvˈA",
+[
+"P=@MODAL|@DO",
+"p1~s",
+"n1=$"
+]
+],
+[
+"səɹvˈA",
+[
+"p1=often|sometimes|always|never|usually|rarely|seldom|also|frequently|regularly|occasionally|routinely"
+]
+]
+],
+"tear": [
+[
+"tˈɛɹ",
+[
+"p1=and",
+"p2=wear"
+]
+],
+[
+"tˈɛɹ",
+[
+"p1=^|please|to|@MODAL|@DO|@SUBJX|not",
+"n1=@OBJ|along|up|down|off|apart|open|out|through|into|at"
+]
+],
+[
+"tˈɛɹ",
+[
+"p1=acl|muscle|ligament|meniscus|rotator|hamstring|tendon|cartilage|retinal"
+]
+],
+[
+"tˈɛɹ",
+[
+"p1=a|the|small|tiny|big|large|minor|long|little",
+"n1=in|on|at",
+"N=shirt|jeans|fabric|sleeve|paper|tent|sail|seam|pants|dress|sheet|muscle|ligament|cartilage|knee|meniscus|tendon|bag|screen|upholstery|canvas|coat|jacket|sock|glove|lining|skin"
+]
+]
+],
+"tears": [
+[
+"tˈɛɹz",
+[
+"p1=small|tiny|big|large|minor|long|several|little|multiple|muscle|ligament|any",
+"N!=eyes|joy|of|streamed|streaming|rolled|ran|welled|flowed"
+]
+],
+[
+"tˈɛɹz",
+[
+"p1=@SUBJX|it|and|then|never|always|just|carefully|quickly",
+"n1=@OBJ|open|up|down|off|apart|into|through|out|at"
+]
+]
+],
+"upset": [
+[
+"ˈʌpsɛt",
+[
+"p1=@DETN|biggest|major|huge|stunning|big|shocking|surprise|massive|historic|minor|first-round",
+"n1!=@DETX|me|him|her|them|us|you|it|about|that|with|by|when|stomach"
+]
+]
+],
+"used": [
+[
+"jˈust",
+[
+"n1=to",
+"p1=@BE|get|got|gets|getting|become|became|grew",
+"n2~ing|@DETX|it|this|that|them|him|her|me|us|being|having"
+]
+],
+[
+"jˈust",
+[
+"n1=to",
+"p1=@SUBJX|it|never|always|once|not|also|just|people|there|things|we|they"
+]
+]
+]
+},
+"TITLES": [
+"dr",
+"e.g",
+"etc",
+"i.e",
+"jr",
+"mr",
+"mrs",
+"ms",
+"mt",
+"no",
+"sr",
+"st",
+"vs"
+],
+"ABBREV": [
+"a.m.",
+"approx.",
+"dr.",
+"e.g.",
+"etc.",
+"i.e.",
+"jr.",
+"mr.",
+"mrs.",
+"ms.",
+"mt.",
+"no.",
+"p.m.",
+"prof.",
+"sr.",
+"st.",
+"u.s.",
+"vs."
+],
+"READ_PAST_BEFORE": [
+"already",
+"been",
+"had",
+"has",
+"have",
+"i've",
+"just",
+"never",
+"once",
+"recently",
+"they've",
+"was",
+"we've",
+"were",
+"you've"
+],
+"READ_PAST_AFTER": [
+"ago",
+"already",
+"before",
+"earlier",
+"last",
+"yesterday"
+],
+"LEAD_METAL": [
+"acid",
+"apron",
+"balloon",
+"bullet",
+"bullets",
+"crystal",
+"paint",
+"pencil",
+"pencils",
+"pipe",
+"pipes",
+"poisoning",
+"shot",
+"sinker",
+"solder",
+"weight",
+"weights"
+],
+"WIND_VERB_BEFORE": [
+"and",
+"can",
+"could",
+"didn't",
+"don't",
+"i",
+"must",
+"please",
+"should",
+"they",
+"to",
+"we",
+"will",
+"would",
+"you"
+],
+"WIND_OBJECT": [
+"a",
+"back",
+"down",
+"her",
+"his",
+"it",
+"my",
+"our",
+"that",
+"the",
+"them",
+"this",
+"up",
+"your"
+],
+"LIVES_SUBJECT": [
+"anyone",
+"everybody",
+"everyone",
+"he",
+"it",
+"nobody",
+"one",
+"she",
+"somebody",
+"someone",
+"that",
+"which",
+"who"
+],
+"LIVES_OWNER": [
+"all",
+"both",
+"her",
+"his",
+"its",
+"many",
+"my",
+"nine",
+"our",
+"save",
+"the",
+"their",
+"these",
+"those",
+"two",
+"whose",
+"your"
+],
+"YEAR_BEFORE": [
+"after",
+"around",
+"autumn",
+"before",
+"by",
+"circa",
+"during",
+"fall",
+"from",
+"in",
+"of",
+"since",
+"spring",
+"summer",
+"till",
+"until",
+"winter",
+"year"
+],
+"NAMES": {
+"tchaikovsky": "chykoffsky",
+"chopin": "showpan",
+"goethe": "gerta"
+},
+"PRONOUN": {
+"i": "eye",
+"i'm": "eim",
+"i'll": "isle",
+"i've": "ive",
+"i'd": "eyed"
+},
+"PRONOUN_AFTER": [
+"am",
+"are",
+"aren't",
+"can",
+"can't",
+"could",
+"couldn't",
+"did",
+"didn't",
+"do",
+"does",
+"doesn't",
+"don't",
+"had",
+"hadn't",
+"has",
+"hasn't",
+"have",
+"haven't",
+"is",
+"isn't",
+"may",
+"might",
+"must",
+"mustn't",
+"shall",
+"should",
+"shouldn't",
+"was",
+"wasn't",
+"were",
+"weren't",
+"will",
+"won't",
+"would",
+"wouldn't"
+],
+"DROPPED": [
+"\"",
+"#",
+"'",
+"(",
+")",
+"*",
+"[",
+"]",
+"_",
+"`",
+"‘",
+"’",
+"“",
+"”"
+],
+"VULGAR": {
+"½": "1/2",
+"¼": "1/4",
+"¾": "3/4",
+"⅓": "1/3",
+"⅔": "2/3",
+"⅛": "1/8",
+"⅜": "3/8",
+"⅝": "5/8",
+"⅞": "7/8"
+},
+"VULGAR_WORDS": {
+"½": "a half",
+"¼": "a quarter",
+"¾": "three quarters",
+"⅓": "a third",
+"⅔": "two thirds",
+"⅛": "an eighth",
+"⅜": "three eighths",
+"⅝": "five eighths",
+"⅞": "seven eighths"
+}
+}

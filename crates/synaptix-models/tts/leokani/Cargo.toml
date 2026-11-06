@@ -1,0 +1,25 @@
+[package]
+name = "synaptix-tts-leokani"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Leokani-tts 7M (Milliwatt Labs): английский TTS 24 кГц (MLGRU-акустика + Vocos-вокодер) и свой G2P Leokani (без espeak-ng)."
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-io        = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+unicode-normalization = { workspace = true }
+fancy-regex        = { workspace = true }
+unicode-properties = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu  = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+synaptix-audio        = { workspace = true }

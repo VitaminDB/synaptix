@@ -41,6 +41,7 @@ synaptix-tts-voxcpm   = { workspace = true }
 synaptix-tts-vibevoice = { workspace = true }
 synaptix-tts-audio8   = { workspace = true }
 synaptix-tts-supertonic = { workspace = true }
+synaptix-tts-leokani  = { workspace = true }
 synaptix-music-acestep = { workspace = true }
 synaptix-music-yue2   = { workspace = true }
 synaptix-music-sheetsage2 = { workspace = true }

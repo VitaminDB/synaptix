@@ -41,6 +41,7 @@ enum Engine {
     OmniVoice,
     Audio8,
     Supertonic,
+    Leokani,
 }
 
 fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
@@ -49,12 +50,16 @@ fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
         "omnivoice" => return Ok(Engine::OmniVoice),
         "audio8" => return Ok(Engine::Audio8),
         "supertonic" => return Ok(Engine::Supertonic),
+        "leokani" => return Ok(Engine::Leokani),
         "auto" => {}
-        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic, а не `{o}`")),
+        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic | leokani, а не `{o}`")),
     }
     let id = synaptix_bundle::Bundle::open(bundle).map(|b| b.id().to_lowercase()).unwrap_or_default();
     let name = bundle.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |k: &str| id.contains(k) || name.contains(k);
+    if has("leokani") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "leokani").unwrap_or(false) {
+        return Ok(Engine::Leokani);
+    }
     if has("supertonic") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "supertonic").unwrap_or(false) {
         return Ok(Engine::Supertonic);
     }
@@ -91,6 +96,7 @@ pub fn run(args: SpeakArgs) -> Result<(), Box<dyn std::error::Error>> {
         Engine::OmniVoice => speak_omnivoice(&args, dev, dtype, t0)?,
         Engine::Audio8 => speak_audio8(&args, dev, dtype, t0)?,
         Engine::Supertonic => speak_supertonic(&args, dev, t0)?,
+        Engine::Leokani => speak_leokani(&args, dev, t0)?,
     };
     write_wav_mono_f32(&args.output, &pcm, rate)?;
     eprintln!("synaptix speak: wrote {}", args.output.display());
@@ -101,6 +107,16 @@ fn report(pcm: &[f32], rate: u32, t: std::time::Instant) {
     let infer = t.elapsed().as_secs_f32();
     let dur = pcm.len() as f32 / rate as f32;
     eprintln!("synaptix speak: {:.2}s audio in {:.2}s (RTF={:.3})", dur, infer, infer / dur.max(1e-6));
+}
+
+/// Leokani-tts 7M (английский): `--voice` dala | pono, `--speed` — темп.
+fn speak_leokani(args: &SpeakArgs, dev: Device, t0: std::time::Instant) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    let pipe = synaptix_tts_leokani::LeokaniPipeline::from_syn(&args.bundle, dev)?;
+    eprintln!("synaptix speak: loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    let t1 = std::time::Instant::now();
+    let pcm = pipe.synthesize(&args.text, args.voice.as_deref().unwrap_or("dala"), args.speed as f32)?;
+    report(&pcm, pipe.sample_rate(), t1);
+    Ok((pcm, pipe.sample_rate()))
 }
 
 /// Supertonic 3: `--voice` — готовый голос (F1…F5, M1…M5), `--language` —
