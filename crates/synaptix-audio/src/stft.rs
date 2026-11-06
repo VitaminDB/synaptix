@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rustfft::num_complex::Complex32;
+pub use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 use crate::error::{AudioError, Result};

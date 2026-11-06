@@ -42,6 +42,7 @@ enum Engine {
     Audio8,
     Supertonic,
     Leokani,
+    F5,
 }
 
 fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
@@ -51,12 +52,16 @@ fn detect_engine(bundle: &Path, requested: &str) -> Result<Engine, String> {
         "audio8" => return Ok(Engine::Audio8),
         "supertonic" => return Ok(Engine::Supertonic),
         "leokani" => return Ok(Engine::Leokani),
+        "f5" => return Ok(Engine::F5),
         "auto" => {}
-        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic | leokani, а не `{o}`")),
+        o => return Err(format!("--engine: auto | voxcpm | omnivoice | audio8 | supertonic | leokani | f5, а не `{o}`")),
     }
     let id = synaptix_bundle::Bundle::open(bundle).map(|b| b.id().to_lowercase()).unwrap_or_default();
     let name = bundle.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |k: &str| id.contains(k) || name.contains(k);
+    if has("f5-tts") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "f5-tts").unwrap_or(false) {
+        return Ok(Engine::F5);
+    }
     if has("leokani") || synaptix_bundle::Bundle::open(bundle).map(|b| b.meta().arch == "leokani").unwrap_or(false) {
         return Ok(Engine::Leokani);
     }
@@ -97,6 +102,7 @@ pub fn run(args: SpeakArgs) -> Result<(), Box<dyn std::error::Error>> {
         Engine::Audio8 => speak_audio8(&args, dev, dtype, t0)?,
         Engine::Supertonic => speak_supertonic(&args, dev, t0)?,
         Engine::Leokani => speak_leokani(&args, dev, t0)?,
+        Engine::F5 => speak_f5(&args, dev, t0)?,
     };
     write_wav_mono_f32(&args.output, &pcm, rate)?;
     eprintln!("synaptix speak: wrote {}", args.output.display());
@@ -107,6 +113,34 @@ fn report(pcm: &[f32], rate: u32, t: std::time::Instant) {
     let infer = t.elapsed().as_secs_f32();
     let dur = pcm.len() as f32 / rate as f32;
     eprintln!("synaptix speak: {:.2}s audio in {:.2}s (RTF={:.3})", dur, infer, infer / dur.max(1e-6));
+}
+
+/// F5-TTS (русские версии): голос — образец `--reference` и его точный текст `--prompt-text`;
+/// `--steps` — NFE (32), `--cfg` (2), `--speed` — темп. Ударение — `+` перед гласной.
+/// Счёт DiT: F16 на CUDA, F32 на CPU (`--compute-dtype` меняет).
+fn speak_f5(args: &SpeakArgs, dev: Device, t0: std::time::Instant) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    use synaptix_tts_f5::{F5Pipeline, Options, VoicePrompt};
+    let dtype = match args.compute_dtype.as_deref() {
+        Some("f16") => Some(DType::F16),
+        Some("bf16") => Some(DType::BF16),
+        Some("f32") => Some(DType::F32),
+        _ => None,
+    };
+    let pipe = F5Pipeline::from_syn(&args.bundle, dev, dtype, None)?;
+    eprintln!("synaptix speak: loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    let (r, t) = match (args.reference.as_ref().or(args.prompt_wav.as_ref()), args.prompt_text.as_ref()) {
+        (Some(r), Some(t)) => (r, t),
+        _ => return Err("F5-TTS клонирует голос с образца: нужны --reference (WAV 3–12 с) и --prompt-text (его точный текст)".into()),
+    };
+    let (pcm, sr) = synaptix_audio::io::read_wav_mono_f32(r)?;
+    let voice = VoicePrompt::new(&pcm, sr, t)?;
+    let o = Options { nfe: args.steps.unwrap_or(32), cfg: args.cfg.unwrap_or(2.0), speed: args.speed as f32, seed: args.seed, ..Options::default() };
+    let t1 = std::time::Instant::now();
+    let pcm = pipe.synthesize(&voice, &args.text, &o)?;
+    report(&pcm, pipe.sample_rate(), t1);
+    let tm = pipe.last_timings();
+    eprintln!("synaptix speak: DiT {:.2}s, вокодер {:.2}s, кусков {}", tm.dit_s, tm.vocoder_s, tm.chunks);
+    Ok((pcm, pipe.sample_rate()))
 }
 
 /// Leokani-tts 7M (английский): `--voice` dala | pono, `--speed` — темп.

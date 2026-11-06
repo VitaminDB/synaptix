@@ -570,7 +570,7 @@ enum Commands {
         #[arg(long)]
         compute_dtype: Option<String>,
     },
-    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3, Leokani): TEXT → WAV.
+    /// Синтез речи (VoxCPM2, OmniVoice, Audio8-TTS, Supertonic 3, Leokani, F5-TTS): TEXT → WAV.
     Speak {
         /// Бандл (.syn) модели синтеза речи.
         bundle: PathBuf,
@@ -603,7 +603,7 @@ enum Commands {
         /// Максимум патчей генерации.
         #[arg(long, default_value_t = 2000)]
         max_len: usize,
-        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8 | supertonic | leokani")]
+        #[arg(long, default_value = "auto", help = "Движок: auto (по бандлу) | voxcpm | omnivoice | audio8 | supertonic | leokani | f5")]
         engine: String,
         #[arg(long, help = "VoxCPM: минимум шагов генерации (2)")]
         min_len: Option<usize>,

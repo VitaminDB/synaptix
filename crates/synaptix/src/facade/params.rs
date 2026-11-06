@@ -112,6 +112,14 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
         Task::Llm => llm(path),
         Task::Tts => match arch.as_str() {
             "vibevoice" => vec![ref_audio(), steps(Some(10), "Шаги диффузии"), guidance(1.3, "Guidance (CFG)"), seed()],
+            "f5" => vec![
+                ref_audio(),
+                spec("ref_text", "Текст образца", "Что именно сказано в записи, слово в слово. Без своего образца голос — персонаж (опорный клип)", ParamKind::Text { multiline: true }, None),
+                spec("speed", "Скорость речи", "1 — обычная (длительность фразы делится на неё)", float(0.3, 2.0, 0.05, 2), f(1.0)),
+                steps(Some(32), "Шаги Эйлера (NFE; как в оригинале — 32; 16 — вдвое быстрее)"),
+                guidance(2.0, "Guidance (CFG)"),
+                seed(),
+            ],
             "leokani" => vec![
                 spec(
                     "voice",
