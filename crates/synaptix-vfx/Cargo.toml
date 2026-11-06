@@ -8,6 +8,7 @@ description = "Видеофильтры на GPU в реальном време�
 
 [dependencies]
 synaptix-core         = { workspace = true }
+synaptix-ops          = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
 synaptix-bundle       = { workspace = true }
 cudarc                = { workspace = true }
@@ -16,3 +17,7 @@ safetensors           = { workspace = true }
 memmap2               = { workspace = true }
 serde_json            = { workspace = true }
 thiserror             = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-npu = { workspace = true }

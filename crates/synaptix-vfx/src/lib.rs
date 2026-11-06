@@ -11,6 +11,7 @@ pub mod nanovsr;
 pub mod plksr;
 pub mod rife;
 pub mod span;
+pub mod tensor;
 pub mod weights;
 
 use std::path::Path;
