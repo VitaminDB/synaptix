@@ -10,8 +10,14 @@ fn main() {
         Some("f16") => DType::F16,
         _ => DType::F32,
     };
+    let dev = if std::env::var("LFM_DEV").as_deref() == Ok("npu") {
+        eprintln!("NPU: {:?}", synaptix_kernels_npu::register().expect("npu"));
+        Device::Npu(0)
+    } else {
+        Device::Cpu
+    };
     let t = std::time::Instant::now();
-    let p = Lfm3Pipeline::load_with_precision(&a[1], Device::Cpu, PrecisionConfig::dense(dt), Some(4096)).expect("load");
+    let p = Lfm3Pipeline::load_with_precision(&a[1], dev, PrecisionConfig::dense(dt), Some(std::env::var("LFM_KV").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))).expect("load");
     eprintln!("загрузка {:.1} с", t.elapsed().as_secs_f64());
     let n: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(32);
     let ids: Vec<u32> = match a.iter().position(|x| x == "--prompt-ids") {
@@ -30,9 +36,22 @@ fn main() {
         let b: Vec<u8> = lg.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&a[i + 1], b).unwrap();
     }
+    if std::env::var_os("LFM_PPROF").is_some() {
+        // профиль префилла по операциям (отдельный прогон промпта)
+        for _ in 0..2 {
+            let mut kv = p.model.make_kv_cache(1, ids.len() + 1).unwrap();
+            let t = synaptix_core::tensor::Tensor::from_vec(ids.clone(), vec![1usize, ids.len()], Device::Cpu).unwrap();
+            synaptix_llm_common::model::set_prefill_prof(true);
+            let t0 = std::time::Instant::now();
+            synaptix_core::grad::no_grad(|| p.model.forward(&t, &mut kv)).unwrap();
+            eprintln!("префилл {} ток.: {} мс", ids.len(), t0.elapsed().as_millis());
+            synaptix_llm_common::model::set_prefill_prof(false);
+            eprintln!("{}", synaptix_llm_common::model::prefill_prof_report_and_clear());
+        }
+    }
     let prof = std::env::var_os("LFM_PROF").is_some();
     synaptix_llm_common::model::set_decode_prof(prof);
-    let (out, st) = p.generate(&ids, GenerationConfig { max_new_tokens: n, temperature: 0.0, ..Default::default() }).expect("gen");
+    let (out, st) = p.generate(&ids, GenerationConfig { max_new_tokens: n, temperature: 0.0, max_seq: std::env::var("LFM_KV").ok().and_then(|v| v.parse().ok()), ..Default::default() }).expect("gen");
     if a.iter().any(|x| x == "--ids") {
         println!("{ids:?}\n{out:?}");
     }

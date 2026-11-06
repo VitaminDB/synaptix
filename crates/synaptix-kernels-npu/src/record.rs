@@ -301,7 +301,10 @@ impl Builder {
             return Err(SynaptixError::Other("NPU: int8-вес не загружен".into()));
         };
         if r.origin != Origin::Param || inp.v.bytes < n * k {
-            return Err(SynaptixError::Unsupported("NPU: int8-вес должен быть параметром модели"));
+            return Err(SynaptixError::Other(format!(
+                "NPU: int8-вес [{n}×{k}] должен быть параметром модели (происхождение {:?}, {} байт)",
+                r.origin, inp.v.bytes
+            )));
         }
         let fp = r.fingerprint(inp.v.bytes);
         let quant = Quant::Axis { axis: 0, scales: scales.iter().map(|&s| (s, 0)).collect() };

@@ -24,3 +24,4 @@ rayon              = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-npu = { workspace = true }

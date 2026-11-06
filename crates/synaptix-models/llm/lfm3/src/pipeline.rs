@@ -1,10 +1,8 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
-use synaptix_core::tensor::Tensor;
 use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 
@@ -129,65 +127,25 @@ impl Lfm3Pipeline {
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
-    fn eos_set(&self, override_eos: Option<u32>) -> HashSet<u32> {
-        match override_eos {
-            Some(e) => HashSet::from([e]),
-            None => self.config.eos_ids().into_iter().collect(),
-        }
-    }
-
     /// Greedy/temperature generate. Возвращает только новые токены (без prompt).
     pub fn generate(
         &self,
         prompt_ids: &[u32],
         gen_cfg: GenerationConfig,
     ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
-        if prompt_ids.is_empty() {
-            return Err(PipelineError::Tokenize("empty prompt".into()));
-        }
-
-        let eos = self.eos_set(gen_cfg.eos_token_id);
-        let device = self.model.device;
-        let kv_max = gen_cfg.max_seq.unwrap_or(prompt_ids.len() + gen_cfg.max_new_tokens);
-        let mut kv = self
-            .model
-            .make_kv_cache(1, kv_max)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let mut rng_state = gen_cfg.seed;
-
-        let prompt_tensor =
-            Tensor::from_vec(prompt_ids.to_vec(), vec![1usize, prompt_ids.len()], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let t0 = std::time::Instant::now();
-        let logits = synaptix_core::grad::no_grad(|| self.model.forward(&prompt_tensor, &mut kv))
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let prefill_ms = t0.elapsed().as_millis();
-
-        let mut new_tokens = Vec::with_capacity(gen_cfg.max_new_tokens);
-        let mut tok = sample_logits(&logits, gen_cfg.temperature, &mut rng_state)?;
-        new_tokens.push(tok);
-
-        let dec_t0 = std::time::Instant::now();
-        for _ in 1..gen_cfg.max_new_tokens {
-            if eos.contains(&tok) {
-                break;
-            }
-            let next = Tensor::from_vec(vec![tok], vec![1usize, 1], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            let logits = synaptix_core::grad::no_grad(|| self.model.forward(&next, &mut kv))
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            tok = sample_logits(&logits, gen_cfg.temperature, &mut rng_state)?;
-            new_tokens.push(tok);
-        }
-        let decode_ms = dec_t0.elapsed().as_millis();
-
-        let stats = GenerationStats {
-            prompt_tokens: prompt_ids.len(),
-            new_tokens: new_tokens.len(),
-            prefill_ms,
-            decode_ms,
+        // Общий генератор (как у службы): на NPU — пошаговый граф декода, на CPU — префилл чанком.
+        let cfg = synaptix_llm_common::GenerationConfig {
+            max_new_tokens: gen_cfg.max_new_tokens,
+            temperature: gen_cfg.temperature,
+            seed: gen_cfg.seed,
+            eos_token_id: gen_cfg.eos_token_id,
+            max_seq: gen_cfg.max_seq,
+            ..Default::default()
         };
-        Ok((new_tokens, stats))
+        let cfg = self.common_cfg_with_eos(cfg);
+        synaptix_llm_common::generate::generate(&self.model, prompt_ids, &cfg)
+            .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
+            .map_err(|e| PipelineError::Forward(e.to_string()))
     }
 
     /// Стоп-токены общего декодера: если вызывающий их не задал — все EOS
@@ -306,44 +264,6 @@ impl Lfm3Pipeline {
             .map(|(ids, st)| (ids, GenerationStats::from_common(st)))
             .map_err(|e| PipelineError::Forward(e.to_string()))
     }
-}
-
-fn sample_logits(logits: &Tensor, temperature: f32, rng_state: &mut u64) -> Result<u32, PipelineError> {
-    let l = logits
-        .to_dtype(DType::F32)
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_vec1::<f32>())
-        .map_err(|e| PipelineError::Forward(e.to_string()))?;
-    if temperature <= 0.0 {
-        let (am, _) = l
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |(ai, av), (i, &v)| if v > av { (i, v) } else { (ai, av) });
-        return Ok(am as u32);
-    }
-    let inv_t = 1.0 / temperature;
-    let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = l.iter().map(|&v| ((v - max) * inv_t).exp()).collect();
-    let sum: f32 = probs.iter().sum();
-    let inv_sum = 1.0 / sum.max(1.0e-30);
-    for p in &mut probs {
-        *p *= inv_sum;
-    }
-    let u = next_uniform(rng_state);
-    let mut cum = 0.0_f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cum += p;
-        if u < cum {
-            return Ok(i as u32);
-        }
-    }
-    Ok((probs.len() - 1) as u32)
-}
-
-fn next_uniform(state: &mut u64) -> f32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    let r = (*state >> 11) as u64;
-    (r as f32) / (1u64 << 53) as f32
 }
 
 #[derive(Debug, thiserror::Error)]

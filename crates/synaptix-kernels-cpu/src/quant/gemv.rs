@@ -34,10 +34,19 @@ pub fn x_rows_f32(dt: DType, bytes: &[u8], off: usize, m: usize, k: usize) -> Re
     Ok(xf)
 }
 
+fn i8mm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::q8mm::available() && std::env::var_os("SYNAPTIX_NO_I8MM").is_none())
+}
+
 pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
     let (n, k) = (view.n, view.k);
     debug_assert_eq!(out.len(), m * n);
     if view.dtype == DType::Q8Row && k % super::q8dot::QK == 0 {
+        if m >= PREFILL_M && i8mm_on() {
+            super::q8mm::gemm(view, xf, m, out);
+            return;
+        }
         gemm_q8row(view, xf, m, out);
         return;
     }
@@ -194,6 +203,30 @@ pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage,
     let packed = w.packed_arc().ok_or(SynaptixError::Unsupported("cpu linear_quant: packed освобождён"))?;
     let view = weight_view(w, &packed, w.scales_opt())?;
     let xb = cpu(x_st, "cpu linear_quant: x не на CPU")?.as_bytes();
+    if view.dtype == DType::Q8Row && m >= PREFILL_M && w.k() % super::q8dot::QK == 0 && i8mm_on() {
+        // Префилл i8mm: строки читаются и выход пишется прямо в типе тензора — без
+        // промежуточных F32-буферов всей матрицы.
+        let (k, n, xoff, ooff) = (w.k(), w.n(), x_lo.offset(), o_lo.offset());
+        let ob = cpu_mut(o_st, "cpu linear_quant: out не на CPU")?.as_bytes_mut();
+        let es = dt.bytes_for_numel(1);
+        let optr = blocked::SendPtr::new(ob.as_mut_ptr() as *mut f32);
+        let olen = ob.len();
+        super::q8mm::gemm_with(&view, m, &|i, r| { let _ = to_f32(dt, xb, xoff + i * k, r); }, &|i, j, v| {
+            let e = ooff + i * n + j;
+            debug_assert!((e + 1) * es <= olen);
+            // SAFETY: каждый элемент (i, j) пишет одна задача; границы — по out_dims_check.
+            unsafe {
+                let p = (optr.ptr() as *mut u8).add(e * es);
+                match dt {
+                    DType::BF16 => (p as *mut u16).write_unaligned(half::bf16::from_f32(v).to_bits()),
+                    DType::F16 => (p as *mut u16).write_unaligned(half::f16::from_f32(v).to_bits()),
+                    _ => (p as *mut f32).write_unaligned(v),
+                }
+            }
+        });
+        let _ = olen;
+        return Ok(());
+    }
     let xf = x_rows_f32(dt, xb, x_lo.offset(), m, w.k())?;
     let mut of = vec![0f32; m * w.n()];
     gemm_quant_f32(&view, &xf, m, &mut of);

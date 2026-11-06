@@ -245,6 +245,8 @@ pub struct ShortConv {
     taps: Vec<Tensor>,
     /// Все отводы одним тензором `[1, k, H]` — шаг декода одной операцией.
     taps_all: Tensor,
+    /// Отводы на хосте `[k, H]` (F32) — слитая свёртка на CPU.
+    taps_host: std::sync::Arc<Vec<f32>>,
     k: usize,
     hidden: usize,
 }
@@ -1176,7 +1178,13 @@ impl DecoderModel {
         embed_dtype: DType,
         rope_capacity: usize,
     ) -> Result<Self, ModelError> {
-        Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity)
+        let f = || Self::build_ext(cfg, weights, device, None, compute, attn_w, mlp_w, lm_head_dtype, embed_dtype, rope_capacity);
+        // На NPU веса — параметры графа (статичные буферы контекста), иначе
+        // int8-матрицы считались бы входами шага.
+        if matches!(device, Device::Npu(_)) {
+            return synaptix_core::backend::with_param_upload(f);
+        }
+        f()
     }
 
     /// Авто-выбор резидент/offload для генерации. Пробует резидентную загрузку
@@ -1487,7 +1495,9 @@ impl DecoderModel {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let taps_all = Tensor::cat(&taps.iter().collect::<Vec<_>>(), 1).map_err(|e| ModelError::Load(e.to_string()))?;
+                    let taps_host: Vec<f32> = (0..k).flat_map(|j| (0..hid).map(move |c| (j, c))).map(|(j, c)| w[c * k + j]).collect();
                     Mixer::Conv(ShortConv {
+                        taps_host: std::sync::Arc::new(taps_host),
                         in_proj: qlin(&key("short_conv.in_proj.weight"), attn_w)?,
                         out_proj: qlin(&key("short_conv.out_proj.weight"), attn_w)?,
                         taps,
@@ -2964,7 +2974,7 @@ impl DecoderModel {
         !self.lora_active()
             && matches!(self.device, Device::Npu(_))
             && self.blocks_all_resident()
-            && self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Full(_)) && b.moe.is_none())
+            && self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Full(_) | Mixer::Conv(_)) && b.moe.is_none())
     }
 
     pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
@@ -4251,6 +4261,7 @@ impl FullAttn {
                 Some(g) => prof(dev, "attn_gate", || attn.mul(&g.sigmoid()?)).coerr()?,
                 None => attn,
             };
+            let attn = self.apply_head_gate(attn, h, b, 1)?;
             let attn = attn.reshape(vec![b, 1, nh * hd]).coerr()?;
             return prof(dev, "attn_oproj", || self.o_proj.forward(&attn));
         }
@@ -4288,8 +4299,20 @@ impl FullAttn {
             Some(g) => prof(dev, "attn_gate", || attn.mul(&g.sigmoid()?)).coerr()?,
             None => attn,
         };
+        let attn = self.apply_head_gate(attn, h, b, 1)?;
         let attn = attn.reshape(vec![b, 1, nh * hd]).coerr()?;
         prof(dev, "attn_oproj", || self.o_proj.forward(&attn))
+    }
+
+    /// LFM3: одно число на голову — `attn [B, S, nh, hd] ⊙ sigmoid(gate_proj(h)) [B, S, nh, 1]`.
+    fn apply_head_gate(&self, attn: Tensor, h: &Tensor, b: usize, s: usize) -> Result<Tensor, ModelError> {
+        match &self.head_gate {
+            Some(gp) => {
+                let g = gp.forward(h)?.reshape(vec![b, s, self.num_heads, 1]).coerr()?.sigmoid().coerr()?;
+                attn.broadcast_mul(&g).coerr()
+            }
+            None => Ok(attn),
+        }
     }
 
     /// Внимание декода слитыми ядрами: групповой GEMV q/k/v от готовой
@@ -5211,7 +5234,96 @@ pub mod lora;
 pub mod train_access;
 
 
+/// Чтение/запись элементов F32/F16/BF16 из сырых байт.
+fn host_read(dt: DType, b: &[u8], i: usize) -> f32 {
+    match dt {
+        DType::BF16 => f32::from_bits((u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32) << 16),
+        DType::F16 => half::f16::from_le_bytes([b[2 * i], b[2 * i + 1]]).to_f32(),
+        _ => f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]),
+    }
+}
+
+fn host_write(dt: DType, b: &mut [u8], i: usize, v: f32) {
+    match dt {
+        DType::BF16 => b[2 * i..2 * i + 2].copy_from_slice(&half::bf16::from_f32(v).to_le_bytes()),
+        DType::F16 => b[2 * i..2 * i + 2].copy_from_slice(&half::f16::from_f32(v).to_le_bytes()),
+        _ => b[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes()),
+    }
+}
+
 impl ShortConv {
+    /// Слитая свёртка на CPU: `y = C ⊙ conv(B ⊙ x)` и сдвиг состояния за один проход,
+    /// параллельно по строкам времени. `None` — не CPU/не тот тип (общий путь тензорами).
+    fn forward_host(&self, bcx: &Tensor, st: &mut ConvState) -> Result<Option<Tensor>, ModelError> {
+        use rayon::prelude::*;
+        let dt = bcx.dtype();
+        if !bcx.device().is_cpu() || !matches!(dt, DType::F32 | DType::F16 | DType::BF16) || !st.state.device().is_cpu() {
+            return Ok(None);
+        }
+        let bcx = bcx.contiguous().coerr()?;
+        let (bsz, s, hid, k) = (bcx.dims()[0], bcx.dims()[1], self.hidden, self.k);
+        let Some(src) = bcx.storage().as_cpu() else { return Ok(None) };
+        let es = dt.bytes_for_numel(1);
+        let off = bcx.layout().offset() * es;
+        let src = &src.as_bytes()[off..off + bsz * s * 3 * hid * es];
+        let prev: Vec<f32> = st.state.to_dtype(DType::F32).coerr()?.flatten_all().coerr()?.to_vec1::<f32>().coerr()?; // [B, k−1, H]
+        let taps = &self.taps_host;
+        let mut out = vec![0u8; bsz * s * hid * es];
+        let mut new_state = vec![0f32; bsz * (k - 1) * hid];
+        const RT: usize = 16;
+        for bi in 0..bsz {
+            let src_b = &src[bi * s * 3 * hid * es..(bi + 1) * s * 3 * hid * es];
+            let prev_b = &prev[bi * (k - 1) * hid..(bi + 1) * (k - 1) * hid];
+            // B⊙x строки t (t < 0 — из состояния)
+            let bx = |t: isize, c: usize| -> f32 {
+                if t < 0 {
+                    prev_b[((k - 1) as isize + t) as usize * hid + c]
+                } else {
+                    let r = t as usize * 3 * hid;
+                    host_read(dt, src_b, r + c) * host_read(dt, src_b, r + 2 * hid + c)
+                }
+            };
+            let out_b = &mut out[bi * s * hid * es..(bi + 1) * s * hid * es];
+            out_b.par_chunks_mut(RT * hid * es).enumerate().for_each(|(ci, oc)| {
+                let t0 = ci * RT;
+                let rows = oc.len() / (hid * es);
+                // окно B⊙x для строк [t0 − (k−1), t0 + rows)
+                let wl = rows + k - 1;
+                let mut win = vec![0f32; wl * hid];
+                for wr in 0..wl {
+                    let t = t0 as isize - (k - 1) as isize + wr as isize;
+                    for c in 0..hid {
+                        win[wr * hid + c] = bx(t, c);
+                    }
+                }
+                let mut acc = vec![0f32; hid];
+                for r in 0..rows {
+                    acc.iter_mut().for_each(|a| *a = 0.0);
+                    for j in 0..k {
+                        let wrow = &win[(r + j) * hid..(r + j + 1) * hid];
+                        let trow = &taps[j * hid..(j + 1) * hid];
+                        for ((a, &v), &w) in acc.iter_mut().zip(wrow).zip(trow) {
+                            *a += v * w;
+                        }
+                    }
+                    let cr = (t0 + r) * 3 * hid + hid;
+                    for (c, &a) in acc.iter().enumerate() {
+                        host_write(dt, oc, r * hid + c, host_read(dt, src_b, cr + c) * a);
+                    }
+                }
+            });
+            let ns = &mut new_state[bi * (k - 1) * hid..(bi + 1) * (k - 1) * hid];
+            for r in 0..k - 1 {
+                let t = s as isize - (k - 1) as isize + r as isize;
+                for c in 0..hid {
+                    ns[r * hid + c] = bx(t, c);
+                }
+            }
+        }
+        st.state = Tensor::from_vec(new_state, vec![bsz, k - 1, hid], Device::Cpu).coerr()?;
+        Ok(Some(Tensor::from_raw_bytes(out, vec![bsz, s, hid], dt, Device::Cpu).coerr()?))
+    }
+
     fn bytes(&self) -> usize {
         self.in_proj.bytes() + self.out_proj.bytes() + self.taps.iter().map(|t| tensor_bytes(Some(t))).sum::<usize>()
     }
@@ -5222,6 +5334,7 @@ impl ShortConv {
             out_proj: self.out_proj.to_device(dev)?,
             taps: self.taps.iter().map(|t| t.to_device(dev).coerr()).collect::<Result<_, _>>()?,
             taps_all: self.taps_all.to_device(dev).coerr()?,
+            taps_host: self.taps_host.clone(),
             k: self.k,
             hidden: self.hidden,
         })
@@ -5234,6 +5347,9 @@ impl ShortConv {
         };
         let (b, s, hid) = (h.dims()[0], h.dims()[1], self.hidden);
         let bcx = self.in_proj.forward(h)?; // [B, S, 3H]
+        if let Some(y) = self.forward_host(&bcx, st)? {
+            return self.out_proj.forward(&y);
+        }
         let part = |i: usize| -> Result<Tensor, ModelError> { bcx.narrow(2, i * hid, hid).coerr()?.contiguous().coerr() };
         let (bg, cg, x) = (part(0)?, part(1)?, part(2)?);
         let bx = bg.mul(&x).coerr()?;
