@@ -67,7 +67,7 @@ Native ports, each validated against its upstream reference:
 | **Image** | FLUX.1, FLUX.2 (dev, klein 4B / 9B), Qwen-Image 2.1 (text-to-image, editing by up to ten references, transparent RGBA), Qwen-Image and Qwen-Image-Edit (2509 / 2511: edit an image, or compose up to four references), SDXL (txt2img and img2img), Depth Anything V2 |
 | **Video** | LTX-2.3 (22B), MiniMax-H3 (video with synchronized audio; image / video / audio references — Ref2VA) |
 | **Speech** | Whisper, GigaAM (ASR), Sortformer (diarization) |
-| **Text-to-speech** | VoxCPM, OmniVoice, VibeVoice (long-form, multi-speaker), Audio8-TTS (23 languages, voice cloning, 44.1 kHz), Supertonic 3 (31 languages, 10 voices), Leokani-tts 7M (English, CPU/NPU), F5-TTS Russian (8 versions, voice cloning, stress marks) |
+| **Text-to-speech** | VoxCPM, OmniVoice, VibeVoice (long-form, multi-speaker), Audio8-TTS (23 languages, voice cloning, 44.1 kHz), Supertonic 3 (31 languages, 10 voices), Leokani-tts 7M (English, CPU/NPU), F5-TTS Russian (8 versions, voice cloning, stress marks), Silero TTS v5 (12 packages: Russian with auto stress & homographs, CIS/Caucasian/Turkic languages incl. Kazakh; CPU RTF ≈ 0.01) |
 | **Music** | YuE2 (song from style and lyrics through an editable ABC score; covers of a recording), SheetSage2 (recording → lead sheet in ABC: melody, chords, beats, key, sections), ACE-Step (generate, cover, edit, extend, extract, repaint) |
 | **Embeddings / rerank** | BGE-M3, BGE-reranker-v2-m3 |
 
