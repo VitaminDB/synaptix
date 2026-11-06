@@ -3,7 +3,7 @@
 //! значения 0..31: младший полубайт плюс бит `qh` (для четверти c: 2c — первые 32, 2c + 1 — вторые).
 
 use super::q8dot::QK;
-use synaptix_core::quant::ggml::q4k_scale_min;
+use synaptix_core::quant::ggml::q4k_scale_min; // скалярный путь
 
 pub const QK_K: usize = 256;
 pub const BLOCK_BYTES: usize = 176;
@@ -54,46 +54,44 @@ unsafe fn sdot(acc: std::arch::aarch64::int32x4_t, a: std::arch::aarch64::int8x1
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_dotprod(xq: &[i8], xs: &[f32], xsum: &[f32], w: &[u8]) -> f32 {
     use std::arch::aarch64::*;
+    use super::q4kdot::{fold8, unpack_scales};
     let nsb = xq.len() / QK_K;
     let xp = xq.as_ptr();
     let m4 = vdupq_n_u8(0x0F);
     let one = vdupq_n_u8(1);
     let two = vdupq_n_u8(2);
     let z = vdupq_n_s32(0);
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut mins = 0f32;
+    let mut acc = vdupq_n_f32(0.0);
+    let mut macc = vdupq_n_f32(0.0);
+    let (mut dsc, mut dmn) = ([0f32; 8], [0f32; 8]);
+    let mut s = [z; 8];
     for sb in 0..nsb {
         let blk = w.as_ptr().add(sb * BLOCK_BYTES);
         let bs = std::slice::from_raw_parts(blk, BLOCK_BYTES);
-        let (d, dmin) = (f16_at(bs, 0), f16_at(bs, 2));
-        let sc = &bs[4..16];
+        unpack_scales(f16_at(bs, 0), f16_at(bs, 2), &bs[4..16], &mut dsc, &mut dmn);
         let mut h0 = vld1q_u8(blk.add(16));
         let mut h1 = vld1q_u8(blk.add(32));
         let qs = blk.add(48);
+        let xb = xp.add(sb * QK_K);
         for c in 0..4 {
             let v0 = vld1q_u8(qs.add(c * 32));
             let v1 = vld1q_u8(qs.add(c * 32 + 16));
-            // пятый бит: младшие значения — бит 0 текущего qh, старшие — бит 1
             let l0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v0, m4), vshlq_n_u8(vandq_u8(h0, one), 4)));
             let l1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v1, m4), vshlq_n_u8(vandq_u8(h1, one), 4)));
             let g0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v0, 4), vshlq_n_u8(vandq_u8(h0, two), 3)));
             let g1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v1, 4), vshlq_n_u8(vandq_u8(h1, two), 3)));
             h0 = vshrq_n_u8(h0, 2);
             h1 = vshrq_n_u8(h1, 2);
-            let b0 = sb * 8 + 2 * c;
-            let x0 = xp.add(b0 * QK);
-            let x1 = xp.add((b0 + 1) * QK);
-            let s0 = sdot(sdot(z, l0, vld1q_s8(x0)), l1, vld1q_s8(x0.add(16)));
-            let s1 = sdot(sdot(z, g0, vld1q_s8(x1)), g1, vld1q_s8(x1.add(16)));
-            let (sc0, m0) = q4k_scale_min(2 * c, sc);
-            let (sc1, m1) = q4k_scale_min(2 * c + 1, sc);
-            acc0 = vfmaq_n_f32(acc0, vcvtq_f32_s32(s0), d * sc0 as f32 * *xs.get_unchecked(b0));
-            acc1 = vfmaq_n_f32(acc1, vcvtq_f32_s32(s1), d * sc1 as f32 * *xs.get_unchecked(b0 + 1));
-            mins += dmin * (m0 as f32 * *xsum.get_unchecked(b0) + m1 as f32 * *xsum.get_unchecked(b0 + 1));
+            let x0 = xb.add(c * 64);
+            s[2 * c] = sdot(sdot(z, l0, vld1q_s8(x0)), l1, vld1q_s8(x0.add(16)));
+            s[2 * c + 1] = sdot(sdot(z, g0, vld1q_s8(x0.add(32))), g1, vld1q_s8(x0.add(48)));
         }
+        let o = sb * 8;
+        acc = fold8(acc, &s, &dsc, xs.as_ptr().add(o));
+        macc = vfmaq_f32(macc, vld1q_f32(dmn.as_ptr()), vld1q_f32(xsum.as_ptr().add(o)));
+        macc = vfmaq_f32(macc, vld1q_f32(dmn.as_ptr().add(4)), vld1q_f32(xsum.as_ptr().add(o + 4)));
     }
-    vaddvq_f32(vaddq_f32(acc0, acc1)) - mins
+    vaddvq_f32(acc) - vaddvq_f32(macc)
 }
 
 /// Строка Q5_K · активации (`xq`, `xs`, `xsum` по блокам 32, см. [`super::q4kdot::block_sums`]).

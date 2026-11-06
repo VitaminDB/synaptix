@@ -57,6 +57,32 @@ unsafe fn sdot(acc: std::arch::aarch64::int32x4_t, a: std::arch::aarch64::int8x1
     acc
 }
 
+/// Шкалы и минимумы восьми подблоков суперблока, уже умноженные на `d` и `dmin`.
+#[inline(always)]
+pub(crate) fn unpack_scales(d: f32, dmin: f32, q: &[u8], dsc: &mut [f32; 8], dmn: &mut [f32; 8]) {
+    for j in 0..4 {
+        dsc[j] = d * (q[j] & 63) as f32;
+        dmn[j] = dmin * (q[j + 4] & 63) as f32;
+    }
+    for j in 4..8 {
+        dsc[j] = d * ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)) as f32;
+        dmn[j] = dmin * ((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) as f32;
+    }
+}
+
+/// Свести 8 сумм подблоков (`int32x4` каждая) и добавить к аккумулятору:
+/// `acc += Σ_j sum(s[j]) · dsc[j] · xs[j]` векторно (vpaddq вместо 8 горизонтальных сумм).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn fold8(acc: std::arch::aarch64::float32x4_t, s: &[std::arch::aarch64::int32x4_t; 8], dsc: &[f32; 8], xs: *const f32) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let q0 = vpaddq_s32(vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3]));
+    let q1 = vpaddq_s32(vpaddq_s32(s[4], s[5]), vpaddq_s32(s[6], s[7]));
+    let f0 = vmulq_f32(vld1q_f32(dsc.as_ptr()), vld1q_f32(xs));
+    let f1 = vmulq_f32(vld1q_f32(dsc.as_ptr().add(4)), vld1q_f32(xs.add(4)));
+    vfmaq_f32(vfmaq_f32(acc, vcvtq_f32_s32(q0), f0), vcvtq_f32_s32(q1), f1)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_dotprod(xq: &[i8], xs: &[f32], xsum: &[f32], w: &[u8]) -> f32 {
@@ -65,35 +91,29 @@ unsafe fn dot_dotprod(xq: &[i8], xs: &[f32], xsum: &[f32], w: &[u8]) -> f32 {
     let xp = xq.as_ptr();
     let m4 = vdupq_n_u8(0x0F);
     let z = vdupq_n_s32(0);
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut mins = 0f32;
+    let mut acc = vdupq_n_f32(0.0);
+    let mut macc = vdupq_n_f32(0.0);
+    let (mut dsc, mut dmn) = ([0f32; 8], [0f32; 8]);
+    let mut s = [z; 8];
     for sb in 0..nsb {
         let blk = w.as_ptr().add(sb * BLOCK_BYTES);
         let bs = std::slice::from_raw_parts(blk, BLOCK_BYTES);
-        let (d, dmin) = (f16_at(bs, 0), f16_at(bs, 2));
-        let sc = &bs[4..16];
+        unpack_scales(f16_at(bs, 0), f16_at(bs, 2), &bs[4..16], &mut dsc, &mut dmn);
         let qs = blk.add(16);
+        let xb = xp.add(sb * QK_K);
         for c in 0..4 {
             let v0 = vld1q_u8(qs.add(c * 32));
             let v1 = vld1q_u8(qs.add(c * 32 + 16));
-            let l0 = vreinterpretq_s8_u8(vandq_u8(v0, m4));
-            let l1 = vreinterpretq_s8_u8(vandq_u8(v1, m4));
-            let h0 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
-            let h1 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
-            let b0 = sb * 8 + 2 * c;
-            let x0 = xp.add(b0 * QK);
-            let x1 = xp.add((b0 + 1) * QK);
-            let s0 = sdot(sdot(z, l0, vld1q_s8(x0)), l1, vld1q_s8(x0.add(16)));
-            let s1 = sdot(sdot(z, h0, vld1q_s8(x1)), h1, vld1q_s8(x1.add(16)));
-            let (sc0, m0) = q4k_scale_min(2 * c, sc);
-            let (sc1, m1) = q4k_scale_min(2 * c + 1, sc);
-            acc0 = vfmaq_n_f32(acc0, vcvtq_f32_s32(s0), d * sc0 as f32 * *xs.get_unchecked(b0));
-            acc1 = vfmaq_n_f32(acc1, vcvtq_f32_s32(s1), d * sc1 as f32 * *xs.get_unchecked(b0 + 1));
-            mins += dmin * (m0 as f32 * *xsum.get_unchecked(b0) + m1 as f32 * *xsum.get_unchecked(b0 + 1));
+            let x0 = xb.add(c * 64);
+            s[2 * c] = sdot(sdot(z, vreinterpretq_s8_u8(vandq_u8(v0, m4)), vld1q_s8(x0)), vreinterpretq_s8_u8(vandq_u8(v1, m4)), vld1q_s8(x0.add(16)));
+            s[2 * c + 1] = sdot(sdot(z, vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)), vld1q_s8(x0.add(32))), vreinterpretq_s8_u8(vshrq_n_u8(v1, 4)), vld1q_s8(x0.add(48)));
         }
+        let o = sb * 8;
+        acc = fold8(acc, &s, &dsc, xs.as_ptr().add(o));
+        macc = vfmaq_f32(macc, vld1q_f32(dmn.as_ptr()), vld1q_f32(xsum.as_ptr().add(o)));
+        macc = vfmaq_f32(macc, vld1q_f32(dmn.as_ptr().add(4)), vld1q_f32(xsum.as_ptr().add(o + 4)));
     }
-    vaddvq_f32(vaddq_f32(acc0, acc1)) - mins
+    vaddvq_f32(acc) - vaddvq_f32(macc)
 }
 
 /// Строка Q4_K (`k/256` суперблоков) · активации (`xq`, `xs`, `xsum` по блокам 32).

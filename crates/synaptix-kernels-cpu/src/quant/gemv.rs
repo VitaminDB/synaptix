@@ -7,7 +7,7 @@ use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::storage::{CpuBuf, Storage};
 
 use super::dequant::WeightView;
-use crate::common::{cpu, cpu_mut, from_f32, is_half, par_chunks_cost, to_f32};
+use crate::common::{cpu, cpu_mut, from_f32, is_half, par_chunks_cost, par_chunks_fine, to_f32};
 use crate::gemm::blocked;
 use crate::gemm::simd_dot::dot_f32;
 
@@ -69,7 +69,7 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
             super::q4kdot::block_sums(&xq[i * k..(i + 1) * k], &xs[i * nb..(i + 1) * nb], &mut xsum[i * nb..(i + 1) * nb]);
         }
         let op = blocked::SendPtr::new(out.as_mut_ptr());
-        par_chunks_cost(n, k * (m + 1) / 16, |n0, n1| {
+        par_chunks_fine(n, 16, |n0, n1| {
             for j in n0..n1 {
                 let w = view.row_bytes_of(j);
                 for i in 0..m {
@@ -91,7 +91,7 @@ pub fn gemm_quant_f32(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) 
             quantize_act(&xf[i * k..(i + 1) * k], &mut xq[i * k..(i + 1) * k], &mut xs[i * nb..(i + 1) * nb]);
         }
         let op = blocked::SendPtr::new(out.as_mut_ptr());
-        par_chunks_cost(n, k * (m + 1) / 16, |n0, n1| {
+        par_chunks_fine(n, 16, |n0, n1| {
             for j in n0..n1 {
                 let w = view.row_bytes_of(j);
                 for i in 0..m {
@@ -190,6 +190,7 @@ fn gemm_q8row(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
         }
     });
 }
+
 
 #[inline]
 pub fn dot_f32_i8(x: &[f32], q: &[u8]) -> f32 {

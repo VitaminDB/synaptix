@@ -33,6 +33,22 @@ pub fn par_chunks(n: usize, min_chunk: usize, f: impl Fn(usize, usize) + Sync) {
     });
 }
 
+/// Как [`par_chunks`], но кусков в 8 раз больше, чем потоков: на big.LITTLE (телефон: 1+3
+/// быстрых и 4 медленных ядра) равные куски по числу потоков ждут медленные ядра, а мелкие
+/// перехватывают быстрые (work stealing).
+pub fn par_chunks_fine(n: usize, min_chunk: usize, f: impl Fn(usize, usize) + Sync) {
+    let chunk = (n / (threads() * 8)).max(min_chunk).max(1);
+    if n <= chunk {
+        f(0, n);
+        return;
+    }
+    use rayon::prelude::*;
+    (0..n.div_ceil(chunk)).into_par_iter().for_each(|i| {
+        let a = i * chunk;
+        f(a, (a + chunk).min(n));
+    });
+}
+
 pub fn par_chunks_cost(n: usize, ns_per_item: usize, f: impl Fn(usize, usize) + Sync) {
     let min_chunk = (60_000 / ns_per_item.max(1)).max(1);
     par_chunks(n, min_chunk, f)
