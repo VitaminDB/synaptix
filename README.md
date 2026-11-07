@@ -2,7 +2,6 @@
 
 [![Licence: GPL-3.0 or commercial](https://img.shields.io/badge/licence-GPL--3.0%20%7C%20commercial-blue)](#license)
 [![CUDA: NVRTC JIT](https://img.shields.io/badge/CUDA-NVRTC%20JIT-76b900?logo=nvidia&logoColor=white)](#building)
-[![Vibe-coded with Claude Code](https://img.shields.io/badge/vibe--coded-Claude%20Code-d97757)](#how-it-is-built)
 
 A native Rust engine for running and training neural networks — hand-written CUDA kernels
 compiled at runtime via NVRTC, with no PyTorch, no libtorch, and no Python runtime.
@@ -196,11 +195,11 @@ transcoded to SQ on load. SQ and ggml formats use the same portable kernels on e
 
 Young, single-author, and moving fast. The API is not stable; expect breaking changes.
 
-## How it is built
+## How it is tested
 
-Since spring 2026 I have been working in [Claude Code](https://claude.com/claude-code). Every
-number in this README was measured on my machine, and correctness is checked against reference
-implementations layer by layer rather than taken on the model's word.
+Every number in this README was measured on my machine, and correctness is checked against
+reference implementations layer by layer rather than taken on faith. Developed with
+the help of [Claude Code](https://claude.com/claude-code).
 
 ## Support
 
