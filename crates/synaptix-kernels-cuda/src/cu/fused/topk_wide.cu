@@ -13,6 +13,16 @@
 #define TW_MISSING 0xFFFFFFFFu
 #define TW_BINS 256
 
+// Атомик в гистограмму с агрегацией по варпу: оценки после relu почти все
+// одного порядка, старший байт у них общий, и 32 лейна били бы в одну
+// ячейку shared по очереди. Лейны с одинаковым бином складываются в одну
+// запись. Хвост цикла: неактивные лейны передают бин TW_BINS (не пишется).
+__device__ __forceinline__ void tw_hist_add(unsigned int* hist, unsigned int bin) {
+    unsigned int peers = __match_any_sync(0xFFFFFFFFu, bin);
+    unsigned int lane = threadIdx.x & 31u;
+    if (bin < TW_BINS && lane == (unsigned int)(__ffs(peers) - 1)) atomicAdd(&hist[bin], (unsigned int)__popc(peers));
+}
+
 extern "C" __global__ void topk_wide_f32(
     const float* __restrict__ scores,
     const unsigned int* __restrict__ valid,
@@ -43,9 +53,11 @@ extern "C" __global__ void topk_wide_f32(
     // Первый проход: гистограмма по старшим восьми битам.
     for (unsigned int b = tid; b < TW_BINS; b += bs) hist[b] = 0;
     __syncthreads();
-    for (unsigned int i = tid; i < n; i += bs) {
-        unsigned int bits = __float_as_uint(src[i]);
-        atomicAdd(&hist[bits >> 24], 1u);
+    for (unsigned int base = 0; base < n; base += bs) {
+        unsigned int i = base + tid;
+        unsigned int bin = TW_BINS;
+        if (i < n) bin = __float_as_uint(src[i]) >> 24;
+        tw_hist_add(hist, bin);
     }
     __syncthreads();
     if (tid == 0) {
@@ -68,9 +80,14 @@ extern "C" __global__ void topk_wide_f32(
     // Второй проход: уточняем порог внутри найденного бина.
     for (unsigned int b = tid; b < TW_BINS; b += bs) hist[b] = 0;
     __syncthreads();
-    for (unsigned int i = tid; i < n; i += bs) {
-        unsigned int bits = __float_as_uint(src[i]);
-        if ((bits >> 24) == hi_bin) atomicAdd(&hist[(bits >> 16) & 0xFFu], 1u);
+    for (unsigned int base = 0; base < n; base += bs) {
+        unsigned int i = base + tid;
+        unsigned int bin = TW_BINS;
+        if (i < n) {
+            unsigned int bits = __float_as_uint(src[i]);
+            if ((bits >> 24) == hi_bin) bin = (bits >> 16) & 0xFFu;
+        }
+        tw_hist_add(hist, bin);
     }
     __syncthreads();
     if (tid == 0) {
@@ -95,9 +112,14 @@ extern "C" __global__ void topk_wide_f32(
     // значения.
     for (unsigned int b = tid; b < TW_BINS; b += bs) hist[b] = 0;
     __syncthreads();
-    for (unsigned int i = tid; i < n; i += bs) {
-        unsigned int bits = __float_as_uint(src[i]);
-        if ((bits >> 16) == hi16) atomicAdd(&hist[(bits >> 8) & 0xFFu], 1u);
+    for (unsigned int base = 0; base < n; base += bs) {
+        unsigned int i = base + tid;
+        unsigned int bin = TW_BINS;
+        if (i < n) {
+            unsigned int bits = __float_as_uint(src[i]);
+            if ((bits >> 16) == hi16) bin = (bits >> 8) & 0xFFu;
+        }
+        tw_hist_add(hist, bin);
     }
     __syncthreads();
     if (tid == 0) {

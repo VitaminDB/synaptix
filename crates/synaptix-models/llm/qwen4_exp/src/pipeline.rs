@@ -916,7 +916,7 @@ impl Qwen4ExpPipeline {
             }
             // Пик хода позади: декод считает по горстке токенов, и кэшу можно
             // вернуться к потолку — на нём и держится скорость генерации.
-            cache.fit_to_vram(activation_reserve(&self.config, DECODE_TOKENS));
+            cache.fit_to_vram(decode_reserve(&self.config));
         }
 
         let decode_start = Instant::now();
@@ -1317,6 +1317,20 @@ fn layer_major_chunk(cfg: &Qwen4ExpConfig, device: Device, want: usize, stream_t
 fn is_oom<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string();
     s.contains("OUT_OF_MEMORY") || s.contains("out of memory") || s.contains(": OOM")
+}
+
+/// Запас VRAM на декоде: активации горстки токенов — мегабайты, и прежний
+/// пол в 2 ГБ (он для префилла) отнимал у кэша экспертов ~450 экспертов —
+/// на 200K контекста это заметная доля попаданий. На нехватку кэш всё равно
+/// отдаёт память через `Reclaimable`. `SYN_QWEN4EXP_DECODE_RESERVE_MB`.
+fn decode_reserve(cfg: &Qwen4ExpConfig) -> usize {
+    let floor_mb = std::env::var("SYN_QWEN4EXP_DECODE_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(768);
+    let hidden = cfg.hidden_size;
+    let per_token = cfg.hc_count.max(1) * hidden * 4 * 3 + cfg.moe.num_experts_per_tok * hidden * 2 * 5;
+    (floor_mb << 20) + DECODE_TOKENS * per_token
 }
 
 fn activation_reserve(cfg: &Qwen4ExpConfig, tokens: usize) -> usize {

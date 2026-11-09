@@ -10,7 +10,7 @@ use synaptix_core::error::{Result, SynaptixError};
 
 use crate::kernels::compile::{compile_module, load_fn};
 
-const BLOCK: u32 = 256;
+const BLOCK: u32 = 1024;
 
 pub struct TopkWideKernels {
     _module: Arc<CudaModule>,
