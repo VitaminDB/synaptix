@@ -23,6 +23,7 @@ serde_json      = { workspace = true }
 memmap2         = { workspace = true }
 tracing         = { workspace = true }
 safetensors     = { workspace = true }
+half            = { workspace = true }
 hound           = { workspace = true, optional = true }
 symphonia       = { workspace = true, optional = true }
 rubato          = { workspace = true, optional = true }

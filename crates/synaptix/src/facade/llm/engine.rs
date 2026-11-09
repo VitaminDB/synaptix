@@ -219,6 +219,7 @@ impl QuantPolicy {
             rules: Vec::new(),
             components: Vec::new(),
             deltas: None,
+            origin: None,
         }
     }
 
@@ -3188,6 +3189,7 @@ fn cpu_quant_request(
         rules: Vec::new(),
         components: Vec::new(),
         deltas: None,
+        origin: None,
     };
     Some(synaptix_io::weights::transcode::request(
         path,

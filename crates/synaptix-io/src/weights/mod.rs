@@ -1,3 +1,4 @@
+pub mod hf_origin;
 pub mod pinned_loader;
 pub mod safetensors;
 pub mod streaming_loader;

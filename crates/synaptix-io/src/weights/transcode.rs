@@ -74,7 +74,23 @@ pub struct TranscodeSpec {
     /// Слияние адаптеров LoRA: к матрицам из набора прибавляется `s·B·A`
     /// перед квантом (формат — `deltas.format` или прежний).
     pub deltas: Option<WeightDeltas>,
+    /// Внешний оригинал (каталог HF): квантованные в бандле веса, которые в
+    /// нём есть, перекодируются из него, а не из бандла (без двойного
+    /// кванта), — даже в тот же формат.
+    pub origin: Option<Origin>,
 }
+
+/// Оригинал весов для перекодировки (сравнение — по каталогу).
+#[derive(Debug, Clone)]
+pub struct Origin(pub Arc<super::hf_origin::HfOrigin>);
+
+impl PartialEq for Origin {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.dir() == other.0.dir()
+    }
+}
+
+impl Eq for Origin {}
 
 /// Добавка LoRA к одной матрице `[n, k]`: `s · B[n, r] · A[r, k]` (F32).
 #[derive(Clone)]
@@ -124,6 +140,7 @@ impl TranscodeSpec {
             rules: Vec::new(),
             components: Vec::new(),
             deltas: None,
+            origin: None,
         }
     }
 
@@ -196,6 +213,9 @@ impl TranscodeSpec {
         }
         if !self.components.is_empty() {
             k += &format!(",components={}", self.components.join("+"));
+        }
+        if let Some(o) = &self.origin {
+            k += &format!(",origin={}", o.0.dir().display());
         }
         k
     }
@@ -346,6 +366,8 @@ struct Item {
     target: DType,
     /// Добавка LoRA к матрице.
     delta: Option<WeightDelta>,
+    /// Оригинал, из которого брать срезы (если он покрывает тензор).
+    origin: Option<Origin>,
 }
 
 fn is_dense(dt: DType) -> bool {
@@ -363,6 +385,24 @@ fn target_ok(target: DType, n: usize, k: usize) -> bool {
     }
 }
 
+/// Есть ли тензор бандла в оригинале (стопка экспертов — по эксперту 0).
+fn origin_covers(o: &super::hf_origin::HfOrigin, name: &str) -> bool {
+    if let Some(p) = name.strip_suffix(".experts.gate_up_proj") {
+        return o.has(&format!("{p}.experts.0.gate_proj.weight"));
+    }
+    if let Some(p) = name.strip_suffix(".experts.down_proj") {
+        return o.has(&format!("{p}.experts.0.down_proj.weight"));
+    }
+    o.has(name)
+}
+
+/// Срез из оригинала в f32 на хосте (`None` — в оригинале его нет).
+fn origin_slice(spec_origin: Option<&Origin>, item: &Item, slice: usize) -> Option<Result<Vec<f32>>> {
+    let o = spec_origin?;
+    let (_, n, k) = item.dims;
+    o.0.bundle_slice(&item.name, slice, n, k)
+}
+
 fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
     let mut out = Vec::new();
     for name in loader.names() {
@@ -374,7 +414,7 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
             if let Some((dw, fmt)) = delta {
                 let target = fmt.unwrap_or(kind.dtype());
                 if dims.0 == 1 && (is_dense(target) || target_ok(target, dims.1, dims.2)) {
-                    out.push(Item { name: name.to_string(), dims, shape: vec![dims.1, dims.2], current: Some(kind), target, delta: Some(dw) });
+                    out.push(Item { name: name.to_string(), dims, shape: vec![dims.1, dims.2], current: Some(kind), target, delta: Some(dw), origin: None });
                     continue;
                 }
             }
@@ -382,11 +422,12 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
                 continue;
             }
             let Some(target) = spec.target_for(name, dims.0) else { continue };
-            if target == kind.dtype() || !target_ok(target, dims.1, dims.2) {
+            let from_origin = spec.origin.as_ref().is_some_and(|o| origin_covers(&o.0, name));
+            if (target == kind.dtype() && !from_origin) || !target_ok(target, dims.1, dims.2) {
                 continue;
             }
             let shape = if dims.0 == 1 { vec![dims.1, dims.2] } else { vec![dims.0, dims.1, dims.2] };
-            out.push(Item { name: name.to_string(), dims, shape, current: Some(kind), target, delta: None });
+            out.push(Item { name: name.to_string(), dims, shape, current: Some(kind), target, delta: None, origin: None });
             continue;
         }
         if let Some((dw, fmt)) = delta {
@@ -394,7 +435,7 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
                 if let [n, k] = shape.as_slice() {
                     let target = fmt.unwrap_or(dtype);
                     if is_dense(target) || target_ok(target, *n, *k) {
-                        out.push(Item { name: name.to_string(), dims: (1, *n, *k), shape: shape.clone(), current: None, target, delta: Some(dw) });
+                        out.push(Item { name: name.to_string(), dims: (1, *n, *k), shape: shape.clone(), current: None, target, delta: Some(dw), origin: None });
                         continue;
                     }
                 }
@@ -416,7 +457,14 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
         if !target_ok(target, dims.1, dims.2) {
             continue;
         }
-        out.push(Item { name: name.to_string(), dims, shape, current: None, target, delta: None });
+        out.push(Item { name: name.to_string(), dims, shape, current: None, target, delta: None, origin: None });
+    }
+    if let Some(o) = &spec.origin {
+        for it in &mut out {
+            if it.delta.is_none() && origin_covers(&o.0, &it.name) {
+                it.origin = Some(o.clone());
+            }
+        }
     }
     out
 }
@@ -424,6 +472,13 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
 /// Матрица среза в плотном виде на `device` (F16; с добавкой LoRA — F32).
 fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<Tensor> {
     let (slices, n, k) = item.dims;
+    if let Some(r) = origin_slice(item.origin.as_ref(), item, slice) {
+        let v = r?;
+        return Tensor::from_vec(v, vec![n, k], Device::Cpu)
+            .and_then(|t| t.to_device(device))
+            .and_then(|t| t.to_dtype(DType::F16))
+            .map_err(|e| IoError::Bundle(format!("{}: срез {slice} из оригинала: {e}", item.name)));
+    }
     let dense: Tensor = match item.current {
         Some(_) => {
             let qw = loader
@@ -480,7 +535,10 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
     let q4_k = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K);
     let q5_k = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q5K);
     if item.target == DType::Q8Row || q4_0 || q4_k || q5_k {
-        let host: Vec<f32> = match item.current {
+        let from_origin = origin_slice(item.origin.as_ref(), item, slice).transpose()?;
+        let host: Vec<f32> = match (from_origin, item.current) {
+            (Some(v), _) => v,
+            (None, cur) => match cur {
             Some(_) => {
                 let qw = loader
                     .load_quant_expert(&item.name, slice, device)
@@ -497,6 +555,7 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
                 let t = if slices == 1 { t } else { t.narrow(0, slice, 1).map_err(IoError::Core)? };
                 t.contiguous().and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?
             }
+            },
         };
         if q4_0 {
             return Ok((synaptix_core::quant::ggml::quantize_q4_0(&host, n, k), Vec::new()));

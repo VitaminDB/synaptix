@@ -24,6 +24,7 @@ pub struct QuantizeArgs {
     pub keep_quant: bool,
     pub device: String,
     pub calib: Option<PathBuf>,
+    pub origin: Option<PathBuf>,
     pub include: Vec<String>,
     pub vision: Option<String>,
     pub rule: Vec<String>,
@@ -140,7 +141,11 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let experts = if q8 { None } else { Some(main) };
-    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone(), deltas: None };
+    let origin = match &args.origin {
+        Some(d) => Some(synaptix_io::weights::transcode::Origin(synaptix_io::weights::hf_origin::HfOrigin::open(d)?)),
+        None => None,
+    };
+    let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone(), deltas: None, origin };
     if args.plan {
         let items = synaptix_io::weights::transcode::plan(&args.input, &spec)?;
         let mut g: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();

@@ -447,6 +447,11 @@ enum Commands {
         /// Статистика входов слоёв из `synaptix calibrate`: шкалы q8row по ошибке выхода слоя.
         #[arg(long)]
         calib: Option<PathBuf>,
+        /// Каталог HF с оригинальными весами (BF16 или FP8 с блочными масштабами):
+        /// квантованные в бандле веса, которые там есть (стопки экспертов —
+        /// из поштучных), перекодируются из него, а не из бандла.
+        #[arg(long)]
+        origin: Option<PathBuf>,
         /// Квантовать только тензоры с этими префиксами имени (повторяемый), например `llm.`.
         #[arg(long)]
         include: Vec<String>,
@@ -1483,8 +1488,8 @@ fn main() -> ExitCode {
             warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, eval_only, seed,
         }),
         Commands::MergeLora { model, adapter, output, format } => train::merge(&model, &adapter, &output, &format),
-        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan } => {
-            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, include, vision, rule, policy, component, plan })
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, origin, include, vision, rule, policy, component, plan } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, origin, include, vision, rule, policy, component, plan })
         }
         Commands::Warmup { model, device } => synaptix_cli::commands::calibrate::warmup(&model, &device),
         Commands::Calibrate { model, audio, output, device, limit } => {
