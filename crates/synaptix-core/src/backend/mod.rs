@@ -120,6 +120,31 @@ pub struct ZcLaunch {
     pub _pad: u32,
 }
 
+/// Аргументы слитого gated-residual Qwen4Exp (раскладка как `HcArgs` в
+/// `qwen4_decode.cu`); все указатели — адреса на устройстве.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HcLaunch {
+    pub x: u64,
+    pub norm_w: u64,
+    pub down_w: u64,
+    pub down_s: u64,
+    /// 0 — без block_inject.
+    pub inj_w: u64,
+    pub up_w: u64,
+    pub up_s: u64,
+    pub mix: u64,
+    pub norms: u64,
+    pub inj_out: u64,
+    pub mixed: u64,
+    pub rows: u32,
+    pub hc: u32,
+    pub h: u32,
+    pub r: u32,
+    pub eps: f32,
+    pub _pad: f32,
+}
+
 pub enum DecIndexedOut<'a> {
     /// `out[p, N]` в `dtype` (F16|BF16).
     Rows { out: &'a mut Storage, dtype: DType },
@@ -331,6 +356,11 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<Storage> {
         Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
+    }
+
+    /// Слитый gated-residual Qwen4Exp на декоде (два ядра, см. `HcLaunch`).
+    fn qwen4_hc_fused(&self, _device: crate::device::Device, _a: &HcLaunch) -> Result<()> {
+        Err(SynaptixError::Unsupported("qwen4_hc_fused не поддержан этим backend"))
     }
 
     /// Кэш экспертов zero-copy-декода на карте (`moe_zc_stage.cu`): ядро

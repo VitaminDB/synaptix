@@ -12,6 +12,8 @@ use synaptix_core::error::{Result, SynaptixError};
 use crate::kernels::compile::{compile_module, load_fn};
 
 const BLOCK: u32 = 256;
+/// Строк down на блок слитого gated-residual (как `HC_RPB` в ядре).
+const HC_RPB: u32 = 4;
 
 pub struct Qwen4DecodeKernels {
     _module: Arc<CudaModule>,
@@ -20,6 +22,8 @@ pub struct Qwen4DecodeKernels {
     hc_inject: CudaFunction,
     scale_act: CudaFunction,
     weighted_rows_sum: CudaFunction,
+    hc_down: CudaFunction,
+    hc_up: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Qwen4DecodeKernels>)>>> = OnceLock::new();
@@ -44,6 +48,8 @@ impl Qwen4DecodeKernels {
             hc_inject: load_fn(&module, "hc_inject_f16")?,
             scale_act: load_fn(&module, "scale_act_f16")?,
             weighted_rows_sum: load_fn(&module, "weighted_rows_sum_f16")?,
+            hc_down: load_fn(&module, "hc_down_f16")?,
+            hc_up: load_fn(&module, "hc_up_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -178,5 +184,35 @@ pub fn weighted_rows_sum_f16(
     unsafe {
         bld.launch(grid1(t as u64 * h as u64)).map_err(|e| launch_err("weighted_rows_sum_f16", e))?
     };
+    Ok(())
+}
+
+/// Слитый gated-residual: `hc_down` (нормы, down-GEMV + silu, block_inject) и
+/// `hc_up` (up-GEMV + sigmoid-смесь потоков).
+pub fn hc_fused(kernels: &Qwen4DecodeKernels, stream: &Arc<CudaStream>, a: &synaptix_core::backend::HcLaunch) -> Result<()> {
+    #[repr(transparent)]
+    struct Arg(synaptix_core::backend::HcLaunch);
+    unsafe impl cudarc::driver::DeviceRepr for Arg {}
+    if a.r % 32 != 0 || a.r % 8 != 0 || a.hc == 0 || a.hc > 8 || 8 % a.hc != 0 || a.h % 8 != 0 || a.h % 64 != 0 || (a.hc * a.h) % 64 != 0 || a.hc * 64 > 1024 {
+        return Err(SynaptixError::Unsupported("hc_fused: форма"));
+    }
+    let arg = Arg(*a);
+    let k = a.hc * a.h;
+    let mut b = stream.launch_builder(&kernels.hc_down);
+    b.arg(&arg);
+    let cfg = LaunchConfig {
+        grid_dim: (a.r / HC_RPB + (a.inj_w != 0) as u32, a.rows, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (k + 64) * 4,
+    };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("hc_down_f16", e))?;
+    let mut b = stream.launch_builder(&kernels.hc_up);
+    b.arg(&arg);
+    let cfg = LaunchConfig {
+        grid_dim: (a.h / 64, a.rows, 1),
+        block_dim: (a.hc * 64, 1, 1),
+        shared_mem_bytes: (a.r + a.hc * 64) * 4,
+    };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("hc_up_f16", e))?;
     Ok(())
 }

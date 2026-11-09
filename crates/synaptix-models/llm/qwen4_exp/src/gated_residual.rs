@@ -69,6 +69,82 @@ impl GatedResidual {
         })
     }
 
+    /// Декод (до 4 строк) двумя слитыми ядрами: веса down/up — из
+    /// перемешанной NVFP4-копии с деквантом в регистрах, активации не
+    /// квантуются. `None` — путь неприменим (не CUDA/F16, веса не NVFP4,
+    /// `SYN_QWEN4EXP_HC_FUSED=0`).
+    fn forward_fused(&self, flat: &Tensor, tokens: usize) -> Result<Option<Mixed>, ModelError> {
+        use synaptix_core::tensor::ops::qwen4_hc_fused;
+        if tokens > 4 || !hc_fused_on() || !crate::norm::fused_on() || !flat.device().is_cuda() || flat.dtype() != DType::F16 {
+            return Ok(None);
+        }
+        let (Some(dw), Some(uw)) = (self.down.quant_weight(), self.up.quant_weight()) else { return Ok(None) };
+        if dw.dtype() != DType::NVFP4 || uw.dtype() != DType::NVFP4 || self.hc_norm.dtype() != DType::F16 {
+            return Ok(None);
+        }
+        let k = self.hc_count * self.hidden;
+        let r = dw.n();
+        if dw.k() != k || uw.n() != k || uw.k() != r || r % 64 != 0 || self.hidden % 64 != 0 || self.hc_count > 8 {
+            return Ok(None);
+        }
+        if dw.ensure_shuffled().is_err() || uw.ensure_shuffled().is_err() {
+            return Ok(None);
+        }
+        let (Some((dwa, dsa)), Some((uwa, usa))) = (dw.shuffled_addr(), uw.shuffled_addr()) else { return Ok(None) };
+        let inj_w = match &self.inject {
+            Some(QLinear::Dense(l)) => {
+                let w = l.weight();
+                if w.dtype() != DType::F16 || w.dims() != [self.hc_count, k] || !w.is_contiguous() {
+                    return Ok(None);
+                }
+                Some(w)
+            }
+            Some(_) => return Ok(None),
+            None => None,
+        };
+        let dev = flat.device();
+        let addr = |t: &Tensor| t.device_address().ok_or_else(|| ModelError::Forward("hc: тензор не на карте".into()));
+        let mix = coerr(Tensor::empty_uninit(vec![tokens, r], DType::F32, dev))?;
+        let norms = coerr(Tensor::empty_uninit(vec![tokens, self.hc_count], DType::F32, dev))?;
+        let mixed = coerr(Tensor::empty_uninit(vec![tokens, self.hidden], DType::F16, dev))?;
+        let inj_out = match &inj_w {
+            Some(_) => Some(coerr(Tensor::empty_uninit(vec![tokens, self.hc_count], DType::F16, dev))?),
+            None => None,
+        };
+        let a = synaptix_core::backend::HcLaunch {
+            x: addr(flat)?,
+            norm_w: addr(&self.hc_norm)?,
+            down_w: dwa,
+            down_s: dsa,
+            inj_w: match &inj_w {
+                Some(w) => addr(w)?,
+                None => 0,
+            },
+            up_w: uwa,
+            up_s: usa,
+            mix: addr(&mix)?,
+            norms: addr(&norms)?,
+            inj_out: match &inj_out {
+                Some(t) => addr(t)?,
+                None => 0,
+            },
+            mixed: addr(&mixed)?,
+            rows: tokens as u32,
+            hc: self.hc_count as u32,
+            h: self.hidden as u32,
+            r: r as u32,
+            eps: self.eps,
+            _pad: 0.0,
+        };
+        match qwen4_hc_fused(dev, &a) {
+            Ok(()) => {
+                Ok(Some(Mixed { mixed, hyper: flat.clone(), inject_weights: inj_out }))
+            }
+            Err(e) if fallback(&e) => Ok(None),
+            Err(e) => Err(ModelError::Forward(e.to_string())),
+        }
+    }
+
     pub fn forward(&self, hyper: &Tensor) -> Result<Mixed, ModelError> {
         let dims = hyper.dims().to_vec();
         let last = *dims.last().unwrap_or(&0);
@@ -80,6 +156,9 @@ impl GatedResidual {
         }
         let tokens: usize = dims[..dims.len() - 1].iter().product();
         let flat = coerr(coerr(hyper.contiguous())?.reshape(vec![tokens, last]))?;
+        if let Some(m) = self.forward_fused(&flat, tokens)? {
+            return Ok(m);
+        }
         let normed = group_rms(&flat, &self.hc_norm, self.hidden, self.eps)?;
 
         let inv = 1.0 / self.hc_count as f32;
@@ -140,4 +219,10 @@ impl GatedResidual {
             .reshape(vec![tokens, self.hc_count * self.hidden]))?;
         coerr(hyper.add(&injection))
     }
+}
+
+/// Слитый gated-residual на декоде (`SYN_QWEN4EXP_HC_FUSED=0` — прежняя цепочка).
+fn hc_fused_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_HC_FUSED").as_deref() != Ok("0"))
 }
