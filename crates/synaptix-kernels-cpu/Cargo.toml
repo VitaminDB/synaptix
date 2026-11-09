@@ -17,3 +17,4 @@ once_cell     = { workspace = true }
 
 [dev-dependencies]
 synaptix-test-utils = { workspace = true }
+serde_json          = { workspace = true }
