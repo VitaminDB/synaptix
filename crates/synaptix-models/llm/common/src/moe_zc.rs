@@ -56,6 +56,19 @@ impl ZcPool {
         self.slots_per_layer.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Индексы `start..start+len` (U32, на карте), из кэша.
+    pub fn iota_range(&self, start: usize, len: usize) -> Result<Tensor, ModelError> {
+        static RANGES: std::sync::OnceLock<Mutex<std::collections::HashMap<(usize, usize, usize), Tensor>>> = std::sync::OnceLock::new();
+        let key = (self as *const Self as usize, start, len);
+        let mut g = RANGES.get_or_init(|| Mutex::new(Default::default())).lock().map_err(|_| zerr("индексы отравлены"))?;
+        if let Some(t) = g.get(&key) {
+            return Ok(t.clone());
+        }
+        let t = Tensor::from_vec::<_, u32>((start as u32..(start + len) as u32).collect(), vec![len], self.device).map_err(zerr)?;
+        g.insert(key, t.clone());
+        Ok(t)
+    }
+
     fn iota(&self, pairs: usize) -> Result<Tensor, ModelError> {
         let mut g = self.iota.lock().map_err(|_| zerr("индексы отравлены"))?;
         if g.len() <= pairs {

@@ -1839,28 +1839,21 @@ impl MoeFfn {
         let gu = gu_t.gemv_indexed_dense(&iota, &x_rows, t > 1).map_err(ferr)?;
         let hh = self.swiglu(&gu)?;
         let hh = if hh.is_contiguous() { hh } else { hh.contiguous().map_err(ferr)? };
-        let mut outs = Vec::with_capacity(t);
-        for j in 0..t {
-            // Таблица down — по парам шага: индексы пар токена j — j·k..j·k+k.
-            let (idx_j, h_j, w_j) = if t == 1 {
-                (iota.clone(), hh.clone(), w.clone())
-            } else {
-                (
-                    iota.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
-                    hh.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
-                    w.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
-                )
-            };
-            let mut acc = Tensor::zeros(vec![h], DType::F32, self.device).map_err(ferr)?;
-            dn_t.gemv_indexed_dense_acc(&idx_j, &h_j, true, &w_j, &mut acc).map_err(ferr)?;
-            outs.push(acc.reshape(vec![1, h]).map_err(ferr)?);
-        }
+        // down — строками по парам и детерминированная взвешенная сумма по
+        // k слотам токена (атомарное накопление давало разный порядок сумм
+        // от прогона к прогону — жадный выбор «плавал» на почти равных).
+        let rows = dn_t.gemv_indexed_dense(&iota, &hh, true).map_err(ferr)?;
         drop(guard);
-        let mixed = if outs.len() == 1 {
-            outs.pop().expect("одна строка")
-        } else {
-            let refs: Vec<&Tensor> = outs.iter().collect();
-            Tensor::cat(&refs, 0).map_err(ferr)?
+        let mixed = match rows.weighted_rows_sum_fused(&w, t, k) {
+            Ok(m) => m,
+            Err(_) => {
+                let scale = w.reshape(vec![t * k, 1]).and_then(|s| s.to_dtype(rows.dtype())).map_err(ferr)?;
+                rows.broadcast_mul(&scale)
+                    .and_then(|r| r.reshape((t, k, h)))
+                    .and_then(|r| r.sum([1usize]))
+                    .and_then(|r| r.reshape((t, h)))
+                    .map_err(ferr)?
+            }
         };
         let mixed = self.to_compute(mixed)?;
         Ok(Some(match &self.shared {
