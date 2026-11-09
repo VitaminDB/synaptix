@@ -104,6 +104,30 @@ pub struct ZcLayer {
     n_slots: usize,
     /// Частоты выбора на префилле — затравка следующей сборки.
     seed: Vec<f32>,
+    ord: usize,
+    /// Скретч упреждающей подкачки (живёт со слоем: его читают ядра второго стрима).
+    pf: Mutex<Option<PfScratch>>,
+    /// Незавершённая подкачка: событие второго стрима и вход, который она читает.
+    pending: Mutex<Option<(LoaderDone, Tensor)>>,
+}
+
+struct PfScratch {
+    logits: Tensor,
+    idx: Tensor,
+    wts: Tensor,
+    cp: Tensor,
+    eff: Tensor,
+    rows: usize,
+    k: usize,
+}
+
+impl Drop for ZcLayer {
+    fn drop(&mut self) {
+        // Ядра второго стрима могут ещё читать слоты и скретч.
+        if self.pending.lock().map(|p| p.is_some()).unwrap_or(true) {
+            let _ = synaptix_core::device::cuda::synchronize_all(self.ord);
+        }
+    }
 }
 
 impl ZcLayer {
@@ -179,7 +203,7 @@ impl ZcLayer {
             owner: Tensor::from_vec::<_, i32>(owner, vec![n_slots], dev).map_err(zerr)?,
             used: Tensor::zeros(vec![n_slots], DType::U8, dev).map_err(zerr)?,
             clock: Tensor::zeros(vec![1], DType::U32, dev).map_err(zerr)?,
-            stats: Tensor::zeros(vec![2], DType::U32, dev).map_err(zerr)?,
+            stats: Tensor::zeros(vec![4], DType::U32, dev).map_err(zerr)?,
             _slots: slots,
             slot_base,
             gu_shape,
@@ -190,6 +214,9 @@ impl ZcLayer {
             experts,
             n_slots,
             seed,
+            ord,
+            pf: Mutex::new(None),
+            pending: Mutex::new(None),
         };
         Ok(Some(me))
     }
@@ -214,6 +241,7 @@ impl ZcLayer {
         idx: &Tensor,
         route: Option<(&Tensor, &Tensor, &Tensor)>,
     ) -> Result<(ExpertTable, ExpertTable, Tensor), ModelError> {
+        self.resolve_pending()?;
         let pairs = idx.numel();
         let dev = pool.device;
         let eff_gu = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
@@ -265,6 +293,86 @@ impl ZcLayer {
         let gu = ExpertTable::from_tensor_dense(self.gu_shape.0, self.gu_shape.1, self.dtype, eff_gu).ok_or_else(|| zerr("таблица gate_up"))?;
         let dn = ExpertTable::from_tensor_dense(self.dn_shape.0, self.dn_shape.1, self.dtype, eff_dn).ok_or_else(|| zerr("таблица down"))?;
         Ok((gu, dn, pool.iota(pairs)?))
+    }
+
+    /// Дождаться (на карте, не на хосте) упреждающей подкачки этого слоя:
+    /// default-стрим ждёт событие второго стрима.
+    fn resolve_pending(&self) -> Result<(), ModelError> {
+        let p = self.pending.lock().map_err(|_| zerr("состояние отравлено"))?.take();
+        if let Some((done, _x)) = p {
+            done.wait_default().map_err(zerr)?;
+            // `_x` освобождается здесь — после ожидания в порядке default-стрима.
+        }
+        Ok(())
+    }
+
+    /// Упреждающая подкачка: по входу MoE предыдущего слоя `x` (f16 [rows, H])
+    /// роутер ЭТОГО слоя предсказывает top-`kpf`; до `budget` промахов
+    /// поднимаются в слоты вторым стримом, пока default считает предыдущий
+    /// слой. Шаг слоя дождётся события ([`Self::resolve_pending`]).
+    pub fn prefetch(&self, pool: &ZcPool, router: &Tensor, x: &Tensor, kpf: usize, budget: usize) -> Result<(), ModelError> {
+        if self.pending.lock().map(|p| p.is_some()).unwrap_or(true) {
+            return Ok(());
+        }
+        let rows = x.dims()[0];
+        let h = x.dims()[1];
+        let dev = pool.device;
+        let mut pf = self.pf.lock().map_err(|_| zerr("скретч отравлен"))?;
+        if pf.as_ref().is_none_or(|s| s.rows < rows || s.k != kpf) {
+            let r = rows.max(4);
+            *pf = Some(PfScratch {
+                logits: Tensor::zeros(vec![r, self.experts], DType::F32, dev).map_err(zerr)?,
+                idx: Tensor::zeros(vec![r * kpf], DType::U32, dev).map_err(zerr)?,
+                wts: Tensor::zeros(vec![r * kpf], DType::F32, dev).map_err(zerr)?,
+                cp: Tensor::zeros(vec![3, r * kpf], DType::I64, dev).map_err(zerr)?,
+                eff: Tensor::zeros(vec![2, r * kpf], DType::I64, dev).map_err(zerr)?,
+                rows: r,
+                k: kpf,
+            });
+        }
+        let sc = pf.as_ref().expect("создан выше");
+        let pairs = rows * kpf;
+        let cpa = addr(&sc.cp)?;
+        let cap = (sc.rows * kpf) as u64;
+        let a = ZcLaunch {
+            idx: addr(&sc.idx)?,
+            tab_gu: addr(&self.tab_gu)?,
+            tab_dn: addr(&self.tab_dn)?,
+            host_gu: addr(&self.host_gu)?,
+            host_dn: addr(&self.host_dn)?,
+            owner: addr(&self.owner)?,
+            used: addr(&self.used)?,
+            clock: addr(&self.clock)?,
+            stats: addr(&self.stats)?,
+            eff_gu: addr(&sc.eff)?,
+            eff_dn: addr(&sc.eff)? + 8 * cap,
+            cp_src_gu: cpa,
+            cp_src_dn: cpa + 8 * cap,
+            cp_dst: cpa + 16 * cap,
+            slot_base: self.slot_base,
+            slot_bytes: (self.gu_bytes + self.dn_bytes) as u64,
+            gu_bytes: self.gu_bytes as u64,
+            dn_bytes: self.dn_bytes as u64,
+            pairs: pairs as u32,
+            experts: self.experts as u32,
+            slots: self.n_slots as u32,
+            _pad: 1,
+            router_w: addr(router)?,
+            x: addr(x)?,
+            logits: addr(&sc.logits)?,
+            wts: addr(&sc.wts)?,
+            rows: rows as u32,
+            k: kpf as u32,
+            h: h as u32,
+            _pad2: budget as u32,
+        };
+        // Второй стрим стартует после всего, что уже поставлено в default
+        // (вход `x`, прошлые шаги слоя), и считает параллельно дальнейшему.
+        synaptix_core::device::cuda::loader_wait_default(self.ord).map_err(zerr)?;
+        synaptix_core::tensor::ops::moe_zc_lru(dev, &a).map_err(zerr)?;
+        let done = LoaderDone::record(self.ord).map_err(zerr)?;
+        *self.pending.lock().map_err(|_| zerr("состояние отравлено"))? = Some((done, x.clone()));
+        Ok(())
     }
 
     /// (попадания, выборы) — синхронное чтение счётчиков, только для логов.

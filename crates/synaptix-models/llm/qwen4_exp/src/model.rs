@@ -1109,6 +1109,11 @@ impl Qwen4ExpModel {
             } else {
                 None
             };
+            // Zero-copy: эксперты следующего слоя подкачиваются вторым стримом
+            // по этому входу, пока считается MoE этого слоя и внимание следующего.
+            if s <= 4 && l + 1 < self.blocks.len() {
+                ctx(self.blocks[l + 1].moe.zc_prefetch(&mixed.mixed), &format!("слой {l} упреждение"))?;
+            }
             let out = stage("moe", || {
                 ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
             })?;

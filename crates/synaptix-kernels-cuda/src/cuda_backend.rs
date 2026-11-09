@@ -936,7 +936,13 @@ impl Backend for CudaBackend {
             return Err(SynaptixError::Unsupported("moe_zc_lru: не CUDA"));
         };
         let ctx = synaptix_core::device::cuda::get(ord)?;
-        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        // `_pad == 1` — упреждающая подкачка: вся пачка идёт loader-стримом,
+        // параллельно счёту в default (порядок — события у вызывающего).
+        let stream = if a._pad == 1 {
+            synaptix_core::device::cuda::loader_stream(ord)?
+        } else {
+            synaptix_core::device::cuda::default_stream(ord)?
+        };
         let key = Arc::as_ptr(&ctx) as usize;
         let (lru, copy, router, topk) = {
             let mut g = CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new())).lock();

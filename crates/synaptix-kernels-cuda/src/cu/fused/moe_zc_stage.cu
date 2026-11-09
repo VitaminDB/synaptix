@@ -119,6 +119,53 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
     unsigned long long* csg = (unsigned long long*)a.cp_src_gu;
     unsigned long long* csd = (unsigned long long*)a.cp_src_dn;
     unsigned long long* cdst = (unsigned long long*)a.cp_dst;
+    if (a._pad == 1u) {
+        // Упреждающая подкачка (второй стрим, до шага слоя): предсказанные
+        // эксперты — резидентам бит обращения, не более `_pad2` промахов
+        // поднимаются в слоты по часам. Таблицы eff и статистика не нужны.
+        for (unsigned int p = 0; p < a.pairs; ++p) {
+            cdst[p] = 0ull;
+            unsigned int e = idx[p];
+            if (e >= a.experts) continue;
+            unsigned long long g = tg[e];
+            if ((g & 1ull) == 0ull) {
+                unsigned int s = (unsigned int)((g - a.slot_base) / a.slot_bytes);
+                if (used[s] == 0) used[s] = 1;
+            }
+        }
+        unsigned int budget = a._pad2;
+        for (unsigned int p = 0; p < a.pairs && budget > 0u; ++p) {
+            unsigned int e = idx[p];
+            if (e >= a.experts) continue;
+            if ((tg[e] & 1ull) == 0ull) continue;       // уже резидент (или поднят выше)
+            unsigned int s = 0;
+            bool found = false;
+            for (unsigned int it = 0; it < 2u * a.slots; ++it) {
+                s = clock[0] % a.slots;
+                clock[0] = clock[0] + 1u;
+                if (owner[s] >= 0 && used[s] >= 1) { used[s] = 0; continue; }
+                found = true;
+                break;
+            }
+            if (!found) break;
+            int old = owner[s];
+            if (old >= 0) {
+                tg[old] = hg[old] | 1ull;
+                td[old] = hd[old] | 1ull;
+            }
+            owner[s] = (int)e;
+            used[s] = 1;
+            unsigned long long dst = a.slot_base + (unsigned long long)s * a.slot_bytes;
+            tg[e] = dst;
+            td[e] = dst + a.gu_bytes;
+            csg[p] = hg[e];
+            csd[p] = hd[e];
+            cdst[p] = dst;
+            --budget;
+        }
+        stats[2] += a.pairs;
+        return;
+    }
     // 1) слоты экспертов шага — неприкосновенны в этом шаге.
     for (unsigned int p = 0; p < a.pairs; ++p) {
         unsigned int e = idx[p];

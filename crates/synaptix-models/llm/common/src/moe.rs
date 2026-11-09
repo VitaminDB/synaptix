@@ -1746,6 +1746,22 @@ impl MoeFfn {
         self.zc_pool = Some(pool);
     }
 
+    /// Упреждающая подкачка экспертов ЭТОГО слоя по входу MoE предыдущего
+    /// (`x: [T ≤ 4, H]`): см. `ZcLayer::prefetch`. Без zero-copy — no-op.
+    pub fn zc_prefetch(&self, x: &Tensor) -> Result<(), ModelError> {
+        let (kpf, budget) = zc_prefetch_cfg();
+        if kpf == 0 {
+            return Ok(());
+        }
+        let Some(pool) = &self.zc_pool else { return Ok(()) };
+        if x.rank() != 2 || x.dims()[0] > 4 || x.dtype() != DType::F16 || !x.is_contiguous() || self.router.dtype() != DType::F32 {
+            return Ok(());
+        }
+        let guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
+        let Some(layer) = guard.as_ref() else { return Ok(()) };
+        layer.prefetch(pool, &self.router, x, kpf, budget * x.dims()[0])
+    }
+
     /// Освободить слоты слоя (перед длинным префиллом); частоты остаются
     /// затравкой следующей сборки.
     pub fn zc_release(&self) {
@@ -3394,4 +3410,17 @@ pub mod route_trace {
 fn zc_check() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SYN_ZC_CHECK").as_deref() == Ok("1"))
+}
+
+/// Упреждающая подкачка zero-copy: `SYN_ZC_PREFETCH=<k>[,<бюджет промахов на строку>]`
+/// (k = 0 — выключено).
+fn zc_prefetch_cfg() -> (usize, usize) {
+    static V: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let s = std::env::var("SYN_ZC_PREFETCH").unwrap_or_default();
+        let mut it = s.split(',').map(|v| v.trim().parse::<usize>().ok());
+        let k = it.next().flatten().unwrap_or(0).min(64);
+        let b = it.next().flatten().unwrap_or(3);
+        (k, b)
+    })
 }
