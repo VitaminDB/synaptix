@@ -156,6 +156,28 @@ pub struct HcLaunch {
     pub _pad: f32,
 }
 
+/// Аргументы слитого shared-эксперта MoE (раскладка как `SeArgs` в
+/// `qwen4_decode.cu`); указатели — адреса на устройстве.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeLaunch {
+    pub x: u64,
+    pub gate_w: u64,
+    pub gate_s: u64,
+    pub up_w: u64,
+    pub up_s: u64,
+    pub down_w: u64,
+    pub down_s: u64,
+    pub router: u64,
+    pub h: u64,
+    pub sg: u64,
+    pub out: u64,
+    pub rows: u32,
+    pub hidden: u32,
+    pub inter: u32,
+    pub _pad: u32,
+}
+
 pub enum DecIndexedOut<'a> {
     /// `out[p, N]` в `dtype` (F16|BF16).
     Rows { out: &'a mut Storage, dtype: DType },
@@ -367,6 +389,11 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<Storage> {
         Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
+    }
+
+    /// Слитый shared-эксперт MoE на декоде (два ядра, см. `SeLaunch`).
+    fn moe_shared_fused(&self, _device: crate::device::Device, _a: &SeLaunch) -> Result<()> {
+        Err(SynaptixError::Unsupported("moe_shared_fused не поддержан этим backend"))
     }
 
     /// Слитый gated-residual Qwen4Exp на декоде (два ядра, см. `HcLaunch`).

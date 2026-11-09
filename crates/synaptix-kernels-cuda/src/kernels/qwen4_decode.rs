@@ -24,6 +24,8 @@ pub struct Qwen4DecodeKernels {
     weighted_rows_sum: CudaFunction,
     hc_down: CudaFunction,
     hc_up: CudaFunction,
+    se_up: CudaFunction,
+    se_down: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Qwen4DecodeKernels>)>>> = OnceLock::new();
@@ -50,6 +52,8 @@ impl Qwen4DecodeKernels {
             weighted_rows_sum: load_fn(&module, "weighted_rows_sum_f16")?,
             hc_down: load_fn(&module, "hc_down_f16")?,
             hc_up: load_fn(&module, "hc_up_f16")?,
+            se_up: load_fn(&module, "se_up_f16")?,
+            se_down: load_fn(&module, "se_down_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -214,5 +218,25 @@ pub fn hc_fused(kernels: &Qwen4DecodeKernels, stream: &Arc<CudaStream>, a: &syna
         shared_mem_bytes: (a.r + a.hc * 64) * 4,
     };
     unsafe { b.launch(cfg) }.map_err(|e| launch_err("hc_up_f16", e))?;
+    Ok(())
+}
+
+/// Слитый shared-эксперт: `se_up` (gate|up + silu·up, sigmoid-гейт) и `se_down`.
+pub fn se_fused(kernels: &Qwen4DecodeKernels, stream: &Arc<CudaStream>, a: &synaptix_core::backend::SeLaunch) -> Result<()> {
+    #[repr(transparent)]
+    struct Arg(synaptix_core::backend::SeLaunch);
+    unsafe impl cudarc::driver::DeviceRepr for Arg {}
+    if a.hidden % 128 != 0 || a.inter % 64 != 0 || a.inter % 4 != 0 {
+        return Err(SynaptixError::Unsupported("se_fused: форма"));
+    }
+    let arg = Arg(*a);
+    let mut b = stream.launch_builder(&kernels.se_up);
+    b.arg(&arg);
+    let cfg = LaunchConfig { grid_dim: (a.inter / 4 + 1, a.rows, 1), block_dim: (256, 1, 1), shared_mem_bytes: (a.hidden + 16) * 4 };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("se_up_f16", e))?;
+    let mut b = stream.launch_builder(&kernels.se_down);
+    b.arg(&arg);
+    let cfg = LaunchConfig { grid_dim: (a.hidden / 128, a.rows, 1), block_dim: (256, 1, 1), shared_mem_bytes: (a.inter + 256) * 4 };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("se_down_f16", e))?;
     Ok(())
 }

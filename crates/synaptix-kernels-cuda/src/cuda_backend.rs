@@ -905,6 +905,16 @@ impl Backend for CudaBackend {
         Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
     }
 
+    fn moe_shared_fused(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::SeLaunch) -> Result<()> {
+        let synaptix_core::device::Device::Cuda(ord) = device else {
+            return Err(SynaptixError::Unsupported("moe_shared_fused: не CUDA"));
+        };
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        crate::kernels::qwen4_decode::se_fused(&k, &stream, a)
+    }
+
     fn qwen4_hc_fused(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::HcLaunch) -> Result<()> {
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("qwen4_hc_fused: не CUDA"));

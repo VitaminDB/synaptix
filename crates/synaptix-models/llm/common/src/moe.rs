@@ -2988,7 +2988,64 @@ impl MoeFfn {
         }
     }
 
+    /// Shared-эксперт на декоде (до 4 строк) двумя слитыми ядрами: веса из
+    /// перемешанных NVFP4-копий, активации не квантуются. `None` — неприменимо.
+    fn shared_forward_fused(&self, shared: &SharedExpert, x: &Tensor) -> Result<Option<Tensor>, ModelError> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("SYN_MOE_SHARED_FUSED").as_deref() != Ok("0")) {
+            return Ok(None);
+        }
+        let t = x.dims()[0];
+        if t > 4 || !self.device.is_cuda() || x.dtype() != DType::F16 || self.compute != DType::F16 || self.cfg.activation != Activation::Silu || !x.is_contiguous() {
+            return Ok(None);
+        }
+        let (Some(g), Some(u), Some(d)) = (shared.gate.quant_weight(), shared.up.quant_weight(), shared.down.quant_weight()) else { return Ok(None) };
+        let (h, i) = (self.cfg.hidden_size, g.n());
+        if [g, u, d].iter().any(|w| w.dtype() != DType::NVFP4) || g.k() != h || u.n() != i || u.k() != h || d.n() != h || d.k() != i {
+            return Ok(None);
+        }
+        if shared.router.dtype() != DType::F32 || shared.router.numel() != h || !shared.router.is_contiguous() || h % 128 != 0 || i % 64 != 0 {
+            return Ok(None);
+        }
+        for w in [g, u, d] {
+            if w.ensure_shuffled().is_err() {
+                return Ok(None);
+            }
+        }
+        let (Some((gw, gs)), Some((uw, us)), Some((dw, ds))) = (g.shuffled_addr(), u.shuffled_addr(), d.shuffled_addr()) else { return Ok(None) };
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE shared (слитый): {e}"));
+        let addr = |t: &Tensor| t.device_address().ok_or_else(|| ModelError::Forward("MoE shared: тензор не на карте".into()));
+        let hbuf = Tensor::empty_uninit(vec![t, i], DType::F32, self.device).map_err(ferr)?;
+        let sg = Tensor::empty_uninit(vec![t], DType::F32, self.device).map_err(ferr)?;
+        let out = Tensor::empty_uninit(vec![t, h], DType::F16, self.device).map_err(ferr)?;
+        let a = synaptix_core::backend::SeLaunch {
+            x: addr(x)?,
+            gate_w: gw,
+            gate_s: gs,
+            up_w: uw,
+            up_s: us,
+            down_w: dw,
+            down_s: ds,
+            router: addr(&shared.router)?,
+            h: addr(&hbuf)?,
+            sg: addr(&sg)?,
+            out: addr(&out)?,
+            rows: t as u32,
+            hidden: h as u32,
+            inter: i as u32,
+            _pad: 0,
+        };
+        match synaptix_core::tensor::ops::moe_shared_fused(self.device, &a) {
+            Ok(()) => Ok(Some(out)),
+            Err(SynError::Unsupported(_)) => Ok(None),
+            Err(e) => Err(ferr(e)),
+        }
+    }
+
     fn shared_forward(&self, shared: &SharedExpert, x: &Tensor) -> Result<Tensor, ModelError> {
+        if let Some(y) = self.shared_forward_fused(shared, x)? {
+            return Ok(y);
+        }
         let gate = shared.gate.forward(x)?;
         let up = shared.up.forward(x)?;
         let h = match gate.silu_and_mul(&up) {

@@ -335,3 +335,93 @@ extern "C" __global__ void hc_up_f16(HcArgs a) {
         ((__half*)a.mixed)[(size_t)t * a.H + i] = __float2half(acc / (float)a.hc);
     }
 }
+
+// ───────────── слитый shared-эксперт MoE на декоде ─────────────
+//
+//   se_up:   h[r]  = silu(Σ gate[r,k]·x[k]) · Σ up[r,k]·x[k]      r < I
+//            sg    = sigmoid(Σ router[k]·x[k])
+//   se_down: out[i] = sg · Σ down[i,k]·h[k]                        i < H
+// Веса gate/up/down — перемешанные NVFP4-копии, деквант в регистрах,
+// активации не квантуются.
+
+struct SeArgs {
+    unsigned long long x, gate_w, gate_s, up_w, up_s, down_w, down_s, router;
+    unsigned long long h, sg, out;
+    unsigned int rows, H, I, _pad;
+};
+
+// grid = (I/4 + 1, rows), block = 256 (4 строки: варп — (строка, gate|up)),
+// shared = (H + 16) f32.
+extern "C" __global__ void se_up_f16(SeArgs a) {
+    extern __shared__ float sm[];
+    float* red = sm;            // [8]
+    float* xs = sm + 16;        // [H]
+    const unsigned t = blockIdx.y, tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const __half* x = (const __half*)a.x + (size_t)t * a.H;
+    for (unsigned v = tid; v < (a.H >> 3); v += blockDim.x) {
+        float f[8];
+        hc_ld8(x + v * 8u, f);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) xs[v * 8u + j] = f[j];
+    }
+    __syncthreads();
+    const unsigned up_blocks = a.I / 4u;
+    if (blockIdx.x < up_blocks) {
+        const unsigned row = blockIdx.x * 4u + (warp >> 1);
+        const bool is_up = (warp & 1u) != 0u;
+        const unsigned char* w = (const unsigned char*)(is_up ? a.up_w : a.gate_w);
+        const unsigned char* s = (const unsigned char*)(is_up ? a.up_s : a.gate_s);
+        float acc = 0.0f;
+        for (unsigned sb = lane; sb < (a.H >> 5); sb += 32u) acc += hc_dot32(w, s, row, a.H, sb, xs + sb * 32u);
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) red[warp] = acc;
+        __syncthreads();
+        if (lane == 0 && !is_up) {
+            const float g = red[warp], u = red[warp + 1];
+            ((float*)a.h)[(size_t)t * a.I + row] = g / (1.0f + __expf(-g)) * u;
+        }
+    } else {
+        const float4* r4 = reinterpret_cast<const float4*>((const float*)a.router);
+        float acc = 0.0f;
+        for (unsigned i = tid; i < (a.H >> 2); i += blockDim.x) {
+            const float4 wv = r4[i];
+            acc = fmaf(wv.x, xs[4 * i], acc);
+            acc = fmaf(wv.y, xs[4 * i + 1], acc);
+            acc = fmaf(wv.z, xs[4 * i + 2], acc);
+            acc = fmaf(wv.w, xs[4 * i + 3], acc);
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float s = 0.0f;
+            for (unsigned w = 0; w < (blockDim.x >> 5); ++w) s += red[w];
+            ((float*)a.sg)[t] = 1.0f / (1.0f + __expf(-s));
+        }
+    }
+}
+
+// grid = (H/128, rows), block = 256 (нить — (половина K, i)), shared = (I + 256) f32.
+extern "C" __global__ void se_down_f16(SeArgs a) {
+    extern __shared__ float sm[];
+    float* hs = sm;             // [I]
+    float* part = sm + a.I;     // [2][128]
+    const unsigned t = blockIdx.y, tid = threadIdx.x;
+    const unsigned half = tid >> 7, il = tid & 127u;
+    const unsigned i = blockIdx.x * 128u + il;
+    const float* hg = (const float*)a.h + (size_t)t * a.I;
+    for (unsigned k = tid; k < a.I; k += blockDim.x) hs[k] = hg[k];
+    __syncthreads();
+    const unsigned subs = a.I >> 5, mid = subs >> 1;
+    const unsigned s0 = half ? mid : 0u, s1 = half ? subs : mid;
+    float acc = 0.0f;
+    for (unsigned sb = s0; sb < s1; ++sb) {
+        acc += hc_dot32((const unsigned char*)a.down_w, (const unsigned char*)a.down_s, i, a.I, sb, hs + sb * 32u);
+    }
+    part[half * 128u + il] = acc;
+    __syncthreads();
+    if (half == 0) {
+        const float sg = ((const float*)a.sg)[t];
+        ((__half*)a.out)[(size_t)t * a.H + i] = __float2half((part[il] + part[128u + il]) * sg);
+    }
+}

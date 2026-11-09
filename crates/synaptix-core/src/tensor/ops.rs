@@ -567,6 +567,11 @@ pub(crate) fn run_quantize_ggml(w: &Tensor, ty: crate::quant::ggml::GgmlType, im
     QuantWeight::new_block(Arc::new(packed), DType::Ggml(ty), n, k)
 }
 
+/// Слитый shared-эксперт MoE на декоде (см. `Backend::moe_shared_fused`).
+pub fn moe_shared_fused(device: crate::device::Device, a: &crate::backend::SeLaunch) -> Result<()> {
+    registry::backend_for(device)?.moe_shared_fused(device, a)
+}
+
 /// Слитый gated-residual Qwen4Exp на декоде (см. `Backend::qwen4_hc_fused`).
 pub fn qwen4_hc_fused(device: crate::device::Device, a: &crate::backend::HcLaunch) -> Result<()> {
     registry::backend_for(device)?.qwen4_hc_fused(device, a)
