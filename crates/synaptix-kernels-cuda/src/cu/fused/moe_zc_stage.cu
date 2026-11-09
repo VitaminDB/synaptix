@@ -232,6 +232,101 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
     stats[1] += a.pairs;
 }
 
+// zc_lru для шага декода (pairs ≤ 32) варпом: проверка резидентности, отметки
+// и адреса попаданий — по лейну на пару (одна глубина обращений к памяти
+// вместо цикла), последовательно идёт только выбор слотов под промахи.
+// Семантика — как у zc_lru. block = 32.
+extern "C" __global__ void zc_lru_w(ZcArgs a) {
+    __shared__ unsigned int e_sm[32];
+    const unsigned int lane = threadIdx.x;
+    if (blockIdx.x != 0 || lane >= 32u) return;
+    const unsigned int* idx = (const unsigned int*)a.idx;
+    unsigned long long* tg = (unsigned long long*)a.tab_gu;
+    unsigned long long* td = (unsigned long long*)a.tab_dn;
+    const unsigned long long* hg = (const unsigned long long*)a.host_gu;
+    const unsigned long long* hd = (const unsigned long long*)a.host_dn;
+    int* owner = (int*)a.owner;
+    unsigned char* used = (unsigned char*)a.used;
+    unsigned int* clock = (unsigned int*)a.clock;
+    unsigned int* stats = (unsigned int*)a.stats;
+    unsigned long long* eg = (unsigned long long*)a.eff_gu;
+    unsigned long long* ed = (unsigned long long*)a.eff_dn;
+    unsigned long long* csg = (unsigned long long*)a.cp_src_gu;
+    unsigned long long* csd = (unsigned long long*)a.cp_src_dn;
+    unsigned long long* cdst = (unsigned long long*)a.cp_dst;
+
+    const bool active = lane < a.pairs;
+    const unsigned int e = active ? idx[lane] : 0xffffffffu;
+    const bool valid = active && e < a.experts;
+    const unsigned long long g = valid ? tg[e] : 1ull;
+    const bool res = valid && (g & 1ull) == 0ull;
+    if (res) {
+        used[(g - a.slot_base) / a.slot_bytes] = 2;
+        eg[lane] = g;
+        ed[lane] = td[e];
+    } else if (active && !valid) {
+        eg[lane] = hg[0];
+        ed[lane] = hd[0];
+    }
+    if (active) cdst[lane] = 0ull;
+    const unsigned int same = __match_any_sync(0xffffffffu, e);
+    const bool first = (unsigned int)(__ffs(same) - 1) == lane;
+    const unsigned int hitmask = __ballot_sync(0xffffffffu, res && first);
+    unsigned int mm = __ballot_sync(0xffffffffu, valid && !res);
+    e_sm[lane] = e;
+    __syncwarp();
+    if (lane == 0u) {
+        while (mm) {
+            const unsigned int p = (unsigned int)(__ffs(mm) - 1);
+            mm &= mm - 1u;
+            const unsigned int em = e_sm[p];
+            const unsigned long long gm = tg[em];
+            if ((gm & 1ull) == 0ull) {          // тот же эксперт уже поднят парой раньше
+                eg[p] = gm;
+                ed[p] = td[em];
+                continue;
+            }
+            unsigned int s = 0;
+            bool found = false;
+            for (unsigned int it = 0; it < 3u * a.slots; ++it) {
+                s = clock[0] % a.slots;
+                clock[0] = clock[0] + 1u;
+                if (used[s] == 2) continue;
+                if (owner[s] >= 0 && used[s] == 1) { used[s] = 0; continue; }
+                found = true;
+                break;
+            }
+            if (!found) {
+                eg[p] = gm & ~1ull;
+                ed[p] = td[em] & ~1ull;
+                continue;
+            }
+            const int old = owner[s];
+            if (old >= 0) {
+                tg[old] = hg[old] | 1ull;
+                td[old] = hd[old] | 1ull;
+            }
+            owner[s] = (int)em;
+            used[s] = 2;
+            const unsigned long long dst = a.slot_base + (unsigned long long)s * a.slot_bytes;
+            tg[em] = dst;
+            td[em] = dst + a.gu_bytes;
+            eg[p] = dst;
+            ed[p] = dst + a.gu_bytes;
+            csg[p] = hg[em];
+            csd[p] = hd[em];
+            cdst[p] = dst;
+        }
+        stats[0] += (unsigned int)__popc(hitmask);
+        stats[1] += a.pairs;
+    }
+    __syncwarp();
+    if (valid) {
+        const unsigned long long g2 = tg[e];
+        if ((g2 & 1ull) == 0ull) used[(g2 - a.slot_base) / a.slot_bytes] = 1;
+    }
+}
+
 extern "C" __global__ void zc_copy(ZcArgs a) {
     const unsigned int p = blockIdx.x;
     if (p >= a.pairs) return;

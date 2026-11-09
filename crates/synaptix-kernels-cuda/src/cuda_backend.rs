@@ -930,7 +930,7 @@ impl Backend for CudaBackend {
         #[repr(transparent)]
         struct Arg(synaptix_core::backend::ZcLaunch);
         unsafe impl cudarc::driver::DeviceRepr for Arg {}
-        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
+        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
         static CACHE: std::sync::OnceLock<parking_lot::Mutex<Vec<Fns>>> = std::sync::OnceLock::new();
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_zc_lru: не CUDA"));
@@ -944,18 +944,19 @@ impl Backend for CudaBackend {
             synaptix_core::device::cuda::default_stream(ord)?
         };
         let key = Arc::as_ptr(&ctx) as usize;
-        let (lru, copy, router, topk) = {
+        let (lru, copy, router, topk, lru_w) = {
             let mut g = CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new())).lock();
             match g.iter().find(|f| f.0 == key) {
-                Some(f) => (f.2.clone(), f.3.clone(), f.4.clone(), f.5.clone()),
+                Some(f) => (f.2.clone(), f.3.clone(), f.4.clone(), f.5.clone(), f.6.clone()),
                 None => {
                     let m = crate::kernels::compile::compile_module(&ctx, include_str!("cu/fused/moe_zc_stage.cu"), "moe_zc_stage.cu")?;
                     let l = crate::kernels::compile::load_fn(&m, "zc_lru")?;
                     let c = crate::kernels::compile::load_fn(&m, "zc_copy")?;
                     let r = crate::kernels::compile::load_fn(&m, "zc_router")?;
                     let t = crate::kernels::compile::load_fn(&m, "zc_topk")?;
-                    g.push((key, m, l.clone(), c.clone(), r.clone(), t.clone()));
-                    (l, c, r, t)
+                    let lw = crate::kernels::compile::load_fn(&m, "zc_lru_w")?;
+                    g.push((key, m, l.clone(), c.clone(), r.clone(), t.clone(), lw.clone()));
+                    (l, c, r, t, lw)
                 }
             }
         };
@@ -973,7 +974,10 @@ impl Backend for CudaBackend {
             unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (a.rows, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
                 .map_err(|e| SynaptixError::Cuda(format!("launch zc_topk: {e:?}")))?;
         }
-        let mut b = stream.launch_builder(&lru);
+        // Шаг декода (до 32 пар) — варп-версия; `SYN_ZC_LRU_SERIAL=1` — прежняя.
+        static FORCE_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let serial = a._pad != 0 || a.pairs > 32 || *FORCE_SERIAL.get_or_init(|| std::env::var("SYN_ZC_LRU_SERIAL").is_ok());
+        let mut b = stream.launch_builder(if serial { &lru } else { &lru_w });
         b.arg(&arg);
         unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }
             .map_err(|e| SynaptixError::Cuda(format!("launch zc_lru: {e:?}")))?;
