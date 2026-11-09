@@ -191,3 +191,18 @@ fn shuf_lm_head_248320x5120() {
     let Some((ctx, stream)) = setup() else { return };
     run(&ctx, &stream, 248320, 5120, "lm_head", 0.99);
 }
+
+/// Узкие матрицы Qwen4Exp: `input_mix_weight_down` hyper-connection
+/// [320, 10240] и gate/up shared-эксперта [640, 2560] — идут split-K путём.
+#[test]
+fn shuf_narrow_hc_down_320x10240() {
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        eprintln!("пропуск: нужен FP4/MXFP8 block-scale MMA (sm_120a)");
+        return;
+    }
+    let Some((ctx, stream)) = setup() else { return };
+    run(&ctx, &stream, 320, 10240, "hc_down", 0.999);
+    run(&ctx, &stream, 640, 2560, "shared_gate", 0.999);
+    run(&ctx, &stream, 2560, 640, "shared_down", 0.999);
+    run(&ctx, &stream, 48, 2560, "la_a", 0.999);
+}

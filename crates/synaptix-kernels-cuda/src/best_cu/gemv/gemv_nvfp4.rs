@@ -275,6 +275,26 @@ pub fn nvfp4_mma_gemv_shuf_f16_view(
     }
     let num_tiles_w8 = if n % W8_M_TILE == 0 { n / W8_M_TILE } else { 0 };
     let want_w8 = num_tiles_w8 >= kernels.num_sms;
+    // Узкая матрица (мало строк, длинная K — `input_mix_weight_down` [320, 10240]
+    // у hyper-connection): w4 даёт N/64 блоков, и варп в одиночку тянет всю K —
+    // 5 блоков на всю карту, 68 мкс. Split-K: 16-строчный тайл на блок, восемь
+    // варпов делят K. `SYN_GEMV_SPLITK_SMALL=0` — прежний w4.
+    if !want_w8 && n % 16 == 0 && n / W4_M_TILE < kernels.num_sms / 2 && splitk_small_on() {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let (w_ptr, _rw) = packed_w_shuf.device_ptr(stream);
+        let (s_ptr, _rs) = scales_w.device_ptr(stream);
+        let (o_ptr, _ro) = out.device_ptr_mut(stream);
+        let group = GemvGroup { w_shuf: w_ptr, scales: s_ptr, out: o_ptr, n };
+        return nvfp4_gemv_grouped_splitk(
+            kernels,
+            stream,
+            &[group],
+            &packed_x.slice(..),
+            &scales_x.slice(..),
+            k,
+            RouterRows::default(),
+        );
+    }
     let want_persistent = want_w8 && num_tiles_w8 >= kernels.num_sms * 4;
     let (kfn, threads, grid) = if want_persistent {
         (&kernels.w8_persistent, W8_THREADS, kernels.num_sms * 4)
@@ -309,6 +329,11 @@ pub fn nvfp4_mma_gemv_shuf_f16_view(
             .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemv_shuf: {e:?}")))?;
     }
     Ok(())
+}
+
+fn splitk_small_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_GEMV_SPLITK_SMALL").as_deref() != Ok("0"))
 }
 
 /// Собрать массивы указателей пакетного GEMV по device-индексам экспертов.
