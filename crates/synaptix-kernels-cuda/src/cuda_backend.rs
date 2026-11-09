@@ -1133,7 +1133,9 @@ impl Backend for CudaBackend {
             .last()
             .ok_or(SynaptixError::Unsupported("linear_epilogue: x scalar"))?;
         let m = x_lo.numel() / k.max(1);
-        if m <= 1 || w_lo.dims().len() != 2 || w_lo.dims()[1] != k {
+        // Горстка строк без bias/residual — путём `linear` (GEMV по строкам).
+        let few = m <= small_m_gemv_rows() && bias.is_none() && residual.is_none();
+        if m <= 1 || few || w_lo.dims().len() != 2 || w_lo.dims()[1] != k {
             return Err(SynaptixError::Unsupported("linear_epilogue: shape/M"));
         }
         if !x_lo.is_contiguous() || !w_lo.is_contiguous() {
