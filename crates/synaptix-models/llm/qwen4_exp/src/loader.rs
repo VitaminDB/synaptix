@@ -550,6 +550,16 @@ impl BundleExperts {
     }
 }
 
+impl Qwen4ExpWeights {
+    /// Эксперты лежат одноблобным форматом (масштабы внутри блоба: IQ3_S-128,
+    /// SQ, типы ggml) — годятся для чтения ядрами прямо из зеркала RAM.
+    pub fn experts_one_blob(&self) -> bool {
+        let Source::Bundle(l) = &self.source else { return false };
+        let key = self.resolve(&format!("{LM_PREFIX}.layers.0.mlp.experts.gate_up_proj"));
+        l.quant_kind(&key).is_some_and(|k| !k.has_scales())
+    }
+}
+
 impl BundleExperts {
     /// Блоб эксперта `expert` стопки `key` (срез mmap) — только одноблобные
     /// форматы (масштабы внутри блоба).

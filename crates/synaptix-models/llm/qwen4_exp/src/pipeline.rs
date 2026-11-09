@@ -334,7 +334,7 @@ impl Qwen4ExpPipeline {
         // Декод MoE без синхронизации: только эксперты из бандла с зеркалом в
         // RAM. Старый кэш нужен лишь префиллу — ужимаем его потолок, место
         // отдадут слотам на первом декоде.
-        let zc_pool = if zc_on() && lazy && host_mirror.is_some() {
+        let zc_pool = if zc_on() && lazy && host_mirror.is_some() && weights.experts_one_blob() {
             let pool = synaptix_llm_common::moe_zc::ZcPool::new(device);
             model.attach_zc(&pool);
             if let Some(cache) = model.expert_cache() {
@@ -798,6 +798,11 @@ impl Qwen4ExpPipeline {
         let media: Vec<(u32, Tensor)> =
             inputs.iter().map(|m| (m.pad, m.embeds.clone())).collect();
         let media = media.as_slice();
+        // Слоты zero-copy отдаём ДО выбора чанка префилла (`prepare` смотрит
+        // на свободную VRAM): иначе длинный префилл шёл чанком 256 — втрое
+        // дольше. Свежих токенов — сверх префикса, живущего в сессии.
+        let reuse_peek = session.as_deref().map(|s| s.reusable_media(prompt_ids, inputs)).unwrap_or(0);
+        self.zc_release_for_prefill(prompt_ids.len().saturating_sub(reuse_peek));
         let cfg = self.prepare(cfg);
         let budget = prompt_ids.len() + cfg.max_new_tokens;
         if budget > self.max_seq {
@@ -1350,9 +1355,11 @@ fn is_oom<E: std::fmt::Display>(e: &E) -> bool {
     s.contains("OUT_OF_MEMORY") || s.contains("out of memory") || s.contains(": OOM")
 }
 
-/// Декод MoE без синхронизации (`SYN_QWEN4EXP_ZC=1`).
+/// Декод MoE без синхронизации — по умолчанию (`SYN_QWEN4EXP_ZC=0` — прежний
+/// путь). Включается сам лишь у одноблобных экспертов с зеркалом в RAM;
+/// NVFP4-бандл идёт прежним путём.
 fn zc_on() -> bool {
-    std::env::var("SYN_QWEN4EXP_ZC").map(|v| v.trim() == "1").unwrap_or(false)
+    std::env::var("SYN_QWEN4EXP_ZC").map(|v| v.trim() != "0").unwrap_or(true)
 }
 
 /// Потолок старого кэша экспертов при zero-copy: он нужен только префиллу
