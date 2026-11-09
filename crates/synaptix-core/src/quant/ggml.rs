@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 pub const QK_K: usize = 256;
 pub const K_SCALE_SIZE: usize = 12;
+/// Байт в блоке [`GgmlType::Iq3S128`].
+pub const IQ3S128_BYTES: usize = 2 + 32 + 4 + 16 + 2;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -57,15 +59,21 @@ pub enum GgmlType {
     Nvfp4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
+    /// Собственный формат synaptix, не из ggml: математика IQ3_S (сетка
+    /// 512 четвёрок нечётных уровней 1…15, знаки отдельно, 4-битная шкала на
+    /// 32 значения `d·(1+2·sc)`), но суперблок 128 значений вместо 256 —
+    /// делит K=640 у down-проекций экспертов. 56 байт на 128 = 3,5 бит на вес:
+    /// `d: f16 | qs[32] | qh[4] | signs[16] | scales[2]`. Номер вне диапазона ggml.
+    Iq3S128 = 1000,
 }
 
 impl GgmlType {
-    pub const ALL: [GgmlType; 35] = {
+    pub const ALL: [GgmlType; 36] = {
         use GgmlType::*;
         [
             F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K, Iq2Xxs,
             Iq2Xs, Iq3Xxs, Iq1S, Iq4Nl, Iq3S, Iq2S, Iq4Xs, I8, I16, I32, I64, F64, Iq1M, BF16,
-            Tq1_0, Tq2_0, Mxfp4, Nvfp4, Q1_0, Q2_0,
+            Tq1_0, Tq2_0, Mxfp4, Nvfp4, Q1_0, Q2_0, Iq3S128,
         ]
     };
 
@@ -107,6 +115,7 @@ impl GgmlType {
             40 => Nvfp4,
             41 => Q1_0,
             42 => Q2_0,
+            1000 => Iq3S128,
             _ => return None,
         })
     }
@@ -150,6 +159,7 @@ impl GgmlType {
             Nvfp4 => "NVFP4",
             Q1_0 => "Q1_0",
             Q2_0 => "Q2_0",
+            Iq3S128 => "IQ3_S128",
         }
     }
 
@@ -172,6 +182,7 @@ impl GgmlType {
             Nvfp4 => 64,
             Q2_0 => 64,
             Q1_0 => 128,
+            Iq3S128 => 128,
             _ => QK_K,
         }
     }
@@ -211,6 +222,7 @@ impl GgmlType {
             Nvfp4 => 4 + 32,
             Q1_0 => 2 + 16,
             Q2_0 => 2 + 16,
+            Iq3S128 => IQ3S128_BYTES,
         }
     }
 
@@ -554,5 +566,198 @@ mod q4k_tests {
         let e5k = err(&deq(GgmlType::Q5K, &quantize_q5_k(&x, n, k, None)));
         assert!(e4k < 0.1 && e4k < e40, "Q4_K {e4k} против Q4_0 {e40}");
         assert!(e5k < e4k * 0.7, "Q5_K {e5k} против Q4_K {e4k}");
+    }
+}
+
+// ───────────────────────── IQ3_S-128: кодировщик ─────────────────────────
+
+/// Таблица сетки IQ3_S как четвёрки f32.
+fn iq3s_grid_f32() -> &'static [[f32; 4]; 512] {
+    static G: std::sync::OnceLock<[[f32; 4]; 512]> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let mut g = [[0f32; 4]; 512];
+        for (i, v) in super::ggml_tables::IQ3S_GRID.iter().enumerate() {
+            let b = v.to_le_bytes();
+            g[i] = [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32];
+        }
+        g
+    })
+}
+
+/// Ближайшая точка сетки к неотрицательной четвёрке `a` с весами `w`.
+#[inline]
+fn iq3s_nearest(a: &[f32; 4], w: &[f32; 4]) -> (usize, f32) {
+    let g = iq3s_grid_f32();
+    let mut best = 0usize;
+    let mut be = f32::INFINITY;
+    for (i, p) in g.iter().enumerate() {
+        let e = w[0] * (a[0] - p[0]) * (a[0] - p[0])
+            + w[1] * (a[1] - p[1]) * (a[1] - p[1])
+            + w[2] * (a[2] - p[2]) * (a[2] - p[2])
+            + w[3] * (a[3] - p[3]) * (a[3] - p[3]);
+        if e < be {
+            be = e;
+            best = i;
+        }
+    }
+    (best, be)
+}
+
+/// Коды под-блока 32 при масштабе `s`: индексы сетки 8 групп и взвешенная
+/// ошибка. `ax` — модули значений.
+fn iq3s_codes(ax: &[f32], w: &[f32], s: f32, idx: &mut [u16; 8]) -> f32 {
+    let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+    let g = iq3s_grid_f32();
+    let mut err = 0f32;
+    for gi in 0..8 {
+        let a = [ax[4 * gi] * inv, ax[4 * gi + 1] * inv, ax[4 * gi + 2] * inv, ax[4 * gi + 3] * inv];
+        let ww = [w[4 * gi], w[4 * gi + 1], w[4 * gi + 2], w[4 * gi + 3]];
+        let (b, _) = iq3s_nearest(&a, &ww);
+        idx[gi] = b as u16;
+        for j in 0..4 {
+            let d = ax[4 * gi + j] - s * g[b][j];
+            err += ww[j] * d * d;
+        }
+    }
+    err
+}
+
+/// Кодировщик блока IQ3_S-128 (эталон, полный перебор сетки): `x.len() ==
+/// 128`, `imp` — важность столбцов (E[x²] входа) или `None`.
+pub fn quantize_iq3_s128_block(x: &[f32], imp: Option<&[f32]>, out: &mut [u8]) {
+    debug_assert_eq!(x.len(), 128);
+    debug_assert_eq!(out.len(), IQ3S128_BYTES);
+    out.fill(0);
+    let ax: Vec<f32> = x.iter().map(|v| v.abs()).collect();
+    // Вес ошибки: важность столбца, смягчённая модулем веса (как в ggml:
+    // крупные веса важнее при той же активации).
+    let sigma2 = x.iter().map(|v| v * v).sum::<f32>() / 128.0;
+    let w: Vec<f32> = (0..128)
+        .map(|i| imp.map(|h| h[i]).unwrap_or(1.0) * (sigma2 + x[i] * x[i]).sqrt())
+        .collect();
+    // 1) лучший вещественный масштаб на под-блок.
+    let mut best_s = [0f32; 4];
+    for sb in 0..4 {
+        let a = &ax[32 * sb..32 * sb + 32];
+        let ww = &w[32 * sb..32 * sb + 32];
+        let amax = a.iter().copied().fold(0f32, f32::max);
+        if amax == 0.0 {
+            continue;
+        }
+        let mut be = f32::INFINITY;
+        let mut idx = [0u16; 8];
+        for c in 0..17 {
+            let s = amax / 15.0 * (0.6 + 0.05 * c as f32);
+            let e = iq3s_codes(a, ww, s, &mut idx);
+            if e < be {
+                be = e;
+                best_s[sb] = s;
+            }
+        }
+    }
+    let smax = best_s.iter().copied().fold(0f32, f32::max);
+    if smax == 0.0 {
+        return;
+    }
+    // 2) общий d и 4-битные шкалы: s ≈ d·(1+2·sc), sc ∈ 0..15. Перебор d
+    // вокруг smax/31 по суммарной ошибке блока.
+    let g = iq3s_grid_f32();
+    let mut best: Option<(f32, f32, [u8; 4], [[u16; 8]; 4])> = None;
+    for c in 0..9 {
+        let d = smax / 31.0 * (0.9 + 0.025 * c as f32);
+        let d = half::f16::from_f32(d).to_f32();
+        if d <= 0.0 {
+            continue;
+        }
+        let mut sc = [0u8; 4];
+        let mut codes = [[0u16; 8]; 4];
+        let mut tot = 0f32;
+        for sb in 0..4 {
+            let q = ((best_s[sb] / d - 1.0) / 2.0).round().clamp(0.0, 15.0) as u8;
+            // проверим соседей шкалы: ±1
+            let mut be = f32::INFINITY;
+            for qq in [q.saturating_sub(1), q, (q + 1).min(15)] {
+                let s = d * (1 + 2 * qq as i32) as f32;
+                let mut idx = [0u16; 8];
+                let e = iq3s_codes(&ax[32 * sb..32 * sb + 32], &w[32 * sb..32 * sb + 32], s, &mut idx);
+                if e < be {
+                    be = e;
+                    sc[sb] = qq;
+                    codes[sb] = idx;
+                }
+            }
+            tot += be;
+        }
+        if best.as_ref().is_none_or(|b| tot < b.0) {
+            best = Some((tot, d, sc, codes));
+        }
+    }
+    let (_, d, sc, codes) = best.expect("хотя бы один d");
+    let _ = g;
+    out[0..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+    for sb in 0..4 {
+        for gi in 0..8 {
+            let gidx = codes[sb][gi] as usize;
+            let group = sb * 8 + gi;
+            out[2 + group] = (gidx & 0xff) as u8;
+            if gidx & 0x100 != 0 {
+                out[34 + group / 8] |= 1 << (group % 8);
+            }
+        }
+        out[54 + sb / 2] |= sc[sb] << (4 * (sb % 2));
+    }
+    for i in 0..128 {
+        if x[i] < 0.0 {
+            out[38 + i / 8] |= 1 << (i % 8);
+        }
+    }
+}
+
+/// Кодировщик матрицы `[n, k]` (`k % 128 == 0`) в IQ3_S-128; `imp` —
+/// важность столбцов длины `k`.
+pub fn quantize_iq3_s128(x: &[f32], n: usize, k: usize, imp: Option<&[f32]>) -> Vec<u8> {
+    use rayon::prelude::*;
+    assert!(k % 128 == 0, "IQ3_S-128: K={k} не кратно 128");
+    let rb = k / 128 * IQ3S128_BYTES;
+    let mut out = vec![0u8; n * rb];
+    out.par_chunks_mut(rb).enumerate().for_each(|(r, row)| {
+        for b in 0..k / 128 {
+            let h = imp.map(|h| &h[128 * b..128 * b + 128]);
+            quantize_iq3_s128_block(&x[r * k + 128 * b..r * k + 128 * b + 128], h, &mut row[b * IQ3S128_BYTES..(b + 1) * IQ3S128_BYTES]);
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod iq3s128_tests {
+    use super::*;
+
+    #[test]
+    fn iq3_s128_roundtrip_error() {
+        let (n, k) = (16usize, 640usize);
+        let mut s = 7u64;
+        let x: Vec<f32> = (0..n * k)
+            .map(|_| {
+                // приблизительно нормальные значения: сумма 4 равномерных
+                let mut acc = 0f32;
+                for _ in 0..4 {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    acc += (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                }
+                acc * 0.02
+            })
+            .collect();
+        let q = quantize_iq3_s128(&x, n, k, None);
+        assert_eq!(q.len(), GgmlType::Iq3S128.bytes_for(k) * n);
+        let mut y = vec![0f32; n * k];
+        crate::quant::ggml_dequant::dequantize(GgmlType::Iq3S128, &q, n * k, &mut y).unwrap();
+        let num: f32 = x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum();
+        let den: f32 = x.iter().map(|a| a * a).sum();
+        let rel = (num / den).sqrt();
+        eprintln!("IQ3_S-128 на гауссовом шуме: отн. ошибка {rel:.4}");
+        assert!(rel < 0.16, "{rel}");
     }
 }

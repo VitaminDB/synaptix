@@ -135,6 +135,7 @@ pub fn dequantize(ty: GgmlType, src: &[u8], n: usize, dst: &mut [f32]) -> Result
         Iq2S => blocks(ty, src, n, dst, deq_iq2_s),
         Iq3Xxs => blocks(ty, src, n, dst, deq_iq3_xxs),
         Iq3S => blocks(ty, src, n, dst, deq_iq3_s),
+        Iq3S128 => blocks(ty, src, n, dst, deq_iq3_s128),
         Iq1S => blocks(ty, src, n, dst, deq_iq1_s),
         Iq1M => blocks(ty, src, n, dst, deq_iq1_m),
         Iq4Nl => blocks(ty, src, n, dst, deq_iq4_nl),
@@ -564,6 +565,26 @@ fn deq_iq3_xxs(b: &[u8], y: &mut [f32]) {
                 y[out + j + 4] = db * grid2[j] as f32 * sign(signs, j + 4);
             }
             out += 8;
+        }
+    }
+}
+
+/// IQ3_S-128 (см. `GgmlType::Iq3S128`): `d | qs[32] | qh[4] | signs[16] | scales[2]`.
+fn deq_iq3_s128(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    for sb in 0..4 {
+        let sc = (b[54 + sb / 2] >> (4 * (sb % 2))) & 0xF;
+        let db = d * (1 + 2 * sc as i32) as f32;
+        for gi in 0..8 {
+            let group = sb * 8 + gi;
+            let g = b[2 + group] as usize | ((((b[34 + group / 8] >> (group % 8)) & 1) as usize) << 8);
+            let grid = IQ3S_GRID[g].to_le_bytes();
+            for j in 0..4 {
+                let i = group * 4 + j;
+                let neg = (b[38 + i / 8] >> (i % 8)) & 1 != 0;
+                let v = db * grid[j] as f32;
+                y[i] = if neg { -v } else { v };
+            }
         }
     }
 }

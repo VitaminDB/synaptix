@@ -22,3 +22,5 @@ thiserror          = { workspace = true }
 [dev-dependencies]
 synaptix-kernels-cpu  = { workspace = true }
 synaptix-kernels-cuda = { workspace = true }
+half                  = { workspace = true }
+bytemuck              = { workspace = true }

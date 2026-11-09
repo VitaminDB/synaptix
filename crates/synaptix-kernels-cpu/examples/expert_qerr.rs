@@ -114,6 +114,12 @@ fn main() {
             } else {
                 line += "  q4_k(K%256)  —   ";
             }
+            {
+                let t = std::time::Instant::now();
+                let q = synaptix_core::quant::ggml::quantize_iq3_s128(&x, n, k, None);
+                synaptix_core::quant::ggml_dequant::dequantize(GgmlType::Iq3S128, &q, n * k, &mut y).unwrap();
+                line += &format!("  iq3_s128(3.50) {:.4} [{:.1} с]", rel(&x, &y), t.elapsed().as_secs_f64());
+            }
             for bits in [4u8, 3, 2] {
                 let q = synaptix_core::quant::sq::quantize_matrix(bits, &x, n, k).unwrap();
                 let yq = synaptix_core::quant::sq::dequantize_matrix(bits, &q, n, k).unwrap();
