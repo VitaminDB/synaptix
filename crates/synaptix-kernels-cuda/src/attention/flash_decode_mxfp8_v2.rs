@@ -143,10 +143,17 @@ pub fn v2_shape_ok(d: u32, t_q: u32, q_dtype: DType, k_off: usize, v_off: usize)
 }
 
 /// split_k: целимся в ~256 блоков (латентность DRAM прячется параллелизмом),
-/// но сегмент держим ≥ ~512 токенов, чтобы не платить за staging тайлов.
+/// сегмент — не меньше тайла ядра (128 токенов). Прежний минимум в 512
+/// токенов на коротком контексте оставлял карту пустой: у QSA Qwen4Exp
+/// (2 KV-головы, группа 6) при ~1–2k ключей выходило 8 блоков и 224 мкс на
+/// слой. `SYN_FD2_MIN_SEG` — другой минимум (для A/B).
 fn v2_split_k(gx_blocks: u32, t_len: u32) -> u32 {
+    static MIN_SEG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let min_seg = *MIN_SEG.get_or_init(|| {
+        std::env::var("SYN_FD2_MIN_SEG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
+    });
     let occ = (256 / gx_blocks.max(1)).max(1);
-    let cap_len = (t_len / 512).max(1);
+    let cap_len = (t_len / min_seg).max(1);
     occ.min(cap_len).clamp(1, V2_SPLIT_K_MAX)
 }
 

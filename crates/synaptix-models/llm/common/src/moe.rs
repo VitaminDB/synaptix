@@ -1766,6 +1766,9 @@ impl MoeFfn {
         let k = self.cfg.num_experts_per_tok;
         let routed = router_in.unwrap_or(x);
         let (experts, weights) = stage("moe:route", || self.route(routed))?;
+        if t == 1 {
+            route_trace::record(self.layer_id, &experts);
+        }
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
@@ -2904,4 +2907,34 @@ fn moe_fp8_off() -> bool {
 fn moe_segmented_off() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0"))
+}
+
+/// Трасса маршрутизации декода: `SYN_MOE_ROUTE_TRACE=<файл>` — на каждый
+/// одиночный токен пишется запись «слой (u16), k экспертов (u16)». По ней
+/// офлайн считаются попадания разных политик кэша экспертов.
+pub mod route_trace {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
+        static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let path = std::env::var("SYN_MOE_ROUTE_TRACE").ok()?;
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            Some(Mutex::new(std::io::BufWriter::new(f)))
+        })
+        .as_ref()
+    }
+
+    pub fn record(layer: usize, experts: &[u32]) {
+        let Some(sink) = sink() else { return };
+        let Ok(mut w) = sink.lock() else { return };
+        let mut buf = Vec::with_capacity(2 + 2 * experts.len());
+        buf.extend_from_slice(&(layer as u16).to_le_bytes());
+        for e in experts {
+            buf.extend_from_slice(&(*e as u16).to_le_bytes());
+        }
+        let _ = w.write_all(&buf);
+        let _ = w.flush();
+    }
 }
