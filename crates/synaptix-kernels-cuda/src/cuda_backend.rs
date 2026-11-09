@@ -920,7 +920,7 @@ impl Backend for CudaBackend {
         #[repr(transparent)]
         struct Arg(synaptix_core::backend::ZcLaunch);
         unsafe impl cudarc::driver::DeviceRepr for Arg {}
-        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
+        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
         static CACHE: std::sync::OnceLock<parking_lot::Mutex<Vec<Fns>>> = std::sync::OnceLock::new();
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_zc_lru: не CUDA"));
@@ -928,20 +928,35 @@ impl Backend for CudaBackend {
         let ctx = synaptix_core::device::cuda::get(ord)?;
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
         let key = Arc::as_ptr(&ctx) as usize;
-        let (lru, copy) = {
+        let (lru, copy, router, topk) = {
             let mut g = CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new())).lock();
             match g.iter().find(|f| f.0 == key) {
-                Some(f) => (f.2.clone(), f.3.clone()),
+                Some(f) => (f.2.clone(), f.3.clone(), f.4.clone(), f.5.clone()),
                 None => {
                     let m = crate::kernels::compile::compile_module(&ctx, include_str!("cu/fused/moe_zc_stage.cu"), "moe_zc_stage.cu")?;
                     let l = crate::kernels::compile::load_fn(&m, "zc_lru")?;
                     let c = crate::kernels::compile::load_fn(&m, "zc_copy")?;
-                    g.push((key, m, l.clone(), c.clone()));
-                    (l, c)
+                    let r = crate::kernels::compile::load_fn(&m, "zc_router")?;
+                    let t = crate::kernels::compile::load_fn(&m, "zc_topk")?;
+                    g.push((key, m, l.clone(), c.clone(), r.clone(), t.clone()));
+                    (l, c, r, t)
                 }
             }
         };
         let arg = Arg(*a);
+        if a.router_w != 0 {
+            if a.experts > 1024 || a.k == 0 || a.k > 64 || a.h % 4 != 0 || a.rows * a.k != a.pairs {
+                return Err(SynaptixError::Unsupported("moe_zc_lru: форма роутера"));
+            }
+            let mut b = stream.launch_builder(&router);
+            b.arg(&arg);
+            unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (a.experts.div_ceil(8), a.rows, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
+                .map_err(|e| SynaptixError::Cuda(format!("launch zc_router: {e:?}")))?;
+            let mut b = stream.launch_builder(&topk);
+            b.arg(&arg);
+            unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (a.rows, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
+                .map_err(|e| SynaptixError::Cuda(format!("launch zc_topk: {e:?}")))?;
+        }
         let mut b = stream.launch_builder(&lru);
         b.arg(&arg);
         unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }

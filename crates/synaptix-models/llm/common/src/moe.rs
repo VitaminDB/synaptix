@@ -1874,19 +1874,31 @@ impl MoeFfn {
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
         let h = self.cfg.hidden_size;
-        let logits = x.to_dtype(DType::F32).and_then(|xf| xf.linear(&self.router)).map_err(ferr)?;
-        let (vals, idx) = logits.topk_rows(k).map_err(ferr)?;
-        let w = vals
-            .max_keepdim(1)
-            .and_then(|m| vals.broadcast_sub(&m))
-            .and_then(|d| d.exp())
-            .and_then(|e| e.sum_keepdim(1).and_then(|s| e.broadcast_div(&s)))
-            .map_err(ferr)?;
-        let idx = idx.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
-        let w = w.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
-
         let xa = if matches!(x.dtype(), DType::F16 | DType::BF16) { x.clone() } else { to_f16(x)? };
         let xa = if xa.is_contiguous() { xa } else { xa.contiguous().map_err(ferr)? };
+        // Роутер, top-k, softmax и кэш экспертов — одной пачкой ядер (F16-вход);
+        // иначе выбор считается тензорными операциями.
+        let routed_on_dev = xa.dtype() == DType::F16 && self.router.dtype() == DType::F32 && self.router.is_contiguous() && self.cfg.num_experts <= 1024 && k <= 64 && h % 4 == 0;
+        let (idx, w, gu_t, dn_t, iota) = if routed_on_dev {
+            let idx = Tensor::empty_uninit(vec![t * k], DType::U32, self.device).map_err(ferr)?;
+            let w = Tensor::empty_uninit(vec![t * k], DType::F32, self.device).map_err(ferr)?;
+            let (gu_t, dn_t, iota) = layer.stage_routed(pool, &idx, Some((&self.router, &xa, &w)))?;
+            (idx, w, gu_t, dn_t, iota)
+        } else {
+            let logits = x.to_dtype(DType::F32).and_then(|xf| xf.linear(&self.router)).map_err(ferr)?;
+            let (vals, idx) = logits.topk_rows(k).map_err(ferr)?;
+            let w = vals
+                .max_keepdim(1)
+                .and_then(|m| vals.broadcast_sub(&m))
+                .and_then(|d| d.exp())
+                .and_then(|e| e.sum_keepdim(1).and_then(|s| e.broadcast_div(&s)))
+                .map_err(ferr)?;
+            let idx = idx.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+            let w = w.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+            let (gu_t, dn_t, iota) = layer.stage(pool, &idx)?;
+            (idx, w, gu_t, dn_t, iota)
+        };
+        let _ = &idx;
         let x_rows = if t == 1 {
             xa
         } else {
@@ -1894,8 +1906,6 @@ impl MoeFfn {
             let rows = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
             take_rows(&xa, &rows)?
         };
-        // Промахи подкачиваются на карте в рабочий буфер; таблицы — по парам.
-        let (gu_t, dn_t, iota) = layer.stage(pool, &idx)?;
         let gu = gu_t.gemv_indexed_dense(&iota, &x_rows, t > 1).map_err(ferr)?;
         let hh = self.swiglu(&gu)?;
         let hh = if hh.is_contiguous() { hh } else { hh.contiguous().map_err(ferr)? };

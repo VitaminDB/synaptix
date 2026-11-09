@@ -202,6 +202,18 @@ impl ZcLayer {
     /// Таблицы по парам шага: кэш на карте обновлён, промахи скопированы в
     /// свои новые слоты.
     pub fn stage(&self, pool: &ZcPool, idx: &Tensor) -> Result<(ExpertTable, ExpertTable, Tensor), ModelError> {
+        self.stage_routed(pool, idx, None)
+    }
+
+    /// Как [`Self::stage`], но выбор экспертов считается тут же на карте:
+    /// `route = (вес роутера f32 [E, H], x f16 [rows, H], wts f32 [rows·k])` —
+    /// `idx` и `wts` заполняются ядрами (роутер → top-k → softmax).
+    pub fn stage_routed(
+        &self,
+        pool: &ZcPool,
+        idx: &Tensor,
+        route: Option<(&Tensor, &Tensor, &Tensor)>,
+    ) -> Result<(ExpertTable, ExpertTable, Tensor), ModelError> {
         let pairs = idx.numel();
         let dev = pool.device;
         let eff_gu = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
@@ -231,7 +243,23 @@ impl ZcLayer {
             experts: self.experts as u32,
             slots: self.n_slots as u32,
             _pad: 0,
+            ..Default::default()
         };
+        let mut a = a;
+        let mut _logits = None;
+        if let Some((router, x, wts)) = route {
+            let rows = x.dims()[0];
+            let h = x.dims()[1];
+            let lg = Tensor::empty_uninit(vec![rows, self.experts], DType::F32, dev).map_err(zerr)?;
+            a.router_w = addr(router)?;
+            a.x = addr(x)?;
+            a.logits = addr(&lg)?;
+            a.wts = addr(wts)?;
+            a.rows = rows as u32;
+            a.k = (pairs / rows.max(1)) as u32;
+            a.h = h as u32;
+            _logits = Some(lg);
+        }
         synaptix_core::tensor::ops::moe_zc_lru(dev, &a).map_err(zerr)?;
         drop(cp);
         let gu = ExpertTable::from_tensor_dense(self.gu_shape.0, self.gu_shape.1, self.dtype, eff_gu).ok_or_else(|| zerr("таблица gate_up"))?;

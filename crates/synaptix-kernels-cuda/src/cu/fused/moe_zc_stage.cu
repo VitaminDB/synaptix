@@ -18,7 +18,90 @@ struct ZcArgs {
     unsigned long long eff_gu, eff_dn, cp_src_gu, cp_src_dn, cp_dst;
     unsigned long long slot_base, slot_bytes, gu_bytes, dn_bytes;
     unsigned int pairs, experts, slots, _pad;
+    // Маршрутизация на карте (router_w != 0): logits = W[E,H]·x[t,H] (W — f32,
+    // x — f16), top-k → idx[t·k], softmax по top-k → wts[t·k].
+    unsigned long long router_w, x, logits, wts;
+    unsigned int rows, k, H, _pad2;
 };
+
+#include <cuda_fp16.h>
+
+// Строка роутера на варп; порядок fmaf — как у mma_gemv_f32 (вектор из 4 на
+// лейн, шаг 32 вектора): выбор экспертов совпадает с прежним путём.
+// grid = (ceil(E/8), rows), block = 256.
+extern "C" __global__ void zc_router(ZcArgs a) {
+    const unsigned e = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const unsigned t = blockIdx.y;
+    if (e >= a.experts) return;
+    const unsigned lane = threadIdx.x & 31u;
+    const float4* w4 = reinterpret_cast<const float4*>((const float*)a.router_w + (size_t)e * a.H);
+    const __half2* x2 = reinterpret_cast<const __half2*>((const __half*)a.x + (size_t)t * a.H);
+    float acc = 0.f;
+    const unsigned k4 = a.H >> 2;
+    for (unsigned i = lane; i < k4; i += 32u) {
+        const float4 wv = w4[i];
+        const float2 xa = __half22float2(x2[2 * i]);
+        const float2 xb = __half22float2(x2[2 * i + 1]);
+        acc = fmaf(wv.x, xa.x, acc);
+        acc = fmaf(wv.y, xa.y, acc);
+        acc = fmaf(wv.z, xb.x, acc);
+        acc = fmaf(wv.w, xb.y, acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) ((float*)a.logits)[(size_t)t * a.experts + e] = acc;
+}
+
+// top-k строки логитов и softmax по выбранным. grid = rows, block = 256,
+// E ≤ 1024. Ничья — меньший индекс.
+extern "C" __global__ void zc_topk(ZcArgs a) {
+    __shared__ float vals[1024];
+    __shared__ float red_v[8];
+    __shared__ unsigned red_i[8];
+    __shared__ float top_v[64];
+    const unsigned t = blockIdx.x, tid = threadIdx.x, bs = blockDim.x;
+    const unsigned lane = tid & 31u, wid = tid >> 5, nw = bs >> 5;
+    const float NEG = __int_as_float(0xFF800000);
+    const float* src = (const float*)a.logits + (size_t)t * a.experts;
+    for (unsigned i = tid; i < a.experts; i += bs) vals[i] = src[i];
+    __syncthreads();
+    for (unsigned slot = 0; slot < a.k; ++slot) {
+        float best = NEG;
+        unsigned bi = 0xffffffffu;
+        for (unsigned i = tid; i < a.experts; i += bs) {
+            const float v = vals[i];
+            if (v > best || bi == 0xffffffffu) { best = v; bi = i; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const unsigned oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        if (lane == 0) { red_v[wid] = best; red_i[wid] = bi; }
+        __syncthreads();
+        if (wid == 0) {
+            best = lane < nw ? red_v[lane] : NEG;
+            bi = lane < nw ? red_i[lane] : 0xffffffffu;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const unsigned oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+            }
+            if (lane == 0) {
+                ((unsigned*)a.idx)[t * a.k + slot] = bi;
+                top_v[slot] = best;
+                vals[bi] = NEG;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        // Значения идут по убыванию: максимум — первый.
+        const float m = top_v[0];
+        float sum = 0.f;
+        for (unsigned j = 0; j < a.k; ++j) sum += __expf(top_v[j] - m);
+        for (unsigned j = 0; j < a.k; ++j) ((float*)a.wts)[t * a.k + j] = __expf(top_v[j] - m) / sum;
+    }
+}
 
 extern "C" __global__ void zc_lru(ZcArgs a) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;

@@ -118,6 +118,17 @@ pub struct ZcLaunch {
     pub experts: u32,
     pub slots: u32,
     pub _pad: u32,
+    /// Маршрутизация на карте: при `router_w != 0` перед кэшем считаются
+    /// логиты роутера (f32 `[E, H]` × f16 `x [rows, H]`), top-k → `idx`,
+    /// softmax по top-k → `wts` (f32 `[rows·k]`). `logits` — скретч `[rows, E]`.
+    pub router_w: u64,
+    pub x: u64,
+    pub logits: u64,
+    pub wts: u64,
+    pub rows: u32,
+    pub k: u32,
+    pub h: u32,
+    pub _pad2: u32,
 }
 
 /// Аргументы слитого gated-residual Qwen4Exp (раскладка как `HcArgs` в
