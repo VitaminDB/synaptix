@@ -1767,6 +1767,66 @@ impl MoeFfn {
         })
     }
 
+    /// Префилл MoE через слоты zero-copy: уникальные эксперты чанка
+    /// поднимаются в слоты тем же ядром «часов» (не влезшие читаются из RAM
+    /// прямо в GEMM), затем групповой GEMM gate_up / down по таблице адресов
+    /// и сборка выхода. `None` — слой zero-copy не собран (тогда прежний путь).
+    fn forward_zc_prefill(&self, x: &Tensor, experts: &[u32], weights: &[f32]) -> Result<Option<Tensor>, ModelError> {
+        use crate::profile::stage;
+        let Some(pool) = &self.zc_pool else { return Ok(None) };
+        let guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
+        let Some(layer) = guard.as_ref() else { return Ok(None) };
+        if !matches!(x.dtype(), DType::F16 | DType::BF16) || moe_grouped_dense_off() {
+            return Ok(None);
+        }
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE zero-copy префилл: {e}"));
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        let mut order: Vec<u32> = (0..(t * k) as u32).collect();
+        order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
+        // Сегменты по экспертам: (эксперт, начало, конец) в `order`.
+        let mut segs: Vec<(u32, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < order.len() {
+            let e = experts[order[i] as usize];
+            let mut j = i + 1;
+            while j < order.len() && experts[order[j] as usize] == e {
+                j += 1;
+            }
+            segs.push((e, i, j));
+            i = j;
+        }
+        let rows_all: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
+        let xc = if x.is_contiguous() { x.clone() } else { x.contiguous().map_err(ferr)? };
+        let fp8 = !moe_fp8_off();
+        // Группами по половине слотов: группа целиком влезает в слоты (часы
+        // вытесняют прошлые группы — их GEMM уже в очереди раньше).
+        let group = (layer.slots() / 2).max(1);
+        let mut parts: Vec<Tensor> = Vec::new();
+        for g in segs.chunks(group) {
+            let ids: Vec<u32> = g.iter().map(|s| s.0).collect();
+            let idx_g = Tensor::from_vec::<_, u32>(ids, vec![g.len()], self.device).map_err(ferr)?;
+            let (gu_t, dn_t, _) = layer.stage(pool, &idx_g)?;
+            let (r0, r1) = (g[0].1, g[g.len() - 1].2);
+            let segments: Vec<(u32, u32, u32)> =
+                g.iter().enumerate().map(|(u, s)| (u as u32, (s.1 - r0) as u32, (s.2 - r0) as u32)).collect();
+            let row_idx = Tensor::from_vec::<_, u32>(rows_all[r0..r1].to_vec(), vec![r1 - r0], self.device).map_err(ferr)?;
+            let gu = stage("moe:gg_gate_up", || gu_t.gemm_grouped_dense_rows(&xc, Some(&row_idx), &segments, fp8)).map_err(ferr)?;
+            let h = self.swiglu(&gu)?;
+            let h = if h.is_contiguous() { h } else { h.contiguous().map_err(ferr)? };
+            parts.push(stage("moe:gg_down", || dn_t.gemm_grouped_dense_rows(&h, None, &segments, fp8)).map_err(ferr)?);
+        }
+        drop(guard);
+        let parts = if parts.len() == 1 {
+            parts.pop().expect("одна группа")
+        } else {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 0).map_err(ferr)?
+        };
+        let parts = if parts.dtype() == self.compute { parts } else { self.to_compute(parts)? };
+        self.mix_back(parts, &order, weights, t, x).map(Some)
+    }
+
     /// Шаг MoE на 1–4 токена целиком на карте: роутер, top-k, softmax,
     /// индексные GEMV по таблице (слот VRAM или блоб в закреплённой RAM).
     /// `None` — путь неприменим (нет пула, формат не одноблобный, зеркало
@@ -2077,6 +2137,11 @@ impl MoeFfn {
         if t == 1 {
             route_trace::record(self.layer_id, &experts);
             LAST_ROUTE.with(|c| *c.borrow_mut() = experts.clone());
+        }
+        if t > 4 {
+            if let Some(out) = stage("moe:zc_prefill", || self.forward_zc_prefill(x, &experts, &weights))? {
+                return Ok(out);
+            }
         }
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
