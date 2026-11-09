@@ -1061,7 +1061,7 @@ impl Backend for CudaBackend {
         // Декод (M=1) и горстка строк (спекулятивная пара MTP и т. п., M ≤ 4) →
         // GEMV по строкам: GEMM на M=2 шёл одним блоком (gemm_f32_nn роутера
         // 116 мкс против 10 у GEMV). `SYN_LINEAR_GEMV_ROWS` — порог M.
-        if m == 1 || (m <= small_m_gemv_rows() && n >= 16) {
+        if m == 1 || m <= small_m_gemv_rows() {
             let kernels = crate::best_cu::gemv::mma_gemv::MmaGemvKernels::for_context(&ctx)?;
             let es = dtype.bytes_for_numel(1);
             for r in 0..m {
