@@ -34,7 +34,7 @@ impl Lcg {
 fn f16_fields(t: GgmlType) -> &'static [usize] {
     use GgmlType::*;
     match t {
-        Q4_0 | Q5_0 | Q8_0 | Q3K | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq1S | Iq4Nl | Iq4Xs | Q1_0 | Q2_0 => {
+        Q4_0 | Q5_0 | Q8_0 | Q3K | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq3S128 | Iq1S | Iq4Nl | Iq4Xs | Q1_0 | Q2_0 => {
             match t {
                 Q3K => &[108],
                 _ => &[0],

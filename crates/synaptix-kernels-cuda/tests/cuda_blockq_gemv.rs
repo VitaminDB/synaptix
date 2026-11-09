@@ -35,7 +35,7 @@ fn f16_fields(t: GgmlType) -> &'static [usize] {
     use GgmlType::*;
     match t {
         Q3K => &[108],
-        Q4_0 | Q5_0 | Q8_0 | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq1S | Iq4Nl | Iq4Xs | Q1_0 | Q2_0 => &[0],
+        Q4_0 | Q5_0 | Q8_0 | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq3S128 | Iq1S | Iq4Nl | Iq4Xs | Q1_0 | Q2_0 => &[0],
         Q4_1 | Q5_1 | Q4K | Q5K => &[0, 2],
         Q2K => &[80, 82],
         Q6K => &[208],

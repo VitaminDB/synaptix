@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: logit_kl <bundle.syn> <текст> --save|--ref <файл> [токенов, 1024]".into());
     }
     let bundle = PathBuf::from(&a[1]);
-    let text = std::fs::read_to_string(&a[2])?;
+    let text = String::from_utf8_lossy(&std::fs::read(&a[2])?).into_owned();
     let mode = a[3].as_str();
     let file = PathBuf::from(&a[4]);
     let limit: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(1024);
@@ -127,6 +127,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 nll(&|i, t| rows[i][t]),
                 nll(&|i, t| ref_rows[i][t]),
             );
+            // KL по участкам: скачок на границе куска префилла выдаёт ошибку
+            // переноса состояния между кусками, а не квант.
+            let bucket = 64;
+            let line: Vec<String> = kls
+                .chunks(bucket)
+                .enumerate()
+                .map(|(i, c)| format!("{}:{:.3}", i * bucket, c.iter().sum::<f64>() / c.len() as f64))
+                .collect();
+            println!("  KL по участкам {bucket}: {}", line.join(" "));
         }
         o => return Err(format!("режим {o}: --save | --ref").into()),
     }

@@ -65,6 +65,7 @@ pub fn entry_suffix(dtype: DType) -> Option<&'static str> {
                 Iq2S => "iq2_s",
                 Iq3Xxs => "iq3_xxs",
                 Iq3S => "iq3_s",
+                Iq3S128 => "iq3_s128",
                 Iq1S => "iq1_s",
                 Iq1M => "iq1_m",
                 Tq1_0 => "tq1_0",
@@ -79,7 +80,7 @@ pub fn entry_suffix(dtype: DType) -> Option<&'static str> {
 const SUFFIXES: &[&str] = &[
     "sq1", "sq2", "sq3", "sq4", "sq5", "sq6", "sq7", "sq8", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
     "q1_0", "q2_0", "mxfp4", "nvfp4", "iq4_nl", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_xs",
-    "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m", "tq1_0", "tq2_0",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq3_s128", "iq1_s", "iq1_m", "tq1_0", "tq2_0",
 ];
 /// Только деквант (форматы активаций dp4a и NVFP4/MXFP8 движка).
 const DEQ_ONLY_SUFFIXES: &[&str] = &["q8_1", "q8_k", "nvfp4_syn", "mxfp8_syn"];

@@ -1379,6 +1379,16 @@ fn fit_cache_to_vram(cache: &Arc<ExpertCache>, cfg: &Qwen4ExpConfig, device: Dev
 
 /// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
 /// остальное — в системной памяти. Размер задаётся
+/// Сколько RAM оставить системе сверх зеркала экспертов: max(24 ГБ, ¼ RAM).
+fn mirror_reserve_bytes() -> usize {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
+        .map(|kb| kb * 1024)
+        .unwrap_or(0);
+    (24usize << 30).max(total / 4)
+}
+
 /// Сколько байт RAM свободно под зеркало (MemAvailable из /proc/meminfo).
 fn mem_available_bytes() -> Option<usize> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -1392,7 +1402,7 @@ fn mem_available_bytes() -> Option<usize> {
 /// из зеркала DMA идёт напрямую (~40 ГБ/с). Регистрировать страницы mmap
 /// как pinned (`cuMemHostRegister`) драйвер на этой платформе не даёт, потому
 /// копия. Бюджет — `SYN_QWEN4EXP_HOST_MIRROR_GB` (0 — выключить), по умолчанию
-/// всё, что влезает в MemAvailable минус запас 10 ГБ; скопированные страницы
+/// всё, что влезает в MemAvailable минус запас max(24 ГБ, ¼ RAM); скопированные страницы
 /// mmap отдаются системе, так что RAM в сумме растёт лишь на то, чего в
 /// страничном кэше не было. Копировщики работают фоном: пока диапазон не
 /// догнан, подкачка идёт прежним путём.
@@ -1413,7 +1423,10 @@ fn host_mirror_for(
     {
         Some(gb) if gb <= 0.0 => return None,
         Some(gb) => (gb * GB) as usize,
-        None => avail.saturating_sub(10 << 30),
+        // Зеркало закреплено (pinned) — его не вытеснить в своп, и система
+        // выталкивает туда всё остальное: при запасе 10 ГБ на 93 ГБ RAM рабочий
+        // стол подвисал. Оставляем не меньше 24 ГБ и не меньше четверти RAM.
+        None => avail.saturating_sub(mirror_reserve_bytes()),
     };
     let budget = budget.min(total);
     if budget < (2usize << 30) {

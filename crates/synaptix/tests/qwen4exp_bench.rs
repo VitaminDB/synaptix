@@ -113,8 +113,16 @@ fn qwen4exp_chat_bench() {
     // первым ходом (тёплый замер подкачки).
     if std::env::var("SYN_BENCH_WAIT_MIRROR").is_ok() {
         let t = Instant::now();
+        // Зеркало может быть частичным (бюджет RAM меньше стопок): ждём, пока
+        // оно перестанет расти, а не полного заполнения.
+        let mut last = (0usize, Instant::now());
         while let Some((ready, total)) = synaptix_core::device::cuda::offload_pin_cache_progress() {
             if ready >= total || t.elapsed().as_secs() > 600 {
+                break;
+            }
+            if ready != last.0 {
+                last = (ready, Instant::now());
+            } else if last.1.elapsed().as_secs() >= 5 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));

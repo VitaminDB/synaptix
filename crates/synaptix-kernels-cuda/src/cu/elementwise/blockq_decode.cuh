@@ -381,6 +381,22 @@ __device__ __forceinline__ void deq_iq3_s(const uint8_t *b, int ib32, float *y) 
         }
     }
 }
+// IQ3_S-128 (свой формат, GgmlType::Iq3S128): блок 128 = d | qs[32] | qh[4] |
+// signs[16] | scales[2]; под-блок 32 — восемь групп по 4.
+__device__ __forceinline__ void deq_iq3_s128(const uint8_t *b, int sb, float *y) {
+    float d = rd_f16(b, 0);
+    float db = d * (float)(1 + 2 * (int)((b[54 + sb / 2] >> (4 * (sb % 2))) & 0xF));
+    int qh = b[34 + sb];
+    const uint8_t *sg = b + 38 + sb * 4;
+    for (int gi = 0; gi < 8; ++gi) {
+        int g = (int)b[2 + sb * 8 + gi] | (((qh >> gi) & 1) << 8);
+        const uint8_t *grid = (const uint8_t *)(iq3s_grid + g);
+        for (int j = 0; j < 4; ++j) {
+            int i = gi * 4 + j;
+            y[i] = db * (float)grid[j] * sgn(sg[i / 8], i % 8);
+        }
+    }
+}
 __device__ __forceinline__ void deq_iq1_s(const uint8_t *b, int ib, float *y) {
     float d = rd_f16(b, 0);
     const uint8_t *qs = b + 2;
