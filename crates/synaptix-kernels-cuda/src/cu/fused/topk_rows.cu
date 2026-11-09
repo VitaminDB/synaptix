@@ -46,20 +46,42 @@ extern "C" __global__ void topk_rows_f32(
                 best_i = i;
             }
         }
-        red_v[tid] = best;
-        red_i[tid] = best_i;
+        // Сведение argmax: варп шаффлами, затем лидеры варпов — первым
+        // варпом (2 барьера на раунд вместо log2(blockDim)). Ничья — меньший
+        // индекс, как и прежде.
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            unsigned int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
+            if (ov > best || (ov == best && oi < best_i)) {
+                best = ov;
+                best_i = oi;
+            }
+        }
+        unsigned int lane = tid & 31u, wid = tid >> 5, nw = (bs + 31u) >> 5;
+        if (lane == 0) {
+            red_v[wid] = best;
+            red_i[wid] = best_i;
+        }
         __syncthreads();
-        for (unsigned int off = bs >> 1; off > 0; off >>= 1) {
-            if (tid < off) {
-                float other = red_v[tid + off];
-                unsigned int oi = red_i[tid + off];
-                if (other > red_v[tid] || (other == red_v[tid] && oi < red_i[tid])) {
-                    red_v[tid] = other;
-                    red_i[tid] = oi;
+        if (wid == 0) {
+            best = lane < nw ? red_v[lane] : TOPK_NEG_INF;
+            best_i = lane < nw ? red_i[lane] : 0xffffffffu;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                unsigned int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
+                if (ov > best || (ov == best && oi < best_i)) {
+                    best = ov;
+                    best_i = oi;
                 }
             }
-            __syncthreads();
+            if (lane == 0) {
+                red_v[0] = best;
+                red_i[0] = best_i;
+            }
         }
+        __syncthreads();
         if (tid == 0) {
             unsigned long long o = (unsigned long long)row * k + slot;
             out_idx[o] = red_i[0];

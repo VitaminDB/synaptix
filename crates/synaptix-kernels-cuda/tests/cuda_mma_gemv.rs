@@ -164,3 +164,44 @@ fn gemv_f32_qwen_attn_qkv() {
     eprintln!("[f32 attn_qkv GEMV] vs CPU: cos={cos_cpu:.6}");
     assert!(cos_cpu >= 0.999, "cos vs CPU={cos_cpu}");
 }
+
+/// Малое N при длинной K (hyper-connection Qwen4Exp [4, 10240]) — блок из
+/// восьми варпов на строку; f32 с хвостом K % 4.
+#[test]
+fn gemv_narrow_rows_wide_block() {
+    let Some((ctx, stream)) = setup() else { return };
+    let kernels = MmaGemvKernels::for_context(&ctx).expect("compile");
+    let reference = |w: &[f32], x: &[f32], n: usize, k: usize| -> Vec<f32> {
+        (0..n).map(|o| (0..k).map(|j| w[o * k + j] * x[j]).sum()).collect()
+    };
+    for (n, k) in [(4u32, 10240u32), (48, 2560), (1, 4098)] {
+        let w = det_f16(7 + n as u64, (n * k) as usize, 0.5);
+        let x = det_f16(11, k as usize, 0.5);
+        let dw: CudaSlice<f16> = stream.clone_htod(&w).unwrap();
+        let dx: CudaSlice<f16> = stream.clone_htod(&x).unwrap();
+        let mut y: CudaSlice<f16> = stream.alloc_zeros(n as usize).unwrap();
+        gemv_f16(&kernels, &stream, &dw, &dx, &mut y, n, k).unwrap();
+        let got: Vec<f32> = stream.clone_dtoh(&y).unwrap().iter().map(|v| v.to_f32()).collect();
+        let r = reference(
+            &w.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+            &x.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+            n as usize,
+            k as usize,
+        );
+        let err = got.iter().zip(&r).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(0f32, f32::max);
+        eprintln!("[f16 N={n} K={k}] max rel err {err:.2e}");
+        assert!(err < 2e-3, "f16 N={n} K={k}: {err}");
+
+        let w32 = det_f32(13 + n as u64, (n * k) as usize, 0.5);
+        let x32 = det_f32(17, k as usize, 0.5);
+        let dw: CudaSlice<f32> = stream.clone_htod(&w32).unwrap();
+        let dx: CudaSlice<f32> = stream.clone_htod(&x32).unwrap();
+        let mut y: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
+        gemv_f32(&kernels, &stream, &dw, &dx, &mut y, n, k).unwrap();
+        let got: Vec<f32> = stream.clone_dtoh(&y).unwrap();
+        let r = reference(&w32, &x32, n as usize, k as usize);
+        let err = got.iter().zip(&r).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(0f32, f32::max);
+        eprintln!("[f32 N={n} K={k}] max rel err {err:.2e}");
+        assert!(err < 1e-4, "f32 N={n} K={k}: {err}");
+    }
+}

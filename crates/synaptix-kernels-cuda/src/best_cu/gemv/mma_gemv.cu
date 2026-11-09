@@ -14,6 +14,26 @@
 //   BF16: __nv_bfloat162 = u32, аналогично
 //   F32: 1 F32 на lane за итерацию (или float2/float4 для лучшего bandwidth)
 
+// Сумма по блоку: варп-редукция, при нескольких варпах — сведение через
+// shared (блок из 256 нитей на строку — для малых N с длинной K). При 32
+// нитях порядок сложения прежний.
+__device__ __forceinline__ float gemv_block_sum(float acc) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    }
+    if (blockDim.x <= 32u) return acc;
+    __shared__ float part[32];
+    unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    if (lane == 0u) part[warp] = acc;
+    __syncthreads();
+    float total = 0.f;
+    if (threadIdx.x == 0u) {
+        for (unsigned int w = 0; w < (blockDim.x >> 5); ++w) total += part[w];
+    }
+    return total;
+}
+
 // ─────────────────────────────── F16 GEMV ───────────────────────────────
 
 extern "C" __global__ void mma_gemv_f16(
@@ -26,14 +46,14 @@ extern "C" __global__ void mma_gemv_f16(
     unsigned int row = blockIdx.x;
     if (row >= N) return;
     unsigned int lane = threadIdx.x;
-    if (lane >= 32u) return;
+    unsigned int nthr = blockDim.x;
 
     unsigned int K2 = K >> 1;
     const __half2* w_row = reinterpret_cast<const __half2*>(W + row * K);
     const __half2* x_h2  = reinterpret_cast<const __half2*>(x);
 
     float acc = 0.f;
-    for (unsigned int k = lane; k < K2; k += 32u) {
+    for (unsigned int k = lane; k < K2; k += nthr) {
         __half2 wv = w_row[k];
         __half2 xv = x_h2[k];
         float2 wf = __half22float2(wv);
@@ -42,10 +62,7 @@ extern "C" __global__ void mma_gemv_f16(
         acc = fmaf(wf.y, xf.y, acc);
     }
 
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-    }
+    acc = gemv_block_sum(acc);
     if (lane == 0u) {
         y[row] = __float2half(acc);
     }
@@ -63,14 +80,14 @@ extern "C" __global__ void mma_gemv_bf16(
     unsigned int row = blockIdx.x;
     if (row >= N) return;
     unsigned int lane = threadIdx.x;
-    if (lane >= 32u) return;
+    unsigned int nthr = blockDim.x;
 
     unsigned int K2 = K >> 1;
     const __nv_bfloat162* w_row = reinterpret_cast<const __nv_bfloat162*>(W + row * K);
     const __nv_bfloat162* x_b2  = reinterpret_cast<const __nv_bfloat162*>(x);
 
     float acc = 0.f;
-    for (unsigned int k = lane; k < K2; k += 32u) {
+    for (unsigned int k = lane; k < K2; k += nthr) {
         __nv_bfloat162 wv = w_row[k];
         __nv_bfloat162 xv = x_b2[k];
         float2 wf = __bfloat1622float2(wv);
@@ -79,10 +96,7 @@ extern "C" __global__ void mma_gemv_bf16(
         acc = fmaf(wf.y, xf.y, acc);
     }
 
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-    }
+    acc = gemv_block_sum(acc);
     if (lane == 0u) {
         y[row] = __float2bfloat16(acc);
     }
@@ -100,7 +114,7 @@ extern "C" __global__ void mma_gemv_f32(
     unsigned int row = blockIdx.x;
     if (row >= N) return;
     unsigned int lane = threadIdx.x;
-    if (lane >= 32u) return;
+    unsigned int nthr = blockDim.x;
 
     const float* w_row = W + row * K;
 
@@ -109,7 +123,7 @@ extern "C" __global__ void mma_gemv_f32(
     unsigned int K4 = K >> 2;
     const float4* w4 = reinterpret_cast<const float4*>(w_row);
     const float4* x4 = reinterpret_cast<const float4*>(x);
-    for (unsigned int k = lane; k < K4; k += 32u) {
+    for (unsigned int k = lane; k < K4; k += nthr) {
         float4 wv = w4[k];
         float4 xv = x4[k];
         acc = fmaf(wv.x, xv.x, acc);
@@ -119,14 +133,11 @@ extern "C" __global__ void mma_gemv_f32(
     }
     // Tail (K не кратно 4) — обрабатываем оставшиеся элементы.
     unsigned int tail_start = K4 << 2;
-    for (unsigned int k = tail_start + lane; k < K; k += 32u) {
+    for (unsigned int k = tail_start + lane; k < K; k += nthr) {
         acc = fmaf(w_row[k], x[k], acc);
     }
 
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-    }
+    acc = gemv_block_sum(acc);
     if (lane == 0u) {
         y[row] = acc;
     }

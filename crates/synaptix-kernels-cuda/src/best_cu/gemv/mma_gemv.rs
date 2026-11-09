@@ -74,7 +74,7 @@ pub fn gemv_f16(
     }
     let launch = LaunchConfig {
         grid_dim: (n, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (gemv_threads(n, k), 1, 1),
         shared_mem_bytes: 0,
     };
     let mut b = stream.launch_builder(&kernels.gemv_f16);
@@ -106,7 +106,7 @@ pub fn gemv_bf16(
     }
     let launch = LaunchConfig {
         grid_dim: (n, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (gemv_threads(n, k), 1, 1),
         shared_mem_bytes: 0,
     };
     let mut b = stream.launch_builder(&kernels.gemv_bf16);
@@ -133,7 +133,7 @@ pub fn gemv_f32(
     }
     let launch = LaunchConfig {
         grid_dim: (n, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (gemv_threads(n, k), 1, 1),
         shared_mem_bytes: 0,
     };
     let mut b = stream.launch_builder(&kernels.gemv_f32);
@@ -171,7 +171,7 @@ pub fn gemv_linear_u8(
     }
     let cfg = LaunchConfig {
         grid_dim: (n, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (gemv_threads(n, k), 1, 1),
         shared_mem_bytes: 0,
     };
     let nk = (n as usize) * (k as usize);
@@ -212,4 +212,10 @@ pub fn gemv_linear_u8(
         _ => return Err(SynaptixError::Unsupported("gemv_linear_u8: dtype")),
     }
     Ok(())
+}
+
+/// Нитей на строку: варп, а при малом N с длинной K — восемь варпов (иначе
+/// на всю карту выходит N варпов: у Qwen4Exp [4, 10240] — 4 блока, 13 мкс).
+fn gemv_threads(n: u32, k: u32) -> u32 {
+    if n < 256 && k >= 2048 { 256 } else { 32 }
 }
