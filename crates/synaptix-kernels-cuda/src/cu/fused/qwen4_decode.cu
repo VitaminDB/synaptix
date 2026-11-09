@@ -425,3 +425,76 @@ extern "C" __global__ void se_down_f16(SeArgs a) {
         ((__half*)a.out)[(size_t)t * a.H + i] = __float2half((part[il] + part[128u + il]) * sg);
     }
 }
+
+// ───────────── NVFP4 GEMV с плотной активацией (W4A16), до 4 строк ─────────────
+//
+// out[m, r] = Σ_k W[r,k]·x[m,k] по перемешанной NVFP4-копии: деквант в
+// регистрах, вес читается один раз на все M строк активации. Для головы
+// словаря на декоде: MMA-путь квантует вход в 4 бита (заметно по KL), а пара
+// MTP читала 318 МБ веса дважды.
+struct A16Args {
+    unsigned long long w, s, x, out;
+    unsigned int N, K, M, rpw;      // rpw — строк веса на варп
+};
+
+// grid = ceil(N / (8·rpw)), block = 256, shared = M·K f32. M — параметр
+// шаблона: с переменным M аккумуляторы уходили в локальную память (×5 по времени).
+template <int M>
+__device__ __forceinline__ void nvfp4_gemv_a16_impl(const A16Args& a) {
+    extern __shared__ float xs[];   // [M][K]
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const __half* x = (const __half*)a.x;
+    for (unsigned v = tid; v < ((M * a.K) >> 3); v += blockDim.x) {
+        float f[8];
+        hc_ld8(x + v * 8u, f);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) xs[v * 8u + j] = f[j];
+    }
+    __syncthreads();
+    const unsigned sf_inner = ((a.K + 63u) / 64u) * 4u;
+    const unsigned subs = a.K >> 5;
+    const unsigned char* shuf = (const unsigned char*)a.w;
+    const unsigned char* scales = (const unsigned char*)a.s;
+    for (unsigned rr = 0; rr < a.rpw; ++rr) {
+        const unsigned row = (blockIdx.x * 8u + warp) * a.rpw + rr;
+        if (row >= a.N) return;
+        float acc[M];
+        #pragma unroll
+        for (int m = 0; m < M; ++m) acc[m] = 0.f;
+        for (unsigned sb = lane; sb < subs; sb += 32u) {
+            const size_t off = (size_t)(row >> 4) * (a.K >> 6) * 512u + (size_t)(sb >> 1) * 512u + (row & 15u) * 32u + (sb & 1u) * 16u;
+            const uint4 raw = *reinterpret_cast<const uint4*>(shuf + off);
+            const unsigned short sc2 = *reinterpret_cast<const unsigned short*>(scales + hc_scale_off(row, sb * 2u, sf_inner));
+            const unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const float sc = hc_e4m3((unsigned char)(sc2 >> (8 * h)));
+                float part[M];
+                #pragma unroll
+                for (int m = 0; m < M; ++m) part[m] = 0.f;
+                #pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const unsigned w = words[h * 2 + q];
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float y = hc_e2m1((w >> (4 * j)) & 0xFu);
+                        #pragma unroll
+                        for (int m = 0; m < M; ++m) part[m] += y * xs[m * a.K + sb * 32u + h * 16 + q * 8 + j];
+                    }
+                }
+                #pragma unroll
+                for (int m = 0; m < M; ++m) acc[m] += part[m] * sc;
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < M; ++m) {
+            float v = acc[m];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) ((__half*)a.out)[(size_t)m * a.N + row] = __float2half(v);
+        }
+    }
+}
+extern "C" __global__ void nvfp4_gemv_a16_m1(A16Args a) { nvfp4_gemv_a16_impl<1>(a); }
+extern "C" __global__ void nvfp4_gemv_a16_m2(A16Args a) { nvfp4_gemv_a16_impl<2>(a); }
+extern "C" __global__ void nvfp4_gemv_a16_m3(A16Args a) { nvfp4_gemv_a16_impl<3>(a); }
+extern "C" __global__ void nvfp4_gemv_a16_m4(A16Args a) { nvfp4_gemv_a16_impl<4>(a); }

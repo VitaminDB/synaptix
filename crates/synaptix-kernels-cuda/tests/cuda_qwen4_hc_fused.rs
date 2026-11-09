@@ -196,3 +196,50 @@ fn shared_expert_fused_matches_dense_reference() {
         assert!(rel < 2e-3, "rows={rows}");
     }
 }
+
+#[test]
+fn nvfp4_gemv_a16_matches_dense_reference() {
+    if synaptix_core::device::cuda::get(0).is_err() {
+        return;
+    }
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    if !synaptix_kernels_cuda::caps::DeviceCaps::for_ordinal(0).map(|c| c.fp4_mma()).unwrap_or(false) {
+        return;
+    }
+    let dev = Device::Cuda(0);
+    for (n, k, m) in [(4096usize, 2560usize, 1usize), (4160, 2560, 2), (320, 640, 4)] {
+        let f16 = |v: Vec<f32>, dims: Vec<usize>| Tensor::from_vec(v, dims, Device::Cpu).unwrap().to_dtype(DType::F16).unwrap().to_device(dev).unwrap();
+        let x = f16(noise(21 + m as u64, m * k, 1.0), vec![m, k]);
+        let w = f16(noise(22, n * k, 0.05), vec![n, k]).quantize_to_nvfp4().unwrap();
+        let wd = host(&w.dequantize(DType::F16).unwrap());
+        let got = host(&w.gemv_a16(&x).unwrap());
+        let xh = host(&x);
+        let (mut e, mut nn) = (0f64, 0f64);
+        for r in 0..m {
+            for o in 0..n {
+                let want: f64 = (0..k).map(|j| wd[o * k + j] as f64 * xh[r * k + j] as f64).sum();
+                e += (got[r * n + o] as f64 - want).powi(2);
+                nn += want * want;
+            }
+        }
+        let rel = (e / nn).sqrt();
+        eprintln!("gemv_a16 N={n} K={k} M={m}: отн. {rel:.2e}");
+        assert!(rel < 2e-3);
+    }
+    if std::env::var("HC_BENCH").is_ok() {
+        let (n, k) = (248320usize, 2560usize);
+        let w = Tensor::zeros(vec![n, k], DType::F16, dev).unwrap().quantize_to_nvfp4().unwrap();
+        for m in [1usize, 2] {
+            let x = Tensor::zeros(vec![m, k], DType::F16, dev).unwrap();
+            let _ = w.gemv_a16(&x).unwrap();
+            synaptix_core::device::cuda::synchronize(0).unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 {
+                let _ = w.gemv_a16(&x).unwrap();
+            }
+            synaptix_core::device::cuda::synchronize(0).unwrap();
+            eprintln!("gemv_a16 голова 248320×2560, M={m}: {:.0} мкс", t0.elapsed().as_secs_f64() * 1e6 / 20.0);
+        }
+    }
+}

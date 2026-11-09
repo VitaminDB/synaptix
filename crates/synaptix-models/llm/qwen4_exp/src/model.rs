@@ -1192,12 +1192,12 @@ impl Qwen4ExpModel {
         let (hidden, _, _) = self.run(tokens, media, cache, opts)?;
         let s = hidden.dims()[0];
         let last = coerr(coerr(hidden.narrow(0, s - 1, 1))?.contiguous())?;
-        self.lm_head.forward(&last)
+        self.lm_head_forward(&last)
     }
 
     pub fn forward(&self, tokens: &[u32], cache: &mut ModelCache) -> Result<Tensor, ModelError> {
         let hidden = self.forward_hidden(tokens, cache)?;
-        self.lm_head.forward(&hidden)
+        self.lm_head_forward(&hidden)
     }
 
     pub fn forward_last(&self, tokens: &[u32], cache: &mut ModelCache) -> Result<Tensor, ModelError> {
@@ -1214,10 +1214,27 @@ impl Qwen4ExpModel {
         let (hidden, _, _) = self.run(tokens, &[], cache, opts)?;
         let s = hidden.dims()[0];
         let last = coerr(coerr(hidden.narrow(0, s - 1, 1))?.contiguous())?;
-        self.lm_head.forward(&last)
+        self.lm_head_forward(&last)
     }
 
     pub fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor, ModelError> {
+        // Декод (одна строка): NVFP4-голова без кванта активации — точнее
+        // MMA-пути (W4A4): KL к эталону 0,128 → 0,115 ценой 0,27 мс на вызов.
+        // `SYN_QWEN4EXP_HEAD_A16=0` — прежний путь.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_HEAD_A16").as_deref() != Ok("0"))
+            && hidden.rank() == 2
+            && hidden.dims()[0] == 1
+            && hidden.dtype() == DType::F16
+        {
+            if let Some(w) = self.lm_head.quant_weight() {
+                match w.gemv_a16(hidden) {
+                    Ok(y) => return Ok(y),
+                    Err(synaptix_core::error::SynaptixError::Unsupported(_)) => {}
+                    Err(e) => return Err(ModelError::Forward(format!("lm_head: {e}"))),
+                }
+            }
+        }
         self.lm_head.forward(hidden)
     }
 

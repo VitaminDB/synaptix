@@ -391,6 +391,14 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
     }
 
+    /// NVFP4 GEMV с плотной f16-активацией (W4A16) по перемешанной копии:
+    /// `out[m, n] f16 = W[n, k] · x[m, k]`, `m ≤ 4`, вес читается один раз.
+    /// Адреса — на устройстве. Default — `Unsupported`.
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemv_a16(&self, _device: crate::device::Device, _w: u64, _s: u64, _x: u64, _out: u64, _n: usize, _k: usize, _m: usize) -> Result<()> {
+        Err(SynaptixError::Unsupported("nvfp4_gemv_a16 не поддержан этим backend"))
+    }
+
     /// Слитый shared-эксперт MoE на декоде (два ядра, см. `SeLaunch`).
     fn moe_shared_fused(&self, _device: crate::device::Device, _a: &SeLaunch) -> Result<()> {
         Err(SynaptixError::Unsupported("moe_shared_fused не поддержан этим backend"))

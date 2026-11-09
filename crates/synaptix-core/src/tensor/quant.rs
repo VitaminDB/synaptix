@@ -688,6 +688,30 @@ impl QuantWeight {
         None
     }
 
+    /// `x [m ≤ 4, K] f16 → [m, N] f16` без кванта активации (W4A16): деквант
+    /// NVFP4 в регистрах по перемешанной копии, вес читается один раз на все
+    /// строки. `Unsupported` — не NVFP4/не CUDA/нет перемешанной копии.
+    pub fn gemv_a16(&self, x: &Tensor) -> Result<Tensor> {
+        use crate::backend::registry;
+        if self.dtype != DType::NVFP4 || !self.device.is_cuda() || x.dtype() != DType::F16 || x.rank() != 2 || x.dims()[1] != self.k {
+            return Err(SynaptixError::Unsupported("gemv_a16: NVFP4 на CUDA и активация f16 [m, K]"));
+        }
+        let m = x.dims()[0];
+        if m == 0 || m > 4 || self.k % 64 != 0 || self.n % 16 != 0 || m * self.k * 4 > 44 * 1024 {
+            return Err(SynaptixError::Unsupported("gemv_a16: форма"));
+        }
+        self.ensure_shuffled()?;
+        let (w, s) = self.shuffled_addr().ok_or(SynaptixError::Unsupported("gemv_a16: нет перемешанной копии"))?;
+        let xc = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let out = Tensor::empty_uninit(vec![m, self.n], DType::F16, self.device)?;
+        let (xa, oa) = (
+            xc.device_address().ok_or(SynaptixError::Unsupported("gemv_a16: x не на карте"))?,
+            out.device_address().ok_or(SynaptixError::Unsupported("gemv_a16: out не на карте"))?,
+        );
+        registry::backend_for(self.device)?.nvfp4_gemv_a16(self.device, w, s, xa, oa, self.n, self.k, m)?;
+        Ok(out)
+    }
+
     pub fn shuffled_addr(&self) -> Option<(u64, u64)> {
         let shuf = self.shuffled()?;
         Some((storage_addr(shuf)?, storage_addr(self.scales_opt()?)?))

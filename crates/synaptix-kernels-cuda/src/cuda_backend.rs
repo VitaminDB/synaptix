@@ -905,6 +905,16 @@ impl Backend for CudaBackend {
         Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
     }
 
+    fn nvfp4_gemv_a16(&self, device: synaptix_core::device::Device, w: u64, s: u64, x: u64, out: u64, n: usize, k: usize, m: usize) -> Result<()> {
+        let synaptix_core::device::Device::Cuda(ord) = device else {
+            return Err(SynaptixError::Unsupported("nvfp4_gemv_a16: не CUDA"));
+        };
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let kern = crate::kernels::qwen4_decode::Qwen4DecodeKernels::for_context(&ctx)?;
+        crate::kernels::qwen4_decode::nvfp4_gemv_a16(&kern, &stream, w, s, x, out, n as u32, k as u32, m as u32)
+    }
+
     fn moe_shared_fused(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::SeLaunch) -> Result<()> {
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_shared_fused: не CUDA"));

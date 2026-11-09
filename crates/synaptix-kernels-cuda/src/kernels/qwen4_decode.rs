@@ -26,6 +26,7 @@ pub struct Qwen4DecodeKernels {
     hc_up: CudaFunction,
     se_up: CudaFunction,
     se_down: CudaFunction,
+    gemv_a16: [CudaFunction; 4],
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<Qwen4DecodeKernels>)>>> = OnceLock::new();
@@ -54,6 +55,12 @@ impl Qwen4DecodeKernels {
             hc_up: load_fn(&module, "hc_up_f16")?,
             se_up: load_fn(&module, "se_up_f16")?,
             se_down: load_fn(&module, "se_down_f16")?,
+            gemv_a16: [
+                load_fn(&module, "nvfp4_gemv_a16_m1")?,
+                load_fn(&module, "nvfp4_gemv_a16_m2")?,
+                load_fn(&module, "nvfp4_gemv_a16_m3")?,
+                load_fn(&module, "nvfp4_gemv_a16_m4")?,
+            ],
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -239,4 +246,37 @@ pub fn se_fused(kernels: &Qwen4DecodeKernels, stream: &Arc<CudaStream>, a: &syna
     let cfg = LaunchConfig { grid_dim: (a.hidden / 128, a.rows, 1), block_dim: (256, 1, 1), shared_mem_bytes: (a.inter + 256) * 4 };
     unsafe { b.launch(cfg) }.map_err(|e| launch_err("se_down_f16", e))?;
     Ok(())
+}
+
+/// NVFP4 GEMV с плотной активацией (см. `nvfp4_gemv_a16_f16`).
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gemv_a16(kernels: &Qwen4DecodeKernels, stream: &Arc<CudaStream>, w: u64, s: u64, x: u64, out: u64, n: u32, k: u32, m: u32) -> Result<()> {
+    #[repr(C)]
+    struct A16 {
+        w: u64,
+        s: u64,
+        x: u64,
+        out: u64,
+        n: u32,
+        k: u32,
+        m: u32,
+        rpw: u32,
+    }
+    unsafe impl cudarc::driver::DeviceRepr for A16 {}
+    // Строк веса на варп: чем больше, тем реже блок перечитывает активацию.
+    let rpw = if n >= 4096 { a16_rpw() } else { 1 };
+    let arg = A16 { w, s, x, out, n, k, m, rpw };
+    if !(1..=4).contains(&m) {
+        return Err(SynaptixError::Unsupported("nvfp4_gemv_a16: M вне 1..=4"));
+    }
+    let mut b = stream.launch_builder(&kernels.gemv_a16[m as usize - 1]);
+    b.arg(&arg);
+    let cfg = LaunchConfig { grid_dim: (n.div_ceil(8 * rpw), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: m * k * 4 };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("nvfp4_gemv_a16_f16", e))?;
+    Ok(())
+}
+
+fn a16_rpw() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_A16_RPW").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1))
 }
