@@ -65,6 +65,14 @@ fn gdn_decode_step_fused_matches_three_kernels() {
     for (num_k, n_rep) in [(16usize, 1usize), (16, 2), (16, 3), (4, 2)] {
         let (o0, c0, s0) = run(false, num_k, n_rep, 128, 4);
         let (o1, c1, s1) = run(true, num_k, n_rep, 128, 4);
+        // Блок на v-голову против блока на k-голову: при том же числе групп
+        // по kk — бит в бит, при другом (n_rep 3: 4 против 2) — порядок сумм.
+        std::env::set_var("SYN_GDN_VHEAD", "0");
+        let (ok, ck, sk) = run(true, num_k, n_rep, 128, 4);
+        std::env::remove_var("SYN_GDN_VHEAD");
+        assert!(max_diff(&o1, &ok) < 1e-4, "v-голова против k-головы: выход, n_rep {n_rep}");
+        assert_eq!(max_diff(&c1, &ck), 0.0, "v-голова против k-головы: свёртка, n_rep {n_rep}");
+        assert!(max_diff(&s1, &sk) < 1e-6, "v-голова против k-головы: состояние, n_rep {n_rep}");
         let (dout, dconv, dstate) = (max_diff(&o0, &o1), max_diff(&c0, &c1), max_diff(&s0, &s1));
         let omax = o0.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         eprintln!("num_k {num_k} n_rep {n_rep}: |out| ≤ {omax:.4}, Δout {dout:.3e}, Δconv {dconv:.3e}, Δstate {dstate:.3e}");

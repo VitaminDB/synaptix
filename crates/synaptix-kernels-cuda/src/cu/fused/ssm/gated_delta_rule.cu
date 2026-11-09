@@ -437,3 +437,171 @@ extern "C" __global__ void gdn_decode_step_f16(
     float act = gate_mode ? sig : gz * sig;
     out_f16[(size_t)vh * hv + d] = __float2half(w * xv * inv * act);
 }
+
+// ───────────── decode-шаг GDN: блок на v-голову ─────────────────────────────
+//
+// То же, что gdn_decode_step_f16, но блок — одна v-голова (grid = num_v):
+// прежний блок k-головы занимал 16 SM из ~80, и чтение состояния (64 КБ на
+// голову, 6 МБ на слой) упиралось в число запросов в полёте. q/k-каналы
+// свёртки нужны всем v-головам k-головы, поэтому состояние свёртки читается
+// из `conv_in` (копия до шага), а пишется в `conv_out`: q/k-каналы сдвигает
+// блок sub = 0, свой v-канал — каждый блок. Арифметика и порядок редукций —
+// как у gdn_decode_step_f16 (бит в бит).
+//
+// Нить (ks, d): канал d, группа ks из KS по строкам kk состояния.
+// Требования: hk == hv (степень двойки), KS | hk, hv·KS ≤ 1024.
+// Shared: (2·hk + (3 + KS)·hv + 2) F32.
+
+extern "C" __global__ void gdn_decode_step_v_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ conv_in,     // [K-1, conv_dim]
+    __half*       __restrict__ conv_out,    // [K-1, conv_dim]
+    const __half* __restrict__ conv_w,
+    const __half* __restrict__ a_f16,
+    const __half* __restrict__ b_f16,
+    const float*  __restrict__ dt_bias,
+    const float*  __restrict__ a_log,
+    float*        __restrict__ state,
+    const __half* __restrict__ gate_f16,
+    const __half* __restrict__ weight_f16,
+    __half*       __restrict__ out_f16,
+    float q_scale,
+    float eps,
+    unsigned int num_k,
+    unsigned int n_rep,
+    unsigned int hk,
+    unsigned int hv,
+    unsigned int conv_k,
+    unsigned int ks_n,
+    unsigned int gate_mode
+) {
+    unsigned int vh = blockIdx.x;
+    unsigned int num_v = num_k * n_rep;
+    if (vh >= num_v) return;
+    unsigned int kh = vh / n_rep;
+    unsigned int sub = vh % n_rep;
+    unsigned int tid = threadIdx.x;
+    unsigned int d = tid % hv;
+    unsigned int ks = tid / hv;
+    if (ks >= ks_n) return;
+    unsigned int key_dim = num_k * hk;
+    unsigned int conv_dim = 2u * key_dim + num_v * hv;
+    unsigned int km1 = conv_k - 1u;
+
+    extern __shared__ float shm[];
+    float* q_sm      = shm;
+    float* k_sm      = shm + hk;
+    float* v_sm      = shm + 2u * hk;
+    float* reduce_sm = v_sm + hv;
+    float* core_sm   = reduce_sm + hv;
+    float* part      = core_sm + hv;            // [KS][hv]
+    float* scal_sm   = part + ks_n * hv;        // [2]
+
+    auto conv_ch = [&](unsigned int c, bool write) -> float {
+        const __half* wc = conv_w + (size_t)c * conv_k;
+        float xc = __half2float(x[c]);
+        float acc = 0.0f;
+        for (unsigned int j = 0u; j < km1; ++j)
+            acc += __half2float(conv_in[(size_t)j * conv_dim + c]) * __half2float(wc[j]);
+        acc += xc * __half2float(wc[km1]);
+        acc = acc / (1.0f + expf(-acc));
+        if (write) {
+            for (unsigned int j = 0u; j + 1u < km1; ++j)
+                conv_out[(size_t)j * conv_dim + c] = conv_in[(size_t)(j + 1u) * conv_dim + c];
+            if (km1 > 0u) conv_out[(size_t)(km1 - 1u) * conv_dim + c] = __float2half(xc);
+        }
+        return __half2float(__float2half(acc));
+    };
+
+    if (ks == 0u) {
+        q_sm[d] = conv_ch(kh * hk + d, sub == 0u);
+        k_sm[d] = conv_ch(key_dim + kh * hk + d, sub == 0u);
+        v_sm[d] = conv_ch(2u * key_dim + vh * hv + d, true);
+        if (d == 0u) {
+            float bv = __half2float(b_f16[vh]);
+            scal_sm[1] = 1.0f / (1.0f + __expf(-bv));
+            float av = __half2float(a_f16[vh]);
+            float dt = av + dt_bias[vh];
+            float softplus_dt = __logf(1.0f + __expf(dt));
+            float g = softplus_dt * (-__expf(a_log[vh]));
+            scal_sm[0] = __expf(g);
+        }
+    }
+    __syncthreads();
+
+    bool lead = (ks == 0u);
+    float qv = q_sm[d];
+    float kv = k_sm[d];
+    if (lead) reduce_sm[d] = qv * qv;
+    __syncthreads();
+    for (unsigned int s = hk / 2u; s > 0u; s >>= 1) {
+        if (lead && d < s) reduce_sm[d] += reduce_sm[d + s];
+        __syncthreads();
+    }
+    float sum_q_sq = reduce_sm[0];
+    __syncthreads();
+    if (lead) reduce_sm[d] = kv * kv;
+    __syncthreads();
+    for (unsigned int s = hk / 2u; s > 0u; s >>= 1) {
+        if (lead && d < s) reduce_sm[d] += reduce_sm[d + s];
+        __syncthreads();
+    }
+    float sum_k_sq = reduce_sm[0];
+    __syncthreads();
+    if (lead) {
+        q_sm[d] = qv * rsqrtf(sum_q_sq + 1e-6f) * q_scale;
+        k_sm[d] = kv * rsqrtf(sum_k_sq + 1e-6f);
+    }
+    __syncthreads();
+
+    float g_t = scal_sm[0];
+    float beta_t = scal_sm[1];
+    unsigned int vi = d;
+    unsigned long long col = (unsigned long long)vh * hk * hv + vi;
+    {
+        float kv_mem = 0.0f;
+        #pragma unroll 8
+        for (unsigned int kk = ks; kk < hk; kk += ks_n) {
+            float st = state[col + (unsigned long long)kk * hv] * g_t;
+            kv_mem += st * k_sm[kk];
+        }
+        part[ks * hv + vi] = kv_mem;
+    }
+    __syncthreads();
+    float kv_mem = 0.0f;
+    for (unsigned int j = 0u; j < ks_n; ++j) kv_mem += part[j * hv + vi];
+    float delta = (v_sm[vi] - kv_mem) * beta_t;
+    __syncthreads();
+    {
+        float out_acc = 0.0f;
+        #pragma unroll 8
+        for (unsigned int kk = ks; kk < hk; kk += ks_n) {
+            unsigned long long idx = col + (unsigned long long)kk * hv;
+            float new_st = state[idx] * g_t + k_sm[kk] * delta;
+            state[idx] = new_st;
+            out_acc += new_st * q_sm[kk];
+        }
+        part[ks * hv + vi] = out_acc;
+    }
+    __syncthreads();
+    if (ks != 0u) return;
+    {
+        float out_acc = 0.0f;
+        for (unsigned int j = 0u; j < ks_n; ++j) out_acc += part[j * hv + vi];
+        core_sm[vi] = out_acc;
+    }
+    float xv = core_sm[d];
+    reduce_sm[d] = xv * xv;
+    asm volatile("bar.sync 1, %0;" :: "r"(hv));
+    for (unsigned int s = hv / 2u; s > 0u; s >>= 1) {
+        if (d < s) reduce_sm[d] += reduce_sm[d + s];
+        asm volatile("bar.sync 1, %0;" :: "r"(hv));
+    }
+    float total = reduce_sm[0];
+    float inv = rsqrtf(total / (float)hv + eps);
+    float w = __half2float(weight_f16[d]);
+    float gz = __half2float(gate_f16[(size_t)vh * hv + d]);
+    float sig = 1.0f / (1.0f + __expf(-gz));
+    float act = gate_mode ? sig : gz * sig;
+    out_f16[(size_t)vh * hv + d] = __float2half(w * xv * inv * act);
+}

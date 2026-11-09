@@ -25,6 +25,7 @@ pub struct GatedDeltaRuleKernels {
     step: CudaFunction,
     step_fused_rms: CudaFunction,
     decode_step: CudaFunction,
+    decode_step_v: CudaFunction,
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<GatedDeltaRuleKernels>)>>> = OnceLock::new();
@@ -47,6 +48,7 @@ impl GatedDeltaRuleKernels {
             step: load_fn(&module, "gated_delta_rule_step_f32")?,
             step_fused_rms: load_fn(&module, "gated_delta_rule_step_fused_rms_norm_f32_to_f16")?,
             decode_step: load_fn(&module, "gdn_decode_step_f16")?,
+            decode_step_v: load_fn(&module, "gdn_decode_step_v_f16")?,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -61,6 +63,10 @@ impl GatedDeltaRuleKernels {
 
     /// Decode-шаг GDN одним ядром (свёртка + β/g + нормы + шаг + RmsNormGated);
     /// блок = k-голова со всеми её v-головами, `n_rep·hk` нитей.
+    pub(crate) fn decode_step_v_fn(&self) -> &CudaFunction {
+        &self.decode_step_v
+    }
+
     pub(crate) fn decode_step_fn(&self) -> &CudaFunction {
         &self.decode_step
     }

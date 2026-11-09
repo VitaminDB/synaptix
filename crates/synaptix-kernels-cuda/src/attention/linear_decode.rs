@@ -167,6 +167,54 @@ pub fn linear_attn_decode_step_u8_dev(
                 .transmute_mut::<f16>(value_dim)
                 .ok_or_else(|| cerr("out"))?
         };
+        // Блок на v-голову (grid = num_v): втрое больше SM читают состояние.
+        // Состояние свёртки читается из копии — q/k-каналы нужны соседним
+        // блокам. `SYN_GDN_VHEAD=0` — прежний блок на k-голову.
+        if n_rep > 1 && std::env::var("SYN_GDN_VHEAD").map(|v| v != "0").unwrap_or(true) {
+            let ks_v = {
+                let want = std::env::var("SYN_GDN_VHEAD_KS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+                let mut k = 1usize;
+                while 2 * k <= want && 2 * k * hv <= 1024 && hk % (2 * k) == 0 {
+                    k *= 2;
+                }
+                k
+            };
+            let cs_len = state_rows * conv_dim;
+            let mut cs_in = unsafe { stream.ws_alloc::<f16>(cs_len.max(1)) }.map_err(|e| aerr("conv_in", e))?;
+            stream
+                .memcpy_dtod(&cs_v.slice(0..cs_len), &mut cs_in.slice_mut(0..cs_len))
+                .map_err(|e| SynaptixError::Cuda(format!("linear_decode: копия conv_state: {e:?}")))?;
+            let shared = ((2 * hk + (3 + ks_v) * hv + 2) * tm::<f32>()) as u32;
+            let cfg = LaunchConfig { grid_dim: (num_v, 1, 1), block_dim: ((hv * ks_v) as u32, 1, 1), shared_mem_bytes: shared };
+            let ks_u = ks_v as u32;
+            let gate_mode: u32 = gate_sigmoid as u32;
+            let mut bld = stream.launch_builder(gdr_kernels.decode_step_v_fn());
+            bld.arg(&x_v)
+                .arg(&cs_in)
+                .arg(&mut cs_v)
+                .arg(&w_v)
+                .arg(&a_v)
+                .arg(&b_v)
+                .arg(&dt_v)
+                .arg(&al_v)
+                .arg(&mut ss_v)
+                .arg(&gate_v)
+                .arg(&nw_v)
+                .arg(&mut out_v)
+                .arg(&q_scale)
+                .arg(&eps)
+                .arg(&num_k)
+                .arg(&n_rep)
+                .arg(&dk)
+                .arg(&dv)
+                .arg(&conv_kernel)
+                .arg(&ks_u)
+                .arg(&gate_mode);
+            unsafe {
+                bld.launch(cfg).map_err(|e| lerr("gdn_decode_step_v", e))?;
+            }
+            return Ok(());
+        }
         let shared = ((2 * hk + (3 + ks_n) * n_rep as usize * hv + 2 * n_rep as usize) * tm::<f32>()) as u32;
         let cfg = LaunchConfig {
             grid_dim: (num_k, 1, 1),
