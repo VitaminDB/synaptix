@@ -40,6 +40,10 @@ pub struct CudaContext {
     pub(crate) num_streams: AtomicUsize,
     pub(crate) event_tracking: AtomicBool,
     pub(crate) error_state: AtomicU32,
+    /// synaptix fork: пул событий с `CU_EVENT_DISABLE_TIMING` — каждая
+    /// аллокация `CudaSlice` берёт два события, и create/destroy на каждую
+    /// стоили ~4 мс хоста на токен декода у Qwen4Exp.
+    pub(crate) event_pool: std::sync::Mutex<Vec<sys::CUevent>>,
 }
 
 unsafe impl Send for CudaContext {}
@@ -48,6 +52,11 @@ unsafe impl Sync for CudaContext {}
 impl Drop for CudaContext {
     fn drop(&mut self) {
         self.record_err(self.bind_to_thread());
+        if let Ok(mut pool) = self.event_pool.lock() {
+            for ev in pool.drain(..) {
+                let _ = unsafe { result::event::destroy(ev) };
+            }
+        }
         let ctx = std::mem::replace(&mut self.cu_ctx, std::ptr::null_mut());
         if !ctx.is_null() {
             if self.is_primary {
@@ -92,6 +101,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            event_pool: std::sync::Mutex::new(Vec::new()),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -165,6 +175,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            event_pool: std::sync::Mutex::new(Vec::new()),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -217,6 +228,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            event_pool: std::sync::Mutex::new(Vec::new()),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -255,6 +267,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            event_pool: std::sync::Mutex::new(Vec::new()),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -536,13 +549,28 @@ impl CudaContext {
 pub struct CudaEvent {
     pub(crate) cu_event: sys::CUevent,
     pub(crate) ctx: Arc<CudaContext>,
+    /// synaptix fork: событие из пула (флаги по умолчанию) — вернётся в пул.
+    pub(crate) pooled: bool,
+    /// synaptix fork: в событие хоть раз записывали работу. Ожидание ни разу
+    /// не записанного события — пустая операция, её пропускаем.
+    pub(crate) recorded: AtomicBool,
 }
+
+const EVENT_POOL_MAX: usize = 8192;
 
 unsafe impl Send for CudaEvent {}
 unsafe impl Sync for CudaEvent {}
 
 impl Drop for CudaEvent {
     fn drop(&mut self) {
+        if self.pooled {
+            if let Ok(mut pool) = self.ctx.event_pool.lock() {
+                if pool.len() < EVENT_POOL_MAX {
+                    pool.push(self.cu_event);
+                    return;
+                }
+            }
+        }
         self.ctx.record_err(self.ctx.bind_to_thread());
         self.ctx
             .record_err(unsafe { result::event::destroy(self.cu_event) });
@@ -556,12 +584,25 @@ impl CudaContext {
         self: &Arc<Self>,
         flags: Option<sys::CUevent_flags>,
     ) -> Result<CudaEvent, DriverError> {
+        let pooled = flags.is_none();
+        if pooled {
+            if let Some(cu_event) = self.event_pool.lock().ok().and_then(|mut p| p.pop()) {
+                return Ok(CudaEvent {
+                    cu_event,
+                    ctx: self.clone(),
+                    pooled,
+                    recorded: AtomicBool::new(false),
+                });
+            }
+        }
         let flags = flags.unwrap_or(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING);
         self.bind_to_thread()?;
         let cu_event = result::event::create(flags)?;
         Ok(CudaEvent {
             cu_event,
             ctx: self.clone(),
+            pooled,
+            recorded: AtomicBool::new(false),
         })
     }
 }
@@ -593,7 +634,9 @@ impl CudaEvent {
             return Err(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT));
         }
         self.ctx.bind_to_thread()?;
-        unsafe { result::event::record(self.cu_event, stream.cu_stream) }
+        unsafe { result::event::record(self.cu_event, stream.cu_stream) }?;
+        self.recorded.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Will only block CPU thraed if [sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC] was used to create this event.
@@ -768,6 +811,10 @@ impl CudaStream {
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g6a898b652dfc6aa1d5c8d97062618b2f)
     pub fn wait(&self, event: &CudaEvent) -> Result<(), DriverError> {
+        // synaptix fork: в событие ничего не записано — ждать нечего.
+        if !event.recorded.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.ctx.bind_to_thread()?;
         unsafe {
             result::stream::wait_event(

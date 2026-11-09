@@ -65,3 +65,17 @@ with `SYN_GRAPH_DECODE=1` and Qwen3-1.7B present.
    a major and the libraries are loaded dynamically — synthos built against 13.3
    already ran on the 13.4 runtime. A new *major* still panics, on purpose. When
    re-vendoring, keep this block unless upstream added the version.
+
+## Event pool (2026-11-09)
+
+Every `CudaSlice` allocation takes two `CudaEvent`s (read/write) for cross-stream
+tracking, and every drop waits on both and destroys them. On a single-stream decode
+step (Qwen4Exp: ~4200 allocations per token) that was ~9600 `cuEventCreate` +
+`cuEventDestroy` + `cuStreamWaitEvent` per token, ~4 ms of host time.
+
+- Events created with default flags (`new_event(None)`) return to a per-context pool
+  on drop (`CudaContext::event_pool`, up to 8192) and are reused.
+- `CudaEvent::recorded` is set by `record()`; `CudaStream::wait()` on an event that was
+  never recorded returns immediately (it was a no-op in the driver anyway).
+
+Cross-stream semantics are unchanged: a recorded event is waited on exactly as before.

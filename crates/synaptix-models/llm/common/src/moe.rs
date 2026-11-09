@@ -1679,6 +1679,32 @@ impl MoeFfn {
         Ok((experts, weights))
     }
 
+    /// Top-`k` экспертов, которых роутер ЭТОГО слоя выбрал бы для `x: [1, H]`
+    /// — для предсказательной подкачки: вход берётся у предыдущего слоя.
+    pub fn predict_topk(&self, x: &Tensor, k: usize) -> Result<Vec<u32>, ModelError> {
+        let logits = x
+            .to_dtype(DType::F32)
+            .and_then(|xf| xf.linear(&self.router))
+            .map_err(|err| ModelError::Forward(format!("предсказание MoE: {err}")))?;
+        let (_, idx) = logits
+            .topk_rows(k)
+            .map_err(|err| ModelError::Forward(format!("предсказание MoE: top-k: {err}")))?;
+        idx.to_device(Device::Cpu)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<u32>())
+            .map_err(|err| ModelError::Forward(format!("предсказание MoE: индексы: {err}")))
+    }
+
+    /// Номер слоя в общем кэше экспертов.
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    /// Есть ли эксперт слоя на устройстве (без учёта попадания в статистике).
+    pub fn resident(&self, expert: usize) -> bool {
+        self.cache.as_ref().is_some_and(|c| c.contains((self.layer_id, expert)))
+    }
+
     /// Персональный множитель эксперта (Gemma-4) поверх нормированных весов
     /// top-k. Без него — no-op.
     fn scale_per_expert(&self, experts: &[u32], weights: &mut [f32]) {
@@ -1768,6 +1794,7 @@ impl MoeFfn {
         let (experts, weights) = stage("moe:route", || self.route(routed))?;
         if t == 1 {
             route_trace::record(self.layer_id, &experts);
+            LAST_ROUTE.with(|c| *c.borrow_mut() = experts.clone());
         }
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
@@ -2907,6 +2934,16 @@ fn moe_fp8_off() -> bool {
 fn moe_segmented_off() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("SYN_MOE_SEGMENTED").is_ok_and(|v| v == "0"))
+}
+
+thread_local! {
+    /// Выбор роутера на последнем одиночном токене (для замеров предсказания).
+    static LAST_ROUTE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Выбор роутера на последнем одиночном токене этого потока.
+pub fn last_route() -> Vec<u32> {
+    LAST_ROUTE.with(|c| c.borrow().clone())
 }
 
 /// Трасса маршрутизации декода: `SYN_MOE_ROUTE_TRACE=<файл>` — на каждый

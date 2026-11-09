@@ -1054,9 +1054,29 @@ impl Qwen4ExpModel {
             ), &format!("слой {l} attn_inject"))?;
 
             let mixed = ctx(block.mlp_hc.forward(&hidden), &format!("слой {l} mlp_hc"))?;
+            let probe = s == 1 && predict_probe::on() && l + 1 < self.blocks.len();
+            let predicted = if probe {
+                let next = &self.blocks[l + 1].moe;
+                let ids = next.predict_topk(&mixed.mixed, predict_probe::k())?;
+                let miss: Vec<bool> = ids.iter().map(|e| !next.resident(*e as usize)).collect();
+                Some((ids, miss))
+            } else {
+                None
+            };
+            let resident_before: Vec<bool> = if s == 1 && predict_probe::on() {
+                (0..512).map(|e| block.moe.resident(e)).collect()
+            } else {
+                Vec::new()
+            };
             let out = stage("moe", || {
                 ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
             })?;
+            if s == 1 && predict_probe::on() {
+                predict_probe::check(l, &synaptix_llm_common::moe::last_route(), &resident_before);
+            }
+            if let Some((ids, miss)) = predicted {
+                predict_probe::stash(l + 1, ids, miss);
+            }
             hidden = ctx(block.mlp_hc.inject(
                 &mixed.hyper,
                 &out,
@@ -1186,4 +1206,82 @@ fn read_ngram_buffers(
         read("ngram_heads_vocab_sizes")?,
         read("ngram_heads_offsets")?,
     ))
+}
+
+/// Замер предсказания экспертов слоя L+1 по входу MoE слоя L
+/// (`SYN_QWEN4EXP_PREDICT_PROBE=<k>`): сколько выбранных экспертов было в
+/// предсказанных top-k и сколько из настоящих промахов кэша угадано.
+mod predict_probe {
+    use std::sync::Mutex;
+
+    struct St {
+        pending: Option<(usize, Vec<u32>, Vec<bool>)>,
+        chosen: u64,
+        hit: u64,
+        actual_miss: u64,
+        miss_predicted: u64,
+        predicted_miss: u64,
+        steps: u64,
+    }
+    static ST: Mutex<St> = Mutex::new(St {
+        pending: None, chosen: 0, hit: 0, actual_miss: 0, miss_predicted: 0, predicted_miss: 0, steps: 0,
+    });
+
+    pub fn on() -> bool {
+        k() > 0
+    }
+    pub fn k() -> usize {
+        static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("SYN_QWEN4EXP_PREDICT_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        })
+    }
+    pub fn stash(layer: usize, ids: Vec<u32>, miss: Vec<bool>) {
+        if let Ok(mut st) = ST.lock() {
+            st.pending = Some((layer, ids, miss));
+        }
+    }
+    /// Сверка после MoE слоя `layer`: `actual` — выбор роутера, промах
+    /// определяется по состоянию кэша в момент предсказания.
+    pub fn check(layer: usize, actual: &[u32], resident: &[bool]) {
+        let Ok(mut st) = ST.lock() else { return };
+        let Some((pl, ids, miss)) = st.pending.take() else { return };
+        if pl != layer {
+            return;
+        }
+        st.steps += 1;
+        for (e, m) in ids.iter().zip(&miss) {
+            if *m {
+                st.predicted_miss += 1;
+            }
+            let _ = e;
+        }
+        for a in actual {
+            st.chosen += 1;
+            let pos = ids.iter().position(|e| e == a);
+            if pos.is_some() {
+                st.hit += 1;
+            }
+            // промах: эксперта не было на карте в момент предсказания
+            let _ = &miss;
+            let was_miss = !resident.get(*a as usize).copied().unwrap_or(true);
+            if was_miss {
+                st.actual_miss += 1;
+                if pos.is_some() {
+                    st.miss_predicted += 1;
+                }
+            }
+        }
+        if st.steps % 4800 == 0 {
+            eprintln!(
+                "[predict] k={} шагов {}: выбранных в предсказании {:.1}%, промахов {:.2}/шаг, из них угадано {:.1}%, подкачка предсказанных {:.2}/шаг",
+                k(),
+                st.steps,
+                100.0 * st.hit as f64 / st.chosen.max(1) as f64,
+                st.actual_miss as f64 / st.steps as f64,
+                100.0 * st.miss_predicted as f64 / st.actual_miss.max(1) as f64,
+                st.predicted_miss as f64 / st.steps as f64,
+            );
+        }
+    }
 }
