@@ -307,7 +307,10 @@ impl Qwen4ExpPipeline {
             fit_cache_to_vram(cache, &config, device, kv_reserve);
         }
         let chat_template = weights.chat_template.clone();
-        let mtp = if speculation_on() && mtp_present(&*weights) {
+        // Спекуляция MTP по умолчанию — там, где она окупается: с zero-copy
+        // декодом (промахи экспертов не стоят синхронизаций).
+        let zc_eligible = zc_on() && lazy && host_mirror.is_some() && weights.experts_one_blob();
+        let mtp = if speculation_on(zc_eligible) && mtp_present(&*weights) {
             let cache = model.expert_cache().cloned();
             let source: Option<Arc<dyn ExpertSource>> = (cache.is_some()
                 && weights.has_lazy_mtp_experts())
@@ -1195,8 +1198,9 @@ fn layer_major() -> bool {
     std::env::var("SYN_QWEN4EXP_LAYER_MAJOR").map(|v| v.trim() != "0").unwrap_or(true)
 }
 
-fn speculation_on() -> bool {
-    std::env::var("SYN_QWEN4EXP_SPEC").map(|v| v.trim() != "0").unwrap_or(false)
+/// `SYN_QWEN4EXP_SPEC=1|0` — принудительно; иначе `default`.
+fn speculation_on(default: bool) -> bool {
+    std::env::var("SYN_QWEN4EXP_SPEC").map(|v| v.trim() != "0").unwrap_or(default)
 }
 
 /// Строки медиа-эмбеддингов, попадающие в чанк префилла `[offset, offset+len)`.
@@ -1401,9 +1405,25 @@ impl Qwen4ExpPipeline {
         if let Some(cache) = self.model.expert_cache() {
             cache.set_capacity(zc_prefill_cache_bytes().min(cache.ceiling_bytes()));
         }
-        let _ = synaptix_core::device::cuda::synchronize_all(ord);
-        let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
-        let Ok((free, _)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        // Все пулы, включая общий: после длинного префилла он держит
+        // гигабайты освобождённых временных буферов.
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let Ok((free, total)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        if std::env::var("SYN_QWEN4EXP_TRACE_MEM").is_ok() {
+            let gb = |x: u64| x as f64 / (1u64 << 30) as f64;
+            let (ar, au) = synaptix_core::device::cuda::activations_pool_stats(ord).unwrap_or((0, 0));
+            let (wr, wu) = synaptix_core::device::cuda::weights_pool_stats(ord).unwrap_or((0, 0));
+            let (er, eu) = synaptix_core::device::cuda::experts_pool_stats(ord).unwrap_or((0, 0));
+            eprintln!(
+                "[qwen4_exp] VRAM перед слотами: свободно {:.2} из {:.2} ГБ; пул активаций {:.2}/{:.2}, весов {:.2}/{:.2}, экспертов {:.2}/{:.2} ГБ; KV по расчёту {:.2} ГБ",
+                gb(free as u64), gb(total as u64), gb(au), gb(ar), gb(wu), gb(wr), gb(eu), gb(er),
+                {
+                    let (dr, du) = synaptix_core::memory::cuda_pool::cuda_mempool_stats(ord).unwrap_or((0, 0));
+                    eprintln!("[qwen4_exp] общий пул {:.2}/{:.2} ГБ", gb(du), gb(dr));
+                    0.0
+                },
+            );
+        }
         // Запас — только на декод: перед длинным префиллом слоты отдаются
         // (`zc_release_for_prefill`) и собираются заново после него.
         let reserve = decode_reserve(&self.config) + (768usize << 20);
