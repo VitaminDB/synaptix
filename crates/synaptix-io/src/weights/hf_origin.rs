@@ -107,6 +107,18 @@ impl HfOrigin {
         self.files.contains_key(name)
     }
 
+    /// Тензор есть и его можно декодировать: плотный или FP8 с блочными
+    /// `_scale_inv` (FP8 с одним масштабом на тензор, как таблица n-грамм
+    /// Qwen3.8-Flash-Next, не берём — пусть перекодируется из бандла).
+    pub fn decodable(&self, name: &str) -> bool {
+        let Ok((dt, ..)) = self.raw(name) else { return false };
+        match dt.as_str() {
+            "BF16" | "F16" | "F32" => true,
+            "F8_E4M3" => self.has(&format!("{name}_scale_inv")),
+            _ => false,
+        }
+    }
+
     /// Сырой тензор: (dtype, форма, байты).
     fn raw(&self, name: &str) -> Result<(String, Vec<usize>, Arc<Shard>, usize, usize)> {
         let file = self.files.get(name).ok_or_else(|| IoError::Bundle(format!("{name}: нет в оригинале")))?;
@@ -195,7 +207,7 @@ impl HfOrigin {
             }
             return Some(check(self.matrix(&d)));
         }
-        if slice == 0 && self.has(name) {
+        if slice == 0 && self.decodable(name) {
             return Some(check(self.matrix(name)));
         }
         None

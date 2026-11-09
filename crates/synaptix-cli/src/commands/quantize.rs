@@ -125,7 +125,9 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(a) => fmt(a, "--attn")?,
         None => Some(main),
     };
-    let q8 = matches!(main, DType::Q8Row | DType::Ggml(_));
+    // Форматы с кодировщиком на CPU; IQ3_S-128 кодируется на карте.
+    let q8 = matches!(main, DType::Q8Row)
+        || matches!(main, DType::Ggml(t) if t != synaptix_core::quant::ggml::GgmlType::Iq3S128);
     let lm_head = match &args.lm_head {
         Some(a) => fmt(a, "--lm-head")?,
         None if q8 => None,

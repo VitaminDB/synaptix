@@ -273,6 +273,21 @@ impl Qwen4ExpWeights {
                 names[0]
             )));
         }
+        // Одноблобный формат ggml (Q4_0 и т. п.): строки — подряд по
+        // `bytes_for(dim)`, масштабы внутри блоков.
+        if let Some(synaptix_bundle::inspect::QuantKind::Ggml(ty)) = bundle.quant_kind(&names[0]) {
+            let mut packed = Vec::with_capacity(names.len());
+            for name in names {
+                let p = resolve_blob(raw, name).ok_or_else(|| ModelError::Load(format!("{name}: в бандле нет .qpacked")))?;
+                raw.advise_random(&p);
+                packed.push(p);
+            }
+            let table = Box::new(GgmlRows { loader: raw.clone(), packed, rows_per_shard: rows, dim, ty });
+            return Ok(Some(match ngram_cache_bytes() {
+                0 => table,
+                bytes => Box::new(CachedRows::new(table, bytes)),
+            }));
+        }
         let mut packed = Vec::with_capacity(names.len());
         let mut scales = Vec::with_capacity(names.len());
         for name in names {
@@ -295,6 +310,49 @@ impl Qwen4ExpWeights {
             0 => table,
             bytes => Box::new(CachedRows::new(table, bytes)),
         }))
+    }
+}
+
+fn resolve_blob(loader: &SafetensorsLoader, name: &str) -> Option<String> {
+    for prefix in ["", "model."] {
+        let packed = format!("{prefix}{name}.qpacked");
+        if loader.raw_bytes(&packed).is_some() {
+            return Some(packed);
+        }
+    }
+    None
+}
+
+/// Строки таблицы в одноблобном формате ggml (Q4_0 и т. п.).
+struct GgmlRows {
+    loader: Arc<SafetensorsLoader>,
+    packed: Vec<String>,
+    rows_per_shard: usize,
+    dim: usize,
+    ty: synaptix_core::quant::ggml::GgmlType,
+}
+
+impl NGramRows for GgmlRows {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn rows(&self) -> usize {
+        self.rows_per_shard * self.packed.len()
+    }
+
+    fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<(), ModelError> {
+        let rb = self.ty.bytes_for(self.dim);
+        for (i, id) in ids.iter().enumerate() {
+            let id = *id as usize;
+            let (shard, row) = (id / self.rows_per_shard, id % self.rows_per_shard);
+            let name = self.packed.get(shard).ok_or_else(|| ModelError::Forward(format!("n-gram: шард {shard} вне таблицы")))?;
+            let (bytes, _, _) = self.loader.raw_bytes(name).ok_or_else(|| ModelError::Forward(format!("n-gram: нет {name}")))?;
+            let src = bytes.get(row * rb..(row + 1) * rb).ok_or_else(|| ModelError::Forward(format!("n-gram: строка {id} вне шарда")))?;
+            synaptix_core::quant::ggml_dequant::dequantize(self.ty, src, self.dim, &mut out[i * self.dim..(i + 1) * self.dim])
+                .map_err(|e| ModelError::Forward(format!("n-gram: деквант строки {id}: {e}")))?;
+        }
+        Ok(())
     }
 }
 

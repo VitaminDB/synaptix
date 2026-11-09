@@ -394,7 +394,7 @@ fn origin_covers(o: &super::hf_origin::HfOrigin, name: &str) -> bool {
     if let Some(p) = name.strip_suffix(".experts.down_proj") {
         return o.has(&format!("{p}.experts.0.down_proj.weight"));
     }
-    o.has(name)
+    o.decodable(name)
 }
 
 /// Срез из оригинала в f32 на хосте (`None` — в оригинале его нет).
