@@ -159,6 +159,14 @@ impl MtpHead {
         })
     }
 
+    pub fn attach_zc(&mut self, pool: &Arc<synaptix_llm_common::moe_zc::ZcPool>) {
+        self.moe.attach_zc(pool.clone());
+    }
+
+    pub fn zc_release(&self) {
+        self.moe.zc_release();
+    }
+
     pub fn make_cache(
         &self,
         cfg: &Qwen4ExpConfig,

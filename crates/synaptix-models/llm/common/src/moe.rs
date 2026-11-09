@@ -881,6 +881,13 @@ pub fn prefill_chunk_tokens(default: usize) -> usize {
 pub trait ExpertSource: Send + Sync {
     fn fetch(&self, layer: usize, expert: usize, device: Device)
         -> Result<(QLinear, QLinear), ModelError>;
+
+    /// Адреса блобов эксперта (gate_up, down) в закреплённом зеркале RAM —
+    /// для чтения ядрами напрямую (zero-copy). `None` — формат не одноблобный
+    /// или зеркало не покрывает эксперта.
+    fn blob_addrs(&self, _layer: usize, _expert: usize) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 enum ExpertStore {
@@ -954,6 +961,13 @@ pub struct MoeFfn {
     shared: Option<SharedExpert>,
     device: Device,
     compute: DType,
+    /// Декод без синхронизации с хостом (см. `moe_zc`): пул и состояние слоя.
+    zc_pool: Option<Arc<crate::moe_zc::ZcPool>>,
+    zc: Mutex<Option<crate::moe_zc::ZcLayer>>,
+    /// Частоты выбора экспертов на префилле — затравка слотов.
+    zc_seed: Mutex<Vec<f32>>,
+    /// Сколько вызовов подряд слой не собрался (зеркало не готово) — пауза.
+    zc_retry: AtomicUsize,
 }
 
 impl MoeFfn {
@@ -1084,6 +1098,10 @@ impl MoeFfn {
             None => None,
         };
         Ok(Self {
+            zc_pool: None,
+            zc: Mutex::new(None),
+            zc_seed: Mutex::new(Vec::new()),
+            zc_retry: AtomicUsize::new(0),
             offload_tables: Mutex::new(None),
             cfg,
             cache: None,
@@ -1723,6 +1741,137 @@ impl MoeFfn {
         Ok((experts, weights))
     }
 
+    /// Включить декод без синхронизации с хостом (zero-copy, см. `moe_zc`).
+    pub fn attach_zc(&mut self, pool: Arc<crate::moe_zc::ZcPool>) {
+        self.zc_pool = Some(pool);
+    }
+
+    /// Освободить слоты слоя (перед длинным префиллом); частоты остаются
+    /// затравкой следующей сборки.
+    pub fn zc_release(&self) {
+        let Ok(mut g) = self.zc.lock() else { return };
+        if let Some(l) = g.take() {
+            if let Ok(mut seed) = self.zc_seed.lock() {
+                *seed = l.counts().to_vec();
+            }
+        }
+        self.zc_retry.store(0, Ordering::Relaxed);
+    }
+
+    /// Доля выборов, попавших в слоты VRAM, и число резидентов (для логов).
+    pub fn zc_stats(&self) -> Option<(u64, u64, usize)> {
+        let g = self.zc.lock().ok()?;
+        g.as_ref().map(|l| {
+            let (h, p) = l.stats();
+            (h, p, l.slots())
+        })
+    }
+
+    /// Шаг MoE на 1–4 токена целиком на карте: роутер, top-k, softmax,
+    /// индексные GEMV по таблице (слот VRAM или блоб в закреплённой RAM).
+    /// `None` — путь неприменим (нет пула, формат не одноблобный, зеркало
+    /// не готово) — считать прежним.
+    fn forward_zc(&self, x: &Tensor) -> Result<Option<Tensor>, ModelError> {
+        let Some(pool) = &self.zc_pool else { return Ok(None) };
+        let ExpertStore::Lazy { source, count } = &self.experts else { return Ok(None) };
+        if !self.cfg.norm_topk_prob || self.cfg.per_expert_scale.is_some() || self.cfg.activation != Activation::Silu {
+            return Ok(None);
+        }
+        let mut guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
+        if guard.is_none() {
+            // Повторная попытка не на каждом вызове: пока зеркало заполняется,
+            // сборка таблицы стоила бы 512 поисков на слой.
+            let tries = self.zc_retry.fetch_add(1, Ordering::Relaxed);
+            if tries % 64 != 0 {
+                return Ok(None);
+            }
+            // Формат и формы — по эксперту 0 (источник отдаёт срез стопки).
+            let probe = source.fetch(self.layer_id, 0, Device::Cpu)?;
+            let (Some(gq), Some(dq)) = (probe.0.quant_weight(), probe.1.quant_weight()) else { return Ok(None) };
+            let dtype = gq.dtype();
+            if !dtype.is_block_quant() || dq.dtype() != dtype {
+                return Ok(None);
+            }
+            let seed = self.zc_seed.lock().ok().map(|s| s.clone()).filter(|s| s.len() == *count);
+            let built = crate::moe_zc::ZcLayer::build(
+                source.as_ref(),
+                self.layer_id,
+                *count,
+                dtype,
+                (gq.n(), gq.k()),
+                (dq.n(), dq.k()),
+                pool,
+                seed.as_deref(),
+            )?;
+            match built {
+                Some(l) => *guard = Some(l),
+                None => return Ok(None),
+            }
+        }
+        let layer = guard.as_mut().expect("собран выше");
+
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE zero-copy: {e}"));
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        let h = self.cfg.hidden_size;
+        let logits = x.to_dtype(DType::F32).and_then(|xf| xf.linear(&self.router)).map_err(ferr)?;
+        let (vals, idx) = logits.topk_rows(k).map_err(ferr)?;
+        let w = vals
+            .max_keepdim(1)
+            .and_then(|m| vals.broadcast_sub(&m))
+            .and_then(|d| d.exp())
+            .and_then(|e| e.sum_keepdim(1).and_then(|s| e.broadcast_div(&s)))
+            .map_err(ferr)?;
+        let idx = idx.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+        let w = w.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+
+        let xa = if matches!(x.dtype(), DType::F16 | DType::BF16) { x.clone() } else { to_f16(x)? };
+        let xa = if xa.is_contiguous() { xa } else { xa.contiguous().map_err(ferr)? };
+        let x_rows = if t == 1 {
+            xa
+        } else {
+            let rows: Vec<u32> = (0..t * k).map(|p| (p / k) as u32).collect();
+            let rows = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
+            take_rows(&xa, &rows)?
+        };
+        // Промахи подкачиваются на карте в рабочий буфер; таблицы — по парам.
+        let (gu_t, dn_t, iota) = layer.stage(pool, &idx)?;
+        let gu = gu_t.gemv_indexed_dense(&iota, &x_rows, t > 1).map_err(ferr)?;
+        let hh = self.swiglu(&gu)?;
+        let hh = if hh.is_contiguous() { hh } else { hh.contiguous().map_err(ferr)? };
+        let mut outs = Vec::with_capacity(t);
+        for j in 0..t {
+            // Таблица down — по парам шага: индексы пар токена j — j·k..j·k+k.
+            let (idx_j, h_j, w_j) = if t == 1 {
+                (iota.clone(), hh.clone(), w.clone())
+            } else {
+                (
+                    iota.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
+                    hh.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
+                    w.narrow(0, j * k, k).and_then(|v| v.contiguous()).map_err(ferr)?,
+                )
+            };
+            let mut acc = Tensor::zeros(vec![h], DType::F32, self.device).map_err(ferr)?;
+            dn_t.gemv_indexed_dense_acc(&idx_j, &h_j, true, &w_j, &mut acc).map_err(ferr)?;
+            outs.push(acc.reshape(vec![1, h]).map_err(ferr)?);
+        }
+        drop(guard);
+        let mixed = if outs.len() == 1 {
+            outs.pop().expect("одна строка")
+        } else {
+            let refs: Vec<&Tensor> = outs.iter().collect();
+            Tensor::cat(&refs, 0).map_err(ferr)?
+        };
+        let mixed = self.to_compute(mixed)?;
+        Ok(Some(match &self.shared {
+            Some(shared) => {
+                let s = self.shared_forward(shared, x)?;
+                mixed.add(&s).map_err(ferr)?
+            }
+            None => mixed,
+        }))
+    }
+
     /// Top-`k` экспертов, которых роутер ЭТОГО слоя выбрал бы для `x: [1, H]`
     /// — для предсказательной подкачки: вход берётся у предыдущего слоя.
     pub fn predict_topk(&self, x: &Tensor, k: usize) -> Result<Vec<u32>, ModelError> {
@@ -1897,7 +2046,41 @@ impl MoeFfn {
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
         let routed = router_in.unwrap_or(x);
+        if t <= 4 && router_in.is_none() {
+            if let Some(out) = stage("moe:zc", || self.forward_zc(x))? {
+                if std::env::var("SYN_ZC_SYNC").as_deref() == Ok("1") {
+                    if let Device::Cuda(o) = self.device {
+                        let _ = synaptix_core::device::cuda::synchronize_all(o);
+                    }
+                }
+                if zc_check() {
+                    // Сверка с прежним путём (отладка): тот же вход, батч GEMV.
+                    let (experts, weights) = self.route(x)?;
+                    self.prefetch(&experts, &weights, true);
+                    if let Some(want) = self.forward_pairs_batched(x, &experts, &weights)? {
+                        let d = out.to_dtype(DType::F32).and_then(|a| want.to_dtype(DType::F32).and_then(|b| a.sub(&b)))
+                            .and_then(|d| d.sqr()).and_then(|d| d.sum_all()).and_then(|v| v.to_device(Device::Cpu)).and_then(|v| v.flatten_all()).and_then(|v| v.to_vec1::<f32>()).map(|v| v[0]).unwrap_or(f32::NAN);
+                        let n = want.to_dtype(DType::F32).and_then(|b| b.sqr()).and_then(|d| d.sum_all()).and_then(|v| v.to_device(Device::Cpu)).and_then(|v| v.flatten_all()).and_then(|v| v.to_vec1::<f32>()).map(|v| v[0]).unwrap_or(f32::NAN);
+                        let rel = (d / n.max(1e-30)).sqrt();
+                        if !(rel < 2e-2) {
+                            eprintln!("[zc-check] слой {} t={t}: отн. расхождение {rel:.3e}", self.layer_id);
+                        }
+                    }
+                }
+                return Ok(out);
+            }
+        }
         let (experts, weights) = stage("moe:route", || self.route(routed))?;
+        if self.zc_pool.is_some() && t > 4 {
+            if let Ok(mut seed) = self.zc_seed.lock() {
+                if seed.len() != self.cfg.num_experts {
+                    *seed = vec![0.0; self.cfg.num_experts];
+                }
+                for e in &experts {
+                    seed[*e as usize] += 1.0;
+                }
+            }
+        }
         if t == 1 {
             route_trace::record(self.layer_id, &experts);
             LAST_ROUTE.with(|c| *c.borrow_mut() = experts.clone());
@@ -3080,4 +3263,10 @@ pub mod route_trace {
         let _ = w.write_all(&buf);
         let _ = w.flush();
     }
+}
+
+/// Сверка zero-copy с прежним путём (`SYN_ZC_CHECK=1`, отладка).
+fn zc_check() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_ZC_CHECK").as_deref() == Ok("1"))
 }

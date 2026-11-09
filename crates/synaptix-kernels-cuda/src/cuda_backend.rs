@@ -905,6 +905,44 @@ impl Backend for CudaBackend {
         Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
     }
 
+    fn moe_zc_lru(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::ZcLaunch) -> Result<()> {
+        use cudarc::driver::PushKernelArg;
+        #[repr(transparent)]
+        struct Arg(synaptix_core::backend::ZcLaunch);
+        unsafe impl cudarc::driver::DeviceRepr for Arg {}
+        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
+        static CACHE: std::sync::OnceLock<parking_lot::Mutex<Vec<Fns>>> = std::sync::OnceLock::new();
+        let synaptix_core::device::Device::Cuda(ord) = device else {
+            return Err(SynaptixError::Unsupported("moe_zc_lru: не CUDA"));
+        };
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let key = Arc::as_ptr(&ctx) as usize;
+        let (lru, copy) = {
+            let mut g = CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new())).lock();
+            match g.iter().find(|f| f.0 == key) {
+                Some(f) => (f.2.clone(), f.3.clone()),
+                None => {
+                    let m = crate::kernels::compile::compile_module(&ctx, include_str!("cu/fused/moe_zc_stage.cu"), "moe_zc_stage.cu")?;
+                    let l = crate::kernels::compile::load_fn(&m, "zc_lru")?;
+                    let c = crate::kernels::compile::load_fn(&m, "zc_copy")?;
+                    g.push((key, m, l.clone(), c.clone()));
+                    (l, c)
+                }
+            }
+        };
+        let arg = Arg(*a);
+        let mut b = stream.launch_builder(&lru);
+        b.arg(&arg);
+        unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }
+            .map_err(|e| SynaptixError::Cuda(format!("launch zc_lru: {e:?}")))?;
+        let mut b = stream.launch_builder(&copy);
+        b.arg(&arg);
+        unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (a.pairs, 16, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
+            .map_err(|e| SynaptixError::Cuda(format!("launch zc_copy: {e:?}")))?;
+        Ok(())
+    }
+
     fn quantize_ggml(
         &self,
         w: (&Storage, &Layout),

@@ -1397,6 +1397,95 @@ mod inner {
         }
     }
 
+    // ── Эксперты из закреплённой RAM (zero-copy) ─────────────────────────
+
+    /// Адрес байтов `bytes` (срез mmap бандла) в pinned-зеркале — при единой
+    /// адресации он же годится ядру как device-указатель. `None` — диапазон
+    /// не зеркалирован или зеркало ещё не догнало.
+    pub fn mirror_addr(bytes: &[u8]) -> Option<u64> {
+        offload_pin_resolve(bytes).map(|m| m.as_ptr() as u64)
+    }
+
+    /// Записать u64 по адресу `dst` в порядке default-стрима (после всего,
+    /// что поставлено раньше). Источник — pinned staging, так что копия не
+    /// синхронизирует хост.
+    pub fn write_u64_ordered(ordinal: usize, dst: u64, value: u64) -> Result<()> {
+        // Кольцо закреплённых ячеек: источник каждой записи живёт, пока кольцо
+        // не обернётся (65536 записей) — к тому времени копия давно исполнена,
+        // и ждать хосту нечего (общий staging ждал бы событие буфера).
+        const SLOTS: usize = 1 << 16;
+        struct Ring {
+            buf: crate::memory::pinned::PinnedBuf,
+            next: usize,
+        }
+        static RING: Lazy<parking_lot::Mutex<Option<Ring>>> = Lazy::new(|| parking_lot::Mutex::new(None));
+        let stream = default_stream(ordinal)?;
+        let mut g = RING.lock();
+        let ring = g.get_or_insert_with(|| Ring { buf: crate::memory::pinned::PinnedBuf::new(SLOTS * 8), next: 0 });
+        let i = ring.next;
+        ring.next = (i + 1) % SLOTS;
+        let cell = &mut ring.buf.as_mut_slice()[i * 8..i * 8 + 8];
+        cell.copy_from_slice(&value.to_le_bytes());
+        let src: &[u8] = unsafe { std::slice::from_raw_parts(cell.as_ptr(), 8) };
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, stream.cu_stream()) }
+            .map_err(|e| SynaptixError::Cuda(format!("write_u64_ordered: {e:?}")))
+    }
+
+    /// Копия `len` байт из pinned-памяти `src` (адрес в зеркале) на карту
+    /// `dst` в loader-стриме — DMA без staging и без ожидания хоста.
+    pub fn loader_copy_from_pinned(ordinal: usize, dst: u64, src: u64, len: usize) -> Result<()> {
+        let l = loader_stream(ordinal)?;
+        // SAFETY: src — закреплённый диапазон зеркала, dst — живой буфер карты.
+        let slice = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, slice, l.cu_stream()) }
+            .map_err(|e| SynaptixError::Cuda(format!("loader_copy_from_pinned: {e:?}")))
+    }
+
+    /// Асинхронное чтение небольшого буфера карты на хост: копия в
+    /// закреплённый буфер (выделен один раз) в default-стриме и событие;
+    /// [`AsyncRead::ready`] не блокирует.
+    pub struct AsyncRead {
+        buf: crate::memory::pinned::PinnedBuf,
+        ev: Option<cudarc::driver::CudaEvent>,
+        len: usize,
+    }
+
+    impl AsyncRead {
+        pub fn new(cap: usize) -> Self {
+            Self { buf: crate::memory::pinned::PinnedBuf::new(cap.max(1)), ev: None, len: 0 }
+        }
+
+        /// Свободен ли буфер под новое чтение (прошлое завершено или его не было).
+        pub fn idle(&self) -> bool {
+            self.ev.is_none()
+        }
+
+        pub fn issue(&mut self, ordinal: usize, src: u64, len: usize) -> Result<()> {
+            let len = len.min(self.buf.len());
+            let stream = default_stream(ordinal)?;
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(&mut self.buf.as_mut_slice()[..len], src, stream.cu_stream())
+            }
+            .map_err(|e| SynaptixError::Cuda(format!("AsyncRead: {e:?}")))?;
+            self.ev = Some(stream.record_event(None).map_err(|e| SynaptixError::Cuda(format!("AsyncRead: событие: {e:?}")))?);
+            self.len = len;
+            Ok(())
+        }
+
+        /// Копия завершена (без ожидания).
+        pub fn ready(&self) -> bool {
+            self.ev
+                .as_ref()
+                .is_some_and(|ev| matches!(unsafe { cudarc::driver::result::event::query(ev.cu_event()) }, Ok(())))
+        }
+
+        /// Забрать данные завершённого чтения и освободить буфер.
+        pub fn take(&mut self) -> &[u8] {
+            self.ev = None;
+            &self.buf.as_slice()[..self.len]
+        }
+    }
+
     /// CUDA-событие слот-протокола (write-after-read анти-гонка ping-pong слотов
     /// весов): record на default-стриме ПОСЛЕ enqueue ядер, читающих слот; wait
     /// на loader-стриме ПЕРЕД перезаписью слота. Никогда не записанное событие

@@ -91,6 +91,35 @@ pub struct DecTopk<'a> {
 }
 
 /// Эпилог индексного GEMV экспертов.
+/// Аргументы ядер кэша экспертов на карте (раскладка как `ZcArgs` в
+/// `moe_zc_stage.cu`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZcLaunch {
+    pub idx: u64,
+    pub tab_gu: u64,
+    pub tab_dn: u64,
+    pub host_gu: u64,
+    pub host_dn: u64,
+    pub owner: u64,
+    pub used: u64,
+    pub clock: u64,
+    pub stats: u64,
+    pub eff_gu: u64,
+    pub eff_dn: u64,
+    pub cp_src_gu: u64,
+    pub cp_src_dn: u64,
+    pub cp_dst: u64,
+    pub slot_base: u64,
+    pub slot_bytes: u64,
+    pub gu_bytes: u64,
+    pub dn_bytes: u64,
+    pub pairs: u32,
+    pub experts: u32,
+    pub slots: u32,
+    pub _pad: u32,
+}
+
 pub enum DecIndexedOut<'a> {
     /// `out[p, N]` в `dtype` (F16|BF16).
     Rows { out: &'a mut Storage, dtype: DType },
@@ -302,6 +331,13 @@ pub trait Backend: Send + Sync + 'static {
         _stream: &Stream,
     ) -> Result<Storage> {
         Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
+    }
+
+    /// Кэш экспертов zero-copy-декода на карте (`moe_zc_stage.cu`): ядро
+    /// «часов» по выбору шага и копия промахов RAM → слот. Все поля — адреса
+    /// на устройстве. Default — `Unsupported`.
+    fn moe_zc_lru(&self, _device: crate::device::Device, _a: &ZcLaunch) -> Result<()> {
+        Err(SynaptixError::Unsupported("moe_zc_lru не поддержан этим backend"))
     }
 
     /// Деквант NVFP4 движка (линейный packed `[n, k/2]` + тайл-мажорные

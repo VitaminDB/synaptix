@@ -39,6 +39,12 @@ pub struct Tensor {
 
 impl Tensor {
     #[allow(dead_code)]
+    /// Адрес первого элемента на устройстве (с учётом смещения вида);
+    /// `None` — тензор не на карте.
+    pub fn device_address(&self) -> Option<u64> {
+        self.storage.device_address().map(|b| b + self.layout.byte_offset() as u64)
+    }
+
     pub(crate) fn from_parts(storage: Arc<Storage>, layout: Layout) -> Self {
         Self { storage, layout, grad_meta: None }
     }

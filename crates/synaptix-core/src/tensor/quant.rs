@@ -780,7 +780,47 @@ impl ExpertTable {
         Some(Self { w_table, s_table, n, k, count, device, dense: None, _keep: Vec::new() })
     }
 
-    /// Портируемая таблица: веса любого квант-формата, который умеет
+    /// Портируемая таблица из готовых адресов блобов (`w` — по эксперту;
+    /// у одноблобных форматов масштабы внутри блоба). Адреса могут указывать
+    /// и на закреплённую RAM (единая адресация): ядро читает вес оттуда.
+    pub fn from_addrs_dense(n: usize, k: usize, device: Device, dtype: DType, w: Vec<i64>) -> Option<Self> {
+        if w.is_empty() || !device.is_cuda() || matches!(dtype, DType::NVFP4 | DType::MXFP8) {
+            return None;
+        }
+        let count = w.len();
+        let w_table = Tensor::from_vec::<_, i64>(w.clone(), vec![count], device).ok()?;
+        let s_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
+        Some(Self { w_table, s_table, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
+    }
+
+    /// Портируемая таблица поверх готового тензора адресов I64[count]
+    /// (у одноблобных форматов масштабы внутри блоба: s_table = w_table).
+    pub fn from_tensor_dense(n: usize, k: usize, dtype: DType, table: Tensor) -> Option<Self> {
+        if table.dtype() != DType::I64 || !table.device().is_cuda() {
+            return None;
+        }
+        let count = table.numel();
+        let device = table.device();
+        Some(Self { w_table: table.clone(), s_table: table, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
+    }
+
+    /// Переписать адрес эксперта `i` в порядке default-стрима (ядра,
+    /// поставленные раньше, видят прежний адрес).
+    pub fn set_entry(&self, i: usize, addr: u64) -> Result<()> {
+        if i >= self.count {
+            return Err(SynaptixError::Unsupported("ExpertTable::set_entry: индекс вне таблицы"));
+        }
+        let Device::Cuda(ord) = self.device else {
+            return Err(SynaptixError::Unsupported("ExpertTable::set_entry: не CUDA"));
+        };
+        for t in [&self.w_table, &self.s_table] {
+            let base = t.storage.device_address().ok_or(SynaptixError::Unsupported("ExpertTable: нет адреса таблицы"))?;
+            crate::device::cuda::write_u64_ordered(ord, base + 8 * i as u64, addr)?;
+        }
+        Ok(())
+    }
+
+    /// Портируемая таблица: веса любого квант-формата, который умеет    /// Портируемая таблица: веса любого квант-формата, который умеет
     /// `quant_gemv_indexed` (SQ, типы ggml, NVFP4/MXFP8 движка), считаются по
     /// исходным блобам с плотной активацией. Путь графового декода MoE на
     /// картах без FP4 MMA. `None` — формы/форматы разные или вес не на карте.

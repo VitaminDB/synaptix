@@ -219,7 +219,11 @@ impl Qwen4ExpWeights {
                 // `cuMemHostAlloc` держит драйверную блокировку на всё время
                 // закрепления страниц, и один кусок в 800 МБ останавливал
                 // загрузку весов и подкачку на сотни миллисекунд.
-                let slice = repack.map(|(n, k)| n * k / 2).unwrap_or(1).max(1);
+                // Кусок — целое число матриц и у одноблобных форматов: эксперт
+                // не должен разрываться между кусками (zero-copy адресует
+                // его блоб одним куском зеркала).
+                let per = l.quant_dims(&key).map(|(sl, _, _)| packed.len() / sl.max(1)).unwrap_or(1);
+                let slice = repack.map(|(n, k)| n * k / 2).unwrap_or(per).max(1);
                 let piece = (MIRROR_PIECE / slice).max(1) * slice;
                 for b in packed.chunks(piece) {
                     out.push(MirrorRange { bytes: b, nvfp4_repack: repack });
@@ -546,7 +550,35 @@ impl BundleExperts {
     }
 }
 
+impl BundleExperts {
+    /// Блоб эксперта `expert` стопки `key` (срез mmap) — только одноблобные
+    /// форматы (масштабы внутри блоба).
+    fn blob_slice(&self, key: &str, expert: usize) -> Option<&[u8]> {
+        let Source::Bundle(l) = &self.weights.source else { return None };
+        let key = self.weights.resolve(key);
+        let kind = l.quant_kind(&key)?;
+        if kind.has_scales() {
+            return None;
+        }
+        let (slices, _, _) = l.quant_dims(&key)?;
+        let Ok((packed, _)) = l.quant_blob_slices(&key)? else { return None };
+        let per = packed.len() / slices.max(1);
+        packed.get(expert * per..(expert + 1) * per)
+    }
+}
+
 impl ExpertSource for BundleExperts {
+    fn blob_addrs(&self, layer: usize, expert: usize) -> Option<(u64, u64)> {
+        let prefix = if layer == self.mtp_layer {
+            format!("{MTP_PREFIX}.layers.0.mlp.experts")
+        } else {
+            format!("{LM_PREFIX}.layers.{layer}.mlp.experts")
+        };
+        let gu = self.blob_slice(&format!("{prefix}.gate_up_proj"), expert)?;
+        let dn = self.blob_slice(&format!("{prefix}.down_proj"), expert)?;
+        Some((synaptix_core::device::cuda::mirror_addr(gu)?, synaptix_core::device::cuda::mirror_addr(dn)?))
+    }
+
     fn fetch(
         &self,
         layer: usize,

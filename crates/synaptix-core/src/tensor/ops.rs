@@ -567,6 +567,11 @@ pub(crate) fn run_quantize_ggml(w: &Tensor, ty: crate::quant::ggml::GgmlType, im
     QuantWeight::new_block(Arc::new(packed), DType::Ggml(ty), n, k)
 }
 
+/// Кэш экспертов zero-copy-декода на карте (см. `Backend::moe_zc_lru`).
+pub fn moe_zc_lru(device: crate::device::Device, a: &crate::backend::ZcLaunch) -> Result<()> {
+    registry::backend_for(device)?.moe_zc_lru(device, a)
+}
+
 #[allow(dead_code)]
 const REDUCE_STAGE_MIN: usize = 1 << 16;
 

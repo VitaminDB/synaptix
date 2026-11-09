@@ -72,6 +72,8 @@ impl VideoPromptInfo {
 }
 
 pub struct Qwen4ExpPipeline {
+    /// Пул декода MoE без синхронизации (`SYN_QWEN4EXP_ZC=1`).
+    zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
     /// Pinned-зеркало стопок экспертов в RAM (см. [`host_mirror_for`]).
     /// Первое поле — гард умирает раньше модели, а с ней и mmap-диапазонов,
     /// на которые он ссылается.
@@ -329,7 +331,26 @@ impl Qwen4ExpPipeline {
         if let Some(m) = &host_mirror {
             m.resume();
         }
+        // Декод MoE без синхронизации: только эксперты из бандла с зеркалом в
+        // RAM. Старый кэш нужен лишь префиллу — ужимаем его потолок, место
+        // отдадут слотам на первом декоде.
+        let zc_pool = if zc_on() && lazy && host_mirror.is_some() {
+            let pool = synaptix_llm_common::moe_zc::ZcPool::new(device);
+            model.attach_zc(&pool);
+            if let Some(cache) = model.expert_cache() {
+                cache.set_ceiling(zc_prefill_cache_bytes());
+            }
+            eprintln!("[qwen4_exp] декод MoE без синхронизации (zero-copy): эксперты из закреплённой RAM + слоты VRAM");
+            Some(pool)
+        } else {
+            None
+        };
+        let mut mtp = mtp;
+        if let (Some(pool), Some(head)) = (&zc_pool, mtp.as_mut()) {
+            head.attach_zc(pool);
+        }
         Ok(Self {
+            zc_pool,
             _host_mirror: host_mirror,
             model,
             vision: None,
@@ -853,6 +874,7 @@ impl Qwen4ExpPipeline {
         // в кэше сессии. Позиции при этом абсолютные — `cache.seq_len`
         // указывает на границу.
         let fresh = &prompt_ids[reuse..];
+        self.zc_release_for_prefill(fresh.len());
         let by_layers = fresh.len() > cfg.prefill_batch
             && self.model.expert_cache().is_some()
             && layer_major();
@@ -918,6 +940,7 @@ impl Qwen4ExpPipeline {
             // вернуться к потолку — на нём и держится скорость генерации.
             cache.fit_to_vram(decode_reserve(&self.config));
         }
+        self.size_zc_pool();
 
         let decode_start = Instant::now();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
@@ -995,6 +1018,9 @@ impl Qwen4ExpPipeline {
             spec.tokens = vec![next, token];
         }
         let decode_ms = decode_start.elapsed().as_millis();
+        if let Some((h, p, r)) = self.model.zc_stats() {
+            eprintln!("[qwen4_exp] zero-copy: попаданий в слоты {:.1} % ({h} из {p}), резидентов {r}", 100.0 * h as f64 / p.max(1) as f64);
+        }
         if let (Some(cache), Some(st)) = (self.model.expert_cache(), self.model.expert_cache_stats())
         {
             let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
@@ -1322,6 +1348,73 @@ fn layer_major_chunk(cfg: &Qwen4ExpConfig, device: Device, want: usize, stream_t
 fn is_oom<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string();
     s.contains("OUT_OF_MEMORY") || s.contains("out of memory") || s.contains(": OOM")
+}
+
+/// Декод MoE без синхронизации (`SYN_QWEN4EXP_ZC=1`).
+fn zc_on() -> bool {
+    std::env::var("SYN_QWEN4EXP_ZC").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// Потолок старого кэша экспертов при zero-copy: он нужен только префиллу
+/// (стрим слоя группами). `SYN_QWEN4EXP_ZC_PREFILL_GB`.
+fn zc_prefill_cache_bytes() -> usize {
+    let gb = std::env::var("SYN_QWEN4EXP_ZC_PREFILL_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(2.5);
+    (gb * (1u64 << 30) as f64) as usize
+}
+
+impl Qwen4ExpPipeline {
+    /// Перед префиллом длиннее `SYN_QWEN4EXP_ZC_RELEASE` (1024) токенов —
+    /// отдать слоты zero-copy под активации; частоты остаются затравкой.
+    fn zc_release_for_prefill(&self, new_tokens: usize) {
+        let Some(pool) = &self.zc_pool else { return };
+        let limit = std::env::var("SYN_QWEN4EXP_ZC_RELEASE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024usize);
+        if new_tokens <= limit || pool.slots_per_layer() == 0 {
+            return;
+        }
+        self.model.zc_release();
+        if let Some(h) = &self.mtp {
+            h.zc_release();
+        }
+        pool.set_slots_per_layer(0);
+        if let Device::Cuda(ord) = self.model.device {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+            let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+        }
+    }
+
+    /// Назначить размер пула слотов один раз, на первом декоде: свободная
+    /// VRAM за вычетом запаса под активации следующего префилла, поровну на
+    /// MoE-слои (48 + голова MTP).
+    fn size_zc_pool(&self) {
+        let Some(pool) = &self.zc_pool else { return };
+        if pool.slots_per_layer() != 0 {
+            return;
+        }
+        let Device::Cuda(ord) = self.model.device else { return };
+        if let Some(cache) = self.model.expert_cache() {
+            cache.set_capacity(zc_prefill_cache_bytes().min(cache.ceiling_bytes()));
+        }
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+        let Ok((free, _)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        // Запас — только на декод: перед длинным префиллом слоты отдаются
+        // (`zc_release_for_prefill`) и собираются заново после него.
+        let reserve = decode_reserve(&self.config) + (768usize << 20);
+        let layers = self.config.num_hidden_layers + self.mtp.is_some() as usize;
+        // Байт на слот: gate_up + down одного эксперта IQ3_S-128 (точно — в слое;
+        // здесь по формам и 3,5 бит на вес).
+        let m = &self.config.moe;
+        let per_expert = (2 * m.moe_intermediate_size * m.hidden_size + m.hidden_size * m.moe_intermediate_size) * 7 / 16;
+        let slots = free.saturating_sub(reserve) / layers.max(1) / per_expert.max(1);
+        let slots = slots.min(m.num_experts);
+        pool.set_slots_per_layer(slots);
+        eprintln!(
+            "[qwen4_exp] zero-copy: слотов VRAM {} на слой ({:.1} ГБ), свободно было {:.1} ГБ",
+            slots,
+            (slots * layers * per_expert) as f64 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64
+        );
+    }
 }
 
 /// Запас VRAM на декоде: активации горстки токенов — мегабайты, и прежний

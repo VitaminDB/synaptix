@@ -595,6 +595,34 @@ impl Qwen4ExpModel {
         self.expert_cache.as_ref().map(|c| c.stats())
     }
 
+    /// Подключить декод MoE без синхронизации (zero-copy) ко всем слоям.
+    pub fn attach_zc(&mut self, pool: &Arc<synaptix_llm_common::moe_zc::ZcPool>) {
+        for b in &mut self.blocks {
+            b.moe.attach_zc(pool.clone());
+        }
+    }
+
+    /// Освободить слоты zero-copy всех слоёв (перед длинным префиллом).
+    pub fn zc_release(&self) {
+        for b in &self.blocks {
+            b.moe.zc_release();
+        }
+    }
+
+    /// Сводка zero-copy по слоям: (попадания в слоты, выборы, резидентов).
+    pub fn zc_stats(&self) -> Option<(u64, u64, usize)> {
+        let mut acc: Option<(u64, u64, usize)> = None;
+        for b in &self.blocks {
+            if let Some((h, p, r)) = b.moe.zc_stats() {
+                let a = acc.get_or_insert((0, 0, 0));
+                a.0 += h;
+                a.1 += p;
+                a.2 += r;
+            }
+        }
+        acc
+    }
+
     pub fn expert_cache(&self) -> Option<&Arc<ExpertCache>> {
         self.expert_cache.as_ref()
     }
