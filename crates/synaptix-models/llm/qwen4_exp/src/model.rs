@@ -958,6 +958,7 @@ impl Qwen4ExpModel {
         let mut snap_linear = Vec::new();
         let mut snap_qsa = Vec::new();
         let mut snap_ple = Vec::new();
+        let mut pending_prefetch: Option<synaptix_llm_common::moe::AsyncPrefetch> = None;
         for (l, block) in self.blocks.iter().enumerate() {
             if trace {
                 traced.push((format!("in_{l}"), hidden.clone()));
@@ -1068,9 +1069,24 @@ impl Qwen4ExpModel {
             } else {
                 Vec::new()
             };
+            // Асинхронная подкачка: эксперты, предсказанные для этого слоя на
+            // прошлом, должны быть дождены до роутинга.
+            if let Some(p) = pending_prefetch.take() {
+                if p.layer() == block.moe.layer_id() {
+                    block.moe.adopt_prefetch(p);
+                }
+            }
+            let predicted_next = if s == 1 && prefetch_k() > 0 && l + 1 < self.blocks.len() {
+                self.blocks[l + 1].moe.predict_topk(&mixed.mixed, prefetch_k()).ok()
+            } else {
+                None
+            };
             let out = stage("moe", || {
                 ctx(block.moe.forward(&mixed.mixed), &format!("слой {l} moe"))
             })?;
+            if let Some(ids) = predicted_next {
+                pending_prefetch = self.blocks[l + 1].moe.prefetch_async(&ids, prefetch_k());
+            }
             if s == 1 && predict_probe::on() {
                 predict_probe::check(l, &synaptix_llm_common::moe::last_route(), &resident_before);
             }
@@ -1284,4 +1300,13 @@ mod predict_probe {
             );
         }
     }
+}
+
+/// Сколько экспертов слоя L+1 предсказывать и подкачивать асинхронно на
+/// декоде (`SYN_QWEN4EXP_PREFETCH`, 0 — выключено).
+fn prefetch_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("SYN_QWEN4EXP_PREFETCH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
 }

@@ -208,6 +208,8 @@ struct CacheInner {
     evict_passes: u32,
     skipped: u64,
     fetched: u64,
+    /// Поднято асинхронной подкачкой по предсказанию.
+    prefetched: u64,
     fetch_nanos: u64,
     batched: u64,
     unbatched: u64,
@@ -222,6 +224,8 @@ pub struct ExpertCacheStats {
     pub skipped: u64,
     /// Сколько экспертов поднято предзагрузкой чанка.
     pub fetched: u64,
+    /// Сколько поднято асинхронно по предсказанию.
+    pub prefetched: u64,
     /// Суммарное время предзагрузки.
     pub fetch_millis: u64,
     /// Сколько шагов декода посчитано батчем и сколько — поэкспертно.
@@ -270,6 +274,7 @@ impl ExpertCache {
                 misses: 0,
                 skipped: 0,
                 fetched: 0,
+                prefetched: 0,
                 fetch_nanos: 0,
                 batched: 0,
                 unbatched: 0,
@@ -377,6 +382,7 @@ impl ExpertCache {
             misses: inner.misses,
             skipped: inner.skipped,
             fetched: inner.fetched,
+            prefetched: inner.prefetched,
             fetch_millis: inner.fetch_nanos / 1_000_000,
             batched: inner.batched,
             unbatched: inner.unbatched,
@@ -408,6 +414,12 @@ impl ExpertCache {
     fn note_fetch_time(&self, elapsed: std::time::Duration) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.fetch_nanos += elapsed.as_nanos() as u64;
+        }
+    }
+
+    fn note_prefetched(&self, count: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.prefetched += count;
         }
     }
 
@@ -703,6 +715,38 @@ impl CacheInner {
             }
         }
         false
+    }
+}
+
+/// Свободная VRAM с кэшем на 50 мс: `cuMemGetInfo` стоит ~50 мкс, а
+/// подкачке по предсказанию нужен лишь грубый запас на каждом слое.
+fn free_vram_cached(ord: usize) -> usize {
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    static FREE: AtomicUsize = AtomicUsize::new(0);
+    static AT: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    let at = AT.load(Ordering::Relaxed);
+    if at == 0 || now.saturating_sub(at) > 50 {
+        let f = synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        FREE.store(f, Ordering::Relaxed);
+        AT.store(now, Ordering::Relaxed);
+        return f;
+    }
+    FREE.load(Ordering::Relaxed)
+}
+
+/// Эксперты слоя, поднятые асинхронно в loader-стриме (см.
+/// [`MoeFfn::prefetch_async`]).
+pub struct AsyncPrefetch {
+    layer: usize,
+    experts: Vec<(u32, Expert)>,
+    done: synaptix_core::device::cuda::LoaderDone,
+}
+
+impl AsyncPrefetch {
+    pub fn layer(&self) -> usize {
+        self.layer
     }
 }
 
@@ -1695,7 +1739,69 @@ impl MoeFfn {
             .map_err(|err| ModelError::Forward(format!("предсказание MoE: индексы: {err}")))
     }
 
-    /// Номер слоя в общем кэше экспертов.
+    /// Асинхронно поднять на карту экспертов `ids` (предсказанных для этого
+    /// слоя по входу предыдущего), которых нет в кэше: копии идут в
+    /// loader-стриме и перекрываются со счётом в default. В кэш эксперты
+    /// попадут в [`Self::adopt_prefetch`] — после того как default дождётся
+    /// копий. `None` — подкачивать нечего или путь неприменим.
+    pub fn prefetch_async(&self, ids: &[u32], max: usize) -> Option<AsyncPrefetch> {
+        let cache = self.cache.as_ref()?;
+        let ExpertStore::Lazy { source, count } = &self.experts else { return None };
+        let Device::Cuda(ord) = self.device else { return None };
+        let mut missing: Vec<u32> = Vec::with_capacity(ids.len());
+        for &e in ids {
+            if (e as usize) < *count && !missing.contains(&e) && !cache.contains((self.layer_id, e as usize)) {
+                missing.push(e);
+            }
+            if missing.len() >= max {
+                break;
+            }
+        }
+        if missing.is_empty() {
+            return None;
+        }
+        // Только с запасом VRAM: под нехваткой аллокатор зовёт вытеснение, а
+        // память вытесненных (их читатели — в default) не должна достаться
+        // копиям loader-стрима без ожидания.
+        let need = missing.len() * self.expert_bytes().max(1);
+        if free_vram_cached(ord) < need + (512usize << 20) {
+            return None;
+        }
+        synaptix_core::device::cuda::loader_wait_default(ord).ok()?;
+        let loader = synaptix_core::device::cuda::loader_stream(ord).ok()?;
+        synaptix_core::device::cuda::set_alloc_stream(Some(loader));
+        let mut experts = Vec::with_capacity(missing.len());
+        {
+            let _experts_pool = synaptix_core::device::cuda::ExpertsAllocGuard::for_device(self.device);
+            let _staging = synaptix_core::device::cuda::PinnedStageGuard::new();
+            for e in missing {
+                let Ok((gate_up, down)) = source.fetch(self.layer_id, e as usize, self.device) else { continue };
+                for w in [gate_up.quant_weight(), down.quant_weight()].into_iter().flatten() {
+                    w.mark_expert_pool();
+                }
+                experts.push((e, Expert { gate_up, down }));
+            }
+        }
+        synaptix_core::device::cuda::set_alloc_stream(None);
+        let done = synaptix_core::device::cuda::LoaderDone::record(ord).ok()?;
+        Some(AsyncPrefetch { layer: self.layer_id, experts, done })
+    }
+
+    /// Принять асинхронную подкачку этого слоя: default ждёт копий (на карте,
+    /// без блокировки хоста), эксперты ложатся в кэш.
+    pub fn adopt_prefetch(&self, p: AsyncPrefetch) {
+        let Some(cache) = &self.cache else { return };
+        if p.layer != self.layer_id || p.done.wait_default().is_err() {
+            return;
+        }
+        let n = p.experts.len() as u64;
+        for (e, ex) in p.experts {
+            cache.insert((self.layer_id, e as usize), Arc::new(ex));
+        }
+        cache.note_prefetched(n);
+    }
+
+    /// Номер слоя в общем кэше экспертов.    /// Номер слоя в общем кэше экспертов.
     pub fn layer_id(&self) -> usize {
         self.layer_id
     }

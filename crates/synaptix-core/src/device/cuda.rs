@@ -1366,6 +1366,37 @@ mod inner {
         .map_err(|e| SynaptixError::Cuda(format!("dtod_into_region: {e:?}")))
     }
 
+    /// loader-стрим ждёт всё, что уже поставлено в default: память, отпущенная
+    /// до этой точки (её читатели — в default), можно переписывать копиями на
+    /// loader. Перед асинхронной подкачкой в чужом стриме.
+    pub fn loader_wait_default(ordinal: usize) -> Result<()> {
+        let d = default_stream(ordinal)?;
+        let l = loader_stream(ordinal)?;
+        let ev = d
+            .record_event(None)
+            .map_err(|e| SynaptixError::Cuda(format!("default→loader: событие: {e:?}")))?;
+        l.wait(&ev).map_err(|e| SynaptixError::Cuda(format!("default→loader: ожидание: {e:?}")))
+    }
+
+    /// Событие «всё, что сейчас в loader-стриме» — default дождётся его
+    /// [`LoaderDone::wait_default`] без блокировки хоста.
+    pub struct LoaderDone(cudarc::driver::CudaEvent, usize);
+
+    impl LoaderDone {
+        pub fn record(ordinal: usize) -> Result<Self> {
+            let l = loader_stream(ordinal)?;
+            l.record_event(None)
+                .map(|e| Self(e, ordinal))
+                .map_err(|e| SynaptixError::Cuda(format!("loader done: {e:?}")))
+        }
+
+        pub fn wait_default(&self) -> Result<()> {
+            default_stream(self.1)?
+                .wait(&self.0)
+                .map_err(|e| SynaptixError::Cuda(format!("loader→default: ожидание: {e:?}")))
+        }
+    }
+
     /// CUDA-событие слот-протокола (write-after-read анти-гонка ping-pong слотов
     /// весов): record на default-стриме ПОСЛЕ enqueue ядер, читающих слот; wait
     /// на loader-стриме ПЕРЕД перезаписью слота. Никогда не записанное событие
