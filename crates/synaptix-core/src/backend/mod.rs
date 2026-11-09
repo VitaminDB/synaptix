@@ -289,6 +289,21 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("quantize_sq не поддержан этим backend"))
     }
 
+    /// Кодировщик одноблобного формата семейства ggml на устройстве (пока
+    /// `GgmlType::Iq3S128`): вес `[n,k]` F16/BF16 → блоб, `imp` — важность
+    /// столбцов (длина `k`). Default — `Unsupported`.
+    fn quantize_ggml(
+        &self,
+        _w: (&Storage, &Layout),
+        _ty: crate::quant::ggml::GgmlType,
+        _imp: Option<&[f32]>,
+        _n: usize,
+        _k: usize,
+        _stream: &Stream,
+    ) -> Result<Storage> {
+        Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
+    }
+
     /// Деквант NVFP4 движка (линейный packed `[n, k/2]` + тайл-мажорные
     /// E4M3-шкалы) в `out` `[n, k]` F16/BF16 — путь перекодировки в другой
     /// формат. Default — `Unsupported`.

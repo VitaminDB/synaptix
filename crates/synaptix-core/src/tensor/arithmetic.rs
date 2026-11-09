@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::tensor::Tensor;
 use crate::tensor::ops::{
     run_binary, run_linear_quant, run_matmul, run_quantize_mxfp8,
-    run_quantize_nvfp4, run_quantize_sq, run_unary,
+    run_quantize_ggml, run_quantize_nvfp4, run_quantize_sq, run_unary,
 };
 use crate::tensor::quant::QuantWeight;
 
@@ -28,6 +28,11 @@ impl Tensor {
     pub fn quantize_to_mxfp8(&self) -> Result<QuantWeight> { run_quantize_mxfp8(self) }
     /// Квант в SQ`bits` (1..=8 бит, супер-блоки по 256): F16/BF16 `[n, k]`.
     pub fn quantize_to_sq(&self, bits: u8) -> Result<QuantWeight> { run_quantize_sq(self, bits) }
+    /// Квант в одноблобный формат ggml на устройстве (`GgmlType::Iq3S128`):
+    /// F16/BF16 `[n, k]`, `imp` — важность столбцов.
+    pub fn quantize_to_ggml(&self, ty: crate::quant::ggml::GgmlType, imp: Option<&[f32]>) -> Result<QuantWeight> {
+        run_quantize_ggml(self, ty, imp)
+    }
 
     /// Квантовать плотный вес `[N, K]` при загрузке в `quant` (NVFP4, MXFP8,
     /// `Sq{bits}`): так любая модель получает квантование на лету независимо

@@ -8,3 +8,4 @@ pub mod mxfp8_kv;
 pub mod quant;
 pub mod rope;
 pub mod sq_quant;
+pub mod iq3s128_quant;

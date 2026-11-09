@@ -905,6 +905,45 @@ impl Backend for CudaBackend {
         Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
     }
 
+    fn quantize_ggml(
+        &self,
+        w: (&Storage, &Layout),
+        ty: synaptix_core::quant::ggml::GgmlType,
+        imp: Option<&[f32]>,
+        n: usize,
+        k: usize,
+        _stream: &Stream,
+    ) -> Result<Storage> {
+        use synaptix_core::quant::ggml::GgmlType;
+        if ty != GgmlType::Iq3S128 {
+            return Err(SynaptixError::Unsupported("quantize_ggml на карте: только IQ3_S-128"));
+        }
+        let (w_st, w_lo) = w;
+        if !w_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        let (ctx, stream) = ctx_stream_of(w_st, "quantize_ggml")?;
+        let ord = w_st.as_cuda().map(|b| b.ordinal()).unwrap_or(0);
+        let kernels = match w_lo.dtype() {
+            DType::F16 => crate::elementwise::iq3s128_quant::Iq3s128QuantKernels::for_context(&ctx)?,
+            DType::BF16 => crate::elementwise::iq3s128_quant::Iq3s128QuantKernels::for_context_bf16(&ctx)?,
+            _ => return Err(SynaptixError::Unsupported("quantize_ggml: вход только F16/BF16")),
+        };
+        let mut out = stream
+            .alloc_zeros::<u8>(n * ty.bytes_for(k))
+            .map_err(|e| SynaptixError::Cuda(format!("quantize_ggml: alloc: {e:?}")))?;
+        let imp_dev = match imp {
+            Some(h) => Some(stream.clone_htod(h).map_err(|e| SynaptixError::Cuda(format!("quantize_ggml: важность: {e:?}")))?),
+            None => None,
+        };
+        let src = w_st.as_cuda().ok_or(SynaptixError::Unsupported("quantize_ggml: w non-cuda"))?.slice();
+        let off = w_lo.byte_offset();
+        let src_v = src.slice(off..off + n * k * 2);
+        let mut out_v = out.as_view_mut();
+        crate::elementwise::iq3s128_quant::iq3s128_quant(&kernels, &stream, &src_v, imp_dev.as_ref(), &mut out_v, n as u32, k as u32)?;
+        Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
+    }
+
     fn nvfp4_dequant(
         &self,
         packed: &Storage,

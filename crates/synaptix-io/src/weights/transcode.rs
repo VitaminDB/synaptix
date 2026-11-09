@@ -381,6 +381,7 @@ fn target_ok(target: DType, n: usize, k: usize) -> bool {
         DType::Q8Row => n > 0 && k > 0,
         DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0) => k % 32 == 0,
         DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K | synaptix_core::quant::ggml::GgmlType::Q5K) => k % 256 == 0,
+        DType::Ggml(synaptix_core::quant::ggml::GgmlType::Iq3S128) => k % 128 == 0,
         _ => false,
     }
 }
@@ -571,6 +572,21 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
     }
     let dense = dense_slice(loader, item, slice, device)?;
     let dense = if dense.dtype() == DType::F16 { dense } else { dense.to_dtype(DType::F16).map_err(IoError::Core)? };
+    if let DType::Ggml(ty @ synaptix_core::quant::ggml::GgmlType::Iq3S128) = item.target {
+        // Кодировщик на карте (на CPU — эталон, в разы медленнее).
+        let h = synaptix_core::quant::calib::table_get(&item.name);
+        let packed = if matches!(device, Device::Cpu) {
+            let host = dense.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
+            synaptix_core::quant::ggml::quantize_iq3_s128(&host, n, k, h.as_deref())
+        } else {
+            let q = dense.quantize_to_ggml(ty, h.as_deref()).map_err(|e| IoError::Bundle(format!("{}: IQ3_S-128: {e}", item.name)))?;
+            let cpu = q.to_device(Device::Cpu).map_err(IoError::Core)?;
+            let p = cpu.packed_arc().ok_or_else(|| IoError::Bundle(format!("{}: упакованные веса освобождены", item.name)))?;
+            p.as_cpu().ok_or_else(|| IoError::Bundle("квант не на хосте".into()))?.as_bytes().to_vec()
+        };
+        let _ = slices;
+        return Ok((packed, Vec::new()));
+    }
     let q: QuantWeight = dense
         .quantize_to(item.target)
         .map_err(|e| IoError::Bundle(format!("{}: квант в {:?}: {e}", item.name, item.target)))?;

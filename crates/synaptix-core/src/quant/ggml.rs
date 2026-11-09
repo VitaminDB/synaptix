@@ -614,10 +614,13 @@ fn iq3s_codes(ax: &[f32], w: &[f32], s: f32, idx: &mut [u16; 8]) -> f32 {
         let ww = [w[4 * gi], w[4 * gi + 1], w[4 * gi + 2], w[4 * gi + 3]];
         let (b, _) = iq3s_nearest(&a, &ww);
         idx[gi] = b as u16;
+        // Сумма по группе, затем по группам — тот же порядок, что у ядра на карте.
+        let mut ge = 0f32;
         for j in 0..4 {
             let d = ax[4 * gi + j] - s * g[b][j];
-            err += ww[j] * d * d;
+            ge += ww[j] * d * d;
         }
+        err += ge;
     }
     err
 }
