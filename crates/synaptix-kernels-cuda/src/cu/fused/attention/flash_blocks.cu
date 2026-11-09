@@ -300,7 +300,8 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
     const unsigned char* __restrict__ v_scale, const unsigned int* __restrict__ table,
     const unsigned int* __restrict__ tail_from, const unsigned int* __restrict__ tail_len,
     T* __restrict__ out,
-    int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale, int row_offset) {
+    int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale, int row_offset,
+    int splits = 1, float* __restrict__ part_ml = nullptr, float* __restrict__ part_acc = nullptr) {
   int row = blockIdx.x;
   int bi = row / NKV;
   int h_kv = row % NKV;
@@ -340,7 +341,15 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
     run_l[r] = 0.0f;
   }
 
-  for (int t = warp; t < total; t += FB_WARPS) {
+  // Split-K: блок z берёт свой отрезок позиций (частичные m/l/acc сливает
+  // fb_split_merge). При splits == 1 — весь диапазон, как прежде.
+  int t_begin = 0, t_end = total;
+  if (splits > 1) {
+    int per = (total + splits - 1) / splits;
+    t_begin = blockIdx.z * per;
+    t_end = min(total, t_begin + per);
+  }
+  for (int t = t_begin + warp; t < t_end; t += FB_WARPS) {
     int pos = fb_pos(row_table, NB, ratio, from, t);
     bool live = pos >= 0;
     if (!live) pos = 0;
@@ -403,6 +412,21 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
       l += sh_l[w * n_rep + r] * f;
     }
     int h = h_kv * total_rep + r_base + r;
+    if (splits > 1) {
+      long pi = ((long)bi * NH + h) * splits + blockIdx.z;
+      if (lane == 0) {
+        part_ml[pi * 2] = m;
+        part_ml[pi * 2 + 1] = l;
+      }
+      #pragma unroll
+      for (int i = 0; i < vec; i++) {
+        int d = lane * vec + i;
+        float a = 0.0f;
+        for (int w = 0; w < FB_WARPS; w++) a += sh_acc[((long)w * n_rep + r) * D + d] * w_scale[w];
+        part_acc[pi * D + d] = a;
+      }
+      continue;
+    }
     #pragma unroll
     for (int i = 0; i < vec; i++) {
       int d = lane * vec + i;
@@ -414,6 +438,61 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
     }
   }
 }
+
+// Слияние split-K частей: блок — (строка, голова), нить — канал d.
+template <typename T>
+__device__ __forceinline__ void fb_split_merge_impl(
+    const float* __restrict__ part_ml, const float* __restrict__ part_acc, T* __restrict__ out,
+    int rows, int D, int splits) {
+  int rh = blockIdx.x;
+  if (rh >= rows) return;
+  const float* ml = part_ml + (long)rh * splits * 2;
+  float m = FB_NEG_INF;
+  for (int s = 0; s < splits; s++) m = fmaxf(m, ml[s * 2]);
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    float l = 0.0f, a = 0.0f;
+    for (int s = 0; s < splits; s++) {
+      float ms = ml[s * 2];
+      float f = (fb_is_finite(ms) && fb_is_finite(m)) ? __expf(ms - m) : 0.0f;
+      l += ml[s * 2 + 1] * f;
+      a += part_acc[((long)rh * splits + s) * D + d] * f;
+    }
+    fb_st(out + (long)rh * D + d, (l > 0.0f) ? a / l : 0.0f);
+  }
+}
+
+extern "C" __global__ void fb_split_merge_f32(const float* ml, const float* acc, float* out, int rows, int D, int splits) {
+  fb_split_merge_impl<float>(ml, acc, out, rows, D, splits);
+}
+extern "C" __global__ void fb_split_merge_f16(const float* ml, const float* acc, __half* out, int rows, int D, int splits) {
+  fb_split_merge_impl<__half>(ml, acc, out, rows, D, splits);
+}
+extern "C" __global__ void fb_split_merge_bf16(const float* ml, const float* acc, __nv_bfloat16* out, int rows, int D, int splits) {
+  fb_split_merge_impl<__nv_bfloat16>(ml, acc, out, rows, D, splits);
+}
+
+#define FB_ENTRY_MXFP8_SPLIT(name, T, VEC, REP)                                            \
+  extern "C" __global__ void name(                                                         \
+      const T* q, const unsigned char* k, const unsigned char* v,                          \
+      const unsigned char* k_scale, const unsigned char* v_scale,                          \
+      const unsigned int* table, const unsigned int* tail_from,                            \
+      const unsigned int* tail_len,                                                        \
+      int B, int NH, int NKV, int CAP, int D, int NB, int ratio, float scale,              \
+      int row_offset, int splits, float* part_ml, float* part_acc) {                       \
+    flash_blocks_mxfp8_impl<T, VEC, REP>(q, k, v, k_scale, v_scale, table, tail_from,      \
+                                         tail_len, nullptr, B, NH, NKV, CAP, D, NB, ratio, \
+                                         scale, row_offset, splits, part_ml, part_acc);    \
+  }
+
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f32, float, 0, 0)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f16, __half, 0, 0)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_bf16, __nv_bfloat16, 0, 0)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f32_h128_r8, float, 4, 8)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f16_h128_r8, __half, 4, 8)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_bf16_h128_r8, __nv_bfloat16, 4, 8)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f32_h256_r6, float, 8, 6)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_f16_h256_r6, __half, 8, 6)
+FB_ENTRY_MXFP8_SPLIT(flash_blocks_mxfp8_split_bf16_h256_r6, __nv_bfloat16, 8, 6)
 
 #define FB_ENTRY_MXFP8(name, T, VEC, REP)                                                  \
   extern "C" __global__ void name(                                                         \

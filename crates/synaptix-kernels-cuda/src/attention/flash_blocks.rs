@@ -48,6 +48,9 @@ pub struct FlashBlocksKernels {
     q8_f32_h256_r6: CudaFunction,
     q8_f16_h256_r6: CudaFunction,
     q8_bf16_h256_r6: CudaFunction,
+    /// Split-K варианты MXFP8 (тот же порядок: f32/f16/bf16 × общий/h128_r8/h256_r6).
+    q8_split: [CudaFunction; 9],
+    merge: [CudaFunction; 3],
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<FlashBlocksKernels>)>>> = OnceLock::new();
@@ -90,6 +93,22 @@ impl FlashBlocksKernels {
             q8_f32_h256_r6: load_fn(q8, "flash_blocks_mxfp8_f32_h256_r6")?,
             q8_f16_h256_r6: load_fn(q8, "flash_blocks_mxfp8_f16_h256_r6")?,
             q8_bf16_h256_r6: load_fn(q8, "flash_blocks_mxfp8_bf16_h256_r6")?,
+            q8_split: [
+                load_fn(q8, "flash_blocks_mxfp8_split_f32")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_f16")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_bf16")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_f32_h128_r8")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_f16_h128_r8")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_bf16_h128_r8")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_f32_h256_r6")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_f16_h256_r6")?,
+                load_fn(q8, "flash_blocks_mxfp8_split_bf16_h256_r6")?,
+            ],
+            merge: [
+                load_fn(q8, "fb_split_merge_f32")?,
+                load_fn(q8, "fb_split_merge_f16")?,
+                load_fn(q8, "fb_split_merge_bf16")?,
+            ],
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -284,11 +303,6 @@ pub fn flash_blocks_mxfp8_u8(
 
     let groups = n_rep.div_ceil(rep_tile);
     let smem = (WARPS * rep_tile.min(n_rep) * (d + 2)) * 4;
-    let cfg = LaunchConfig {
-        grid_dim: (b * nkv, groups, 1),
-        block_dim: (BLOCK, 1, 1),
-        shared_mem_bytes: smem,
-    };
     let (b_i, nh_i, nkv_i, cap_i, d_i, nb_i, ratio_i, off_i) = (
         b as i32,
         nh as i32,
@@ -299,6 +313,79 @@ pub fn flash_blocks_mxfp8_u8(
         ratio as i32,
         row_offset as i32,
     );
+    // Split-K по позициям: на декоде блоков всего b·nkv·groups (у QSA
+    // Qwen4Exp — 4), и каждый варп последовательно проходил ~2k позиций —
+    // 1 мс на слой. Части сливает fb_split_merge.
+    let splits = fb_splits(b * nkv * groups, nb * ratio);
+    if splits > 1 {
+        let vi = match (d, rep_tile) {
+            (128, 8) => 1,
+            (256, 6) => 2,
+            _ => 0,
+        };
+        let ti = match dtype {
+            DType::F32 => 0,
+            DType::F16 => 1,
+            DType::BF16 => 2,
+            other => {
+                return Err(SynaptixError::Cuda(format!("flash_blocks mxfp8: dtype {other:?} не поддержан")))
+            }
+        };
+        let rows = (b * nh) as usize;
+        let mut part_ml = unsafe { synaptix_core::device::cuda::alloc_act_uninit::<f32>(stream, rows * splits as usize * 2) }
+            .map_err(|e| SynaptixError::Cuda(format!("flash_blocks split: буфер: {e:?}")))?;
+        let mut part_acc = unsafe { synaptix_core::device::cuda::alloc_act_uninit::<f32>(stream, rows * splits as usize * d as usize) }
+            .map_err(|e| SynaptixError::Cuda(format!("flash_blocks split: буфер: {e:?}")))?;
+        let splits_i = splits as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (b * nkv, groups, splits),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        let mut bld = stream.launch_builder(&kernels.q8_split[vi * 3 + ti]);
+        bld.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(k_scale)
+            .arg(v_scale)
+            .arg(table)
+            .arg(tail_from)
+            .arg(tail_len)
+            .arg(&b_i)
+            .arg(&nh_i)
+            .arg(&nkv_i)
+            .arg(&cap_i)
+            .arg(&d_i)
+            .arg(&nb_i)
+            .arg(&ratio_i)
+            .arg(&scale)
+            .arg(&off_i)
+            .arg(&splits_i)
+            .arg(&mut part_ml)
+            .arg(&mut part_acc);
+        unsafe {
+            bld.launch(cfg)
+                .map_err(|e| SynaptixError::Cuda(format!("launch flash_blocks mxfp8 split: {e:?}")))?;
+        }
+        let rows_i = rows as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (d.min(256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bld = stream.launch_builder(&kernels.merge[ti]);
+        bld.arg(&part_ml).arg(&part_acc).arg(out).arg(&rows_i).arg(&d_i).arg(&splits_i);
+        unsafe {
+            bld.launch(cfg)
+                .map_err(|e| SynaptixError::Cuda(format!("launch fb_split_merge: {e:?}")))?;
+        }
+        return Ok(());
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (b * nkv, groups, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: smem,
+    };
     let mut bld = stream.launch_builder(func);
     bld.arg(q)
         .arg(k)
@@ -326,4 +413,19 @@ pub fn flash_blocks_mxfp8_u8(
         })?;
     }
     Ok(())
+}
+
+/// Сколько частей split-K: целимся в ~128 блоков, не меньше 64 позиций на
+/// часть. `SYN_FB_SPLITS` — принудительно (1 — без split-K).
+fn fb_splits(base_blocks: u32, positions: u32) -> u32 {
+    static FORCED: OnceLock<Option<u32>> = OnceLock::new();
+    if let Some(v) = *FORCED.get_or_init(|| std::env::var("SYN_FB_SPLITS").ok().and_then(|v| v.trim().parse().ok())) {
+        return v.clamp(1, 64);
+    }
+    if base_blocks >= 64 {
+        return 1;
+    }
+    let by_occ = (128 / base_blocks.max(1)).max(1);
+    let by_len = (positions / 64).max(1);
+    by_occ.min(by_len).clamp(1, 64)
 }
