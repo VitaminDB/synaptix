@@ -207,3 +207,45 @@ extern "C" __global__ void name( \
 ARGMAX_KERNEL(argmax_f32, float, pass_f32)
 ARGMAX_KERNEL(argmax_f16, __half, pass_f16)
 ARGMAX_KERNEL(argmax_bf16, __nv_bfloat16, pass_bf16)
+
+// argmax по строкам при свёртке последних contiguous-осей: блок на строку,
+// нити шагают по строке, затем сведение шаффлами и через shared. Ничья —
+// меньший индекс (как у построчного ядра выше: строгое `>` идёт по
+// возрастанию индекса). Общее ядро считало одну строку одной нитью —
+// 248k логитов словаря за 54 мс.
+#define ARGMAX_ROWS(name, T, to_f32) \
+extern "C" __global__ void name( \
+    const T* __restrict__ in, unsigned int* __restrict__ out, long long inner, long long in_offset \
+) { \
+    const T* row = in + in_offset + (long long)blockIdx.x * inner; \
+    float best = -3.4028235e38f; \
+    unsigned int bi = 0xffffffffu; \
+    for (long long i = threadIdx.x; i < inner; i += blockDim.x) { \
+        float v = to_f32(row[i]); \
+        if (v > best || bi == 0xffffffffu) { best = v; bi = (unsigned int)i; } \
+    } \
+    for (int o = 16; o > 0; o >>= 1) { \
+        float ov = __shfl_xor_sync(0xffffffffu, best, o); \
+        unsigned int oi = __shfl_xor_sync(0xffffffffu, bi, o); \
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; } \
+    } \
+    __shared__ float sv[32]; \
+    __shared__ unsigned int si[32]; \
+    unsigned int lane = threadIdx.x & 31u, wid = threadIdx.x >> 5, nw = (blockDim.x + 31u) >> 5; \
+    if (lane == 0) { sv[wid] = best; si[wid] = bi; } \
+    __syncthreads(); \
+    if (wid == 0) { \
+        best = lane < nw ? sv[lane] : -3.4028235e38f; \
+        bi = lane < nw ? si[lane] : 0xffffffffu; \
+        for (int o = 16; o > 0; o >>= 1) { \
+            float ov = __shfl_xor_sync(0xffffffffu, best, o); \
+            unsigned int oi = __shfl_xor_sync(0xffffffffu, bi, o); \
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; } \
+        } \
+        if (lane == 0) out[blockIdx.x] = bi == 0xffffffffu ? 0u : bi; \
+    } \
+}
+
+ARGMAX_ROWS(argmax_rows_f32, float, pass_f32)
+ARGMAX_ROWS(argmax_rows_f16, __half, pass_f16)
+ARGMAX_ROWS(argmax_rows_bf16, __nv_bfloat16, pass_bf16)

@@ -184,6 +184,7 @@ impl MtpHead {
         rope: &RopeCache,
     ) -> Result<Tensor, ModelError> {
         let t = hidden.dims()[0];
+        let _t0 = crate::norm::stage("mtp:enter", || ());
         let normed = group_rms(hidden, &self.norm_hidden, self.hidden, self.eps)?;
         let branches = coerr(coerr(normed.contiguous())?.reshape(vec![t * self.hc_count, self.hidden]))?;
         let projected = self.fc_hidden.forward(&branches)?;
@@ -197,8 +198,8 @@ impl MtpHead {
             .reshape(vec![t, self.hc_count * self.hidden]))?;
 
         let past = cache.seq_len;
-        let mixed = self.attn_hc.forward(&stream)?;
-        let (out, _) = self
+        let mixed = crate::norm::stage("mtp:fc+hc", || self.attn_hc.forward(&stream))?;
+        let (out, _) = crate::norm::stage("mtp:attn", || self
             .attn
             .forward(
                 &mixed.mixed,
@@ -208,7 +209,7 @@ impl MtpHead {
                 t,
                 rope,
                 synaptix_llm_common::model::RopePositions::Sequential,
-            )?;
+            ))?;
         stream = self.attn_hc.inject(
             &mixed.hyper,
             &out,
@@ -219,7 +220,7 @@ impl MtpHead {
         )?;
 
         let mixed = self.mlp_hc.forward(&stream)?;
-        let out = self.moe.forward(&mixed.mixed)?;
+        let out = crate::norm::stage("mtp:moe", || self.moe.forward(&mixed.mixed))?;
         stream = self.mlp_hc.inject(
             &mixed.hyper,
             &out,

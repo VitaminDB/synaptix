@@ -37,17 +37,24 @@ pub struct GdnSnap {
 
 impl GdnSnap {
     pub fn take(state: &GatedDeltaNetState) -> Result<Self, ModelError> {
+        // Состояние на карте — истина там, хостовая копия устарела: не
+        // копируем её (3 МБ на слой, ~110 МБ memcpy на спекулятивный шаг).
+        let host = |dev: &Option<Tensor>, v: &Vec<f32>| if dev.is_some() { Vec::new() } else { v.clone() };
         Ok(Self {
             conv_dev: clone_dev(state.conv_state_dev.as_ref())?,
             ssm_dev: clone_dev(state.ssm_state_dev.as_ref())?,
-            conv_host: state.conv_state.clone(),
-            ssm_host: state.ssm_state.clone(),
+            conv_host: host(&state.conv_state_dev, &state.conv_state),
+            ssm_host: host(&state.ssm_state_dev, &state.ssm_state),
         })
     }
 
     pub fn restore(&self, state: &mut GatedDeltaNetState) -> Result<(), ModelError> {
-        state.conv_state.clone_from(&self.conv_host);
-        state.ssm_state.clone_from(&self.ssm_host);
+        if self.conv_dev.is_none() {
+            state.conv_state.clone_from(&self.conv_host);
+        }
+        if self.ssm_dev.is_none() {
+            state.ssm_state.clone_from(&self.ssm_host);
+        }
         put_dev(&mut state.conv_state_dev, self.conv_dev.as_ref())?;
         put_dev(&mut state.ssm_state_dev, self.ssm_dev.as_ref())?;
         Ok(())
@@ -58,6 +65,17 @@ impl GdnSnap {
     /// освобождённые байты. См. `ModelCache::park_to_host`.
     pub fn park_to_host(&mut self) -> usize {
         let bytes = dev_bytes(self.conv_dev.as_ref()) + dev_bytes(self.ssm_dev.as_ref());
+        // `take` не копирует устаревший хост при живом device-состоянии —
+        // перед сбросом device-половины истину надо скачать.
+        let down = |t: &Option<Tensor>, v: &mut Vec<f32>| {
+            if let (Some(t), true) = (t, v.is_empty()) {
+                if let Ok(h) = t.to_dtype(DType::F32).and_then(|x| x.to_device(Device::Cpu)).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()) {
+                    *v = h;
+                }
+            }
+        };
+        down(&self.conv_dev, &mut self.conv_host);
+        down(&self.ssm_dev, &mut self.ssm_host);
         self.conv_dev = None;
         self.ssm_dev = None;
         bytes
@@ -240,6 +258,18 @@ impl LinearAttn {
         s: usize,
         split: usize,
     ) -> Result<(Tensor, GdnSnap), ModelError> {
+        // Пара «токен + драфт» на декоде: два слитых шага вместо чанкового
+        // скана (тот на двух токенах стоил ~1,4 мс на слой против ~0,05).
+        if s == 2 && split == 1 && split_fused_on() {
+            let r0 = coerr(coerr(h.narrow(0, 0, 1))?.contiguous())?;
+            if let Some(first) = self.decode_step(&r0, state) {
+                let first = first?;
+                let snap = GdnSnap::take(state)?;
+                let r1 = coerr(coerr(h.narrow(0, 1, 1))?.contiguous())?;
+                let second = self.decode_step(&r1, state).expect("путь применим — проверен первым шагом")?;
+                return Ok((coerr(Tensor::cat(&[&first, &second], 0))?, snap));
+            }
+        }
         let head = coerr(coerr(h.narrow(0, 0, split))?.contiguous())?;
         let tail = coerr(coerr(h.narrow(0, split, s - split))?.contiguous())?;
         let first = match self.core_on_device(&head, state, split) {
@@ -525,4 +555,10 @@ fn host_vec(t: &Tensor) -> Result<Vec<f32>, ModelError> {
         .and_then(|x| x.flatten_all())
         .and_then(|x| x.to_vec1::<f32>())
         .map_err(|e| ModelError::Forward(e.to_string()))
+}
+
+/// Пара спекулятивного шага двумя слитыми шагами GDN (`SYN_QWEN4EXP_SPLIT_FUSED=0` — прежний скан).
+fn split_fused_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_SPLIT_FUSED").as_deref() != Ok("0"))
 }

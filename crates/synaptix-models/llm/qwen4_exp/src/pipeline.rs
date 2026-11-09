@@ -522,15 +522,15 @@ impl Qwen4ExpPipeline {
         let hidden = spec
             .head
             .forward(&spec.stream, &embeds, &mut spec.cache, self.model.rope())?;
-        let logits = self.model.lm_head_forward(&last_row(&hidden)?)?;
-        let best = logits
+        let logits = crate::norm::stage("mtp:lm_head", || self.model.lm_head_forward(&last_row(&hidden)?))?;
+        let best = crate::norm::stage("mtp:argmax", || logits
             .flatten_all()
             .and_then(|t| t.argmax(0))
             .and_then(|t| t.to_device(Device::Cpu))
             .and_then(|t| t.to_dtype(DType::U32))
             .and_then(|t| t.flatten_all())
             .and_then(|t| t.to_vec1::<u32>())
-            .map_err(|e| ModelError::Forward(format!("драфт: {e}")))?;
+            .map_err(|e| ModelError::Forward(format!("драфт: {e}"))))?;
         best.first()
             .copied()
             .ok_or_else(|| ModelError::Forward("драфт: пустой argmax".into()))
@@ -953,7 +953,7 @@ impl Qwen4ExpPipeline {
                     if spec.tokens.len() < spec.stream.dims()[0] {
                         spec.tokens.push(token);
                     }
-                    Some(no_grad(|| self.draft(spec))?)
+                    Some(crate::norm::stage("spec:draft", || no_grad(|| self.draft(spec)))?)
                 }
                 None => None,
             };
@@ -966,13 +966,16 @@ impl Qwen4ExpPipeline {
 
             drafted += 1;
             runs += 1;
-            let (hidden, stream, snap) =
-                no_grad(|| self.model.forward_pair(&[token, draft], cache, decode_pos))?;
-            let first = no_grad(|| self.model.lm_head_forward(&row(&hidden, 0)?))?;
-            let next = sampler.sample(&first)?;
+            let (hidden, stream, snap) = crate::norm::stage("spec:pair", || {
+                no_grad(|| self.model.forward_pair(&[token, draft], cache, decode_pos))
+            })?;
+            let next = crate::norm::stage("spec:head1", || -> Result<u32, PipelineError> {
+                let first = no_grad(|| self.model.lm_head_forward(&row(&hidden, 0)?))?;
+                Ok(sampler.sample(&first)?)
+            })?;
             let spec = spec.as_mut().expect("драфт без спекуляции");
             if next != draft {
-                cache.restore(&snap).map_err(PipelineError::from)?;
+                crate::norm::stage("spec:restore", || cache.restore(&snap)).map_err(PipelineError::from)?;
                 spec.stream = row(&stream, 0)?;
                 spec.tokens = vec![next];
                 token = next;
@@ -984,8 +987,10 @@ impl Qwen4ExpPipeline {
             if !sink.on_token(next) || eos.contains(&next) || out.len() >= cfg.max_new_tokens {
                 break;
             }
-            let second = no_grad(|| self.model.lm_head_forward(&row(&hidden, 1)?))?;
-            token = sampler.sample(&second)?;
+            token = crate::norm::stage("spec:head2", || -> Result<u32, PipelineError> {
+                let second = no_grad(|| self.model.lm_head_forward(&row(&hidden, 1)?))?;
+                Ok(sampler.sample(&second)?)
+            })?;
             spec.stream = stream;
             spec.tokens = vec![next, token];
         }

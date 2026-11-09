@@ -43,6 +43,7 @@ pub struct ReduceKernels {
     argmax_f32: CudaFunction,
     argmax_f16: CudaFunction,
     argmax_bf16: CudaFunction,
+    argmax_rows: [CudaFunction; 3],
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<ReduceKernels>)>>> = OnceLock::new();
@@ -71,6 +72,11 @@ impl ReduceKernels {
             argmax_f32: load_fn(&module, "argmax_f32")?,
             argmax_f16: load_fn(&module, "argmax_f16")?,
             argmax_bf16: load_fn(&module, "argmax_bf16")?,
+            argmax_rows: [
+                load_fn(&module, "argmax_rows_f32")?,
+                load_fn(&module, "argmax_rows_f16")?,
+                load_fn(&module, "argmax_rows_bf16")?,
+            ],
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -257,6 +263,30 @@ pub fn run_reduce(
                         _ => unreachable!(),
                     }
                 }
+                return Ok(());
+            }
+        }
+    }
+
+    if is_argmax && rows_path_enabled() {
+        if let Some((rows, inner)) = trailing_contiguous_reduce(src_lo, dims_reduced) {
+            let fi = match dtype {
+                DType::F32 => Some(0),
+                DType::F16 => Some(1),
+                DType::BF16 => Some(2),
+                _ => None,
+            };
+            if let Some(fi) = fi {
+                let rcfg = rows_launch_cfg(rows, inner);
+                let off = src_lo.offset() as i64;
+                let src = src_buf.slice();
+                let mut dst_v = dst_buf.slice_mut().as_view_mut();
+                let mut dst_t = unsafe { dst_v.transmute_mut::<u32>(dst_v.len() / 4) }
+                    .ok_or_else(|| SynaptixError::Cuda("argmax_rows: transmute dst".into()))?;
+                let mut b = stream.launch_builder(&kernels.argmax_rows[fi]);
+                // Смещение — в элементах: ядро получает сырой буфер как T*.
+                b.arg(src).arg(&mut dst_t).arg(&inner).arg(&off);
+                unsafe { b.launch(rcfg) }.map_err(|e| SynaptixError::Cuda(format!("launch argmax_rows: {e:?}")))?;
                 return Ok(());
             }
         }
