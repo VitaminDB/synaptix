@@ -251,6 +251,26 @@ pub fn nvfp4_linear_f16(
     if m == 0 || n == 0 {
         return Ok(pick_nvfp4(m.max(1), n, k));
     }
+    // Горстка строк (спекулятивная пара MTP): GEMV по строкам — GEMM n8-тайлом
+    // на M=2 шёл 50 мкс против 5–13 у GEMV. Строка — копией во временный
+    // буфер (вход/выход по паре килобайт).
+    if prequant.is_none() && m > 1 && m <= small_m_rows() {
+        let es = 2usize;
+        let (kk, nn) = (k as usize, n as usize);
+        let mut plan = None;
+        for r in 0..m as usize {
+            let mut xr = unsafe { stream.alloc::<u8>(kk * es) }.map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: строка x: {e:?}")))?;
+            stream
+                .memcpy_dtod(&x_u8.slice(r * kk * es..(r + 1) * kk * es), &mut xr)
+                .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: копия строки: {e:?}")))?;
+            let mut yr = unsafe { stream.alloc::<u8>(nn * es) }.map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: строка y: {e:?}")))?;
+            plan = Some(nvfp4_linear_f16(gemm_k, gemv_k, quant_k, ctx, stream, ordinal, &xr, &mut yr, w, 1, out_bf16, None)?);
+            stream
+                .memcpy_dtod(&yr, &mut out_u8.slice_mut(r * nn * es..(r + 1) * nn * es))
+                .map_err(|e| SynaptixError::Cuda(format!("nvfp4_linear: копия выхода: {e:?}")))?;
+        }
+        return Ok(plan.expect("m > 1"));
+    }
 
     // M-ПАДДИНГ (prefill, m>1): GEMM-ядра требуют выровненного M; невыровненный
     // large-M падает в медленный Broadcast (8-9× медленнее — был корень «prefill 50×»).
@@ -1056,4 +1076,11 @@ pub fn quant_linear_generic(
 fn blockq_gemv_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("SYN_BLOCKQ_GEMV").map(|v| v != "0").unwrap_or(true))
+}
+
+/// До скольких строк NVFP4-линейный слой считается GEMV по строкам
+/// (`SYN_LINEAR_GEMV_ROWS`, как у плотных).
+fn small_m_rows() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SYN_LINEAR_GEMV_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
 }

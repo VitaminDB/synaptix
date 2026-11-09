@@ -260,15 +260,8 @@ impl LinearAttn {
     ) -> Result<(Tensor, GdnSnap), ModelError> {
         // Пара «токен + драфт» на декоде: два слитых шага вместо чанкового
         // скана (тот на двух токенах стоил ~1,4 мс на слой против ~0,05).
-        if s == 2 && split == 1 && split_fused_on() {
-            let r0 = coerr(coerr(h.narrow(0, 0, 1))?.contiguous())?;
-            if let Some(first) = self.decode_step(&r0, state) {
-                let first = first?;
-                let snap = GdnSnap::take(state)?;
-                let r1 = coerr(coerr(h.narrow(0, 1, 1))?.contiguous())?;
-                let second = self.decode_step(&r1, state).expect("путь применим — проверен первым шагом")?;
-                return Ok((coerr(Tensor::cat(&[&first, &second], 0))?, snap));
-            }
+        if s == 2 && split == 1 && split_fused_on() && self.decode_step_ok() {
+            return self.decode_pair(h, state);
         }
         let head = coerr(coerr(h.narrow(0, 0, split))?.contiguous())?;
         let tail = coerr(coerr(h.narrow(0, split, s - split))?.contiguous())?;
@@ -307,19 +300,52 @@ impl LinearAttn {
         Some(self.decode_step_inner(h, state))
     }
 
+    fn decode_step_ok(&self) -> bool {
+        crate::norm::fused_on()
+            && matches!(self.device, Device::Cuda(_))
+            && self.compute == DType::F16
+            && self.conv_w_dev.is_some()
+            && self.dk == self.dv
+    }
+
+    /// Пара «токен + драфт»: проекции — одним GEMV на обе строки (вес читается
+    /// раз), рекурсия — два слитых шага подряд со снимком состояния между ними.
+    fn decode_pair(&self, h: &Tensor, state: &mut GatedDeltaNetState) -> Result<(Tensor, GdnSnap), ModelError> {
+        let (qkv, a, b, z) = stage("la:proj", || self.project(h))?;
+        let row = |t: &Tensor, r: usize| -> Result<Tensor, ModelError> { coerr(coerr(t.narrow(0, r, 1))?.contiguous()) };
+        let c0 = self.core_step(&row(&qkv, 0)?, &row(&a, 0)?, &row(&b, 0)?, &row(&z, 0)?, state)?;
+        let snap = GdnSnap::take(state)?;
+        let c1 = self.core_step(&row(&qkv, 1)?, &row(&a, 1)?, &row(&b, 1)?, &row(&z, 1)?, state)?;
+        let normed = coerr(Tensor::cat(&[&coerr(c0.reshape(vec![1, self.value_dim]))?, &coerr(c1.reshape(vec![1, self.value_dim]))?], 0))?;
+        let out = stage("la:finish", || self.out_proj.forward(&normed))?;
+        Ok((out, snap))
+    }
+
+    fn project(&self, h: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor), ModelError> {
+        let qkv = self.in_proj_qkv.forward(h)?;
+        let a = coerr(self.in_proj_a.forward(h)?.to_dtype(DType::F16))?;
+        let b = coerr(self.in_proj_b.forward(h)?.to_dtype(DType::F16))?;
+        let z = coerr(self.in_proj_z.forward(h)?.to_dtype(DType::F16))?;
+        Ok((qkv, a, b, z))
+    }
+
     fn decode_step_inner(
         &self,
         h: &Tensor,
         state: &mut GatedDeltaNetState,
     ) -> Result<Tensor, ModelError> {
+        let (qkv, a, b, z) = stage("la:proj", || self.project(h))?;
+        let core = self.core_step(&qkv, &a, &b, &z, state)?;
+        stage("la:finish", || {
+            let normed = coerr(core.reshape(vec![1, self.value_dim]))?;
+            self.out_proj.forward(&normed)
+        })
+    }
+
+    /// Свёртка + gated delta rule + RmsNorm·gate для одной строки проекций.
+    fn core_step(&self, qkv: &Tensor, a: &Tensor, b: &Tensor, z: &Tensor, state: &mut GatedDeltaNetState) -> Result<Tensor, ModelError> {
         let (dk, dv, h_v) = (self.dk, self.dv, self.num_v_heads);
-        let (qkv, a, b, z) = stage("la:proj", || -> Result<_, ModelError> {
-            let qkv = self.in_proj_qkv.forward(h)?;
-            let a = coerr(self.in_proj_a.forward(h)?.to_dtype(DType::F16))?;
-            let b = coerr(self.in_proj_b.forward(h)?.to_dtype(DType::F16))?;
-            let z = coerr(self.in_proj_z.forward(h)?.to_dtype(DType::F16))?;
-            Ok((qkv, a, b, z))
-        })?;
+        let (a, b, z) = (a.clone(), b.clone(), z.clone());
         let conv_w = self.conv_w_dev.as_ref().unwrap();
         let a_log = self.a_log_dev.as_ref().unwrap();
         let dt_bias = self.dt_bias_dev.as_ref().unwrap();
@@ -363,10 +389,7 @@ impl LinearAttn {
                 self.gate_sigmoid,
             ))
         })?;
-        stage("la:finish", || {
-            let normed = coerr(out.reshape(vec![1, self.value_dim]))?;
-            self.out_proj.forward(&normed)
-        })
+        Ok(out)
     }
 
     fn finish(&self, h: &Tensor, core: &Tensor, s: usize) -> Result<Tensor, ModelError> {

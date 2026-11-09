@@ -1058,22 +1058,28 @@ impl Backend for CudaBackend {
         let ord = x_buf.ordinal();
         let stream = synaptix_core::device::cuda::default_stream(ord)?;
 
-        if m == 1 {
-            // Decode (M=1) → warp-reduction GEMV (учитывает byte-offset x).
+        // Декод (M=1) и горстка строк (спекулятивная пара MTP и т. п., M ≤ 4) →
+        // GEMV по строкам: GEMM на M=2 шёл одним блоком (gemm_f32_nn роутера
+        // 116 мкс против 10 у GEMV). `SYN_LINEAR_GEMV_ROWS` — порог M.
+        if m == 1 || (m <= small_m_gemv_rows() && n >= 16) {
             let kernels = crate::best_cu::gemv::mma_gemv::MmaGemvKernels::for_context(&ctx)?;
-            return crate::best_cu::gemv::mma_gemv::gemv_linear_u8(
-                &kernels,
-                &stream,
-                w_buf.slice(),
-                w_lo.byte_offset(),
-                x_buf.slice(),
-                x_lo.byte_offset(),
-                out_buf.slice_mut(),
-                0,
-                n as u32,
-                k as u32,
-                dtype,
-            );
+            let es = dtype.bytes_for_numel(1);
+            for r in 0..m {
+                crate::best_cu::gemv::mma_gemv::gemv_linear_u8(
+                    &kernels,
+                    &stream,
+                    w_buf.slice(),
+                    w_lo.byte_offset(),
+                    x_buf.slice(),
+                    x_lo.byte_offset() + r * k * es,
+                    out_buf.slice_mut(),
+                    r * n * es,
+                    n as u32,
+                    k as u32,
+                    dtype,
+                )?;
+            }
+            return Ok(());
         }
 
         // Prefill (M>1) → CUTLASS Linear GEMM (ColumnMajor-B, без транспонирования
@@ -7394,4 +7400,10 @@ impl Backend for CudaBackend {
 /// bf16, head_dim 128, без маски и GQA, обе последовательности ≥ 256.
 fn fp8_attention_applies(dtype: DType, d: usize, causal: bool, h: usize, hkv: usize, s_q: usize, s_kv: usize) -> bool {
     synaptix_core::precision::attention_fp8() && matches!(dtype, DType::BF16 | DType::F16) && d == 128 && !causal && h == hkv && s_q >= 256 && s_kv >= 256
+}
+
+/// До скольких строк линейный слой считается GEMV по строкам.
+fn small_m_gemv_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SYN_LINEAR_GEMV_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
 }
