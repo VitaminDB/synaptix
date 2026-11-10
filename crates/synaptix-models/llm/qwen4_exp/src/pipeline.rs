@@ -1384,7 +1384,29 @@ impl Qwen4ExpPipeline {
     fn zc_release_for_prefill(&self, new_tokens: usize) {
         let Some(pool) = &self.zc_pool else { return };
         let limit = std::env::var("SYN_QWEN4EXP_ZC_RELEASE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024usize);
-        if new_tokens <= limit || pool.slots_per_layer() == 0 {
+        if pool.slots_per_layer() == 0 {
+            return;
+        }
+        // Короткий префилл слоты не трогает, пока под его активации есть место. Слоты занимают всю свободную
+        // VRAM, кроме запаса на декод; если запас между ходами съела соседняя модель службы (TTS, ASR),
+        // слоты отдаются и на коротком префилле — иначе ход падает по OOM.
+        let tight = new_tokens > DECODE_TOKENS
+            && match self.model.device {
+                Device::Cuda(ord) => {
+                    let free = synaptix_core::device::cuda::mem_info(ord).map(|m| m.0).unwrap_or(usize::MAX);
+                    let held = self.model.expert_cache().map(|c| c.used_bytes()).unwrap_or(0);
+                    let tight = free.saturating_add(held) < (1usize << 30);
+                    if tight {
+                        eprintln!(
+                            "[qwen4_exp] zero-copy: свободно {:.1} ГБ — слоты отданы под префилл {new_tokens} токенов",
+                            (free + held) as f64 / (1u64 << 30) as f64
+                        );
+                    }
+                    tight
+                }
+                _ => false,
+            };
+        if new_tokens <= limit && !tight {
             return;
         }
         self.model.zc_release();
@@ -1475,7 +1497,12 @@ impl Qwen4ExpPipeline {
         }
         // Запас — только на декод: перед длинным префиллом слоты отдаются
         // (`zc_release_for_prefill`) и собираются заново после него.
-        let reserve = decode_reserve(&self.config) + (768usize << 20);
+        // Плюс место соседям по карте: слоты забирали всю свободную VRAM, и любая малая модель службы,
+        // пришедшая между ходами или во время хода (озвучка, распознавание речи — 0,3–1,7 ГБ), либо
+        // вытесняла эту модель целиком (перезагрузка на каждом сообщении), либо роняла ход по OOM.
+        // `SYN_QWEN4EXP_ZC_HEADROOM_MB` (2048; 0 — всё под слоты).
+        let headroom = std::env::var("SYN_QWEN4EXP_ZC_HEADROOM_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20;
+        let reserve = decode_reserve(&self.config) + (768usize << 20) + headroom;
         let layers = self.config.num_hidden_layers + self.mtp.is_some() as usize;
         // Байт на слот: gate_up + down одного эксперта IQ3_S-128 (точно — в слое;
         // здесь по формам и 3,5 бит на вес).
