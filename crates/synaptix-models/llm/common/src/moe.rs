@@ -1836,8 +1836,20 @@ impl MoeFfn {
 
     /// Освободить слоты слоя (перед длинным префиллом); частоты остаются
     /// затравкой следующей сборки.
+    /// Слой zero-copy собран (слоты и таблицы на карте): шаг декода идёт без
+    /// хостовых веток.
+    pub fn zc_built(&self) -> bool {
+        self.zc.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Флаги отладки и упреждения, при которых шаг декода ходит на хост.
+    pub fn zc_host_flags() -> bool {
+        zc_check() || zc_prefetch_cfg().0 > 0 || std::env::var("SYN_ZC_SYNC").as_deref() == Ok("1")
+    }
+
     pub fn zc_release(&self) {
         let Ok(mut g) = self.zc.lock() else { return };
+        crate::moe_zc::ZC_GENERATION.fetch_add(1, Ordering::Relaxed);
         if let Some(l) = g.take() {
             if let Ok(mut seed) = self.zc_seed.lock() {
                 *seed = l.counts().to_vec();
@@ -1952,7 +1964,10 @@ impl MoeFfn {
                 seed.as_deref(),
             )?;
             match built {
-                Some(l) => *guard = Some(l),
+                Some(l) => {
+                    *guard = Some(l);
+                    crate::moe_zc::ZC_GENERATION.fetch_add(1, Ordering::Relaxed);
+                }
                 None => return Ok(None),
             }
         }
@@ -1990,8 +2005,21 @@ impl MoeFfn {
         let x_rows = if t == 1 {
             xa
         } else {
-            let rows: Vec<u32> = (0..t * k).map(|p| (p / k) as u32).collect();
-            let rows = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
+            // Индексы строк пар — постоянный тензор: загрузка с хоста на каждом
+            // шаге не ложится в CUDA-граф (и стоила лишний H2D).
+            static ROWS: std::sync::OnceLock<Mutex<std::collections::HashMap<(Device, usize, usize), Tensor>>> = std::sync::OnceLock::new();
+            let rows = {
+                let mut g = ROWS.get_or_init(|| Mutex::new(Default::default())).lock().map_err(|_| ModelError::Forward("zero-copy: строки пар отравлены".into()))?;
+                match g.get(&(self.device, t, k)) {
+                    Some(r) => r.clone(),
+                    None => {
+                        let rows: Vec<u32> = (0..t * k).map(|p| (p / k) as u32).collect();
+                        let r = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
+                        g.insert((self.device, t, k), r.clone());
+                        r
+                    }
+                }
+            };
             take_rows(&xa, &rows)?
         };
         let gu = gu_t.gemv_indexed_dense(&iota, &x_rows, t > 1).map_err(ferr)?;

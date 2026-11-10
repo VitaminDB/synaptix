@@ -48,6 +48,22 @@ impl GdnSnap {
         })
     }
 
+    /// Снимок в постоянные буферы `bufs` (conv, ssm): копии по фиксированным
+    /// адресам вместо свежих тензоров — ложится в CUDA-граф шага декода.
+    pub fn take_into(state: &GatedDeltaNetState, bufs: &(Tensor, Tensor)) -> Result<Self, ModelError> {
+        let (Some(c), Some(s)) = (state.conv_state_dev.as_ref(), state.ssm_state_dev.as_ref()) else {
+            return Self::take(state);
+        };
+        crate::seg_graph::copy_into_fixed(&bufs.0, c)?;
+        crate::seg_graph::copy_into_fixed(&bufs.1, s)?;
+        Ok(Self::from_bufs(bufs))
+    }
+
+    /// Снимок, уже лежащий в постоянных буферах (их заполнил граф).
+    pub fn from_bufs(bufs: &(Tensor, Tensor)) -> Self {
+        Self { conv_dev: Some(bufs.0.clone()), ssm_dev: Some(bufs.1.clone()), conv_host: Vec::new(), ssm_host: Vec::new() }
+    }
+
     pub fn restore(&self, state: &mut GatedDeltaNetState) -> Result<(), ModelError> {
         if self.conv_dev.is_none() {
             state.conv_state.clone_from(&self.conv_host);
@@ -257,11 +273,12 @@ impl LinearAttn {
         state: &mut GatedDeltaNetState,
         s: usize,
         split: usize,
+        pair_buf: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, GdnSnap), ModelError> {
         // Пара «токен + драфт» на декоде: два слитых шага вместо чанкового
         // скана (тот на двух токенах стоил ~1,4 мс на слой против ~0,05).
         if s == 2 && split == 1 && split_fused_on() && self.decode_step_ok() {
-            return self.decode_pair(h, state);
+            return self.decode_pair(h, state, pair_buf);
         }
         let head = coerr(coerr(h.narrow(0, 0, split))?.contiguous())?;
         let tail = coerr(coerr(h.narrow(0, split, s - split))?.contiguous())?;
@@ -310,11 +327,20 @@ impl LinearAttn {
 
     /// Пара «токен + драфт»: проекции — одним GEMV на обе строки (вес читается
     /// раз), рекурсия — два слитых шага подряд со снимком состояния между ними.
-    fn decode_pair(&self, h: &Tensor, state: &mut GatedDeltaNetState) -> Result<(Tensor, GdnSnap), ModelError> {
+    /// Шаг декода этого слоя идёт слитым device-путём без хостовых веток:
+    /// состояние уже на карте (годится под CUDA-граф, см. `seg_graph`).
+    pub fn decode_ready(&self, state: &GatedDeltaNetState) -> bool {
+        self.decode_step_ok() && split_fused_on() && state.conv_state_dev.is_some() && state.ssm_state_dev.is_some()
+    }
+
+    fn decode_pair(&self, h: &Tensor, state: &mut GatedDeltaNetState, pair_buf: Option<&(Tensor, Tensor)>) -> Result<(Tensor, GdnSnap), ModelError> {
         let (qkv, a, b, z) = stage("la:proj", || self.project(h))?;
         let row = |t: &Tensor, r: usize| -> Result<Tensor, ModelError> { coerr(coerr(t.narrow(0, r, 1))?.contiguous()) };
         let c0 = self.core_step(&row(&qkv, 0)?, &row(&a, 0)?, &row(&b, 0)?, &row(&z, 0)?, state)?;
-        let snap = GdnSnap::take(state)?;
+        let snap = match pair_buf {
+            Some(b) => GdnSnap::take_into(state, b)?,
+            None => GdnSnap::take(state)?,
+        };
         let c1 = self.core_step(&row(&qkv, 1)?, &row(&a, 1)?, &row(&b, 1)?, &row(&z, 1)?, state)?;
         let normed = coerr(Tensor::cat(&[&coerr(c0.reshape(vec![1, self.value_dim]))?, &coerr(c1.reshape(vec![1, self.value_dim]))?], 0))?;
         let out = stage("la:finish", || self.out_proj.forward(&normed))?;

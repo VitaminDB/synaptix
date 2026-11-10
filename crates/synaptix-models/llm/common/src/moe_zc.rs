@@ -35,6 +35,11 @@ fn addr(t: &Tensor) -> Result<u64, ModelError> {
 }
 
 /// Общее для слоёв: размер пула слотов и тождественные индексы.
+/// Поколение слотов zero-copy: растёт при каждой сборке и роспуске слоя.
+/// Захваченные CUDA-графы шага декода помнят адреса таблиц слоя и годятся,
+/// пока поколение то же.
+pub static ZC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct ZcPool {
     pub device: Device,
     /// Слотов на слой; 0 — размер ещё не назначен (слои не собираются).

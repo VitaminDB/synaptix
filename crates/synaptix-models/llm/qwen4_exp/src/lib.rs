@@ -10,6 +10,7 @@ pub mod norm;
 pub mod pipeline;
 pub mod ple;
 pub mod qsa;
+pub mod seg_graph;
 
 pub use config::{IndexerConfig, LayerType, PleConfig, Qwen4ExpConfig};
 pub use loader::{LoadError, Qwen4ExpWeights};

@@ -45,6 +45,8 @@ pub struct ModelCache {
     pub ple: Vec<PleState>,
     pub seq_len: usize,
     pub max_seq: usize,
+    /// CUDA-графы шага декода по отрезкам слоёв линейного внимания.
+    pub seg: crate::seg_graph::SegGraphs,
 }
 
 impl ModelCache {
@@ -148,6 +150,8 @@ impl ModelCache {
     /// Перевоз через PCIe дешевле, чем потерять префикс и префиллить историю
     /// заново.
     pub fn park_to_host(&mut self) -> Result<usize, ModelError> {
+        // Графы шага и буферы снимка пары держат VRAM и адреса прежнего состояния.
+        self.seg.clear();
         let mut moved = 0;
         for l in self.layers.iter_mut() {
             match l {
@@ -658,7 +662,7 @@ impl Qwen4ExpModel {
             .iter()
             .filter_map(|b| b.ple.as_ref().map(|p| p.state()))
             .collect();
-        Ok(ModelCache { layers, ple, seq_len: 0, max_seq })
+        Ok(ModelCache { layers, ple, seq_len: 0, max_seq, seg: Default::default() })
     }
 
     /// Эмбеддинги промпта с подставленными строками медиа: `media` — пары
@@ -951,6 +955,168 @@ impl Qwen4ExpModel {
         Ok((out, last_stream))
     }
 
+    /// Конец отрезка слоёв линейного внимания, начатого на `l0` (не включая):
+    /// до слоя разреженного внимания или слоя с PLE.
+    fn segment_end(&self, l0: usize) -> usize {
+        let mut e = l0 + 1;
+        while e < self.blocks.len() && matches!(self.blocks[e].mixer, Mixer::Linear(_)) && self.blocks[e].ple.is_none() {
+            e += 1;
+        }
+        e
+    }
+
+    /// Слой линейного внимания целиком (HC, GDN, HC, MoE) — без трассировки,
+    /// проб и упреждения: то, что пишется в CUDA-граф.
+    fn gdn_layer(
+        &self,
+        l: usize,
+        hidden: &Tensor,
+        state: &mut LayerState,
+        s: usize,
+        split: Option<usize>,
+        snaps: &mut Vec<crate::linear_attn::GdnSnap>,
+        pair_buf: Option<&(Tensor, Tensor)>,
+    ) -> Result<Tensor, ModelError> {
+        let block = &self.blocks[l];
+        let (Mixer::Linear(la), LayerState::Linear(state)) = (&block.mixer, state) else {
+            return Err(ModelError::Shape(format!("слой {l}: не линейное внимание")));
+        };
+        let no_inject = || ModelError::Forward(format!("слой {l}: hc без inject"));
+        let mixed = block.attn_hc.forward(hidden)?;
+        let out = match split {
+            None => la.forward(&mixed.mixed, state, s)?,
+            Some(k) => {
+                let (out, snap) = la.forward_split(&mixed.mixed, state, s, k, pair_buf)?;
+                snaps.push(snap);
+                out
+            }
+        };
+        let hidden = block.attn_hc.inject(&mixed.hyper, &out, mixed.inject_weights.as_ref().ok_or_else(no_inject)?)?;
+        let mixed = block.mlp_hc.forward(&hidden)?;
+        let out = block.moe.forward(&mixed.mixed)?;
+        block.mlp_hc.inject(&mixed.hyper, &out, mixed.inject_weights.as_ref().ok_or_else(no_inject)?)
+    }
+
+    /// Слои `l0..l1` (линейное внимание) графом. `None` — отрезок ещё не готов
+    /// (прогрев, ленивые части не достроены) или захват не удался: считать
+    /// обычным путём. См. `seg_graph`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_segment(
+        &self,
+        l0: usize,
+        l1: usize,
+        hidden: &Tensor,
+        cache: &mut ModelCache,
+        s: usize,
+        split: Option<usize>,
+        snaps: &mut Vec<crate::linear_attn::GdnSnap>,
+    ) -> Result<Option<Tensor>, ModelError> {
+        use crate::seg_graph::{capture, copy_into_fixed, like_fixed, SegGraph, SegSlot};
+        let Device::Cuda(ord) = self.device else { return Ok(None) };
+        let pair = split.is_some();
+        for l in l0..l1 {
+            let block = &self.blocks[l];
+            let (Mixer::Linear(la), LayerState::Linear(st)) = (&block.mixer, &cache.layers[l]) else { return Ok(None) };
+            if !la.decode_ready(st) || !block.moe.zc_built() {
+                return Ok(None);
+            }
+        }
+        let addr = |t: &Tensor| t.cuda_region().map(|r| r.0).unwrap_or(0);
+        if pair {
+            if cache.seg.pair.len() < self.blocks.len() {
+                cache.seg.pair.resize_with(self.blocks.len(), || None);
+            }
+            for l in l0..l1 {
+                let LayerState::Linear(st) = &cache.layers[l] else { return Ok(None) };
+                let (Some(c), Some(ss)) = (st.conv_state_dev.as_ref(), st.ssm_state_dev.as_ref()) else { return Ok(None) };
+                let fresh = match &cache.seg.pair[l] {
+                    Some((bc, bs)) => bc.dims() != c.dims() || bs.dims() != ss.dims(),
+                    None => true,
+                };
+                if fresh {
+                    cache.seg.pair[l] = Some((like_fixed(c)?, like_fixed(ss)?));
+                }
+            }
+        }
+        let mut stamp: Vec<u64> = Vec::with_capacity(4 * (l1 - l0) + 2);
+        for l in l0..l1 {
+            let LayerState::Linear(st) = &cache.layers[l] else { return Ok(None) };
+            stamp.push(st.conv_state_dev.as_ref().map(addr).unwrap_or(0));
+            stamp.push(st.ssm_state_dev.as_ref().map(addr).unwrap_or(0));
+            if pair {
+                let (bc, bs) = cache.seg.pair[l].as_ref().expect("создан выше");
+                stamp.push(addr(bc));
+                stamp.push(addr(bs));
+            }
+        }
+        stamp.push(synaptix_llm_common::moe_zc::ZC_GENERATION.load(std::sync::atomic::Ordering::Relaxed));
+        stamp.push(l1 as u64);
+
+        let key = (l0, s);
+        let mut slot = cache.seg.slots.remove(&key).unwrap_or_default();
+        if slot.stamp != stamp {
+            slot = SegSlot { stamp, ..Default::default() };
+        }
+        let push_pair_snaps = |cache: &ModelCache, snaps: &mut Vec<crate::linear_attn::GdnSnap>| {
+            for l in l0..l1 {
+                snaps.push(crate::linear_attn::GdnSnap::from_bufs(cache.seg.pair[l].as_ref().expect("создан выше")));
+            }
+        };
+        let launch = |g: &SegGraph| -> Result<(), ModelError> {
+            g.graph.launch().map_err(|e| ModelError::Forward(format!("граф декода, слои {l0}..{l1}: запуск: {e:?}")))
+        };
+        if let Some(g) = &slot.graph {
+            copy_into_fixed(&g.input, hidden)?;
+            launch(g)?;
+            let out = g.output.clone();
+            if pair {
+                push_pair_snaps(cache, snaps);
+            }
+            cache.seg.slots.insert(key, slot);
+            return Ok(Some(out));
+        }
+        if slot.failed || slot.warm < crate::seg_graph::WARM_STEPS {
+            slot.warm += 1;
+            cache.seg.slots.insert(key, slot);
+            return Ok(None);
+        }
+        // Захват: ядра только записываются, шаг исполнит первый запуск графа.
+        let input = like_fixed(hidden)?;
+        let output = like_fixed(hidden)?;
+        copy_into_fixed(&input, hidden)?;
+        let captured = {
+            let (layers, pairs) = (&mut cache.layers, &cache.seg.pair);
+            let mut scratch = Vec::new();
+            capture(ord, || {
+                let mut h = input.clone();
+                for l in l0..l1 {
+                    let buf = if pair { pairs[l].as_ref() } else { None };
+                    h = self.gdn_layer(l, &h, &mut layers[l], s, split, &mut scratch, buf)?;
+                }
+                copy_into_fixed(&output, &h)
+            })
+        };
+        match captured {
+            Ok(graph) => {
+                let g = SegGraph { graph, input, output };
+                launch(&g)?;
+                let out = g.output.clone();
+                slot.graph = Some(g);
+                if pair {
+                    push_pair_snaps(cache, snaps);
+                }
+                cache.seg.slots.insert(key, slot);
+                Ok(Some(out))
+            }
+            Err(e) => {
+                eprintln!("[qwen4_exp] граф декода, слои {l0}..{l1} (строк {s}): захват не удался, обычный путь: {e}");
+                slot.failed = true;
+                cache.seg.slots.insert(key, slot);
+                Ok(None)
+            }
+        }
+    }
+
     fn run(
         &self,
         tokens: &[u32],
@@ -987,7 +1153,18 @@ impl Qwen4ExpModel {
         let mut snap_qsa = Vec::new();
         let mut snap_ple = Vec::new();
         let mut pending_prefetch: Option<synaptix_llm_common::moe::AsyncPrefetch> = None;
-        for (l, block) in self.blocks.iter().enumerate() {
+        let seg_ok = crate::seg_graph::enabled()
+            && matches!(self.device, Device::Cuda(_))
+            && self.compute == DType::F16
+            && ((s == 1 && split.is_none()) || (s == 2 && split == Some(1)))
+            && opts.trace == Trace::Off
+            && !crate::norm::profiling()
+            && !predict_probe::on()
+            && prefetch_k() == 0
+            && !synaptix_llm_common::moe::MoeFfn::zc_host_flags();
+        let mut l = 0usize;
+        while l < self.blocks.len() {
+            let block = &self.blocks[l];
             if trace {
                 traced.push((format!("in_{l}"), hidden.clone()));
             }
@@ -1014,6 +1191,16 @@ impl Qwen4ExpModel {
                 hidden = coerr(hidden.add(&delta))?;
             }
 
+            // Отрезок слоёв линейного внимания — одним CUDA-графом.
+            if seg_ok && matches!(block.mixer, Mixer::Linear(_)) {
+                let end = self.segment_end(l);
+                if let Some(h) = self.run_segment(l, end, &hidden, cache, s, split, &mut snap_linear)? {
+                    hidden = h;
+                    l = end;
+                    continue;
+                }
+            }
+
             let mixed = stage("hc", || {
                 ctx(block.attn_hc.forward(&hidden), &format!("слой {l} attn_hc"))
             })?;
@@ -1023,7 +1210,7 @@ impl Qwen4ExpModel {
                         None => ctx(la.forward(&mixed.mixed, state, s), &format!("слой {l} linear_attn")),
                         Some(k) => {
                             let (out, snap) = ctx(
-                                la.forward_split(&mixed.mixed, state, s, k),
+                                la.forward_split(&mixed.mixed, state, s, k, None),
                                 &format!("слой {l} linear_attn"),
                             )?;
                             snap_linear.push(snap);
@@ -1137,6 +1324,7 @@ impl Qwen4ExpModel {
             if trace {
                 traced.push((format!("layer_out_{l}"), hidden.clone()));
             }
+            l += 1;
         }
 
         cache.seq_len = past + s;
