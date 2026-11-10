@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod calibrate;
 pub mod config;
 pub mod gated_residual;
 pub mod linear_attn;

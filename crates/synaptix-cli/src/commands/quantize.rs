@@ -24,6 +24,8 @@ pub struct QuantizeArgs {
     pub keep_quant: bool,
     pub device: String,
     pub calib: Option<PathBuf>,
+    /// `auto` | `on` | `off` — компенсация ошибки (блочный GPTQ).
+    pub gptq: String,
     pub origin: Option<PathBuf>,
     pub include: Vec<String>,
     pub vision: Option<String>,
@@ -173,8 +175,18 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     synaptix::init()?;
     if let Some(c) = &args.calib {
         let t = synaptix_core::quant::calib::load(c)?;
-        println!("  калибровка: {} ({} тензоров)", c.display(), t.len());
+        let grams = t.keys().filter(|k| k.ends_with(synaptix_core::quant::calib::GRAM_SUFFIX)).count();
+        println!("  калибровка: {} ({} тензоров, матриц связей входов {grams})", c.display(), t.len());
+        match args.gptq.as_str() {
+            "off" => std::env::set_var("SYN_QUANT_GPTQ", "0"),
+            "on" if grams == 0 => return Err("--gptq on: в калибровке нет матриц связей входов (соберите её `synaptix calibrate <модель> <текст.txt>`)".into()),
+            "on" | "auto" => {}
+            o => return Err(format!("--gptq {o}: auto | on | off").into()),
+        }
+        println!("  компенсация ошибки: {}", if args.gptq == "off" || grams == 0 { "нет" } else { "да (блочный GPTQ, iq3_s128)" });
         synaptix_core::quant::calib::set_table(Some(t));
+    } else if args.gptq == "on" {
+        return Err("--gptq on требует --calib с матрицами связей входов".into());
     }
     let src_formats = synaptix::facade::arch::bundle_quant_formats(&args.input);
     println!("Quantize {} → {}", args.input.display(), args.output.display());

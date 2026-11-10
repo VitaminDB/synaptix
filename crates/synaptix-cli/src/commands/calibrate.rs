@@ -77,9 +77,33 @@ fn calibrate_tts(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Языковая модель с экспертами MoE (Qwen4Exp) на тексте: статистика входов
+/// каждого эксперта и матрицы связей входов слоёв (под компенсацию ошибки).
+fn calibrate_llm(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_llm_qwen4_exp::calibrate::{calibrate_experts, CalibOpts};
+    let text = String::from_utf8_lossy(&std::fs::read(&args.audio)?).into_owned();
+    let opts = CalibOpts { tokens: args.limit, ..Default::default() };
+    println!("Calibrate {} (LLM, эксперты MoE) на тексте {} — до {} токенов ({:?})", args.model.display(), args.audio.display(), opts.tokens, device);
+    let r = calibrate_experts(&args.model, &text, &args.output, device, &opts, &|done, n| eprint!("\r  [{done}/{n}]"))?;
+    eprintln!();
+    println!(
+        "Done: {} ({} матриц экспертов, {} видели меньше 64 строк; матриц связей входов {}; {} токенов, {:.1} с)",
+        args.output.display(), r.matrices, r.rare, r.grams, r.tokens, r.seconds
+    );
+    Ok(())
+}
+
 pub fn run(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     synaptix::init()?;
     let device = super::device::resolve(&args.device);
+    let is_text = args.audio.extension().is_some_and(|x| ["txt", "md", "jsonl", "text"].iter().any(|e| x.eq_ignore_ascii_case(e)));
+    if is_text && !is_omnivoice(&args.model) {
+        return match synaptix::facade::arch::detect_llm_arch(&args.model) {
+            Ok(synaptix::facade::arch::LlmArch::Qwen4Exp) => calibrate_llm(&args, device),
+            Ok(_) => Err("калибровка языковых моделей на тексте: пока только Qwen4Exp (эксперты MoE)".into()),
+            Err(e) => Err(e.into()),
+        };
+    }
     if is_omnivoice(&args.model) {
         return calibrate_tts(&args, device);
     }

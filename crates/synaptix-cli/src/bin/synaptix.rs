@@ -447,6 +447,11 @@ enum Commands {
         /// Статистика входов слоёв из `synaptix calibrate`: шкалы q8row по ошибке выхода слоя.
         #[arg(long)]
         calib: Option<PathBuf>,
+        /// Компенсация ошибки квантования (блочный GPTQ, формат iq3_s128): ошибка округлённого блока
+        /// переносится на ещё не округлённые веса по матрицам связей входов из `--calib`.
+        /// `auto` — если они есть в калибровке; `on` — требовать; `off` — не применять.
+        #[arg(long, default_value = "auto")]
+        gptq: String,
         /// Каталог HF с оригинальными весами (BF16 или FP8 с блочными масштабами):
         /// квантованные в бандле веса, которые там есть (стопки экспертов —
         /// из поштучных), перекодируются из него, а не из бандла.
@@ -473,16 +478,17 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         plan: bool,
     },
-    /// Калибровка для квантования: прогнать модель по записям и сохранить E[x²] входов каждого Linear.
+    /// Калибровка для квантования: прогнать модель по записям или тексту и сохранить статистику входов слоёв
+    /// (E[x²]; у языковых моделей с MoE — по каждому эксперту, плюс матрицы связей входов под `quantize --gptq`).
     Calibrate {
         model: PathBuf,
-        /// WAV-файл или каталог с записями (рекурсивно).
+        /// WAV-файл или каталог с записями (рекурсивно); для языковой модели — текстовый файл (.txt/.md).
         audio: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, default_value = "cuda")]
         device: String,
-        /// Не больше стольких записей (равномерно по списку).
+        /// Не больше стольких записей (равномерно по списку); для текста — токенов (обычно 32768).
         #[arg(long, default_value_t = 256)]
         limit: usize,
     },
@@ -1488,8 +1494,8 @@ fn main() -> ExitCode {
             warmup, weight_decay, max_grad_norm, eval_fraction, eval_every, save_every, max_samples, thinking, resume, eval_only, seed,
         }),
         Commands::MergeLora { model, adapter, output, format } => train::merge(&model, &adapter, &output, &format),
-        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, origin, include, vision, rule, policy, component, plan } => {
-            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, origin, include, vision, rule, policy, component, plan })
+        Commands::Quantize { input, output, format, attn, lm_head, embed, keep_quant, device, calib, gptq, origin, include, vision, rule, policy, component, plan } => {
+            quantize::run(quantize::QuantizeArgs { input, output, format, attn, lm_head, embed, keep_quant, device, calib, gptq, origin, include, vision, rule, policy, component, plan })
         }
         Commands::Warmup { model, device } => synaptix_cli::commands::calibrate::warmup(&model, &device),
         Commands::Calibrate { model, audio, output, device, limit } => {
