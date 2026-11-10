@@ -32,7 +32,8 @@ static DESC_CACHE: OnceLock<Mutex<std::collections::HashMap<DescKey, Arc<TmaDesc
 pub fn clear_desc_cache() -> usize {
     match DESC_CACHE.get() {
         Some(c) => {
-            let mut g = c.lock();
+            // try_lock: может вызываться из аллокатора под этим же замком (reclaim на OOM).
+            let Some(mut g) = c.try_lock() else { return 0 };
             let n = g.len();
             g.clear();
             n

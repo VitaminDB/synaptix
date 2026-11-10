@@ -562,7 +562,7 @@ fn with_mxfp8_scratch<R>(
 pub fn clear_mxfp8_scratch() -> usize {
     let mut freed = 0usize;
     if let Some(c) = MXFP8_SCRATCH.get() {
-        if let Ok(mut g) = c.lock() {
+        if let Ok(mut g) = c.try_lock() {
             for s in g.values() {
                 freed += s.xq.len() + s.sa.len();
             }
@@ -570,7 +570,7 @@ pub fn clear_mxfp8_scratch() -> usize {
         }
     }
     if let Some(c) = MXFP8_DEQ_SCRATCH.get() {
-        if let Ok(mut g) = c.lock() {
+        if let Ok(mut g) = c.try_lock() {
             for s in g.values() {
                 freed += s.w.len() + s.y.len();
             }

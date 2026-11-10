@@ -275,7 +275,9 @@ static WS: OnceLock<Mutex<HashMap<usize, ChunkWs>>> = OnceLock::new();
 /// при выгрузке модели — до трима пулов.
 pub fn clear_chunk_scan_ws() -> usize {
     let Some(cache) = WS.get() else { return 0 };
-    let mut g = cache.lock();
+    // try_lock: зовут и из аллокатора на нехватке памяти (reclaim → выгрузка соседней модели) — тогда замок держит
+    // тот самый проход, что упёрся в OOM; ждать его — зависнуть навсегда.
+    let Some(mut g) = cache.try_lock() else { return 0 };
     let freed = g.values().map(ChunkWs::bytes).sum();
     g.clear();
     freed
@@ -658,4 +660,19 @@ pub fn chunk_gated_delta_rule(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+
+    /// Очистка скретчей зовётся и из аллокатора на нехватке памяти — под замком
+    /// самого прохода. Она не должна ждать замок (иначе служба зависает навсегда).
+    #[test]
+    fn clear_does_not_block_under_own_lock() {
+        let cache = WS.get_or_init(|| Mutex::new(HashMap::new()));
+        let _held = cache.lock();
+        assert_eq!(clear_chunk_scan_ws(), 0);
+        assert_eq!(crate::release_device_caches().1, 0);
+    }
 }

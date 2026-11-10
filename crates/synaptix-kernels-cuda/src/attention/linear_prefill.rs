@@ -82,7 +82,8 @@ static WS: OnceLock<Mutex<HashMap<usize, PrefillWs>>> = OnceLock::new();
 /// Отдать пулу скретчи linear-prefill'а. Вызывается при выгрузке модели.
 pub fn clear_linear_prefill_ws() -> usize {
     let Some(cache) = WS.get() else { return 0 };
-    let mut g = cache.lock();
+    // try_lock — см. clear_chunk_scan_ws.
+    let Some(mut g) = cache.try_lock() else { return 0 };
     let freed = g.values().map(PrefillWs::bytes).sum();
     g.clear();
     freed
