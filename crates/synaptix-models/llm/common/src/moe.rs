@@ -941,6 +941,8 @@ impl ExpertTables<'_> {
 
 pub struct MoeFfn {
     cfg: MoeConfig,
+    /// Путь блока в источнике весов — ключи калибровки (`calib::record`).
+    prefix: String,
     cache: Option<Arc<ExpertCache>>,
     layer_id: usize,
     /// Таблицы адресов резидентов кэша (слитый декод с экспертами в RAM).
@@ -1098,6 +1100,7 @@ impl MoeFfn {
             None => None,
         };
         Ok(Self {
+            prefix: prefix.to_string(),
             zc_pool: None,
             zc: Mutex::new(None),
             zc_seed: Mutex::new(Vec::new()),
@@ -2122,6 +2125,9 @@ impl MoeFfn {
 
     fn forward_chunk(&self, x: &Tensor, router_in: Option<&Tensor>) -> Result<Tensor, ModelError> {
         use crate::profile::stage;
+        if synaptix_core::quant::calib::active() {
+            return self.forward_chunk_calib(x, router_in);
+        }
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
         let routed = router_in.unwrap_or(x);
@@ -2249,6 +2255,56 @@ impl MoeFfn {
                 .map_err(|e| ModelError::Forward(format!("MoE: сборка экспертов: {e}")))
         })?;
 
+        self.mix_back(stacked, &order, &weights, t, x)
+    }
+
+    /// Проход под калибровку квантования: простой путь «эксперт за экспертом»
+    /// с записью вторых моментов входа каждой матрицы — `…gate_up_proj#e`
+    /// (строки, которые роутер отдал эксперту) и `…down_proj#e` (его
+    /// промежуточный вектор). Скорость не важна: это разовый прогон.
+    fn forward_chunk_calib(&self, x: &Tensor, router_in: Option<&Tensor>) -> Result<Tensor, ModelError> {
+        use synaptix_core::quant::calib;
+        let t = x.dims()[0];
+        let k = self.cfg.num_experts_per_tok;
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE калибровка: {e}"));
+        let (experts, weights) = self.route(router_in.unwrap_or(x))?;
+        self.prefetch(&experts, &weights, false);
+        let mut order: Vec<u32> = (0..(t * k) as u32).collect();
+        order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
+        let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();
+        let row_idx = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
+        let gathered = take_rows(x, &row_idx)?;
+        let mut outs: Vec<Tensor> = Vec::new();
+        let mut pos = 0usize;
+        while pos < order.len() {
+            let expert = experts[order[pos] as usize] as usize;
+            let mut end = pos + 1;
+            while end < order.len() && experts[order[end] as usize] as usize == expert {
+                end += 1;
+            }
+            let slice = gathered.narrow(0, pos, end - pos).and_then(|t| t.contiguous()).map_err(ferr)?;
+            calib::record(&format!("{}.experts.gate_up_proj#{expert}", self.prefix), &slice).map_err(ferr)?;
+            let run = |gate_up: &QLinear, down: &QLinear| -> Result<Tensor, ModelError> {
+                let h = self.swiglu(&gate_up.forward(&slice)?)?;
+                calib::record(&format!("{}.experts.down_proj#{expert}", self.prefix), &h).map_err(ferr)?;
+                down.forward(&h)
+            };
+            let out = match (&self.experts, &self.cache) {
+                (ExpertStore::Resident(all), None) => {
+                    let e = all.get(expert).ok_or_else(|| ModelError::Forward(format!("MoE: нет эксперта {expert}")))?;
+                    run(&e.gate_up, &e.down)?
+                }
+                (_, Some(cache)) => {
+                    let e = self.resident_expert(expert, cache)?;
+                    run(&e.gate_up, &e.down)?
+                }
+                _ => return Err(ModelError::Forward("MoE калибровка: ленивые эксперты без кэша".into())),
+            };
+            outs.push(if out.dtype() == self.compute { out } else { self.to_compute(out)? });
+            pos = end;
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        let stacked = if refs.len() == 1 { outs[0].clone() } else { Tensor::cat(&refs, 0).map_err(ferr)? };
         self.mix_back(stacked, &order, &weights, t, x)
     }
 

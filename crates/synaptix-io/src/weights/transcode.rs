@@ -562,11 +562,11 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
             return Ok((synaptix_core::quant::ggml::quantize_q4_0(&host, n, k), Vec::new()));
         }
         if q4_k || q5_k {
-            let h = synaptix_core::quant::calib::table_get(&item.name);
+            let h = synaptix_core::quant::calib::table_get(&format!("{}#{slice}", item.name)).or_else(|| synaptix_core::quant::calib::table_get(&item.name));
             let f = if q5_k { synaptix_core::quant::ggml::quantize_q5_k } else { synaptix_core::quant::ggml::quantize_q4_k };
             return Ok((f(&host, n, k, h.as_deref()), Vec::new()));
         }
-        let h = synaptix_core::quant::calib::table_get(&item.name);
+        let h = synaptix_core::quant::calib::table_get(&format!("{}#{slice}", item.name)).or_else(|| synaptix_core::quant::calib::table_get(&item.name));
         let (packed, scales) = synaptix_core::quant::q8row::quantize(&host, n, k, h.as_deref());
         return Ok((packed, synaptix_core::quant::q8row::scales_to_bytes(&scales)));
     }
@@ -574,7 +574,7 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
     let dense = if dense.dtype() == DType::F16 { dense } else { dense.to_dtype(DType::F16).map_err(IoError::Core)? };
     if let DType::Ggml(ty @ synaptix_core::quant::ggml::GgmlType::Iq3S128) = item.target {
         // Кодировщик на карте (на CPU — эталон, в разы медленнее).
-        let h = synaptix_core::quant::calib::table_get(&item.name);
+        let h = synaptix_core::quant::calib::table_get(&format!("{}#{slice}", item.name)).or_else(|| synaptix_core::quant::calib::table_get(&item.name));
         let packed = if matches!(device, Device::Cpu) {
             let host = dense.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
             synaptix_core::quant::ggml::quantize_iq3_s128(&host, n, k, h.as_deref())
