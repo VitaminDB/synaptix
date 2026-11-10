@@ -948,6 +948,7 @@ impl Qwen4ExpPipeline {
             // вернуться к потолку — на нём и держится скорость генерации.
             cache.fit_to_vram(decode_reserve(&self.config));
         }
+        self.compact_session_vram(cache);
         self.size_zc_pool();
 
         let decode_start = Instant::now();
@@ -1391,6 +1392,50 @@ impl Qwen4ExpPipeline {
             let _ = synaptix_core::device::cuda::synchronize_all(ord);
             let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
         }
+    }
+
+    /// Уплотнить VRAM сессии перед раздачей слотов: KV рос на префилле
+    /// кусками и остался размазанным по страницам пула активаций вперемешку с
+    /// уже освобождёнными временными буферами — драйвер такие страницы не
+    /// забирает (на 200K это 1,5 ГБ, 15 слотов на слой). Кэш уезжает на хост,
+    /// пул отдаётся целиком, кэш возвращается подряд. Порог слабины —
+    /// `SYN_QWEN4EXP_COMPACT_MB` (512; 0 — не уплотнять).
+    fn compact_session_vram(&self, cache: &mut ModelCache) {
+        let Some(pool) = &self.zc_pool else { return };
+        if pool.slots_per_layer() != 0 {
+            return;
+        }
+        let Device::Cuda(ord) = self.model.device else { return };
+        let limit = std::env::var("SYN_QWEN4EXP_COMPACT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512);
+        if limit == 0 {
+            return;
+        }
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+        let Ok((rsv, used)) = synaptix_core::device::cuda::activations_pool_stats(ord) else { return };
+        if rsv.saturating_sub(used) < limit << 20 {
+            return;
+        }
+        let t = Instant::now();
+        let moved = match cache.park_to_host() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[qwen4_exp] уплотнение VRAM: кэш не уехал на хост: {e}");
+                return;
+            }
+        };
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        if let Err(e) = cache.unpark_to(self.model.device) {
+            eprintln!("[qwen4_exp] уплотнение VRAM: кэш не вернулся на карту: {e}");
+            return;
+        }
+        let (rsv2, used2) = synaptix_core::device::cuda::activations_pool_stats(ord).unwrap_or((0, 0));
+        let gb = |x: u64| x as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "[qwen4_exp] уплотнение VRAM: пул активаций {:.2}/{:.2} → {:.2}/{:.2} ГБ, перенесено {:.2} ГБ за {:.2} с",
+            gb(used), gb(rsv), gb(used2), gb(rsv2), gb(moved as u64), t.elapsed().as_secs_f64()
+        );
     }
 
     /// Назначить размер пула слотов один раз, на первом декоде: свободная

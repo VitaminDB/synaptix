@@ -528,6 +528,92 @@ fn dense_bytes(loader: &SynBundleLoader, item: &Item, device: Device) -> Result<
         .map_err(IoError::Core)
 }
 
+/// Упакованные байты квант-веса на хосте.
+fn quant_bytes(q: &QuantWeight, name: &str) -> Result<Vec<u8>> {
+    let cpu = q.to_device(Device::Cpu).map_err(IoError::Core)?;
+    let p = cpu.packed_arc().ok_or_else(|| IoError::Bundle(format!("{name}: упакованные веса освобождены")))?;
+    Ok(p.as_cpu().ok_or_else(|| IoError::Bundle("квант не на хосте".into()))?.as_bytes().to_vec())
+}
+
+/// Матрицы переноса ошибки слоя на устройстве и важность столбцов по слою.
+struct Transfers {
+    /// `t[b]` — `[128, k − 128·(b+1)]` F32; у последнего блока — `None`.
+    t: Vec<Option<Tensor>>,
+    /// Диагональ матрицы связей (E[x²] по слою) — база поправки на эксперта.
+    layer_imp: Vec<f32>,
+}
+
+/// Компенсация ошибки включена (`SYN_QUANT_GPTQ=0` — выключить), и в
+/// калибровке есть матрица связей входов `<имя>@gram` с этим `k`.
+fn gptq_transfers(name: &str, k: usize, device: Device) -> Result<Option<Arc<Transfers>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Transfers>>>>> = OnceLock::new();
+    if std::env::var("SYN_QUANT_GPTQ").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(name) {
+        return Ok(v.clone());
+    }
+    let built = match synaptix_core::quant::calib::table_get(&format!("{name}{}", synaptix_core::quant::calib::GRAM_SUFFIX)) {
+        Some(h) if h.len() == k * k && k % 128 == 0 => {
+            let damp: f64 = std::env::var("SYN_QUANT_GPTQ_DAMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.01);
+            let t = synaptix_core::quant::gptq::block_transfers(&h, k, 128, damp).map_err(|e| IoError::Bundle(format!("{name}: {e}")))?;
+            let mut dev = Vec::with_capacity(t.len());
+            for (b, m) in t.into_iter().enumerate() {
+                let rest = k - 128 * (b + 1);
+                dev.push(if rest == 0 { None } else { Some(Tensor::from_vec(m, vec![128, rest], device).map_err(IoError::Core)?) });
+            }
+            Some(Arc::new(Transfers { t: dev, layer_imp: (0..k).map(|i| h[i * k + i]).collect() }))
+        }
+        _ => None,
+    };
+    // Один слой за раз: прежние матрицы больше не понадобятся.
+    let mut g = cache.lock().unwrap();
+    g.clear();
+    g.insert(name.to_string(), built.clone());
+    Ok(built)
+}
+
+/// IQ3_S-128 с компенсацией ошибки: блок 128 столбцов кодируется, его ошибка
+/// переносится на ещё не закодированные столбцы (`quant::gptq`). `imp` —
+/// важность столбцов этой матрицы (эксперта): по ней и взвешивается блок, и
+/// масштабируется перенос относительно общей по слою.
+fn gptq_iq3s128(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: usize) -> synaptix_core::error::Result<Vec<u8>> {
+    use synaptix_core::quant::ggml::GgmlType;
+    let device = dense.device();
+    let nb = k / 128;
+    let bb = GgmlType::Iq3S128.bytes_for(128);
+    // d = sqrt(важность эксперта / важность слоя), в разумных пределах.
+    let d: Option<Vec<f32>> = imp.map(|e| e.iter().zip(&tr.layer_imp).map(|(a, b)| if *b > 0.0 && *a > 0.0 { (a / b).sqrt().clamp(0.25, 4.0) } else { 1.0 }).collect());
+    let mut rest = dense.to_dtype(DType::F32)?;
+    let mut out = vec![0u8; n * nb * bb];
+    for b in 0..nb {
+        let width = k - 128 * b;
+        let wb = if width == 128 { rest.clone() } else { rest.narrow(1, 0, 128)?.contiguous()? };
+        let q = wb.to_dtype(DType::F16)?.quantize_to_ggml(GgmlType::Iq3S128, imp.map(|h| &h[128 * b..128 * (b + 1)]))?;
+        if let Some(t) = &tr.t[b] {
+            let e = wb.sub(&q.dequantize(DType::F16)?.to_dtype(DType::F32)?)?;
+            let e = match &d {
+                Some(d) => e.broadcast_mul(&Tensor::from_vec(d[128 * b..128 * (b + 1)].to_vec(), vec![1, 128], device)?)?,
+                None => e,
+            };
+            let upd = e.matmul(t)?;
+            let upd = match &d {
+                Some(d) => upd.broadcast_div(&Tensor::from_vec(d[128 * (b + 1)..].to_vec(), vec![1, width - 128], device)?)?,
+                None => upd,
+            };
+            rest = rest.narrow(1, 128, width - 128)?.contiguous()?.sub(&upd)?;
+        }
+        let cpu = q.to_device(Device::Cpu)?;
+        let p = cpu.packed_arc().ok_or(synaptix_core::error::SynaptixError::Unsupported("gptq: упакованные веса освобождены"))?;
+        let bytes = p.as_cpu().ok_or(synaptix_core::error::SynaptixError::Unsupported("gptq: квант не на хосте"))?.as_bytes();
+        for r in 0..n {
+            out[(r * nb + b) * bb..(r * nb + b + 1) * bb].copy_from_slice(&bytes[r * bb..(r + 1) * bb]);
+        }
+    }
+    Ok(out)
+}
+
 /// Байты перекодированного среза: `(packed, scales)`; масштабы пусты у
 /// одноблобных форматов. Считается на `device`, возвращается на хосте.
 fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -579,10 +665,14 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
             let host = dense.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
             synaptix_core::quant::ggml::quantize_iq3_s128(&host, n, k, h.as_deref())
         } else {
-            let q = dense.quantize_to_ggml(ty, h.as_deref()).map_err(|e| IoError::Bundle(format!("{}: IQ3_S-128: {e}", item.name)))?;
-            let cpu = q.to_device(Device::Cpu).map_err(IoError::Core)?;
-            let p = cpu.packed_arc().ok_or_else(|| IoError::Bundle(format!("{}: упакованные веса освобождены", item.name)))?;
-            p.as_cpu().ok_or_else(|| IoError::Bundle("квант не на хосте".into()))?.as_bytes().to_vec()
+            match gptq_transfers(&item.name, k, device)? {
+                // Связи входов слоя известны — блок за блоком с переносом ошибки.
+                Some(tr) => gptq_iq3s128(&dense, h.as_deref(), &tr, n, k).map_err(|e| IoError::Bundle(format!("{}: IQ3_S-128 с компенсацией: {e}", item.name)))?,
+                None => {
+                    let q = dense.quantize_to_ggml(ty, h.as_deref()).map_err(|e| IoError::Bundle(format!("{}: IQ3_S-128: {e}", item.name)))?;
+                    quant_bytes(&q, &item.name)?
+                }
+            }
         };
         let _ = slices;
         return Ok((packed, Vec::new()));
