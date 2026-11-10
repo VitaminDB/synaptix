@@ -17,17 +17,6 @@ use synaptix_core::quant::ggml_lowbit::quantize_lowbit;
 
 
 
-fn _unused() {
-    let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = ((b >> 3) & 0x0f) as i32;
-    let m = (b & 7) as f32;
-    if e == 0 {
-        s * m / 8.0 * 2f32.powi(-6)
-    } else {
-        s * (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    }
-}
-
 /// Байты тензора `name` и его форма.
 fn tensor(dir: &Path, index: &serde_json::Value, name: &str) -> Result<(Vec<u8>, Vec<usize>), Box<dyn std::error::Error>> {
     let file = index["weight_map"][name].as_str().ok_or_else(|| format!("{name}: нет в индексе"))?;
@@ -65,14 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = rows.min(n_all);
     // Строки равномерно по матрице.
     let mut x = vec![0f32; n * k];
-    for r in 0..n {
-        let src = r * n_all / n;
-        for c in 0..k {
-            let byte = packed[src * (k / 2) + c / 2];
-            let nib = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
-            x[r * k + c] = E2M1[nib as usize] * e4m3(scale[src * (k / 16) + c / 16]) / g;
-        }
-    }
+    synaptix_core::quant::nvfp4_ct::dequant_rows(&packed, &scale, g, k, (0..n).map(|r| r * n_all / n), &mut x);
     let rms = (x.iter().map(|v| (v * v) as f64).sum::<f64>() / x.len() as f64).sqrt();
     let zeros = x.iter().filter(|v| **v == 0.0).count() as f64 / x.len() as f64;
     println!("{name}: [{n_all}, {k}], строк в пробе {n}, СКО {rms:.5}, нулей {:.1} %, глобальный масштаб {g:.3}", zeros * 100.0);
