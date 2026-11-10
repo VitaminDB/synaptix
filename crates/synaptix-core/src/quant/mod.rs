@@ -9,6 +9,7 @@
 pub mod ggml;
 pub mod ggml_dequant;
 pub mod ggml_lowbit;
+pub mod nvfp4_ct;
 pub mod ggml_tables;
 pub mod calib;
 pub mod q8row;

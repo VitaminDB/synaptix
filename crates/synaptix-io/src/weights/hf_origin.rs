@@ -132,6 +132,23 @@ impl HfOrigin {
         Ok((dt, shape, sh, start + a, start + b))
     }
 
+    /// Тензор как есть: (dtype safetensors, форма, байты).
+    pub fn bytes(&self, name: &str) -> Result<(String, Vec<usize>, Vec<u8>)> {
+        let (dt, shape, sh, a, b) = self.raw(name)?;
+        Ok((dt, shape, sh.map[a..b].to_vec()))
+    }
+
+    /// Тип и форма без чтения данных.
+    pub fn shape(&self, name: &str) -> Result<(String, Vec<usize>)> {
+        let (dt, shape, ..) = self.raw(name)?;
+        Ok((dt, shape))
+    }
+
+    /// Имена всех тензоров.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(|s| s.as_str())
+    }
+
     fn floats(dt: &str, bytes: &[u8]) -> Result<Vec<f32>> {
         Ok(match dt {
             "F32" => bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),

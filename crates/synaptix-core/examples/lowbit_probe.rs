@@ -15,9 +15,9 @@ use synaptix_core::quant::ggml::{quantize_iq3_s128, GgmlType};
 use synaptix_core::quant::ggml_dequant::dequantize;
 use synaptix_core::quant::ggml_lowbit::quantize_lowbit;
 
-const E2M1: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
 
-fn e4m3(b: u8) -> f32 {
+
+fn _unused() {
     let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let e = ((b >> 3) & 0x0f) as i32;
     let m = (b & 7) as f32;
