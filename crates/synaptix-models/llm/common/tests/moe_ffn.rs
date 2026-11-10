@@ -103,6 +103,7 @@ fn cfg(with_shared: bool, norm_topk_prob: bool) -> MoeConfig {
         router_key: None,
         per_expert_scale: None,
         activation: synaptix_llm_common::Activation::Silu,
+        ext: Default::default(),
     }
 }
 

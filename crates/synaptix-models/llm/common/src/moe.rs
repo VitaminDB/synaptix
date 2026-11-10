@@ -70,6 +70,24 @@ pub struct MoeConfig {
     pub per_expert_scale: Option<Vec<f32>>,
     /// Активация в эксперте: `silu(gate)·up` у Qwen, `gelu_tanh(gate)·up` у Gemma-4.
     pub activation: Activation,
+    /// Отличия роутера и shared-эксперта от раскладки Qwen-MoE.
+    pub ext: MoeExt,
+}
+
+/// Варианты MoE помимо Qwen-раскладки (softmax по top-k, shared-эксперт с
+/// sigmoid-гейтом). По умолчанию — всё как у Qwen.
+#[derive(Debug, Clone, Default)]
+pub struct MoeExt {
+    /// Оценка роутера — `sigmoid(логит)`, вес — оценка, делённая на сумму
+    /// выбранных (MiniMax, DeepSeek-V3); иначе softmax.
+    pub sigmoid_scoring: bool,
+    /// Поправка к оценке ТОЛЬКО при выборе top-k (`e_score_correction_bias`),
+    /// в вес не входит. Работает с `sigmoid_scoring`.
+    pub select_bias: Option<Vec<f32>>,
+    /// Множитель суммы выбранных экспертов (`routed_scaling_factor`); 0 — нет.
+    pub routed_scale: f32,
+    /// Shared-эксперт без гейта (`shared_expert_gate` в весах нет).
+    pub shared_ungated: bool,
 }
 
 impl MoeConfig {
@@ -87,6 +105,7 @@ impl MoeConfig {
             router_key: None,
             per_expert_scale: None,
             activation: Activation::Silu,
+            ext: Default::default(),
         }
     }
 }
@@ -1081,17 +1100,19 @@ impl MoeFfn {
                 gate: lin("gate_proj")?,
                 up: lin("up_proj")?,
                 down: lin("down_proj")?,
-                router: weights.tensor(
-                    &format!("{prefix}.shared_expert_gate.weight"),
-                    device,
-                    DType::F32,
-                )?,
+                router: if cfg.ext.shared_ungated {
+                    Tensor::zeros(vec![1usize, cfg.hidden_size], DType::F32, device)
+                        .map_err(|e| ModelError::Load(format!("shared expert: {e}")))?
+                } else {
+                    weights.tensor(&format!("{prefix}.shared_expert_gate.weight"), device, DType::F32)?
+                },
             })
         } else {
             None
         };
 
         let router_gate = match &shared {
+            Some(_) if cfg.ext.shared_ungated => None,
             Some(sh) => {
                 let g = sh.router.reshape(vec![1usize, cfg.hidden_size])
                     .map_err(|e| ModelError::Load(format!("shared_expert_gate: {e}")))?;
@@ -1659,6 +1680,50 @@ impl MoeFfn {
     /// токена `t` лежит в позиции `t * k + s`. Логиты считаются на устройстве,
     /// а выбор top-k — на хосте: сортировка 512 чисел на токен ядром пока не
     /// оформлена, и для decode (`T = 1`) это ровно один D2H на 2 КБ.
+    /// Роутер с sigmoid-оценкой: выбор top-k по `σ(логит) + bias`, вес —
+    /// `σ` выбранного, делённая на сумму выбранных, и общий множитель.
+    fn route_sigmoid(&self, logits: &[f32], t: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+        let e = self.cfg.num_experts;
+        let k = self.cfg.num_experts_per_tok;
+        let bias = self.cfg.ext.select_bias.as_deref();
+        let scale = if self.cfg.ext.routed_scale > 0.0 { self.cfg.ext.routed_scale } else { 1.0 };
+        let mut experts = vec![0u32; t * k];
+        let mut weights = vec![0f32; t * k];
+        experts.par_chunks_mut(k).zip(weights.par_chunks_mut(k)).enumerate().for_each(|(i, (ex, w))| {
+            let s: Vec<f32> = logits[i * e..(i + 1) * e].iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
+            let score = |j: u32| s[j as usize] + bias.map(|b| b[j as usize]).unwrap_or(0.0);
+            let mut order: Vec<u32> = (0..e as u32).collect();
+            order.select_nth_unstable_by(k - 1, |a, b| score(*b).partial_cmp(&score(*a)).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &mut order[..k];
+            top.sort_unstable_by(|a, b| score(*b).partial_cmp(&score(*a)).unwrap_or(std::cmp::Ordering::Equal));
+            let denom: f32 = top.iter().map(|j| s[*j as usize]).sum::<f32>() + 1e-20;
+            for (slot, j) in top.iter().enumerate() {
+                ex[slot] = *j;
+                w[slot] = s[*j as usize] / denom * scale;
+            }
+        });
+        self.scale_per_expert(&experts, &mut weights);
+        Ok((experts, weights))
+    }
+
+    /// `act(gate)·up` активации слоя (без слитых ядер кванта).
+    fn act_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor, ModelError> {
+        let ferr = |e: SynError| ModelError::Forward(format!("MoE: активация: {e}"));
+        match self.cfg.activation {
+            Activation::GeluTanh => gate.gelu_tanh().and_then(|g| g.mul(up)).map_err(ferr),
+            Activation::Silu => match gate.silu_and_mul(up) {
+                Ok(h) => Ok(h),
+                Err(_) => gate.silu().and_then(|g| g.mul(up)).map_err(ferr),
+            },
+            Activation::SwigluOai => {
+                let lim = Activation::SWIGLU_OAI_LIMIT;
+                let g = gate.clamp(-3.0e4, lim).map_err(ferr)?;
+                let glu = g.mul_scalar(Activation::SWIGLU_OAI_ALPHA).and_then(|a| a.sigmoid()).and_then(|sg| sg.mul(&g)).map_err(ferr)?;
+                up.clamp(-lim, lim).and_then(|u| u.add_scalar(1.0)).and_then(|u| u.mul(&glu)).map_err(ferr)
+            }
+        }
+    }
+
     fn route(&self, x: &Tensor) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
         let t = x.dims()[0];
         let e = self.cfg.num_experts;
@@ -1667,6 +1732,10 @@ impl MoeFfn {
             .to_dtype(DType::F32)
             .and_then(|xf| xf.linear(&self.router))
             .map_err(|err| ModelError::Forward(format!("роутер MoE: {err}")))?;
+
+        if self.cfg.ext.sigmoid_scoring {
+            return self.route_sigmoid(&to_host_f32(&logits)?, t);
+        }
 
         // Выбор top-k считает карта: на хост тогда уезжают k пар «эксперт,
         // логит» вместо всей строки из сотен логитов. Нормировка без
@@ -2584,6 +2653,7 @@ impl MoeFfn {
                 let (ph, sh) = match self.cfg.activation {
                     Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
                     Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
+                    Activation::SwigluOai => self.swiglu(&gu).and_then(|h| if h.dtype() == DType::F16 { Ok(h) } else { to_f16(&h) })?.nvfp4_quantize_act(),
                 }
                 .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
                 let part = QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, g_rows, self.compute)
@@ -2818,7 +2888,7 @@ impl MoeFfn {
         // слой, а не на эксперта.
         let quantized = match self.cfg.activation {
             Activation::Silu => gu.silu_mul_quant_nvfp4(1.0).ok(),
-            Activation::GeluTanh => {
+            Activation::GeluTanh | Activation::SwigluOai => {
                 let h = self.swiglu(&gu)?;
                 let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
                 h.nvfp4_quantize_act().ok()
@@ -3020,10 +3090,10 @@ impl MoeFfn {
         gate_up: &Tensor,
         m: usize,
     ) -> Result<Tensor, ModelError> {
-        if down.quant_dtype() == Some(DType::NVFP4) {
+        if down.quant_dtype() == Some(DType::NVFP4) && self.cfg.activation != Activation::SwigluOai {
             let fused = match self.cfg.activation {
                 Activation::Silu => gate_up.silu_mul_quant_nvfp4(1.0),
-                Activation::GeluTanh => gate_up.gelu_tanh_mul_quant_nvfp4(1.0),
+                _ => gate_up.gelu_tanh_mul_quant_nvfp4(1.0),
             };
             if let Ok((packed, scales)) = fused {
                 return down.forward_prequant(&packed, &scales, m, self.compute);
@@ -3044,20 +3114,7 @@ impl MoeFfn {
             .narrow(1, i, i)
             .and_then(|t| t.contiguous())
             .map_err(|e| ModelError::Forward(format!("MoE: up: {e}")))?;
-        if self.cfg.activation == Activation::GeluTanh {
-            return gate
-                .gelu_tanh()
-                .and_then(|g| g.mul(&up))
-                .map_err(|e| ModelError::Forward(format!("MoE: geglu: {e}")));
-        }
-        // Fused-ядро есть не на всех устройствах — тогда обычные silu и mul.
-        match gate.silu_and_mul(&up) {
-            Ok(h) => Ok(h),
-            Err(_) => gate
-                .silu()
-                .and_then(|g| g.mul(&up))
-                .map_err(|e| ModelError::Forward(format!("MoE: swiglu: {e}"))),
-        }
+        self.act_mul(&gate, &up)
     }
 
     /// Shared-эксперт на декоде (до 4 строк) двумя слитыми ядрами: веса из
@@ -3120,14 +3177,11 @@ impl MoeFfn {
         }
         let gate = shared.gate.forward(x)?;
         let up = shared.up.forward(x)?;
-        let h = match gate.silu_and_mul(&up) {
-            Ok(h) => h,
-            Err(_) => gate
-                .silu()
-                .and_then(|g| g.mul(&up))
-                .map_err(|e| ModelError::Forward(format!("MoE: shared swiglu: {e}")))?,
-        };
+        let h = self.act_mul(&gate, &up)?;
         let y = self.to_compute(shared.down.forward(&h)?)?;
+        if self.cfg.ext.shared_ungated {
+            return Ok(y);
+        }
         let g = x
             .to_dtype(DType::F32)
             .and_then(|xf| xf.linear(&shared.router))

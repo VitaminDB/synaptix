@@ -1577,6 +1577,7 @@ impl DecoderModel {
                         router_key: None,
                         per_expert_scale: None,
                         activation: cfg.activation,
+                        ext: Default::default(),
                     };
                     let prefix = format!("model.layers.{l}.mlp");
                     Ffn::Moe(match &expert_cache {
@@ -1628,6 +1629,7 @@ impl DecoderModel {
                         router_key: Some("router.proj.weight".into()),
                         per_expert_scale: Some(per_expert_scale),
                         activation: cfg.activation,
+                        ext: Default::default(),
                     };
                     let prefix = format!("model.layers.{l}");
                     let ffn = match &expert_cache {
@@ -3870,6 +3872,12 @@ impl Mlp {
                 Err(e) => Err(ModelError::Forward(e.to_string())),
             },
             Activation::GeluTanh => Ok(gate.gelu_tanh().coerr()?.mul(&up).coerr()?),
+            Activation::SwigluOai => {
+                let lim = Activation::SWIGLU_OAI_LIMIT;
+                let g = gate.clamp(-3.0e4, lim).coerr()?;
+                let glu = g.mul_scalar(Activation::SWIGLU_OAI_ALPHA).coerr()?.sigmoid().coerr()?.mul(&g).coerr()?;
+                Ok(up.clamp(-lim, lim).coerr()?.add_scalar(1.0).coerr()?.mul(&glu).coerr()?)
+            }
         })?;
         prof(dev, "mlp_down", || self.down_proj.forward(&gated))
     }

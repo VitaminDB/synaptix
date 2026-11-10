@@ -8,6 +8,13 @@ pub enum NormGain {
 pub enum Activation {
     Silu,
     GeluTanh,
+    /// MiniMax M3 (`swigluoai`): `g = min(gate, 7)`, `g·σ(1,702·g)·(clamp(up, ±7) + 1)`.
+    SwigluOai,
+}
+
+impl Activation {
+    pub const SWIGLU_OAI_ALPHA: f32 = 1.702;
+    pub const SWIGLU_OAI_LIMIT: f32 = 7.0;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
