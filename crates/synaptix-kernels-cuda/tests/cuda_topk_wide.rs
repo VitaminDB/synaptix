@@ -86,3 +86,44 @@ fn wide_topk_respects_valid_prefix() {
     // кандидатов меньше, чем слотов.
     check(32, 2048, 128, |r| 40 + r * 60);
 }
+
+/// Отбор детерминирован: при равных оценках (нули после relu) добираются
+/// блоки с наименьшими индексами, выдача — по возрастанию индекса, повторный
+/// запуск даёт те же байты. Гонка в этом месте делала выбор блоков
+/// разреженного внимания случайным от запуска к запуску.
+#[test]
+fn ties_are_broken_by_index_and_output_is_sorted() {
+    if !ready() {
+        return;
+    }
+    let device = Device::Cuda(0);
+    let (rows, cols, k) = (3usize, 5000usize, 512usize);
+    // Положительных оценок меньше k: остальное — нули, из них берутся первые.
+    let mut data = vec![0f32; rows * cols];
+    for r in 0..rows {
+        for j in 0..200 {
+            data[r * cols + (j * 23 + r * 7 + 11) % cols] = 0.5 + j as f32 * 0.01;
+        }
+    }
+    let valid = vec![cols as u32, 4000u32, 600u32];
+    let scores = Tensor::from_vec(data.clone(), vec![rows, cols], device).expect("скоры");
+    let valid_t = Tensor::from_vec(valid.clone(), vec![rows], device).expect("valid");
+    let run = || -> Vec<u32> {
+        scores.topk_wide(&valid_t, k).and_then(|t| t.to_device(Device::Cpu)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<u32>()).expect("top-k")
+    };
+    let first = run();
+    for _ in 0..20 {
+        assert_eq!(run(), first, "повторный запуск дал другой отбор");
+    }
+    for r in 0..rows {
+        let n = valid[r] as usize;
+        let row = &data[r * cols..r * cols + n];
+        let got = &first[r * k..(r + 1) * k];
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "строка {r}: индексы не по возрастанию");
+        let positive: Vec<u32> = (0..n as u32).filter(|i| row[*i as usize] > 0.0).collect();
+        let mut want: Vec<u32> = positive.clone();
+        want.extend((0..n as u32).filter(|i| row[*i as usize] == 0.0).take(k - positive.len()));
+        want.sort_unstable();
+        assert_eq!(got, want.as_slice(), "строка {r}: при равных оценках ждём наименьшие индексы");
+    }
+}

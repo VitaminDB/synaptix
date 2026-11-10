@@ -92,3 +92,67 @@ extern "C" __global__ void gemv_mxfp8_e4m3_grouped(
   if (lane == 0)
     out[grow] = SYN_TO_OUT(acc);
 }
+
+// MXFP8 GEMV с плотной активацией (W8A16), до 4 строк за один проход по
+// весу: out[M, N] = x[M, K] · Wᵀ. Активация F16 не квантуется — точнее пути
+// с fp8-активацией и одинаково считает строку что в одиночном шаге декода,
+// что в паре «токен + драфт» (тот же порядок суммирования на строку).
+// Шаблон по M держит аккумуляторы в регистрах.
+template <int M>
+__device__ __forceinline__ void gemv_mxfp8_a16_impl(const __nv_fp8_e4m3 *__restrict__ w,
+                                                    const unsigned char *__restrict__ sw,
+                                                    const __half *__restrict__ x,
+                                                    syn_out_t *__restrict__ out, int N, int K) {
+  const int warps = blockDim.x >> 5;
+  const int row = blockIdx.x * warps + (threadIdx.x >> 5);
+  if (row >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  const int kb = K / 32;
+  float acc[M];
+#pragma unroll
+  for (int r = 0; r < M; r++)
+    acc[r] = 0.f;
+  for (int b = lane; b < kb; b += 32) {
+    const float sw_v = __uint_as_float((unsigned)sw[(long)row * kb + b] << 23);
+    const uint4 *wp = reinterpret_cast<const uint4 *>(w + (long)row * K + (long)b * 32);
+    uint4 wv[2] = {wp[0], wp[1]};
+    const __nv_fp8_e4m3 *wb = reinterpret_cast<const __nv_fp8_e4m3 *>(wv);
+    float wf[32];
+#pragma unroll
+    for (int i = 0; i < 32; i++)
+      wf[i] = float(wb[i]);
+#pragma unroll
+    for (int r = 0; r < M; r++) {
+      const uint4 *xp = reinterpret_cast<const uint4 *>(x + (long)r * K + (long)b * 32);
+      uint4 xv[4] = {xp[0], xp[1], xp[2], xp[3]};
+      const __half *xh = reinterpret_cast<const __half *>(xv);
+      float dot = 0.f;
+#pragma unroll
+      for (int i = 0; i < 32; i++)
+        dot += wf[i] * __half2float(xh[i]);
+      acc[r] += sw_v * dot;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < M; r++) {
+    float a = acc[r];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      a += __shfl_down_sync(0xffffffffu, a, o);
+    if (lane == 0)
+      out[(long)r * N + row] = SYN_TO_OUT(a);
+  }
+}
+
+#define GEMV_MXFP8_A16(NAME, M)                                                              \
+  extern "C" __global__ void NAME(const __nv_fp8_e4m3 *__restrict__ w,                       \
+                                  const unsigned char *__restrict__ sw,                      \
+                                  const __half *__restrict__ x, syn_out_t *__restrict__ out, \
+                                  int N, int K) {                                            \
+    gemv_mxfp8_a16_impl<M>(w, sw, x, out, N, K);                                             \
+  }
+GEMV_MXFP8_A16(gemv_mxfp8_a16_m1, 1)
+GEMV_MXFP8_A16(gemv_mxfp8_a16_m2, 2)
+GEMV_MXFP8_A16(gemv_mxfp8_a16_m3, 3)
+GEMV_MXFP8_A16(gemv_mxfp8_a16_m4, 4)

@@ -17,6 +17,7 @@ pub struct GemvMxfp8Kernels {
     _module: Arc<CudaModule>,
     gemv: CudaFunction,
     grouped: CudaFunction,
+    a16: [CudaFunction; 4],
 }
 
 static CACHE: OnceLock<Mutex<Vec<(usize, Arc<GemvMxfp8Kernels>)>>> = OnceLock::new();
@@ -58,9 +59,16 @@ impl GemvMxfp8Kernels {
         let module = compile_module_with_opts(ctx, src, name, opts, None)?;
         let gemv = load_fn(&module, "gemv_mxfp8_e4m3")?;
         let grouped = load_fn(&module, "gemv_mxfp8_e4m3_grouped")?;
+        let a16 = [
+            load_fn(&module, "gemv_mxfp8_a16_m1")?,
+            load_fn(&module, "gemv_mxfp8_a16_m2")?,
+            load_fn(&module, "gemv_mxfp8_a16_m3")?,
+            load_fn(&module, "gemv_mxfp8_a16_m4")?,
+        ];
         let new = Arc::new(Self {
             gemv,
             grouped,
+            a16,
             _module: module,
         });
         cache.lock().push((key, new.clone()));
@@ -157,6 +165,37 @@ pub fn gemv_mxfp8_grouped(
             shared_mem_bytes: 0,
         })
         .map_err(|e| SynaptixError::Cuda(format!("launch gemv_mxfp8_grouped: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// MXFP8 GEMV с плотной F16-активацией (W8A16), `m` = 1…4 строк за один
+/// проход по весу: `out[m, n] = x[m, k] · Wᵀ`. Выход — f16 или bf16 по модулю.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_mxfp8_a16(
+    kernels: &GemvMxfp8Kernels,
+    stream: &Arc<CudaStream>,
+    w: &CudaSlice<u8>,
+    sw: &CudaSlice<u8>,
+    x: &CudaView<f16>,
+    out: &mut CudaViewMut<f16>,
+    n: u32,
+    k: u32,
+    m: u32,
+) -> Result<()> {
+    if n == 0 || m == 0 {
+        return Ok(());
+    }
+    if m > 4 || k % 32 != 0 {
+        return Err(SynaptixError::Unsupported("gemv_mxfp8_a16: до 4 строк, K кратно 32"));
+    }
+    let grid = n.div_ceil(WARPS);
+    let (ni, ki) = (n as i32, k as i32);
+    let mut bld = stream.launch_builder(&kernels.a16[m as usize - 1]);
+    bld.arg(w).arg(sw).arg(x).arg(&mut *out).arg(&ni).arg(&ki);
+    unsafe {
+        bld.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| SynaptixError::Cuda(format!("launch gemv_mxfp8_a16: {e:?}")))?;
     }
     Ok(())
 }

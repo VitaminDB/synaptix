@@ -61,7 +61,11 @@ pub fn topk_wide_f32(
         shared_mem_bytes: 0,
     };
     let mut bld = stream.launch_builder(&kernels.f32);
-    bld.arg(scores).arg(valid).arg(out).arg(&rows).arg(&cols).arg(&k);
+    // При равных оценках (нули после relu) добирать самые свежие блоки
+    // вместо самых старых: `SYN_TOPK_WIDE_RECENT=1` (опыт; по умолчанию — как torch.topk).
+    static RECENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let recent = *RECENT.get_or_init(|| (std::env::var("SYN_TOPK_WIDE_RECENT").as_deref() == Ok("1")) as u32);
+    bld.arg(scores).arg(valid).arg(out).arg(&rows).arg(&cols).arg(&k).arg(&recent);
     unsafe {
         bld.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch topk_wide: {e:?}")))?;

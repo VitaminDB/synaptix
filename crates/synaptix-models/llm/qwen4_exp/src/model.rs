@@ -774,6 +774,14 @@ impl Qwen4ExpModel {
         Ok((out, traced))
     }
 
+    /// Пара «токен + драфт» с послойной трассировкой (отладка расхождений
+    /// парного шага с декодом по одному токену, пример `pair_trace`).
+    pub fn forward_pair_traced(&self, tokens: &[u32], cache: &mut ModelCache) -> Result<(Tensor, Vec<(String, Tensor)>), ModelError> {
+        let opts = RunOpts { trace: Trace::Full, split: Some(1), rope: RopePositions::Sequential };
+        let (out, traced, _) = self.run(tokens, &[], cache, opts)?;
+        Ok((out, traced))
+    }
+
     /// Прогон пары «токен + драфт» одним проходом. Кроме скрытых состояний
     /// обеих позиций отдаёт снимок кэша на границе между ними: если драфт не
     /// подтвердился, откатывать надо только его.

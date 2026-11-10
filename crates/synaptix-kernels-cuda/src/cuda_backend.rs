@@ -697,6 +697,24 @@ impl Backend for CudaBackend {
 
                 let mk = (m as usize) * k;
                 let mn = (m as usize) * nn;
+                // Декод и пара «токен + драфт» (до 4 строк), F16: вес читается
+                // один раз на все строки, активация не квантуется — строка
+                // считается одинаково в одиночном шаге и в паре, и точнее пути
+                // с fp8-активацией. `SYN_MXFP8_GEMV_A16=0` — прежние пути.
+                if m as usize <= 4 && !bf16 && mxfp8_gemv_a16_on() {
+                    let gv = crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context(&ctx)?;
+                    let x_view = unsafe { x_buf.slice().transmute::<f16>(mk) }.ok_or_else(|| {
+                        SynaptixError::Cuda("linear_quant MXFP8: transmute x→f16".into())
+                    })?;
+                    let mut out_view =
+                        unsafe { out_buf.slice_mut().transmute_mut::<f16>(mn) }.ok_or_else(|| {
+                            SynaptixError::Cuda("linear_quant MXFP8: transmute out→f16".into())
+                        })?;
+                    crate::best_cu::gemv::gemv_mxfp8::gemv_mxfp8_a16(
+                        &gv, &stream, w_packed, w_scales, &x_view, &mut out_view, nn as u32, k as u32, m as u32,
+                    )?;
+                    return Ok(());
+                }
                 if m == 1 {
                     let gv = if bf16 {
                         crate::best_cu::gemv::gemv_mxfp8::GemvMxfp8Kernels::for_context_bf16(&ctx)?
@@ -7460,6 +7478,11 @@ fn fp8_attention_applies(dtype: DType, d: usize, causal: bool, h: usize, hkv: us
 }
 
 /// До скольких строк линейный слой считается GEMV по строкам.
+fn mxfp8_gemv_a16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_MXFP8_GEMV_A16").as_deref() != Ok("0"))
+}
+
 fn small_m_gemv_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("SYN_LINEAR_GEMV_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))

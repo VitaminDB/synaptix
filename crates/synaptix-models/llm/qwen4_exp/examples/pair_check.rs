@@ -67,14 +67,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    // A: по одному токену.
-    let mut ca = pipeline.make_cache(n + 8)?;
-    prefill(&mut ca)?;
-    let mut la: Vec<Vec<f32>> = Vec::with_capacity(n - pre);
-    for i in pre..n {
-        la.push(log_softmax(host(&m.forward_last(&[ids[i]], &mut ca)?)?));
-    }
-    drop(ca);
+    // A: по одному токену (дважды — детерминизм префилла и одиночного шага).
+    let run_single = || -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        let mut ca = pipeline.make_cache(n + 8)?;
+        prefill(&mut ca)?;
+        let mut la: Vec<Vec<f32>> = Vec::with_capacity(n - pre);
+        for i in pre..n {
+            la.push(log_softmax(host(&m.forward_last(&[ids[i]], &mut ca)?)?));
+        }
+        Ok(la)
+    };
+    let la = run_single()?;
+    let la2 = run_single()?;
+    let first_diff = la.iter().zip(&la2).position(|(x, y)| x != y);
+    let det_a = la.iter().zip(&la2).map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max)).fold(0f32, f32::max);
+    println!("детерминизм одиночного пути (с префиллом): наибольшее расхождение {det_a:.6}, первая отличная позиция {:?}", first_diff.map(|i| pre + i));
 
     // B: парами, каждая четвёртая — с откатом.
     let run_pairs = || -> Result<(Vec<Vec<f32>>, Vec<Kind>), Box<dyn std::error::Error>> {

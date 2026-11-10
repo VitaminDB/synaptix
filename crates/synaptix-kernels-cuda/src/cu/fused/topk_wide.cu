@@ -29,12 +29,16 @@ extern "C" __global__ void topk_wide_f32(
     unsigned int* __restrict__ out,
     unsigned int rows,
     unsigned int cols,
-    unsigned int k
+    unsigned int k,
+    unsigned int recent
 ) {
     __shared__ unsigned int hist[TW_BINS];
     __shared__ unsigned int shared_prefix;
     __shared__ unsigned int shared_bin;
     __shared__ unsigned int taken;
+    __shared__ unsigned int cnt_above[1024];
+    __shared__ unsigned int cnt_equal[1024];
+    __shared__ unsigned int cnt_skip[1024];
 
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
@@ -138,24 +142,73 @@ extern "C" __global__ void topk_wide_f32(
     __syncthreads();
     unsigned int thresh = shared_bin;   // старшие 24 бита порога
 
-    // Всё, что строго выше порога, входит наверняка: таких меньше k.
-    for (unsigned int i = tid; i < n; i += bs) {
+    // Отбор детерминирован: кто вошёл и в каком порядке, от запуска к запуску
+    // не меняется. Прежний вариант раздавал слоты атомиком — при равных
+    // оценках (после relu их много: нулевые блоки) набор выбранных блоков
+    // зависел от гонки нитей, и ответ модели на длинном контексте плавал.
+    // Здесь: всё, что строго выше порога, входит; равные порогу добираются
+    // до k по индексу (с начала строки или, при `recent`, с конца); выход —
+    // по возрастанию индекса.
+    // Нить ведёт сплошной отрезок строки, слоты — по префиксным суммам.
+    unsigned int seg = (n + bs - 1u) / bs;
+    unsigned int lo = tid * seg;
+    unsigned int hi = lo + seg < n ? lo + seg : n;
+    unsigned int ca = 0, ce = 0;
+    for (unsigned int i = lo; i < hi; ++i) {
         unsigned int bits = __float_as_uint(src[i]) >> 8;
-        if (bits > thresh) {
-            unsigned int slot = atomicAdd(&taken, 1u);
-            if (slot < k) dst[slot] = i;
+        ca += bits > thresh;
+        ce += bits == thresh;
+    }
+    cnt_above[tid] = ca;
+    cnt_equal[tid] = ce;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned int total_above = 0;
+        for (unsigned int t = 0; t < bs; ++t) total_above += cnt_above[t];
+        unsigned int need = total_above < k ? k - total_above : 0u;   // сколько равных добрать
+        // Квота равных по нитям: с начала строки (наименьшие индексы — как у
+        // torch.topk) либо с конца (самые свежие блоки, `recent`).
+        if (recent) {
+            for (int t = (int)bs - 1; t >= 0; --t) {
+                unsigned int e = cnt_equal[t];
+                unsigned int take = need < e ? need : e;
+                cnt_skip[t] = e - take;
+                cnt_equal[t] = take;
+                need -= take;
+            }
+        } else {
+            for (unsigned int t = 0; t < bs; ++t) {
+                unsigned int e = cnt_equal[t];
+                unsigned int take = need < e ? need : e;
+                cnt_skip[t] = 0u;
+                cnt_equal[t] = take;
+                need -= take;
+            }
         }
+        unsigned int slot = 0;
+        for (unsigned int t = 0; t < bs; ++t) {
+            unsigned int a = cnt_above[t];
+            cnt_above[t] = slot;                          // первый слот нити
+            slot += a + cnt_equal[t];
+        }
+        taken = slot < k ? slot : k;
     }
     __syncthreads();
-
-    // Равные порогу добираются до k — их порядок не определён, как и у
-    // отбора на процессоре при равных значениях.
-    for (unsigned int i = tid; i < n; i += bs) {
-        if (taken >= k) break;
-        unsigned int bits = __float_as_uint(src[i]) >> 8;
-        if (bits == thresh) {
-            unsigned int slot = atomicAdd(&taken, 1u);
-            if (slot < k) dst[slot] = i;
+    {
+        unsigned int slot = cnt_above[tid];
+        unsigned int skip = cnt_skip[tid];
+        unsigned int quota = cnt_equal[tid];
+        for (unsigned int i = lo; i < hi; ++i) {
+            unsigned int bits = __float_as_uint(src[i]) >> 8;
+            bool in = bits > thresh;
+            if (bits == thresh) {
+                if (skip > 0u) --skip;
+                else if (quota > 0u) { in = true; --quota; }
+            }
+            if (in) {
+                if (slot < k) dst[slot] = i;
+                ++slot;
+            }
         }
     }
     __syncthreads();
