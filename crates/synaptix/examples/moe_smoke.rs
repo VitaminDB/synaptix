@@ -143,6 +143,7 @@ fn config_from_bundle(path: &PathBuf) -> anyhow::Result<MoeConfig> {
         router_key: None,
         per_expert_scale: None,
         activation: synaptix_llm_common::Activation::Silu,
+        ext: Default::default(),
     })
 }
 

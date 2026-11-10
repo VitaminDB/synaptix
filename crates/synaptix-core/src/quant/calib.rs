@@ -37,6 +37,7 @@ static STATS: Mutex<BTreeMap<String, InputStats>> = Mutex::new(BTreeMap::new());
 
 pub fn start() {
     STATS.lock().unwrap().clear();
+    GRAMS.lock().unwrap().clear();
     ACTIVE.store(true, Ordering::Release);
 }
 
@@ -68,6 +69,40 @@ pub fn record(weight_name: &str, x: &Tensor) -> Result<()> {
     }
     e.rows += rows as u64;
     Ok(())
+}
+
+static GRAMS: Mutex<BTreeMap<String, InputStats>> = Mutex::new(BTreeMap::new());
+
+/// Суффикс ключа матрицы вторых моментов входа (`E[x·xᵀ]`, `[k·k]` построчно).
+pub const GRAM_SUFFIX: &str = "@gram";
+
+/// Накопить `XᵀX` входа `x` `[.., k]` под именем `weight_name` — для
+/// компенсации ошибки квантования (`quant::gptq`). Сумма копится на хосте в f64.
+pub fn record_gram(weight_name: &str, x: &Tensor) -> Result<()> {
+    if !active() {
+        return Ok(());
+    }
+    let dims = x.dims().to_vec();
+    let k = *dims.last().ok_or(SynaptixError::Unsupported("calib::record_gram: скаляр"))?;
+    let rows: usize = dims[..dims.len() - 1].iter().product();
+    let xf = x.to_dtype(DType::F32)?.reshape((rows, k))?.contiguous()?;
+    let g = xf.t()?.contiguous()?.matmul(&xf)?;
+    let v = g.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut map = GRAMS.lock().unwrap();
+    let e = map.entry(weight_name.to_string()).or_insert_with(|| InputStats { sum_sq: vec![0.0; k * k], rows: 0 });
+    if e.sum_sq.len() != k * k {
+        return Err(SynaptixError::Other(format!("calib: {weight_name}: грам {k}² вместо {}", e.sum_sq.len())));
+    }
+    for (a, b) in e.sum_sq.iter_mut().zip(&v) {
+        *a += *b as f64;
+    }
+    e.rows += rows as u64;
+    Ok(())
+}
+
+/// Забрать накопленные матрицы вторых моментов: ключи `<имя>@gram`.
+pub fn take_grams() -> BTreeMap<String, InputStats> {
+    std::mem::take(&mut *GRAMS.lock().unwrap()).into_iter().map(|(k, v)| (format!("{k}{GRAM_SUFFIX}"), v)).collect()
 }
 
 pub fn save(path: &Path, stats: &BTreeMap<String, InputStats>) -> std::io::Result<()> {

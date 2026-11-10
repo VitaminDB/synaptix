@@ -2338,6 +2338,8 @@ impl MoeFfn {
         let ferr = |e: SynError| ModelError::Forward(format!("MoE калибровка: {e}"));
         let (experts, weights) = self.route(router_in.unwrap_or(x))?;
         self.prefetch(&experts, &weights, false);
+        // Связи между входами слоя — общие на всех экспертов (вход у них один).
+        calib::record_gram(&format!("{}.experts.gate_up_proj", self.prefix), x).map_err(ferr)?;
         let mut order: Vec<u32> = (0..(t * k) as u32).collect();
         order.sort_unstable_by_key(|p| (experts[*p as usize], *p));
         let rows: Vec<u32> = order.iter().map(|p| *p / k as u32).collect();

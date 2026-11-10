@@ -96,6 +96,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rows: Vec<u64> = stats.values().map(|s| s.rows).collect();
     let rare = rows.iter().filter(|r| **r < 64).count();
     shrink(&mut stats, env("CALIB_PRIOR", 64) as f64);
+    // Матрицы связей входов слоёв (`<стопка>@gram`) — для компенсации ошибки.
+    let grams = calib::take_grams();
+    let n_grams = grams.len();
+    stats.extend(grams);
+    eprintln!("матриц связей входов: {n_grams}");
     calib::save(&out, &stats)?;
     println!(
         "калибровка: {} — {seen} матриц экспертов, из них {rare} видели меньше 64 строк; {n} токенов за {:.0} с",

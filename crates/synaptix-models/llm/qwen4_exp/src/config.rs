@@ -224,6 +224,7 @@ impl Qwen4ExpConfig {
             router_key: None,
             per_expert_scale: None,
             activation: synaptix_llm_common::Activation::Silu,
+            ext: Default::default(),
         };
 
         let ple_layer_ids: Vec<usize> = text
