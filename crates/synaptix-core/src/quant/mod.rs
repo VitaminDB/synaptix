@@ -8,6 +8,7 @@
 
 pub mod ggml;
 pub mod ggml_dequant;
+pub mod ggml_lowbit;
 pub mod ggml_tables;
 pub mod calib;
 pub mod q8row;
