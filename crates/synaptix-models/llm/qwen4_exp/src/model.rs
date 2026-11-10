@@ -1068,6 +1068,7 @@ impl Qwen4ExpModel {
         if let Some(g) = &slot.graph {
             copy_into_fixed(&g.input, hidden)?;
             launch(g)?;
+            crate::seg_graph::LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let out = g.output.clone();
             if pair {
                 push_pair_snaps(cache, snaps);
@@ -1076,6 +1077,7 @@ impl Qwen4ExpModel {
             return Ok(Some(out));
         }
         if slot.failed || slot.warm < crate::seg_graph::WARM_STEPS {
+            crate::seg_graph::EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             slot.warm += 1;
             cache.seg.slots.insert(key, slot);
             return Ok(None);
@@ -1100,6 +1102,7 @@ impl Qwen4ExpModel {
             Ok(graph) => {
                 let g = SegGraph { graph, input, output };
                 launch(&g)?;
+                crate::seg_graph::CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let out = g.output.clone();
                 slot.graph = Some(g);
                 if pair {
@@ -1157,7 +1160,7 @@ impl Qwen4ExpModel {
             && matches!(self.device, Device::Cuda(_))
             && self.compute == DType::F16
             && ((s == 1 && split.is_none()) || (s == 2 && split == Some(1)))
-            && opts.trace == Trace::Off
+            && opts.trace != Trace::Full
             && !crate::norm::profiling()
             && !predict_probe::on()
             && prefetch_k() == 0

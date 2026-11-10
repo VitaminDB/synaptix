@@ -30,6 +30,16 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_GRAPH").as_deref() == Ok("1"))
 }
 
+/// Счётчики для отладки (`SYN_QWEN4EXP_GRAPH_TRACE=1` печатает их в логе хода).
+pub static CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EAGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_GRAPH_TRACE").is_ok())
+}
+
 pub struct SegGraph {
     pub graph: Arc<cudarc::driver::CudaGraph>,
     pub input: Tensor,

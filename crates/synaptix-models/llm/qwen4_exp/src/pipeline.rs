@@ -1028,6 +1028,10 @@ impl Qwen4ExpPipeline {
         }
         let decode_ms = decode_start.elapsed().as_millis();
         if let Some((h, p, r)) = self.model.zc_stats() {
+            if crate::seg_graph::trace() {
+                use std::sync::atomic::Ordering::Relaxed;
+                eprintln!("[qwen4_exp] графы декода: захватов {}, запусков {}, обычных проходов отрезка {}", crate::seg_graph::CAPTURES.load(Relaxed), crate::seg_graph::LAUNCHES.load(Relaxed), crate::seg_graph::EAGER.load(Relaxed));
+            }
             eprintln!("[qwen4_exp] zero-copy: попаданий в слоты {:.1} % ({h} из {p}), резидентов {r}", 100.0 * h as f64 / p.max(1) as f64);
         }
         if let (Some(cache), Some(st)) = (self.model.expert_cache(), self.model.expert_cache_stats())
