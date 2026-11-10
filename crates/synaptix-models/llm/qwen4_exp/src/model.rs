@@ -1063,7 +1063,7 @@ impl Qwen4ExpModel {
             }
         };
         let launch = |g: &SegGraph| -> Result<(), ModelError> {
-            g.graph.launch().map_err(|e| ModelError::Forward(format!("граф декода, слои {l0}..{l1}: запуск: {e:?}")))
+            g.graph.0.launch().map_err(|e| ModelError::Forward(format!("граф декода, слои {l0}..{l1}: запуск: {e:?}")))
         };
         if let Some(g) = &slot.graph {
             copy_into_fixed(&g.input, hidden)?;
@@ -1100,7 +1100,7 @@ impl Qwen4ExpModel {
         };
         match captured {
             Ok(graph) => {
-                let g = SegGraph { graph, input, output };
+                let g = SegGraph { graph: crate::seg_graph::GraphHandle(graph), input, output };
                 launch(&g)?;
                 crate::seg_graph::CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let out = g.output.clone();

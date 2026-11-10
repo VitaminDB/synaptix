@@ -40,8 +40,19 @@ pub fn trace() -> bool {
     *ON.get_or_init(|| std::env::var("SYN_QWEN4EXP_GRAPH_TRACE").is_ok())
 }
 
+/// Граф CUDA как значение, которое можно держать в кэше сессии. Сам
+/// `CudaGraph` — сырые указатели драйвера и потому не `Send`/`Sync`; здесь
+/// он запускается только через `&mut ModelCache` (один поток за раз), а
+/// контекст CUDA привязывается к потоку при запуске (`CudaGraph::launch`).
+pub struct GraphHandle(pub Arc<cudarc::driver::CudaGraph>);
+
+// SAFETY: доступ к графу исключительный (через `&mut` кэша сессии); драйвер
+// CUDA допускает вызовы над одним объектом из разных потоков по очереди.
+unsafe impl Send for GraphHandle {}
+unsafe impl Sync for GraphHandle {}
+
 pub struct SegGraph {
-    pub graph: Arc<cudarc::driver::CudaGraph>,
+    pub graph: GraphHandle,
     pub input: Tensor,
     pub output: Tensor,
 }
@@ -117,5 +128,17 @@ pub fn capture(ord: usize, step: impl FnMut() -> Result<(), ModelError>) -> Resu
         (Ok(g), None) => Ok(g),
         (_, Some(e)) => Err(e),
         (Err(e), None) => Err(ModelError::Forward(format!("граф декода: захват: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Кэш сессии обязан оставаться `Send + Sync`: служба держит сессии в
+    /// глобальных таблицах между потоками.
+    #[test]
+    fn model_cache_is_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<crate::ModelCache>();
+        check::<crate::Qwen4ExpPipeline>();
     }
 }
