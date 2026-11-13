@@ -259,6 +259,32 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
     }
 }
 
+/// Сэмплинг хода с размышлениями: значения пресета размышлений, где они
+/// отличаются от умолчаний схемы (те взяты из пресета без размышлений).
+/// Служба подставляет их под запрос с `thinking`, если пользователь их не
+/// задал сам: у Qwen3.5+ без размышлений `presence_penalty` 1.5 — с ним
+/// штрафуются токены самого рассуждения. Пусто — модель без такого пресета.
+pub fn llm_thinking_sampling(path: &Path) -> Vec<(&'static str, ParamValue)> {
+    let profile = super::sampling::sampling_profile(path);
+    let (Some(think), Some(plain)) = (profile.pick("", true), profile.pick("", false)) else { return Vec::new() };
+    if think.thinking != Some(true) || think.id == plain.id {
+        return Vec::new();
+    }
+    let pairs: [(&'static str, f64, f64); 6] = [
+        ("temperature", think.temperature as f64, plain.temperature as f64),
+        ("top_p", think.top_p as f64, plain.top_p as f64),
+        ("top_k", think.top_k as f64, plain.top_k as f64),
+        ("min_p", think.min_p as f64, plain.min_p as f64),
+        ("repeat_penalty", think.repetition_penalty as f64, plain.repetition_penalty as f64),
+        ("presence_penalty", think.presence_penalty as f64, plain.presence_penalty as f64),
+    ];
+    pairs
+        .into_iter()
+        .filter(|(_, t, p)| t != p)
+        .map(|(k, t, _)| (k, if k == "top_k" { ParamValue::Int(t as i64) } else { ParamValue::Float(t) }))
+        .collect()
+}
+
 fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     let profile = path.map(super::sampling::sampling_profile).unwrap_or_default();
     let template = path.and_then(super::llm::load_template_source).unwrap_or_default();
@@ -309,6 +335,24 @@ mod tests {
         let turbo = param_schema(Task::Music, "acestep", "acestep-v15-turbo", None);
         assert_eq!(turbo.iter().find(|p| p.key == "steps").unwrap().default, Some(ParamValue::Int(8)));
         assert!(param_schema(Task::Ctc, "wav2vec2", "w2v2", None).is_empty());
+    }
+
+    /// `SYNAPTIX_TEST_QWEN4EXP=<бандл Qwen3.8-Flash-Next>`: под размышления —
+    /// температура 1.0, top_p 0.95 и без presence_penalty (у пресета без
+    /// размышлений 0.7 / 0.8 / 1.5).
+    #[test]
+    fn thinking_sampling_of_qwen4exp() {
+        let Some(path) = std::env::var_os("SYNAPTIX_TEST_QWEN4EXP") else { return };
+        let path = std::path::PathBuf::from(path);
+        let schema = param_schema(Task::Llm, "qwen4_exp", "q", Some(&path));
+        let def = |k: &str| schema.iter().find(|s| s.key == k).and_then(|s| s.default.clone());
+        assert_eq!(def("presence_penalty"), Some(ParamValue::Float(1.5)));
+        let t = llm_thinking_sampling(&path);
+        let get = |k: &str| t.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("presence_penalty"), Some(ParamValue::Float(0.0)));
+        assert_eq!(get("temperature"), Some(ParamValue::Float(1.0)));
+        assert_eq!(get("top_p"), Some(ParamValue::Float(0.95f32 as f64)));
+        assert_eq!(get("top_k"), None);
     }
 
     #[test]

@@ -11,7 +11,11 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    /// Сдвиг логита вниз за появление токена в окне (OpenAI-семантика).
+    pub presence_penalty: f32,
     pub frequency_penalty: f32,
+    /// Окно штрафов за повторы по хвосту контекста, токенов; 0 — весь контекст.
+    pub repeat_last_n: usize,
     pub max_new_tokens: usize,
     pub seed: u64,
     pub stop_token_ids: Vec<u32>,
@@ -26,7 +30,9 @@ impl Default for SamplingParams {
             top_k: 0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            repeat_last_n: 64,
             max_new_tokens: 256,
             seed: 0,
             stop_token_ids: Vec::new(),

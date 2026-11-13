@@ -8,7 +8,8 @@ use crate::sampling::multinomial::MultinomialSampler;
 use crate::sampling::logit_processor::TemperatureProcessor;
 use crate::sampling::top_p::TopPProcessor;
 use crate::sampling::top_k::TopKProcessor;
-use crate::sampling::repetition::RepetitionPenaltyProcessor;
+use crate::sampling::repetition::{PresenceFrequencyProcessor, RepetitionPenaltyProcessor};
+use crate::sampling::min_p::MinPProcessor;
 use crate::streaming::StreamingToken;
 use synaptix_ops::rng::Philox4x32;
 
@@ -32,22 +33,31 @@ impl InferPipeline {
         Self { config, forward_fn }
     }
 
+    /// Тот же порядок, что у `synaptix-llm-common::generate`: штрафы →
+    /// температура → top-k → top-p → min-p.
     pub fn build_logit_pipeline(params: &SamplingParams) -> LogitPipeline {
         let mut pipe = LogitPipeline::new();
+        if params.repetition_penalty != 1.0 {
+            pipe = pipe.add(RepetitionPenaltyProcessor { penalty: params.repetition_penalty, last_n: params.repeat_last_n });
+        }
+        if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+            pipe = pipe.add(PresenceFrequencyProcessor {
+                presence: params.presence_penalty,
+                frequency: params.frequency_penalty,
+                last_n: params.repeat_last_n,
+            });
+        }
         if params.temperature > 0.0 && params.temperature != 1.0 {
             pipe = pipe.add(TemperatureProcessor { temperature: params.temperature });
-        }
-        if params.repetition_penalty != 1.0 {
-            pipe = pipe.add(RepetitionPenaltyProcessor {
-                penalty: params.repetition_penalty,
-                last_n: 0,
-            });
         }
         if params.top_k > 0 {
             pipe = pipe.add(TopKProcessor { k: params.top_k });
         }
         if params.top_p < 1.0 {
             pipe = pipe.add(TopPProcessor { p: params.top_p });
+        }
+        if params.min_p > 0.0 {
+            pipe = pipe.add(MinPProcessor { min_p: params.min_p });
         }
         pipe
     }
@@ -78,5 +88,28 @@ impl InferPipeline {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampling::ProcessorContext;
+
+    /// presence/frequency, окно и min-p доходят до логитов (раньше
+    /// `build_logit_pipeline` их молча терял).
+    #[test]
+    fn penalties_and_min_p_are_applied() {
+        let ctx = ProcessorContext { input_ids: vec![0, 1, 1], step: 0, batch_idx: 0 };
+        let params = SamplingParams { presence_penalty: 1.5, frequency_penalty: 0.5, repeat_last_n: 2, ..Default::default() };
+        let mut logits = vec![5.0, 5.0, 5.0];
+        InferPipeline::build_logit_pipeline(&params).process(&mut logits, &ctx).unwrap();
+        // окно 2 — только [1, 1]: токен 0 не штрафуется, токен 1 — 1.5 + 0.5×2
+        assert_eq!(logits, vec![5.0, 2.5, 5.0]);
+
+        let params = SamplingParams { min_p: 0.5, ..Default::default() };
+        let mut logits = vec![10.0, 0.0, 9.9];
+        InferPipeline::build_logit_pipeline(&params).process(&mut logits, &ctx).unwrap();
+        assert!(logits[1] == f32::NEG_INFINITY && logits[0] == 10.0 && logits[2] == 9.9);
     }
 }
