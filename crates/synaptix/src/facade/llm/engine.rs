@@ -616,6 +616,15 @@ impl LlmPipeline {
         }
     }
 
+    /// Эксперты MoE — с карты в RAM (см. `DecoderModel::offload_experts`).
+    fn offload_experts(&mut self, path: &Path) -> Result<bool, LlmError> {
+        match self {
+            Self::Hybrid(p) => p.offload_experts(path).map_err(|e| LlmError(e.to_string())),
+            Self::Gemma4(p) => p.offload_experts().map_err(|e| LlmError(e.to_string())),
+            _ => Ok(false),
+        }
+    }
+
     fn set_block_residency(&mut self, resident: usize) -> Option<usize> {
         match self {
             Self::Qwen3(p) => Some(p.model.set_block_residency(resident)),
@@ -1640,6 +1649,21 @@ impl Llm {
     /// блоков — восьмую часть, минимум два. `false` — отдавать больше нечего.
     pub fn shed_blocks(&self) -> bool {
         let Device::Cuda(ord) = self.device else { return false };
+        // MoE целиком на карте: блоки с экспертами по PCIe не стримятся, зато
+        // эксперты уходят в RAM (лениво из бандла через закреплённое зеркало)
+        // — освобождается почти вся их память, ход повторяется на карте, а не
+        // на CPU (Ornith-1.5-35B-A3B на длинном контексте агента).
+        let offloaded = self.pipeline.lock().map(|mut p| p.offload_experts(&self.model_path));
+        match offloaded {
+            Ok(Ok(true)) => {
+                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+                eprintln!("[synaptix] VRAM: ход упёрся в память — эксперты MoE ушли в RAM, повтор на карте");
+                return true;
+            }
+            Ok(Err(e)) => eprintln!("[synaptix] эксперты в RAM не перевелись: {e}"),
+            _ => {}
+        }
         let Some(resident) = self.resident_blocks() else { return false };
         if resident == 0 {
             return false;

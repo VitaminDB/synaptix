@@ -352,6 +352,14 @@ impl HybridPipeline {
         Ok(me)
     }
 
+    /// Эксперты MoE — с карты в RAM (лениво из бандла через закреплённое
+    /// зеркало): модели целиком на карте не хватило памяти на ход.
+    pub fn offload_experts(&mut self, path: impl AsRef<Path>) -> Result<bool, PipelineError> {
+        let weights = HybridWeights::load(path, self.model.device, self.model.dtype)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        self.model.offload_experts(&weights).map_err(|e| PipelineError::Model(e.to_string()))
+    }
+
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }

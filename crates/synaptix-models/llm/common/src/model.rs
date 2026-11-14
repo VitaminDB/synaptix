@@ -143,6 +143,25 @@ pub fn set_offload_mode(mode: OffloadMode) {
     OFFLOAD_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Стопки экспертов модели в бандле (`None` — источник не квантованный
+/// бандл или у слоёв нет квантованных стопок): MoE-слои Qwen-MoE —
+/// `model.layers.N.mlp`, ветка экспертов Gemma-4 — `model.layers.N`, в
+/// именах источника ([`WeightSource::source_key`]).
+fn expert_stacks_for(cfg: &DecoderConfig, weights: &dyn WeightSource) -> Option<std::sync::Arc<crate::expert_mirror::ExpertStacks>> {
+    let loader = weights.bundle_loader()?;
+    let prefixes = (0..cfg.num_hidden_layers).map(|l| {
+        if cfg.moe_ffn_at(l).is_some() {
+            Some(weights.source_key(&format!("model.layers.{l}.mlp")))
+        } else if cfg.moe_branch().is_some() {
+            Some(weights.source_key(&format!("model.layers.{l}")))
+        } else {
+            None
+        }
+    });
+    let stacks = std::sync::Arc::new(crate::expert_mirror::ExpertStacks::from_prefixes(loader, prefixes));
+    (0..cfg.num_hidden_layers).any(|l| crate::expert_mirror::has_lazy_stacks(&*stacks, l)).then_some(stacks)
+}
+
 pub fn offload_mode() -> OffloadMode {
     // `SYN_OFFLOAD=resident|offload|auto` — принудительно, поверх настройки
     // процесса (отладка и замеры).
@@ -1275,28 +1294,13 @@ impl DecoderModel {
         // Эксперты в RAM из квантованного бандла — лениво, срезом стопки при
         // промахе кэша, через закреплённое зеркало (DMA ~40 ГБ/с), а не
         // копией всех экспертов в обычной RAM (8–12 ГБ/с через страничный кэш).
-        let (expert_source, host_mirror) = match (expert_offload, weights.bundle_loader()) {
-            (true, Some(loader)) => {
-                let prefixes = (0..cfg.num_hidden_layers).map(|l| {
-                    if cfg.moe_ffn_at(l).is_some() {
-                        Some(weights.source_key(&format!("model.layers.{l}.mlp")))
-                    } else if cfg.moe_branch().is_some() {
-                        Some(weights.source_key(&format!("model.layers.{l}")))
-                    } else {
-                        None
-                    }
-                });
-                let stacks = std::sync::Arc::new(crate::expert_mirror::ExpertStacks::from_prefixes(loader, prefixes));
-                let lazy = (0..cfg.num_hidden_layers).any(|l| crate::expert_mirror::has_lazy_stacks(&*stacks, l));
-                if lazy {
-                    let mirror = crate::expert_mirror::host_mirror(&crate::expert_mirror::mirror_ranges(&*stacks, device), "llm");
-                    eprintln!("[llm] эксперты в RAM: читаются из бандла по одному{}", if mirror.is_some() { " через закреплённое зеркало" } else { "" });
-                    (Some(stacks), mirror.map(|(g, _)| g))
-                } else {
-                    (None, None)
-                }
+        let (expert_source, host_mirror) = match expert_offload.then(|| expert_stacks_for(cfg, weights)).flatten() {
+            Some(stacks) => {
+                let mirror = crate::expert_mirror::host_mirror(&crate::expert_mirror::mirror_ranges(&*stacks, device), "llm");
+                eprintln!("[llm] эксперты в RAM: читаются из бандла по одному{}", if mirror.is_some() { " через закреплённое зеркало" } else { "" });
+                (Some(stacks), mirror.map(|(g, _)| g))
             }
-            _ => (None, None),
+            None => (None, None),
         };
         // Слой экспертов в оффлоаде: лениво из бандла, если его стопки там
         // квантованы, иначе копией в RAM.
@@ -1822,6 +1826,61 @@ impl DecoderModel {
     /// оффлоаде CUDA-графы недоступны: адреса весов меняются каждый ход.
     pub fn blocks_all_resident(&self) -> bool {
         self.resident_blocks >= self.blocks.len()
+    }
+
+    /// Модели целиком на карте не хватило памяти на ход (длинный префилл):
+    /// эксперты MoE уходят в RAM — лениво из бандла через закреплённое
+    /// зеркало, на карте остаётся кэш, который сам подстраивается под фазу
+    /// (`fit_expert_cache`). Блоки, KV и сессии те же. `false` — переводить
+    /// нечего (эксперты уже в RAM, нет экспертов или источник не бандл).
+    pub fn offload_experts(&mut self, weights: &dyn WeightSource) -> Result<bool, ModelError> {
+        let Device::Cuda(ord) = self.device else { return Ok(false) };
+        if self.expert_cache.is_some() {
+            return Ok(false);
+        }
+        let any_resident = self.blocks.iter().any(|b| {
+            b.mlp.moe().is_some_and(|m| m.experts_resident()) || b.moe.as_ref().is_some_and(|s| s.ffn.experts_resident())
+        });
+        if !any_resident {
+            return Ok(false);
+        }
+        let Some(stacks) = expert_stacks_for(&self.config, weights) else { return Ok(false) };
+        let cache = crate::moe::ExpertCache::new(self.device, 64usize << 30);
+        cache.set_capacity(crate::moe::MIN_CACHE_BYTES);
+        let source: std::sync::Arc<dyn crate::moe::ExpertSource> =
+            std::sync::Arc::new(crate::expert_mirror::BundleExperts::new(stacks.clone()));
+        let mut moved = 0usize;
+        for (l, b) in self.blocks.iter_mut().enumerate() {
+            if !crate::expert_mirror::has_lazy_stacks(&*stacks, l) {
+                continue;
+            }
+            if let Ffn::Moe(m) = &mut b.mlp {
+                if m.experts_resident() {
+                    m.make_lazy(cache.clone(), l, source.clone());
+                    moved += 1;
+                }
+            }
+            if let Some(side) = &mut b.moe {
+                if side.ffn.experts_resident() {
+                    side.ffn.make_lazy(cache.clone(), l, source.clone());
+                    moved += 1;
+                }
+            }
+        }
+        let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let mirror = crate::expert_mirror::host_mirror(&crate::expert_mirror::mirror_ranges(&*stacks, self.device), "llm");
+        if let Some(g) = &mirror {
+            g.0.resume();
+        }
+        eprintln!(
+            "[llm] эксперты {moved} слоёв ушли с карты в RAM{} — место под ход",
+            if mirror.is_some() { " (закреплённое зеркало)" } else { "" }
+        );
+        self.expert_cache = Some(cache);
+        self.host_mirror = mirror.map(|(g, _)| g);
+        self.weights_gen = self.weights_gen.wrapping_add(1);
+        Ok(moved > 0)
     }
 
     /// Оставить на устройстве первые `resident` блоков, остальные отправить на

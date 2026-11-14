@@ -1338,6 +1338,25 @@ impl MoeFfn {
         Ok(me)
     }
 
+    /// Перевести резидентный слой на ленивых экспертов: эксперты карты
+    /// сбрасываются (память уходит пулу), выбранный роутером эксперт дальше
+    /// читается из `source` через общий `cache`. Нужно, когда модели целиком
+    /// на карте не хватило памяти на ход (длинный префилл): блоки, KV и
+    /// сессии остаются те же.
+    pub fn make_lazy(&mut self, cache: Arc<ExpertCache>, layer_id: usize, source: Arc<dyn ExpertSource>) {
+        let count = self.cfg.num_experts;
+        self.experts = ExpertStore::Lazy { source, count };
+        self.cache = Some(cache);
+        self.layer_id = layer_id;
+        self.dev_tables = None;
+        *self.offload_tables.lock().unwrap() = None;
+    }
+
+    /// Эксперты слоя на устройстве целиком (без кэша).
+    pub fn experts_resident(&self) -> bool {
+        self.cache.is_none() && matches!(self.experts, ExpertStore::Resident(ref v) if !v.is_empty())
+    }
+
     /// Веса экспертов остаются в системной памяти, а на устройство едет
     /// только выбранное роутером — через общий [`ExpertCache`]. Всё остальное
     /// (роутер, shared expert) резидентно на `device`, как обычно.

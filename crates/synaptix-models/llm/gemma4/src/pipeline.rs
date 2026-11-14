@@ -257,6 +257,14 @@ impl Gemma4Pipeline {
         Ok(true)
     }
 
+    /// Эксперты MoE — с карты в RAM (лениво из бандла через закреплённое
+    /// зеркало): модели целиком на карте не хватило памяти на ход.
+    pub fn offload_experts(&mut self) -> Result<bool, PipelineError> {
+        let weights = Gemma4Weights::open(&self.model_path, self.model.device, self.model.dtype)
+            .map_err(|e| PipelineError::Load(e.to_string()))?;
+        self.model.offload_experts(&weights).map_err(|e| PipelineError::Load(e.to_string()))
+    }
+
     /// Отпустить башню (её VRAM нужна контексту между ходами с картинками).
     pub fn release_vision(&mut self) {
         self.vision = None;

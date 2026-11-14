@@ -9,7 +9,7 @@ use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader};
 use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
-use synaptix_llm_common::{ModelError, QLinear, WeightSource};
+use synaptix_llm_common::{ModelError, WeightSource};
 
 use crate::config::Qwen4ExpConfig;
 use crate::model::LM_PREFIX;
