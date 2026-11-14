@@ -1609,14 +1609,21 @@ fn fit_cache_to_vram(cache: &Arc<ExpertCache>, cfg: &Qwen4ExpConfig, device: Dev
 
 /// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
 /// остальное — в системной памяти. Размер задаётся
-/// Сколько RAM оставить системе сверх зеркала экспертов: max(24 ГБ, ¼ RAM).
+/// Сколько RAM оставить системе сверх зеркала экспертов: max(16 ГБ, ⅙ RAM);
+/// `SYN_QWEN4EXP_MIRROR_RESERVE_GB` — своё значение. Было max(24 ГБ, ¼ RAM):
+/// на 96 ГБ при 82 ГБ свободных зеркало получало 58 ГБ из 65 ГБ экспертов
+/// NVFP4-бандла, и 2,6 тыс. экспертов читались с NVMe. 10 ГБ запаса мало —
+/// закреплённое зеркало не уходит в своп, и рабочий стол подвисал.
 fn mirror_reserve_bytes() -> usize {
+    if let Some(gb) = std::env::var("SYN_QWEN4EXP_MIRROR_RESERVE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        return (gb.max(0.0) * (1u64 << 30) as f64) as usize;
+    }
     let total = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
         .map(|kb| kb * 1024)
         .unwrap_or(0);
-    (24usize << 30).max(total / 4)
+    (16usize << 30).max(total / 6)
 }
 
 /// Сколько байт RAM свободно под зеркало (MemAvailable из /proc/meminfo).
@@ -1656,7 +1663,7 @@ fn host_mirror_for(
         Some(gb) => (gb * GB) as usize,
         // Зеркало закреплено (pinned) — его не вытеснить в своп, и система
         // выталкивает туда всё остальное: при запасе 10 ГБ на 93 ГБ RAM рабочий
-        // стол подвисал. Оставляем не меньше 24 ГБ и не меньше четверти RAM.
+        // стол подвисал. Запас — `mirror_reserve_bytes`.
         None => avail.saturating_sub(mirror_reserve_bytes()),
     };
     let budget = budget.min(total);
