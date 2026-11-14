@@ -105,6 +105,45 @@ pub fn take_grams() -> BTreeMap<String, InputStats> {
     std::mem::take(&mut *GRAMS.lock().unwrap()).into_iter().map(|(k, v)| (format!("{k}{GRAM_SUFFIX}"), v)).collect()
 }
 
+/// Стянуть статистику экспертов MoE к априорной с весом `n0` строк: редкий
+/// эксперт видит мало строк, и его оценка шумна. Ключи `<стопка>#<эксперт>`.
+/// У `gate_up` — к среднему по слою (вход общий для всех экспертов; среднее
+/// пишется и под ключом `<стопка>` — для экспертов, которых роутер на тексте
+/// не выбрал), у `down` — к ровной (координаты промежуточного вектора у
+/// экспертов свои).
+pub fn shrink_experts(stats: &mut BTreeMap<String, InputStats>, n0: f64) {
+    let mut pooled: BTreeMap<String, InputStats> = BTreeMap::new();
+    for (name, s) in stats.iter() {
+        let Some((base, _)) = name.split_once('#') else { continue };
+        let p = pooled.entry(base.to_string()).or_insert_with(|| InputStats { sum_sq: vec![0.0; s.sum_sq.len()], rows: 0 });
+        for (a, b) in p.sum_sq.iter_mut().zip(&s.sum_sq) {
+            *a += *b;
+        }
+        p.rows += s.rows;
+    }
+    for (name, s) in stats.iter_mut() {
+        let Some((base, _)) = name.split_once('#') else { continue };
+        let p = &pooled[base];
+        let pn = p.rows.max(1) as f64;
+        if base.ends_with("gate_up_proj") {
+            for (a, b) in s.sum_sq.iter_mut().zip(&p.sum_sq) {
+                *a += n0 * b / pn;
+            }
+        } else {
+            let own = s.sum_sq.iter().sum::<f64>() / s.sum_sq.len() as f64 / s.rows.max(1) as f64;
+            for a in s.sum_sq.iter_mut() {
+                *a += n0 * own;
+            }
+        }
+        s.rows += n0 as u64;
+    }
+    for (base, p) in pooled {
+        if base.ends_with("gate_up_proj") {
+            stats.insert(base, p);
+        }
+    }
+}
+
 pub fn save(path: &Path, stats: &BTreeMap<String, InputStats>) -> std::io::Result<()> {
     let mut header = serde_json::Map::new();
     let mut data: Vec<u8> = Vec::new();
@@ -153,4 +192,74 @@ pub fn load(path: &Path) -> std::io::Result<BTreeMap<String, Vec<f32>>> {
         out.insert(name.clone(), raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
     }
     Ok(out)
+}
+
+/// Параметры калибровки языковой модели на тексте.
+pub struct TextCalibOpts {
+    /// Сколько токенов текста взять.
+    pub tokens: usize,
+    /// Окно с чистым кэшем.
+    pub window: usize,
+    /// Кусок префилла.
+    pub chunk: usize,
+    /// Вес априорной оценки редких экспертов, строк ([`shrink_experts`]).
+    pub prior: usize,
+}
+
+impl Default for TextCalibOpts {
+    fn default() -> Self {
+        Self { tokens: 32768, window: 4096, chunk: 1024, prior: 64 }
+    }
+}
+
+pub struct TextCalibReport {
+    pub tokens: usize,
+    /// Матриц со статистикой входов (у MoE — матриц экспертов).
+    pub matrices: usize,
+    /// Из них видели меньше 64 строк.
+    pub rare: usize,
+    /// Матриц связей входов (под компенсацию ошибки).
+    pub grams: usize,
+    pub seconds: f64,
+}
+
+/// Общий прогон калибровки на тексте: `ids` режутся на окна `opts.window`
+/// с чистым кэшем, окно — кусками `opts.chunk`: `step(кусок, окно)`, где у
+/// первого куска окна `окно = Some(длина окна)` — завести чистый кэш; статистика экспертов стягивается и вместе с
+/// матрицами связей пишется в `out` (файл для `synaptix quantize --calib`).
+pub fn calibrate_text<E>(
+    ids: &[u32],
+    out: &Path,
+    opts: &TextCalibOpts,
+    mut step: impl FnMut(&[u32], Option<usize>) -> std::result::Result<(), E>,
+    progress: &dyn Fn(usize, usize),
+) -> std::result::Result<TextCalibReport, E>
+where
+    E: From<std::io::Error>,
+{
+    let n = ids.len().min(opts.tokens);
+    let ids = &ids[..n];
+    start();
+    let t = std::time::Instant::now();
+    let mut done = 0usize;
+    let run: std::result::Result<(), E> = (|| {
+        for win in ids.chunks(opts.window.max(1)) {
+            for (i, part) in win.chunks(opts.chunk.max(1)).enumerate() {
+                step(part, (i == 0).then_some(win.len()))?;
+                done += part.len();
+                progress(done, n);
+            }
+        }
+        Ok(())
+    })();
+    let mut stats = finish();
+    run?;
+    let matrices = stats.len();
+    let rare = stats.values().filter(|s| s.rows < 64).count();
+    shrink_experts(&mut stats, opts.prior as f64);
+    let grams = take_grams();
+    let n_grams = grams.len();
+    stats.extend(grams);
+    save(out, &stats)?;
+    Ok(TextCalibReport { tokens: n, matrices, rare, grams: n_grams, seconds: t.elapsed().as_secs_f64() })
 }

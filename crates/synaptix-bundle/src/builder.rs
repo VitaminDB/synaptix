@@ -1083,8 +1083,15 @@ fn materialise_safetensors_to_file(
         return Err(Error::Safetensors("no safetensors paths provided".into()));
     }
 
-    // Fast path: single shard with no prefix.
-    if sources.len() == 1 && sources[0].paths.len() == 1 && sources[0].prefix.is_none() {
+    // Fast path: single shard with no prefix (и без поштучных экспертов MoE,
+    // которые надо свести в стопки).
+    if sources.len() == 1 && sources[0].paths.len() == 1 && sources[0].prefix.is_none() && {
+        let f = std::fs::File::open(&sources[0].paths[0])?;
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        let st = safetensors::SafeTensors::deserialize(&mmap)?;
+        let names: Vec<String> = st.names().into_iter().map(|n| n.to_string()).collect();
+        expert_stacks(&names).is_empty()
+    } {
         let src = &sources[0].paths[0];
         // Validate via mmap-deserialise (constant-time on header).
         let f = std::fs::File::open(src)?;
@@ -1140,6 +1147,7 @@ fn materialise_safetensors_to_file(
             merged.insert(final_name, view);
         }
     }
+    let merged = stack_experts(merged)?;
 
     // Stream-write the merged stream: safetensors::serialize_to_file writes
     // the header and then each tensor's `.data()` slice via a `BufWriter`.
@@ -1184,6 +1192,107 @@ fn materialise_safetensors_to_file(
         }
     }
     Ok(())
+}
+
+/// Стопка экспертов MoE в бандле: `prefix` → `E` экспертов. Поштучные
+/// `<prefix>.experts.<i>.{gate,up,down}_proj.weight` (так в HF лежат, например,
+/// эксперты MTP-слоя Qwen3.5-MoE) сводятся в `<prefix>.experts.gate_up_proj`
+/// `[E, 2I, H]` (строки gate, затем up — как у fused-формата HF) и
+/// `<prefix>.experts.down_proj` `[E, H, I]` — в том виде, в каком стопки
+/// ждут загрузчик MoE, квантование и кэш экспертов.
+fn expert_stacks(names: &[String]) -> BTreeMap<String, usize> {
+    let mut seen: BTreeMap<String, BTreeSet<(usize, &'static str)>> = BTreeMap::new();
+    for n in names {
+        let Some(base) = n.strip_suffix(".weight") else { continue };
+        let Some((head, proj)) = base.rsplit_once('.') else { continue };
+        let proj: &'static str = match proj {
+            "gate_proj" => "gate_proj",
+            "up_proj" => "up_proj",
+            "down_proj" => "down_proj",
+            _ => continue,
+        };
+        let Some((pre, idx)) = head.rsplit_once('.') else { continue };
+        let Some(prefix) = pre.strip_suffix(".experts") else { continue };
+        let Ok(i) = idx.parse::<usize>() else { continue };
+        seen.entry(prefix.to_string()).or_default().insert((i, proj));
+    }
+    let all: BTreeSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    seen.into_iter()
+        .filter_map(|(prefix, set)| {
+            let e = set.len() / 3;
+            let full = e > 0 && set.len() == 3 * e && (0..e).all(|i| ["gate_proj", "up_proj", "down_proj"].iter().all(|p| set.contains(&(i, *p))));
+            let taken = all.contains(format!("{prefix}.experts.gate_up_proj").as_str()) || all.contains(format!("{prefix}.experts.down_proj").as_str());
+            (full && !taken).then_some((prefix, e))
+        })
+        .collect()
+}
+
+/// Тензор для записи: исходный вид или стопка из нескольких (байты подряд).
+enum MergedView<'a> {
+    Plain(safetensors::tensor::TensorView<'a>),
+    Stack { dtype: safetensors::Dtype, shape: Vec<usize>, parts: Vec<&'a [u8]> },
+}
+
+impl safetensors::View for MergedView<'_> {
+    fn dtype(&self) -> safetensors::Dtype {
+        match self {
+            MergedView::Plain(v) => v.dtype(),
+            MergedView::Stack { dtype, .. } => *dtype,
+        }
+    }
+    fn shape(&self) -> &[usize] {
+        match self {
+            MergedView::Plain(v) => v.shape(),
+            MergedView::Stack { shape, .. } => shape,
+        }
+    }
+    fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            MergedView::Plain(v) => std::borrow::Cow::Borrowed(v.data()),
+            MergedView::Stack { parts, .. } => std::borrow::Cow::Owned(parts.concat()),
+        }
+    }
+    fn data_len(&self) -> usize {
+        match self {
+            MergedView::Plain(v) => v.data().len(),
+            MergedView::Stack { parts, .. } => parts.iter().map(|p| p.len()).sum(),
+        }
+    }
+}
+
+fn stack_experts<'a>(mut merged: BTreeMap<String, safetensors::tensor::TensorView<'a>>) -> Result<BTreeMap<String, MergedView<'a>>> {
+    let names: Vec<String> = merged.keys().cloned().collect();
+    let stacks = expert_stacks(&names);
+    let mut out: BTreeMap<String, MergedView<'a>> = BTreeMap::new();
+    for (prefix, e) in &stacks {
+        let take = |m: &mut BTreeMap<String, safetensors::tensor::TensorView<'a>>, i: usize, p: &str| -> safetensors::tensor::TensorView<'a> {
+            m.remove(&format!("{prefix}.experts.{i}.{p}.weight")).expect("эксперт в списке")
+        };
+        let (mut gu, mut dn) = (Vec::with_capacity(2 * e), Vec::with_capacity(*e));
+        let (mut gshape, mut dshape, mut dtype) = (Vec::new(), Vec::new(), None);
+        for i in 0..*e {
+            let (g, u, d) = (take(&mut merged, i, "gate_proj"), take(&mut merged, i, "up_proj"), take(&mut merged, i, "down_proj"));
+            let dt = *dtype.get_or_insert(g.dtype());
+            if [g.dtype(), u.dtype(), d.dtype()].iter().any(|x| *x != dt) || g.shape().len() != 2 || g.shape() != u.shape() || d.shape().len() != 2 {
+                return Err(Error::Safetensors(format!("{prefix}.experts.{i}: разные dtype/формы gate/up/down — в стопку не свести")));
+            }
+            if i == 0 {
+                gshape = vec![*e, 2 * g.shape()[0], g.shape()[1]];
+                dshape = vec![*e, d.shape()[0], d.shape()[1]];
+            } else if [2 * g.shape()[0], g.shape()[1]] != gshape[1..] || d.shape() != &dshape[1..] {
+                return Err(Error::Safetensors(format!("{prefix}.experts.{i}: форма отличается от эксперта 0")));
+            }
+            gu.push(g.data());
+            gu.push(u.data());
+            dn.push(d.data());
+        }
+        let dtype = dtype.expect("эксперты есть");
+        tracing::info!("[syn-format] {prefix}: {e} поштучных экспертов сведены в стопки gate_up_proj {gshape:?} и down_proj {dshape:?}");
+        out.insert(format!("{prefix}.experts.gate_up_proj"), MergedView::Stack { dtype, shape: gshape, parts: gu });
+        out.insert(format!("{prefix}.experts.down_proj"), MergedView::Stack { dtype, shape: dshape, parts: dn });
+    }
+    out.extend(merged.into_iter().map(|(k, v)| (k, MergedView::Plain(v))));
+    Ok(out)
 }
 
 /// Resolve safetensors files in a HuggingFace-style directory:
@@ -1234,4 +1343,66 @@ pub fn resolve_safetensors_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         return Err(Error::Safetensors(format!("no .safetensors in {}", dir.display())));
     }
     Ok(files.into_iter().collect())
+}
+
+#[cfg(test)]
+mod expert_stack_tests {
+    use super::*;
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// Поштучные эксперты (как MTP-слой Qwen3.5-MoE) сводятся в стопки:
+    /// `gate_up_proj` `[E, 2I, H]` — gate, затем up у каждого эксперта,
+    /// `down_proj` `[E, H, I]`; прочие тензоры остаются как были.
+    #[test]
+    fn per_expert_tensors_become_stacks() {
+        let (e, i, h) = (3usize, 2usize, 4usize);
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        let val = |x: usize, p: usize, r: usize, c: usize| (x * 1000 + p * 100 + r * 10 + c) as f32;
+        for x in 0..e {
+            for (p, name) in ["gate_proj", "up_proj"].iter().enumerate() {
+                let v: Vec<f32> = (0..i * h).map(|k| val(x, p, k / h, k % h)).collect();
+                tensors.push((format!("mtp.layers.0.mlp.experts.{x}.{name}.weight"), vec![i, h], f32_bytes(&v)));
+            }
+            let v: Vec<f32> = (0..h * i).map(|k| val(x, 2, k / i, k % i)).collect();
+            tensors.push((format!("mtp.layers.0.mlp.experts.{x}.down_proj.weight"), vec![h, i], f32_bytes(&v)));
+        }
+        tensors.push(("mtp.fc.weight".into(), vec![2, 2], f32_bytes(&[1.0, 2.0, 3.0, 4.0])));
+        let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensors
+            .iter()
+            .map(|(n, s, b)| (n.clone(), safetensors::tensor::TensorView::new(safetensors::Dtype::F32, s.clone(), b).unwrap()))
+            .collect();
+        let src = dir.path().join("a.safetensors");
+        safetensors::serialize_to_file(views, None, &src).unwrap();
+        let out = dir.path().join("out.safetensors");
+        let source = TensorSource { name: "main".into(), paths: vec![src], prefix: None };
+        materialise_safetensors_to_file(std::slice::from_ref(&source), &out, None).unwrap();
+
+        let bytes = std::fs::read(&out).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut names: Vec<String> = st.names().into_iter().map(|s| s.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["mtp.fc.weight", "mtp.layers.0.mlp.experts.down_proj", "mtp.layers.0.mlp.experts.gate_up_proj"]);
+        let read = |n: &str| -> (Vec<usize>, Vec<f32>) {
+            let t = st.tensor(n).unwrap();
+            (t.shape().to_vec(), t.data().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let (gs, gv) = read("mtp.layers.0.mlp.experts.gate_up_proj");
+        assert_eq!(gs, vec![e, 2 * i, h]);
+        for x in 0..e {
+            for r in 0..2 * i {
+                for c in 0..h {
+                    let (p, rr) = if r < i { (0, r) } else { (1, r - i) };
+                    assert_eq!(gv[(x * 2 * i + r) * h + c], val(x, p, rr, c));
+                }
+            }
+        }
+        let (ds, dv) = read("mtp.layers.0.mlp.experts.down_proj");
+        assert_eq!(ds, vec![e, h, i]);
+        assert_eq!(dv[(2 * h + 3) * i + 1], val(2, 2, 3, 1));
+        assert_eq!(read("mtp.fc.weight").1, vec![1.0, 2.0, 3.0, 4.0]);
+    }
 }

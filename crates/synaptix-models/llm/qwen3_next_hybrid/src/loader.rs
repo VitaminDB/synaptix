@@ -64,6 +64,10 @@ impl HybridWeights {
 }
 
 impl synaptix_llm_common::WeightSource for HybridWeights {
+    fn source_key(&self, key: &str) -> String {
+        Self::bundle_key(key)
+    }
+
     fn tensor(
         &self,
         key: &str,

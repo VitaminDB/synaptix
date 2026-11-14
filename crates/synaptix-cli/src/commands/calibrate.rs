@@ -93,6 +93,26 @@ fn calibrate_llm(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Гибрид Qwen3.5/3.6 с экспертами MoE (Qwen3.5-MoE, MiniCPM-V 4.7 35B-A3B):
+/// модель в MXFP8 (`SYN_CALIB_PRECISION=nvfp4` — в NVFP4, если не помещается).
+fn calibrate_hybrid(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn std::error::Error>> {
+    use synaptix_core::precision::PrecisionConfig;
+    let text = String::from_utf8_lossy(&std::fs::read(&args.audio)?).into_owned();
+    let opts = calib::TextCalibOpts { tokens: args.limit, ..Default::default() };
+    let precision = match std::env::var("SYN_CALIB_PRECISION").as_deref() {
+        Ok("nvfp4") => PrecisionConfig::nvfp4(),
+        _ => PrecisionConfig::mxfp8(),
+    };
+    println!("Calibrate {} (LLM-гибрид, эксперты MoE) на тексте {} — до {} токенов ({:?})", args.model.display(), args.audio.display(), opts.tokens, device);
+    let r = synaptix_llm_qwen3_next_hybrid::calibrate::calibrate(&args.model, &text, &args.output, device, precision, &opts, &|done, n| eprint!("\r  [{done}/{n}]"))?;
+    eprintln!();
+    println!(
+        "Done: {} ({} матриц экспертов, {} видели меньше 64 строк; матриц связей входов {}; {} токенов, {:.1} с)",
+        args.output.display(), r.matrices, r.rare, r.grams, r.tokens, r.seconds
+    );
+    Ok(())
+}
+
 pub fn run(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     synaptix::init()?;
     let device = super::device::resolve(&args.device);
@@ -100,7 +120,8 @@ pub fn run(args: CalibrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     if is_text && !is_omnivoice(&args.model) {
         return match synaptix::facade::arch::detect_llm_arch(&args.model) {
             Ok(synaptix::facade::arch::LlmArch::Qwen4Exp) => calibrate_llm(&args, device),
-            Ok(_) => Err("калибровка языковых моделей на тексте: пока только Qwen4Exp (эксперты MoE)".into()),
+            Ok(synaptix::facade::arch::LlmArch::Hybrid) => calibrate_hybrid(&args, device),
+            Ok(_) => Err("калибровка языковых моделей на тексте: Qwen4Exp и гибрид Qwen3.5/3.6 с экспертами MoE".into()),
             Err(e) => Err(e.into()),
         };
     }

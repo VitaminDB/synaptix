@@ -97,6 +97,7 @@ fn pretty(stem: &str) -> String {
         ("qwen3.8-27b", "Qwen3.8 27B"),
         ("qwen3.8-flash-next", "Qwen3.8 Flash Next"),
         ("qwen3.6 27b", "Qwen3.6 27B"),
+        ("ornith-1.5-35b-a3b", "Ornith 1.5 35B A3B"),
     ];
     known.iter().find(|(k, _)| *k == s).map(|(_, v)| v.to_string()).unwrap_or_else(|| stem.to_string())
 }

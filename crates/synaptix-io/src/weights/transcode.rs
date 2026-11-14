@@ -541,6 +541,9 @@ struct Transfers {
     t: Vec<Option<Tensor>>,
     /// Диагональ матрицы связей (E[x²] по слою) — база поправки на эксперта.
     layer_imp: Vec<f32>,
+    /// Диагональные блоки `U_bb` `[128·128]` (хост) — поколоночная
+    /// компенсация внутри блока у форматов с поэлементным округлением (NVFP4).
+    u: Vec<Vec<f32>>,
 }
 
 /// Компенсация ошибки включена (`SYN_QUANT_GPTQ=0` — выключить), и в
@@ -557,13 +560,13 @@ fn gptq_transfers(name: &str, k: usize, device: Device) -> Result<Option<Arc<Tra
     let built = match synaptix_core::quant::calib::table_get(&format!("{name}{}", synaptix_core::quant::calib::GRAM_SUFFIX)) {
         Some(h) if h.len() == k * k && k % 128 == 0 => {
             let damp: f64 = std::env::var("SYN_QUANT_GPTQ_DAMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.01);
-            let t = synaptix_core::quant::gptq::block_transfers(&h, k, 128, damp).map_err(|e| IoError::Bundle(format!("{name}: {e}")))?;
-            let mut dev = Vec::with_capacity(t.len());
-            for (b, m) in t.into_iter().enumerate() {
+            let f = synaptix_core::quant::gptq::block_factors(&h, k, 128, damp).map_err(|e| IoError::Bundle(format!("{name}: {e}")))?;
+            let mut dev = Vec::with_capacity(f.transfers.len());
+            for (b, m) in f.transfers.into_iter().enumerate() {
                 let rest = k - 128 * (b + 1);
                 dev.push(if rest == 0 { None } else { Some(Tensor::from_vec(m, vec![128, rest], device).map_err(IoError::Core)?) });
             }
-            Some(Arc::new(Transfers { t: dev, layer_imp: (0..k).map(|i| h[i * k + i]).collect() }))
+            Some(Arc::new(Transfers { t: dev, layer_imp: (0..k).map(|i| h[i * k + i]).collect(), u: f.diag }))
         }
         _ => None,
     };
@@ -574,25 +577,34 @@ fn gptq_transfers(name: &str, k: usize, device: Device) -> Result<Option<Arc<Tra
     Ok(built)
 }
 
-/// IQ3_S-128 с компенсацией ошибки: блок 128 столбцов кодируется, его ошибка
-/// переносится на ещё не закодированные столбцы (`quant::gptq`). `imp` —
-/// важность столбцов этой матрицы (эксперта): по ней и взвешивается блок, и
-/// масштабируется перенос относительно общей по слою.
-fn gptq_iq3s128(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: usize) -> synaptix_core::error::Result<Vec<u8>> {
-    use synaptix_core::quant::ggml::GgmlType;
+/// Общий цикл компенсации ошибки: блок 128 столбцов отдаётся кодировщику
+/// `enc(b, блок F32 [n, 128])`, тот сохраняет свои байты и возвращает
+/// деквантованный блок; ошибка блока переносится на ещё не закодированные
+/// столбцы (`quant::gptq`). `imp` — важность столбцов этой матрицы
+/// (эксперта): перенос масштабируется ею относительно общей по слою.
+fn gptq_blocks(
+    dense: &Tensor,
+    imp: Option<&[f32]>,
+    tr: &Transfers,
+    k: usize,
+    mut enc: impl FnMut(usize, &Tensor) -> synaptix_core::error::Result<Tensor>,
+) -> synaptix_core::error::Result<()> {
     let device = dense.device();
-    let nb = k / 128;
-    let bb = GgmlType::Iq3S128.bytes_for(128);
     // d = sqrt(важность эксперта / важность слоя), в разумных пределах.
     let d: Option<Vec<f32>> = imp.map(|e| e.iter().zip(&tr.layer_imp).map(|(a, b)| if *b > 0.0 && *a > 0.0 { (a / b).sqrt().clamp(0.25, 4.0) } else { 1.0 }).collect());
     let mut rest = dense.to_dtype(DType::F32)?;
-    let mut out = vec![0u8; n * nb * bb];
-    for b in 0..nb {
+    for b in 0..k / 128 {
         let width = k - 128 * b;
         let wb = if width == 128 { rest.clone() } else { rest.narrow(1, 0, 128)?.contiguous()? };
-        let q = wb.to_dtype(DType::F16)?.quantize_to_ggml(GgmlType::Iq3S128, imp.map(|h| &h[128 * b..128 * (b + 1)]))?;
-        if let Some(t) = &tr.t[b] {
-            let e = wb.sub(&q.dequantize(DType::F16)?.to_dtype(DType::F32)?)?;
+        let deq = enc(b, &wb)?;
+        if width == 128 {
+            break;
+        }
+        let next = rest.narrow(1, 128, width - 128)?.contiguous()?;
+        rest = match &tr.t[b] {
+            None => next,
+            Some(t) => {
+            let e = wb.sub(&deq)?;
             let e = match &d {
                 Some(d) => e.broadcast_mul(&Tensor::from_vec(d[128 * b..128 * (b + 1)].to_vec(), vec![1, 128], device)?)?,
                 None => e,
@@ -602,16 +614,181 @@ fn gptq_iq3s128(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k
                 Some(d) => upd.broadcast_div(&Tensor::from_vec(d[128 * (b + 1)..].to_vec(), vec![1, width - 128], device)?)?,
                 None => upd,
             };
-            rest = rest.narrow(1, 128, width - 128)?.contiguous()?.sub(&upd)?;
-        }
-        let cpu = q.to_device(Device::Cpu)?;
-        let p = cpu.packed_arc().ok_or(synaptix_core::error::SynaptixError::Unsupported("gptq: упакованные веса освобождены"))?;
-        let bytes = p.as_cpu().ok_or(synaptix_core::error::SynaptixError::Unsupported("gptq: квант не на хосте"))?.as_bytes();
+            next.sub(&upd)?
+            }
+        };
+    }
+    Ok(())
+}
+
+fn host_packed(q: &QuantWeight) -> synaptix_core::error::Result<(Vec<u8>, Option<Vec<u8>>)> {
+    use synaptix_core::error::SynaptixError;
+    let cpu = q.to_device(Device::Cpu)?;
+    let p = cpu.packed_arc().ok_or(SynaptixError::Unsupported("gptq: упакованные веса освобождены"))?;
+    let packed = p.as_cpu().ok_or(SynaptixError::Unsupported("gptq: квант не на хосте"))?.as_bytes().to_vec();
+    let scales = match cpu.scales_opt() {
+        Some(s) => Some(s.as_cpu().ok_or(SynaptixError::Unsupported("gptq: масштабы не на хосте"))?.as_bytes().to_vec()),
+        None => None,
+    };
+    Ok((packed, scales))
+}
+
+/// IQ3_S-128 с компенсацией ошибки: блок кодируется с весами важности
+/// столбцов эксперта.
+fn gptq_iq3s128(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: usize) -> synaptix_core::error::Result<Vec<u8>> {
+    use synaptix_core::quant::ggml::GgmlType;
+    let nb = k / 128;
+    let bb = GgmlType::Iq3S128.bytes_for(128);
+    let mut out = vec![0u8; n * nb * bb];
+    gptq_blocks(dense, imp, tr, k, |b, wb| {
+        let q = wb.to_dtype(DType::F16)?.quantize_to_ggml(GgmlType::Iq3S128, imp.map(|h| &h[128 * b..128 * (b + 1)]))?;
+        let (bytes, _) = host_packed(&q)?;
         for r in 0..n {
             out[(r * nb + b) * bb..(r * nb + b + 1) * bb].copy_from_slice(&bytes[r * bb..(r + 1) * bb]);
         }
-    }
+        q.dequantize(DType::F16)?.to_dtype(DType::F32)
+    })?;
     Ok(out)
+}
+
+/// Значение кода E2M1 (знак — старший бит полубайта).
+const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// Кодировщик NVFP4 участка строк шириной `width` (кратна 16): у каждой
+/// группы из 16 значений код масштаба E4M3 выбирается перебором соседей
+/// `amax/6` (±2 кода) по минимуму ошибки группы, взвешенной важностью
+/// столбцов `wimp`. Без общего масштаба на тензор масштабы весов лежат в
+/// субнормальной зоне E4M3 с шагами ×2/×1,5, и округление `amax/6` то
+/// обрезает верх группы, то теряет диапазон.
+///
+/// Перебор — только среди масштабов без обрезки (`6·s ≥ amax`): минимум
+/// ошибки весов с обрезкой срезает выбросы, и выход слоя портится сильнее,
+/// чем выигрывают мелкие веса (Ornith-1.5-35B-A3B, путь декода, KL к
+/// эталону: `amax/6` 0,196; перебор с обрезкой 0,222; без обрезки 0,180;
+/// с GPTQ без обрезки 0,162). `SYN_QUANT_NVFP4_CLIP=1` — перебор с обрезкой.
+///
+/// `u` — диагональный блок `U_bb` `[width·width]`: поколоночный GPTQ —
+/// масштаб группы берётся по уже поправленным значениям, ошибка значения
+/// переносится на следующие столбцы участка (у эксперта — `U_e = U·D⁻¹`).
+/// Строки независимы. Возвращает полубайты `[n, width/2]`, масштабы
+/// `[n, width/16]` построчно и деквант `[n, width]`.
+fn nvfp4_encode_rows(wb: &[f32], width: usize, u: Option<&[f32]>, d: Option<&[f32]>, wimp: Option<&[f32]>, n: usize, search: bool) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
+    use rayon::prelude::*;
+    use synaptix_kernels_cpu::quant::encode::encode_e2m1_rtne;
+    use synaptix_kernels_cpu::quant::fp8_e4m3::{decode_e4m3, encode_e4m3};
+    let ng = width / 16;
+    let noclip = std::env::var("SYN_QUANT_NVFP4_CLIP").as_deref() != Ok("1");
+    let mut packed = vec![0u8; n * width / 2];
+    let mut scales = vec![0u8; n * ng];
+    let mut deq = vec![0f32; n * width];
+    let qv = |v: f32, s: f32| -> (u8, f32) {
+        let c = encode_e2m1_rtne(v / s);
+        (c, E2M1[(c & 7) as usize] * s * if c & 8 != 0 { -1.0 } else { 1.0 })
+    };
+    packed
+        .par_chunks_mut(width / 2)
+        .zip(scales.par_chunks_mut(ng))
+        .zip(deq.par_chunks_mut(width))
+        .enumerate()
+        .for_each(|(r, ((p, s), q))| {
+            let mut w = wb[r * width..(r + 1) * width].to_vec();
+            let mut codes = vec![0u8; width];
+            for g in 0..ng {
+                let grp = g * 16..g * 16 + 16;
+                let amax = w[grp.clone()].iter().fold(0f32, |m, v| m.max(v.abs()));
+                let base = encode_e4m3(if amax > 0.0 { amax / 6.0 } else { 1e-9 });
+                let mut sb = base;
+                if search && amax > 0.0 {
+                    let mut best = f64::MAX;
+                    for c in (base as i32 - 2).max(1)..=(base as i32 + 2).min(0x7e) {
+                        let sc = decode_e4m3(c as u8);
+                        // Без обрезки: крупнейший вес группы должен
+                        // представляться (6·s ≥ amax) — выбросы важнее для
+                        // выхода слоя, чем их вклад в ошибку весов.
+                        if noclip && 6.0 * sc < amax * (1.0 - 1e-6) && c < 0x7e {
+                            continue;
+                        }
+                        let e: f64 = grp.clone().map(|i| {
+                            let dv = (w[i] - qv(w[i], sc).1) as f64;
+                            dv * dv * wimp.map_or(1.0, |m| m[i] as f64)
+                        }).sum();
+                        if e < best {
+                            best = e;
+                            sb = c as u8;
+                        }
+                    }
+                }
+                let mut sq = decode_e4m3(sb);
+                if sq == 0.0 {
+                    sq = 1e-9;
+                }
+                s[g] = sb;
+                for i in grp {
+                    let (c, v) = qv(w[i], sq);
+                    codes[i] = c;
+                    q[i] = v;
+                    if let Some(u) = u {
+                        let di = d.map_or(1.0, |d| d[i]);
+                        let err = (w[i] - v) * di / u[i * width + i];
+                        if err != 0.0 {
+                            let row = &u[i * width..(i + 1) * width];
+                            match d {
+                                None => (i + 1..width).for_each(|j| w[j] -= err * row[j]),
+                                Some(d) => (i + 1..width).for_each(|j| w[j] -= err * row[j] / d[j]),
+                            }
+                        }
+                    }
+                }
+            }
+            for j in 0..width / 2 {
+                p[j] = codes[2 * j] | (codes[2 * j + 1] << 4);
+            }
+        });
+    (packed, scales, deq)
+}
+
+/// Выбор масштабов NVFP4 включён (`SYN_QUANT_NVFP4_SEARCH=0` — штатное `amax/6`).
+fn nvfp4_search_on() -> bool {
+    std::env::var("SYN_QUANT_NVFP4_SEARCH").as_deref() != Ok("0")
+}
+
+/// Масштабы `[n, k/16]` построчно → раскладка тайлов 128×4 целой матрицы.
+fn nvfp4_tile_scales(rows: &[u8], n: usize, k: usize) -> Vec<u8> {
+    use synaptix_kernels_cpu::quant::dequant::nvfp4_scale_index;
+    let (sf, ng) = (k.div_ceil(64) * 4, k / 16);
+    let mut out = vec![0u8; sf * n.div_ceil(128) * 128];
+    for r in 0..n {
+        for g in 0..ng {
+            out[nvfp4_scale_index(r, g, sf)] = rows[r * ng + g];
+        }
+    }
+    out
+}
+
+/// NVFP4 с компенсацией ошибки (GPTQ). Масштаб у NVFP4 свой на каждые 16
+/// значений (общего на тензор нет), поэтому блоки 128 столбцов кодируются
+/// независимо: байты блока ложатся в строку, его 8 масштабов — в раскладку
+/// тайлов целой матрицы. Внутри блока — поколоночная компенсация
+/// ([`nvfp4_encode_rows`]), между блоками — перенос на карте ([`gptq_blocks`]).
+fn gptq_nvfp4(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: usize) -> synaptix_core::error::Result<(Vec<u8>, Vec<u8>)> {
+    let ng = k / 16;
+    let mut packed = vec![0u8; n * k / 2];
+    let mut srows = vec![0u8; n * ng];
+    let device = dense.device();
+    let d: Option<Vec<f32>> = imp.map(|e| e.iter().zip(&tr.layer_imp).map(|(a, b)| if *b > 0.0 && *a > 0.0 { (a / b).sqrt().clamp(0.25, 4.0) } else { 1.0 }).collect());
+    // Вес ошибки при выборе масштаба: важность столбцов эксперта, иначе слоя.
+    let wimp: &[f32] = imp.unwrap_or(&tr.layer_imp);
+    gptq_blocks(dense, imp, tr, k, |b, wb| {
+        let host = wb.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let cols = 128 * b..128 * (b + 1);
+        let (p, s, q) = nvfp4_encode_rows(&host, 128, Some(&tr.u[b]), d.as_deref().map(|d| &d[cols.clone()]), Some(&wimp[cols]), n, nvfp4_search_on());
+        for r in 0..n {
+            packed[r * k / 2 + b * 64..r * k / 2 + (b + 1) * 64].copy_from_slice(&p[r * 64..(r + 1) * 64]);
+            srows[r * ng + b * 8..r * ng + (b + 1) * 8].copy_from_slice(&s[r * 8..(r + 1) * 8]);
+        }
+        Tensor::from_vec(q, vec![n, 128], device)
+    })?;
+    Ok((packed, nvfp4_tile_scales(&srows, n, k)))
 }
 
 /// Байты перекодированного среза: `(packed, scales)`; масштабы пусты у
@@ -676,6 +853,30 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
         };
         let _ = slices;
         return Ok((packed, Vec::new()));
+    }
+    if item.target == DType::NVFP4 {
+        let h = synaptix_core::quant::calib::table_get(&format!("{}#{slice}", item.name)).or_else(|| synaptix_core::quant::calib::table_get(&item.name));
+        let tr = if !matches!(device, Device::Cpu) && k % 128 == 0 { gptq_transfers(&item.name, k, device)? } else { None };
+        let out = match tr {
+            // Связи входов слоя известны — GPTQ с выбором масштабов.
+            Some(tr) => gptq_nvfp4(&dense, h.as_deref(), &tr, n, k).map_err(|e| IoError::Bundle(format!("{}: NVFP4 с компенсацией: {e}", item.name)))?,
+            // Иначе — выбор масштабов (с важностью столбцов, если есть).
+            None if nvfp4_search_on() => {
+                let host = dense.to_dtype(DType::F32).and_then(|t| t.to_device(Device::Cpu)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
+                let imp = h.as_deref().filter(|v| v.len() == k);
+                let (p, s, _) = nvfp4_encode_rows(&host, k, None, None, imp, n, true);
+                (p, nvfp4_tile_scales(&s, n, k))
+            }
+            None => {
+                let q = dense.quantize_to(DType::NVFP4).map_err(|e| IoError::Bundle(format!("{}: NVFP4: {e}", item.name)))?;
+                let (p, s) = host_packed(&q).map_err(IoError::Core)?;
+                (p, s.unwrap_or_default())
+            }
+        };
+        if let Device::Cuda(o) = device {
+            let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+        }
+        return Ok(out);
     }
     let q: QuantWeight = dense
         .quantize_to(item.target)
@@ -1236,4 +1437,89 @@ pub fn write_bundle(src: &Path, out: &Path, spec: &TranscodeSpec, device: Device
     builder = builder.add_file_bytes(MANIFEST_NAME, mbytes, FileTag::Inference).map_err(|e| IoError::Bundle(e.to_string()))?;
     builder.write(out).map_err(|e| IoError::Bundle(format!("{}: {e}", out.display())))?;
     Ok(TranscodeReport { tensors, bytes_before: before, bytes_after: after, placement: "file", cache_path: Some(out.to_path_buf()), seconds: t0.elapsed().as_secs_f64() })
+}
+
+#[cfg(test)]
+mod gptq_nvfp4_tests {
+    use super::*;
+
+    fn rnd(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// (1) Без перебора и компенсации кодировщик = CPU-эталон байт в байт.
+    /// (2) Перебор масштабов уменьшает ошибку весов. (3) GPTQ по реальной
+    /// матрице связей уменьшает ошибку выхода `‖(W − Q)·X‖` сильнее перебора.
+    #[test]
+    fn gptq_nvfp4_blocks_and_error() {
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+        let dev = Device::Cuda(0);
+        let (n, k, rows) = (192usize, 512usize, 2048usize);
+        // Веса масштаба настоящих экспертов (|w| ~ 0,01–0,1): масштабы в субнормальной зоне E4M3.
+        let wh: Vec<f32> = rnd(7, n * k).iter().map(|v| half::f16::from_f32(v * 0.05).to_f32()).collect();
+        let w = Tensor::from_vec(wh.clone(), vec![n, k], dev).unwrap().to_dtype(DType::F16).unwrap();
+        let z = rnd(11, rows * k);
+        let mut x = vec![0f32; rows * k];
+        for r in 0..rows {
+            for c in 0..k {
+                let prev = if c > 0 { x[r * k + c - 1] } else { 0.0 };
+                x[r * k + c] = 0.7 * prev + z[r * k + c] * (1.0 + 3.0 * ((c * 37 % 11) as f32 / 11.0));
+            }
+        }
+        let mut h = vec![0f32; k * k];
+        for r in 0..rows {
+            let xr = &x[r * k..(r + 1) * k];
+            for i in 0..k {
+                for j in 0..k {
+                    h[i * k + j] += xr[i] * xr[j] / rows as f32;
+                }
+            }
+        }
+        // 1) Эталон.
+        let (p0, s0, q0) = nvfp4_encode_rows(&wh, k, None, None, None, n, false);
+        let (pr, sr) = synaptix_kernels_cpu::quant::encode::quantize_nvfp4_rows(&wh, n, k).unwrap();
+        assert_eq!(p0, pr, "packed");
+        assert_eq!(nvfp4_tile_scales(&s0, n, k), sr, "scales");
+        // 2) Перебор.
+        let (_, _, q1) = nvfp4_encode_rows(&wh, k, None, None, None, n, true);
+        let werr = |q: &[f32]| -> f64 { wh.iter().zip(q).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() };
+        eprintln!("ошибка весов: amax/6 {:.4e}, перебор {:.4e}", werr(&q0), werr(&q1));
+        assert!(werr(&q1) < werr(&q0) * 0.9);
+        // 3) GPTQ.
+        let f = synaptix_core::quant::gptq::block_factors(&h, k, 128, 0.01).unwrap();
+        let tr = Transfers {
+            u: f.diag,
+            t: f.transfers.into_iter().enumerate().map(|(b, m)| { let rest = k - 128 * (b + 1); (rest > 0).then(|| Tensor::from_vec(m, vec![128, rest], dev).unwrap()) }).collect(),
+            layer_imp: (0..k).map(|i| h[i * k + i]).collect(),
+        };
+        let (pg, sg) = gptq_nvfp4(&w, None, &tr, n, k).unwrap();
+        let qg = {
+            use synaptix_core::tensor::storage::{CpuBuf, Storage};
+            let q = QuantWeight::new(Arc::new(Storage::Cpu(CpuBuf::from_vec(pg))), Arc::new(Storage::Cpu(CpuBuf::from_vec(sg))), DType::NVFP4, n, k).unwrap();
+            q.dequantize(DType::F16).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let out_err = |q: &[f32]| -> f64 {
+            let mut e = 0f64;
+            for r in (0..rows).step_by(4) {
+                let xr = &x[r * k..(r + 1) * k];
+                for o in 0..n {
+                    let d: f64 = (0..k).map(|c| ((wh[o * k + c] - q[o * k + c]) * xr[c]) as f64).sum();
+                    e += d * d;
+                }
+            }
+            e
+        };
+        let (e0, e1, eg) = (out_err(&q0), out_err(&q1), out_err(&qg));
+        eprintln!("ошибка выхода: amax/6 {e0:.4e}, перебор {e1:.4e} ({:.0}%), GPTQ {eg:.4e} ({:.0}%)", 100.0 * e1 / e0, 100.0 * eg / e0);
+        assert!(eg < e1 * 0.9, "GPTQ {eg} не лучше перебора {e1}");
+    }
 }

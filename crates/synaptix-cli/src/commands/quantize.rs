@@ -53,9 +53,12 @@ fn num_layers(path: &std::path::Path) -> Option<usize> {
 fn llm_rules(path: &std::path::Path) -> Result<Vec<(String, Option<DType>)>, String> {
     let n = num_layers(path).ok_or("--policy llm: нет num_hidden_layers в config.json")?;
     let m = Some(DType::MXFP8);
+    // `model.layers.N.` входит и в `model.language_model.layers.N.`, и в
+    // `llm.model.layers.N.`, но не в `mtp.layers.0.` — у MTP-слоя эксперты
+    // остаются NVFP4, как у прочих (иначе +0,35 ГБ на карте у Qwen3.5-MoE 35B).
     Ok(vec![
-        (".layers.0.".into(), m),
-        (format!(".layers.{}.", n - 1), m),
+        ("model.layers.0.".into(), m),
+        (format!("model.layers.{}.", n - 1), m),
         ("shared_expert".into(), m),
         // таблицы, из которых читают строки, — как есть
         ("pos_embed".into(), None),
@@ -183,7 +186,7 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
             "on" | "auto" => {}
             o => return Err(format!("--gptq {o}: auto | on | off").into()),
         }
-        println!("  компенсация ошибки: {}", if args.gptq == "off" || grams == 0 { "нет" } else { "да (блочный GPTQ, iq3_s128)" });
+        println!("  компенсация ошибки: {}", if args.gptq == "off" || grams == 0 { "нет" } else { "да (блочный GPTQ: NVFP4, IQ3_S-128)" });
         synaptix_core::quant::calib::set_table(Some(t));
     } else if args.gptq == "on" {
         return Err("--gptq on требует --calib с матрицами связей входов".into());

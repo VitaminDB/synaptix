@@ -12,6 +12,14 @@ pub trait RowSource: Send + Sync {
 }
 
 pub trait WeightSource {
+    /// Имя тензора (или префикса блока) в самом источнике: модель адресует
+    /// веса логическими именами, а источник может хранить их под другими
+    /// (у гибрида Qwen3.5 — `model.language_model.…` вместо `model.…`).
+    /// Нужен там, где имя уходит наружу — ключи калибровки квантования.
+    fn source_key(&self, key: &str) -> String {
+        key.to_string()
+    }
+
     fn rows(&self, _key: &str) -> Option<Result<std::sync::Arc<dyn RowSource>, ModelError>> {
         None
     }

@@ -20,6 +20,20 @@ use rayon::prelude::*;
 /// построчно, для последнего блока пусто. `damp` — доля среднего диагонали,
 /// добавляемая к диагонали (0,01 — обычное значение).
 pub fn block_transfers(h: &[f32], k: usize, block: usize, damp: f64) -> Result<Vec<Vec<f32>>, String> {
+    block_factors(h, k, block, damp).map(|f| f.transfers)
+}
+
+/// Множители для GPTQ по блокам: переносы между блоками и диагональные
+/// блоки `U_bb` (`[block, block]` построчно, верхние треугольные) — по ним
+/// кодировщик, у которого значения внутри блока округляются по отдельности,
+/// компенсирует ошибку столбец за столбцом. Межблочный перенос при этом не
+/// меняется: `(W_b − Q_b)·U_bb⁻¹ = Err_b` — ошибки столбцов GPTQ.
+pub struct BlockFactors {
+    pub transfers: Vec<Vec<f32>>,
+    pub diag: Vec<Vec<f32>>,
+}
+
+pub fn block_factors(h: &[f32], k: usize, block: usize, damp: f64) -> Result<BlockFactors, String> {
     if h.len() != k * k || block == 0 || k % block != 0 {
         return Err(format!("gptq: H {} значений, k={k}, блок {block}", h.len()));
     }
@@ -122,7 +136,19 @@ pub fn block_transfers(h: &[f32], k: usize, block: usize, damp: f64) -> Result<V
             x.iter().map(|v| *v as f32).collect()
         })
         .collect();
-    Ok(out)
+    let diag = (0..nb)
+        .map(|b| {
+            let r0 = b * block;
+            let mut d = vec![0f32; block * block];
+            for i in 0..block {
+                for j in i..block {
+                    d[i * block + j] = u(r0 + i, r0 + j) as f32;
+                }
+            }
+            d
+        })
+        .collect();
+    Ok(BlockFactors { transfers: out, diag })
 }
 
 #[cfg(test)]

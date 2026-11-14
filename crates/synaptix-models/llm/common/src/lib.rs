@@ -1,5 +1,6 @@
 pub mod config;
 pub mod generate;
+pub mod logit_eval;
 pub mod model;
 pub mod mrope;
 pub mod moe;

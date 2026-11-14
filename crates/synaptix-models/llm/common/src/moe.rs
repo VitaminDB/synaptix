@@ -1121,7 +1121,7 @@ impl MoeFfn {
             None => None,
         };
         Ok(Self {
-            prefix: prefix.to_string(),
+            prefix: weights.source_key(prefix),
             zc_pool: None,
             zc: Mutex::new(None),
             zc_seed: Mutex::new(Vec::new()),
