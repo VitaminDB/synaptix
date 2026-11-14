@@ -318,6 +318,16 @@ impl HybridPipeline {
             );
             return Ok(me);
         }
+        // Проверка черновика (2 токена) без CUDA-графа дороже, чем выигрыш
+        // от принятых черновиков: у Ornith-1.5-35B-A3B (MoE) шаг проверки
+        // 11,7 мс против 6,2 мс у графового шага одного токена — 76–82 %
+        // принятия дают 104–125 ток/с против 136–161 без MTP. Пока граф
+        // префилла не берёт MoE, голову не грузим (и место на карте не
+        // занимаем). `SYN_MTP_EAGER=1` — грузить всё равно.
+        if !me.mtp_graph_supported() && std::env::var("SYN_MTP_EAGER").as_deref() != Ok("1") {
+            eprintln!("[hybrid] MTP пропущен: проверка черновиков у этой модели идёт без CUDA-графа и медленнее обычного декода (SYN_MTP_EAGER=1 — включить)");
+            return Ok(me);
+        }
         let weights = HybridWeights::load(path, device, precision.compute)
             .map_err(|e| PipelineError::Load(e.to_string()))?;
         if !synaptix_llm_common::mtp::present(&weights) {

@@ -1873,9 +1873,34 @@ impl Llm {
                     layout: Some(layout),
                 });
             }
-            LlmPipeline::Hybrid(h) => h
-                .encode_image_limited_with_grid(path, max_tokens)
-                .map_err(|e| LlmError(format!("image encode: {e}")))?,
+            // Модель целиком на карте (MoE 35B-A3B — 22 из 24 ГБ): башне на
+            // крупной картинке может не хватить памяти под активации. Тогда —
+            // та же картинка с вдвое меньшим числом токенов, пока не влезет:
+            // текст остаётся на полной скорости, а не уходит в RAM ради зрения.
+            LlmPipeline::Hybrid(h) => {
+                let mut cap = max_tokens;
+                loop {
+                    match h.encode_image_limited_with_grid(path, cap) {
+                        Ok(v) => break v,
+                        Err(e) if is_oom(&e.to_string()) => {
+                            let used = h
+                                .image_limits(cap)
+                                .and_then(|l| h.image_token_count(path, l))
+                                .map_err(|e| LlmError(format!("image encode: {e}")))?;
+                            if used <= MIN_IMAGE_TOKENS_ON_OOM {
+                                return Err(LlmError(format!("image encode: {e}")));
+                            }
+                            let next = (used / 2).max(MIN_IMAGE_TOKENS_ON_OOM);
+                            eprintln!("[synaptix] картинка {used} токенов не влезла в VRAM — повтор с {next}");
+                            if let Device::Cuda(o) = self.device {
+                                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+                            }
+                            cap = Some(next);
+                        }
+                        Err(e) => return Err(LlmError(format!("image encode: {e}"))),
+                    }
+                }
+            }
             LlmPipeline::Qwen4Exp(q) => {
                 let limits = q
                     .image_limits(max_tokens)
@@ -3174,6 +3199,24 @@ pub fn load_llm(
 /// дорог: каждый блок, отданный хосту, едет по PCIe на каждом токене (36 →
 /// 11 ток/с при шести блоках). Ход, которому не хватило, служба повторяет,
 /// отдав ещё блоки (`shed_blocks`). `SYN_VRAM_RESERVE_MB` — свой.
+/// Байты башни зрения в бандле (`visual.*`, `vision_tower.*`, с квант-блобами).
+fn vision_bytes(path: &Path) -> usize {
+    let Ok(ld) = synaptix_io::weights::safetensors::SafetensorsLoader::open_bundle(path, None) else { return 0 };
+    let names: Vec<String> = ld.infos().map(|(n, _, _)| n.to_string()).filter(|n| n.contains("visual.") || n.contains("vision_tower.")).collect();
+    names
+        .iter()
+        .map(|n| ["", ".qpacked", ".qscales"].iter().filter_map(|suf| ld.raw_bytes(&format!("{n}{suf}")).map(|(d, _, _)| d.len())).sum::<usize>())
+        .sum()
+}
+
+/// Нижний предел токенов картинки при повторах после нехватки VRAM.
+const MIN_IMAGE_TOKENS_ON_OOM: usize = 256;
+
+/// Ошибка — нехватка памяти устройства (CUDA OOM в любом из видов текста).
+fn is_oom(msg: &str) -> bool {
+    msg.contains("OOM") || msg.contains("OUT_OF_MEMORY") || msg.to_ascii_lowercase().contains("out of memory")
+}
+
 fn vram_turn_reserve() -> usize {
     std::env::var("SYN_VRAM_RESERVE_MB")
         .ok()
@@ -3191,12 +3234,13 @@ impl Drop for OffloadGuard {
     }
 }
 
-/// Модель со зрением на карте: башня грузится после весов LLM и должна
-/// поместиться рядом с ними вместе с KV и активациями. Если резидентные веса
-/// займут VRAM почти целиком (MiniCPM-V 4.7 35B-A3B: 23.1 из 24.4 ГБ), башня
-/// упрётся в OOM — тогда эксперты сразу уходят в RAM с кэшем на карте, а
-/// место под башню кэш освобождает при её загрузке
-/// (`HybridPipeline::VISION_RESERVE_BYTES`). Явно выбранный режим не трогаем.
+/// Модель со зрением и экспертами MoE на карте: эксперты уходят в RAM с
+/// кэшем на карте, только если сама языковая модель на карту не влезает.
+/// Башня зрения грузится по требованию на время кодирования картинки; если
+/// ей рядом с резидентной моделью не хватит памяти, картинка кодируется с
+/// меньшим числом токенов (`encode_image`), а не вся модель уходит в RAM:
+/// у Ornith-1.5-35B-A3B это 12,5 ток/с вместо 136–161 на любом тексте.
+/// Явно выбранный режим не трогаем.
 fn vlm_offload_guard(path: &Path, device: Device, arch: LlmArch) -> Option<OffloadGuard> {
     use synaptix_llm_common::model::{offload_mode, set_offload_mode, OffloadMode};
     let Device::Cuda(ord) = device else { return None };
@@ -3212,15 +3256,15 @@ fn vlm_offload_guard(path: &Path, device: Device, arch: LlmArch) -> Option<Offlo
     // Квантованный бандл — почти целиком веса; на карте они занимают ~10 %
     // сверх файла (перемешанные копии NVFP4, слабина пулов): 22.15 ГБ файла →
     // 24.2 ГБ VRAM у MiniCPM-V 4.7 35B (23.1 ГиБ по nvidia-smi).
-    let weights = std::fs::metadata(path).ok()?.len() as usize;
-    let resident = weights + weights / 10;
+    // Башня в бандле не на карте, пока нет картинки: её доля в файле не в счёт.
+    let weights = (std::fs::metadata(path).ok()?.len() as usize).saturating_sub(vision_bytes(path));
+    let resident = weights + weights / 20;
     let (free, _total) = synaptix_core::device::cuda::mem_info(ord).ok()?;
-    let reserve = synaptix_llm_qwen3_next_hybrid::pipeline::VISION_RESERVE_BYTES;
-    if resident.saturating_add(reserve) <= free {
+    if resident.saturating_add(vram_turn_reserve()) <= free {
         return None;
     }
     eprintln!(
-        "[synaptix] {}: веса {:.1} ГБ при {:.1} ГБ свободной VRAM не оставят места башне зрения — эксперты в RAM с кэшем на карте",
+        "[synaptix] {}: языковая часть {:.1} ГБ при {:.1} ГБ свободной VRAM на карту не влезет — эксперты в RAM с кэшем на карте",
         path.display(),
         weights as f64 / 1e9,
         free as f64 / 1e9
