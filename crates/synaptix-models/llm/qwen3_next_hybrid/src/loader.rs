@@ -68,6 +68,10 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
         Self::bundle_key(key)
     }
 
+    fn bundle_loader(&self) -> Option<synaptix_io::weights::syn_bundle::SynBundleLoader> {
+        Some(self.loader.clone())
+    }
+
     fn tensor(
         &self,
         key: &str,

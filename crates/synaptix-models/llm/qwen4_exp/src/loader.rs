@@ -9,7 +9,6 @@ use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader};
 use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
-use synaptix_llm_common::moe::ExpertSource;
 use synaptix_llm_common::{ModelError, QLinear, WeightSource};
 
 use crate::config::Qwen4ExpConfig;
@@ -35,8 +34,6 @@ pub struct Qwen4ExpWeights {
     pub dtype: DType,
 }
 
-/// Кусок зеркала экспертов в RAM (см. `expert_blob_ranges`).
-const MIRROR_PIECE: usize = 64 << 20;
 
 impl Qwen4ExpWeights {
     pub fn open(path: impl AsRef<Path>, device: Device, dtype: DType) -> Result<Self, LoadError> {
@@ -189,75 +186,16 @@ impl Qwen4ExpWeights {
         }
     }
 
-    /// Диапазоны mmap всех стопок экспертов (`gate_up_proj`/`down_proj`,
-    /// packed + scales) в порядке слоёв — под pinned-зеркало в RAM. Пусто,
-    /// если источник не квантованный бандл.
-    pub fn expert_blob_ranges(&self) -> Vec<synaptix_core::device::cuda::MirrorRange<'_>> {
-        use synaptix_core::device::cuda::MirrorRange;
-        let Source::Bundle(l) = &self.source else { return Vec::new() };
-        let mut out = Vec::with_capacity(self.config.num_hidden_layers * 4);
-        // Без FP4 MMA перемешанная раскладка не нужна: ядра-обходы читают
-        // линейный packed, зеркало хранит байты как в файле.
-        let nvfp4_native = synaptix_core::backend::registry::backend_for(self.device)
-            .map(|b| b.quant_native(DType::NVFP4, self.device))
-            .unwrap_or(false);
-        for layer in 0..self.config.num_hidden_layers {
-            for name in ["gate_up_proj", "down_proj"] {
-                let key = self.resolve(&format!("{LM_PREFIX}.layers.{layer}.mlp.experts.{name}"));
-                let Some(Ok((packed, scales))) = l.quant_blob_slices(&key) else { continue };
-                // NVFP4-стопка: зеркало хранит матрицы перемешанными — как их
-                // читают ядра; иные форматы — байт в байт.
-                let repack = match (l.quant_kind(&key), l.quant_dims(&key)) {
-                    (Some(synaptix_bundle::inspect::QuantKind::Nvfp4), Some((_, n, k)))
-                        if nvfp4_native =>
-                    {
-                        Some((n, k))
-                    }
-                    _ => None,
-                };
-                // Диапазоны режем на куски ≤64 МБ (целое число матриц):
-                // `cuMemHostAlloc` держит драйверную блокировку на всё время
-                // закрепления страниц, и один кусок в 800 МБ останавливал
-                // загрузку весов и подкачку на сотни миллисекунд.
-                // Кусок — целое число матриц и у одноблобных форматов: эксперт
-                // не должен разрываться между кусками (zero-copy адресует
-                // его блоб одним куском зеркала).
-                let per = l.quant_dims(&key).map(|(sl, _, _)| packed.len() / sl.max(1)).unwrap_or(1);
-                let slice = repack.map(|(n, k)| n * k / 2).unwrap_or(per).max(1);
-                let piece = (MIRROR_PIECE / slice).max(1) * slice;
-                for b in packed.chunks(piece) {
-                    out.push(MirrorRange { bytes: b, nvfp4_repack: repack });
-                }
-                let scales_per = l
-                    .quant_dims(&key)
-                    .map(|(slices, _, _)| scales.len() / slices.max(1))
-                    .unwrap_or(1)
-                    .max(1);
-                let piece = (MIRROR_PIECE / scales_per).max(1) * scales_per;
-                for b in scales.chunks(piece) {
-                    out.push(MirrorRange { bytes: b, nvfp4_repack: None });
-                }
-            }
-        }
-        out
-    }
-
-    /// Готов ли источник отдавать экспертов по одному (квантованный бандл).
-    pub fn has_lazy_experts(&self, layer: usize) -> bool {
-        let key = format!("{LM_PREFIX}.layers.{layer}.mlp.experts.gate_up_proj");
-        self.lazy_stack(&key)
-    }
-
-    /// То же про экспертов головы многотокенного предсказания.
-    pub fn has_lazy_mtp_experts(&self) -> bool {
-        self.lazy_stack(&format!("{MTP_PREFIX}.layers.0.mlp.experts.gate_up_proj"))
-    }
-
-    fn lazy_stack(&self, key: &str) -> bool {
-        match &self.source {
-            Source::Bundle(l) => l.quant_dims(&self.resolve(key)).is_some(),
-            Source::Files(_) => false,
-        }
+    /// Стопки экспертов в бандле (слои модели и голова MTP следующим
+    /// номером) — для ленивого чтения, зеркала в RAM и zero-copy
+    /// ([`synaptix_llm_common::expert_mirror`]). `None` — источник не бандл.
+    pub fn expert_stacks(&self) -> Option<synaptix_llm_common::expert_mirror::ExpertStacks> {
+        let Source::Bundle(l) = &self.source else { return None };
+        let n = self.config.num_hidden_layers;
+        let prefixes = (0..n)
+            .map(|layer| Some(self.resolve(&format!("{LM_PREFIX}.layers.{layer}.mlp"))))
+            .chain(std::iter::once(Some(format!("{MTP_PREFIX}.layers.0.mlp"))));
+        Some(synaptix_llm_common::expert_mirror::ExpertStacks::from_prefixes(l.clone(), prefixes))
     }
 
     /// Квантованная таблица n-грамм: строки читаются прямо из блобов
@@ -530,84 +468,3 @@ pub enum LoadError {
 }
 
 
-/// Источник экспертов поверх квантованного бандла: каждая пара
-/// `gate_up`/`down` читается срезом стопки в момент промаха кэша.
-pub struct BundleExperts {
-    weights: Arc<Qwen4ExpWeights>,
-    mtp_layer: usize,
-}
-
-impl BundleExperts {
-    pub fn new(weights: Arc<Qwen4ExpWeights>) -> Self {
-        let mtp_layer = weights.config.num_hidden_layers;
-        Self { weights, mtp_layer }
-    }
-
-    /// Номер, под которым эксперты головы многотокенного предсказания живут в
-    /// общем кэше: сразу за слоями модели.
-    pub fn mtp_layer(&self) -> usize {
-        self.mtp_layer
-    }
-}
-
-impl Qwen4ExpWeights {
-    /// Эксперты лежат одноблобным форматом (масштабы внутри блоба: IQ3_S-128,
-    /// SQ, типы ggml) — годятся для чтения ядрами прямо из зеркала RAM.
-    pub fn experts_one_blob(&self) -> bool {
-        let Source::Bundle(l) = &self.source else { return false };
-        let key = self.resolve(&format!("{LM_PREFIX}.layers.0.mlp.experts.gate_up_proj"));
-        l.quant_kind(&key).is_some_and(|k| !k.has_scales())
-    }
-}
-
-impl BundleExperts {
-    /// Блоб эксперта `expert` стопки `key` (срез mmap) — только одноблобные
-    /// форматы (масштабы внутри блоба).
-    fn blob_slice(&self, key: &str, expert: usize) -> Option<&[u8]> {
-        let Source::Bundle(l) = &self.weights.source else { return None };
-        let key = self.weights.resolve(key);
-        let kind = l.quant_kind(&key)?;
-        if kind.has_scales() {
-            return None;
-        }
-        let (slices, _, _) = l.quant_dims(&key)?;
-        let Ok((packed, _)) = l.quant_blob_slices(&key)? else { return None };
-        let per = packed.len() / slices.max(1);
-        packed.get(expert * per..(expert + 1) * per)
-    }
-}
-
-impl ExpertSource for BundleExperts {
-    fn blob_addrs(&self, layer: usize, expert: usize) -> Option<(u64, u64)> {
-        let prefix = if layer == self.mtp_layer {
-            format!("{MTP_PREFIX}.layers.0.mlp.experts")
-        } else {
-            format!("{LM_PREFIX}.layers.{layer}.mlp.experts")
-        };
-        let gu = self.blob_slice(&format!("{prefix}.gate_up_proj"), expert)?;
-        let dn = self.blob_slice(&format!("{prefix}.down_proj"), expert)?;
-        Some((synaptix_core::device::cuda::mirror_addr(gu)?, synaptix_core::device::cuda::mirror_addr(dn)?))
-    }
-
-    fn fetch(
-        &self,
-        layer: usize,
-        expert: usize,
-        device: Device,
-    ) -> Result<(QLinear, QLinear), ModelError> {
-        let prefix = if layer == self.mtp_layer {
-            format!("{MTP_PREFIX}.layers.0.mlp.experts")
-        } else {
-            format!("{LM_PREFIX}.layers.{layer}.mlp.experts")
-        };
-        let one = |name: &str| -> Result<QLinear, ModelError> {
-            let key = format!("{prefix}.{name}");
-            let w = self
-                .weights
-                .quant_expert(&key, expert, device)
-                .ok_or_else(|| ModelError::Load(format!("{key}: стопка не квантована")))??;
-            Ok(QLinear::Quant(w))
-        };
-        Ok((one("gate_up_proj")?, one("down_proj")?))
-    }
-}

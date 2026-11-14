@@ -635,6 +635,9 @@ pub struct DecoderModel {
     /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
     /// ([`Self::fit_expert_cache`]).
     expert_cache: Option<std::sync::Arc<crate::moe::ExpertCache>>,
+    /// Закреплённое зеркало стопок экспертов в RAM (оффлоад из бандла):
+    /// живёт, пока жива модель ([`crate::expert_mirror::host_mirror`]).
+    host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     ple: Option<ModelPle>,
     ple_cur: std::sync::Mutex<Option<Tensor>>,
 }
@@ -1269,6 +1272,50 @@ impl DecoderModel {
             c.set_capacity(crate::moe::MIN_CACHE_BYTES);
             c
         });
+        // Эксперты в RAM из квантованного бандла — лениво, срезом стопки при
+        // промахе кэша, через закреплённое зеркало (DMA ~40 ГБ/с), а не
+        // копией всех экспертов в обычной RAM (8–12 ГБ/с через страничный кэш).
+        let (expert_source, host_mirror) = match (expert_offload, weights.bundle_loader()) {
+            (true, Some(loader)) => {
+                let prefixes = (0..cfg.num_hidden_layers).map(|l| {
+                    if cfg.moe_ffn_at(l).is_some() {
+                        Some(weights.source_key(&format!("model.layers.{l}.mlp")))
+                    } else if cfg.moe_branch().is_some() {
+                        Some(weights.source_key(&format!("model.layers.{l}")))
+                    } else {
+                        None
+                    }
+                });
+                let stacks = std::sync::Arc::new(crate::expert_mirror::ExpertStacks::from_prefixes(loader, prefixes));
+                let lazy = (0..cfg.num_hidden_layers).any(|l| crate::expert_mirror::has_lazy_stacks(&*stacks, l));
+                if lazy {
+                    let mirror = crate::expert_mirror::host_mirror(&crate::expert_mirror::mirror_ranges(&*stacks, device), "llm");
+                    eprintln!("[llm] эксперты в RAM: читаются из бандла по одному{}", if mirror.is_some() { " через закреплённое зеркало" } else { "" });
+                    (Some(stacks), mirror.map(|(g, _)| g))
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        };
+        // Слой экспертов в оффлоаде: лениво из бандла, если его стопки там
+        // квантованы, иначе копией в RAM.
+        let load_offloaded_moe = |prefix: &str, mcfg: crate::moe::MoeConfig, cache: &std::sync::Arc<crate::moe::ExpertCache>, l: usize| {
+            match &expert_source {
+                Some(stacks) if crate::expert_mirror::has_lazy_stacks(&**stacks, l) => crate::moe::MoeFfn::load_lazy(
+                    weights,
+                    prefix,
+                    mcfg,
+                    device,
+                    compute,
+                    mlp_w,
+                    cache.clone(),
+                    l,
+                    std::sync::Arc::new(crate::expert_mirror::BundleExperts::new(stacks.clone())),
+                ),
+                _ => crate::moe::MoeFfn::load_offloaded(weights, prefix, mcfg, device, compute, mlp_w, cache.clone(), l),
+            }
+        };
 
         let qlin = |key: &str, wq: DType| -> Result<QLinear, ModelError> {
             if let Some(prequant) = weights.quant(key, if b_dev == device { device } else { b_dev }) {
@@ -1581,16 +1628,7 @@ impl DecoderModel {
                     };
                     let prefix = format!("model.layers.{l}.mlp");
                     Ffn::Moe(match &expert_cache {
-                        Some(cache) => crate::moe::MoeFfn::load_offloaded(
-                            weights,
-                            &prefix,
-                            mcfg,
-                            device,
-                            compute,
-                            mlp_w,
-                            cache.clone(),
-                            l,
-                        )?,
+                        Some(cache) => load_offloaded_moe(&prefix, mcfg, cache, l)?,
                         None => crate::moe::MoeFfn::load(weights, &prefix, mcfg, device, compute, mlp_w)?,
                     })
                 }
@@ -1633,16 +1671,7 @@ impl DecoderModel {
                     };
                     let prefix = format!("model.layers.{l}");
                     let ffn = match &expert_cache {
-                        Some(cache) => crate::moe::MoeFfn::load_offloaded(
-                            weights,
-                            &prefix,
-                            mcfg,
-                            device,
-                            compute,
-                            mlp_w,
-                            cache.clone(),
-                            l,
-                        )?,
+                        Some(cache) => load_offloaded_moe(&prefix, mcfg, cache, l)?,
                         None => crate::moe::MoeFfn::load(weights, &prefix, mcfg, device, compute, mlp_w)?,
                     };
                     Some(MoeSide {
@@ -1757,6 +1786,7 @@ impl DecoderModel {
             lora: lora::LoraState::default(),
             lora_gen: 0,
             expert_cache,
+            host_mirror: host_mirror.inspect(|g| g.resume()),
             ple: model_ple,
             ple_cur: std::sync::Mutex::new(None),
         })

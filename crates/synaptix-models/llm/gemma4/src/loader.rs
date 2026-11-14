@@ -240,6 +240,17 @@ impl RowSource for TableRows {
 }
 
 impl WeightSource for Gemma4Weights {
+    fn source_key(&self, key: &str) -> String {
+        self.resolve(key)
+    }
+
+    fn bundle_loader(&self) -> Option<synaptix_io::weights::syn_bundle::SynBundleLoader> {
+        match &self.source {
+            Source::Bundle(l) => Some((**l).clone()),
+            Source::Files(_) => None,
+        }
+    }
+
     fn rows(&self, key: &str) -> Option<Result<Arc<dyn RowSource>, ModelError>> {
         let key = self.resolve(key);
         let r = match &self.source {

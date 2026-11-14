@@ -17,7 +17,8 @@ use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::tokenizer::Tokenizer;
 
 use crate::config::Qwen4ExpConfig;
-use crate::loader::{BundleExperts, Qwen4ExpWeights};
+use crate::loader::Qwen4ExpWeights;
+use synaptix_llm_common::expert_mirror as em;
 use crate::model::{CacheSnapshot, ModelCache, Qwen4ExpModel};
 use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 
@@ -74,7 +75,7 @@ impl VideoPromptInfo {
 pub struct Qwen4ExpPipeline {
     /// Пул декода MoE без синхронизации (`SYN_QWEN4EXP_ZC=1`).
     zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
-    /// Pinned-зеркало стопок экспертов в RAM (см. [`host_mirror_for`]).
+    /// Pinned-зеркало стопок экспертов в RAM (см. [`em::host_mirror`]).
     /// Первое поле — гард умирает раньше модели, а с ней и mmap-диапазонов,
     /// на которые он ссылается.
     _host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
@@ -279,14 +280,17 @@ impl Qwen4ExpPipeline {
         // длинном промпте это кратный перечит всей стопки.
         config.moe.chunk = config.moe.chunk.max(prefill_chunk());
         let expert_cache = expert_cache_for(&config, device);
-        let lazy = expert_cache.is_some() && weights.has_lazy_experts(0);
+        let stacks = weights.expert_stacks().map(Arc::new);
+        let lazy = expert_cache.is_some() && stacks.as_deref().is_some_and(|s| em::has_lazy_stacks(s, 0));
         let expert_source: Option<Arc<dyn ExpertSource>> = lazy
-            .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
-        let (host_mirror, mirror_budget) = match lazy.then(|| host_mirror_for(&weights)).flatten() {
-            Some((g, b)) => (Some(g), Some(b as u64)),
-            None => (None, None),
-        };
-        let experts_bytes: u64 = weights.expert_blob_ranges().iter().map(|r| r.bytes.len() as u64).sum();
+            .then(|| Arc::new(em::BundleExperts::new(stacks.clone().expect("lazy"))) as Arc<dyn ExpertSource>);
+        let (host_mirror, mirror_budget) =
+            match lazy.then(|| em::host_mirror(&em::mirror_ranges(&**stacks.as_ref().expect("lazy"), device), "qwen4_exp")).flatten() {
+                Some((g, b)) => (Some(g), Some(b as u64)),
+                None => (None, None),
+            };
+        let experts_bytes: u64 = stacks.as_deref().map_or(0, |s| s.total_bytes(device));
+        let one_blob = stacks.as_deref().is_some_and(|s| em::experts_one_blob(s));
         if let Some(cache) = &expert_cache {
             eprintln!(
                 "[qwen4_exp] эксперты {}, на карте кэш {:.1} ГБ",
@@ -317,12 +321,12 @@ impl Qwen4ExpPipeline {
         let chat_template = weights.chat_template.clone();
         // Спекуляция MTP по умолчанию — там, где она окупается: с zero-copy
         // декодом (промахи экспертов не стоят синхронизаций).
-        let zc_eligible = zc_on() && lazy && host_mirror.is_some() && weights.experts_one_blob();
+        let zc_eligible = zc_on() && lazy && host_mirror.is_some() && one_blob;
         let mtp = if speculation_on(zc_eligible) && mtp_present(&*weights) {
             let cache = model.expert_cache().cloned();
             let source: Option<Arc<dyn ExpertSource>> = (cache.is_some()
-                && weights.has_lazy_mtp_experts())
-            .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
+                && stacks.as_deref().is_some_and(|s| em::has_lazy_stacks(s, config.num_hidden_layers)))
+            .then(|| Arc::new(em::BundleExperts::new(stacks.clone().expect("стопки"))) as Arc<dyn ExpertSource>);
             let head = MtpHead::load(
                 &*weights,
                 &config,
@@ -345,7 +349,7 @@ impl Qwen4ExpPipeline {
         // Декод MoE без синхронизации: только эксперты из бандла с зеркалом в
         // RAM. Старый кэш нужен лишь префиллу — ужимаем его потолок, место
         // отдадут слотам на первом декоде.
-        let zc_pool = if zc_on() && lazy && host_mirror.is_some() && weights.experts_one_blob() {
+        let zc_pool = if zc_on() && lazy && host_mirror.is_some() && one_blob {
             let pool = synaptix_llm_common::moe_zc::ZcPool::new(device);
             model.attach_zc(&pool);
             if let Some(cache) = model.expert_cache() {
@@ -1605,92 +1609,6 @@ fn fit_cache_to_vram(cache: &Arc<ExpertCache>, cfg: &Qwen4ExpConfig, device: Dev
         gb(free),
         gb(reserve),
     );
-}
-
-/// Кэш резидентных экспертов: на CUDA держим часть экспертов на карте, всё
-/// остальное — в системной памяти. Размер задаётся
-/// Сколько RAM оставить системе сверх зеркала экспертов: max(12 ГБ, ⅛ RAM);
-/// `SYN_QWEN4EXP_MIRROR_RESERVE_GB` — своё значение. Было max(24 ГБ, ¼ RAM),
-/// затем 16 ГБ: на 96 ГБ при 79–82 ГБ свободных зеркалу недоставало до всех
-/// 63,3 ГБ экспертов NVFP4-бандла (58, потом 62,9 ГБ), остаток читался с
-/// NVMe. 10 ГБ запаса мало — закреплённое зеркало не уходит в своп, и
-/// рабочий стол подвисал.
-fn mirror_reserve_bytes() -> usize {
-    if let Some(gb) = std::env::var("SYN_QWEN4EXP_MIRROR_RESERVE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
-        return (gb.max(0.0) * (1u64 << 30) as f64) as usize;
-    }
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
-        .map(|kb| kb * 1024)
-        .unwrap_or(0);
-    (12usize << 30).max(total / 8)
-}
-
-/// Сколько байт RAM свободно под зеркало (MemAvailable из /proc/meminfo).
-fn mem_available_bytes() -> Option<usize> {
-    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
-}
-
-/// Pinned-зеркало стопок экспертов в RAM. Подкачка эксперта из mmap идёт
-/// «страничный кэш → копия в pinned-буфер → DMA» и упирается в 8–12 ГБ/с;
-/// из зеркала DMA идёт напрямую (~40 ГБ/с). Регистрировать страницы mmap
-/// как pinned (`cuMemHostRegister`) драйвер на этой платформе не даёт, потому
-/// копия. Бюджет — `SYN_QWEN4EXP_HOST_MIRROR_GB` (0 — выключить), по умолчанию
-/// всё, что влезает в MemAvailable минус запас max(24 ГБ, ¼ RAM); скопированные страницы
-/// mmap отдаются системе, так что RAM в сумме растёт лишь на то, чего в
-/// страничном кэше не было. Копировщики работают фоном: пока диапазон не
-/// догнан, подкачка идёт прежним путём.
-/// Зеркало и его бюджет, байт.
-fn host_mirror_for(
-    weights: &Qwen4ExpWeights,
-) -> Option<(synaptix_core::device::cuda::OffloadPinCacheGuard, usize)> {
-    use synaptix_core::device::cuda::{offload_pin_cache_active, OffloadPinCacheGuard};
-    const GB: f64 = (1u64 << 30) as f64;
-    let ranges = weights.expert_blob_ranges();
-    if ranges.is_empty() || offload_pin_cache_active() {
-        return None;
-    }
-    let total: usize = ranges.iter().map(|r| r.bytes.len()).sum();
-    let avail = mem_available_bytes().unwrap_or(0);
-    let budget = match std::env::var("SYN_QWEN4EXP_HOST_MIRROR_GB")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-    {
-        Some(gb) if gb <= 0.0 => return None,
-        Some(gb) => (gb * GB) as usize,
-        // Зеркало закреплено (pinned) — его не вытеснить в своп, и система
-        // выталкивает туда всё остальное: при запасе 10 ГБ на 93 ГБ RAM рабочий
-        // стол подвисал. Запас — `mirror_reserve_bytes`.
-        None => avail.saturating_sub(mirror_reserve_bytes()),
-    };
-    let budget = budget.min(total);
-    if budget < (2usize << 30) {
-        eprintln!(
-            "[qwen4_exp] зеркало экспертов в RAM не поднято: доступно {:.1} ГБ, стопки {:.1} ГБ",
-            avail as f64 / GB,
-            total as f64 / GB
-        );
-        return None;
-    }
-    let workers = std::env::var("SYN_QWEN4EXP_HOST_MIRROR_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(1, 16);
-    eprintln!(
-        "[qwen4_exp] зеркало экспертов в RAM: до {:.1} ГБ из {:.1} ГБ (RAM доступно {:.1} ГБ), \
-         копировщиков {workers}",
-        budget as f64 / GB,
-        total as f64 / GB,
-        avail as f64 / GB
-    );
-    // Старт на паузе: заполнение читает весь бандл и отняло бы NVMe у
-    // загрузки весов (3 → 20 с). Продолжаем, когда модель поднята.
-    Some((OffloadPinCacheGuard::new_pooled_paused(&ranges, workers, budget, true), budget))
 }
 
 /// `SYN_QWEN4EXP_EXPERT_CACHE_GB` (0 — грузить эксперты целиком на

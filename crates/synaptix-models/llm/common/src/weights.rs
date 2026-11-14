@@ -20,6 +20,13 @@ pub trait WeightSource {
         key.to_string()
     }
 
+    /// Клон загрузчика квантованного бандла (тот же mmap): эксперты MoE в
+    /// режиме RAM тогда читаются лениво срезом стопки, через закреплённое
+    /// зеркало ([`crate::expert_mirror`]), а не держатся копией в обычной RAM.
+    fn bundle_loader(&self) -> Option<synaptix_io::weights::syn_bundle::SynBundleLoader> {
+        None
+    }
+
     fn rows(&self, _key: &str) -> Option<Result<std::sync::Arc<dyn RowSource>, ModelError>> {
         None
     }

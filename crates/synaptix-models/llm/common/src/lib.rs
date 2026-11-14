@@ -1,4 +1,5 @@
 pub mod config;
+pub mod expert_mirror;
 pub mod generate;
 pub mod logit_eval;
 pub mod model;

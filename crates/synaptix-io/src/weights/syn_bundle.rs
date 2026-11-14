@@ -25,6 +25,7 @@ fn st_dtype_to_synaptix(dtype: safetensors::Dtype) -> Option<DType> {
     }
 }
 
+#[derive(Clone)]
 struct TensorMeta {
     dtype: Option<DType>,
     shape: Vec<usize>,
@@ -32,6 +33,7 @@ struct TensorMeta {
     len: usize,
 }
 
+#[derive(Clone)]
 struct TensorIndex {
     by_name: HashMap<String, TensorMeta>,
     names: Vec<String>,
@@ -43,6 +45,11 @@ struct TensorIndex {
 /// (`synaptix_gguf::GgufSource`), квантованные — блоками ggml как
 /// [`QuantWeight`]; синтезированные `config.json`/`tokenizer.json` — через
 /// [`Self::read_file`]. Потребителю всё равно, какой формат под капотом.
+///
+/// Клон делит тот же файл (`Arc<Bundle>`, одно отображение в память) — срезы
+/// клона и оригинала совпадают по адресам (на этом держится зеркало
+/// экспертов в RAM: оно узнаёт диапазоны mmap по адресу).
+#[derive(Clone)]
 pub struct SynBundleLoader {
     bundle: Option<Arc<Bundle>>,
     gguf: Option<Arc<GgufSource>>,
