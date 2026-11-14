@@ -85,6 +85,10 @@ pub struct Qwen4ExpPipeline {
     pub mtp: Option<MtpHead>,
     tokenizer: Option<HfTokenizer>,
     max_seq: usize,
+    /// Раскладка экспертов для виджетов (читается без замка пайплайна).
+    placement: Option<synaptix_llm_common::placement::PlacementProbe>,
+    /// Принятые драфты MTP с загрузки.
+    spec_counters: Arc<synaptix_llm_common::placement::SpecCounters>,
 }
 
 /// Сессия префикс-KV: посчитанный контекст диалога живёт между ходами, и ход
@@ -278,7 +282,11 @@ impl Qwen4ExpPipeline {
         let lazy = expert_cache.is_some() && weights.has_lazy_experts(0);
         let expert_source: Option<Arc<dyn ExpertSource>> = lazy
             .then(|| Arc::new(BundleExperts::new(weights.clone())) as Arc<dyn ExpertSource>);
-        let host_mirror = if lazy { host_mirror_for(&weights) } else { None };
+        let (host_mirror, mirror_budget) = match lazy.then(|| host_mirror_for(&weights)).flatten() {
+            Some((g, b)) => (Some(g), Some(b as u64)),
+            None => (None, None),
+        };
+        let experts_bytes: u64 = weights.expert_blob_ranges().iter().map(|r| r.bytes.len() as u64).sum();
         if let Some(cache) = &expert_cache {
             eprintln!(
                 "[qwen4_exp] эксперты {}, на карте кэш {:.1} ГБ",
@@ -352,7 +360,16 @@ impl Qwen4ExpPipeline {
         if let (Some(pool), Some(head)) = (&zc_pool, mtp.as_mut()) {
             head.attach_zc(pool);
         }
+        let placement = model.expert_cache().map(|cache| synaptix_llm_common::placement::PlacementProbe {
+            layers: config.num_hidden_layers as u32,
+            experts_per_layer: config.moe.num_experts as u32,
+            total_bytes: experts_bytes,
+            cache: Some(cache.clone()),
+            mirror_budget,
+        });
         Ok(Self {
+            placement,
+            spec_counters: Arc::default(),
             zc_pool,
             _host_mirror: host_mirror,
             model,
@@ -363,6 +380,17 @@ impl Qwen4ExpPipeline {
             tokenizer,
             max_seq: cap,
         })
+    }
+
+    /// Зонд раскладки экспертов (кэш на карте, зеркало RAM, бандл) — читается
+    /// из другого потока, пока пайплайн занят генерацией.
+    pub fn placement_probe(&self) -> Option<synaptix_llm_common::placement::PlacementProbe> {
+        self.placement.clone()
+    }
+
+    /// Счётчики спекуляции MTP с загрузки (принятые драфты).
+    pub fn spec_counters(&self) -> Arc<synaptix_llm_common::placement::SpecCounters> {
+        self.spec_counters.clone()
     }
 
     /// Поднять vision-башню из того же бандла. `false` — компонента нет.
@@ -1056,6 +1084,7 @@ impl Qwen4ExpPipeline {
                 st.fetch_millis,
             );
         }
+        self.spec_counters.add(drafted, accepted);
         if drafted > 0 {
             eprintln!(
                 "[qwen4_exp] спекуляция: принято {accepted} из {drafted} ({:.0}%), токенов за прогон {:.2}",
@@ -1607,9 +1636,10 @@ fn mem_available_bytes() -> Option<usize> {
 /// mmap отдаются системе, так что RAM в сумме растёт лишь на то, чего в
 /// страничном кэше не было. Копировщики работают фоном: пока диапазон не
 /// догнан, подкачка идёт прежним путём.
+/// Зеркало и его бюджет, байт.
 fn host_mirror_for(
     weights: &Qwen4ExpWeights,
-) -> Option<synaptix_core::device::cuda::OffloadPinCacheGuard> {
+) -> Option<(synaptix_core::device::cuda::OffloadPinCacheGuard, usize)> {
     use synaptix_core::device::cuda::{offload_pin_cache_active, OffloadPinCacheGuard};
     const GB: f64 = (1u64 << 30) as f64;
     let ranges = weights.expert_blob_ranges();
@@ -1652,7 +1682,7 @@ fn host_mirror_for(
     );
     // Старт на паузе: заполнение читает весь бандл и отняло бы NVMe у
     // загрузки весов (3 → 20 с). Продолжаем, когда модель поднята.
-    Some(OffloadPinCacheGuard::new_pooled_paused(&ranges, workers, budget, true))
+    Some((OffloadPinCacheGuard::new_pooled_paused(&ranges, workers, budget, true), budget))
 }
 
 /// `SYN_QWEN4EXP_EXPERT_CACHE_GB` (0 — грузить эксперты целиком на

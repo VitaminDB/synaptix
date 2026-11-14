@@ -7,6 +7,7 @@ pub mod moe_zc;
 pub mod profile;
 pub mod rope_scaling;
 pub mod mtp;
+pub mod placement;
 pub mod weights;
 
 pub use config::{

@@ -1207,6 +1207,69 @@ pub struct Llm {
     /// Последний план отдал хосту блоки только ради активаций префилла:
     /// декоду того же хода они не мешали бы (см. `generate_streaming_cached`).
     regrow_after_prefill: std::sync::atomic::AtomicBool,
+    /// Что видно снаружи во время генерации без замка пайплайна.
+    probe: RuntimeProbe,
+}
+
+/// Снимок для виджетов: раскладка экспертов и спекулятивный декод.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LlmRuntimeInfo {
+    /// Спекулятивный декод загружен и включён: `"MTP"` (Qwen4Exp, гибрид) или
+    /// `"DFlash"` (Muse-Glimmer). `None` — каждый токен — полный проход.
+    pub speculation: Option<&'static str>,
+    /// Спекуляция работает только при temperature 0 (гибрид, Muse-Glimmer).
+    pub speculation_greedy_only: bool,
+    /// Драфтов предложено и принято с загрузки (пока считает Qwen4Exp).
+    pub drafted: u64,
+    pub accepted: u64,
+    /// Раскладка экспертов MoE; `None` — без кэша экспертов (всё на устройстве).
+    pub experts: Option<synaptix_llm_common::placement::ExpertPlacement>,
+}
+
+#[derive(Clone, Default)]
+struct RuntimeProbe {
+    placement: Option<synaptix_llm_common::placement::PlacementProbe>,
+    spec: Option<std::sync::Arc<synaptix_llm_common::placement::SpecCounters>>,
+    /// Имя спекуляции, если голова загружена; второе — только greedy;
+    /// третье — зависит от флага `speculation` (DFlash, MTP гибрида).
+    speculation: Option<(&'static str, bool, bool)>,
+}
+
+impl RuntimeProbe {
+    fn of(p: &LlmPipeline) -> Self {
+        match p {
+            LlmPipeline::Qwen4Exp(q) => Self {
+                placement: q.placement_probe(),
+                spec: Some(q.spec_counters()),
+                speculation: q.mtp.is_some().then_some(("MTP", false, false)),
+            },
+            LlmPipeline::Hybrid(h) => Self { speculation: h.mtp.is_some().then_some(("MTP", true, true)), ..Default::default() },
+            LlmPipeline::MuseGlimmer(m) => Self { speculation: m.has_dflash().then_some(("DFlash", true, true)), ..Default::default() },
+            _ => Self::default(),
+        }
+    }
+}
+
+impl Llm {
+    /// Раскладка экспертов и спекуляция — не ждёт замка пайплайна, так что
+    /// годится и во время генерации.
+    pub fn runtime_info(&self) -> LlmRuntimeInfo {
+        let flag = self
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|r| r.speculation)
+            .unwrap_or_else(|| DFLASH_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+        let speculation = self.probe.speculation.filter(|(_, _, gated)| !gated || flag);
+        let (drafted, accepted) = self.probe.spec.as_ref().map(|c| c.get()).unwrap_or((0, 0));
+        LlmRuntimeInfo {
+            speculation: speculation.map(|(n, _, _)| n),
+            speculation_greedy_only: speculation.is_some_and(|(_, g, _)| g),
+            drafted,
+            accepted,
+            experts: self.probe.placement.as_ref().map(|p| p.snapshot()),
+        }
+    }
 }
 
 impl Llm {
@@ -3028,7 +3091,9 @@ fn build_facade(
         .or_else(|| config_max_seq(path))
         .map_or(capacity, |requested| requested.min(capacity));
 
+    let probe = RuntimeProbe::of(&pipeline);
     let model = Llm {
+        probe,
         pipeline: Mutex::new(pipeline),
         config: LlmConfig { max_seq_len },
         device,
