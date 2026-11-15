@@ -1055,6 +1055,26 @@ impl Backend for CudaBackend {
         Ok(Storage::Cuda(CudaBuf::new(ctx, stream, out, ord)))
     }
 
+    fn nvfp4_encode_rows(&self, w: (&Storage, &Layout), a: &synaptix_core::backend::Nvfp4EncodeArgs<'_>, _stream: &Stream) -> Result<(Vec<u8>, Vec<u8>, Storage)> {
+        let (w_st, w_lo) = w;
+        if !w_lo.is_contiguous() {
+            return Err(SynaptixError::NonContiguous);
+        }
+        if w_lo.dtype() != DType::F32 {
+            return Err(SynaptixError::Unsupported("nvfp4_encode_rows: вход только F32"));
+        }
+        let (ctx, stream) = ctx_stream_of(w_st, "nvfp4_encode_rows")?;
+        let ord = w_st.as_cuda().map(|b| b.ordinal()).unwrap_or(0);
+        let kernels = crate::elementwise::nvfp4_encode::Nvfp4EncodeKernels::for_context(&ctx, &stream)?;
+        let src = w_st.as_cuda().ok_or(SynaptixError::Unsupported("nvfp4_encode_rows: w не на карте"))?.slice();
+        let off = w_lo.byte_offset();
+        let bytes = src.slice(off..off + a.n * a.width * 4);
+        // SAFETY: f32-вид на те же байты (выравнивание буфера карты ≥ 256).
+        let view = unsafe { bytes.transmute::<f32>(a.n * a.width) }.ok_or(SynaptixError::Unsupported("nvfp4_encode_rows: вид f32"))?;
+        let (p, s, deq) = crate::elementwise::nvfp4_encode::nvfp4_encode_rows(&kernels, &stream, &view, a)?;
+        Ok((p, s, Storage::Cuda(CudaBuf::new(ctx, stream, deq, ord))))
+    }
+
     fn nvfp4_dequant(
         &self,
         packed: &Storage,

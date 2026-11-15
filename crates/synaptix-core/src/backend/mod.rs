@@ -391,6 +391,14 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("quantize_ggml не поддержан этим backend"))
     }
 
+    /// Кодировщик NVFP4 участка строк с выбором масштабов и поколоночной
+    /// компенсацией ошибки (см. [`Nvfp4EncodeArgs`]): вес `[n, width]` F32.
+    /// Возвращает полубайты `[n, width/2]` и коды масштабов `[n, width/16]`
+    /// на хосте и деквант `[n, width]` F32 на устройстве. Default — `Unsupported`.
+    fn nvfp4_encode_rows(&self, _w: (&Storage, &Layout), _a: &Nvfp4EncodeArgs<'_>, _stream: &Stream) -> Result<(Vec<u8>, Vec<u8>, Storage)> {
+        Err(SynaptixError::Unsupported("nvfp4_encode_rows не поддержан этим backend"))
+    }
+
     /// NVFP4 GEMV с плотной f16-активацией (W4A16) по перемешанной копии:
     /// `out[m, n] f16 = W[n, k] · x[m, k]`, `m ≤ 4`, вес читается один раз.
     /// Адреса — на устройстве. Default — `Unsupported`.
@@ -2045,4 +2053,22 @@ pub trait Backend: Send + Sync + 'static {
         dims: &[usize],
         stream: &Stream,
     ) -> Result<()>;
+}
+
+/// Параметры кодировщика NVFP4 участка строк ([`Backend::nvfp4_encode_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Nvfp4EncodeArgs<'a> {
+    pub n: usize,
+    pub width: usize,
+    /// Диагональный блок GPTQ `U_bb` `[width·width]` (тогда `width == 128`):
+    /// ошибка столбца `i` переносится на `j > i` как `err·u[i,j]/d[j]`.
+    pub u: Option<&'a [f32]>,
+    /// Поправка эксперта `d` `[width]`.
+    pub d: Option<&'a [f32]>,
+    /// Важность столбцов `[width]` — вес ошибки при выборе масштаба.
+    pub wimp: Option<&'a [f32]>,
+    /// Перебор ±2 кодов масштаба (иначе `amax/6`).
+    pub search: bool,
+    /// Перебор только среди масштабов без обрезки (`6·s ≥ amax`).
+    pub noclip: bool,
 }

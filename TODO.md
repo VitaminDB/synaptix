@@ -1,0 +1,8 @@
+# TODO
+
+- [ ] Замерить скорость полной сборки NVFP4 с GPTQ на карте (ядро `nvfp4_encode.cu`): пересобрать Ornith-1.5-35B-A3B
+      из каталога HF (`--policy llm --calib … --gptq auto`), сравнить время с 446 с CPU-кодировщика и `bundle_cmp` с
+      `llm/ornith-1.5-35b-a3b.syn` (должно совпасть бит в бит; один слой уже совпал).
+- [ ] Проверить на модели чтение плотной (BF16) таблицы n-грамм Qwen4Exp из бандла построчно через mmap
+      (`qwen4_exp/src/loader.rs`, ветка `Source::Bundle`): собрать бандл без `+ngram_embedding=mxfp8` и прогнать
+      `logit_kl`/`calibrate` — раньше таблица поднималась в RAM целиком в F32 (~100 ГБ) и падала по OOM.

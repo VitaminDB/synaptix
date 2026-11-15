@@ -678,7 +678,7 @@ fn nvfp4_encode_rows(wb: &[f32], width: usize, u: Option<&[f32]>, d: Option<&[f3
     use synaptix_kernels_cpu::quant::encode::encode_e2m1_rtne;
     use synaptix_kernels_cpu::quant::fp8_e4m3::{decode_e4m3, encode_e4m3};
     let ng = width / 16;
-    let noclip = std::env::var("SYN_QUANT_NVFP4_CLIP").as_deref() != Ok("1");
+    let noclip = nvfp4_noclip();
     let mut packed = vec![0u8; n * width / 2];
     let mut scales = vec![0u8; n * ng];
     let mut deq = vec![0f32; n * width];
@@ -753,6 +753,16 @@ fn nvfp4_search_on() -> bool {
     std::env::var("SYN_QUANT_NVFP4_SEARCH").as_deref() != Ok("0")
 }
 
+/// Перебор масштабов только без обрезки (`SYN_QUANT_NVFP4_CLIP=1` — с обрезкой).
+fn nvfp4_noclip() -> bool {
+    std::env::var("SYN_QUANT_NVFP4_CLIP").as_deref() != Ok("1")
+}
+
+/// Кодировщик NVFP4 на карте (бит в бит как CPU-эталон); `SYN_QUANT_NVFP4_CPU=1` — CPU.
+fn nvfp4_on_device(device: Device) -> bool {
+    !matches!(device, Device::Cpu) && std::env::var("SYN_QUANT_NVFP4_CPU").as_deref() != Ok("1")
+}
+
 /// Масштабы `[n, k/16]` построчно → раскладка тайлов 128×4 целой матрицы.
 fn nvfp4_tile_scales(rows: &[u8], n: usize, k: usize) -> Vec<u8> {
     use synaptix_kernels_cpu::quant::dequant::nvfp4_scale_index;
@@ -779,15 +789,23 @@ fn gptq_nvfp4(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: 
     let d: Option<Vec<f32>> = imp.map(|e| e.iter().zip(&tr.layer_imp).map(|(a, b)| if *b > 0.0 && *a > 0.0 { (a / b).sqrt().clamp(0.25, 4.0) } else { 1.0 }).collect());
     // Вес ошибки при выборе масштаба: важность столбцов эксперта, иначе слоя.
     let wimp: &[f32] = imp.unwrap_or(&tr.layer_imp);
+    let on_dev = nvfp4_on_device(device);
     gptq_blocks(dense, imp, tr, k, |b, wb| {
-        let host = wb.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         let cols = 128 * b..128 * (b + 1);
-        let (p, s, q) = nvfp4_encode_rows(&host, 128, Some(&tr.u[b]), d.as_deref().map(|d| &d[cols.clone()]), Some(&wimp[cols]), n, nvfp4_search_on());
+        let dcols = d.as_deref().map(|d| &d[cols.clone()]);
+        let (p, s, q) = if on_dev {
+            let a = synaptix_core::backend::Nvfp4EncodeArgs { n, width: 128, u: Some(&tr.u[b]), d: dcols, wimp: Some(&wimp[cols]), search: nvfp4_search_on(), noclip: nvfp4_noclip() };
+            synaptix_core::tensor::ops::nvfp4_encode_rows(&wb.contiguous()?, &a)?
+        } else {
+            let host = wb.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let (p, s, q) = nvfp4_encode_rows(&host, 128, Some(&tr.u[b]), dcols, Some(&wimp[cols]), n, nvfp4_search_on());
+            (p, s, Tensor::from_vec(q, vec![n, 128], device)?)
+        };
         for r in 0..n {
             packed[r * k / 2 + b * 64..r * k / 2 + (b + 1) * 64].copy_from_slice(&p[r * 64..(r + 1) * 64]);
             srows[r * ng + b * 8..r * ng + (b + 1) * 8].copy_from_slice(&s[r * 8..(r + 1) * 8]);
         }
-        Tensor::from_vec(q, vec![n, 128], device)
+        Ok(q)
     })?;
     Ok((packed, nvfp4_tile_scales(&srows, n, k)))
 }
@@ -865,9 +883,17 @@ fn transcode_slice(loader: Option<&SynBundleLoader>, item: &Item, slice: usize, 
             Some(tr) => gptq_nvfp4(&dense, h.as_deref(), &tr, n, k).map_err(|e| IoError::Bundle(format!("{}: NVFP4 с компенсацией: {e}", item.name)))?,
             // Иначе — выбор масштабов (с важностью столбцов, если есть).
             None if nvfp4_search_on() => {
-                let host = dense.to_dtype(DType::F32).and_then(|t| t.to_device(Device::Cpu)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
                 let imp = h.as_deref().filter(|v| v.len() == k);
-                let (p, s, _) = nvfp4_encode_rows(&host, k, None, None, imp, n, true);
+                let (p, s) = if nvfp4_on_device(device) {
+                    let a = synaptix_core::backend::Nvfp4EncodeArgs { n, width: k, u: None, d: None, wimp: imp, search: true, noclip: nvfp4_noclip() };
+                    let w = dense.to_dtype(DType::F32).and_then(|t| t.contiguous()).map_err(IoError::Core)?;
+                    let (p, s, _) = synaptix_core::tensor::ops::nvfp4_encode_rows(&w, &a).map_err(|e| IoError::Bundle(format!("{}: NVFP4 на карте: {e}", item.name)))?;
+                    (p, s)
+                } else {
+                    let host = dense.to_dtype(DType::F32).and_then(|t| t.to_device(Device::Cpu)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?;
+                    let (p, s, _) = nvfp4_encode_rows(&host, k, None, None, imp, n, true);
+                    (p, s)
+                };
                 (p, nvfp4_tile_scales(&s, n, k))
             }
             None => {
@@ -1659,6 +1685,55 @@ mod gptq_nvfp4_tests {
                 (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
             })
             .collect()
+    }
+
+    /// Кодировщик на карте = CPU-эталон бит в бит: перебор масштабов с
+    /// важностью (без GPTQ, широкая строка с хвостом участка), GPTQ-блок 128
+    /// с поправкой эксперта и без неё, перебор с обрезкой и `amax/6`.
+    #[test]
+    fn nvfp4_encode_device_matches_cpu() {
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+        let dev = Device::Cuda(0);
+        let run = |w: &[f32], n: usize, width: usize, u: Option<&[f32]>, d: Option<&[f32]>, m: Option<&[f32]>, search: bool, noclip: bool| {
+            std::env::set_var("SYN_QUANT_NVFP4_CLIP", if noclip { "0" } else { "1" });
+            let (pc, sc, qc) = nvfp4_encode_rows(w, width, u, d, m, n, search);
+            let t = Tensor::from_vec(w.to_vec(), vec![n, width], dev).unwrap();
+            let a = synaptix_core::backend::Nvfp4EncodeArgs { n, width, u, d, wimp: m, search, noclip };
+            let (pg, sg, qg) = synaptix_core::tensor::ops::nvfp4_encode_rows(&t, &a).unwrap();
+            let qg = qg.to_device(Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(sc, sg, "масштабы (width {width}, u {}, d {}, search {search}, noclip {noclip})", u.is_some(), d.is_some());
+            assert_eq!(pc, pg, "полубайты");
+            assert!(qc.iter().zip(&qg).all(|(a, b)| a.to_bits() == b.to_bits()), "деквант");
+        };
+        // Широкая строка: 336 = 2·128 + 80 (хвост участка), веса с выбросами.
+        let (n, k) = (96usize, 336usize);
+        let w: Vec<f32> = rnd(3, n * k).iter().enumerate().map(|(i, v)| v * 0.05 * if i % 37 == 0 { 9.0 } else { 1.0 }).collect();
+        let m: Vec<f32> = rnd(5, k).iter().map(|v| v.abs() * 4.0 + 0.1).collect();
+        run(&w, n, k, None, None, Some(&m), true, true);
+        run(&w, n, k, None, None, None, true, false);
+        run(&w, n, k, None, None, None, false, true);
+        // GPTQ-блок 128 по реальной матрице связей.
+        let (n, k, rows) = (64usize, 128usize, 512usize);
+        let x = rnd(17, rows * k);
+        let mut h = vec![0f32; k * k];
+        for r in 0..rows {
+            let xr = &x[r * k..(r + 1) * k];
+            for i in 0..k {
+                for j in 0..k {
+                    h[i * k + j] += xr[i] * xr[j] * (1.0 + (i % 7) as f32) / rows as f32;
+                }
+            }
+        }
+        let f = synaptix_core::quant::gptq::block_factors(&h, k, 128, 0.01).unwrap();
+        let u = &f.diag[0];
+        let w: Vec<f32> = rnd(23, n * k).iter().map(|v| v * 0.03).collect();
+        let d: Vec<f32> = rnd(29, k).iter().map(|v| 0.5 + v.abs() * 2.0).collect();
+        let m: Vec<f32> = (0..k).map(|i| h[i * k + i]).collect();
+        run(&w, n, k, Some(u), None, Some(&m), true, true);
+        run(&w, n, k, Some(u), Some(&d), Some(&m), true, true);
+        run(&w, n, k, Some(u), Some(&d), Some(&m), false, true);
+        std::env::remove_var("SYN_QUANT_NVFP4_CLIP");
     }
 
     /// (1) Без перебора и компенсации кодировщик = CPU-эталон байт в байт.

@@ -567,6 +567,22 @@ pub(crate) fn run_quantize_ggml(w: &Tensor, ty: crate::quant::ggml::GgmlType, im
     QuantWeight::new_block(Arc::new(packed), DType::Ggml(ty), n, k)
 }
 
+/// Кодировщик NVFP4 участка строк на устройстве `w` (см.
+/// `Backend::nvfp4_encode_rows`): `w` — `[n, width]` F32. Возвращает
+/// полубайты и коды масштабов на хосте и деквант `[n, width]` F32 на том же
+/// устройстве.
+pub fn nvfp4_encode_rows(w: &Tensor, a: &crate::backend::Nvfp4EncodeArgs<'_>) -> Result<(Vec<u8>, Vec<u8>, Tensor)> {
+    if w.dtype() != DType::F32 || w.dims() != [a.n, a.width] {
+        return Err(SynaptixError::Unsupported("nvfp4_encode_rows: ожидался F32 [n, width]"));
+    }
+    let w = w.contiguous_view()?;
+    let backend = registry::backend_for(w.device())?;
+    let stream = Stream::default_for(w.device())?;
+    let (p, s, deq) = backend.nvfp4_encode_rows((&w.storage, &w.layout), a, &stream)?;
+    let layout = crate::tensor::layout::Layout::contiguous(crate::tensor::shape::Shape::new(vec![a.n, a.width]), DType::F32);
+    Ok((p, s, Tensor::from_storage(Arc::new(deq), layout)))
+}
+
 /// Слитый shared-эксперт MoE на декоде (см. `Backend::moe_shared_fused`).
 pub fn moe_shared_fused(device: crate::device::Device, a: &crate::backend::SeLaunch) -> Result<()> {
     registry::backend_for(device)?.moe_shared_fused(device, a)

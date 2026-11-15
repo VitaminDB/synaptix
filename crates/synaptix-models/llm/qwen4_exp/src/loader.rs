@@ -149,6 +149,24 @@ impl Qwen4ExpWeights {
                 })
             }
             Source::Bundle(_) => {
+                // Плотная таблица в бандле (BF16 — сотня гигабайт у
+                // Qwen3.8-Flash-Next): строки прямо из mmap, как у файлов HF.
+                // Подъём в F32 целиком съедал всю RAM и падал по OOM.
+                if let Some(raw) = &self.raw {
+                    if let Some((_, dtype, shape)) = raw.raw_bytes(&names[0]) {
+                        if shape.len() == 2 && names.iter().all(|n| raw.raw_bytes(n).is_some()) {
+                            let (rows, dim) = (shape[0], shape[1]);
+                            for name in &names {
+                                raw.advise_random(name);
+                            }
+                            let table = Box::new(MmapRows { loader: raw.clone(), names, rows_per_shard: rows, dim, dtype });
+                            return Ok(match ngram_cache_bytes() {
+                                0 => table,
+                                bytes => Box::new(CachedRows::new(table, bytes)),
+                            });
+                        }
+                    }
+                }
                 let mut parts = Vec::with_capacity(names.len());
                 for name in &names {
                     parts.push(self.tensor(name, Device::Cpu, DType::F32)?);
