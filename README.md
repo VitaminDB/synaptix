@@ -28,6 +28,7 @@ cargo build --release -p synaptix-cli
 synaptix inspect model.syn                       # layout of a bundle
 synaptix convert model.gguf model.syn            # GGUF / safetensors → .syn (ggml blocks kept as is)
 synaptix quantize model.syn model-sq4.syn --format sq4   # re-encode any weights (dense, NVFP4, ggml) into SQ4
+synaptix quantize ./Qwen-HF-dir model.syn --policy llm --calib calib --gptq auto   # HF safetensors (BF16/FP8) → NVFP4 .syn in one pass
 synaptix run model.gguf "Explain NVFP4" --max-tokens 256   # .gguf loads directly
 synaptix run model.syn "Explain NVFP4" --max-tokens 256 --quant sq4
 synaptix chat model.syn --context 32768          # interactive, prefix-KV across turns

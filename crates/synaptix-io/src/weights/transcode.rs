@@ -471,7 +471,7 @@ fn plan_items(loader: &SynBundleLoader, spec: &TranscodeSpec) -> Vec<Item> {
 }
 
 /// Матрица среза в плотном виде на `device` (F16; с добавкой LoRA — F32).
-fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<Tensor> {
+fn dense_slice(loader: Option<&SynBundleLoader>, item: &Item, slice: usize, device: Device) -> Result<Tensor> {
     let (slices, n, k) = item.dims;
     if let Some(r) = origin_slice(item.origin.as_ref(), item, slice) {
         let v = r?;
@@ -480,6 +480,7 @@ fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Devi
             .and_then(|t| t.to_dtype(DType::F16))
             .map_err(|e| IoError::Bundle(format!("{}: срез {slice} из оригинала: {e}", item.name)));
     }
+    let loader = loader.ok_or_else(|| IoError::Bundle(format!("{}: среза {slice} нет в оригинале", item.name)))?;
     let dense: Tensor = match item.current {
         Some(_) => {
             let qw = loader
@@ -519,7 +520,7 @@ fn dense_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Devi
 }
 
 /// Плотные байты матрицы с добавкой (цель — BF16/F16/F32).
-fn dense_bytes(loader: &SynBundleLoader, item: &Item, device: Device) -> Result<Vec<u8>> {
+fn dense_bytes(loader: Option<&SynBundleLoader>, item: &Item, device: Device) -> Result<Vec<u8>> {
     dense_slice(loader, item, 0, device)?
         .to_dtype(item.target)
         .and_then(|t| t.to_device(Device::Cpu))
@@ -793,7 +794,8 @@ fn gptq_nvfp4(dense: &Tensor, imp: Option<&[f32]>, tr: &Transfers, n: usize, k: 
 
 /// Байты перекодированного среза: `(packed, scales)`; масштабы пусты у
 /// одноблобных форматов. Считается на `device`, возвращается на хосте.
-fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
+fn transcode_slice(loader: Option<&SynBundleLoader>, item: &Item, slice: usize, device: Device) -> Result<(Vec<u8>, Vec<u8>)> {
+    let no_src = || IoError::Bundle(format!("{}: среза {slice} нет в оригинале", item.name));
     let (slices, n, k) = item.dims;
     let q4_0 = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4_0);
     let q4_k = item.target == DType::Ggml(synaptix_core::quant::ggml::GgmlType::Q4K);
@@ -805,6 +807,7 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
             (None, cur) => match cur {
             Some(_) => {
                 let qw = loader
+                    .ok_or_else(no_src)?
                     .load_quant_expert(&item.name, slice, device)
                     .ok_or_else(|| IoError::Bundle(format!("{}: квант-вес пропал из источника", item.name)))??;
                 qw.dequantize(DType::F16)
@@ -815,7 +818,7 @@ fn transcode_slice(loader: &SynBundleLoader, item: &Item, slice: usize, device: 
                     .map_err(IoError::Core)?
             }
             None => {
-                let t = loader.load_to(&item.name, Device::Cpu, DType::F32)?;
+                let t = loader.ok_or_else(no_src)?.load_to(&item.name, Device::Cpu, DType::F32)?;
                 let t = if slices == 1 { t } else { t.narrow(0, slice, 1).map_err(IoError::Core)? };
                 t.contiguous().and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(IoError::Core)?
             }
@@ -1023,7 +1026,7 @@ impl TensorStream for TranscodeStream {
         }
         let mut scales_all = Vec::new();
         for s in 0..item.dims.0 {
-            let (packed, scales) = transcode_slice(&self.loader, item, s, self.device).map_err(|e| synaptix_bundle::Error::Safetensors(e.to_string()))?;
+            let (packed, scales) = transcode_slice(Some(&self.loader), item, s, self.device).map_err(|e| synaptix_bundle::Error::Safetensors(e.to_string()))?;
             w.write_all(&packed).map_err(synaptix_bundle::Error::Io)?;
             scales_all.extend_from_slice(&scales);
         }
@@ -1087,7 +1090,7 @@ pub(crate) fn build_overlay(loader: &SynBundleLoader, src_path: &Path, req: &Req
             let mut packed_all = Vec::new();
             let mut scales_all = Vec::new();
             for s in 0..it.dims.0 {
-                let (p, sc) = transcode_slice(loader, it, s, req.device)?;
+                let (p, sc) = transcode_slice(Some(loader), it, s, req.device)?;
                 packed_all.extend_from_slice(&p);
                 scales_all.extend_from_slice(&sc);
             }
@@ -1319,7 +1322,7 @@ impl TensorStream for FullStream {
                 if let Some(p) = &self.progress {
                     p(self.done, self.items.len(), &item.name);
                 }
-                let bytes = dense_bytes(&self.loader, item, self.device).map_err(err)?;
+                let bytes = dense_bytes(Some(&self.loader), item, self.device).map_err(err)?;
                 self.done += 1;
                 w.write_all(&bytes).map_err(synaptix_bundle::Error::Io)
             }
@@ -1338,7 +1341,7 @@ impl TensorStream for FullStream {
                 }
                 let mut scales_all = Vec::new();
                 for s in 0..item.dims.0 {
-                    let (packed, scales) = transcode_slice(&self.loader, item, s, self.device).map_err(err)?;
+                    let (packed, scales) = transcode_slice(Some(&self.loader), item, s, self.device).map_err(err)?;
                     w.write_all(&packed).map_err(synaptix_bundle::Error::Io)?;
                     scales_all.extend_from_slice(&scales);
                 }
@@ -1432,6 +1435,209 @@ pub fn write_bundle(src: &Path, out: &Path, spec: &TranscodeSpec, device: Device
         if let Some(bytes) = base.read_file(&name) {
             builder = builder.add_file_bytes(&name, bytes, FileTag::Inference).map_err(|e| IoError::Bundle(e.to_string()))?;
         }
+    }
+    let mbytes = serde_json::to_vec_pretty(&manifest).map_err(|e| IoError::Bundle(e.to_string()))?;
+    builder = builder.add_file_bytes(MANIFEST_NAME, mbytes, FileTag::Inference).map_err(|e| IoError::Bundle(e.to_string()))?;
+    builder.write(out).map_err(|e| IoError::Bundle(format!("{}: {e}", out.display())))?;
+    Ok(TranscodeReport { tensors, bytes_before: before, bytes_after: after, placement: "file", cache_path: Some(out.to_path_buf()), seconds: t0.elapsed().as_secs_f64() })
+}
+
+// ─────────────────────────────────────────────── прямо из каталога HF
+
+/// Тип safetensors оригинала → тип потока.
+fn st_dtype_str(dt: &str) -> Option<StDtype> {
+    Some(match dt {
+        "F64" => StDtype::F64,
+        "F32" => StDtype::F32,
+        "F16" => StDtype::F16,
+        "BF16" => StDtype::BF16,
+        "I64" => StDtype::I64,
+        "I32" => StDtype::I32,
+        "I16" => StDtype::I16,
+        "I8" => StDtype::I8,
+        "U8" => StDtype::U8,
+        "BOOL" => StDtype::Bool,
+        _ => return None,
+    })
+}
+
+/// Что квантовать из оригинала: по тензору бандла — элемент или `None`
+/// (перенести как есть).
+fn hf_items(hf: &Arc<super::hf_origin::HfOrigin>, tensors: &[super::hf_origin::HfTensor], spec: &TranscodeSpec) -> Vec<Option<Item>> {
+    tensors
+        .iter()
+        .map(|t| {
+            let float = matches!(t.dtype.as_str(), "BF16" | "F16" | "F32") || (t.dtype == "F8_E4M3" && (t.stacked.is_some() || hf.decodable(&t.name)));
+            if !float {
+                return None;
+            }
+            let dims = match t.shape.as_slice() {
+                [n, k] => (1usize, *n, *k),
+                [e, n, k] => (*e, *n, *k),
+                _ => return None,
+            };
+            let target = spec.target_for(&t.name, dims.0)?;
+            if is_dense(target) || !target_ok(target, dims.1, dims.2) {
+                return None;
+            }
+            Some(Item { name: t.name.clone(), dims, shape: t.shape.clone(), current: None, target, delta: None, origin: Some(Origin(hf.clone())) })
+        })
+        .collect()
+}
+
+/// Поток компонента бандла прямо из шардов HF: выбранные матрицы кодируются
+/// из оригинала (с калибровкой и GPTQ, как у [`write_bundle`]), остальное
+/// переносится байтами — без промежуточного плотного `.syn`.
+struct HfStream {
+    hf: Arc<super::hf_origin::HfOrigin>,
+    tensors: Vec<super::hf_origin::HfTensor>,
+    device: Device,
+    plan: Vec<StreamTensor>,
+    kinds: Vec<HfKind>,
+    items: Vec<Item>,
+    pending_scales: Option<(usize, Vec<u8>)>,
+    progress: Option<Progress>,
+    done: usize,
+}
+
+enum HfKind {
+    Pass(usize),
+    Quant(usize, bool),
+}
+
+impl HfStream {
+    fn new(hf: Arc<super::hf_origin::HfOrigin>, spec: &TranscodeSpec, device: Device, manifest: &mut QuantManifest, progress: Option<Progress>) -> Result<Self> {
+        let tensors = hf.bundle_tensors()?;
+        let decided = hf_items(&hf, &tensors, spec);
+        let mut plan = Vec::new();
+        let mut kinds = Vec::new();
+        let mut items = Vec::new();
+        for (ti, (t, it)) in tensors.iter().zip(decided).enumerate() {
+            match it {
+                Some(it) => {
+                    let entry = entry_for(&it);
+                    let kind = entry.kind().unwrap();
+                    manifest.tensors.insert(it.name.clone(), entry.clone());
+                    let i = items.len();
+                    plan.push(StreamTensor { name: manifest.packed_name(&it.name), dtype: StDtype::U8, shape: packed_shape(kind, it.dims) });
+                    kinds.push(HfKind::Quant(i, false));
+                    if kind.has_scales() {
+                        plan.push(StreamTensor { name: manifest.scales_name(&it.name), dtype: StDtype::U8, shape: vec![entry.scales_bytes().unwrap_or(0) as usize] });
+                        kinds.push(HfKind::Quant(i, true));
+                    }
+                    items.push(it);
+                }
+                None => {
+                    let dt = super::hf_origin::HfOrigin::pass_dtype(t);
+                    let st = st_dtype_str(dt).ok_or_else(|| IoError::Bundle(format!("{}: тип {} писатель не переносит", t.name, t.dtype)))?;
+                    plan.push(StreamTensor { name: t.name.clone(), dtype: st, shape: t.shape.clone() });
+                    kinds.push(HfKind::Pass(ti));
+                }
+            }
+        }
+        Ok(Self { hf, tensors, device, plan, kinds, items, pending_scales: None, progress, done: 0 })
+    }
+}
+
+impl TensorStream for HfStream {
+    fn plan(&self) -> &[StreamTensor] {
+        &self.plan
+    }
+
+    fn write_tensor(&mut self, index: usize, w: &mut dyn std::io::Write) -> synaptix_bundle::Result<()> {
+        let err = |e: IoError| synaptix_bundle::Error::Safetensors(e.to_string());
+        match self.kinds[index] {
+            HfKind::Pass(ti) => self.hf.write_pass(&self.tensors[ti], w).map_err(err),
+            HfKind::Quant(ii, true) => {
+                let item = &self.items[ii];
+                let (i, bytes) = self.pending_scales.take().ok_or_else(|| synaptix_bundle::Error::Safetensors(format!("{}: масштабы не посчитаны", item.name)))?;
+                if i != ii {
+                    return Err(synaptix_bundle::Error::Safetensors(format!("{}: масштабы от другого тензора", item.name)));
+                }
+                w.write_all(&bytes).map_err(synaptix_bundle::Error::Io)
+            }
+            HfKind::Quant(ii, false) => {
+                let item = &self.items[ii];
+                if let Some(p) = &self.progress {
+                    p(self.done, self.items.len(), &item.name);
+                }
+                let mut scales_all = Vec::new();
+                for s in 0..item.dims.0 {
+                    let (packed, scales) = transcode_slice(None, item, s, self.device).map_err(err)?;
+                    w.write_all(&packed).map_err(synaptix_bundle::Error::Io)?;
+                    scales_all.extend_from_slice(&scales);
+                }
+                self.done += 1;
+                if !scales_all.is_empty() {
+                    self.pending_scales = Some((ii, scales_all));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Компоненты плана, к которым применяется `spec` (остальные — как есть).
+fn hf_component_spec<'a>(spec: &'a TranscodeSpec, keep: &'a TranscodeSpec, name: &str) -> &'a TranscodeSpec {
+    if spec.components.is_empty() || spec.components.iter().any(|c| c == name) { spec } else { keep }
+}
+
+/// План перекодировки каталога HF без записи (как [`plan`]).
+pub fn plan_hf(src: &synaptix_bundle::PackPlan, spec: &TranscodeSpec) -> Result<Vec<(String, String, String, DType)>> {
+    let keep = TranscodeSpec::keep();
+    let mut out = Vec::new();
+    for c in src.components.iter().filter(|c| c.enabled) {
+        let hf = super::hf_origin::HfOrigin::from_files(&c.paths, Some(c.prefix.as_str()))?;
+        let tensors = hf.bundle_tensors()?;
+        for (t, it) in tensors.iter().zip(hf_items(&hf, &tensors, hf_component_spec(spec, &keep, &c.name))) {
+            if let Some(it) = it {
+                out.push((c.name.clone(), it.name, t.dtype.to_ascii_lowercase(), it.target));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Полный бандл прямо из каталога HF (план упаковки `pack_plan`): матрицы
+/// по `spec` кодируются из оригинала, прочие тензоры и файлы — как у
+/// `synaptix convert` (поштучные эксперты — стопками). Промежуточный
+/// плотный `.syn` не пишется.
+pub fn write_bundle_hf(src: &synaptix_bundle::PackPlan, out: &Path, spec: &TranscodeSpec, device: Device, progress: Option<Progress>) -> Result<TranscodeReport> {
+    let t0 = Instant::now();
+    let mut builder = BundleBuilder::new(&src.meta.id, &src.meta.version).require_capability(CAP_QUANT_WEIGHTS);
+    if !src.meta.arch.is_empty() {
+        builder = builder.arch(&src.meta.arch);
+    }
+    if !src.meta.purpose.is_empty() {
+        builder = builder.purpose(&src.meta.purpose);
+    }
+    let keep = TranscodeSpec::keep();
+    let mut manifest = QuantManifest::new();
+    let (mut tensors, mut before, mut after) = (0usize, 0u64, 0u64);
+    let mut streams = Vec::new();
+    for c in src.components.iter().filter(|c| c.enabled) {
+        if c.paths.is_empty() {
+            return Err(IoError::Bundle(format!("компонент `{}`: нет шардов", c.name)));
+        }
+        if !c.prefix.is_empty() {
+            builder = builder.component(&c.name, &c.prefix);
+        }
+        let hf = super::hf_origin::HfOrigin::from_files(&c.paths, Some(c.prefix.as_str()))?;
+        let s = HfStream::new(hf, hf_component_spec(spec, &keep, &c.name), device, &mut manifest, progress.clone())?;
+        let (b, a) = bytes_of_items(&s.items);
+        tensors += s.items.len();
+        before += b;
+        after += a;
+        streams.push((c.name.clone(), s));
+    }
+    if streams.is_empty() {
+        return Err(IoError::Bundle("в плане нет включённых компонентов".into()));
+    }
+    for (c, s) in streams {
+        builder = builder.add_tensor_stream(&c, Box::new(s));
+    }
+    for f in src.aux.iter().filter(|f| f.enabled && f.rel != MANIFEST_NAME) {
+        builder = builder.add_file_path(&f.rel, &f.path, f.tag).map_err(|e| IoError::Bundle(e.to_string()))?;
     }
     let mbytes = serde_json::to_vec_pretty(&manifest).map_err(|e| IoError::Bundle(e.to_string()))?;
     builder = builder.add_file_bytes(MANIFEST_NAME, mbytes, FileTag::Inference).map_err(|e| IoError::Bundle(e.to_string()))?;

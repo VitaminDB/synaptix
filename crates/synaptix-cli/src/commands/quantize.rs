@@ -1,7 +1,9 @@
 //! `synaptix quantize` — квантование и перекодировка модели в `.syn`.
 //!
-//! Источник — `.syn` (плотный или уже квантованный NVFP4/MXFP8/SQ) или
-//! `.gguf` (блоки ggml). Матрицы attn/mlp/экспертов/головы деквантуются на
+//! Источник — `.syn` (плотный или уже квантованный NVFP4/MXFP8/SQ), `.gguf`
+//! (блоки ggml) или каталог HF (safetensors BF16/F16/F32 или FP8 с блочными
+//! масштабами): из каталога бандл пишется сразу, без промежуточного
+//! `synaptix convert`. Матрицы attn/mlp/экспертов/головы деквантуются на
 //! карте в F16 и кодируются целевым форматом (`Tensor::quantize_to`),
 //! остальные тензоры и файлы копируются как есть. Двойной квант из уже
 //! квантованного источника — осознанный выбор (`--keep-quant` его отключает).
@@ -83,9 +85,17 @@ fn fmt(s: &str, what: &str) -> Result<Option<DType>, String> {
 }
 
 pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.input.is_dir() {
-        return Err("каталог HF не поддержан: сперва `synaptix convert <dir> model.syn`, затем quantize".into());
-    }
+    let hf_plan = if args.input.is_dir() {
+        if args.origin.is_some() {
+            return Err("--origin не нужен: источник и так каталог HF".into());
+        }
+        if args.keep_quant {
+            return Err("--keep-quant: в каталоге HF нет квантованных весов".into());
+        }
+        Some(synaptix_bundle::pack_plan::PackPlan::scan(&args.input)?)
+    } else {
+        None
+    };
     // Пресеты политики. Качество важнее «влезет ли»: размещение — дело
     // движка (оффлоад), чувствительные веса — MXFP8 или как есть.
     //   llm     — MLP/эксперты NVFP4; внимание, эмбеддинг, голова, зрение,
@@ -155,7 +165,10 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let spec = TranscodeSpec { attn, mlp: Some(main), experts, lm_head, embed, requant: !args.keep_quant, quantize_dense: true, include: args.include.clone(), vision, rules, components: args.component.clone(), deltas: None, origin };
     if args.plan {
-        let items = synaptix_io::weights::transcode::plan(&args.input, &spec)?;
+        let items = match &hf_plan {
+            Some(p) => synaptix_io::weights::transcode::plan_hf(p, &spec)?,
+            None => synaptix_io::weights::transcode::plan(&args.input, &spec)?,
+        };
         let mut g: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();
         for (c, n, cur, t) in &items {
             let pat: String = n.split('.').map(|p| if p.chars().all(|ch| ch.is_ascii_digit()) { "N" } else { p }).collect::<Vec<_>>().join(".");
@@ -201,7 +214,10 @@ pub fn run(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let progress: synaptix_io::weights::transcode::Progress = Arc::new(|done, total, name| {
         eprint!("\r  [{done}/{total}] {name:<70}");
     });
-    let report = synaptix::facade::llm::transcode_bundle(&args.input, &args.output, &spec, device, Some(progress))?;
+    let report = match &hf_plan {
+        Some(p) => synaptix::facade::llm::transcode_hf(p, &args.output, &spec, device, Some(progress))?,
+        None => synaptix::facade::llm::transcode_bundle(&args.input, &args.output, &spec, device, Some(progress))?,
+    };
     eprintln!();
     println!("Done: {}", args.output.display());
     println!("  тензоров:   {} перекодировано", report.tensors);

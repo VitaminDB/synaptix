@@ -3402,6 +3402,20 @@ pub fn transcode_bundle(
     synaptix_io::weights::transcode::write_bundle(src, out, spec, device, progress).map_err(|e| LlmError(e.to_string()))
 }
 
+/// Бандл прямо из каталога HF (план упаковки): матрицы по `spec` кодируются
+/// из оригинала, без промежуточного плотного `.syn`.
+pub fn transcode_hf(
+    src: &synaptix_bundle::PackPlan,
+    out: &Path,
+    spec: &synaptix_io::weights::transcode::TranscodeSpec,
+    device: Device,
+    progress: Option<synaptix_io::weights::transcode::Progress>,
+) -> Result<synaptix_io::weights::transcode::TranscodeReport, LlmError> {
+    ensure_kernels_registered();
+    let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+    synaptix_io::weights::transcode::write_bundle_hf(src, out, spec, device, progress).map_err(|e| LlmError(e.to_string()))
+}
+
 // ── Настройки генерации одной модели ────────────────────────────────────────
 
 /// Настройки генерации модели поверх общих флагов процесса (`None` — как у
