@@ -102,6 +102,9 @@ pub struct HybridPipeline {
     pub tokenizer: HfTokenizer,
     pub config: HybridConfig,
     pub add_bos: bool,
+    /// Черновиков на шаг сверки MTP у этой модели (настройка пользователя);
+    /// 0 — умолчание процесса ([`mtp_depth`]).
+    pub mtp_depth: std::sync::atomic::AtomicUsize,
 }
 
 /// Разметка видео в промпте: сколько групп кадров, сколько токенов на
@@ -236,7 +239,7 @@ impl HybridPipeline {
         let dcfg = config.to_decoder_config();
         let model = DecoderModel::build_auto(&dcfg, &weights, device, dtype, dtype, dtype, dtype, dtype, cap)
             .map_err(|e| PipelineError::Model(e.to_string()))?;
-        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false, mtp_depth: Default::default() })
     }
 
     pub fn load_with_precision(
@@ -264,7 +267,7 @@ impl HybridPipeline {
         // model.kv_dtype оставался compute(F16) → MXFP8-KV игнорировался, KV
         // аллоцировался F16 и decode шёл по f16-flash (qwen3-pipeline это делал).
         .with_kv_cache_dtype(precision.kv);
-        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false, mtp_depth: Default::default() })
     }
 
     /// Как [`Self::load_with_precision`], но у MoE-модели эксперты сразу
@@ -292,7 +295,7 @@ impl HybridPipeline {
         )
         .map_err(|e| PipelineError::Model(e.to_string()))?
         .with_kv_cache_dtype(precision.kv);
-        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false })
+        Ok(Self { model, mtp: None, vision: None, vision_minicpm: None, tokenizer, config, add_bos: false, mtp_depth: Default::default() })
     }
 
     pub fn load_with_precision_mtp(
@@ -1476,7 +1479,10 @@ impl HybridPipeline {
         // поэтому за ним идёт цепочка: первый черновик голова строит по
         // скрытому состоянию ствола, следующие — по собственному (замер
         // Qwen3.8-27B: первый принимается в 79–90 %, второй следом — в 69–79 %).
-        let t_step = mtp_depth() + 1;
+        let t_step = match self.mtp_depth.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => mtp_depth(),
+            n => n.clamp(1, MTP_DEPTH_MAX),
+        } + 1;
 
         let mut graph_ctx = if use_graph {
             Some(self.build_mtp_graph(&mut kv, t_step)?)
@@ -1925,9 +1931,12 @@ struct VerifyStep {
 pub fn mtp_depth() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("SYN_MTP_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 3)
+        std::env::var("SYN_MTP_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, MTP_DEPTH_MAX)
     })
 }
+
+/// Предел глубины цепочки черновиков (шаг сверки — до четырёх токенов).
+pub const MTP_DEPTH_MAX: usize = 3;
 
 type ArgmaxFn<'a> = &'a dyn Fn(&synaptix_core::tensor::Tensor) -> Result<u32, PipelineError>;
 

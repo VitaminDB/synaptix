@@ -1919,6 +1919,19 @@ impl Llm {
         }
     }
 
+    /// Глубина цепочки черновиков MTP у этой модели: сколько черновых токенов
+    /// сверяет один шаг ствола (1…3; 0 — умолчание). Действует со следующего
+    /// хода. `false` — у модели нет MTP-головы.
+    pub fn set_mtp_depth(&self, depth: usize) -> bool {
+        match self.pipeline.lock().as_deref() {
+            Ok(LlmPipeline::Hybrid(p)) if p.has_mtp() => {
+                p.mtp_depth.store(depth, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Выгружает vision-башню и возвращает её память пулу устройства.
     pub fn release_media_tower(&self) {
         if let Ok(mut guard) = self.pipeline.lock() {

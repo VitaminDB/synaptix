@@ -40,6 +40,8 @@ pub struct RunArgs {
     pub warmup: bool,
     /// Запретить MTP даже когда он доступен.
     pub no_mtp: bool,
+    /// Глубина цепочки черновиков MTP (1…3); None — умолчание.
+    pub mtp_depth: Option<usize>,
     /// Изображение для мультимодального промпта (Qwen3.6-VL).
     pub image: Option<PathBuf>,
     /// Видео для мультимодального промпта (Muse Glimmer).
@@ -134,6 +136,11 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
     let t0 = std::time::Instant::now();
     let (llm, tok) = load_llm(&args.model, device, precision, args.max_seq)?;
     eprintln!("synaptix run: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+    if let Some(d) = args.mtp_depth {
+        if !llm.set_mtp_depth(d) {
+            eprintln!("synaptix run: --mtp-depth: у модели нет MTP-головы");
+        }
+    }
     // `SYNAPTIX_LLM_PROF=1` — профиль по операциям (как в службе): префилл и
     // обычный (неграфовый) декод; отчёт — после статистики.
     let prof = std::env::var_os("SYNAPTIX_LLM_PROF").is_some();

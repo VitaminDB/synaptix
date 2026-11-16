@@ -320,8 +320,28 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
             Some(ParamValue::Text(r.default.clone())),
         ));
     }
+    // Модели с MTP-головой (гибрид Qwen3.5+): сколько черновых токенов сверяет
+    // один шаг. Больше единицы — быстрее, особенно на длинном контексте, но
+    // текст ответа при том же зерне может отличаться в мелочах.
+    if path.is_some_and(llm_has_mtp) {
+        out.push(spec(
+            "mtp_depth",
+            "Глубина черновиков",
+            "Сколько токенов наперёд угадывается за один шаг: больше — быстрее, особенно на длинном контексте; ответ при том же зерне может отличаться в мелочах",
+            int(1, 3, 1),
+            i(1),
+        ));
+    }
     out.push(seed());
     out
+}
+
+/// У модели есть встроенная MTP-голова (`mtp_num_hidden_layers` в конфиге).
+pub fn llm_has_mtp(path: &Path) -> bool {
+    let Some(bytes) = super::arch::read_model_file(path, "config.json") else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    let n = |v: &serde_json::Value| v.get("mtp_num_hidden_layers").and_then(|x| x.as_u64()).unwrap_or(0);
+    n(&v) > 0 || v.get("text_config").is_some_and(|t| n(t) > 0)
 }
 
 #[cfg(test)]
