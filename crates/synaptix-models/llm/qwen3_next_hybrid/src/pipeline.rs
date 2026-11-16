@@ -348,6 +348,14 @@ impl HybridPipeline {
             cap,
         )
         .map_err(|e| PipelineError::Model(format!("mtp: {e}")))?;
+        // Кэш головы — в том же формате, что основной KV: плотный F16 на
+        // 262К контекста занимал 1.07 ГБ видеопамяти (MXFP8 — вдвое меньше).
+        // На ответ это не влияет: черновик головы проверяет основная модель.
+        // `SYN_MTP_KV_DENSE=1` — прежний плотный кэш.
+        let mut module = module;
+        if std::env::var_os("SYN_MTP_KV_DENSE").is_none() {
+            module.layers = module.layers.with_kv_cache_dtype(precision.kv);
+        }
         me.mtp = Some(module);
         Ok(me)
     }
