@@ -60,10 +60,51 @@ pub struct PlacementProbe {
     pub cache: Option<Arc<ExpertCache>>,
     /// Зеркало этой модели: бюджет, байт. `None` — зеркала нет.
     pub mirror_budget: Option<u64>,
+    /// Раскладка, меняющаяся на ходу (эксперты уезжают с карты в RAM при
+    /// нехватке памяти): если задана, кэш и зеркало берутся отсюда, а без
+    /// кэша эксперты считаются целиком на карте.
+    pub live: Option<Arc<LivePlacement>>,
+}
+
+/// Изменчивая часть раскладки модели на общем декодере.
+#[derive(Default)]
+pub struct LivePlacement {
+    cache: std::sync::Mutex<Option<Arc<ExpertCache>>>,
+    /// Бюджет зеркала, байт; 0 — зеркала нет.
+    mirror_budget: AtomicU64,
+}
+
+impl LivePlacement {
+    /// Эксперты в RAM: кэш на карте и бюджет зеркала (`None` — без зеркала).
+    pub fn set_offloaded(&self, cache: Arc<ExpertCache>, mirror_budget: Option<u64>) {
+        *self.cache.lock().unwrap() = Some(cache);
+        self.mirror_budget.store(mirror_budget.unwrap_or(0), Ordering::Relaxed);
+    }
 }
 
 impl PlacementProbe {
     pub fn snapshot(&self) -> ExpertPlacement {
+        if let Some(live) = &self.live {
+            let cache = live.cache.lock().unwrap().clone();
+            let total = self.layers * self.experts_per_layer;
+            let Some(cache) = cache else {
+                // Эксперты целиком на карте.
+                return ExpertPlacement {
+                    layers: self.layers,
+                    experts_per_layer: self.experts_per_layer,
+                    total,
+                    total_bytes: self.total_bytes,
+                    vram: total,
+                    vram_bytes: self.total_bytes,
+                    // 0 — отдельного кэша нет: эксперты входят в веса модели.
+                    vram_capacity: 0,
+                    ..Default::default()
+                };
+            };
+            let budget = live.mirror_budget.load(Ordering::Relaxed);
+            let p = PlacementProbe { live: None, cache: Some(cache), mirror_budget: (budget > 0).then_some(budget), ..self.clone() };
+            return p.snapshot();
+        }
         let total = self.layers * self.experts_per_layer;
         let per = self.total_bytes / total.max(1) as u64;
         let count = |bytes: u64| if per == 0 { 0 } else { (bytes / per).min(total as u64) as u32 };
@@ -99,5 +140,25 @@ impl PlacementProbe {
             hits,
             misses,
         }
+    }
+}
+
+/// Слои модели по месту: сколько блоков на карте (остальные — на хосте в RAM,
+/// приезжают на каждом проходе). Счётчик меняется на ходу.
+#[derive(Clone)]
+pub struct LayerProbe {
+    pub total: u32,
+    pub resident: Arc<AtomicU64>,
+}
+
+impl LayerProbe {
+    /// Все слои на устройстве (модель без перекладки блоков).
+    pub fn all_resident(total: usize) -> Self {
+        Self { total: total as u32, resident: Arc::new(AtomicU64::new(total as u64)) }
+    }
+
+    /// `(всего, на карте)`.
+    pub fn snapshot(&self) -> (u32, u32) {
+        (self.total, (self.resident.load(Ordering::Relaxed) as u32).min(self.total))
     }
 }

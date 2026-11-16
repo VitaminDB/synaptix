@@ -162,6 +162,25 @@ fn expert_stacks_for(cfg: &DecoderConfig, weights: &dyn WeightSource) -> Option<
     (0..cfg.num_hidden_layers).any(|l| crate::expert_mirror::has_lazy_stacks(&*stacks, l)).then_some(stacks)
 }
 
+/// Зонд раскладки экспертов модели: слои со стопками в бандле, экспертов на
+/// слой и их байты. Изначально эксперты на карте; при оффлоаде кэш и зеркало
+/// сообщаются через [`crate::placement::LivePlacement`].
+fn expert_placement_probe(cfg: &DecoderConfig, weights: &dyn WeightSource, device: Device) -> Option<crate::placement::PlacementProbe> {
+    let stacks = expert_stacks_for(cfg, weights)?;
+    let layers = (0..cfg.num_hidden_layers).filter(|l| crate::expert_mirror::has_lazy_stacks(&*stacks, *l)).count();
+    let per = (0..cfg.num_hidden_layers)
+        .find_map(|l| cfg.moe_ffn_at(l).map(|m| m.num_experts))
+        .or_else(|| cfg.moe_branch().map(|m| m.num_experts))?;
+    (layers > 0 && per > 0).then(|| crate::placement::PlacementProbe {
+        layers: layers as u32,
+        experts_per_layer: per as u32,
+        total_bytes: stacks.total_bytes(device),
+        cache: None,
+        mirror_budget: None,
+        live: Some(std::sync::Arc::default()),
+    })
+}
+
 pub fn offload_mode() -> OffloadMode {
     // `SYN_OFFLOAD=resident|offload|auto` — принудительно, поверх настройки
     // процесса (отладка и замеры).
@@ -641,6 +660,8 @@ pub struct DecoderModel {
     /// стримятся по одному во время forward'а с префетчем следующего.
     /// Равно числу блоков — вся модель резидентна (обычный путь).
     resident_blocks: usize,
+    /// Копия `resident_blocks` для виджетов службы (читается без замка).
+    resident_live: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Уникальный номер экземпляра модели и поколение её весов (растёт при
     /// переносе блоков) — ключ годности захваченных графов.
     instance_id: u64,
@@ -657,6 +678,9 @@ pub struct DecoderModel {
     /// Закреплённое зеркало стопок экспертов в RAM (оффлоад из бандла):
     /// живёт, пока жива модель ([`crate::expert_mirror::host_mirror`]).
     host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
+    /// Раскладка экспертов для виджетов службы (`None` — модель без стопок
+    /// экспертов в бандле).
+    placement: Option<crate::placement::PlacementProbe>,
     ple: Option<ModelPle>,
     ple_cur: std::sync::Mutex<Option<Tensor>>,
 }
@@ -1298,10 +1322,17 @@ impl DecoderModel {
             Some(stacks) => {
                 let mirror = crate::expert_mirror::host_mirror(&crate::expert_mirror::mirror_ranges(&*stacks, device), "llm");
                 eprintln!("[llm] эксперты в RAM: читаются из бандла по одному{}", if mirror.is_some() { " через закреплённое зеркало" } else { "" });
-                (Some(stacks), mirror.map(|(g, _)| g))
+                (Some(stacks), mirror)
             }
             None => (None, None),
         };
+        let placement = expert_placement_probe(cfg, weights, device);
+        if let (Some(p), Some(cache)) = (&placement, &expert_cache) {
+            if let Some(live) = &p.live {
+                live.set_offloaded(cache.clone(), host_mirror.as_ref().map(|(_, b)| *b as u64));
+            }
+        }
+        let host_mirror = host_mirror.map(|(g, _)| g);
         // Слой экспертов в оффлоаде: лениво из бандла, если его стопки там
         // квантованы, иначе копией в RAM.
         let load_offloaded_moe = |prefix: &str, mcfg: crate::moe::MoeConfig, cache: &std::sync::Arc<crate::moe::ExpertCache>, l: usize| {
@@ -1782,6 +1813,7 @@ impl DecoderModel {
             rope_capacity,
             embed_scale: cfg.embed_scale,
             resident_blocks: if b_dev != device { 0 } else { n_blocks },
+            resident_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(if b_dev != device { 0 } else { n_blocks as u64 })),
             instance_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1791,6 +1823,7 @@ impl DecoderModel {
             lora_gen: 0,
             expert_cache,
             host_mirror: host_mirror.inspect(|g| g.resume()),
+            placement,
             ple: model_ple,
             ple_cur: std::sync::Mutex::new(None),
         })
@@ -1818,6 +1851,16 @@ impl DecoderModel {
     }
 
     /// Сколько блоков сейчас живёт на устройстве.
+    fn set_resident(&mut self, n: usize) {
+        self.resident_blocks = n;
+        self.resident_live.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Слои на карте / на хосте для виджетов службы (живой счётчик).
+    pub fn layer_probe(&self) -> crate::placement::LayerProbe {
+        crate::placement::LayerProbe { total: self.blocks.len() as u32, resident: self.resident_live.clone() }
+    }
+
     pub fn resident_blocks(&self) -> usize {
         self.resident_blocks
     }
@@ -1877,6 +1920,9 @@ impl DecoderModel {
             "[llm] эксперты {moved} слоёв ушли с карты в RAM{} — место под ход",
             if mirror.is_some() { " (закреплённое зеркало)" } else { "" }
         );
+        if let Some(live) = self.placement.as_ref().and_then(|p| p.live.as_ref()) {
+            live.set_offloaded(cache.clone(), mirror.as_ref().map(|(_, b)| *b as u64));
+        }
         self.expert_cache = Some(cache);
         self.host_mirror = mirror.map(|(g, _)| g);
         self.weights_gen = self.weights_gen.wrapping_add(1);
@@ -1931,13 +1977,13 @@ impl DecoderModel {
                 Ok(b) => self.blocks[idx] = b,
                 Err(e) => {
                     eprintln!("[llm] блок {idx} не въехал на карту ({e}) — остаток стримим");
-                    self.resident_blocks = idx;
+                    self.set_resident(idx);
                     return idx;
                 }
             }
         }
         let got = want.max(host_from);
-        self.resident_blocks = got;
+        self.set_resident(got);
         got
     }
 
@@ -2173,6 +2219,12 @@ impl DecoderModel {
             .map(|q| q.dtype() == DType::MXFP8)
             .unwrap_or(false)
             || self.lm_head.quant_dtype() == Some(DType::MXFP8)
+    }
+
+    /// Зонд раскладки экспертов (карта / зеркало RAM / бандл) для виджетов
+    /// службы — читается из другого потока без замка пайплайна.
+    pub fn placement_probe(&self) -> Option<crate::placement::PlacementProbe> {
+        self.placement.clone()
     }
 
     /// Кэш экспертов MoE в оффлоаде (см. `expert_cache`).

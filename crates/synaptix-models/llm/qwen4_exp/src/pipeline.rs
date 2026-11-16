@@ -370,6 +370,7 @@ impl Qwen4ExpPipeline {
             total_bytes: experts_bytes,
             cache: Some(cache.clone()),
             mirror_budget,
+            live: None,
         });
         Ok(Self {
             placement,

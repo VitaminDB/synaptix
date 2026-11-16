@@ -1231,13 +1231,17 @@ pub struct LlmRuntimeInfo {
     /// Драфтов предложено и принято с загрузки (пока считает Qwen4Exp).
     pub drafted: u64,
     pub accepted: u64,
-    /// Раскладка экспертов MoE; `None` — без кэша экспертов (всё на устройстве).
+    /// Раскладка экспертов MoE (у MoE-моделей из бандла, в том числе целиком
+    /// на карте); `None` — модель без экспертов.
     pub experts: Option<synaptix_llm_common::placement::ExpertPlacement>,
+    /// Слои: `(всего, на карте)`; остальные на хосте в RAM.
+    pub layers: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Default)]
 struct RuntimeProbe {
     placement: Option<synaptix_llm_common::placement::PlacementProbe>,
+    layers: Option<synaptix_llm_common::placement::LayerProbe>,
     spec: Option<std::sync::Arc<synaptix_llm_common::placement::SpecCounters>>,
     /// Имя спекуляции, если голова загружена; второе — только greedy;
     /// третье — зависит от флага `speculation` (DFlash, MTP гибрида).
@@ -1249,12 +1253,17 @@ impl RuntimeProbe {
         match p {
             LlmPipeline::Qwen4Exp(q) => Self {
                 placement: q.placement_probe(),
+                layers: Some(synaptix_llm_common::placement::LayerProbe::all_resident(q.config.num_hidden_layers)),
                 spec: Some(q.spec_counters()),
                 speculation: q.mtp.is_some().then_some(("MTP", false, false)),
             },
-            LlmPipeline::Hybrid(h) => Self { speculation: h.mtp.is_some().then_some(("MTP", true, true)), ..Default::default() },
-            LlmPipeline::MuseGlimmer(m) => Self { speculation: m.has_dflash().then_some(("DFlash", true, true)), ..Default::default() },
-            _ => Self::default(),
+            LlmPipeline::Hybrid(h) => Self { placement: h.model.placement_probe(), layers: Some(h.model.layer_probe()), speculation: h.mtp.is_some().then_some(("MTP", true, true)), ..Default::default() },
+            LlmPipeline::MuseGlimmer(m) => Self { placement: m.model.placement_probe(), layers: Some(m.model.layer_probe()), speculation: m.has_dflash().then_some(("DFlash", true, true)), ..Default::default() },
+            LlmPipeline::Qwen3(p) => Self { placement: p.model.placement_probe(), layers: Some(p.model.layer_probe()), ..Default::default() },
+            LlmPipeline::Llama(p) => Self { placement: p.model.placement_probe(), layers: Some(p.model.layer_probe()), ..Default::default() },
+            LlmPipeline::Lfm3(p) => Self { placement: p.model.placement_probe(), layers: Some(p.model.layer_probe()), ..Default::default() },
+            LlmPipeline::Gemma3(p) => Self { placement: p.model.placement_probe(), layers: Some(p.model.layer_probe()), ..Default::default() },
+            LlmPipeline::Gemma4(p) => Self { placement: p.model.placement_probe(), layers: Some(p.model.layer_probe()), ..Default::default() },
         }
     }
 }
@@ -1277,6 +1286,7 @@ impl Llm {
             drafted,
             accepted,
             experts: self.probe.placement.as_ref().map(|p| p.snapshot()),
+            layers: self.probe.layers.as_ref().map(|l| l.snapshot()),
         }
     }
 }
