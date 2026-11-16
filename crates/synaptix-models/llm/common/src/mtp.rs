@@ -147,6 +147,11 @@ impl MtpModule {
         self.layers.rope_capacity()
     }
 
+    /// Байт кэша головы на токен контекста (см. `DecoderModel::kv_bytes_per_token`).
+    pub fn kv_bytes_per_token(&self) -> usize {
+        self.layers.kv_bytes_per_token()
+    }
+
     pub fn make_kv_cache(&self, batch: usize, max_seq: usize) -> Result<KvCache, ModelError> {
         self.layers.make_kv_cache(batch, max_seq)
     }

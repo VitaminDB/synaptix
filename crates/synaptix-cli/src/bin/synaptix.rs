@@ -86,9 +86,6 @@ enum Commands {
         no_spec: bool,
         #[arg(long, default_value_t = 0)]
         prefill_batch: usize,
-        /// Без сессии префикс-KV: разовый ход старым путём (служба и чат ходят через сессию).
-        #[arg(long, default_value_t = false)]
-        no_session: bool,
     },
     Run {
         model: PathBuf,
@@ -1348,11 +1345,11 @@ fn main() -> ExitCode {
         }),
         Commands::Bench {
             model, n_tokens, prompt_tokens, batch_size, warmup, device, attn, dtype, repeat, quant,
-            storage_dtype, lm_head_dtype, embed_dtype, kv_dtype, no_graph, no_spec, prefill_batch, no_session,
+            storage_dtype, lm_head_dtype, embed_dtype, kv_dtype, no_graph, no_spec, prefill_batch,
         } => bench::run(bench::BenchArgs {
             model, n_tokens, prompt_tokens, batch_size, warmup, repeat, device, attn, quant,
             compute_dtype: dtype, storage_dtype, lm_head_dtype, embed_dtype, kv_dtype, no_graph, no_spec,
-            prefill_batch, no_session,
+            prefill_batch,
         }),
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,

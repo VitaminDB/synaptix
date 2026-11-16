@@ -21,6 +21,21 @@ use parking_lot::Mutex;
 use crate::error::{Result, SynaptixError};
 use crate::memory::pinned::PinnedBuf;
 
+/// Буферы меньше этого в закреплённую RAM не кладутся (см.
+/// `cuda_alloc_from_bytes`): `SYN_HOST_MAPPED_MIN_MB` — для замеров.
+pub static MIN_BYTES_DEFAULT: usize = 8 << 20;
+
+pub fn min_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SYN_HOST_MAPPED_MIN_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| (mb << 20).max(1))
+            .unwrap_or(MIN_BYTES_DEFAULT)
+    })
+}
+
 static LO: AtomicU64 = AtomicU64::new(u64::MAX);
 static HI: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);

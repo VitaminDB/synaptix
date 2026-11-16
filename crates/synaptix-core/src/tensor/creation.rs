@@ -499,7 +499,10 @@ pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Stor
     // offload-загрузка: байты внутри pinned-кэша ckpt → DMA из персистентной
     // pinned-копии (async на stream — потребитель синкает stream); иначе pinned
     // staging (45 GB/s vs 3.6 pageable).
-    let buf = if crate::memory::host_mapped::enabled() && !bytes.is_empty() {
+    // Мелочь (масштабы блоков, нормы, смещения) остаётся в видеопамяти: её
+    // ядра читают побайтно, а по шине это в разы медленнее широких загрузок
+    // (7–27 ГБ/с против 45), при том что занимает она несколько процентов блока.
+    let buf = if crate::memory::host_mapped::enabled() && bytes.len() >= crate::memory::host_mapped::min_bytes() {
         // Zero-copy: байты остаются в закреплённой RAM, карта читает их по шине.
         crate::memory::host_mapped::htod(&stream, bytes)?
     } else if let Some(r) = crate::device::cuda::offload_pin_cache_htod(&stream, bytes) {

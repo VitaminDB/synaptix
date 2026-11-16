@@ -187,6 +187,12 @@ fn expert_placement_probe(cfg: &DecoderConfig, weights: &dyn WeightSource, devic
 /// декода остаются включёнными, а ответ токен в токен тот же, что у модели
 /// целиком на карте (Qwen3.8-27B, 20 блоков в RAM: 6.5 ток/с против 3.1 у
 /// стрима). `SYN_TAIL=stream` — прежний стрим блоков.
+/// До скольких токенов проход читает хвост из закреплённой RAM напрямую, без
+/// стрима блоков: декод, сверка MTP и досчёт хвоста промпта после точки
+/// возврата (до 63 токенов). План видеопамяти фасада считает такой ход
+/// «прямым» по этой же границе — запаса под въезжающие блоки ему не нужно.
+pub const TAIL_DIRECT_MAX: usize = 256;
+
 pub fn tail_mapped() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("SYN_TAIL").as_deref(), Ok("stream")))
@@ -2149,9 +2155,8 @@ impl DecoderModel {
     /// один раз привезти на карту (замер 83К: 1005 ток/с напрямую против
     /// 2034 со стримом).
     fn streams_blocks(&self, tokens: usize) -> bool {
-        const DIRECT_MAX: usize = 32;
         let dev = self.device;
-        self.blocks.iter().zip(&self.mapped).any(|(b, m)| !b.on_device(dev) || (*m && tokens > DIRECT_MAX))
+        self.blocks.iter().zip(&self.mapped).any(|(b, m)| !b.on_device(dev) || (*m && tokens > TAIL_DIRECT_MAX))
     }
 
     fn for_each_block<F>(&self, dev: Device, tokens: usize, mut body: F) -> Result<(), ModelError>

@@ -555,7 +555,13 @@ impl LlmPipeline {
         match self {
             Self::Qwen3(p) => p.model.kv_bytes_per_token(),
             Self::Qwen4Exp(p) => p.kv_bytes_per_token(),
-            Self::Hybrid(p) => p.model.kv_bytes_per_token(),
+            // Кэш MTP-головы растёт вместе с контекстом (у Qwen3.8-27B — плотный
+            // слой, 4 КБ на токен: на 262К это гигабайт, которого плану
+            // не хватало — сессия падала по памяти при создании).
+            Self::Hybrid(p) => {
+                p.model.kv_bytes_per_token()
+                    + if mtp_enabled() { p.mtp.as_ref().map(|m| m.kv_bytes_per_token()).unwrap_or(0) } else { 0 }
+            }
             Self::Llama(p) => p.model.kv_bytes_per_token(),
             Self::Lfm3(p) => p.model.kv_bytes_per_token(),
             Self::Gemma3(p) => p.model.kv_bytes_per_token(),
@@ -1619,7 +1625,19 @@ impl Llm {
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
         let f = free();
         // Сколько блоков держать на карте при запасе `need` от нынешнего состояния.
-        let plan = |need: usize| -> usize {
+        // Хвост в закреплённой RAM (zero-copy) короткий ход читает напрямую:
+        // буферов под въезжающие блоки ему не нужно, а каждый блок, оставшийся
+        // в RAM при свободной видеопамяти, — это лишние миллисекунды шины на
+        // каждом токене. Поэтому на декоде запас под стрим не держим.
+        let mapped = synaptix_llm_common::model::tail_mapped();
+        let plan = |need: usize, direct: bool| -> usize {
+            if direct && resident < total {
+                return if f < need {
+                    resident.saturating_sub((need - f).div_ceil(blk))
+                } else {
+                    (resident + (f - need) / blk_max).min(total)
+                };
+            }
             let streamed_need = need + 2 * blk_max;
             if resident >= total && f >= need {
                 total
@@ -1634,16 +1652,40 @@ impl Llm {
                 if spare < 2 { resident } else { (resident + spare - 1).min(total) }
             }
         };
-        let want = plan(need);
+        if std::env::var_os("SYN_VRAM_TRACE").is_some() {
+            eprintln!("[VRAM_TRACE] план: free {f} need {need} need_dec {need_dec} blk {blk} blk_max {blk_max} resident {resident} prefill {prefill_tokens}");
+        }
+        let want = plan(need, mapped && prefill_tokens <= synaptix_llm_common::model::TAIL_DIRECT_MAX);
         // Декоду того же хода активации куска не нужны: префилл идёт
         // отдельным проходом, а план второго (без активаций) вернёт блоки.
-        let want_dec = plan(need_dec);
+        let want_dec = plan(need_dec, mapped);
         set_dec((want_dec > want).then_some(want_dec));
         if want == resident {
             return Some(resident);
         }
-        let got = self.set_block_residency(want).unwrap_or(resident);
+        let mut got = self.set_block_residency(want).unwrap_or(resident);
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        // Блок в видеопамяти занимает меньше, чем весит (мелкие буферы блока в
+        // RAM не уезжают), и план по среднему весу недобирает: добираем по
+        // факту, пока свободного хватает ещё на блок.
+        if mapped && prefill_tokens <= synaptix_llm_common::model::TAIL_DIRECT_MAX {
+            for _ in 0..4 {
+                let fr = free();
+                if got >= total || fr < need + blk_max {
+                    break;
+                }
+                let more = (got + (fr - need) / blk_max).min(total);
+                let now = self.set_block_residency(more).unwrap_or(got);
+                if std::env::var_os("SYN_VRAM_TRACE").is_some() {
+                    eprintln!("[VRAM_TRACE] добор: free {fr} need {need} blk {blk} blk_max {blk_max} → {more}, вышло {now}");
+                }
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+                if now <= got {
+                    break;
+                }
+                got = now;
+            }
+        }
         eprintln!(
             "[synaptix] VRAM: блоков на карте {resident} → {got} из {total} (свободно было {:.2} ГБ, нужно {:.2}; теперь {:.2}){}",
             f as f64 / 1e9,
@@ -2066,15 +2108,17 @@ impl<'a> LlmGeneration<'a> {
             let mut on_token = on_token;
             let mut retries = 0;
             loop {
-                let Some(mut session) = self.model.new_kv_session(kv_tokens, self.opts.max_new_tokens)? else {
-                    break;
-                };
                 let mut emitted = false;
-                let r = self.generate_streaming_cached(&mut session, prompt_ids, tokenizer, |id, s| {
-                    emitted = true;
-                    on_token(id, s)
-                });
-                drop(session);
+                let r = match self.model.new_kv_session(kv_tokens, self.opts.max_new_tokens) {
+                    Ok(None) => break,
+                    Ok(Some(mut session)) => self
+                        .generate_streaming_cached(&mut session, prompt_ids, tokenizer, |id, s| {
+                            emitted = true;
+                            on_token(id, s)
+                        })
+                        .map(|_| ()),
+                    Err(e) => Err(e),
+                };
                 let Err(e) = r else { return Ok(()) };
                 let msg = e.to_string().to_ascii_lowercase();
                 let oom = msg.contains("out of memory") || msg.contains("oom") || msg.contains("alloc_");
