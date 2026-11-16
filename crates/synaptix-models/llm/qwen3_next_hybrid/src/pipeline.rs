@@ -970,7 +970,10 @@ impl HybridPipeline {
         // `generate_mtp_inner`): разрез посередине его чанка оставляет
         // состояние частичного чанка и расходится с непрерывным префиллом.
         let snap_at = if on_prefill.is_some() {
-            (l.min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
+            // Не весь промпт: хоть один токен следующий ход обязан посчитать
+            // ради логитов (`LlmKvSession::reusable`), и точку на длине,
+            // кратной чанку, он отверг бы целиком — полный префилл заново.
+            ((l - 1).min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
         } else {
             0
         };
@@ -1370,7 +1373,10 @@ impl HybridPipeline {
         // 47/73/100 — нет). Поэтому хвост промпта после последней кратной
         // границы в кэш-точку не входит и на следующем ходу считается заново.
         let snap_at = if on_prefill.is_some() {
-            (l.min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
+            // Не весь промпт: хоть один токен следующий ход обязан посчитать
+            // ради логитов (`LlmKvSession::reusable`), и точку на длине,
+            // кратной чанку, он отверг бы целиком — полный префилл заново.
+            ((l - 1).min(resume_at.unwrap_or(l)) / GDN_CHUNK) * GDN_CHUNK
         } else {
             0
         };

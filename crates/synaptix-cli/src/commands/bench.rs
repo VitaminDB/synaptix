@@ -25,6 +25,7 @@ pub struct BenchArgs {
     pub no_graph: bool,
     pub no_spec: bool,
     pub prefill_batch: usize,
+    pub no_session: bool,
 }
 
 pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -84,13 +85,37 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut gen = LlmGeneration::new(&llm, opts);
         let started = Instant::now();
-        let mut first = None;
-        let mut n = 0usize;
-        gen.generate_streaming(&prompt_ids, &tok, |_, _| {
-            first.get_or_insert_with(Instant::now);
-            n += 1;
-            true
-        })?;
+        let mut first;
+        let mut n: usize;
+        // Тот же путь, что у службы и чата: ход через сессию префикс-KV (план
+        // VRAM с возвратом блоков на декод), а упёршийся в память ход
+        // повторяется после `shed_blocks` — до восьми раз, как в synaptixd.
+        let mut session = if args.no_session { None } else { llm.new_kv_session(max_seq, max_new)? };
+        let mut retries = 0;
+        loop {
+            first = None;
+            n = 0;
+            let mut on_token = |_: u32, _: &str| {
+                first.get_or_insert_with(Instant::now);
+                n += 1;
+                true
+            };
+            let r = match session.as_mut() {
+                Some(s) => gen.generate_streaming_cached(s, &prompt_ids, &tok, &mut on_token).map(|_| ()),
+                None => gen.generate_streaming(&prompt_ids, &tok, &mut on_token),
+            };
+            let Err(e) = r else { break };
+            let msg = e.to_string().to_ascii_lowercase();
+            let oom = msg.contains("out of memory") || msg.contains(": oom") || msg.contains("alloc_");
+            if !(oom && retries < 8 && llm.shed_blocks()) {
+                return Err(e.into());
+            }
+            retries += 1;
+            eprintln!("synaptix bench: ход упёрся в видеопамять ({e}) — повтор {retries}");
+            if let Some(s) = session.as_mut() {
+                *s = llm.new_kv_session(max_seq, max_new)?.ok_or("сессия не пересоздалась")?;
+            }
+        }
         let end = Instant::now();
         let first = first.unwrap_or(end);
         Ok((n, (first - started).as_secs_f64() * 1e3, (end - first).as_secs_f64() * 1e3))
