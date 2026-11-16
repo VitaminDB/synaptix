@@ -631,6 +631,19 @@ impl LlmPipeline {
         }
     }
 
+    /// Таблица эмбеддингов — в закреплённую RAM (см. `DecoderModel::map_embeddings`).
+    fn map_embeddings(&mut self) -> bool {
+        match self {
+            Self::Qwen3(p) => p.model.map_embeddings(),
+            Self::Hybrid(p) => p.model.map_embeddings(),
+            Self::Llama(p) => p.model.map_embeddings(),
+            Self::Lfm3(p) => p.model.map_embeddings(),
+            Self::Gemma3(p) => p.model.map_embeddings(),
+            Self::MuseGlimmer(p) => p.model.map_embeddings(),
+            Self::Gemma4(_) | Self::Qwen4Exp(_) => false,
+        }
+    }
+
     fn set_block_residency(&mut self, resident: usize) -> Option<usize> {
         match self {
             Self::Qwen3(p) => Some(p.model.set_block_residency(resident)),
@@ -1623,6 +1636,13 @@ impl Llm {
             synaptix_kernels_cuda::release_prefill_scratch();
         }
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        // Первой место уступает таблица эмбеддингов: в закреплённой RAM она
+        // шагу ничего не стоит, в отличие от блоков.
+        if self.pipeline.lock().map(|mut p| p.map_embeddings()).unwrap_or(false) {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+            let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+            eprintln!("[synaptix] VRAM: таблица эмбеддингов — в закреплённую RAM (свободно {:.2} ГБ)", free() as f64 / 1e9);
+        }
         let f = free();
         // Сколько блоков держать на карте при запасе `need` от нынешнего состояния.
         // Хвост в закреплённой RAM (zero-copy) короткий ход читает напрямую:

@@ -681,6 +681,8 @@ pub struct DecoderModel {
     /// оттуда (zero-copy, см. [`tail_mapped`]): для forward'а они «на карте»
     /// — адреса постоянны, графы годны, — но видеопамяти не занимают.
     mapped: Vec<bool>,
+    /// Таблица эмбеддингов лежит в закреплённой RAM (см. `map_embeddings`).
+    embed_mapped: bool,
     /// Копия `resident_blocks` для виджетов службы (читается без замка).
     resident_live: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Уникальный номер экземпляра модели и поколение её весов (растёт при
@@ -1917,6 +1919,7 @@ impl DecoderModel {
             embed_scale: cfg.embed_scale,
             resident_blocks: if b_dev != device { 0 } else { n_blocks },
             mapped: vec![false; n_blocks],
+            embed_mapped: false,
             resident_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(if b_dev != device { 0 } else { n_blocks as u64 })),
             instance_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1973,6 +1976,42 @@ impl DecoderModel {
     /// оффлоаде CUDA-графы недоступны: адреса весов меняются каждый ход.
     pub fn blocks_all_resident(&self) -> bool {
         self.resident_blocks >= self.blocks.len() || self.blocks.iter().all(|b| b.on_device(self.device))
+    }
+
+    /// Таблицу эмбеддингов — в закреплённую RAM (zero-copy): шаг читает из неё
+    /// одну-две строки, по шине это микросекунды, а видеопамять освобождается
+    /// на всю таблицу (Qwen3.8-27B — 1.27 ГБ, четыре-пять блоков хвоста).
+    /// Таблица остаётся «на устройстве» — графы и выбор строк ядром те же.
+    /// `false` — переносить нечего (уже там, связана с головой, не CUDA).
+    pub fn map_embeddings(&mut self) -> bool {
+        let dev = self.device;
+        if self.embed_mapped || !matches!(dev, Device::Cuda(_)) || self.config.tie_word_embeddings || !tail_mapped() {
+            return false;
+        }
+        let _g = synaptix_core::memory::host_mapped::HostMappedGuard::new();
+        let mut moved = false;
+        if let Some(q) = &self.embed_q {
+            match q.to_device(Device::Cpu).and_then(|h| h.to_device(dev)) {
+                Ok(m) => {
+                    self.embed_q = Some(m);
+                    moved = true;
+                }
+                Err(e) => eprintln!("[llm] таблица эмбеддингов не ушла в закреплённую RAM: {e}"),
+            }
+        } else if let Some(t) = &self.embed {
+            match t.to_device(Device::Cpu).and_then(|h| h.to_device(dev)) {
+                Ok(m) => {
+                    self.embed = Some(m);
+                    moved = true;
+                }
+                Err(e) => eprintln!("[llm] таблица эмбеддингов не ушла в закреплённую RAM: {e}"),
+            }
+        }
+        if moved {
+            self.embed_mapped = true;
+            self.weights_gen += 1;
+        }
+        moved
     }
 
     /// Сколько блоков читается из закреплённой RAM (zero-copy хвост).
