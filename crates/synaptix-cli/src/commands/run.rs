@@ -42,7 +42,7 @@ pub struct RunArgs {
     pub no_mtp: bool,
     /// Глубина цепочки черновиков MTP (1…3); None — умолчание.
     pub mtp_depth: Option<usize>,
-    /// Бюджет размышлений в токенах (ход с размышлениями); None — без учёта.
+    /// Бюджет размышлений в токенах (ход с размышлениями); None — без бюджета.
     pub thinking_budget: Option<usize>,
     /// Изображение для мультимодального промпта (Qwen3.6-VL).
     pub image: Option<PathBuf>,
@@ -194,8 +194,10 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         for s in &args.stop {
             gen.add_stop_sequence(s);
         }
-        if let (Some(b), true) = (args.thinking_budget, chat && thinking) {
-            gen.set_thinking(b);
+        // Учёт размышлений — всегда, когда ход с ними; бюджет 0 — без
+        // принудительного `</think>` (иначе итог печатал «размышлений 0»).
+        if chat && thinking {
+            gen.set_thinking(args.thinking_budget.unwrap_or(0));
         }
         let mut splitter = Splitter::new(&tok, &prompt);
         let started = std::time::Instant::now();
