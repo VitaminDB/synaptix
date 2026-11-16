@@ -365,6 +365,7 @@ pub fn generate_streaming_resume(
             .map_err(|e| ModelError::Forward(e.to_string()))?;
         let logits = no_grad(|| model.forward(&t, &mut *kv))?;
         last_logits = Some(logits);
+        crate::prefill_progress::add(end - off);
         off = end;
     }
     let prefill_ms = t0.elapsed().as_millis();
@@ -527,6 +528,7 @@ pub fn generate_graph_streaming_resume(
         let t = Tensor::from_vec(slice.to_vec(), vec![1usize, slice.len()], device)
             .map_err(|e| ModelError::Forward(e.to_string()))?;
         last_logits = Some(no_grad(|| model.forward(&t, &mut *kv))?);
+        crate::prefill_progress::add(end - off);
         off = end;
     }
     let prefill_ms = t0.elapsed().as_millis();

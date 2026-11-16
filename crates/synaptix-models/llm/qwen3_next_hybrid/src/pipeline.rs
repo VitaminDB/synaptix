@@ -993,6 +993,7 @@ impl HybridPipeline {
             let h = no_grad(|| self.model.forward_from_hidden_pos(&part, kv, prefill_pos))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             last_hidden = Some(h);
+            synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
             // Снимок — до декода и с согласованными host/dev половинами
             // GDN-состояния (см. `generate_mtp_inner`).
@@ -1408,6 +1409,7 @@ impl HybridPipeline {
                     .map_err(|e| PipelineError::Forward(format!("mtp prefill: {e}")))?;
             }
             hidden = Some(h);
+            synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
             trace_prefill_mem(device, off, l);
             // Точка возврата снимается ЗДЕСЬ, до декода: он продвинет и kv, и
@@ -1845,6 +1847,7 @@ impl HybridPipeline {
             let lg = no_grad(|| self.model.forward(&part, kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             logits_opt = Some(lg);
+            synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
         }
         let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill suffix".into()))?;

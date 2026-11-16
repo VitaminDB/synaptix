@@ -593,6 +593,7 @@ impl MusePipeline {
             let h = no_grad(|| self.model.forward_from_hidden(&part, kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             last_hidden = Some(h);
+            synaptix_llm_common::prefill_progress::add(step.min(l - off));
             off += step;
         }
         let hidden = last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
@@ -866,6 +867,7 @@ impl MusePipeline {
                 slot.push(t);
             }
             last_hidden = Some(h);
+            synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
         }
         let hidden = last_hidden.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;
@@ -1120,6 +1122,7 @@ impl MusePipeline {
             let lg = no_grad(|| self.model.forward(&part, &mut *kv))
                 .map_err(|e| PipelineError::Forward(e.to_string()))?;
             logits_opt = Some(lg);
+            synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
         }
         let logits = logits_opt.ok_or_else(|| PipelineError::Forward("empty prefill".into()))?;

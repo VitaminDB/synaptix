@@ -1214,6 +1214,7 @@ impl Qwen4ExpPipeline {
                         last = Some(self.model.forward_media_last(part, &slice, cache, pos)?);
                     }
                 }
+                synaptix_llm_common::prefill_progress::add(take);
                 offset += take;
             }
             last.ok_or_else(|| ModelError::Forward("пустой префилл".into()))

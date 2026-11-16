@@ -6,6 +6,7 @@ pub mod model;
 pub mod mrope;
 pub mod moe;
 pub mod moe_zc;
+pub mod prefill_progress;
 pub mod profile;
 pub mod rope_scaling;
 pub mod mtp;

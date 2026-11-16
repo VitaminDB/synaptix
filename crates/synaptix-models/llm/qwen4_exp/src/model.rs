@@ -858,10 +858,13 @@ impl Qwen4ExpModel {
 
         let mut ple_slot = 0usize;
         let trace_mem = std::env::var("SYN_QWEN4EXP_TRACE_MEM").is_ok();
+        let n_layers = self.blocks.len().max(1);
         for (l, block) in self.blocks.iter().enumerate() {
             if trace_mem {
                 self.trace_prefill_mem(l);
             }
+            // Слой за слоем: на график службы — доля токенов за слой.
+            synaptix_llm_common::prefill_progress::add(s * (l + 1) / n_layers - s * l / n_layers);
             let ple_here = block.ple.as_ref().map(|ple| (ple, ple_slot));
             if ple_here.is_some() {
                 ple_slot += 1;

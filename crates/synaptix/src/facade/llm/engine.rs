@@ -3412,6 +3412,12 @@ pub fn transcode_bundle(
     synaptix_io::weights::transcode::write_bundle(src, out, spec, device, progress).map_err(|e| LlmError(e.to_string()))
 }
 
+/// Токенов префилла всех языковых моделей процесса с запуска (растёт по
+/// мере пройденных кусков) — для графика службы.
+pub fn prefill_tokens_total() -> u64 {
+    synaptix_llm_common::prefill_progress::total()
+}
+
 /// Бандл прямо из каталога HF (план упаковки): матрицы по `spec` кодируются
 /// из оригинала, без промежуточного плотного `.syn`.
 pub fn transcode_hf(

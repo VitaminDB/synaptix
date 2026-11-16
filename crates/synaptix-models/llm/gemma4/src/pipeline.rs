@@ -434,6 +434,7 @@ impl Gemma4Pipeline {
             })
             .map_err(|e| PipelineError::Model(e.to_string()))?;
             last_hidden = Some(h);
+            synaptix_llm_common::prefill_progress::add(step.min(l - off));
             off += step;
         }
         let last = last_hidden.ok_or_else(|| PipelineError::Model("пустой префилл".into()))?;
