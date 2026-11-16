@@ -401,6 +401,7 @@ impl HybridPipeline {
     fn build_mtp_graph(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
+        t_step: usize,
     ) -> Result<MtpGraph, PipelineError> {
         use synaptix_core::grad::no_grad;
         use synaptix_infer::graph_capture::GraphCapturer;
@@ -412,7 +413,7 @@ impl HybridPipeline {
         };
         let mut state = self
             .model
-            .make_prefill_state(2)
+            .make_prefill_state(t_step)
             .map_err(|e| PipelineError::Forward(format!("prefill state: {e}")))?;
         self.model
             .sync_decode_host_state(kv)
@@ -426,7 +427,7 @@ impl HybridPipeline {
             .map_err(|e| PipelineError::Forward(format!("mtp graph snapshot: {e}")))?;
 
         state
-            .update(&[0u32, 0u32], seq0 as u32)
+            .update(&vec![0u32; t_step], seq0 as u32)
             .map_err(|e| PipelineError::Forward(format!("mtp graph warmup update: {e}")))?;
         let stream = synaptix_core::device::cuda::default_stream(ord)
             .map_err(|e| PipelineError::Forward(format!("stream: {e}")))?;
@@ -1465,12 +1466,20 @@ impl HybridPipeline {
         let mut out: Vec<u32> = vec![first];
         let mut cancelled = !sink.on_token(first);
         let mut cur = first;
-        let mut forced: Option<u32> = None;
-        let mut draft_q: Option<Vec<f32>> = None;
+        // Истинные токены сразу за `cur`, уже отданные наружу, но ещё не
+        // проведённые через ствол (шаг с отвергнутым черновиком откатывается
+        // целиком — GDN-состояние посередине шага не снять).
+        let mut known: Vec<u32> = Vec::new();
         let mut stats = MtpStats::default();
+        // Токенов в шаге сверки: `cur` и до `depth` черновиков. Шаг ствола на
+        // длинном контексте стоит одинаково, сколько бы токенов он ни сверял,
+        // поэтому за ним идёт цепочка: первый черновик голова строит по
+        // скрытому состоянию ствола, следующие — по собственному (замер
+        // Qwen3.8-27B: первый принимается в 79–90 %, второй следом — в 69–79 %).
+        let t_step = mtp_depth() + 1;
 
         let mut graph_ctx = if use_graph {
-            Some(self.build_mtp_graph(&mut kv)?)
+            Some(self.build_mtp_graph(&mut kv, t_step)?)
         } else {
             None
         };
@@ -1479,37 +1488,41 @@ impl HybridPipeline {
             .alloc_linear_snapshot()
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
 
+        let one = |t: u32| -> Result<Tensor, PipelineError> {
+            Tensor::from_vec(vec![t], vec![1usize, 1], device).map_err(|e| PipelineError::Forward(e.to_string()))
+        };
+        // Запись `j` кэша головы — пара (скрытое состояние позиции `j`, токен
+        // позиции `j + 1`); `mtp_next` — первая ещё не внесённая. Перед шагом
+        // без отложенных токенов она равна `pos − 1`: её вносит сам черновик.
+        let mut mtp_next = kv.seq_len.saturating_sub(1);
         let mut mprof = MtpProf::new(device);
         let dec_t0 = std::time::Instant::now();
         while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
             let pos = kv.seq_len;
-            if pos + 2 > kv.max_seq {
-                break;
-            }
-            // MTP-кэш исчерпан (draft+advance добавляют 1-2 слота за шаг и не
-            // откатываются при reject) — дорабатываем остаток обычным
-            // autoregressive decode на основном kv, MTP больше не трогаем.
-            let mtp_need = if forced.is_some() { 1 } else { 2 };
-            if mtp_kv.seq_len + mtp_need > mtp_kv.max_seq {
-                // Отложенный forced-токен уже эмитирован (push при reject), но в
-                // kv ещё не проведён — прогоняем [cur, forced] без повторного
-                // emit и продолжаем с него.
-                if let Some(second) = forced.take() {
-                    if pos + 2 > kv.max_seq {
+            // Кэш ствола или головы исчерпан — остаток дорабатывается обычным
+            // авторегрессионным декодом на основном kv, голову больше не трогаем.
+            if pos + t_step > kv.max_seq || mtp_kv.seq_len + t_step > mtp_kv.max_seq {
+                // Отложенные токены уже отданы, но в kv не проведены —
+                // прогоняем `[cur, …]` без повторной выдачи.
+                if !known.is_empty() {
+                    if pos + 1 + known.len() > kv.max_seq {
                         break;
                     }
-                    let chunk = Tensor::from_vec(vec![cur, second], vec![1usize, 2], device)
+                    let mut ids = vec![cur];
+                    ids.extend_from_slice(&known);
+                    let n = ids.len();
+                    let chunk = Tensor::from_vec(ids, vec![1usize, n], device)
                         .map_err(|e| PipelineError::Forward(e.to_string()))?;
                     let _ = no_grad(|| self.model.forward(&chunk, &mut kv))
                         .map_err(|e| PipelineError::Forward(e.to_string()))?;
-                    cur = second;
+                    cur = *known.last().unwrap();
+                    known.clear();
                 }
                 while !cancelled && out.len() < cfg.max_new_tokens && !eos.contains(&cur) {
                     if kv.seq_len >= kv.max_seq {
                         break;
                     }
-                    let t = Tensor::from_vec(vec![cur], vec![1usize, 1], device)
-                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
+                    let t = one(cur)?;
                     let logits = no_grad(|| self.model.forward(&t, &mut kv))
                         .map_err(|e| PipelineError::Forward(e.to_string()))?;
                     let tok = if stochastic {
@@ -1523,141 +1536,137 @@ impl HybridPipeline {
                 }
                 break;
             }
-            let (second, was_draft) = match forced.take() {
-                Some(t) => (t, false),
-                None => {
+
+            // ── Состав шага: `cur`, отложенные токены, черновики до `t_step`.
+            let n_known = known.len();
+            let mut toks: Vec<u32> = Vec::with_capacity(t_step);
+            toks.push(cur);
+            toks.extend_from_slice(&known);
+            let mut draft_q: Vec<Option<Vec<f32>>> = Vec::new();
+            if toks.len() < t_step {
+                // Первый черновик — по скрытому состоянию ствола: `h_prev` —
+                // позиция перед последним известным токеном.
+                mprof.begin();
+                let next = one(*toks.last().unwrap())?;
+                let (dl, mut h_mtp) = no_grad(|| mtp.draft_logits_h(&self.model, &h_prev, &next, &mut mtp_kv))
+                    .map_err(|e| PipelineError::Forward(format!("mtp draft: {e}")))?;
+                mtp_next += 1;
+                mprof.end("draft");
+                mprof.begin();
+                let (d, q) = mtp_pick_draft(stochastic, &mut sampler, &dl, &argmax)?;
+                mprof.end("draft_sample");
+                toks.push(d);
+                draft_q.push(q);
+                stats.drafted += 1;
+                // Дальше — цепочкой по состоянию самой головы; её записи в кэш
+                // черновые и после шага снимаются.
+                let keep = mtp_kv.seq_len;
+                while toks.len() < t_step {
                     mprof.begin();
-                    let next = Tensor::from_vec(vec![cur], vec![1usize, 1], device)
-                        .map_err(|e| PipelineError::Forward(e.to_string()))?;
-                    let dl = no_grad(|| mtp.draft_logits(&self.model, &h_prev, &next, &mut mtp_kv))
-                        .map_err(|e| PipelineError::Forward(format!("mtp draft: {e}")))?;
-                    stats.drafted += 1;
+                    let next = one(*toks.last().unwrap())?;
+                    let (dl, h) = no_grad(|| mtp.draft_logits_h(&self.model, &h_mtp, &next, &mut mtp_kv))
+                        .map_err(|e| PipelineError::Forward(format!("mtp chain: {e}")))?;
                     mprof.end("draft");
                     mprof.begin();
-                    let tok = if stochastic {
-                        let q = sampler.probs(&dl).map_err(PipelineError::from)?;
-                        let t = sampler.sample_from_probs(&q);
-                        draft_q = Some(q);
-                        t
-                    } else {
-                        argmax(&dl)?
-                    };
+                    let (d, q) = mtp_pick_draft(stochastic, &mut sampler, &dl, &argmax)?;
                     mprof.end("draft_sample");
-                    (tok, true)
+                    toks.push(d);
+                    draft_q.push(q);
+                    h_mtp = h;
+                    stats.drafted += 1;
                 }
-            };
+                mtp_kv.seq_len = keep;
+            }
+            let has_draft = toks.len() > 1 + n_known;
             stats.steps += 1;
 
-            if was_draft {
+            if has_draft {
                 mprof.begin();
                 kv.save_linear_into(&mut snap_buf)
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
                 mprof.end("snapshot");
             }
-            let seq_before = kv.seq_len;
 
             mprof.begin();
-            let step = {
-                {
-                    match graph_ctx.as_mut() {
-                        Some(g) => g.run(&mut kv, cur, second, pos as u32)?,
-                        None => self.verify_plain(&mut kv, cur, second, device)?,
-                    }
-                }
+            let step = match graph_ctx.as_mut() {
+                Some(g) => g.run(&mut kv, &toks, pos as u32)?,
+                None => self.verify_plain(&mut kv, &toks, device)?,
             };
             mprof.end("verify");
+
+            // ── Разбор: истинный токен после входа `i − 1` дают его логиты.
             mprof.begin();
-            let (a, draft_accepted) = if !was_draft {
-                (second, false)
-            } else if stochastic {
-                let p = sampler.probs(&step.logits0).map_err(PipelineError::from)?;
-                match draft_q.take() {
-                    Some(q) => {
-                        let idx = second as usize;
-                        let qi = q.get(idx).copied().unwrap_or(0.0);
-                        let pi = p.get(idx).copied().unwrap_or(0.0);
-                        let ratio = if qi > 0.0 { (pi / qi).min(1.0) } else { 0.0 };
-                        if sampler.uniform() < ratio {
-                            (second, true)
-                        } else {
-                            let mut resid: Vec<f32> = p
-                                .iter()
-                                .zip(q.iter())
-                                .map(|(pv, qv)| (pv - qv).max(0.0))
-                                .collect();
-                            let sum: f32 = resid.iter().sum();
-                            if sum > 0.0 {
-                                for x in resid.iter_mut() {
-                                    *x /= sum;
-                                }
-                                (sampler.sample_from_probs(&resid), false)
-                            } else {
-                                (sampler.sample_from_probs(&p), false)
-                            }
-                        }
-                    }
-                    None => (sampler.sample_from_probs(&p), false),
+            let mut truth: Vec<u32> = known.clone();
+            let mut n_ok = 1 + n_known;
+            let mut stop = false;
+            for i in (1 + n_known)..t_step {
+                let q = draft_q[i - 1 - n_known].take();
+                let (tok, ok) = mtp_decide(stochastic, &mut sampler, &step.logits[i - 1], Some((toks[i], q)), &argmax)?;
+                out.push(tok);
+                cancelled = !sink.on_token(tok);
+                truth.push(tok);
+                if cancelled || eos.contains(&tok) || out.len() >= cfg.max_new_tokens {
+                    stop = true;
+                    break;
                 }
-            } else {
-                let a = argmax(&step.logits0)?;
-                let acc = a == second;
-                (a, acc)
-            };
+                if !ok {
+                    break;
+                }
+                stats.accepted += 1;
+                n_ok += 1;
+            }
             mprof.end("accept_sample");
-
-            mprof.begin();
-            let fill = Tensor::from_vec(vec![a], vec![1usize, 1], device)
-                .map_err(|e| PipelineError::Forward(e.to_string()))?;
-            no_grad(|| mtp.advance(&self.model, &step.hidden0, &fill, &mut mtp_kv))
-                .map_err(|e| PipelineError::Forward(format!("mtp advance: {e}")))?;
-            mprof.end("advance");
-
-            if !was_draft {
-                mprof.begin();
-                let b = if stochastic {
-                    sampler.sample(&step.logits1).map_err(PipelineError::from)?
-                } else {
-                    argmax(&step.logits1)?
-                };
-                mprof.end("emit_sample");
-                out.push(b);
-                cancelled = !sink.on_token(b);
-                h_prev = step.hidden1;
-                cur = b;
-                continue;
+            if stop {
+                cur = *truth.last().unwrap();
+                break;
             }
 
-            out.push(a);
-            cancelled = !sink.on_token(a);
-            sampler.commit(a);
-            if draft_accepted {
-                stats.accepted += 1;
-                if eos.contains(&a) || out.len() >= cfg.max_new_tokens {
-                    cur = a;
-                    continue;
-                }
+            // ── Кэш головы: записи позиций с верным входом. Последнюю из
+            // них при отказе вносит черновик следующего шага.
+            mprof.begin();
+            let upto = if n_ok == t_step { pos + t_step - 1 } else { pos + n_ok - 1 };
+            while mtp_next < upto {
+                let j = mtp_next - pos;
+                let fill = one(truth[j])?;
+                no_grad(|| mtp.advance(&self.model, &step.hidden[j], &fill, &mut mtp_kv))
+                    .map_err(|e| PipelineError::Forward(format!("mtp advance: {e}")))?;
+                mtp_next += 1;
+            }
+            mprof.end("advance");
+
+            if n_ok == t_step {
+                // Все входы верны — состояние ствола годно; ещё один токен
+                // дают логиты последней позиции.
                 mprof.begin();
-                let b = if stochastic {
-                    sampler.sample(&step.logits1).map_err(PipelineError::from)?
-                } else {
-                    argmax(&step.logits1)?
-                };
+                let (c, _) = mtp_decide(stochastic, &mut sampler, &step.logits[t_step - 1], None, &argmax)?;
                 mprof.end("emit_sample");
-                out.push(b);
-                cancelled = !sink.on_token(b);
-                h_prev = step.hidden1;
-                cur = b;
+                out.push(c);
+                cancelled = !sink.on_token(c);
+                h_prev = step.hidden[t_step - 1].clone();
+                cur = c;
+                known.clear();
             } else {
                 mprof.begin();
                 kv.restore_linear(&snap_buf)
                     .map_err(|e| PipelineError::Forward(e.to_string()))?;
-                kv.seq_len = seq_before;
+                kv.seq_len = pos;
                 mprof.end("restore");
-                forced = Some(a);
+                h_prev = step.hidden[n_ok - 1].clone();
+                known = truth;
             }
         }
         let decode_ms = dec_t0.elapsed().as_millis();
         mprof.report();
+        if std::env::var_os("SYN_MTP_PROF").is_some() {
+            eprintln!(
+                "[MTP] шаг на {t_step} ток.: шагов {}, черновиков {}, принято {} ({:.0}%), {:.2} ток/шаг",
+                stats.steps,
+                stats.drafted,
+                stats.accepted,
+                100.0 * stats.acceptance(),
+                out.len() as f32 / stats.steps.max(1) as f32
+            );
+        }
 
         let stats_gen = GenerationStats {
             prompt_tokens: l,
@@ -1899,10 +1908,106 @@ impl HybridPipeline {
 
 
 struct VerifyStep {
-    logits0: synaptix_core::tensor::Tensor,
-    logits1: synaptix_core::tensor::Tensor,
-    hidden0: synaptix_core::tensor::Tensor,
-    hidden1: synaptix_core::tensor::Tensor,
+    /// Логиты и скрытые состояния ствола по позициям шага.
+    logits: Vec<synaptix_core::tensor::Tensor>,
+    hidden: Vec<synaptix_core::tensor::Tensor>,
+}
+
+/// Черновиков на шаг сверки MTP: `SYN_MTP_DEPTH` (1…3), по умолчанию 1.
+///
+/// Глубина 2 даёт 2.1 токена на шаг вместо 1.65 (Qwen3.8-27B: +11 % на
+/// коротком контексте, больше — на длинном, где шаг упирается в шину), но
+/// текст ответа с глубиной 1 совпадает не токен в токен: многострочные ядра
+/// считают строку шага чуть по-разному в зависимости от числа строк, и на
+/// токенах с почти равными кандидатами выбор расходится (та же природа, что у
+/// расхождения шага на два токена с однотокенным декодом). Поэтому глубже
+/// единицы — только явным выбором.
+pub fn mtp_depth() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SYN_MTP_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 3)
+    })
+}
+
+type ArgmaxFn<'a> = &'a dyn Fn(&synaptix_core::tensor::Tensor) -> Result<u32, PipelineError>;
+
+/// Черновой токен по логитам головы: жадно — максимум, иначе — выборка из
+/// распределения головы (оно же — предложение для спекулятивной выборки).
+fn mtp_pick_draft(
+    stochastic: bool,
+    sampler: &mut synaptix_llm_common::generate::TokenSampler,
+    logits: &synaptix_core::tensor::Tensor,
+    argmax: ArgmaxFn,
+) -> Result<(u32, Option<Vec<f32>>), PipelineError> {
+    if !stochastic {
+        return Ok((argmax(logits)?, None));
+    }
+    let q = sampler.probs(logits).map_err(PipelineError::from)?;
+    let t = sampler.sample_from_probs(&q);
+    Ok((t, Some(q)))
+}
+
+/// Истинный токен по логитам ствола и судьба черновика на этом месте.
+/// Жадно — максимум и сравнение. С выборкой — спекулятивная выборка: черновик
+/// из `q` принимается с вероятностью `min(1, p/q)`, иначе токен берётся из
+/// остатка `max(p − q, 0)` — распределение выхода в точности `p`.
+fn mtp_decide(
+    stochastic: bool,
+    sampler: &mut synaptix_llm_common::generate::TokenSampler,
+    logits: &synaptix_core::tensor::Tensor,
+    draft: Option<(u32, Option<Vec<f32>>)>,
+    argmax: ArgmaxFn,
+) -> Result<(u32, bool), PipelineError> {
+    if !stochastic {
+        let a = argmax(logits)?;
+        // `SYN_MTP_MARGIN=1`: отрыв выбранного токена от второго — видно, где
+        // ответ держится на округлении (сверка ходов разной глубины).
+        if std::env::var_os("SYN_MTP_MARGIN").is_some() {
+            if let Ok(v) = logits
+                .to_dtype(synaptix_core::dtype::DType::F32)
+                .and_then(|x| x.flatten_all())
+                .and_then(|x| x.to_vec1::<f32>())
+            {
+                let top = v[a as usize];
+                let second = v.iter().enumerate().filter(|(i, _)| *i != a as usize).map(|(_, x)| *x).fold(f32::NEG_INFINITY, f32::max);
+                eprintln!("[MTP_MARGIN] {a} {:.4}", top - second);
+            }
+        }
+        sampler.commit(a);
+        return Ok((a, draft.is_some_and(|(d, _)| d == a)));
+    }
+    let Some((d, q)) = draft else {
+        return Ok((sampler.sample(logits).map_err(PipelineError::from)?, false));
+    };
+    let p = sampler.probs(logits).map_err(PipelineError::from)?;
+    let (tok, ok) = match q {
+        Some(q) => {
+            let idx = d as usize;
+            let qi = q.get(idx).copied().unwrap_or(0.0);
+            let pi = p.get(idx).copied().unwrap_or(0.0);
+            let ratio = if qi > 0.0 { (pi / qi).min(1.0) } else { 0.0 };
+            if sampler.uniform() < ratio {
+                (d, true)
+            } else {
+                let mut resid: Vec<f32> = p.iter().zip(q.iter()).map(|(pv, qv)| (pv - qv).max(0.0)).collect();
+                let sum: f32 = resid.iter().sum();
+                if sum > 0.0 {
+                    for x in resid.iter_mut() {
+                        *x /= sum;
+                    }
+                    (sampler.sample_from_probs(&resid), false)
+                } else {
+                    (sampler.sample_from_probs(&p), false)
+                }
+            }
+        }
+        None => {
+            let t = sampler.sample_from_probs(&p);
+            (t, t == d)
+        }
+    };
+    sampler.commit(tok);
+    Ok((tok, ok))
 }
 
 /// Пофазный профиль MTP-цикла (SYN_MTP_PROF=1): draft / snapshot / verify /
@@ -1979,27 +2084,23 @@ impl HybridPipeline {
     fn verify_plain(
         &self,
         kv: &mut synaptix_llm_common::KvCache,
-        cur: u32,
-        second: u32,
+        toks: &[u32],
         device: Device,
     ) -> Result<VerifyStep, PipelineError> {
         use synaptix_core::grad::no_grad;
         use synaptix_core::tensor::Tensor;
-        let chunk = Tensor::from_vec(vec![cur, second], vec![1usize, 2], device)
+        let n = toks.len();
+        let chunk = Tensor::from_vec(toks.to_vec(), vec![1usize, n], device)
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
         let hh = no_grad(|| self.model.forward_trunk(&chunk, kv))
             .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let logits0 = self
-            .model
-            .head_at(&hh, 0)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let logits1 = self
-            .model
-            .head_at(&hh, 1)
-            .map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let hidden0 = hh.narrow(1, 0, 1).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        let hidden1 = hh.narrow(1, 1, 1).map_err(|e| PipelineError::Forward(e.to_string()))?;
-        Ok(VerifyStep { logits0, logits1, hidden0, hidden1 })
+        let mut logits = Vec::with_capacity(n);
+        let mut hidden = Vec::with_capacity(n);
+        for i in 0..n {
+            logits.push(self.model.head_at(&hh, i).map_err(|e| PipelineError::Forward(e.to_string()))?);
+            hidden.push(hh.narrow(1, i, 1).map_err(|e| PipelineError::Forward(e.to_string()))?);
+        }
+        Ok(VerifyStep { logits, hidden })
     }
 }
 
@@ -2007,12 +2108,11 @@ impl MtpGraph {
     fn run(
         &mut self,
         kv: &mut synaptix_llm_common::KvCache,
-        cur: u32,
-        second: u32,
+        toks: &[u32],
         pos: u32,
     ) -> Result<VerifyStep, PipelineError> {
         self.state
-            .update(&[cur, second], pos)
+            .update(toks, pos)
             .map_err(|e| PipelineError::Forward(format!("mtp graph update: {e}")))?;
         self.graph
             .launch()
@@ -2020,24 +2120,24 @@ impl MtpGraph {
         self.stream
             .synchronize()
             .map_err(|e| PipelineError::Forward(format!("sync post-launch: {e:?}")))?;
-        kv.seq_len = pos as usize + 2;
+        let n = toks.len();
+        kv.seq_len = pos as usize + n;
         let row = |t: &synaptix_core::tensor::Tensor, i: usize| {
             t.narrow(0, i, 1)
                 .and_then(|x| x.contiguous())
                 .map_err(|e| PipelineError::Forward(format!("mtp graph row {i}: {e}")))
         };
-        let h0 = row(&self.state.hidden, 0)?
-            .reshape(vec![1usize, 1, self.hidden_size])
-            .map_err(|e| PipelineError::Forward(format!("mtp graph hidden0: {e}")))?;
-        let h1 = row(&self.state.hidden, 1)?
-            .reshape(vec![1usize, 1, self.hidden_size])
-            .map_err(|e| PipelineError::Forward(format!("mtp graph hidden1: {e}")))?;
-        Ok(VerifyStep {
-            logits0: row(&self.state.logits, 0)?,
-            logits1: row(&self.state.logits, 1)?,
-            hidden0: h0,
-            hidden1: h1,
-        })
+        let mut logits = Vec::with_capacity(n);
+        let mut hidden = Vec::with_capacity(n);
+        for i in 0..n {
+            logits.push(row(&self.state.logits, i)?);
+            hidden.push(
+                row(&self.state.hidden, i)?
+                    .reshape(vec![1usize, 1, self.hidden_size])
+                    .map_err(|e| PipelineError::Forward(format!("mtp graph hidden{i}: {e}")))?,
+            );
+        }
+        Ok(VerifyStep { logits, hidden })
     }
 }
 

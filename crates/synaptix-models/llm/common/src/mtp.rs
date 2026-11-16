@@ -203,6 +203,24 @@ impl MtpModule {
         parent.lm_head_forward(&row)
     }
 
+    /// Как [`Self::draft_logits`], но ещё отдаёт скрытое состояние головы на
+    /// последней позиции `[1, 1, H]` — им голова продолжает собственную
+    /// цепочку черновиков вместо скрытого состояния ствола.
+    pub fn draft_logits_h(
+        &self,
+        parent: &DecoderModel,
+        trunk_hidden: &Tensor,
+        next_ids: &Tensor,
+        kv: &mut KvCache,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        let x = self.project(parent, trunk_hidden, next_ids)?;
+        let out = self.layers.forward_from_hidden(&x, kv)?;
+        let last = out.dims()[1] - 1;
+        let row = self.layers.normed_at(&out, last)?;
+        let h = out.narrow(1, last, 1).map_err(|e| ModelError::Forward(e.to_string()))?;
+        Ok((parent.lm_head_forward(&row)?, h))
+    }
+
     pub fn device(&self) -> Device {
         self.device
     }
