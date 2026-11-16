@@ -141,6 +141,9 @@ enum Commands {
         /// Глубина цепочки черновиков MTP: сколько токенов сверяет один шаг (1…3).
         #[arg(long)]
         mtp_depth: Option<usize>,
+        /// Бюджет размышлений, токенов: по исчерпании размышления закрываются и модель переходит к ответу.
+        #[arg(long)]
+        thinking_budget: Option<usize>,
         /// Изображение для мультимодального промпта.
         #[arg(long)]
         image: Option<PathBuf>,
@@ -1357,7 +1360,7 @@ fn main() -> ExitCode {
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, no_mtp, mtp_depth, image, video, no_dflash, preset, top_k, top_p,
+            warmup, no_mtp, mtp_depth, thinking_budget, image, video, no_dflash, preset, top_k, top_p,
             min_p, repetition_penalty, repeat_last_n, presence_penalty, frequency_penalty, prefill_batch,
             chat, system, no_think, reasoning_effort, stop, max_image_tokens, layer_sync, expert_cache_gb,
             host_mirror_gb, qwen4_spec, embed_host,
@@ -1385,6 +1388,7 @@ fn main() -> ExitCode {
                 graph: !no_graph,
                 no_mtp,
                 mtp_depth,
+                thinking_budget,
                 image,
                 video,
                 no_dflash,

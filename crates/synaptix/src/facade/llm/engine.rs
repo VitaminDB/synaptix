@@ -2092,11 +2092,83 @@ pub struct LlmGeneration<'a> {
     stop_tokens: Vec<u32>,
     interrupt: Option<Box<dyn Fn() -> bool + 'a>>,
     constraint: Option<synaptix_llm_common::generate::SharedConstraint>,
+    /// Ход начинается внутри размышлений; значение — их бюджет в токенах
+    /// (0 — без предела). См. [`LlmGeneration::set_thinking`].
+    thinking: Option<usize>,
+    finish: GenerationFinish,
+}
+
+/// Почему ход остановился.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Модель закончила сама (стоп-токен).
+    #[default]
+    Eos,
+    /// Встретилась стоп-строка.
+    Stop,
+    /// Остановил вызывающий (его `on_token` вернул `false`).
+    Callback,
+    /// Упёрлись в предел: `max_new_tokens` или конец контекста. Ответ оборван.
+    Length,
+}
+
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eos => "eos",
+            Self::Stop => "stop",
+            Self::Callback => "callback",
+            Self::Length => "length",
+        }
+    }
+}
+
+/// Итог хода (см. [`LlmGeneration::finish`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GenerationFinish {
+    pub reason: FinishReason,
+    /// Сгенерировано токенов (вместе с размышлениями и вставленным закрытием).
+    pub tokens: usize,
+    /// Из них — токены размышлений (если ход объявлен думающим).
+    pub thinking_tokens: usize,
+    /// Ход кончился ВНУТРИ размышлений: ответа нет. Вместе с `Length` это
+    /// «размышления съели весь предел».
+    pub thinking_open: bool,
+    /// Размышления исчерпали бюджет и были закрыты принудительно.
+    pub thinking_forced: bool,
 }
 
 impl<'a> LlmGeneration<'a> {
     pub fn new(model: &'a Llm, opts: GenerationOptions) -> Self {
-        Self { model, opts, stop_sequences: Vec::new(), stop_tokens: Vec::new(), interrupt: None, constraint: None }
+        Self {
+            model,
+            opts,
+            stop_sequences: Vec::new(),
+            stop_tokens: Vec::new(),
+            interrupt: None,
+            constraint: None,
+            thinking: None,
+            finish: GenerationFinish::default(),
+        }
+    }
+
+    /// Ход начинается внутри размышлений (шаблон открыл `<think>`), бюджет —
+    /// `budget` токенов; 0 — без предела, только учёт для [`Self::finish`].
+    ///
+    /// Размышления и ответ делят `max_new_tokens`, и мягкая просьба «думай
+    /// кратко» в шаблоне модель не связывает: Qwen3.8 на трудной задаче тратил
+    /// на размышления все 16К токенов хода и не доходил ни до ответа, ни до
+    /// вызова инструмента. С бюджетом размышления, не закрытые к его концу,
+    /// закрываются принудительно (`</think>`), и остаток предела достаётся
+    /// ответу. Действует у моделей, где `</think>` — один токен, в ходах через
+    /// сессию без вложений.
+    pub fn set_thinking(&mut self, budget: usize) {
+        self.thinking = Some(budget);
+    }
+
+    /// Итог последнего хода: причина остановки и судьба размышлений.
+    pub fn finish(&self) -> GenerationFinish {
+        self.finish
     }
 
     /// Вывод строго по грамматике (см. [`super::super::llm::json_constraint`]).
@@ -2137,7 +2209,7 @@ impl<'a> LlmGeneration<'a> {
         // шёл без возврата блоков на декод (стрим с хоста на каждом токене) и
         // без повтора после нехватки памяти (`synaptix run` на 83К падал с OOM).
         // `SYN_NO_TEMP_SESSION=1` — прежний прямой путь.
-        if prompt_ids.len() > 256 && std::env::var_os("SYN_NO_TEMP_SESSION").is_none() {
+        if std::env::var_os("SYN_NO_TEMP_SESSION").is_none() {
             let mut on_token = on_token;
             let mut retries = 0;
             loop {
@@ -2224,6 +2296,131 @@ impl<'a> LlmGeneration<'a> {
     /// сообщение, сменили системный prompt) обнаруживается сравнением токенов и
     /// просто приводит к полному префиллу.
     pub fn generate_streaming_cached<F>(
+        &mut self,
+        session: &mut LlmKvSession,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        mut on_token: F,
+    ) -> Result<usize, LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        self.finish = GenerationFinish::default();
+        let max_new = self.opts.max_new_tokens;
+        let close = self.thinking.and_then(|_| match tokenizer.encode("</think>") {
+            Ok(ids) if ids.len() == 1 => Some(ids[0]),
+            _ => None,
+        });
+        let budget = match (close, self.thinking) {
+            (Some(_), Some(b)) if b > 0 && b < max_new => b,
+            _ => 0,
+        };
+        let resume = session.resume_at;
+        // Учёт хода: токены, размышления, кто остановил.
+        struct Track {
+            n: usize,
+            last: Option<u32>,
+            callback_stop: bool,
+            closed: bool,
+            think: Vec<u32>,
+            over: bool,
+            tail: String,
+        }
+        let mut tr = Track {
+            n: 0,
+            last: None,
+            callback_stop: false,
+            closed: close.is_none(),
+            think: Vec::new(),
+            over: false,
+            tail: String::new(),
+        };
+        let stop_len = self.stop_sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+        let mut feed = |tr: &mut Track, id: u32, s: &str, budget: usize, on_token: &mut F| -> bool {
+            tr.n += 1;
+            tr.last = Some(id);
+            if !tr.closed {
+                if Some(id) == close {
+                    tr.closed = true;
+                } else {
+                    tr.think.push(id);
+                }
+            }
+            if stop_len > 0 {
+                tr.tail.push_str(s);
+                if tr.tail.len() > 4 * stop_len + 64 {
+                    let cut = tr.tail.floor_char_boundary(tr.tail.len() - (2 * stop_len + 32));
+                    tr.tail.drain(..cut);
+                }
+            }
+            if !on_token(id, s) {
+                tr.callback_stop = true;
+                return false;
+            }
+            if budget > 0 && !tr.closed && tr.think.len() >= budget {
+                tr.over = true;
+                return false;
+            }
+            true
+        };
+        let reused = self.generate_streaming_cached_split(session, prompt_ids, tokenizer, |id, s| {
+            feed(&mut tr, id, s, budget, &mut on_token)
+        })?;
+        let mut total_prompt = prompt_ids.len();
+        if tr.over && !tr.callback_stop {
+            // Бюджет размышлений исчерпан: закрываем их за модель и даём ей
+            // остаток предела на ответ. Вставка уходит вызывающему как обычные
+            // токены — его разбор размышлений увидит закрытие. Размышления
+            // пересчитываются префиллом от точки возврата (конец промпта) —
+            // секунда-две на несколько тысяч токенов.
+            let forced = tokenizer.encode("\n</think>\n\n").map_err(|e| LlmError(e.to_string()))?;
+            let mut prompt2 = Vec::with_capacity(prompt_ids.len() + tr.think.len() + forced.len());
+            prompt2.extend_from_slice(prompt_ids);
+            prompt2.extend_from_slice(&tr.think);
+            let mut go = true;
+            for id in &forced {
+                prompt2.push(*id);
+                if go {
+                    let piece = tokenizer.decode(&[*id]).unwrap_or_default();
+                    go = feed(&mut tr, *id, &piece, 0, &mut on_token);
+                }
+            }
+            tr.closed = true;
+            self.finish.thinking_forced = true;
+            if go {
+                self.opts.max_new_tokens = max_new.saturating_sub(tr.n).max(1);
+                // Точка возврата сессии — не дальше конца исходного промпта:
+                // следующий ход истории размышлений не несёт.
+                session.resume_at = Some(resume.unwrap_or(prompt_ids.len()).min(prompt_ids.len()));
+                total_prompt = prompt2.len() - tr.n;
+                let r = self.generate_streaming_cached_split(session, &prompt2, tokenizer, |id, s| {
+                    feed(&mut tr, id, s, 0, &mut on_token)
+                });
+                self.opts.max_new_tokens = max_new;
+                r?;
+            }
+        }
+        let stopped_by_sequence = !self.stop_sequences.is_empty()
+            && self.stop_sequences.iter().any(|s| tr.tail.contains(s.as_str()));
+        self.finish.tokens = tr.n;
+        self.finish.thinking_tokens = tr.think.len();
+        self.finish.thinking_open = close.is_some() && !tr.closed;
+        self.finish.reason = if tr.callback_stop {
+            FinishReason::Callback
+        } else if tr.last.is_some_and(|t| self.stop_tokens.contains(&t)) {
+            FinishReason::Eos
+        } else if stopped_by_sequence {
+            FinishReason::Stop
+        } else if tr.n >= max_new || total_prompt + tr.n + 3 >= session.ctx_tokens {
+            FinishReason::Length
+        } else {
+            FinishReason::Eos
+        };
+        Ok(reused)
+    }
+
+    /// Ход через сессию с возвратом блоков после длинного префилла.
+    fn generate_streaming_cached_split<F>(
         &mut self,
         session: &mut LlmKvSession,
         prompt_ids: &[u32],

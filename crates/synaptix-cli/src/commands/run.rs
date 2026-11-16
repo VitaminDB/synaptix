@@ -42,6 +42,8 @@ pub struct RunArgs {
     pub no_mtp: bool,
     /// Глубина цепочки черновиков MTP (1…3); None — умолчание.
     pub mtp_depth: Option<usize>,
+    /// Бюджет размышлений в токенах (ход с размышлениями); None — без учёта.
+    pub thinking_budget: Option<usize>,
     /// Изображение для мультимодального промпта (Qwen3.6-VL).
     pub image: Option<PathBuf>,
     /// Видео для мультимодального промпта (Muse Glimmer).
@@ -192,6 +194,9 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         for s in &args.stop {
             gen.add_stop_sequence(s);
         }
+        if let (Some(b), true) = (args.thinking_budget, chat && thinking) {
+            gen.set_thinking(b);
+        }
         let mut splitter = Splitter::new(&tok, &prompt);
         let started = std::time::Instant::now();
         let mut first = None;
@@ -228,6 +233,17 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         }
         let end = std::time::Instant::now();
         let first = first.unwrap_or(end);
+        if print {
+            let f = gen.finish();
+            eprintln!(
+                "\nsynaptix run: остановка — {}; токенов {}, размышлений {}{}{}",
+                f.reason.as_str(),
+                f.tokens,
+                f.thinking_tokens,
+                if f.thinking_forced { ", закрыты по бюджету" } else { "" },
+                if f.thinking_open { ", ход оборван внутри размышлений" } else { "" }
+            );
+        }
         Ok((n, (first - started).as_millis(), (end - first).as_millis()))
     };
     if args.warmup {

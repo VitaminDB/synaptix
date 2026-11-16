@@ -307,6 +307,15 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     if template.contains("enable_thinking") {
         out.push(spec("thinking", "Размышления", "Модель сначала рассуждает, потом отвечает — точнее и дольше", ParamKind::Bool, Some(ParamValue::Bool(false))));
     }
+    if template.contains("enable_thinking") {
+        out.push(spec(
+            "thinking_budget",
+            "Бюджет размышлений, токенов",
+            "Предел длины размышлений: по его исчерпании они закрываются, и модель переходит к ответу. 0 — авто (по глубине размышлений, не больше трёх четвертей длины ответа)",
+            int(0, window as i64, 256),
+            i(0),
+        ));
+    }
     if let Some(r) = &profile.reasoning {
         out.push(spec(
             "reasoning",
@@ -334,6 +343,24 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     }
     out.push(seed());
     out
+}
+
+/// Бюджет размышлений хода в токенах: явный (`explicit` > 0) либо авто — по
+/// глубине размышлений; в любом случае не больше трёх четвертей `max_tokens`,
+/// чтобы ответу и вызову инструмента осталось место.
+pub fn thinking_budget(explicit: i64, reasoning: Option<&str>, max_tokens: usize) -> usize {
+    let cap = (max_tokens * 3 / 4).max(1);
+    if explicit > 0 {
+        return (explicit as usize).min(cap);
+    }
+    let by_level = match reasoning.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+        Some("minimal" | "none") => 1024,
+        Some("low") => 2048,
+        Some("medium") => 6144,
+        Some("high") => 12288,
+        _ => cap,
+    };
+    by_level.min(cap)
 }
 
 /// У модели есть встроенная MTP-голова (`mtp_num_hidden_layers` в конфиге).
