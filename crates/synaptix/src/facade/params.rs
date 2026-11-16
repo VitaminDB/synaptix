@@ -311,7 +311,11 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
         out.push(spec(
             "reasoning",
             "Глубина размышлений",
-            "Сколько модель думает перед ответом",
+            if r.instruct_default.is_some() {
+                "Режим модели: сколько думать перед ответом; действует и без размышлений (режимы инструкта)"
+            } else {
+                "Сколько модель думает перед ответом"
+            },
             ParamKind::Choice { options: r.levels.clone() },
             Some(ParamValue::Text(r.default.clone())),
         ));

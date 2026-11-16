@@ -48,6 +48,11 @@ pub struct ReasoningLevels {
     pub levels: Vec<String>,
     /// Уровень, который шаблон берёт, если его не задать.
     pub default: String,
+    /// Уровни действуют и без размышлений (режимы инструкта у моделей
+    /// DavidAU: `reasoning_effort` при `enable_thinking=false` подставляет
+    /// свою инструкцию) — тогда здесь уровень шаблона по умолчанию для
+    /// этого режима. `None` — без размышлений уровень не передаётся.
+    pub instruct_default: Option<String>,
 }
 
 impl ReasoningLevels {
@@ -222,16 +227,35 @@ pub fn reasoning_levels(arch: Option<LlmArch>, template: &str) -> Option<Reasoni
         let default = quoted_after(template, "reasoning_effort|default('")
             .filter(|d| levels.contains(d))
             .unwrap_or_else(|| levels.last().cloned().unwrap_or_default());
-        return Some(ReasoningLevels { var: ReasoningVar::Effort, levels: by_depth(levels), default });
+        let instruct_default = instruct_effort_default(template).filter(|d| levels.contains(d));
+        return Some(ReasoningLevels { var: ReasoningVar::Effort, levels: by_depth(levels), default, instruct_default });
     }
     if template.contains("reasoning_strength") && matches!(arch, Some(LlmArch::MuseGlimmer)) {
         let levels: Vec<String> = ["low", "medium", "high", "xhigh"].map(String::from).into();
         let default = quoted_after(template, "reasoning_strength else '")
             .filter(|d| levels.contains(d))
             .unwrap_or_else(|| "high".to_string());
-        return Some(ReasoningLevels { var: ReasoningVar::Strength, levels, default });
+        return Some(ReasoningLevels { var: ReasoningVar::Strength, levels, default, instruct_default: None });
     }
     None
+}
+
+/// Уровень по умолчанию ветки «без размышлений», если шаблон в ней сам
+/// разбирает `reasoning_effort` (`{%- if enable_thinking is false %}` и сразу
+/// `reasoning_effort|default('medium')`). У обычного Qwen3.8 такой ветки нет.
+fn instruct_effort_default(template: &str) -> Option<String> {
+    const BRANCH: &str = "enable_thinking is false %}";
+    const DEFAULT: &str = "reasoning_effort|default('";
+    template.match_indices(BRANCH).find_map(|(at, _)| {
+        let body = &template[at + BRANCH.len()..];
+        let next = body.find(DEFAULT)?;
+        // Только в теле самой ветки: до следующего тега `{%`, кроме `set`.
+        let before = &body[..next];
+        if before.matches("{%").count() > 1 {
+            return None;
+        }
+        quoted_after(body, DEFAULT)
+    })
 }
 
 /// `'a', 'b', 'c'` сразу после `marker` до закрывающей скобки.
@@ -254,7 +278,9 @@ fn quoted_after(src: &str, marker: &str) -> Option<String> {
 }
 
 fn by_depth(mut levels: Vec<String>) -> Vec<String> {
-    const ORDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    // `einstein` и `spoon` — режимы DavidAU глубже `xhigh`: «20 виртуальных
+    // агентов» и «исследование» с размышлениями от 5000 слов.
+    const ORDER: [&str; 9] = ["none", "minimal", "low", "medium", "high", "xhigh", "einstein", "spoon", "max"];
     let rank = |s: &String| ORDER.iter().position(|o| o.eq_ignore_ascii_case(s)).unwrap_or(ORDER.len());
     levels.sort_by_key(rank);
     levels
@@ -267,13 +293,16 @@ fn by_depth(mut levels: Vec<String>) -> Vec<String> {
 /// размышления его протокол не позволяет, поэтому «без размышлений» там —
 /// `low`. `reasoning_effort` — только уровнем, который шаблон знает, и
 /// только при включённых размышлениях: без них Qwen3.8 инструкцию не рендерит.
+/// Исключение — шаблоны с режимами инструкта ([`ReasoningLevels::instruct_default`]).
 pub(crate) fn with_thinking_vars(
     mut opts: RenderOptions,
     levels: Option<&ReasoningLevels>,
     enable_thinking: bool,
     effort: Option<&str>,
 ) -> RenderOptions {
-    let chosen = if enable_thinking { levels.and_then(|l| l.resolve(effort)) } else { None };
+    let chosen = levels
+        .filter(|l| enable_thinking || l.instruct_default.is_some())
+        .and_then(|l| l.resolve(effort));
     let strength = match levels {
         _ if !enable_thinking => "low",
         Some(l) if l.var == ReasoningVar::Strength => chosen.unwrap_or(&l.default),
@@ -353,6 +382,69 @@ mod tests {
         let out = render(QWEN38, LlmArch::Qwen4Exp, false, Some("low"));
         assert!(!out.contains("Reasoning effort"), "{out}");
         assert!(out.ends_with("<think>\n\n</think>\n\n"), "{out}");
+    }
+
+    const DAU: &str =
+        include_str!("../../../synaptix-tokenizer/tests/fixtures/qwen3_5_dau_modes_chat_template.jinja");
+
+    #[test]
+    fn qwen38_has_no_instruct_levels() {
+        let l = reasoning_levels(Some(LlmArch::Qwen4Exp), QWEN38).expect("levels");
+        assert_eq!(l.instruct_default, None);
+    }
+
+    #[test]
+    fn dau_modes_levels_and_instruct() {
+        let l = reasoning_levels(Some(LlmArch::Hybrid), DAU).expect("levels");
+        assert_eq!(l.levels, ["low", "medium", "xhigh", "einstein", "spoon"]);
+        assert_eq!(l.default, "xhigh");
+        assert_eq!(l.instruct_default.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn dau_modes_reach_prompt_with_and_without_thinking() {
+        let a = LlmArch::Hybrid;
+        let spoon = render(DAU, a, true, Some("spoon"));
+        assert!(spoon.contains("You are Qwen Deep Research, a careful local 9B Qwen"), "{spoon}");
+        assert!(spoon.ends_with("<|im_start|>assistant\n<think>\n"), "{spoon}");
+        // Инструкт: уровень доходит, размышления пустые.
+        let ilow = render(DAU, a, false, Some("low"));
+        assert!(ilow.contains("Reasoning effort is set to low."), "{ilow}");
+        assert!(ilow.ends_with("<think>\n\n</think>\n\n"), "{ilow}");
+        let ieinstein = render(DAU, a, false, Some("einstein"));
+        assert!(ieinstein.contains("Spawn 20 agents"), "{ieinstein}");
+        // Без уровня: думание — xhigh, инструкт — medium (без инструкции).
+        assert!(render(DAU, a, true, None).contains("Reasoning effort is set to xhigh."));
+        let imed = render(DAU, a, false, None);
+        assert!(!imed.contains("Reasoning effort"), "{imed}");
+        assert!(imed.contains("<|im_start|>system\nsys<|im_end|>"), "{imed}");
+    }
+
+    #[test]
+    fn dau_reason_tag_in_chat_switches_mode_and_is_removed() {
+        let levels = reasoning_levels(Some(LlmArch::Hybrid), DAU);
+        let opts = with_thinking_vars(RenderOptions::new().with_generation_prompt(true), levels.as_ref(), true, None);
+        let t = ChatTemplate::from_source(DAU);
+        let out = t
+            .render(&[Message::user("{REASON:ilow} расскажи сказку")], &opts)
+            .expect("render");
+        assert!(out.contains("Reasoning effort is set to low."), "{out}");
+        assert!(!out.contains("{REASON:"), "метка убирается из сообщения: {out}");
+        assert!(out.contains("<|im_start|>user\nрасскажи сказку<|im_end|>"), "{out}");
+        assert!(out.ends_with("<think>\n\n</think>\n\n"), "i-режим выключает размышления: {out}");
+        // Метка из прошлого хода действует, пока её не сменят.
+        let out = t
+            .render(
+                &[
+                    Message::user("{REASON:spoon} вопрос"),
+                    Message::assistant("ответ"),
+                    Message::user("ещё"),
+                ],
+                &opts,
+            )
+            .expect("render");
+        assert!(out.contains("Qwen Deep Research"), "{out}");
+        assert!(out.ends_with("<think>\n"), "{out}");
     }
 
     #[test]
