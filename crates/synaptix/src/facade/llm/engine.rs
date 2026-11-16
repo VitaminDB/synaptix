@@ -2056,6 +2056,47 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
+        let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
+        // Разовый ход — тем же путём, что ходы службы и чата: через временную
+        // сессию префикс-KV. Иначе длинный промпт на карте, занятой весами,
+        // шёл без возврата блоков на декод (стрим с хоста на каждом токене) и
+        // без повтора после нехватки памяти (`synaptix run` на 83К падал с OOM).
+        // `SYN_NO_TEMP_SESSION=1` — прежний прямой путь.
+        if prompt_ids.len() > 256 && std::env::var_os("SYN_NO_TEMP_SESSION").is_none() {
+            let mut on_token = on_token;
+            let mut retries = 0;
+            loop {
+                let Some(mut session) = self.model.new_kv_session(kv_tokens, self.opts.max_new_tokens)? else {
+                    break;
+                };
+                let mut emitted = false;
+                let r = self.generate_streaming_cached(&mut session, prompt_ids, tokenizer, |id, s| {
+                    emitted = true;
+                    on_token(id, s)
+                });
+                drop(session);
+                let Err(e) = r else { return Ok(()) };
+                let msg = e.to_string().to_ascii_lowercase();
+                let oom = msg.contains("out of memory") || msg.contains("oom") || msg.contains("alloc_");
+                if emitted || !oom || retries >= 8 || !self.model.shed_blocks() {
+                    return Err(e);
+                }
+                retries += 1;
+            }
+            return self.generate_streaming_direct(prompt_ids, tokenizer, on_token);
+        }
+        self.generate_streaming_direct(prompt_ids, tokenizer, on_token)
+    }
+
+    fn generate_streaming_direct<F>(
+        &mut self,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        on_token: F,
+    ) -> Result<(), LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
         let _runtime = self.model.runtime_scope();
         let kv_tokens = self.opts.max_seq_len.max(1).min(prompt_ids.len() + self.opts.max_new_tokens + 1);
         self.model.fit_vram(self.model.kv_session_bytes(kv_tokens), prompt_ids.len());

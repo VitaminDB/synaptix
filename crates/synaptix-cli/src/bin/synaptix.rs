@@ -138,16 +138,9 @@ enum Commands {
         /// Прогрев NVRTC JIT (prefill+1 токен) до замера — для честного бенча.
         #[arg(long, default_value_t = false)]
         warmup: bool,
-        /// Требовать MTP-декод на встроенной nextn-голове (greedy и сэмплинг). Без флага
-        /// MTP включается сам, когда доступен.
-        #[arg(long, default_value_t = false)]
-        mtp: bool,
         /// Запретить MTP-декод.
         #[arg(long, default_value_t = false)]
         no_mtp: bool,
-        /// Отключить CUDA-graph в MTP-декоде.
-        #[arg(long, default_value_t = false)]
-        no_graph_mtp: bool,
         /// Изображение для мультимодального промпта.
         #[arg(long)]
         image: Option<PathBuf>,
@@ -157,8 +150,6 @@ enum Commands {
         /// Отключить DFlash-спекуляцию (Muse Glimmer).
         #[arg(long, default_value_t = false)]
         no_dflash: bool,
-        #[arg(long, default_value_t = false, help = "Muse Glimmer: без lookup-спекуляции на greedy")]
-        no_lookup: bool,
         #[arg(long, help = "Пресет сэмплинга модели (с --chat; по умолчанию под режим размышлений)")]
         preset: Option<String>,
         #[arg(long, help = "Top-k (0 — выкл)")]
@@ -1366,7 +1357,7 @@ fn main() -> ExitCode {
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, mtp, no_mtp, no_graph_mtp, image, video, no_dflash, no_lookup, preset, top_k, top_p,
+            warmup, no_mtp, image, video, no_dflash, preset, top_k, top_p,
             min_p, repetition_penalty, repeat_last_n, presence_penalty, frequency_penalty, prefill_batch,
             chat, system, no_think, reasoning_effort, stop, max_image_tokens, layer_sync, expert_cache_gb,
             host_mirror_gb, qwen4_spec, embed_host,
@@ -1392,14 +1383,11 @@ fn main() -> ExitCode {
                 lm_head_dtype,
                 embed_dtype,
                 graph: !no_graph,
-                mtp,
                 no_mtp,
-                no_graph_mtp,
                 image,
                 video,
                 no_dflash,
                 warmup,
-                no_lookup,
                 sampling: synaptix_cli::commands::llm_facade::SamplingFlags {
                     preset,
                     temperature,

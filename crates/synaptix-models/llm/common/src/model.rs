@@ -181,6 +181,17 @@ fn expert_placement_probe(cfg: &DecoderConfig, weights: &dyn WeightSource, devic
     })
 }
 
+/// Хвостовые блоки, которым не хватило видеопамяти, держать в закреплённой
+/// RAM и читать ядрами прямо оттуда (zero-copy), а не возить по одному на
+/// каждом проходе. Так по умолчанию: адреса весов постоянны, CUDA-графы
+/// декода остаются включёнными, а ответ токен в токен тот же, что у модели
+/// целиком на карте (Qwen3.8-27B, 20 блоков в RAM: 6.5 ток/с против 3.1 у
+/// стрима). `SYN_TAIL=stream` — прежний стрим блоков.
+pub fn tail_mapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("SYN_TAIL").as_deref(), Ok("stream")))
+}
+
 pub fn offload_mode() -> OffloadMode {
     // `SYN_OFFLOAD=resident|offload|auto` — принудительно, поверх настройки
     // процесса (отладка и замеры).
@@ -660,6 +671,10 @@ pub struct DecoderModel {
     /// стримятся по одному во время forward'а с префетчем следующего.
     /// Равно числу блоков — вся модель резидентна (обычный путь).
     resident_blocks: usize,
+    /// Блоки, чьи веса лежат в закреплённой RAM и читаются ядрами прямо
+    /// оттуда (zero-copy, см. [`tail_mapped`]): для forward'а они «на карте»
+    /// — адреса постоянны, графы годны, — но видеопамяти не занимают.
+    mapped: Vec<bool>,
     /// Копия `resident_blocks` для виджетов службы (читается без замка).
     resident_live: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Уникальный номер экземпляра модели и поколение её весов (растёт при
@@ -1119,6 +1134,88 @@ pub struct DecodeState {
     pub rope_cos_local: Option<Tensor>,
     pub rope_sin_local: Option<Tensor>,
     pub logits: Tensor,
+}
+
+/// Диагностика `SYN_ATTN_SPARSITY=<шагов>`: на шаге декода считает на хосте
+/// точные веса внимания последнего запроса по всему MXFP8-кэшу слоя и
+/// печатает, сколько позиций держат массу 1−ε (ε = 1e-2, 1e-3, 5e-4, 1e-4):
+/// столько строк V пришлось бы прочитать разреженному чтению.
+fn attn_sparsity_probe(q: &Tensor, k: &Tensor, ks: &Tensor, t: usize, scale: f32, nh: usize, nkv: usize, hd: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static LEFT: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        AtomicUsize::new(std::env::var("SYN_ATTN_SPARSITY").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    });
+    if left.load(Relaxed) == 0 {
+        return;
+    }
+    left.fetch_sub(1, Relaxed);
+    let run = || -> Result<String, synaptix_core::error::SynaptixError> {
+        let tq = q.dims()[2];
+        // Буферы кэша — целиком (вид по длине у MXFP8 на карте не уплотняется):
+        // шаг строк — ёмкость `cap`, а не `t`.
+        let cap = k.dims()[2];
+        let qh = q.to_dtype(DType::F32)?.contiguous()?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let kb = k.to_device(Device::Cpu)?.to_bytes()?;
+        let sb = ks.to_device(Device::Cpu)?.to_bytes()?;
+        let lut: Vec<f32> = (0..=255u8).map(synaptix_core::quant::mxfp8::e4m3_to_f32).collect();
+        let eps = [1e-2f64, 1e-3, 5e-4, 1e-4];
+        let rep = nh / nkv;
+        use rayon::prelude::*;
+        let per_head: Vec<[usize; 4]> = (0..nh)
+            .into_par_iter()
+            .map(|h| {
+                let g = h / rep;
+                let qrow = &qh[((h * tq) + tq - 1) * hd..((h * tq) + tq) * hd];
+                let mut sc = vec![0f32; t];
+                for (j, o) in sc.iter_mut().enumerate() {
+                    let row = &kb[(g * cap + j) * hd..(g * cap + j + 1) * hd];
+                    let srow = &sb[(g * cap + j) * (hd / 32)..(g * cap + j + 1) * (hd / 32)];
+                    let mut acc = 0f32;
+                    for b in 0..hd / 32 {
+                        let f = f32::from_bits((srow[b] as u32) << 23);
+                        let mut a = 0f32;
+                        for d in b * 32..b * 32 + 32 {
+                            a += lut[row[d] as usize] * qrow[d];
+                        }
+                        acc += a * f;
+                    }
+                    *o = acc * scale;
+                }
+                let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut w: Vec<f64> = sc.iter().map(|x| ((x - m) as f64).exp()).collect();
+                let total: f64 = w.iter().sum();
+                w.sort_by(|a, b| b.total_cmp(a));
+                let mut out = [t; 4];
+                let mut cum = 0f64;
+                let mut e = 0;
+                for (i, x) in w.iter().enumerate() {
+                    cum += x;
+                    while e < 4 && total - cum <= eps[e] * total {
+                        out[e] = i + 1;
+                        e += 1;
+                    }
+                    if e == 4 {
+                        break;
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut line = format!("[ATTN_SPARSITY] T={t}");
+        for (e, eps) in eps.iter().enumerate() {
+            let mut v: Vec<usize> = per_head.iter().map(|x| x[e]).collect();
+            v.sort();
+            // Строк V на KV-голову: объединение по группе ≤ сумма.
+            let sum: usize = v.iter().sum();
+            line += &format!(" | ε={eps:e}: мед {} макс {} сумма {} ({:.2}% от {}·T)", v[v.len() / 2], v[v.len() - 1], sum, 100.0 * sum as f64 / (nh * t) as f64, nh);
+        }
+        Ok(line)
+    };
+    match run() {
+        Ok(l) => eprintln!("{l}"),
+        Err(e) => eprintln!("[ATTN_SPARSITY] ошибка: {e}"),
+    }
 }
 
 impl DecodeState {
@@ -1813,6 +1910,7 @@ impl DecoderModel {
             rope_capacity,
             embed_scale: cfg.embed_scale,
             resident_blocks: if b_dev != device { 0 } else { n_blocks },
+            mapped: vec![false; n_blocks],
             resident_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(if b_dev != device { 0 } else { n_blocks as u64 })),
             instance_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1868,7 +1966,12 @@ impl DecoderModel {
     /// Вся модель на устройстве — обычный резидентный путь. При частичном
     /// оффлоаде CUDA-графы недоступны: адреса весов меняются каждый ход.
     pub fn blocks_all_resident(&self) -> bool {
-        self.resident_blocks >= self.blocks.len()
+        self.resident_blocks >= self.blocks.len() || self.blocks.iter().all(|b| b.on_device(self.device))
+    }
+
+    /// Сколько блоков читается из закреплённой RAM (zero-copy хвост).
+    pub fn mapped_blocks(&self) -> usize {
+        self.mapped.iter().filter(|m| **m).count()
     }
 
     /// Модели целиком на карте не хватило памяти на ход (длинный префилл):
@@ -1946,30 +2049,71 @@ impl DecoderModel {
         self.weights_gen += 1;
         let want = resident.min(self.blocks.len());
         let dev = self.device;
+        let map = tail_mapped() && matches!(dev, Device::Cuda(_));
         // Сначала выселяем лишние — так освобождается место под въезд.
-        // `host_from` — граница, начиная с которой блоки действительно на
-        // хосте. Не уехавший блок остаётся на карте, и записывать его в
-        // нерезидентные нельзя: forward стримил бы то, что и так лежит на
-        // устройстве, а вызывающий считал бы освободившейся память, которая
-        // не освободилась.
+        // `host_from` — граница, начиная с которой блоки действительно не
+        // занимают видеопамять. Не уехавший блок остаётся на карте, и
+        // записывать его в нерезидентные нельзя: forward стримил бы то, что и
+        // так лежит на устройстве, а вызывающий считал бы освободившейся
+        // память, которая не освободилась.
         let mut host_from = self.blocks.len();
         for idx in (want..self.blocks.len()).rev() {
-            if !self.blocks[idx].on_device(dev) {
-                host_from = idx;
-                continue;
-            }
-            match self.blocks[idx].to_device(Device::Cpu) {
-                Ok(b) => {
-                    self.blocks[idx] = b;
+            if self.mapped[idx] {
+                if map {
                     host_from = idx;
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("[llm] блок {idx} не уехал на хост ({e}) — остаётся на карте");
-                    break;
+                // Режим сменился: из закреплённой RAM — в обычную.
+                match self.blocks[idx].to_device(Device::Cpu) {
+                    Ok(b) => {
+                        self.blocks[idx] = b;
+                        self.mapped[idx] = false;
+                        host_from = idx;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[llm] блок {idx} не ушёл из закреплённой RAM ({e})");
+                        break;
+                    }
                 }
             }
+            if self.blocks[idx].on_device(dev) {
+                match self.blocks[idx].to_device(Device::Cpu) {
+                    Ok(b) => self.blocks[idx] = b,
+                    Err(e) => {
+                        eprintln!("[llm] блок {idx} не уехал на хост ({e}) — остаётся на карте");
+                        break;
+                    }
+                }
+            }
+            if map {
+                // Zero-copy: веса — в закреплённую RAM под видом буферов
+                // устройства; ядра читают их по шине, адреса постоянны.
+                let _g = synaptix_core::memory::host_mapped::HostMappedGuard::new();
+                match self.blocks[idx].to_device(dev) {
+                    Ok(b) => {
+                        self.blocks[idx] = b;
+                        self.mapped[idx] = true;
+                    }
+                    Err(e) => eprintln!("[llm] блок {idx} не закрепился в RAM ({e}) — стримится"),
+                }
+            }
+            host_from = idx;
         }
         for idx in 0..want {
+            if self.mapped[idx] {
+                match self.blocks[idx].to_device(Device::Cpu) {
+                    Ok(b) => {
+                        self.blocks[idx] = b;
+                        self.mapped[idx] = false;
+                    }
+                    Err(e) => {
+                        eprintln!("[llm] блок {idx} не ушёл из закреплённой RAM ({e})");
+                        self.set_resident(idx);
+                        return idx;
+                    }
+                }
+            }
             if self.blocks[idx].on_device(dev) {
                 continue;
             }
@@ -1977,6 +2121,13 @@ impl DecoderModel {
                 Ok(b) => self.blocks[idx] = b,
                 Err(e) => {
                     eprintln!("[llm] блок {idx} не въехал на карту ({e}) — остаток стримим");
+                    if map {
+                        let _g = synaptix_core::memory::host_mapped::HostMappedGuard::new();
+                        if let Ok(b) = self.blocks[idx].to_device(dev) {
+                            self.blocks[idx] = b;
+                            self.mapped[idx] = true;
+                        }
+                    }
                     self.set_resident(idx);
                     return idx;
                 }
@@ -1990,12 +2141,25 @@ impl DecoderModel {
     /// Проход по блокам по порядку: резидентные отдаются как есть,
     /// нерезидентные приезжают с хоста, а следующий за ними префетчится на
     /// loader-стриме параллельно текущему шагу (pinned-H2D, как DiT-блоки LTX).
-    fn for_each_block<F>(&self, dev: Device, mut body: F) -> Result<(), ModelError>
+    /// Пойдёт ли проход на `tokens` токенов со стримом хвостовых блоков.
+    /// Блоки в обычной RAM стримятся всегда. Блоки в закреплённой RAM
+    /// (zero-copy) короткий проход — декод, сверка MTP — читает напрямую: вес
+    /// читается один раз за проход, и шина тут не хуже копии. Длинный кусок
+    /// префилла перечитывает вес по плиткам много раз — ему блок выгоднее
+    /// один раз привезти на карту (замер 83К: 1005 ток/с напрямую против
+    /// 2034 со стримом).
+    fn streams_blocks(&self, tokens: usize) -> bool {
+        const DIRECT_MAX: usize = 32;
+        let dev = self.device;
+        self.blocks.iter().zip(&self.mapped).any(|(b, m)| !b.on_device(dev) || (*m && tokens > DIRECT_MAX))
+    }
+
+    fn for_each_block<F>(&self, dev: Device, tokens: usize, mut body: F) -> Result<(), ModelError>
     where
         F: FnMut(usize, &Block) -> Result<(), ModelError>,
     {
         let n = self.blocks.len();
-        if self.blocks_all_resident() || !matches!(dev, Device::Cuda(_)) {
+        if !self.streams_blocks(tokens) || !matches!(dev, Device::Cuda(_)) {
             for (idx, blk) in self.blocks.iter().enumerate() {
                 body(idx, blk)?;
             }
@@ -2008,6 +2172,9 @@ impl DecoderModel {
         let first_streamed = self.resident_blocks;
         // Первый нерезидентный блок везём заранее — дальше каждый следующий
         // едет во время счёта предыдущего.
+        // Блок из закреплённой RAM «на устройстве» уже числится — копию в
+        // видеопамять просим явно.
+        let _vram = synaptix_core::memory::host_mapped::VramCopyGuard::new();
         let mut staged: Option<Block> = if first_streamed < n {
             Some(self.blocks[first_streamed].to_device(dev)?)
         } else {
@@ -2033,6 +2200,7 @@ impl DecoderModel {
                         Some(sp.spawn(move || -> Result<Block, ModelError> {
                             synaptix_core::device::cuda::set_alloc_stream(Some(lsc.clone()));
                             synaptix_core::device::cuda::set_offload_pinned(true);
+                            let _vram = synaptix_core::memory::host_mapped::VramCopyGuard::new();
                             let r = self.blocks[idx + 1].to_device(dev);
                             let _ = lsc.synchronize();
                             synaptix_core::device::cuda::set_offload_pinned(false);
@@ -2707,11 +2875,11 @@ impl DecoderModel {
         // Резидентные блоки идут как есть, нерезидентные приезжают с хоста —
         // решает `for_each_block`, здесь разница только в послойной синхре
         // (на стриме её делает сам префетч).
-        let sync_ord = match (self.device, self.blocks_all_resident()) {
+        let sync_ord = match (self.device, !self.streams_blocks(s)) {
             (Device::Cuda(o), true) => Some(o),
             _ => None,
         };
-        self.for_each_block(dev, |idx, blk| {
+        self.for_each_block(dev, s, |idx, blk| {
             hidden = step(idx, blk, &hidden, kv_cache)?;
             if taps.contains(&idx) {
                 tapped.push(hidden.clone());
@@ -2833,7 +3001,7 @@ impl DecoderModel {
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
             residual2.add(&mlp_out).coerr()
         };
-        self.for_each_block(dev, |idx, blk| {
+        self.for_each_block(dev, s, |idx, blk| {
             hidden = step(idx, blk, &hidden, &mut kv)?;
             Ok(())
         })?;
@@ -4113,6 +4281,9 @@ impl FullAttn {
             // narrow по dim-2 (max_seq); блочная ось hd/32 — dim-3, не задета.
             let ks = ksc.as_ref().unwrap().narrow(2, 0, new_len).coerr()?;
             let vs = vsc.as_ref().unwrap().narrow(2, 0, new_len).coerr()?;
+            if s <= 8 {
+                attn_sparsity_probe(&q, kc, ksc.as_ref().unwrap(), new_len, self.attn_scale, nh, nkv, hd);
+            }
             q.flash_attention_mxfp8kv(&k_q, &v_q, &ks, &vs, self.attn_scale, true)
                 .map_err(|e| ModelError::Forward(e.to_string()))?
         } else {

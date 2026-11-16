@@ -146,8 +146,7 @@ fn widen_bounds(base: u64, len: usize) {
 fn open_slab(st: &mut State, ordinal: usize, slot: usize) -> Option<usize> {
     // Хук ставим при первом slab'е: до него в арене нет ни одного адреса, и
     // платить лишним вызовом на каждом освобождении в процессе незачем.
-    static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| cudarc::driver::set_free_hook(claim_free));
+    crate::memory::install_free_hook();
     register_reclaimable();
     // Длину режем по слоту: хвост короче слота всё равно никому не достанется.
     let len = (slab_bytes() / slot).max(1) * slot;

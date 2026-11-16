@@ -402,6 +402,11 @@ impl QuantWeight {
         self.preshuffle_host_for(dev)?;
         let moved = |s: &Arc<Storage>| -> Result<Arc<Storage>> {
             if same_device {
+                if crate::memory::host_mapped::vram_copy_enabled() {
+                    if let Some(c) = crate::tensor::conversion::vram_copy_of_mapped(s)? {
+                        return Ok(Arc::new(c));
+                    }
+                }
                 Ok(s.clone())
             } else {
                 Ok(Arc::new(crate::tensor::conversion::storage_to_device(s, dev)?))

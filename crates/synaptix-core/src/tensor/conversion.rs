@@ -11,6 +11,14 @@ use crate::tensor::storage::CpuBuf;
 impl Tensor {
     pub fn to_device(&self, device: Device) -> Result<Self> {
         if self.device() == device {
+            if crate::memory::host_mapped::vram_copy_enabled() {
+                if let Some(storage) = vram_copy_of_mapped(&self.storage)? {
+                    if !self.is_contiguous() || self.layout.offset() != 0 {
+                        return Err(SynaptixError::Unsupported("копия в VRAM: вид на буфер в закреплённой RAM"));
+                    }
+                    return Ok(Tensor::from_parts(Arc::new(storage), self.layout.clone()));
+                }
+            }
             return Ok(self.clone());
         }
         if !self.is_contiguous() {
@@ -38,7 +46,11 @@ impl Tensor {
                     let stream = b.stream().clone();
                     // offload-выгрузка → pinned-конвейер (pageable dtoh 3-6GB/s
                     // жёг 5-8s на 24GB квант-блоков LTX host-stream).
-                    let bytes: Vec<u8> = if crate::device::cuda::offload_pinned_enabled()
+                    let bytes: Vec<u8> = if let Some(h) =
+                        crate::memory::host_mapped::host_bytes(b.device_address(), b.slice().len())
+                    {
+                        h
+                    } else if crate::device::cuda::offload_pinned_enabled()
                         && b.slice().len() >= (4 << 20)
                     {
                         crate::device::cuda::pinned_dtoh(&stream, b.slice())?
@@ -75,6 +87,21 @@ impl Tensor {
     }
 }
 
+/// Буфер живёт в закреплённой RAM (zero-copy) — его копия в видеопамяти;
+/// `None` — обычный буфер.
+pub(crate) fn vram_copy_of_mapped(s: &Storage) -> Result<Option<Storage>> {
+    let Storage::Cuda(b) = s else { return Ok(None) };
+    let ord = b.ordinal();
+    let stream = crate::device::cuda::alloc_stream(ord)?;
+    match crate::memory::host_mapped::to_vram(&stream, b.device_address(), b.slice().len()) {
+        Some(buf) => {
+            let ctx = crate::device::cuda::get(ord)?;
+            Ok(Some(Storage::Cuda(crate::tensor::storage::CudaBuf::new(ctx, stream, buf?, ord))))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Побайтовый перенос Storage между устройствами (для стриминга квант-весов:
 /// packed/scales — сырые байты без dtype-семантики). CPU→CUDA идёт через
 /// `cuda_alloc_from_bytes` → alloc-stream текущего потока + pinned staging
@@ -88,7 +115,11 @@ pub(crate) fn storage_to_device(s: &Storage, device: Device) -> Result<Storage> 
         }
         (Storage::Cuda(b), Device::Cpu) => {
             {
-                let bytes: Vec<u8> = if crate::device::cuda::offload_pinned_enabled()
+                let bytes: Vec<u8> = if let Some(h) =
+                    crate::memory::host_mapped::host_bytes(b.device_address(), b.slice().len())
+                {
+                    h
+                } else if crate::device::cuda::offload_pinned_enabled()
                     && b.slice().len() >= (4 << 20)
                 {
                     crate::device::cuda::pinned_dtoh(&b.stream().clone(), b.slice())?
