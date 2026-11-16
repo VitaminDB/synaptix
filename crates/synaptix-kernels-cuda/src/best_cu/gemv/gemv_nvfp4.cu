@@ -182,6 +182,123 @@ extern "C" __global__ void nvfp4_mma_gemv_shuf_f16_w8(
     mma_gemv_shuf_impl<8>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w, 0u);
 }
 
+// ── Несколько строк активации за ОДИН проход по весу ────────────────────────
+//
+// MMA m16n8k64 считает 8 столбцов активации разом; одиночный GEMV кладёт одну
+// и ту же строку во все восемь и берёт столбец 0. Здесь столбец `c` (его
+// B-данные и масштабы держат нити с lane>>2 == c) получает строку `c`
+// активации: до восьми строк при тех же загрузках веса. Порядок накопления по
+// чанкам на столбец тот же, что у одиночного ядра, — строка выходит бит в бит
+// как отдельным GEMV. Нужен шагу сверки MTP (2–4 токена): построчный цикл читал
+// вес на каждую строку, и у блоков в закреплённой RAM это упиралось в шину.
+//
+// `packed_x` — строки подряд по K/2 байт; `scales_x` — общий квант [rows, K]
+// (смещение строки `r` в тайле — `(r % 32) * 16 + (r / 32) * 4`). `out` —
+// `[rows, N]`.
+template <unsigned int WARPS>
+__device__ __forceinline__ void mma_gemv_shuf_rows_impl(
+    const unsigned char* __restrict__ packed_w,
+    const unsigned char* __restrict__ scales_w,
+    const unsigned char* __restrict__ packed_x,
+    const unsigned char* __restrict__ scales_x,
+    syn_out_t*           __restrict__ out,
+    unsigned int N,
+    unsigned int K,
+    unsigned int sf_inner_dim_w,
+    unsigned int rows)
+{
+    constexpr unsigned int M_TILE = WARPS * 16;
+    constexpr unsigned int THREADS = WARPS * 32;
+
+    extern __shared__ unsigned char smem[];
+    unsigned char* smem_x = smem;
+    unsigned int k_half = K >> 1;
+
+    unsigned int tid  = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    unsigned int lane = tid & 31u;
+
+    unsigned int x_u32_count = (k_half >> 2) * rows;
+    unsigned int*       smem_x_u32 = (unsigned int*)smem_x;
+    const unsigned int* gmem_x_u32 = (const unsigned int*)packed_x;
+    for (unsigned int i = tid; i < x_u32_count; i += THREADS) {
+        smem_x_u32[i] = gmem_x_u32[i];
+    }
+    __syncthreads();
+
+    unsigned int m_warp_base = blockIdx.x * M_TILE + warp * 16u;
+    if (m_warp_base >= N) return;
+
+    unsigned int m_t = lane & 3u;
+    unsigned int k_t = lane >> 2;
+    unsigned int s_a = lane & 1u;
+    unsigned int s_c = lane >> 2;
+    unsigned int m_for_sfa = m_warp_base + s_a * 8u + s_c;
+
+    unsigned int m_block_warp = m_warp_base >> 4;
+    unsigned int block_base = m_block_warp * (K >> 6) * 512u;
+    unsigned int top_off = k_t * 32u + m_t * 4u;
+    unsigned int bot_off = (k_t + 8u) * 32u + m_t * 4u;
+
+    unsigned int k_lo_off    = m_t * 4u;
+    unsigned int k_hi_off    = k_lo_off + 16u;
+
+    unsigned int tile_row_w   = m_for_sfa >> 7;
+    unsigned int local_outer  = m_for_sfa & 127u;
+    unsigned int off_in_tile  = (local_outer & 31u) * 16u + (local_outer >> 5) * 4u;
+    unsigned int sfa_row_base = tile_row_w * sf_inner_dim_w * 128u + off_in_tile;
+
+    // Столбец активации этой нити; лишние столбцы повторяют строку 0.
+    unsigned int col = lane >> 2;
+    unsigned int row_x = col < rows ? col : 0u;
+    const unsigned char* smem_row = smem_x + row_x * k_half;
+    unsigned int x_sf_off = (row_x & 31u) * 16u + (row_x >> 5) * 4u;
+
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    unsigned int num_chunks = K >> 6;
+    for (unsigned int chunk = 0; chunk < num_chunks; chunk++) {
+        nvfp4_gemv_mma_chunk(packed_w, scales_w, smem_row, scales_x, block_base, chunk,
+                             top_off, bot_off, k_lo_off, k_hi_off, sfa_row_base, x_sf_off,
+                             d0, d1, d2, d3);
+    }
+
+    // D: нить держит строки lane>>2 и +8, столбцы (lane&3)*2 и +1.
+    unsigned int row_top = lane >> 2;
+    unsigned int m_top_g = m_warp_base + row_top;
+    unsigned int m_bot_g = m_top_g + 8u;
+    unsigned int c0 = (lane & 3u) * 2u;
+    if (c0 < rows) {
+        if (m_top_g < N) out[(size_t)c0 * N + m_top_g] = SYN_TO_OUT(d0);
+        if (m_bot_g < N) out[(size_t)c0 * N + m_bot_g] = SYN_TO_OUT(d2);
+    }
+    if (c0 + 1u < rows) {
+        if (m_top_g < N) out[(size_t)(c0 + 1u) * N + m_top_g] = SYN_TO_OUT(d1);
+        if (m_bot_g < N) out[(size_t)(c0 + 1u) * N + m_bot_g] = SYN_TO_OUT(d3);
+    }
+}
+
+extern "C" __global__ void nvfp4_mma_gemv_shuf_rows_f16_w4(
+    const unsigned char* __restrict__ packed_w,
+    const unsigned char* __restrict__ scales_w,
+    const unsigned char* __restrict__ packed_x,
+    const unsigned char* __restrict__ scales_x,
+    syn_out_t*           __restrict__ out,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w, unsigned int rows)
+{
+    mma_gemv_shuf_rows_impl<4>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w, rows);
+}
+
+extern "C" __global__ void nvfp4_mma_gemv_shuf_rows_f16_w8(
+    const unsigned char* __restrict__ packed_w,
+    const unsigned char* __restrict__ scales_w,
+    const unsigned char* __restrict__ packed_x,
+    const unsigned char* __restrict__ scales_x,
+    syn_out_t*           __restrict__ out,
+    unsigned int N, unsigned int K, unsigned int sf_inner_dim_w, unsigned int rows)
+{
+    mma_gemv_shuf_rows_impl<8>(packed_w, scales_w, packed_x, scales_x, out, N, K, sf_inner_dim_w, rows);
+}
+
 // Батч GEMV по списку весов: blockIdx.z выбирает эксперта, указатели на его
 // packed/scales и на его активацию берутся из массивов. Нужен MoE-декоду, где
 // на слой приходится десяток матриц по одной строке каждая: отдельными

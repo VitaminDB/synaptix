@@ -254,7 +254,16 @@ pub fn nvfp4_linear_f16(
     // Горстка строк (спекулятивная пара MTP): GEMV по строкам — GEMM n8-тайлом
     // на M=2 шёл 50 мкс против 5–13 у GEMV. Строка — копией во временный
     // буфер (вход/выход по паре килобайт).
-    if prequant.is_none() && m > 1 && m <= small_m_rows() {
+    // Те же строки одним проходом по весу (`nvfp4_mma_gemv_shuf_rows`): строка
+    // выходит бит в бит как отдельным GEMV, а вес читается один раз — у блоков
+    // в закреплённой RAM цена шага сверки перестаёт зависеть от числа токенов.
+    // `SYN_NVFP4_GEMV_ROWS=0` — прежний построчный цикл.
+    let rows_gemv = prequant.is_none()
+        && m > 1
+        && m <= small_m_rows()
+        && gemv_rows_on()
+        && crate::best_cu::gemv::gemv_nvfp4::gemv_rows_fits(gemv_k, n, k, m);
+    if !rows_gemv && prequant.is_none() && m > 1 && m <= small_m_rows() {
         let es = 2usize;
         let (kk, nn) = (k as usize, n as usize);
         let mut plan = None;
@@ -292,7 +301,7 @@ pub fn nvfp4_linear_f16(
     let full_direct = m >= 32
         && k % 128 == 0
         && pick_nvfp4_full(m, n, k).map(|c| !c.persistent).unwrap_or(false);
-    let m_run = if full_direct {
+    let m_run = if full_direct || rows_gemv {
         m
     } else if m > 1 {
         if m >= 1280 {
@@ -435,6 +444,12 @@ pub fn nvfp4_linear_f16(
             unsafe { out_u8.transmute_mut::<f16>(mn) }
         }
         .ok_or_else(|| SynaptixError::Cuda("nvfp4_linear: transmute out→f16".into()))?;
+        if rows_gemv {
+            crate::best_cu::gemv::gemv_nvfp4::nvfp4_mma_gemv_shuf_rows_f16_view(
+                gemv_k, stream, shuf_w, scales_w, packed_x, scales_x, &mut out_view, n, k, m,
+            )?;
+            return Ok(Nvfp4Plan::Gemv);
+        }
         match plan {
             Nvfp4Plan::Gemv => nvfp4_mma_gemv_shuf_f16_view(
                 gemv_k, stream, shuf_w, scales_w, packed_x, scales_x, &mut out_view, n, k,
@@ -1080,6 +1095,11 @@ fn blockq_gemv_enabled() -> bool {
 
 /// До скольких строк NVFP4-линейный слой считается GEMV по строкам
 /// (`SYN_LINEAR_GEMV_ROWS`, как у плотных).
+fn gemv_rows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SYN_NVFP4_GEMV_ROWS").as_deref() != Ok("0"))
+}
+
 fn small_m_rows() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("SYN_LINEAR_GEMV_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))

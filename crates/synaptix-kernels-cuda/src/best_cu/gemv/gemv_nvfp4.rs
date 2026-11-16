@@ -18,6 +18,8 @@ pub struct Nvfp4MmaGemvShufKernels {
     w4: CudaFunction,
     w8: CudaFunction,
     w8_persistent: CudaFunction,
+    rows_w4: CudaFunction,
+    rows_w8: CudaFunction,
     w8_batched: CudaFunction,
     ptr_gather: CudaFunction,
     grouped_splitk: CudaFunction,
@@ -87,12 +89,14 @@ impl Nvfp4MmaGemvShufKernels {
         let w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8")?;
         let w8p = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_persistent")?;
         let w8b = load_fn(&module, "nvfp4_mma_gemv_shuf_f16_w8_batched")?;
+        let rows_w4 = load_fn(&module, "nvfp4_mma_gemv_shuf_rows_f16_w4")?;
+        let rows_w8 = load_fn(&module, "nvfp4_mma_gemv_shuf_rows_f16_w8")?;
         let ptr_gather = load_fn(&module, "nvfp4_expert_ptr_gather")?;
         let grouped_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_grouped_splitk")?;
         let indexed_splitk = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk")?;
         let indexed_splitk_mt2 = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk_mt2")?;
         let indexed_splitk_mt4 = load_fn(&module, "nvfp4_mma_gemv_shuf_indexed_splitk_mt4")?;
-        for f in [&w4, &w8, &w8p, &w8b] {
+        for f in [&w4, &w8, &w8p, &w8b, &rows_w4, &rows_w8] {
             f.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 SMEM_OPT_IN_BYTES,
@@ -107,6 +111,8 @@ impl Nvfp4MmaGemvShufKernels {
             w4,
             w8,
             w8_persistent: w8p,
+            rows_w4,
+            rows_w8,
             w8_batched: w8b,
             ptr_gather,
             grouped_splitk,
@@ -327,6 +333,65 @@ pub fn nvfp4_mma_gemv_shuf_f16_view(
     unsafe {
         b.launch(cfg)
             .map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemv_shuf: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// До скольких строк считает [`nvfp4_mma_gemv_shuf_rows_f16_view`].
+pub const GEMV_ROWS_MAX: u32 = 8;
+
+/// Подходит ли форма многострочному GEMV: те же случаи, где одиночный GEMV
+/// идёт ядром w4/w8 (у split-K и persistent свой порядок накопления — там
+/// строки считаются по одной, чтобы результат не менялся), и активация всех
+/// строк помещается в разделяемую память блока.
+pub fn gemv_rows_fits(kernels: &Nvfp4MmaGemvShufKernels, n: u32, k: u32, rows: u32) -> bool {
+    if rows < 2 || rows > GEMV_ROWS_MAX || k % 64 != 0 || (k / 2) * rows > SMEM_OPT_IN_BYTES as u32 {
+        return false;
+    }
+    let num_tiles_w8 = if n % W8_M_TILE == 0 { n / W8_M_TILE } else { 0 };
+    let want_w8 = num_tiles_w8 >= kernels.num_sms;
+    if !want_w8 && n % 16 == 0 && n / W4_M_TILE < kernels.num_sms / 2 && splitk_small_on() {
+        return false;
+    }
+    if want_w8 {
+        num_tiles_w8 < kernels.num_sms * 4
+    } else {
+        n % W4_M_TILE == 0
+    }
+}
+
+/// GEMV на `rows` строк активации одним проходом по весу: `out[rows, N]`.
+/// `packed_x` — строки подряд по K/2 байт, `scales_x` — их общий квант.
+/// Строка считается бит в бит как одиночным [`nvfp4_mma_gemv_shuf_f16_view`].
+/// Звать при [`gemv_rows_fits`].
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_mma_gemv_shuf_rows_f16_view(
+    kernels: &Nvfp4MmaGemvShufKernels,
+    stream: &Arc<CudaStream>,
+    packed_w_shuf: &CudaSlice<u8>,
+    scales_w: &CudaSlice<u8>,
+    packed_x: &CudaSlice<u8>,
+    scales_x: &CudaSlice<u8>,
+    out: &mut CudaViewMut<f16>,
+    n: u32,
+    k: u32,
+    rows: u32,
+) -> Result<()> {
+    if !gemv_rows_fits(kernels, n, k, rows) {
+        return Err(SynaptixError::Cuda(format!("nvfp4_mma_gemv_shuf_rows: форма N={n} K={k} строк {rows}")));
+    }
+    let want_w8 = n % W8_M_TILE == 0 && n / W8_M_TILE >= kernels.num_sms;
+    let (kfn, threads, grid) = if want_w8 {
+        (&kernels.rows_w8, W8_THREADS, n / W8_M_TILE)
+    } else {
+        (&kernels.rows_w4, W4_THREADS, n / W4_M_TILE)
+    };
+    let sf_inner_w = sf_inner_dim(k);
+    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: (k / 2) * rows };
+    let mut b = stream.launch_builder(kfn);
+    b.arg(packed_w_shuf).arg(scales_w).arg(packed_x).arg(scales_x).arg(&mut *out).arg(&n).arg(&k).arg(&sf_inner_w).arg(&rows);
+    unsafe {
+        b.launch(cfg).map_err(|e| SynaptixError::Cuda(format!("launch nvfp4_mma_gemv_shuf_rows: {e:?}")))?;
     }
     Ok(())
 }
