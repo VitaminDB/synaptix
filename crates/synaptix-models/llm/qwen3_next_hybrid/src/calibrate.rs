@@ -1,6 +1,7 @@
 //! Калибровка квантования гибрида Qwen3.5/3.6 (GatedDeltaNet + full-attn,
-//! эксперты MoE): вторые моменты входов матриц каждого эксперта и матрицы
-//! связей входов слоёв MoE (запись — в общем слое `common::moe`) → файл для
+//! эксперты MoE или плотный MLP): вторые моменты входов матриц (у MoE — каждого
+//! эксперта) и матрицы связей входов (запись — в общем слое: `common::moe`,
+//! плотный — `Mlp::forward_pq`) → файл для
 //! `synaptix quantize --calib`: выбор масштабов NVFP4 по важности столбцов
 //! и компенсация ошибки (GPTQ). Общая обвязка — [`calib::calibrate_text`].
 //!
@@ -26,9 +27,6 @@ pub fn calibrate(
     progress: &dyn Fn(usize, usize),
 ) -> Result<TextCalibReport, Box<dyn std::error::Error>> {
     let pipeline = HybridPipeline::load_with_precision(bundle, device, precision, Some(opts.window + 64))?;
-    if pipeline.config.moe.is_none() {
-        return Err("калибровка гибрида: у модели нет экспертов MoE (плотный MLP пока не пишет статистику)".into());
-    }
     let ids = pipeline.encode(text)?;
     let mut kv = None;
     calib::calibrate_text(

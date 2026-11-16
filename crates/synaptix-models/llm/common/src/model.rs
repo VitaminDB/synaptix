@@ -316,6 +316,8 @@ pub struct Mlp {
     up_proj: QLinear,
     down_proj: QLinear,
     activation: Activation,
+    /// Путь блока в источнике весов (`….mlp`) — ключи калибровки (`calib::record`).
+    calib_prefix: std::sync::Arc<str>,
 }
 
 /// FFN блока: плотный MLP либо разрежённый Qwen-MoE вместо него (роутер,
@@ -482,6 +484,7 @@ impl Mlp {
             up_proj: self.up_proj.to_device(dev)?,
             down_proj: self.down_proj.to_device(dev)?,
             activation: self.activation,
+            calib_prefix: self.calib_prefix.clone(),
         })
     }
 }
@@ -1777,6 +1780,7 @@ impl DecoderModel {
                     up_proj: qlin(&key("mlp.up_proj.weight"), mlp_w)?,
                     down_proj: qlin(&key("mlp.down_proj.weight"), mlp_w)?,
                     activation: cfg.activation,
+                    calib_prefix: weights.source_key(&key("mlp")).into(),
                 }),
             };
             // MoE-ветка: свои нормы, свой роутер. Множитель роутера
@@ -4212,6 +4216,10 @@ impl Mlp {
         pq: Option<&(Tensor, Tensor, DType)>,
     ) -> Result<Tensor, ModelError> {
         let dev = h.device();
+        let calib = synaptix_core::quant::calib::active();
+        if calib {
+            self.calib_record_input(h)?;
+        }
         // gate и up берут один и тот же `h`: prequant из эпилога нормы, иначе 1×.
         let act = pq.cloned().or_else(|| quant_act_shared(h, self.gate_proj.quant_dtype()));
         let gate = proj_shared(&self.gate_proj, h, &act, dev, "mlp_gate")?;
@@ -4232,7 +4240,26 @@ impl Mlp {
                 Ok(up.clamp(-lim, lim).coerr()?.add_scalar(1.0).coerr()?.mul(&glu).coerr()?)
             }
         })?;
+        if calib {
+            let ferr = |e: SynaptixError| ModelError::Forward(format!("calib mlp: {e}"));
+            synaptix_core::quant::calib::record(&format!("{}.down_proj.weight", self.calib_prefix), &gated).map_err(ferr)?;
+        }
         prof(dev, "mlp_down", || self.down_proj.forward(&gated))
+    }
+
+    /// Калибровка: E[x²] входа gate/up и матрица связей входов под GPTQ
+    /// (у `down` — только E[x²]: его вход шириной intermediate, матрица
+    /// связей была бы в десятки раз больше). Вход у gate и up общий, поэтому
+    /// матрица пишется под обоими именами.
+    fn calib_record_input(&self, h: &Tensor) -> Result<(), ModelError> {
+        use synaptix_core::quant::calib;
+        let ferr = |e: SynaptixError| ModelError::Forward(format!("calib mlp: {e}"));
+        for w in ["gate_proj", "up_proj"] {
+            let name = format!("{}.{w}.weight", self.calib_prefix);
+            calib::record(&name, h).map_err(ferr)?;
+            calib::record_gram(&name, h).map_err(ferr)?;
+        }
+        Ok(())
     }
 }
 

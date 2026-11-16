@@ -103,11 +103,11 @@ fn calibrate_hybrid(args: &CalibrateArgs, device: Device) -> Result<(), Box<dyn 
         Ok("nvfp4") => PrecisionConfig::nvfp4(),
         _ => PrecisionConfig::mxfp8(),
     };
-    println!("Calibrate {} (LLM-гибрид, эксперты MoE) на тексте {} — до {} токенов ({:?})", args.model.display(), args.audio.display(), opts.tokens, device);
+    println!("Calibrate {} (LLM-гибрид) на тексте {} — до {} токенов ({:?})", args.model.display(), args.audio.display(), opts.tokens, device);
     let r = synaptix_llm_qwen3_next_hybrid::calibrate::calibrate(&args.model, &text, &args.output, device, precision, &opts, &|done, n| eprint!("\r  [{done}/{n}]"))?;
     eprintln!();
     println!(
-        "Done: {} ({} матриц экспертов, {} видели меньше 64 строк; матриц связей входов {}; {} токенов, {:.1} с)",
+        "Done: {} ({} матриц со статистикой входов, {} видели меньше 64 строк; матриц связей входов {}; {} токенов, {:.1} с)",
         args.output.display(), r.matrices, r.rare, r.grams, r.tokens, r.seconds
     );
     Ok(())
