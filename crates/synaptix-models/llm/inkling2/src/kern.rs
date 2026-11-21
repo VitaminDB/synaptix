@@ -57,6 +57,7 @@ pub fn rms(x: &Tensor, w: Option<&Tensor>, eps: f32, out_bf16: bool) -> R<Tensor
 }
 
 /// Внимание по глубине: состояния (`[T, H]` F32), запросы `[nq, H]` → `[nq, T, H]`.
+/// Два прохода по кускам H: частичные суммы (`ink2_mix_part`), softmax и выход (`ink2_mix_out`).
 pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     if states.is_empty() || states.len() > 8 {
         return Err(ModelError::Forward(format!("inkling2 mix: {} состояний", states.len())));
@@ -75,14 +76,6 @@ pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     a.u[2] = h as u32;
     a.u[3] = nq as u32;
     let dev = states[0].device();
-    if std::env::var_os("INK2_ORIG_MIX").is_some() {
-        launch(dev, "ink2_mix_orig", &a, (t as u32, 1, 1), 256)?;
-        return Ok(out);
-    }
-    if std::env::var_os("INK2_OLD_MIX").is_some() {
-        launch(dev, "ink2_mix", &a, (t as u32, 1, 1), 1024)?;
-        return Ok(out);
-    }
     let b = (h as u32).div_ceil(256);
     let part = empty(vec![t * b as usize * 40], DType::F32, dev)?;
     a.a[10] = addr(&part)?;

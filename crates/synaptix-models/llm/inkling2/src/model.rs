@@ -308,7 +308,7 @@ impl Inkling2Model {
         let unembed = Lin::load(w, &format!("{LLM}.unembed.weight"), dev)?;
         let norm = f32t(&format!("{LLM}.norm.weight"))?;
         let output_q = f32t(&format!("{LLM}.attn_res.output_query"))?.reshape(vec![1, h]).map_err(lerr)?;
-        let (cs, ce) = cfg.core();
+        let (cs, _) = cfg.core();
         let msg = if t.loop_config.is_some() {
             Some((
                 w.host_f32(&format!("{LLM}.middle_cycle_cross_pass_queries"))?,
@@ -378,7 +378,6 @@ impl Inkling2Model {
             } else {
                 None
             };
-            let _ = ce;
             layers.push(Layer {
                 swa,
                 attn_norm,
@@ -688,11 +687,7 @@ impl Inkling2Model {
         let n = idt.dims()[0];
         let past = cache.seq_len;
         let dev = self.device;
-        let x = if std::env::var_os("INK2_OLD_EMBED").is_some() {
-            synaptix_ops::embed::token_embedding(idt, &self.embed).map_err(fe)?
-        } else {
-            self.embed.embed_gather(idt).map_err(fe)?
-        };
+        let x = self.embed.embed_gather(idt).map_err(fe)?;
         let x = f32c(&x.reshape(vec![n, t.hidden_size]).map_err(fe)?)?;
         let mut cur = kern::rms(&x, Some(&self.embed_norm), t.rms_norm_eps, false)?;
         for p in patches {
@@ -760,17 +755,6 @@ impl Inkling2Model {
     }
 
     fn control(&self, x: &Tensor, m: &Tensor, c: &Ctrl) -> R<Tensor> {
-        if std::env::var_os("INK2_OLD_CTRL").is_some() {
-            let xr = kern::rms(x, None, 1e-6, false)?;
-            let mr = kern::rms(m, None, 1e-6, false)?;
-            let cat = Tensor::cat(&[&xr, &mr], 1).map_err(fe)?;
-            let down_t = c.down.transpose(0, 1).map_err(fe)?.contiguous().map_err(fe)?;
-            let d = cat.matmul(&down_t).map_err(fe)?;
-            let gain = d.matmul(&c.gain).map_err(fe)?.tanh().map_err(fe)?;
-            let forget = d.matmul(&c.forget).map_err(fe)?.tanh().map_err(fe)?;
-            let keep = x.sub(&forget.mul(x).map_err(fe)?).map_err(fe)?;
-            return f32c(&keep.add(&gain.mul(m).map_err(fe)?).map_err(fe)?);
-        }
         let (n, h) = (x.dims()[0], x.dims()[1]);
         let dev = self.device;
         let d = empty(vec![n, c.rank], DType::F32, dev)?;
@@ -803,7 +787,6 @@ impl Inkling2Model {
         let t = &self.cfg.text;
         let l = &self.layers[ip];
         let n = cur.dims()[0];
-        let h = t.hidden_size;
         let (nh, nkv, d, dr) = (t.num_attention_heads, t.num_key_value_heads, t.head_dim, t.d_rel);
         let eps = t.rms_norm_eps;
         let dev = self.device;
@@ -842,20 +825,7 @@ impl Inkling2Model {
         let k_scale = 1.0 / ((t.sconv_kernel_size + 1) as f32).sqrt();
         let kd_scale = 1.0 / ((2 * t.sconv_kernel_size + 1) as f32).sqrt();
         let col = |y: &Tensor, off: usize, len: usize| -> R<Tensor> { y.narrow(1, off, len).map_err(fe)?.contiguous().map_err(fe) };
-        let ya = if std::env::var_os("INK2_UNFUSED").is_some() {
-            // Отладка: те же веса по частям (срезы склейки) — сверка с раздельными GEMV.
-            let Lin::Dense(lin) = &l.pa else { unreachable!() };
-            let w = lin.weight();
-            let mut outs = Vec::new();
-            for (off, len) in [(0, nh * d), (nh * d, nh * dr), (nh * d + nh * dr, nh * d), (2 * nh * d + nh * dr, nh)] {
-                let wp = w.narrow(0, off, len).map_err(fe)?.contiguous().map_err(fe)?;
-                outs.push(Lin::Dense(Linear::new(wp, None).map_err(fe)?).f32(&normed[0])?);
-            }
-            let refs: Vec<&Tensor> = outs.iter().collect();
-            f32c(&Tensor::cat(&refs, 1).map_err(fe)?)?
-        } else {
-            kern::stage("proj_a", dev, || l.pa.f32(&normed[0]))?
-        };
+        let ya = kern::stage("proj_a", dev, || l.pa.f32(&normed[0]))?;
         let (q, r, gate, sink) = (col(&ya, 0, nh * d)?, col(&ya, nh * d, nh * dr)?, col(&ya, nh * d + nh * dr, nh * d)?, col(&ya, 2 * nh * d + nh * dr, nh)?);
         let (yk, yv) = kern::stage("proj_kv", dev, || -> R<_> { Ok((l.pk.f32(&normed[1])?, l.pv.f32(&normed[2])?)) })?;
         let kk = t.sconv_kernel_size;
@@ -896,7 +866,7 @@ impl Inkling2Model {
         a.f[1] = t.rel_l2_clip_threshold;
         a.f[2] = eps;
         a.f[3] = t.log_scaling_alpha;
-        if std::env::var_os("INK2_HOST_POS").is_none() { a.a[10] = addr(&cache.pos_dev)?; }
+        a.a[10] = addr(&cache.pos_dev)?;
         kern::stage("k_qkv", dev, || launch(dev, "ink2_qkv", &a, (n as u32, (nh + 2 * nkv) as u32, 1), d as u32))?;
 
         let att = empty(vec![n, nh * d], DType::F32, dev)?;
@@ -920,13 +890,13 @@ impl Inkling2Model {
         a.u[10] = sc.ring as u32;
         a.u[8] = l.extent as u32;
         a.f[0] = 1.0 / (d as f32).sqrt();
-        if std::env::var_os("INK2_HOST_POS").is_none() { a.a[10] = addr(&cache.pos_dev)?; }
+        a.a[10] = addr(&cache.pos_dev)?;
         // Части по ключам на декоде: число фиксировано от ёмкости окна (граф), ~64 позиции на часть.
         let span = if l.swa { t.sliding_window_size.min(cache.capacity) } else { cache.capacity };
         // Префилл (T > 1) — flash-ядро на тензорных ядрах ink2_attn_fa (bias, окно, кольцо, синк, гейт);
-        // части по ключам — от длины контекста, сборка — ink2_attn_merge. INK2_OLD_ATTN=1 — прежнее ядро.
+        // части по ключам — от длины контекста, сборка — ink2_attn_merge.
         // Декод (T = 1): прежнее ink2_attn, число частей фиксировано от ёмкости (CUDA-граф).
-        let fa = n > 1 && d == 128 && dr == 16 && std::env::var_os("INK2_OLD_ATTN").is_none();
+        let fa = n > 1 && d == 128 && dr == 16;
         let splits = if fa {
             let keys = if l.swa { (t.sliding_window_size + 64).min(past + n) } else { past + n };
             kern::attn_fa_splits(n, nh, keys)
@@ -972,7 +942,6 @@ impl Inkling2Model {
         let y = kern::stage("moe", dev, || self.moe(l, &xn))?;
         let sc = &mut cache.slots[slot];
         let y = kern::conv(&y, &l.ffn_post_conv, &sc.ffn_state, None, k_scale)?;
-        let _ = h;
         f32c(&ffn_inp.add(&y).map_err(fe)?)
     }
 
@@ -986,11 +955,6 @@ impl Inkling2Model {
         let ex = &l.experts;
         let xf = f32c(xn)?;
         let logits = empty(vec![n, e], DType::F32, dev)?;
-        if std::env::var_os("INK2_OLD_ROUTER").is_some() {
-            let rt = l.router.transpose(0, 1).map_err(fe)?.contiguous().map_err(fe)?;
-            let lg = f32c(&xf.matmul(&rt).map_err(fe)?)?;
-            return self.moe_after_logits(l, xn, lg);
-        }
         let mut a = Ink2Launch::default();
         a.a[0] = addr(&xf)?;
         a.a[1] = addr(&l.router)?;
@@ -999,15 +963,6 @@ impl Inkling2Model {
         a.u[1] = hdim as u32;
         a.u[2] = e as u32;
         launch(dev, "ink2_router", &a, (n as u32, (e as u32).div_ceil(8), 1), 256)?;
-        self.moe_after_logits(l, xn, logits)
-    }
-
-    fn moe_after_logits(&self, l: &Layer, xn: &Tensor, logits: Tensor) -> R<Tensor> {
-        let t = &self.cfg.text;
-        let n = xn.dims()[0];
-        let (e, k, hdim, inter) = (t.n_routed_experts, t.num_experts_per_tok, t.hidden_size, t.intermediate_size);
-        let dev = self.device;
-        let ex = &l.experts;
         let idx = empty(vec![n * k], DType::U32, dev)?;
         let wts = empty(vec![n * k], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -1020,7 +975,7 @@ impl Inkling2Model {
         a.u[1] = e as u32;
         a.u[2] = k as u32;
         a.f[0] = t.route_scale;
-        if std::env::var_os("INK2_OLD_ROUTE").is_some() { launch(dev, "ink2_route_blk", &a, (n as u32, 1, 1), 128)?; } else { launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?; }
+        launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?;
         if n == 1 {
             let mut acc = Tensor::zeros(vec![hdim], DType::F32, dev).map_err(fe)?;
             match &ex.store {
