@@ -106,10 +106,30 @@ impl Inkling2Pipeline {
         self.tokenizer.decode(ids, false).map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
-    /// Байт KV и состояний на токен контекста (все слоты цикла).
+    /// Байт KV на токен контекста: растут только слоты полного внимания (у SWA — кольцо
+    /// фиксированного размера, см. [`Self::kv_fixed_bytes`]).
     pub fn kv_bytes_per_token(&self) -> usize {
         let t = &self.config.text;
-        self.config.num_slots() * 2 * t.num_key_value_heads * t.head_dim * 2
+        self.full_slots() * 2 * t.num_key_value_heads * t.head_dim * 2
+    }
+
+    /// Слотов полного внимания (физический полный слой × его проходы).
+    pub fn full_slots(&self) -> usize {
+        (0..self.config.num_slots())
+            .filter(|&s| {
+                let n = self.config.text.num_hidden_layers;
+                let (cs, ce) = self.config.core();
+                let phys = if s < n { s } else { cs + (s - n) % (ce - cs) };
+                !self.config.is_swa(phys)
+            })
+            .count()
+    }
+
+    /// Фиксированные байты KV: кольца SWA-слотов (окно + чанк префилла).
+    pub fn kv_fixed_bytes(&self) -> usize {
+        let t = &self.config.text;
+        let swa = self.config.num_slots() - self.full_slots();
+        swa * 2 * t.num_key_value_heads * t.head_dim * 2 * (t.sliding_window_size + crate::model::MAX_CHUNK)
     }
 
     pub fn new_session(&self, ctx: usize) -> Result<Inkling2Session, PipelineError> {

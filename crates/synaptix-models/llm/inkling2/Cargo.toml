@@ -22,6 +22,7 @@ thiserror           = { workspace = true }
 half                = { workspace = true }
 rayon               = { workspace = true }
 cudarc              = { workspace = true }
+image               = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cuda = { workspace = true }

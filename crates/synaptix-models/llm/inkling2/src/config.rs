@@ -52,9 +52,57 @@ pub struct TextConfig {
     pub loop_config: Option<LoopConfig>,
 }
 
+/// `vision_config`: ViT с осевым 2D RoPE, слиянием 2×2 патчей и MLP-проекцией в текст.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisionConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    #[serde(default = "vision_mlp_ratio")]
+    pub mlp_ratio: f32,
+    #[serde(alias = "patch_size")]
+    pub native_patch_size: usize,
+    #[serde(alias = "spatial_merge_size")]
+    pub adapter_merge_size: usize,
+    pub posemb_grid_size: usize,
+    pub projection_hidden_dim: usize,
+    #[serde(default)]
+    pub projector_bias: bool,
+    pub text_hidden_size: usize,
+    #[serde(default = "vision_ln_eps")]
+    pub layer_norm_eps: f32,
+    #[serde(default = "vision_rope_theta")]
+    pub rope_theta: f32,
+}
+
+fn vision_mlp_ratio() -> f32 {
+    4.0
+}
+fn vision_ln_eps() -> f32 {
+    1e-5
+}
+fn vision_rope_theta() -> f32 {
+    10000.0
+}
+
+impl VisionConfig {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+    pub fn intermediate_size(&self) -> usize {
+        (self.hidden_size as f32 * self.mlp_ratio) as usize
+    }
+    /// Сторона клетки картинки на один токен текста (40 px).
+    pub fn cell(&self) -> usize {
+        self.native_patch_size * self.adapter_merge_size
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct Root {
     text_config: TextConfig,
+    #[serde(default)]
+    vision_config: Option<VisionConfig>,
     #[serde(default)]
     eos_token_id: Option<serde_json::Value>,
     #[serde(default)]
@@ -64,6 +112,7 @@ struct Root {
 #[derive(Debug, Clone)]
 pub struct Inkling2Config {
     pub text: TextConfig,
+    pub vision: Option<VisionConfig>,
     pub eos_ids: Vec<u32>,
     pub model_type: String,
 }
@@ -86,7 +135,7 @@ impl Inkling2Config {
             Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect(),
             _ => Vec::new(),
         };
-        let cfg = Self { text: root.text_config, eos_ids, model_type: root.model_type };
+        let cfg = Self { text: root.text_config, vision: root.vision_config, eos_ids, model_type: root.model_type };
         cfg.validate()?;
         Ok(cfg)
     }

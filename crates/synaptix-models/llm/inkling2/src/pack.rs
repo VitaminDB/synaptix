@@ -126,10 +126,7 @@ impl Inkling2Stream {
         };
         let attn_q = ["wq_du.weight", "wk_dv.weight", "wv_dv.weight", "wo_ud.weight", "wr_du.weight", "gate_attn.weight"];
         for (name, dt, shape) in &names {
-            if name.starts_with("model.visual.") {
-                // Vision — отдельным компонентом позже; текстовой модели не нужен.
-                continue;
-            }
+            // model.visual.* (башня картинок) — плотные BF16, идут как есть веткой Copy ниже.
             if name.contains(".mlp.experts.") {
                 // Стопки собираются по w13_weight/w2_weight; спутники (scale/amax/…) уходят в них.
                 let base = if let Some(b) = name.strip_suffix(".w13_weight") {

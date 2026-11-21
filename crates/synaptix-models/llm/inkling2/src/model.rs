@@ -18,6 +18,9 @@ use crate::kern::{self, addr, bf16c, empty, f32c, fe, launch, R};
 use crate::loader::{ExpertStack, Inkling2Weights, LoadError, LLM};
 
 /// Проекция: BF16-вес `[out, in]` либо квант-вес бандла с общим множителем.
+/// Наибольший чанк одного прогона: кольцо KV SWA-слоя — окно + столько.
+pub const MAX_CHUNK: usize = 512;
+
 pub enum Lin {
     Dense(Linear),
     Quant(synaptix_llm_common::QLinear, f32),
@@ -116,6 +119,8 @@ pub struct Layer {
 
 /// Кэш одного слота (физический слой на своём проходе цикла).
 pub struct SlotCache {
+    /// Кольцо KV SWA-слоя (окно + запас на чанк префилла); 0 — линейный кэш на весь контекст.
+    ring: usize,
     k: Tensor,
     v: Tensor,
     k_state: Tensor,
@@ -162,6 +167,12 @@ impl ModelCache {
         }
         Ok(())
     }
+}
+
+/// Готовые эмбеддинги (F32 `[len, H]` на карте) вместо строк чанка с `row`.
+pub struct EmbedPatch {
+    pub row: usize,
+    pub embeds: Tensor,
 }
 
 pub struct Inkling2Model {
@@ -340,16 +351,35 @@ impl Inkling2Model {
         Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers })
     }
 
+    /// Физический слой слота кэша.
+    fn slot_phys(&self, slot: usize) -> usize {
+        let n = self.cfg.text.num_hidden_layers;
+        if slot < n {
+            return slot;
+        }
+        let (s, e) = self.cfg.core();
+        s + (slot - n) % (e - s)
+    }
+
+    /// Кольцо KV слота: у SWA-слоёв — окно + наибольший чанк префилла, если это меньше контекста.
+    fn slot_ring(&self, slot: usize, capacity: usize) -> usize {
+        let ring = self.cfg.text.sliding_window_size + MAX_CHUNK;
+        if self.cfg.is_swa(self.slot_phys(slot)) && ring < capacity { ring } else { 0 }
+    }
+
     pub fn make_cache(&self, capacity: usize) -> R<ModelCache> {
         let t = &self.cfg.text;
         let (nkv, d, h, k) = (t.num_key_value_heads, t.head_dim, t.hidden_size, t.sconv_kernel_size);
         let dev = self.device;
         let z = |shape: Vec<usize>, dt: DType| Tensor::zeros(shape, dt, dev).map_err(fe);
         let mut slots = Vec::with_capacity(self.cfg.num_slots());
-        for _ in 0..self.cfg.num_slots() {
+        for si in 0..self.cfg.num_slots() {
+            let ring = self.slot_ring(si, capacity);
+            let cap = if ring > 0 { ring } else { capacity };
             slots.push(SlotCache {
-                k: z(vec![nkv, capacity, d], DType::BF16)?,
-                v: z(vec![nkv, capacity, d], DType::BF16)?,
+                ring,
+                k: z(vec![nkv, cap, d], DType::BF16)?,
+                v: z(vec![nkv, cap, d], DType::BF16)?,
                 k_state: z(vec![k - 1, nkv * d], DType::F32)?,
                 v_state: z(vec![k - 1, nkv * d], DType::F32)?,
                 attn_state: z(vec![k - 1, h], DType::F32)?,
@@ -375,7 +405,31 @@ impl Inkling2Model {
         }
         cache.drop_graph();
         let used = cache.seq_len;
-        for s in cache.slots.iter_mut() {
+        for (si, s) in cache.slots.iter_mut().enumerate() {
+            if s.ring > 0 {
+                continue;
+            }
+            let ring = self.slot_ring(si, capacity);
+            if ring > 0 {
+                // Слот, бывший линейным на малом контексте, становится кольцом: переложить хвост окна.
+                let (nkv, d) = (s.k.dims()[0], s.k.dims()[2]);
+                let lo = used.saturating_sub(ring);
+                for kv in [&mut s.k, &mut s.v] {
+                    let host: Vec<half::bf16> = kv.to_device(Device::Cpu).map_err(fe)?.flatten_all().map_err(fe)?.to_vec1::<half::bf16>().map_err(fe)?;
+                    let cap_old = kv.dims()[1];
+                    let mut buf = vec![half::bf16::ZERO; nkv * ring * d];
+                    for h in 0..nkv {
+                        for p in lo..used {
+                            let src = (h * cap_old + p) * d;
+                            let dst = (h * ring + p % ring) * d;
+                            buf[dst..dst + d].copy_from_slice(&host[src..src + d]);
+                        }
+                    }
+                    *kv = Tensor::from_vec(buf, vec![nkv, ring, d], self.device).map_err(fe)?;
+                }
+                s.ring = ring;
+                continue;
+            }
             for kv in [&mut s.k, &mut s.v] {
                 let (nkv, d) = (kv.dims()[0], kv.dims()[2]);
                 if used > 0 {
@@ -395,6 +449,40 @@ impl Inkling2Model {
     /// `[1, V]` последнего токена (или всех `[T, V]` при `all_logits`), F32,
     /// словарь без паддинга.
     pub fn forward(&self, ids: &[u32], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
+        self.forward_with_embeds(ids, &[], cache, all_logits)
+    }
+
+    /// Как [`Self::forward`], но строки `patches` заменяются готовыми
+    /// эмбеддингами (признаки картинки) — после `embed_norm`, без нормировки.
+    /// `patches[i].row` — строка относительно всего `ids`; длинный прогон
+    /// режется на куски по [`MAX_CHUNK`], патчи — по кускам.
+    pub fn forward_with_embeds(&self, ids: &[u32], patches: &[EmbedPatch], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
+        if ids.len() <= MAX_CHUNK {
+            return self.forward_chunk(ids, patches, cache, all_logits);
+        }
+        let mut outs = Vec::new();
+        let mut off = 0;
+        while off < ids.len() {
+            let end = (off + MAX_CHUNK).min(ids.len());
+            let mut part = Vec::new();
+            for p in patches {
+                let len = p.embeds.dims()[0];
+                let (a, b) = (p.row.max(off), (p.row + len).min(end));
+                if a < b {
+                    part.push(EmbedPatch { row: a - off, embeds: p.embeds.narrow(0, a - p.row, b - a).map_err(fe)? });
+                }
+            }
+            outs.push(self.forward_chunk(&ids[off..end], &part, cache, all_logits)?);
+            off = end;
+        }
+        if !all_logits {
+            return Ok(outs.pop().expect("непустой прогон"));
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        Tensor::cat(&refs, 0).map_err(fe)
+    }
+
+    fn forward_chunk(&self, ids: &[u32], patches: &[EmbedPatch], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
         let n = ids.len();
         let past = cache.seq_len;
         if past + n > cache.capacity {
@@ -402,7 +490,7 @@ impl Inkling2Model {
         }
         set_u32(&cache.pos_dev, past as u32)?;
         let idt = Tensor::from_vec(ids.to_vec(), vec![n], self.device).map_err(fe)?;
-        let out = self.forward_dev(&idt, cache, all_logits)?;
+        let out = self.forward_dev_with(&idt, patches, cache, all_logits)?;
         cache.seq_len = past + n;
         Ok(out)
     }
@@ -462,6 +550,10 @@ impl Inkling2Model {
     /// Прогон по токенам на карте (`idt` U32 `[T]`) с позиции из `cache.pos_dev`;
     /// хост в нём не участвует, кроме маршрута MoE префилла (T > 1).
     fn forward_dev(&self, idt: &Tensor, cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
+        self.forward_dev_with(idt, &[], cache, all_logits)
+    }
+
+    fn forward_dev_with(&self, idt: &Tensor, patches: &[EmbedPatch], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
         let t = &self.cfg.text;
         let n = idt.dims()[0];
         let past = cache.seq_len;
@@ -473,6 +565,13 @@ impl Inkling2Model {
         };
         let x = f32c(&x.reshape(vec![n, t.hidden_size]).map_err(fe)?)?;
         let mut cur = kern::rms(&x, Some(&self.embed_norm), t.rms_norm_eps, false)?;
+        for p in patches {
+            let len = p.embeds.dims()[0];
+            if p.row + len > n || p.embeds.dims().get(1) != Some(&t.hidden_size) {
+                return Err(ModelError::Shape(format!("inkling2: эмбеддинги {:?} с строки {} в чанк {n}", p.embeds.dims(), p.row)));
+            }
+            copy_into(&cur.narrow(0, p.row, len).map_err(fe)?, &f32c(&p.embeds)?)?;
+        }
 
         let (cs, ce) = self.cfg.core();
         let passes = self.cfg.num_passes();
@@ -658,9 +757,10 @@ impl Inkling2Model {
         a.u[2] = nkv as u32;
         a.u[3] = d as u32;
         a.u[4] = dr as u32;
-        a.u[5] = cache.capacity as u32;
+        a.u[5] = sc.k.dims()[1] as u32;
         a.u[6] = past as u32;
         a.u[7] = (!l.swa) as u32;
+        a.u[9] = sc.ring as u32;
         a.u[8] = t.log_scaling_n_floor as u32;
         a.f[0] = t.qk_l2_clip_threshold;
         a.f[1] = t.rel_l2_clip_threshold;
@@ -684,9 +784,10 @@ impl Inkling2Model {
         a.u[2] = nkv as u32;
         a.u[3] = d as u32;
         a.u[4] = dr as u32;
-        a.u[5] = cache.capacity as u32;
+        a.u[5] = sc.k.dims()[1] as u32;
         a.u[6] = past as u32;
         a.u[7] = if l.swa { t.sliding_window_size as u32 } else { 0 };
+        a.u[10] = sc.ring as u32;
         a.u[8] = l.extent as u32;
         a.f[0] = 1.0 / (d as f32).sqrt();
         if std::env::var_os("INK2_HOST_POS").is_none() { a.a[10] = addr(&cache.pos_dev)?; }
@@ -699,11 +800,7 @@ impl Inkling2Model {
             a.u[9] = splits as u32;
         }
         kern::stage("k_attn", dev, || -> R<()> {
-            if std::env::var_os("INK2_ORIG_ATTN").is_some() && splits == 1 {
-                launch(dev, "ink2_attn_orig", &a, (n as u32, nh as u32, 1), 128)?;
-            } else {
-                launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
-            }
+            launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
             if parts.is_some() {
                 launch(dev, "ink2_attn_merge", &a, (n as u32, nh as u32, 1), 128)?;
             }

@@ -158,7 +158,8 @@ extern "C" __global__ void ink2_conv(Ink2Args args) {
 // у полных слоёв, иначе 1.
 // a0 q, a1 k, a2 v, a3 r (f32 [T, ·]), a4 qscale f32 [nh·d], a5 rscale f32 [nh·dr],
 // a6 q_out f32, a7 r_out f32, a8 kcache bf16 [nkv,cap,d], a9 vcache bf16;
-// u0 T, u1 nh, u2 nkv, u3 d, u4 dr, u5 cap, u6 past (или a10 — u32 на карте), u7 full, u8 floor;
+// u0 T, u1 nh, u2 nkv, u3 d, u4 dr, u5 cap, u6 past (или a10 — u32 на карте), u7 full, u8 floor,
+// u9 кольцо (позиция p — ячейка p mod кольцо; 0 — линейно);
 // f0 qk_clip, f1 rel_clip, f2 eps, f3 alpha.
 extern "C" __global__ void ink2_qkv(Ink2Args args) {
     __shared__ float red[32];
@@ -185,13 +186,13 @@ extern "C" __global__ void ink2_qkv(Ink2Args args) {
         float v = i < d ? CPF(1)[((unsigned long long)t * nkv + h) * d + i] : 0.0f;
         float n = sqrtf(block_sum(v * v, red));
         float k = fminf(1.0f, args.f[0] / (n + 1e-6f));
-        if (i < d) PB(8)[((unsigned long long)h * cap + pos) * d + i] = __float2bfloat16(v * k);
+        if (i < d) PB(8)[((unsigned long long)h * cap + (args.u[9] ? pos % args.u[9] : pos)) * d + i] = __float2bfloat16(v * k);
     } else {
         unsigned int h = vi - nh - nkv;
         float v = i < d ? CPF(2)[((unsigned long long)t * nkv + h) * d + i] : 0.0f;
         float ss = block_sum(v * v, red);
         float inv = rsqrtf(ss / (float)d + args.f[2]);
-        if (i < d) PB(9)[((unsigned long long)h * cap + pos) * d + i] = __float2bfloat16(v * inv);
+        if (i < d) PB(9)[((unsigned long long)h * cap + (args.u[9] ? pos % args.u[9] : pos)) * d + i] = __float2bfloat16(v * inv);
     }
 }
 
@@ -204,7 +205,7 @@ extern "C" __global__ void ink2_qkv(Ink2Args args) {
 // a0 q f32 [T,nh,d], a1 r f32 [T,nh,dr], a2 proj f32 [dr,extent], a3 sink f32 [T,nh],
 // a4 kcache, a5 vcache bf16 [nkv,cap,d], a6 gate f32 [T,nh·d], a7 out f32 [T,nh·d], a8 части f32 [T,nh,S,130];
 // u0 T, u1 nh, u2 nkv, u3 d (=128), u4 dr (≤32), u5 cap, u6 past (или a10 — u32 на карте), u7 window, u8 extent,
-// u9 splits; f0 scale.
+// u9 splits, u10 кольцо KV (0 — линейно); f0 scale.
 extern "C" __global__ void ink2_attn(Ink2Args args) {
     __shared__ float sm_m[4], sm_l[4];
     __shared__ float sm_acc[4][128];
@@ -227,7 +228,8 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
     unsigned int lo = lo0 + sp * chunk, hi = min(lo + chunk, pos + 1);
     float m = -INFINITY, l = 0.0f, acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (unsigned int j = lo + wid; j < hi; j += 4) {
-        const __nv_bfloat16* kr = kc + (unsigned long long)j * d + lane * 4;
+        unsigned int jr = args.u[10] ? j % args.u[10] : j;
+        const __nv_bfloat16* kr = kc + (unsigned long long)jr * d + lane * 4;
         float2 k01 = __bfloat1622float2(*(const __nv_bfloat162*)kr);
         float2 k23 = __bfloat1622float2(*(const __nv_bfloat162*)(kr + 2));
         float part = q[0] * k01.x + q[1] * k01.y + q[2] * k23.x + q[3] * k23.y;
@@ -236,7 +238,7 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
         float s = warp_sum(part);
         float mn = fmaxf(m, s);
         float corr = expf(m - mn), p = expf(s - mn);
-        const __nv_bfloat16* vr = vc + (unsigned long long)j * d + lane * 4;
+        const __nv_bfloat16* vr = vc + (unsigned long long)jr * d + lane * 4;
         float2 v01 = __bfloat1622float2(*(const __nv_bfloat162*)vr);
         float2 v23 = __bfloat1622float2(*(const __nv_bfloat162*)(vr + 2));
         acc[0] = acc[0] * corr + p * v01.x;
