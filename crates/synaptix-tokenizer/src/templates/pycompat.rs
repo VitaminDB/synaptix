@@ -228,66 +228,144 @@ fn fn_len(v: Value) -> Result<usize, MjError> {
     })
 }
 
-// HF-шаблоны зовут и `tojson(4)`, и `tojson(indent=4)` (Llama 3.x); кварги в
-// minijinja приходят отдельной картой, поэтому indent берём из обоих мест.
+// `tojson` как в transformers: `json.dumps(x, ensure_ascii=False, indent=…,
+// separators=…, sort_keys=…)`. HF-шаблоны зовут и `tojson(4)`, и
+// `tojson(indent=4)` (Llama 3.x); кварги в minijinja приходят отдельной
+// картой, поэтому indent берём из обоих мест. `separators=(",", ":")` и
+// `sort_keys=true` — Inkling-2 (объявление инструментов и аргументы вызовов).
 fn filt_tojson(v: Value, indent: Option<Value>, kwargs: Kwargs) -> Result<String, MjError> {
     let kw_indent: Option<Value> = kwargs.get("indent")?;
     let _ = kwargs.get::<Option<Value>>("ensure_ascii")?;
-    let _ = kwargs.get::<Option<Value>>("sort_keys")?;
+    let sort_keys = kwargs.get::<Option<Value>>("sort_keys")?.is_some_and(|v| v.is_true());
+    let separators: Option<Value> = kwargs.get("separators")?;
     kwargs.assert_all_used()?;
     let indent = match indent.or(kw_indent) {
         None => None,
         Some(i) if i.is_none() || i.is_undefined() => None,
         Some(i) => Some(usize::try_from(i)?),
     };
-    let out = match indent {
-        Some(n) if n > 0 => {
-            let spaces = " ".repeat(n);
-            let formatter = serde_json::ser::PrettyFormatter::with_indent(spaces.as_bytes());
-            let mut buf = Vec::new();
-            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-            serde::Serialize::serialize(&v, &mut ser)
-                .map_err(|e| MjError::new(ErrorKind::InvalidOperation, format!("tojson serialize failed: {e}")))?;
-            String::from_utf8(buf).map_err(|e| {
-                MjError::new(ErrorKind::InvalidOperation, format!("tojson utf8: {e}"))
-            })?
+    // Умолчания Python: с отступом `(",", ": ")`, без него `(", ", ": ")`.
+    let (item, key) = match separators.filter(|s| !s.is_none() && !s.is_undefined()) {
+        Some(s) => {
+            let part = |i: usize| -> Result<String, MjError> {
+                let p = s.get_item(&Value::from(i))?;
+                p.as_str().map(str::to_string).ok_or_else(|| {
+                    MjError::new(ErrorKind::InvalidOperation, "tojson: separators — пара строк (item, key)")
+                })
+            };
+            (part(0)?, part(1)?)
         }
-        _ => {
-            let formatter = PySeparatorFormatter::default();
-            let mut buf = Vec::new();
-            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-            serde::Serialize::serialize(&v, &mut ser)
-                .map_err(|e| MjError::new(ErrorKind::InvalidOperation, format!("tojson serialize failed: {e}")))?;
-            String::from_utf8(buf).map_err(|e| {
-                MjError::new(ErrorKind::InvalidOperation, format!("tojson utf8: {e}"))
-            })?
-        }
+        None if indent.is_some_and(|n| n > 0) => (",".to_string(), ": ".to_string()),
+        None => (", ".to_string(), ": ".to_string()),
     };
-    Ok(out)
+    let ser_err = |e: serde_json::Error| MjError::new(ErrorKind::InvalidOperation, format!("tojson serialize failed: {e}"));
+    let formatter = PyJsonFormatter {
+        item: item.into_bytes(),
+        key: key.into_bytes(),
+        indent: indent.filter(|n| *n > 0).map(|n| " ".repeat(n).into_bytes()),
+        level: 0,
+        has_value: false,
+    };
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    if sort_keys {
+        let json = serde_json::to_value(&v).map_err(ser_err)?;
+        serde::Serialize::serialize(&sorted_keys(json), &mut ser).map_err(ser_err)?;
+    } else {
+        serde::Serialize::serialize(&v, &mut ser).map_err(ser_err)?;
+    }
+    String::from_utf8(buf).map_err(|e| MjError::new(ErrorKind::InvalidOperation, format!("tojson utf8: {e}")))
 }
 
-#[derive(Default)]
-struct PySeparatorFormatter;
-
-impl serde_json::ser::Formatter for PySeparatorFormatter {
-    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
+/// Ключи объектов по возрастанию на всех уровнях (`sort_keys=True`): порядок
+/// байтов UTF-8 совпадает с порядком кодовых точек, как сортирует Python.
+fn sorted_keys(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut items: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(items.into_iter().map(|(k, v)| (k, sorted_keys(v))).collect())
         }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(sorted_keys).collect()),
+        other => other,
+    }
+}
+
+/// Разделители и отступ как у `json.dumps`: с отступом элемент отделяется
+/// `item` и переводом строки, пустые `[]`/`{}` остаются в одну строку.
+struct PyJsonFormatter {
+    item: Vec<u8>,
+    key: Vec<u8>,
+    indent: Option<Vec<u8>>,
+    level: usize,
+    has_value: bool,
+}
+
+impl PyJsonFormatter {
+    fn newline<W: ?Sized + std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        if let Some(ind) = &self.indent {
+            writer.write_all(b"\n")?;
+            for _ in 0..self.level {
+                writer.write_all(ind)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, open: &[u8]) -> std::io::Result<()> {
+        self.level += 1;
+        self.has_value = false;
+        writer.write_all(open)
+    }
+
+    fn end<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, close: &[u8]) -> std::io::Result<()> {
+        self.level -= 1;
+        if self.has_value {
+            self.newline(writer)?;
+        }
+        writer.write_all(close)
+    }
+
+    fn element<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(&self.item)?;
+        }
+        self.newline(writer)
+    }
+}
+
+impl serde_json::ser::Formatter for PyJsonFormatter {
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.begin(writer, b"[")
+    }
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.end(writer, b"]")
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()> {
+        self.element(writer, first)
+    }
+    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, _writer: &mut W) -> std::io::Result<()> {
+        self.has_value = true;
+        Ok(())
+    }
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.begin(writer, b"{")
+    }
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.end(writer, b"}")
     }
     fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
+        self.element(writer, first)
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(b": ")
+        writer.write_all(&self.key)
+    }
+    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, _writer: &mut W) -> std::io::Result<()> {
+        self.has_value = true;
+        Ok(())
     }
 }
+
 
 /// `{% generation %}…{% endgeneration %}` — тег transformers для маски ответа ассистента при
 /// обучении (LFM3, SmolLM3 …); на текст промпта не влияет. minijinja его не знает — заменяем на

@@ -128,7 +128,13 @@ pub fn run(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.system.clone(),
         format!("{arch:?}"),
         model_label(&args.model),
-        Settings { opts, thinking, effort: args.reasoning_effort.clone(), preset },
+        Settings {
+            opts,
+            thinking,
+            effort: args.reasoning_effort.clone(),
+            preset,
+            keep_reasoning: arch == synaptix::facade::arch::LlmArch::Inkling2,
+        },
     );
     for (path, kind) in attach {
         engine.send(EngineCmd::Attach { path, kind });

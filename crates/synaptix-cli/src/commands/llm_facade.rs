@@ -129,6 +129,18 @@ struct ChannelIds {
     eot: u32,
 }
 
+/// Разметка реплик Inkling-2: `<|message_model|>` [имя] `<|content_…|>` тело
+/// `<|end_message|>`; размышления — `<|content_thinking|>`, ответ —
+/// `<|content_text|>`, вызов инструмента — `<|content_invoke_tool_json|>`.
+#[derive(Clone, Copy)]
+struct MessageIds {
+    message: u32,
+    thinking: u32,
+    text: u32,
+    tool: u32,
+    end: u32,
+}
+
 enum State {
     Header,
     Body(Part),
@@ -136,6 +148,7 @@ enum State {
 
 pub struct Splitter {
     channels: Option<ChannelIds>,
+    messages: Option<MessageIds>,
     state: State,
     header: String,
     thinking: bool,
@@ -155,12 +168,55 @@ impl Splitter {
                 eot: single("<|eot|>")?,
             })
         })();
+        let messages = (|| {
+            Some(MessageIds {
+                message: single("<|message_model|>")?,
+                thinking: single("<|content_thinking|>")?,
+                text: single("<|content_text|>")?,
+                tool: single("<|content_invoke_tool_json|>")?,
+                end: single("<|end_message|>")?,
+            })
+        })();
         let thinking = prompt.trim_end().ends_with("<think>");
-        let state = if channels.is_some() { State::Header } else { State::Body(Part::Answer) };
-        Self { channels, state, header: String::new(), thinking }
+        let state = if channels.is_some() || messages.is_some() { State::Header } else { State::Body(Part::Answer) };
+        Self { channels, messages, state, header: String::new(), thinking }
     }
 
     pub fn push(&mut self, id: u32, delta: &str, emit: &mut dyn FnMut(Part, &str)) {
+        if let Some(m) = self.messages {
+            let content = if id == m.thinking {
+                Some(Part::Reasoning)
+            } else if id == m.text {
+                Some(Part::Answer)
+            } else if id == m.tool {
+                Some(Part::Tool)
+            } else {
+                None
+            };
+            if id == m.message {
+                self.state = State::Header;
+                self.header.clear();
+            } else if let Some(part) = content {
+                if part == Part::Tool {
+                    emit(Part::Tool, &format!("[{}] ", self.header.trim()));
+                }
+                self.state = State::Body(part);
+            } else if id == m.end {
+                if let State::Body(Part::Tool) = self.state {
+                    emit(Part::Tool, "\n");
+                }
+                self.state = State::Header;
+                self.header.clear();
+            } else {
+                // Прочие спецтокены (`<|content_model_end_sampling|>`) декодируются
+                // в пустую строку; имя автора реплики копится в заголовке.
+                match self.state {
+                    State::Header => self.header.push_str(delta),
+                    State::Body(p) => emit(p, delta),
+                }
+            }
+            return;
+        }
         if let Some(c) = self.channels {
             if id == c.start {
                 self.state = State::Header;

@@ -107,11 +107,13 @@ pub enum LlmArch {
     Gemma4,
     MuseGlimmer,
     Qwen4Exp,
+    Inkling2,
 }
 
 /// `qwen3_next`/`qwen3_5`/`qwen3_6`/`qwen3_5_moe`/`minicpmv4_7` → гибрид
 /// (GatedDeltaNet + full-attn, плотный MLP или Qwen-MoE);
-/// `qwen4_exp` → Qwen4Exp (GatedDeltaNet + QSA + MoE + PLE); `llama` → Llama;
+/// `qwen4_exp` → Qwen4Exp (GatedDeltaNet + QSA + MoE + PLE); `inkling2_loop` →
+/// Inkling2 (зацикленный трансформер с MoE, свой пайплайн); `llama` → Llama;
 /// `gemma`/`gemma3` → Gemma3; `gemma4` → Gemma4 (MoE + широкие global-слои);
 /// остальное → Qwen3 (dense/MoE).
 pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
@@ -127,6 +129,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         "gemma4" | "gemma4_text" => LlmArch::Gemma4,
         "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,
         "qwen4_exp" | "qwen4_exp_text" => LlmArch::Qwen4Exp,
+        "inkling2_loop" | "inkling2_loop_text" | "inkling2" => LlmArch::Inkling2,
         _ if has_moe_experts(path) => {
             return Err(format!(
                 "{key}: MoE-вариант этой архитектуры движок пока не исполняет (плотный Qwen3-путь не знает экспертов)"

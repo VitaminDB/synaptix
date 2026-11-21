@@ -125,6 +125,22 @@ mod tests {
     }
 
     #[test]
+    fn pycompat_tojson_separators_and_sort_keys() {
+        // Inkling-2: `tojson(sort_keys=true, separators=(",", ":"))`; эталон —
+        // `json.dumps(..., ensure_ascii=False)` Python.
+        let env = JinjaEnv::new();
+        let x: Value = serde_json::from_str::<Value>(r#"{"b":[1,{}],"a":{"d":[],"c":"ы"}}"#).unwrap();
+        let r = |src: &str| env.render(src, context! { x => x.clone() }).unwrap();
+        assert_eq!(r(r#"{{ x | tojson(sort_keys=true, separators=(",", ":")) }}"#), r#"{"a":{"c":"ы","d":[]},"b":[1,{}]}"#);
+        assert_eq!(r(r#"{{ x | tojson(separators=(",", ":")) }}"#), r#"{"b":[1,{}],"a":{"d":[],"c":"ы"}}"#);
+        assert_eq!(
+            r(r#"{{ x | tojson(indent=2, sort_keys=true) }}"#),
+            "{\n  \"a\": {\n    \"c\": \"ы\",\n    \"d\": []\n  },\n  \"b\": [\n    1,\n    {}\n  ]\n}"
+        );
+        assert_eq!(r("{{ x | tojson }}"), r#"{"b": [1, {}], "a": {"d": [], "c": "ы"}}"#);
+    }
+
+    #[test]
     fn trailing_newline_of_template_is_dropped() {
         let env = JinjaEnv::new();
         let src = "{%- if add_generation_prompt %}{{ 'assistant\n\n' }}{%- endif %}\n";

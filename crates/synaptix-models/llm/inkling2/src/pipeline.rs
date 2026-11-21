@@ -21,6 +21,9 @@ use synaptix_llm_common::expert_mirror::{self as em, ExpertStacks};
 use synaptix_llm_common::moe::ExpertSource;
 use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
 use crate::model::{Inkling2Model, ModelCache};
+use crate::preprocess::{load_image, ImageLimits};
+use crate::vision::{expand_image_tokens, prefill_with_images, ImageSpan, VisionTower, IMAGE_TOKEN_ID};
+use synaptix_core::tensor::Tensor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -42,6 +45,9 @@ pub struct Inkling2Pipeline {
     /// раньше `_stacks`: гард джойнит копировщиков, пока mmap ещё жив.
     _host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     _stacks: Option<Arc<ExpertStacks>>,
+    /// Башня зрения: грузится по требованию ([`Self::load_vision`]) и
+    /// отпускается после кодирования картинок ([`Self::release_vision`]).
+    pub vision: Option<VisionTower>,
 }
 
 /// Где держать экспертов MoE.
@@ -153,7 +159,7 @@ impl Inkling2Pipeline {
         let tokenizer = HfTokenizer::from_bytes(&w.tokenizer_json).map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
         let config = w.config.clone();
         let chat_template = w.chat_template.clone();
-        let finish = |model, host_mirror, stacks| Self { model, tokenizer, chat_template, config: w.config.clone(), path, _host_mirror: host_mirror, _stacks: stacks };
+        let finish = |model, host_mirror, stacks| Self { model, tokenizer, chat_template, config: w.config.clone(), path, _host_mirror: host_mirror, _stacks: stacks, vision: None };
         let ctx = ctx.unwrap_or_else(planned_ctx).max(2);
         let stacks = w.expert_stacks().map(Arc::new);
         let experts_bytes: usize = stacks.as_deref().map_or(0, |s| em::mirror_ranges_natural(s, device).iter().map(|r| r.bytes.len()).sum());
@@ -284,6 +290,117 @@ impl Inkling2Pipeline {
         }
         self.model.grow_cache(&mut s.cache, ctx)?;
         Ok(())
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Загрузить башню зрения. `Ok(false)` — у модели нет `vision_config`.
+    pub fn load_vision(&mut self) -> Result<bool, PipelineError> {
+        if self.vision.is_some() {
+            return Ok(true);
+        }
+        if self.config.vision.is_none() {
+            return Ok(false);
+        }
+        let w = Inkling2Weights::open(&self.path).map_err(|e| PipelineError::Load(e.to_string()))?;
+        self.vision = Some(VisionTower::load(&w, self.model.device).map_err(|e| PipelineError::Load(e.to_string()))?);
+        Ok(true)
+    }
+
+    pub fn release_vision(&mut self) {
+        self.vision = None;
+    }
+
+    /// Признаки картинки `[N, hidden]` (N — клеток 40 px, по токену на клетку);
+    /// `max_tokens` — потолок клеток на картинку.
+    pub fn encode_image(&self, path: &Path, max_tokens: Option<usize>) -> Result<Tensor, PipelineError> {
+        let tower = self.vision.as_ref().ok_or_else(|| PipelineError::Load("башня зрения не загружена".into()))?;
+        let vcfg = self.config.vision.as_ref().ok_or_else(|| PipelineError::Load("нет vision_config".into()))?;
+        let mut lim = ImageLimits::default();
+        if let Some(n) = max_tokens {
+            lim.max_tokens = n;
+        }
+        let img = load_image(path, vcfg, lim).map_err(|e| PipelineError::Load(e.to_string()))?;
+        Ok(no_grad(|| tower.encode(&img))?)
+    }
+
+    /// Разовая генерация по промпту с картинками. В `prompt_ids` на картинку —
+    /// один плейсхолдер [`IMAGE_TOKEN_ID`] (в порядке `images`); если он стоит
+    /// внутри текстовой части реплики (`<|content_text|>…`), картинка выносится
+    /// в свою часть `<|content_image|>` перед этой текстовой — как шаблон
+    /// рендерит сообщение с частями `[картинки…, текст]`. Затем плейсхолдер
+    /// разворачивается в N строк признаков.
+    pub fn generate_media_streaming(
+        &self,
+        prompt_ids: &[u32],
+        images: &[&Tensor],
+        cfg: &GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats), PipelineError> {
+        let ids = self.image_parts(prompt_ids)?;
+        let counts: Vec<usize> = images.iter().map(|t| t.dims()[0]).collect();
+        let (ids, starts) = expand_image_tokens(&ids, IMAGE_TOKEN_ID, &counts)?;
+        let spans: Vec<ImageSpan> =
+            starts.into_iter().zip(images).map(|(start, t)| ImageSpan { start, embeds: (*t).clone() }).collect();
+        let ctx = cfg.max_seq.unwrap_or(0).max(ids.len() + cfg.max_new_tokens + 1);
+        let mut s = self.new_session(ctx)?;
+        let eos = eos_set(cfg);
+        let mut sampler = TokenSampler::new(cfg, &ids);
+        let t0 = Instant::now();
+        let logits = no_grad(|| prefill_with_images(&self.model, &mut s.cache, &ids, &spans))?;
+        synaptix_llm_common::prefill_progress::add(ids.len());
+        let prefill_ms = t0.elapsed().as_millis();
+        let mut out = Vec::with_capacity(cfg.max_new_tokens);
+        let t1 = Instant::now();
+        if cfg.max_new_tokens > 0 {
+            let mut tok = sampler.sample(&logits)?;
+            loop {
+                out.push(tok);
+                if !sink.on_token(tok) || eos.contains(&tok) || out.len() >= cfg.max_new_tokens {
+                    break;
+                }
+                let l = no_grad(|| self.model.decode(tok, &mut s.cache))?;
+                tok = sampler.sample(&l)?;
+            }
+        }
+        let st = GenerationStats { prompt_tokens: ids.len(), new_tokens: out.len(), prefill_ms, decode_ms: t1.elapsed().as_millis() };
+        Ok((out, st))
+    }
+
+    /// Вынести плейсхолдеры картинок из текстовых частей в свои части
+    /// `<роль><|content_image|><img><|end_message|>` перед текстовой.
+    fn image_parts(&self, ids: &[u32]) -> Result<Vec<u32>, PipelineError> {
+        let single = |s: &str| -> Result<u32, PipelineError> {
+            match self.encode(s)?.as_slice() {
+                [id] => Ok(*id),
+                _ => Err(PipelineError::Tokenize(format!("{s}: не один токен"))),
+            }
+        };
+        let (text, image, end) = (single("<|content_text|>")?, single("<|content_image|>")?, single("<|end_message|>")?);
+        let mut out = Vec::with_capacity(ids.len() + 8);
+        let mut i = 0;
+        while i < ids.len() {
+            // Текстовая часть: `<роль><|content_text|>` … `<|end_message|>`.
+            if i + 1 < ids.len() && ids[i + 1] == text {
+                let body_end = ids[i + 2..].iter().position(|&t| t == end).map_or(ids.len(), |p| i + 2 + p);
+                let body = &ids[i + 2..body_end];
+                let n_img = body.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
+                if n_img > 0 {
+                    for _ in 0..n_img {
+                        out.extend_from_slice(&[ids[i], image, IMAGE_TOKEN_ID, end]);
+                    }
+                    out.extend_from_slice(&[ids[i], text]);
+                    out.extend(body.iter().copied().filter(|&t| t != IMAGE_TOKEN_ID));
+                    i = body_end;
+                    continue;
+                }
+            }
+            out.push(ids[i]);
+            i += 1;
+        }
+        Ok(out)
     }
 
     /// Разовая генерация с нуля.

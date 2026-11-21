@@ -33,6 +33,11 @@ pub struct Settings {
     pub thinking: bool,
     pub effort: Option<String>,
     pub preset: String,
+    /// Реплики ассистента уходят в историю дословно, с размышлениями: кэш
+    /// модели назад не откатывается (Inkling-2 — короткие свёртки), и
+    /// следующий ход берёт его, только если промпт продолжает сгенерированное
+    /// токен в токен.
+    pub keep_reasoning: bool,
 }
 
 pub struct App {
@@ -118,6 +123,11 @@ impl App {
             .map(|m| match m.role {
                 Role::System => Message::system(m.text.clone()),
                 Role::User => Message::user(format!("{}{}", m.prompt_prefix, m.text)),
+                Role::Assistant if self.settings.keep_reasoning => Message::assistant_turn(
+                    m.text.clone(),
+                    (!m.reasoning.is_empty()).then(|| m.reasoning.clone()),
+                    Vec::new(),
+                ),
                 Role::Assistant => Message::assistant(m.text.trim().to_string()),
             })
             .collect()
@@ -218,7 +228,7 @@ impl App {
 
     pub fn finish(&mut self, s: &TurnStats) {
         if let Some(m) = self.messages.last_mut() {
-            if m.role == Role::Assistant {
+            if m.role == Role::Assistant && !self.settings.keep_reasoning {
                 m.text = m.text.trim().to_string();
                 m.reasoning = m.reasoning.trim().to_string();
             }

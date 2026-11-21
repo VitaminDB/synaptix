@@ -33,7 +33,8 @@ pub struct SamplingPreset {
 /// Через какую переменную шаблона задаётся глубина размышлений.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningVar {
-    /// `reasoning_effort` — Qwen3.8 (`xhigh` / `medium` / `low`).
+    /// `reasoning_effort` — Qwen3.8 (`xhigh` / `medium` / `low`), Inkling-2
+    /// (`none` … `max` через `effort_map` шаблона).
     Effort,
     /// `reasoning_strength` — Muse Glimmer (`low` … `xhigh`), строкой
     /// `Reasoning strength: …` в системном блоке.
@@ -222,6 +223,12 @@ fn generation_config_preset(bytes: &[u8]) -> Option<SamplingPreset> {
 /// модель с другим набором не требовала правки движка. `reasoning_strength`
 /// (Muse Glimmer) шаблон не проверяет, уровни есть только в карточке модели.
 pub fn reasoning_levels(arch: Option<LlmArch>, template: &str) -> Option<ReasoningLevels> {
+    if template.contains("reasoning_effort") && !template.contains("reasoning_effort not in (") {
+        // Inkling-2: уровни — ключи `effort_map` (строка → число в системной
+        // реплике), по умолчанию число `… is not none else 0.9`.
+        let (levels, default) = effort_map_levels(template)?;
+        return Some(ReasoningLevels { var: ReasoningVar::Effort, levels: by_depth(levels), default, instruct_default: None });
+    }
     if template.contains("reasoning_effort") {
         let levels = quoted_list_after(template, "reasoning_effort not in (")?;
         let default = quoted_after(template, "reasoning_effort|default('")
@@ -256,6 +263,35 @@ fn instruct_effort_default(template: &str) -> Option<String> {
         }
         quoted_after(body, DEFAULT)
     })
+}
+
+/// Ключи словаря `effort_map = {"none": 0.0, …}` и уровень по умолчанию —
+/// первый ключ с числом из `reasoning_effort is not none else <число>`.
+fn effort_map_levels(template: &str) -> Option<(Vec<String>, String)> {
+    const MAP: &str = "effort_map = {";
+    let start = template.find(MAP)? + MAP.len();
+    let end = start + template[start..].find('}')?;
+    let pairs: Vec<(String, f64)> = template[start..end]
+        .split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once(':')?;
+            let k = k.trim().trim_matches(|c| c == '"' || c == '\'');
+            Some((k.to_string(), v.trim().parse().ok()?))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    let default_num = template
+        .find("reasoning_effort is not none else ")
+        .map(|at| &template[at + "reasoning_effort is not none else ".len()..])
+        .and_then(|rest| rest.split(|c: char| !(c.is_ascii_digit() || c == '.')).next())
+        .and_then(|n| n.parse::<f64>().ok());
+    let default = default_num
+        .and_then(|d| pairs.iter().find(|(_, v)| (*v - d).abs() < 1e-9))
+        .or(pairs.last())
+        .map(|(k, _)| k.clone())?;
+    Some((pairs.into_iter().map(|(k, _)| k).collect(), default))
 }
 
 /// `'a', 'b', 'c'` сразу после `marker` до закрывающей скобки.
@@ -302,7 +338,14 @@ pub(crate) fn with_thinking_vars(
 ) -> RenderOptions {
     let chosen = levels
         .filter(|l| enable_thinking || l.instruct_default.is_some())
-        .and_then(|l| l.resolve(effort));
+        .and_then(|l| l.resolve(effort))
+        // Шаблон без `enable_thinking`, но с уровнем `none` (Inkling-2):
+        // «без размышлений» — это минимальный уровень.
+        .or_else(|| {
+            levels
+                .filter(|l| !enable_thinking && l.var == ReasoningVar::Effort && l.instruct_default.is_none())
+                .and_then(|l| l.resolve(Some("none")))
+        });
     let strength = match levels {
         _ if !enable_thinking => "low",
         Some(l) if l.var == ReasoningVar::Strength => chosen.unwrap_or(&l.default),
@@ -328,6 +371,8 @@ mod tests {
         include_str!("../../../synaptix-tokenizer/tests/fixtures/qwen3_8_chat_template.jinja");
     const MUSE: &str =
         include_str!("../../../synaptix-tokenizer/tests/fixtures/muse_glimmer_chat_template.jinja");
+    const INKLING2: &str =
+        include_str!("../../../synaptix-tokenizer/tests/fixtures/inkling2_chat_template.jinja");
 
     fn render(template: &str, arch: LlmArch, thinking: bool, effort: Option<&str>) -> String {
         let levels = reasoning_levels(Some(arch), template);
@@ -340,6 +385,23 @@ mod tests {
         ChatTemplate::from_source(template)
             .render(&[Message::system("sys"), Message::user("hi")], &opts)
             .expect("render")
+    }
+
+    #[test]
+    fn inkling2_levels_from_effort_map() {
+        let l = reasoning_levels(Some(LlmArch::Inkling2), INKLING2).expect("levels");
+        assert_eq!(l.var, ReasoningVar::Effort);
+        assert_eq!(l.levels, ["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(l.default, "high");
+        assert_eq!(l.instruct_default, None);
+        let a = LlmArch::Inkling2;
+        assert!(render(INKLING2, a, true, None).contains("Thinking effort level: 0.9<"));
+        assert!(render(INKLING2, a, true, Some("low")).contains("Thinking effort level: 0.2<"));
+        // Неизвестный уровень в шаблон не уходит (там `raise_exception`).
+        assert!(render(INKLING2, a, true, Some("turbo")).contains("Thinking effort level: 0.9<"));
+        // Без размышлений — минимальный уровень `none`.
+        assert!(render(INKLING2, a, false, None).contains("Thinking effort level: 0<"));
+        assert!(render(INKLING2, a, false, Some("max")).contains("Thinking effort level: 0<"));
     }
 
     #[test]
