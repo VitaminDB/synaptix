@@ -25,25 +25,6 @@ use crate::preprocess::{load_image, ImageLimits};
 use crate::vision::{expand_image_tokens, prefill_with_images, ImageSpan, VisionTower, IMAGE_TOKEN_ID};
 use synaptix_core::tensor::Tensor;
 
-/// Разметка реплик модели (для фасада: учёт и бюджет размышлений, разбор
-/// ответа). Реплика — `<|message_model|>` [имя] `<|content_…|>` тело
-/// `<|end_message|>`; ход кончается `<|content_model_end_sampling|>`.
-pub mod markup {
-    /// Начало реплики модели.
-    pub const MESSAGE: &str = "<|message_model|>";
-    /// Часть с размышлениями.
-    pub const THINKING: &str = "<|content_thinking|>";
-    /// Часть с ответом.
-    pub const TEXT: &str = "<|content_text|>";
-    /// Часть с вызовом инструмента (JSON `{"name":…,"args":{…}}`).
-    pub const TOOL_JSON: &str = "<|content_invoke_tool_json|>";
-    /// Конец части.
-    pub const END: &str = "<|end_message|>";
-    /// Принудительное закрытие размышлений по бюджету: конец части и начало
-    /// следующей реплики — модель сама выбирает ответ или вызов инструмента.
-    pub const FORCED_THINKING_CLOSE: &str = "<|end_message|><|message_model|>";
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error("load: {0}")]

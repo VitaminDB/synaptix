@@ -2416,7 +2416,7 @@ impl<'a> LlmGeneration<'a> {
         let markup = match self.thinking {
             None => None,
             Some(_) if self.model.thinking_in_parts() => {
-                use synaptix_llm_inkling2::pipeline::markup as ink;
+                use crate::facade::chat::inkling::markup as ink;
                 match (single(ink::THINKING), single(ink::END)) {
                     (Some(open), Some(close)) => {
                         Some(ThinkMarkup { open: Some(open), close, forced: ink::FORCED_THINKING_CLOSE })

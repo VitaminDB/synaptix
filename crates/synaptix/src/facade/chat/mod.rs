@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod inkling;
 pub mod json_repair;
 pub mod think;
 pub mod tool_parser;
@@ -7,6 +8,7 @@ use synaptix_tokenizer::{Gemma4Ids, Gemma4StreamParser};
 
 use crate::facade::llm::LlmTokenizer;
 use channel::{ChannelIds, ChannelParser};
+use inkling::{InklingIds, InklingParser};
 use think::ThinkParser;
 pub use tool_parser::{LlamaJsonParser, RawToolCall, ToolCallParser};
 
@@ -15,12 +17,16 @@ pub enum StreamParser {
     Channel(ChannelParser),
     Gemma(Gemma4StreamParser),
     Llama(LlamaJsonParser),
+    Inkling(InklingParser),
 }
 
 impl StreamParser {
     pub fn for_model(tokenizer: &LlmTokenizer, enable_thinking: bool, prompt: &str) -> Self {
         if let Some(ids) = ChannelIds::detect(tokenizer) {
             return Self::Channel(ChannelParser::new(ids));
+        }
+        if let Some(ids) = InklingIds::detect(tokenizer) {
+            return Self::Inkling(InklingParser::new(ids));
         }
         if is_llama3_prompt(prompt) {
             return Self::Llama(LlamaJsonParser::new(single_token(tokenizer, "<|python_tag|>")));
@@ -57,7 +63,7 @@ impl StreamParser {
     }
 
     pub fn has_native_stops(tokenizer: &LlmTokenizer) -> bool {
-        ChannelIds::detect(tokenizer).is_some() || gemma4_ids(tokenizer).is_some()
+        ChannelIds::detect(tokenizer).is_some() || gemma4_ids(tokenizer).is_some() || InklingIds::detect(tokenizer).is_some()
     }
 
     pub fn feed(&mut self, id: u32, delta: &str) -> (String, String, String) {
@@ -84,6 +90,10 @@ impl StreamParser {
                 let (body, tool) = p.feed(id, delta);
                 (body, String::new(), tool)
             }
+            Self::Inkling(p) => {
+                let split = p.feed(id, delta);
+                (split.body, split.thinking, split.tool)
+            }
         }
     }
 
@@ -100,6 +110,7 @@ impl StreamParser {
             Self::Channel(p) => p.has_closed_call(),
             Self::Gemma(p) => p.has_closed_call(),
             Self::Llama(p) => p.has_closed_call(),
+            Self::Inkling(p) => p.has_closed_call(),
         }
     }
 
@@ -113,6 +124,7 @@ impl StreamParser {
                 .map(|c| RawToolCall { arguments_json: c.arguments_json(), name: c.name })
                 .collect(),
             Self::Llama(p) => p.finish(),
+            Self::Inkling(p) => p.finish(),
         }
     }
 }
