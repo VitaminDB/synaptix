@@ -1418,6 +1418,12 @@ impl Llm {
         &self.device
     }
 
+    /// Размышления — отдельная часть реплики, которую модель открывает сама
+    /// (Inkling-2), а не блок `<think>`, открытый шаблоном.
+    pub fn thinking_in_parts(&self) -> bool {
+        self.pipeline.lock().map(|p| matches!(&*p, LlmPipeline::Inkling2(_))).unwrap_or(false)
+    }
+
     /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
     /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
     /// Все архитектуры с сессией и башней зрения: гибрид Qwen3.6/3.8,
@@ -2162,6 +2168,17 @@ const GEMMA4_IMAGE_START_TOKEN: &str = "<|image>";
 const GEMMA4_IMAGE_END_TOKEN: &str = "<image|>";
 const GEMMA4_IMAGE_PAD_TOKEN: &str = "<|image|>";
 
+/// Разметка размышлений хода (см. [`LlmGeneration::set_thinking`]).
+struct ThinkMarkup {
+    /// Токен, открывающий размышления; `None` — ход начинается внутри них
+    /// (шаблон открыл `<think>`).
+    open: Option<u32>,
+    /// Токен, закрывающий размышления.
+    close: u32,
+    /// Что вставить за модель, когда бюджет исчерпан.
+    forced: &'static str,
+}
+
 pub struct LlmGeneration<'a> {
     model: &'a Llm,
     opts: GenerationOptions,
@@ -2229,16 +2246,20 @@ impl<'a> LlmGeneration<'a> {
         }
     }
 
-    /// Ход начинается внутри размышлений (шаблон открыл `<think>`), бюджет —
-    /// `budget` токенов; 0 — без предела, только учёт для [`Self::finish`].
+    /// Ход с размышлениями, бюджет — `budget` токенов; 0 — без предела,
+    /// только учёт для [`Self::finish`]. Разметку задаёт архитектура: у
+    /// ChatML-моделей ход начинается внутри `<think>` (его открыл шаблон) и
+    /// закрывается `</think>`, у Inkling-2 размышления — часть реплики
+    /// `<|content_thinking|>` … `<|end_message|>`.
     ///
     /// Размышления и ответ делят `max_new_tokens`, и мягкая просьба «думай
     /// кратко» в шаблоне модель не связывает: Qwen3.8 на трудной задаче тратил
     /// на размышления все 16К токенов хода и не доходил ни до ответа, ни до
     /// вызова инструмента. С бюджетом размышления, не закрытые к его концу,
-    /// закрываются принудительно (`</think>`), и остаток предела достаётся
-    /// ответу. Действует у моделей, где `</think>` — один токен, в ходах через
-    /// сессию без вложений.
+    /// закрываются принудительно (`</think>`; у Inkling-2 — конец части и
+    /// начало новой реплики), и остаток предела достаётся ответу. Действует у
+    /// моделей, где маркеры — отдельные токены, в ходах через сессию без
+    /// вложений.
     pub fn set_thinking(&mut self, budget: usize) {
         self.thinking = Some(budget);
     }
@@ -2388,19 +2409,40 @@ impl<'a> LlmGeneration<'a> {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),
             _ => None,
         };
-        let close = self.thinking.and_then(|_| single("</think>"));
-        // Шаблон мог сам закрыть блок размышлений (`<think>\n\n</think>`):
-        // режим без размышлений, выбранный в чате меткой (`{REASON:ilow}` у
-        // моделей DavidAU), хотя ход просили с размышлениями. Тогда ждать
-        // `</think>` от модели нечего.
-        let close = close.filter(|&c| {
-            let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
-            let open = single("<think>").and_then(last);
-            !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
-        });
-        let budget = match (close, self.thinking) {
+        // Разметка размышлений задаётся архитектурой: у ChatML-моделей ход
+        // начинается внутри `<think>` и кончается на `</think>`; у Inkling-2
+        // размышления — отдельная часть реплики `<|content_thinking|>` …
+        // `<|end_message|>`, которую модель открывает сама (или не открывает).
+        let markup = match self.thinking {
+            None => None,
+            Some(_) if self.model.thinking_in_parts() => {
+                use synaptix_llm_inkling2::pipeline::markup as ink;
+                match (single(ink::THINKING), single(ink::END)) {
+                    (Some(open), Some(close)) => {
+                        Some(ThinkMarkup { open: Some(open), close, forced: ink::FORCED_THINKING_CLOSE })
+                    }
+                    _ => None,
+                }
+            }
+            Some(_) => single("</think>")
+                // Шаблон мог сам закрыть блок размышлений (`<think>\n\n</think>`):
+                // режим без размышлений, выбранный в чате меткой (`{REASON:ilow}` у
+                // моделей DavidAU), хотя ход просили с размышлениями. Тогда ждать
+                // `</think>` от модели нечего.
+                .filter(|&c| {
+                    let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
+                    let open = single("<think>").and_then(last);
+                    !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
+                })
+                .map(|close| ThinkMarkup { open: None, close, forced: "\n</think>\n\n" }),
+        };
+        let budget = match (&markup, self.thinking) {
             (Some(_), Some(b)) if b > 0 && b < max_new => b,
             _ => 0,
+        };
+        let (open, close) = match &markup {
+            Some(m) => (m.open, Some(m.close)),
+            None => (None, None),
         };
         let resume = session.resume_at;
         // Учёт хода: токены, размышления, кто остановил.
@@ -2408,8 +2450,12 @@ impl<'a> LlmGeneration<'a> {
             n: usize,
             last: Option<u32>,
             callback_stop: bool,
-            closed: bool,
-            think: Vec<u32>,
+            /// Сейчас внутри размышлений.
+            inside: bool,
+            /// Токенов размышлений (без открывающей и закрывающей разметки).
+            think: usize,
+            /// Токены первого прохода — для пересчёта после закрытия по бюджету.
+            seq: Vec<u32>,
             over: bool,
             tail: String,
         }
@@ -2417,8 +2463,9 @@ impl<'a> LlmGeneration<'a> {
             n: 0,
             last: None,
             callback_stop: false,
-            closed: close.is_none(),
-            think: Vec::new(),
+            inside: markup.as_ref().is_some_and(|m| m.open.is_none()),
+            think: 0,
+            seq: Vec::new(),
             over: false,
             tail: String::new(),
         };
@@ -2426,12 +2473,17 @@ impl<'a> LlmGeneration<'a> {
         let mut feed = |tr: &mut Track, id: u32, s: &str, budget: usize, on_token: &mut F| -> bool {
             tr.n += 1;
             tr.last = Some(id);
-            if !tr.closed {
+            if budget > 0 {
+                tr.seq.push(id);
+            }
+            if tr.inside {
                 if Some(id) == close {
-                    tr.closed = true;
+                    tr.inside = false;
                 } else {
-                    tr.think.push(id);
+                    tr.think += 1;
                 }
+            } else if open.is_some() && Some(id) == open {
+                tr.inside = true;
             }
             if stop_len > 0 {
                 tr.tail.push_str(s);
@@ -2444,7 +2496,7 @@ impl<'a> LlmGeneration<'a> {
                 tr.callback_stop = true;
                 return false;
             }
-            if budget > 0 && !tr.closed && tr.think.len() >= budget {
+            if budget > 0 && tr.inside && tr.think >= budget {
                 tr.over = true;
                 return false;
             }
@@ -2460,10 +2512,11 @@ impl<'a> LlmGeneration<'a> {
             // токены — его разбор размышлений увидит закрытие. Размышления
             // пересчитываются префиллом от точки возврата (конец промпта) —
             // секунда-две на несколько тысяч токенов.
-            let forced = tokenizer.encode("\n</think>\n\n").map_err(|e| LlmError(e.to_string()))?;
-            let mut prompt2 = Vec::with_capacity(prompt_ids.len() + tr.think.len() + forced.len());
+            let forced = markup.as_ref().map_or("", |m| m.forced);
+            let forced = tokenizer.encode(forced).map_err(|e| LlmError(e.to_string()))?;
+            let mut prompt2 = Vec::with_capacity(prompt_ids.len() + tr.seq.len() + forced.len());
             prompt2.extend_from_slice(prompt_ids);
-            prompt2.extend_from_slice(&tr.think);
+            prompt2.extend_from_slice(&tr.seq);
             let mut go = true;
             for id in &forced {
                 prompt2.push(*id);
@@ -2472,7 +2525,7 @@ impl<'a> LlmGeneration<'a> {
                     go = feed(&mut tr, *id, &piece, 0, &mut on_token);
                 }
             }
-            tr.closed = true;
+            tr.inside = false;
             self.finish.thinking_forced = true;
             if go {
                 self.opts.max_new_tokens = max_new.saturating_sub(tr.n).max(1);
@@ -2490,8 +2543,8 @@ impl<'a> LlmGeneration<'a> {
         let stopped_by_sequence = !self.stop_sequences.is_empty()
             && self.stop_sequences.iter().any(|s| tr.tail.contains(s.as_str()));
         self.finish.tokens = tr.n;
-        self.finish.thinking_tokens = tr.think.len();
-        self.finish.thinking_open = close.is_some() && !tr.closed;
+        self.finish.thinking_tokens = tr.think;
+        self.finish.thinking_open = tr.inside;
         self.finish.reason = if tr.callback_stop {
             FinishReason::Callback
         } else if tr.last.is_some_and(|t| self.stop_tokens.contains(&t)) {
