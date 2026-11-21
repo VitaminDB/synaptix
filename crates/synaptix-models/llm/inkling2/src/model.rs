@@ -185,6 +185,45 @@ impl ModelCache {
         self.warm = 0;
     }
 
+    /// Переселить KV и состояния свёрток в host-RAM, освободив VRAM. Позиция
+    /// (`seq_len`) не меняется: после [`Self::unpark_to`] ход продолжается с
+    /// той же точки. Граф шага держит адреса прежних буферов — сбрасывается и
+    /// переснимается после возврата. Возвращает байты, уехавшие с карты.
+    pub fn park_to_host(&mut self) -> R<usize> {
+        self.drop_graph();
+        self.out_dev = None;
+        let mut moved = 0;
+        for s in self.slots.iter_mut() {
+            for t in [&mut s.k, &mut s.v, &mut s.k_state, &mut s.v_state, &mut s.attn_state, &mut s.ffn_state] {
+                moved += move_tensor(t, Device::Cpu)?;
+            }
+        }
+        for t in [&mut self.pos_dev, &mut self.tok_dev] {
+            moved += move_tensor(t, Device::Cpu)?;
+        }
+        Ok(moved)
+    }
+
+    /// Обратный переезд на карту `device`.
+    pub fn unpark_to(&mut self, device: Device) -> R<usize> {
+        self.drop_graph();
+        let mut moved = 0;
+        for s in self.slots.iter_mut() {
+            for t in [&mut s.k, &mut s.v, &mut s.k_state, &mut s.v_state, &mut s.attn_state, &mut s.ffn_state] {
+                moved += move_tensor(t, device)?;
+            }
+        }
+        for t in [&mut self.pos_dev, &mut self.tok_dev] {
+            moved += move_tensor(t, device)?;
+        }
+        Ok(moved)
+    }
+
+    /// Кэш сейчас в host-RAM.
+    pub fn is_parked(&self) -> bool {
+        self.slots.first().is_some_and(|s| s.k.device() == Device::Cpu)
+    }
+
     pub fn reset(&mut self) -> R<()> {
         self.drop_graph();
         self.seq_len = 0;
@@ -564,6 +603,9 @@ impl Inkling2Model {
     fn forward_chunk(&self, ids: &[u32], patches: &[EmbedPatch], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
         let n = ids.len();
         let past = cache.seq_len;
+        if cache.is_parked() {
+            return Err(ModelError::Forward("inkling2: кэш в RAM (unpark_to перед ходом)".into()));
+        }
         if past + n > cache.capacity {
             return Err(ModelError::Forward(format!("inkling2: кэш {} < {}", cache.capacity, past + n)));
         }
@@ -578,6 +620,9 @@ impl Inkling2Model {
     /// Возвращает логиты `[1, V]` (буфер графа: годен до следующего шага).
     pub fn decode(&self, tok: u32, cache: &mut ModelCache) -> R<Tensor> {
         let past = cache.seq_len;
+        if cache.is_parked() {
+            return Err(ModelError::Forward("inkling2: кэш в RAM (unpark_to перед ходом)".into()));
+        }
         if past + 1 > cache.capacity {
             return Err(ModelError::Forward(format!("inkling2: кэш {} < {}", cache.capacity, past + 1)));
         }
@@ -1116,6 +1161,16 @@ impl Inkling2Model {
         launch(self.device, "ink2_act", &a, ((inter as u32).div_ceil(256), rows as u32, 1), 256)?;
         Ok(out)
     }
+}
+
+/// Перевезти тензор на `dev` (карта ↔ host-RAM); байты переезда, 0 — уже там.
+fn move_tensor(t: &mut Tensor, dev: Device) -> R<usize> {
+    if t.device() == dev {
+        return Ok(0);
+    }
+    let bytes = t.dtype().bytes_for_numel(t.numel());
+    *t = t.to_device(dev).map_err(fe)?;
+    Ok(bytes)
 }
 
 /// D2D-копия `src` в постоянный буфер `dst` той же формы (на default-стриме).

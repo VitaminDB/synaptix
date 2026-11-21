@@ -135,3 +135,69 @@ fn inkling2_chat_turn_reuses_previous_turn() {
     let reused = r.generate_streaming_cached(&mut session, &other, &tok, |_, _| true).expect("turn 3");
     assert_eq!(reused, 0, "при расхождении префикса переиспользовать нельзя");
 }
+
+/// Кэш переживает переезд в host-RAM: `park_to_host` + `unpark_to` между
+/// ходами дают ровно те же токены второго хода, что сессия без переезда
+/// (позиция, кольца SWA, состояния свёрток целы; граф декода переснимается).
+#[test]
+fn inkling2_park_unpark_keeps_cache() {
+    let Ok(path) = std::env::var("SYN_INKLING2_DIR") else {
+        eprintln!("SYN_INKLING2_DIR не задан — пропускаем");
+        return;
+    };
+    let (model, tok) = load_llm_with_policy(Path::new(&path), QuantPolicy::balance(), &Device::Cuda(0)).expect("load");
+    let (ctx, max_new) = (4096usize, 24usize);
+    let prompt1 = tok
+        .apply_chat_template_reasoning(&[Message::user("Перечисли планеты Солнечной системы по порядку.")], true, true, None, None)
+        .expect("template");
+    let ids1 = tok.encode(&prompt1).expect("encode");
+    let tail = tok.encode(" Продолжи список и коротко опиши каждую планету.").expect("encode tail");
+
+    let run = |park: bool| -> (Vec<u32>, Vec<u32>, usize) {
+        let mut session = model.new_kv_session(ctx, max_new).expect("session").expect("префикс-KV");
+        let mut out1 = Vec::new();
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        r.generate_streaming_cached(&mut session, &ids1, &tok, |id, _| {
+            out1.push(id);
+            true
+        })
+        .expect("ход 1");
+        if park {
+            let held = session.device_bytes();
+            assert!(held > 0);
+            let t = std::time::Instant::now();
+            let moved = session.park_to_host().expect("park");
+            let park_ms = t.elapsed().as_millis();
+            assert!(session.is_parked());
+            assert_eq!(session.device_bytes(), 0, "припаркованный кэш не держит VRAM");
+            let t = std::time::Instant::now();
+            let back = session.unpark_to(Device::Cuda(0)).expect("unpark");
+            println!(
+                "inkling2: в RAM {} МБ за {park_ms} мс, обратно {} МБ за {} мс (держал {} МБ)",
+                moved >> 20,
+                back >> 20,
+                t.elapsed().as_millis(),
+                held >> 20
+            );
+            assert_eq!(moved, back);
+            assert!(!session.is_parked());
+        }
+        let ids2: Vec<u32> = ids1.iter().chain(&out1).chain(&tail).copied().collect();
+        let mut out2 = Vec::new();
+        let mut r = LlmGeneration::new(&model, opts(ctx, max_new));
+        let reused = r
+            .generate_streaming_cached(&mut session, &ids2, &tok, |id, _| {
+                out2.push(id);
+                true
+            })
+            .expect("ход 2");
+        (out1, out2, reused)
+    };
+    let (a1, a2, ra) = run(false);
+    let (b1, b2, rb) = run(true);
+    assert_eq!(a1, b1, "ход 1 детерминирован");
+    assert_eq!(ra, ids1.len() + a1.len() - 1, "весь прошлый ход из кэша");
+    assert_eq!(rb, ra, "переезд не должен ломать префикс");
+    println!("ход 2: {:?}", tok.decode(&b2).unwrap_or_default());
+    assert_eq!(b2, a2, "ход после переезда кэша разошёлся с ходом без переезда");
+}

@@ -129,9 +129,28 @@ impl Inkling2Session {
         self.cache.seq_len = 0;
     }
 
-    /// VRAM под KV сессии (состояния свёрток — копейки, не в счёт).
+    /// VRAM под KV сессии (состояния свёрток — копейки, не в счёт); 0 — кэш в RAM.
     pub fn device_bytes(&self) -> usize {
+        if self.cache.is_parked() {
+            return 0;
+        }
         self.cache.capacity * self.kv_bytes_per_token
+    }
+
+    /// Переселить KV и состояния свёрток в host-RAM (на время вложенной
+    /// генерации): позиция и токены сессии сохраняются, следующий ход после
+    /// [`Self::unpark_to`] продолжает кэш. Возвращает байты, ушедшие с карты.
+    pub fn park_to_host(&mut self) -> Result<usize, PipelineError> {
+        Ok(self.cache.park_to_host()?)
+    }
+
+    /// Обратный переезд; граф декода переснимется на первом шаге.
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, PipelineError> {
+        Ok(self.cache.unpark_to(device)?)
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.cache.is_parked()
     }
 }
 

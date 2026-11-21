@@ -1142,8 +1142,8 @@ impl LlmKvSession {
             SessionKind::Qwen4Exp(s) => {
                 moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
             }
-            SessionKind::Inkling2(_) => {
-                return Err(LlmError("Inkling-2: перенос кэша сессии в RAM не поддержан".into()))
+            SessionKind::Inkling2(s) => {
+                moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
             }
         }
         Ok(moved)
@@ -1177,8 +1177,9 @@ impl LlmKvSession {
             SessionKind::Qwen4Exp(s) => {
                 moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
             }
-            // Не паркуется (см. `park_to_host`) — возвращать нечего.
-            SessionKind::Inkling2(_) => {}
+            SessionKind::Inkling2(s) => {
+                moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
+            }
         }
         Ok(moved)
     }
@@ -1187,6 +1188,7 @@ impl LlmKvSession {
     pub fn is_parked(&self) -> bool {
         match &self.kind {
             SessionKind::Qwen4Exp(s) => s.is_parked(),
+            SessionKind::Inkling2(s) => s.is_parked(),
             _ => self.kv.is_parked(),
         }
     }
