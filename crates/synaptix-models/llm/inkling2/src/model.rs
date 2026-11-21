@@ -224,6 +224,12 @@ pub struct ModelCache {
 impl ModelCache {
     /// Граф держит адреса KV и состояний: после их замены он негоден.
     fn drop_graph(&mut self) {
+        // Последний запуск графа может ещё идти: его буферы нельзя отдавать, пока он не кончился.
+        if self.graph.is_some() {
+            if let Device::Cuda(o) = self.pos_dev.device() {
+                let _ = synaptix_core::device::cuda::synchronize(o);
+            }
+        }
         self.graph = None;
         self.warm = 0;
     }
@@ -264,6 +270,10 @@ impl ModelCache {
         }
         for t in [&mut self.pos_dev, &mut self.tok_dev] {
             moved += move_tensor(t, device)?;
+        }
+        // Копии с хоста идут на стримах буферов: дождаться их до первого ядра хода.
+        if let Device::Cuda(o) = device {
+            synaptix_core::device::cuda::synchronize(o).map_err(fe)?;
         }
         Ok(moved)
     }
