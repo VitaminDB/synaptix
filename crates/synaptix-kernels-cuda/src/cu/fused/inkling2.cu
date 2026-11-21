@@ -797,6 +797,45 @@ extern "C" __global__ void ink2_route(Ink2Args args) {
     if (args.a[5] && t == 0)
         for (unsigned int i = lane; i < args.u[3]; i += 32) PF(5)[i] = 0.0f;
     const float* lg = CPF(0) + (unsigned long long)t * E;
+    if (E <= 128 && K <= 32) {
+        // E ≤ 128: ключи и σ — в регистрах (развёрнуто, без local memory), σ выбранного берётся
+        // шаффлом у лейна-владельца, веса пишут лейны k < K. Значения и порядок суммы те же.
+        float key[4], sv[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int e = j * 32 + lane;
+            sv[j] = e < E ? sigm(lg[e]) : 0.0f;
+            key[j] = e < E ? sv[j] + CPF(1)[e] : -INFINITY;
+        }
+        int my_i = 0;
+        float my_s = 0.0f, sum = 0.0f;
+        for (unsigned int k = 0; k < K; ++k) {
+            float best = -INFINITY;
+            int idx = 0x7fffffff;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (key[j] > best) { best = key[j]; idx = j * 32 + lane; }
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                float ob = __shfl_xor_sync(0xffffffffu, best, o);
+                int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+                if (ob > best || (ob == best && oi < idx)) { best = ob; idx = oi; }
+            }
+            const int jw = idx >> 5;
+            float own = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) if (j == jw) { own = sv[j]; if ((idx & 31) == lane) key[j] = -INFINITY; }
+            const float s = __shfl_sync(0xffffffffu, own, idx & 31);
+            if ((unsigned)lane == k) { my_i = idx; my_s = s; }
+            sum += s;
+        }
+        if ((unsigned)lane < K) {
+            ((unsigned int*)args.a[2])[t * K + lane] = (unsigned int)my_i;
+            float m = args.a[4] ? CPF(4)[my_i] : 1.0f;
+            PF(3)[t * K + lane] = my_s / (sum + 1e-20f) * args.f[0] * m;
+        }
+        return;
+    }
     float key[32];
     unsigned int per = (E + 31) / 32;
     for (unsigned int j = 0; j < per; ++j) {
