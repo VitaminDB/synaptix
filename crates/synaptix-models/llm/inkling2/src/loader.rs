@@ -151,6 +151,35 @@ impl Inkling2Weights {
         Ok(ExpertStack { gate_up, down, alpha_gate_up, alpha_down })
     }
 
+    /// Множители alpha экспертов слоя `(gate_up, down)` из бандла — без
+    /// чтения самих весов (режим экспертов в RAM). `None` — не бандл.
+    pub fn expert_alpha(&self, layer: usize) -> Result<Option<(Vec<f32>, Vec<f32>)>, LoadError> {
+        if self.bundle.is_none() {
+            return Ok(None);
+        }
+        let p = format!("{LLM}.layers.{layer}.mlp.experts");
+        Ok(Some((self.host_f32(&format!("{p}.gate_up_alpha"))?, self.host_f32(&format!("{p}.down_alpha"))?)))
+    }
+
+    /// Формат экспертов слоя в бандле (NVFP4 / MXFP8).
+    pub fn expert_dtype(&self, layer: usize) -> Option<DType> {
+        let b = self.bundle.as_ref()?;
+        Some(b.quant_kind(&format!("{LLM}.layers.{layer}.mlp.experts.gate_up"))?.dtype())
+    }
+
+    /// Стопки экспертов бандла по слоям — под закреплённое зеркало и
+    /// zero-copy (`synaptix_llm_common::expert_mirror`). `None` — не бандл.
+    pub fn expert_stacks(&self) -> Option<synaptix_llm_common::expert_mirror::ExpertStacks> {
+        let b = self.bundle.as_ref()?;
+        let keys = (0..self.config.text.num_hidden_layers)
+            .map(|l| {
+                let p = format!("{LLM}.layers.{l}.mlp.experts");
+                Some((format!("{p}.gate_up"), format!("{p}.down")))
+            })
+            .collect();
+        Some(synaptix_llm_common::expert_mirror::ExpertStacks::new(b.clone(), keys))
+    }
+
     fn expert_matrix(&self, name: &str, interleaved: bool, device: Device) -> Result<(Vec<QuantWeight>, Vec<f32>), LoadError> {
         let (w, _wdt, wsh) = self.raw(name)?;
         let (s, _sdt, ssh) = self.raw(&format!("{name}_scale"))?;

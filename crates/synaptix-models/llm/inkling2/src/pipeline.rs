@@ -5,6 +5,7 @@
 //! (как у LFM3); иначе ход считается с нуля.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use synaptix_core::device::Device;
@@ -15,7 +16,10 @@ use synaptix_tokenizer::hf::HfTokenizer;
 use synaptix_tokenizer::Tokenizer;
 
 use crate::config::Inkling2Config;
-use crate::loader::Inkling2Weights;
+use crate::loader::{Inkling2Weights, LoadError};
+use synaptix_llm_common::expert_mirror::{self as em, ExpertStacks};
+use synaptix_llm_common::moe::ExpertSource;
+use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
 use crate::model::{Inkling2Model, ModelCache};
 
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +38,53 @@ pub struct Inkling2Pipeline {
     pub chat_template: Option<String>,
     pub config: Inkling2Config,
     pub path: PathBuf,
+    /// Закреплённое зеркало стопок экспертов в RAM (режим zero-copy). Поле
+    /// раньше `_stacks`: гард джойнит копировщиков, пока mmap ещё жив.
+    _host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
+    _stacks: Option<Arc<ExpertStacks>>,
 }
+
+/// Где держать экспертов MoE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertMode {
+    /// Все на карте (как было).
+    Resident,
+    /// В закреплённом зеркале RAM, на карте — кэш слотов (zero-copy).
+    Zc,
+}
+
+/// Ручной выбор: `SYN_INKLING2_EXPERTS=resident|zc` (иначе — автоматически).
+fn expert_mode_env() -> Option<ExpertMode> {
+    match std::env::var("SYN_INKLING2_EXPERTS").ok()?.trim() {
+        "resident" | "vram" | "gpu" => Some(ExpertMode::Resident),
+        "zc" | "ram" | "zero-copy" => Some(ExpertMode::Zc),
+        _ => None,
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// Ёмкость контекста, под которую считается VRAM, если загрузчику её не
+/// назвали: `SYN_INKLING2_CTX`, иначе 32K.
+fn planned_ctx() -> usize {
+    env_usize("SYN_INKLING2_CTX").unwrap_or(32768)
+}
+
+/// Запас VRAM сверх весов и KV: активации чанка префилла, граф декода,
+/// фрагментация пулов. `SYN_INKLING2_ACT_RESERVE_MB` (1536).
+fn activation_reserve() -> usize {
+    env_usize("SYN_INKLING2_ACT_RESERVE_MB").unwrap_or(1536) << 20
+}
+
+/// Место соседям по карте в режиме zero-copy (малые модели службы),
+/// `SYN_INKLING2_ZC_HEADROOM_MB` (512).
+fn zc_headroom() -> usize {
+    env_usize("SYN_INKLING2_ZC_HEADROOM_MB").unwrap_or(512) << 20
+}
+
+const GB: f64 = (1u64 << 30) as f64;
 
 /// Кэш хода между репликами чата.
 pub struct Inkling2Session {
@@ -85,13 +135,110 @@ fn prefill_chunk() -> usize {
 }
 
 impl Inkling2Pipeline {
+    /// Загрузка под контекст по умолчанию ([`planned_ctx`]).
     pub fn load(path: impl AsRef<Path>, device: Device) -> Result<Self, PipelineError> {
-        let _weights = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+        Self::load_with_ctx(path, device, None)
+    }
+
+    /// Загрузка под ёмкость контекста `ctx` (токенов): если эксперты вместе с
+    /// KV на `ctx` и запасом под активации помещаются на карту — они
+    /// резидентны, иначе — zero-copy (зеркало в RAM + слоты VRAM на всё, что
+    /// осталось). `SYN_INKLING2_EXPERTS=resident|zc` — выбрать вручную.
+    pub fn load_with_ctx(path: impl AsRef<Path>, device: Device, ctx: Option<usize>) -> Result<Self, PipelineError> {
         let path = path.as_ref().to_path_buf();
-        let w = Inkling2Weights::open(&path).map_err(|e| PipelineError::Load(e.to_string()))?;
-        let model = Inkling2Model::load(&w, device).map_err(|e| PipelineError::Load(e.to_string()))?;
+        let le = |e: LoadError| PipelineError::Load(e.to_string());
+        let w = Inkling2Weights::open(&path).map_err(le)?;
+        let weights_guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
+        let mut model = Inkling2Model::load_base(&w, device).map_err(le)?;
         let tokenizer = HfTokenizer::from_bytes(&w.tokenizer_json).map_err(|e| PipelineError::Load(format!("tokenizer.json: {e}")))?;
-        Ok(Self { model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path })
+        let config = w.config.clone();
+        let chat_template = w.chat_template.clone();
+        let finish = |model, host_mirror, stacks| Self { model, tokenizer, chat_template, config: w.config.clone(), path, _host_mirror: host_mirror, _stacks: stacks };
+        let ctx = ctx.unwrap_or_else(planned_ctx).max(2);
+        let stacks = w.expert_stacks().map(Arc::new);
+        let experts_bytes: usize = stacks.as_deref().map_or(0, |s| em::mirror_ranges_natural(s, device).iter().map(|r| r.bytes.len()).sum());
+        let reserve = kv_fixed_bytes(&config) + ctx * kv_bytes_per_token(&config) + activation_reserve();
+        let free = match device {
+            Device::Cuda(ord) => {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+                synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0)
+            }
+            _ => usize::MAX,
+        };
+        let zc_ok = stacks.as_deref().is_some_and(|s| em::experts_zc_capable(s)) && device.is_cuda();
+        let mode = match expert_mode_env() {
+            Some(ExpertMode::Zc) if zc_ok => ExpertMode::Zc,
+            Some(ExpertMode::Zc) => return Err(PipelineError::Load("zero-copy экспертов: нужен .syn-бандл NVFP4/MXFP8 и CUDA".into())),
+            Some(m) => m,
+            None if zc_ok && free < reserve + experts_bytes => ExpertMode::Zc,
+            None => ExpertMode::Resident,
+        };
+        eprintln!(
+            "[inkling2] эксперты {:.1} ГБ, KV на {ctx} ток. + запас {:.1} ГБ, свободно {:.1} ГБ → {}",
+            experts_bytes as f64 / GB,
+            reserve as f64 / GB,
+            free as f64 / GB,
+            if mode == ExpertMode::Zc { "zero-copy (эксперты в RAM, слоты VRAM)" } else { "эксперты на карте" }
+        );
+        if mode == ExpertMode::Resident {
+            model.load_resident_experts(&w).map_err(le)?;
+            return Ok(finish(model, None, None));
+        }
+        let stacks = stacks.expect("zc_ok");
+        // Зеркало стопок: NVFP4 — в натуральной раскладке (её читают ядра GEMV_SYN/группового GEMM).
+        let (mirror, budget) = {
+            let ranges = em::mirror_ranges_natural(&*stacks, device);
+            em::host_mirror(&ranges, "inkling2").ok_or_else(|| PipelineError::Load("zero-copy: зеркало экспертов в RAM не поднято".into()))?
+        };
+        if budget < experts_bytes {
+            return Err(PipelineError::Load(format!(
+                "zero-copy: RAM под зеркало {:.1} ГБ < стопок {:.1} ГБ (SYN_HOST_MIRROR_GB / SYN_MIRROR_RESERVE_GB)",
+                budget as f64 / GB,
+                experts_bytes as f64 / GB
+            )));
+        }
+        mirror.resume();
+        wait_mirror()?;
+        // Слоты: всё, что свободно после весов, KV на `ctx`, активаций и запаса соседям.
+        let t = &config.text;
+        let (hidden, inter, ne) = (t.hidden_size, t.intermediate_size, t.n_routed_experts);
+        let mut dtypes = Vec::with_capacity(t.num_hidden_layers);
+        let mut per_slot = 0usize;
+        for l in 0..t.num_hidden_layers {
+            let dt = w.expert_dtype(l).ok_or_else(|| PipelineError::Load(format!("слой {l}: формат экспертов")))?;
+            let b = |n, k| synaptix_core::quant::matrix_blob_bytes(dt, n, k).map(|(p, s)| p + s).unwrap_or(0);
+            per_slot += b(2 * inter, hidden) + b(hidden, inter);
+            dtypes.push(dt);
+        }
+        let avail = free.saturating_sub(reserve + zc_headroom());
+        let slots = env_usize("SYN_INKLING2_ZC_SLOTS").unwrap_or(avail / per_slot.max(1)).min(ne);
+        let pool = ZcPool::new(device);
+        pool.set_min_slots(env_usize("SYN_INKLING2_ZC_MIN_SLOTS").unwrap_or(8));
+        pool.set_slots_per_layer(slots);
+        let src = em::BundleExperts::new(stacks.clone());
+        let mut layers = Vec::with_capacity(t.num_hidden_layers);
+        for (l, &dt) in dtypes.iter().enumerate() {
+            let blobs: Vec<ExpertBlobs> = (0..ne)
+                .map(|e| src.blob_addrs4(l, e))
+                .collect::<Option<_>>()
+                .ok_or_else(|| PipelineError::Load(format!("zero-copy: слой {l}: эксперт не в зеркале")))?;
+            let z = ZcLayer::build_from_blobs(&blobs, dt, (2 * inter, hidden), (hidden, inter), &pool, None)?
+                .ok_or_else(|| PipelineError::Load(format!("zero-copy: слой {l}: слотов {slots} мало (свободно {:.1} ГБ)", avail as f64 / GB)))?;
+            layers.push(z);
+        }
+        model.attach_zc(pool, layers).map_err(le)?;
+        drop(weights_guard);
+        eprintln!(
+            "[inkling2] zero-copy: слотов {slots} из {ne} на слой ({:.1} ГБ VRAM), зеркало {:.1} ГБ",
+            (slots * per_slot) as f64 / GB,
+            experts_bytes as f64 / GB
+        );
+        Ok(finish(model, Some(mirror), Some(stacks)))
+    }
+
+    /// Режим экспертов загруженной модели.
+    pub fn expert_mode(&self) -> ExpertMode {
+        if self.model.zc_active() { ExpertMode::Zc } else { ExpertMode::Resident }
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
@@ -109,27 +256,17 @@ impl Inkling2Pipeline {
     /// Байт KV на токен контекста: растут только слоты полного внимания (у SWA — кольцо
     /// фиксированного размера, см. [`Self::kv_fixed_bytes`]).
     pub fn kv_bytes_per_token(&self) -> usize {
-        let t = &self.config.text;
-        self.full_slots() * 2 * t.num_key_value_heads * t.head_dim * 2
+        kv_bytes_per_token(&self.config)
     }
 
     /// Слотов полного внимания (физический полный слой × его проходы).
     pub fn full_slots(&self) -> usize {
-        (0..self.config.num_slots())
-            .filter(|&s| {
-                let n = self.config.text.num_hidden_layers;
-                let (cs, ce) = self.config.core();
-                let phys = if s < n { s } else { cs + (s - n) % (ce - cs) };
-                !self.config.is_swa(phys)
-            })
-            .count()
+        full_slots(&self.config)
     }
 
     /// Фиксированные байты KV: кольца SWA-слотов (окно + чанк префилла).
     pub fn kv_fixed_bytes(&self) -> usize {
-        let t = &self.config.text;
-        let swa = self.config.num_slots() - self.full_slots();
-        swa * 2 * t.num_key_value_heads * t.head_dim * 2 * (t.sliding_window_size + crate::model::MAX_CHUNK)
+        kv_fixed_bytes(&self.config)
     }
 
     pub fn new_session(&self, ctx: usize) -> Result<Inkling2Session, PipelineError> {
@@ -232,4 +369,50 @@ impl Inkling2Pipeline {
         }
         Ok((out.clone(), stats(&out, t1.elapsed().as_millis()), reuse))
     }
+}
+
+/// Дождаться, пока зеркало экспертов заполнится целиком: слои zero-copy
+/// собираются по адресам в нём.
+fn wait_mirror() -> Result<(), PipelineError> {
+    let t0 = Instant::now();
+    let mut last = 0usize;
+    loop {
+        let Some((ready, total)) = synaptix_core::device::cuda::offload_pin_cache_progress() else {
+            return Err(PipelineError::Load("zero-copy: зеркало пропало".into()));
+        };
+        if ready >= total {
+            eprintln!("[inkling2] зеркало экспертов: {:.1} ГБ за {:.1} с", total as f64 / GB, t0.elapsed().as_secs_f64());
+            return Ok(());
+        }
+        if t0.elapsed().as_secs() > 900 {
+            return Err(PipelineError::Load(format!("zero-copy: зеркало {:.1}/{:.1} ГБ за 15 мин", ready as f64 / GB, total as f64 / GB)));
+        }
+        if ready >= last + (2usize << 30) {
+            eprintln!("[inkling2] зеркало экспертов: {:.1}/{:.1} ГБ", ready as f64 / GB, total as f64 / GB);
+            last = ready;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn kv_bytes_per_token(cfg: &Inkling2Config) -> usize {
+    let t = &cfg.text;
+    full_slots(cfg) * 2 * t.num_key_value_heads * t.head_dim * 2
+}
+
+fn full_slots(cfg: &Inkling2Config) -> usize {
+    let n = cfg.text.num_hidden_layers;
+    let (cs, ce) = cfg.core();
+    (0..cfg.num_slots())
+        .filter(|&s| {
+            let phys = if s < n { s } else { cs + (s - n) % (ce - cs) };
+            !cfg.is_swa(phys)
+        })
+        .count()
+}
+
+fn kv_fixed_bytes(cfg: &Inkling2Config) -> usize {
+    let t = &cfg.text;
+    let swa = cfg.num_slots() - full_slots(cfg);
+    swa * 2 * t.num_key_value_heads * t.head_dim * 2 * (t.sliding_window_size + crate::model::MAX_CHUNK)
 }

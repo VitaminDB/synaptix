@@ -561,4 +561,11 @@ impl ZcLayer {
     pub fn slots(&self) -> usize {
         self.n_slots
     }
+
+    /// Какие эксперты сейчас в слотах (синхронное чтение `owner`, −1 — слот
+    /// пуст). Для префилла: группы с попаданиями ставятся вперёд, чтобы
+    /// подкачка промахов не вытесняла ещё не посчитанных резидентов.
+    pub fn slot_owners(&self) -> Result<Vec<i32>, ModelError> {
+        self.owner.to_device(Device::Cpu).and_then(|t| t.to_vec1::<i32>()).map_err(zerr)
+    }
 }

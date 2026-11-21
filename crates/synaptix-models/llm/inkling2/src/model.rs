@@ -9,6 +9,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::tensor::quant::{ExpertTable, QuantWeight};
 use synaptix_core::tensor::Tensor;
+use synaptix_llm_common::moe_zc::{ZcLayer, ZcPool};
 use synaptix_llm_common::ModelError;
 use synaptix_nn::linear::Linear;
 use synaptix_nn::Module;
@@ -76,16 +77,41 @@ struct LoopLayer {
     ctrl: [Ctrl; 4],
 }
 
+/// Где лежат веса экспертов слоя.
+enum ExpertStore {
+    /// Ещё не подняты ([`Inkling2Model::load_base`]).
+    Pending,
+    /// Все эксперты на карте: таблицы адресов (плотная активация) и сами веса.
+    Resident {
+        gate_up: ExpertTable,
+        down: ExpertTable,
+        /// Держит веса живыми (таблицы — только адреса).
+        _weights: (Vec<QuantWeight>, Vec<QuantWeight>),
+    },
+    /// Zero-copy: эксперты в закреплённом зеркале RAM, на карте — кэш слотов
+    /// (`synaptix_llm_common::moe_zc`). Один слой на физический слой: три
+    /// прохода цикла делят его слоты.
+    Zc(ZcLayer),
+}
+
 struct Experts {
-    /// Таблицы адресов весов экспертов на карте (плотная активация).
-    gate_up: ExpertTable,
-    down: ExpertTable,
+    store: ExpertStore,
     alpha_gate_up: Vec<f32>,
     /// Множители на карте `[E]`: gate_up — для активации, down — в вес маршрута.
     alpha_gate_up_dev: Tensor,
     alpha_down_dev: Tensor,
-    /// Держит веса живыми (таблицы — только адреса).
-    _weights: (Vec<QuantWeight>, Vec<QuantWeight>),
+}
+
+impl Experts {
+    fn new(store: ExpertStore, alpha_gate_up: Vec<f32>, alpha_down: Vec<f32>, dev: Device) -> Result<Self, LoadError> {
+        let e = alpha_gate_up.len();
+        Ok(Self {
+            store,
+            alpha_gate_up_dev: dev_f32(alpha_gate_up.clone(), vec![e], dev)?,
+            alpha_down_dev: dev_f32(alpha_down, vec![alpha_gate_up.len()], dev)?,
+            alpha_gate_up,
+        })
+    }
 }
 
 pub struct Layer {
@@ -148,6 +174,8 @@ pub struct ModelCache {
     out_dev: Option<Tensor>,
     graph: Option<GraphHandle>,
     warm: u32,
+    /// Поколение слотов zero-copy, при котором записан граф (адреса таблиц слоёв).
+    zc_gen: u64,
 }
 
 impl ModelCache {
@@ -184,6 +212,8 @@ pub struct Inkling2Model {
     norm: Tensor,
     output_q: Tensor,
     layers: Vec<Layer>,
+    /// Пул слотов zero-copy (режим экспертов в RAM).
+    zc_pool: Option<std::sync::Arc<ZcPool>>,
 }
 
 fn lerr(e: impl std::fmt::Display) -> LoadError {
@@ -226,7 +256,9 @@ fn conv_w(w: &Inkling2Weights, name: &str, k: usize, dev: Device) -> Result<Tens
 }
 
 impl Inkling2Model {
-    pub fn load(w: &Inkling2Weights, dev: Device) -> Result<Self, LoadError> {
+    /// Всё, кроме весов экспертов: их поднимает [`Self::load_resident_experts`]
+    /// либо подключает [`Self::attach_zc`].
+    pub fn load_base(w: &Inkling2Weights, dev: Device) -> Result<Self, LoadError> {
         let cfg = w.config.clone();
         let t = &cfg.text;
         let h = t.hidden_size;
@@ -286,7 +318,7 @@ impl Inkling2Model {
             let e = t.n_routed_experts;
             let router = dev_f32(router, vec![e, h], dev)?;
             let router_bias = dev_f32(w.host_f32(&format!("{p}.mlp.gate.bias"))?, vec![e], dev)?;
-            let ExpertStack { gate_up, down, alpha_gate_up, alpha_down } = w.experts(i, dev)?;
+            let (alpha_gate_up, alpha_down) = w.expert_alpha(i)?.unwrap_or_else(|| (vec![1.0; e], vec![1.0; e]));
             let lp = if let (Some((q, kv)), true) = (&msg, cfg.loop_layer(i)) {
                 let j = i - cs;
                 let mut mq = Vec::with_capacity(4 * h);
@@ -331,24 +363,70 @@ impl Inkling2Model {
                 ffn_norm: f32t(&format!("{p}.mlp_norm.weight"))?,
                 router,
                 router_bias,
-                experts: {
-                    let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
-                    let dn_refs: Vec<&QuantWeight> = down.iter().collect();
-                    let gt = ExpertTable::build_dense(&gu_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица gate_up")))?;
-                    let dt = ExpertTable::build_dense(&dn_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица down")))?;
-                    Experts {
-                        gate_up: gt,
-                        down: dt,
-                        alpha_gate_up_dev: dev_f32(alpha_gate_up.clone(), vec![e], dev)?,
-                        alpha_down_dev: dev_f32(alpha_down, vec![e], dev)?,
-                        alpha_gate_up,
-                        _weights: (gate_up, down),
-                    }
-                },
+                experts: Experts::new(ExpertStore::Pending, alpha_gate_up, alpha_down, dev)?,
                 lp,
             });
         }
-        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers })
+        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, zc_pool: None })
+    }
+
+    /// Модель целиком, эксперты резидентны на карте.
+    pub fn load(w: &Inkling2Weights, dev: Device) -> Result<Self, LoadError> {
+        let mut m = Self::load_base(w, dev)?;
+        m.load_resident_experts(w)?;
+        Ok(m)
+    }
+
+    /// Поднять экспертов всех слоёв на карту (резидентный режим).
+    pub fn load_resident_experts(&mut self, w: &Inkling2Weights) -> Result<(), LoadError> {
+        let dev = self.device;
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            let ExpertStack { gate_up, down, alpha_gate_up, alpha_down } = w.experts(i, dev)?;
+            let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
+            let dn_refs: Vec<&QuantWeight> = down.iter().collect();
+            let gt = ExpertTable::build_dense(&gu_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица gate_up")))?;
+            let dt = ExpertTable::build_dense(&dn_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица down")))?;
+            l.experts = Experts::new(ExpertStore::Resident { gate_up: gt, down: dt, _weights: (gate_up, down) }, alpha_gate_up, alpha_down, dev)?;
+        }
+        Ok(())
+    }
+
+    /// Режим экспертов в RAM: по [`ZcLayer`] на физический слой (`layers[i]` —
+    /// слой `i`, свой dtype) и общий пул слотов.
+    pub fn attach_zc(&mut self, pool: std::sync::Arc<ZcPool>, layers: Vec<ZcLayer>) -> Result<(), LoadError> {
+        if layers.len() != self.layers.len() {
+            return Err(LoadError::Weights(format!("zero-copy: слоёв {} из {}", layers.len(), self.layers.len())));
+        }
+        for (l, z) in self.layers.iter_mut().zip(layers) {
+            l.experts.store = ExpertStore::Zc(z);
+        }
+        self.zc_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Эксперты в RAM (zero-copy), а не на карте.
+    pub fn zc_active(&self) -> bool {
+        self.zc_pool.is_some()
+    }
+
+    /// Слотов VRAM на слой в режиме zero-copy.
+    pub fn zc_slots(&self) -> Option<usize> {
+        self.zc_pool.as_ref().map(|p| p.slots_per_layer())
+    }
+
+    /// Счётчики zero-copy по всем слоям: (попадания в слоты, выборы
+    /// экспертов). Синхронное чтение — только для журналов и замеров.
+    pub fn zc_stats(&self) -> Option<(u64, u64)> {
+        self.zc_pool.as_ref()?;
+        let mut acc = (0, 0);
+        for l in &self.layers {
+            if let ExpertStore::Zc(z) = &l.experts.store {
+                let (h, p) = z.stats();
+                acc.0 += h;
+                acc.1 += p;
+            }
+        }
+        Some(acc)
     }
 
     /// Физический слой слота кэша.
@@ -395,6 +473,7 @@ impl Inkling2Model {
             out_dev: None,
             graph: None,
             warm: 0,
+            zc_gen: 0,
         })
     }
 
@@ -505,6 +584,11 @@ impl Inkling2Model {
         let graph_on = std::env::var("SYN_INKLING2_GRAPH").as_deref() != Ok("0") && self.device.is_cuda();
         set_u32(&cache.pos_dev, past as u32)?;
         set_u32(&cache.tok_dev, tok)?;
+        // Слои zero-copy пересобраны — таблицы на новых адресах, граф негоден.
+        let zc_gen = synaptix_llm_common::moe_zc::ZC_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        if cache.graph.is_some() && cache.zc_gen != zc_gen {
+            cache.drop_graph();
+        }
         if let (true, Some(g)) = (graph_on, &cache.graph) {
             g.0.launch().map_err(|e| ModelError::Forward(format!("граф декода: {e:?}")))?;
             cache.seq_len = past + 1;
@@ -539,6 +623,7 @@ impl Inkling2Model {
             (Ok(g), None) => {
                 g.launch().map_err(|e| ModelError::Forward(format!("граф декода: {e:?}")))?;
                 cache.graph = Some(GraphHandle(g));
+                cache.zc_gen = zc_gen;
                 cache.seq_len = past + 1;
                 Ok(out_buf)
             }
@@ -877,16 +962,47 @@ impl Inkling2Model {
         a.f[0] = t.route_scale;
         if std::env::var_os("INK2_OLD_ROUTE").is_some() { launch(dev, "ink2_route_blk", &a, (n as u32, 1, 1), 128)?; } else { launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?; }
         if n == 1 {
-            let gu = ex.gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
-            let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
             let mut acc = Tensor::zeros(vec![hdim], DType::F32, dev).map_err(fe)?;
-            ex.down.gemv_indexed_dense_acc(&idx, &h, true, &wts, &mut acc).map_err(fe)?;
+            match &ex.store {
+                ExpertStore::Resident { gate_up, down, .. } => {
+                    let gu = gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
+                    let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
+                    down.gemv_indexed_dense_acc(&idx, &h, true, &wts, &mut acc).map_err(fe)?;
+                }
+                ExpertStore::Zc(z) => {
+                    // Те же ядра по таблицам пар: запись `p` — эксперт `idx[p]` (слот или RAM);
+                    // alpha и вес маршрута — по настоящему `idx`.
+                    let pool = self.zc_pool.as_ref().expect("пул zero-copy");
+                    let (gu_t, dn_t, iota) = z.stage(pool, &idx)?;
+                    let gu = gu_t.gemv_indexed_dense(&iota, xn, false).map_err(fe)?;
+                    let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
+                    dn_t.gemv_indexed_dense_acc(&iota, &h, true, &wts, &mut acc).map_err(fe)?;
+                }
+                ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
+            }
             return acc.reshape(vec![1, hdim]).map_err(fe);
         }
         let idx_h: Vec<u32> = idx.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
+        // Zero-copy: эксперты, уже лежащие в слотах, считаются первыми — подкачка
+        // промахов вытесняет только тех, чей GEMM уже поставлен в поток.
+        let resident: Option<Vec<bool>> = match &ex.store {
+            ExpertStore::Zc(z) => {
+                let mut r = vec![false; e];
+                for o in z.slot_owners()? {
+                    if o >= 0 && (o as usize) < e {
+                        r[o as usize] = true;
+                    }
+                }
+                Some(r)
+            }
+            _ => None,
+        };
         let pairs = n * k;
         let mut order: Vec<usize> = (0..pairs).collect();
-        order.sort_by_key(|&p| (idx_h[p], p));
+        match &resident {
+            Some(r) => order.sort_by_key(|&p| (!r[idx_h[p] as usize], idx_h[p], p)),
+            None => order.sort_by_key(|&p| (idx_h[p], p)),
+        }
         let mut rowmap = vec![0u32; pairs];
         let mut rows = Vec::with_capacity(pairs);
         let mut alpha_rows = Vec::with_capacity(pairs);
@@ -901,11 +1017,20 @@ impl Inkling2Model {
                 _ => segments.push((ei, pos as u32, pos as u32 + 1)),
             }
         }
-        let row_idx = Tensor::from_vec(rows, vec![pairs], dev).map_err(fe)?;
-        let gu = ex.gate_up.gemm_grouped_dense_rows(xn, Some(&row_idx), &segments, false).map_err(fe)?;
-        let at = Tensor::from_vec(alpha_rows, vec![pairs], dev).map_err(fe)?;
-        let h = self.act(&gu, &at, None, inter)?;
-        let y = bf16c(&ex.down.gemm_grouped_dense_rows(&h, None, &segments, false).map_err(fe)?)?;
+        let y = match &ex.store {
+            ExpertStore::Resident { gate_up, down, .. } => {
+                let row_idx = Tensor::from_vec(rows, vec![pairs], dev).map_err(fe)?;
+                let at = Tensor::from_vec(alpha_rows, vec![pairs], dev).map_err(fe)?;
+                let gu = gate_up.gemm_grouped_dense_rows(xn, Some(&row_idx), &segments, false).map_err(fe)?;
+                let h = self.act(&gu, &at, None, inter)?;
+                bf16c(&down.gemm_grouped_dense_rows(&h, None, &segments, false).map_err(fe)?)?
+            }
+            ExpertStore::Zc(z) => {
+                let r = resident.as_ref().expect("резиденты слоя");
+                self.moe_zc_prefill(z, xn, &rows, &alpha_rows, &segments, r, inter)?
+            }
+            ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
+        };
         let rm = Tensor::from_vec(rowmap, vec![pairs], dev).map_err(fe)?;
         let out = empty(vec![n, hdim], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -918,6 +1043,45 @@ impl Inkling2Model {
         a.u[2] = k as u32;
         launch(dev, "ink2_combine", &a, ((hdim as u32).div_ceil(256), n as u32, 1), 256)?;
         Ok(out)
+    }
+
+    /// Префилл MoE по слотам zero-copy: сегменты (уже по порядку «резиденты, затем
+    /// промахи») группами не больше числа слотов — группа целиком помещается в
+    /// слоты, её промахи копируются в слоты прошлых групп (их GEMM в потоке
+    /// раньше). Групповой GEMM — тот же, что у резидентного пути, по таблице группы.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_zc_prefill(&self, z: &ZcLayer, xn: &Tensor, row_idx: &[u32], alpha_rows: &[f32], segments: &[(u32, u32, u32)], resident: &[bool], inter: usize) -> R<Tensor> {
+        let pool = self.zc_pool.as_ref().expect("пул zero-copy");
+        let dev = self.device;
+        let cap = z.slots().max(1);
+        // Группы: сначала все попадания одной группой (сколько бы их ни было — они
+        // уже в слотах), промахи — по `cap`.
+        let hits = segments.iter().take_while(|s| resident[s.0 as usize]).count();
+        let mut groups: Vec<&[(u32, u32, u32)]> = Vec::new();
+        if hits > 0 {
+            groups.push(&segments[..hits]);
+        }
+        groups.extend(segments[hits..].chunks(cap));
+        let xn = bf16c(xn)?;
+        let mut parts: Vec<Tensor> = Vec::with_capacity(groups.len());
+        for g in groups {
+            let ids: Vec<u32> = g.iter().map(|s| s.0).collect();
+            let idx_g = Tensor::from_vec(ids, vec![g.len()], dev).map_err(fe)?;
+            let (gu_t, dn_t, _) = z.stage(pool, &idx_g)?;
+            let (r0, r1) = (g[0].1, g[g.len() - 1].2);
+            let segs: Vec<(u32, u32, u32)> = g.iter().enumerate().map(|(u, s)| (u as u32, s.1 - r0, s.2 - r0)).collect();
+            let (r0u, r1u) = (r0 as usize, r1 as usize);
+            let rows = Tensor::from_vec(row_idx[r0u..r1u].to_vec(), vec![r1u - r0u], dev).map_err(fe)?;
+            let gu = gu_t.gemm_grouped_dense_rows(&xn, Some(&rows), &segs, false).map_err(fe)?;
+            let at = Tensor::from_vec(alpha_rows[r0u..r1u].to_vec(), vec![r1u - r0u], dev).map_err(fe)?;
+            let h = self.act(&gu, &at, None, inter)?;
+            parts.push(bf16c(&dn_t.gemm_grouped_dense_rows(&h, None, &segs, false).map_err(fe)?)?);
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("одна группа"));
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        Tensor::cat(&refs, 0).map_err(fe)
     }
 
     /// Активация экспертов: `gu [R, 2I]`, множитель — `alpha[r]` либо `alpha[idx[r]]` → `[R, I]` BF16.
