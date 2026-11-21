@@ -274,6 +274,317 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
     PF(7)[(unsigned long long)t * nh * d + h * d + i] = o * sigm(g);
 }
 
+// Префилл-внимание на тензорных ядрах (flash, mma.sync m16n8k16 bf16 → F32): та же семантика,
+// что у ink2_attn (bias по расстоянию, окно, кольцо KV, синк, гейт). Блок — 64 запроса одной
+// головы (4 варпа × 16 строк), ключи плитками по 32, часть z из S по ключам (blockIdx.z).
+// Точность как у F32-пути: q и p расщеплены на bf16 hi + lo (два mma), k/v — bf16 кэша как
+// есть; online softmax и накопление — F32 (основание 2: q и r заранее ×log2e).
+// Bias плитки — маленький GEMM [16 строк × 16 каналов] × [16 × 48 расстояний] на варп
+// (r и срез proj расщеплены на hi + lo, три mma), таблица в shared варпа, сборка в логиты по
+// dist = pos_q − pos_k. Плитки дальше extent bias не считают (большинство на длинном контексте).
+// a0 q f32 [T,nh,128], a1 r f32 [T,nh,16], a2 proj f32 [16,extent], a3 sink f32 [T,nh],
+// a4 kcache, a5 vcache bf16 [nkv,cap,128], a6 gate f32 [T,nh·128], a7 out f32 [T,nh·128],
+// a8 части f32 [T,nh,S,130] (при S > 1; сборка — ink2_attn_merge с u9 = S), a10 позиция u32 | u6;
+// u0 T, u1 nh, u2 nkv, u5 cap, u7 window (0 — нет), u8 extent, u9 S (≤ 1 — сразу в out),
+// u10 кольцо KV (0 — линейно); f0 scale. grid = (ceil(T/64), nh, S), block = 128.
+#define FA_BM 64
+#define FA_BN 32
+#define FA_LD 136  // bf16 на строку K/V в shared (128 + 8: без конфликтов банков у ldmatrix)
+#define FA_PD 96   // строк среза proj на блок (расстояния плитки для 64 строк)
+#define FA_PLD 24  // bf16 на строку среза (16 каналов + паддинг)
+#define FA_BLD 52  // float на строку таблицы bias варпа (48 расстояний + паддинг)
+#define FA_L2E 1.4426950408889634f
+#define FA_LN2 0.6931471805599453f
+
+__device__ __forceinline__ void ink2_mma(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Пара (x0 — младший адрес, x1) → bf16x2 hi и остаток lo (x ≈ hi + lo с точностью ~2^-17).
+__device__ __forceinline__ void ink2_split2(float x0, float x1, unsigned& hi, unsigned& lo) {
+    __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
+    float2 hf = __bfloat1622float2(h);
+    __nv_bfloat162 l = __floats2bfloat162_rn(x0 - hf.x, x1 - hf.y);
+    hi = *(unsigned*)&h;
+    lo = *(unsigned*)&l;
+}
+
+__device__ __forceinline__ unsigned ink2_smem(const void* p) {
+    unsigned r;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(r) : "l"(p));
+    return r;
+}
+
+__device__ __forceinline__ void ink2_cp16(unsigned dst, const void* src, bool ok) {
+    // ok = false — заполнить нулями (src-size 0).
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(ok ? 16 : 0));
+}
+
+__device__ __forceinline__ void ink2_ldm4(unsigned* r, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+
+__device__ __forceinline__ void ink2_ldm4t(unsigned* r, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2) ink2_attn_fa(Ink2Args args) {
+    __shared__ __align__(16) __nv_bfloat16 ks[FA_BN * FA_LD];
+    __shared__ __align__(16) __nv_bfloat16 vs[FA_BN * FA_LD];
+    __shared__ __align__(16) __nv_bfloat16 prh[FA_PD * FA_PLD];
+    __shared__ __align__(16) __nv_bfloat16 prl[FA_PD * FA_PLD];
+    __shared__ __align__(16) float btab[4][16 * FA_BLD];
+    const unsigned T = args.u[0], nh = args.u[1], nkv = args.u[2], cap = args.u[5];
+    const unsigned window = args.u[7], extent = args.u[8], S = args.u[9] > 1 ? args.u[9] : 1u, ring = args.u[10];
+    const unsigned h = blockIdx.y, kvh = h / (nh / nkv), z = blockIdx.z;
+    const unsigned past = args.a[10] ? *(const unsigned int*)args.a[10] : args.u[6];
+    const unsigned t0 = blockIdx.x * FA_BM;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tg = lane & 3;
+    const unsigned wrow = t0 + w * 16;           // первая строка варпа
+    const unsigned ta = wrow + g, tb = ta + 8;   // строки потока
+    const bool va = ta < T, vb = tb < T;
+    const unsigned pa = past + ta, pb = past + tb;
+
+    // Ключи блока: [kbeg, kend), плитки [tile0, tile1) делятся на S частей.
+    const unsigned tlast = min(t0 + FA_BM, T) - 1u;
+    const unsigned kend = past + tlast + 1u;
+    const unsigned kbeg = (window && past + t0 + 1u > window) ? past + t0 + 1u - window : 0u;
+    const unsigned tile0 = kbeg / FA_BN, tile1 = (kend + FA_BN - 1u) / FA_BN;
+    const unsigned per = (tile1 - tile0 + S - 1u) / S;
+    const unsigned my0 = tile0 + z * per, my1 = min(my0 + per, tile1);
+
+    // q (×scale·log2e) и r (×log2e) — A-фрагменты hi/lo в регистрах.
+    unsigned qh[8][4], ql[8][4], rh[4], rl[4];
+    {
+        const float qs = args.f[0] * FA_L2E;
+        const float* q = CPF(0);
+        #pragma unroll
+        for (int kq = 0; kq < 8; ++kq) {
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                unsigned row = (r & 1) ? tb : ta;
+                unsigned col = kq * 16 + 2 * tg + ((r & 2) ? 8 : 0);
+                float2 x = make_float2(0.0f, 0.0f);
+                if (row < T) x = *(const float2*)(q + ((unsigned long long)row * nh + h) * 128 + col);
+                ink2_split2(x.x * qs, x.y * qs, qh[kq][r], ql[kq][r]);
+            }
+        }
+        const float* rr = CPF(1);
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            unsigned row = (r & 1) ? tb : ta;
+            unsigned col = 2 * tg + ((r & 2) ? 8 : 0);
+            float2 x = make_float2(0.0f, 0.0f);
+            if (row < T) x = *(const float2*)(rr + ((unsigned long long)row * nh + h) * 16 + col);
+            ink2_split2(x.x * FA_L2E, x.y * FA_L2E, rh[r], rl[r]);
+        }
+    }
+    float o[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
+    const __nv_bfloat16* kc = CPB(4) + (unsigned long long)kvh * cap * 128;
+    const __nv_bfloat16* vc = CPB(5) + (unsigned long long)kvh * cap * 128;
+    const float* proj = CPF(2);
+    float* bt = btab[w];
+    // Последняя строка варпа (для пропуска плиток) — в пределах T.
+    const unsigned wlast = wrow < T ? min(wrow + 15u, T - 1u) : 0u;
+
+    for (unsigned kt = my0; kt < my1; ++kt) {
+        const unsigned j0 = kt * FA_BN;
+        __syncthreads();  // прошлая плитка дочитана
+        for (int i = tid; i < FA_BN * 16; i += 128) {
+            int r = i >> 4, c = (i & 15) * 8;
+            unsigned j = j0 + r;
+            bool ok = j < kend;
+            unsigned long long jr = ok ? (ring ? j % ring : j) : 0ull;
+            ink2_cp16(ink2_smem(ks + r * FA_LD + c), kc + jr * 128 + c, ok);
+            ink2_cp16(ink2_smem(vs + r * FA_LD + c), vc + jr * 128 + c, ok);
+        }
+        asm volatile("cp.async.commit_group;\n");
+        // Ближняя плитка (у какой-то строки dist < extent): срез proj по расстояниям
+        // base0 .. base0+95, base0 = dist(строка t0, ключ j0+31).
+        const int base0 = (int)(past + t0) - (int)(j0 + FA_BN - 1);
+        const bool near_blk = base0 < (int)extent;
+        if (near_blk) {
+            for (int i = tid; i < FA_PD * 16; i += 128) {
+                int ch = i / FA_PD, di = i - ch * FA_PD, dist = base0 + di;
+                float v = (dist >= 0 && dist < (int)extent) ? proj[(unsigned long long)ch * extent + dist] : 0.0f;
+                __nv_bfloat16 hv = __float2bfloat16_rn(v);
+                prh[di * FA_PLD + ch] = hv;
+                prl[di * FA_PLD + ch] = __float2bfloat16_rn(v - __bfloat162float(hv));
+            }
+        }
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+
+        // Варп без видимых ключей в плитке — пропуск (синхронизации общие).
+        if (wrow >= T || j0 > past + wlast) continue;
+        if (window && (int)(past + wrow) - (int)(j0 + FA_BN - 1) >= (int)window) continue;
+
+        // S = Q·Kᵀ (q = hi + lo).
+        float s[4][4];
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        #pragma unroll
+        for (int kp = 0; kp < 4; ++kp) {
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                unsigned kb[4];
+                ink2_ldm4(kb, ink2_smem(ks + (n * 8 + (lane & 7)) * FA_LD + kp * 32 + (lane >> 3) * 8));
+                ink2_mma(s[n], ql[2 * kp], kb[0], kb[1]);
+                ink2_mma(s[n], qh[2 * kp], kb[0], kb[1]);
+                ink2_mma(s[n], ql[2 * kp + 1], kb[2], kb[3]);
+                ink2_mma(s[n], qh[2 * kp + 1], kb[2], kb[3]);
+            }
+        }
+
+        // Bias: таблица варпа bt[r][idx] = r_row · proj[:, base_w + idx], idx = r + 31 − c.
+        const int base_w = base0 + w * 16;
+        if (base_w < (int)extent) {
+            #pragma unroll
+            for (int nt = 0; nt < 6; ++nt) {
+                float c4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int pr = (w * 16 + nt * 8 + g) * FA_PLD + 2 * tg;
+                unsigned bh0 = *(const unsigned*)(prh + pr), bh1 = *(const unsigned*)(prh + pr + 8);
+                unsigned bl0 = *(const unsigned*)(prl + pr), bl1 = *(const unsigned*)(prl + pr + 8);
+                ink2_mma(c4, rl, bh0, bh1);
+                ink2_mma(c4, rh, bl0, bl1);
+                ink2_mma(c4, rh, bh0, bh1);
+                *(float2*)(bt + g * FA_BLD + nt * 8 + 2 * tg) = make_float2(c4[0], c4[1]);
+                *(float2*)(bt + (g + 8) * FA_BLD + nt * 8 + 2 * tg) = make_float2(c4[2], c4[3]);
+            }
+            __syncwarp();
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                #pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    int c = n * 8 + 2 * tg + e;
+                    s[n][e] += bt[g * FA_BLD + g + (FA_BN - 1) - c];
+                    s[n][2 + e] += bt[(g + 8) * FA_BLD + g + 8 + (FA_BN - 1) - c];
+                }
+            }
+            __syncwarp();
+        }
+
+        // Маска: каузальная, окно, строки за T. Плитка целиком видна всем строкам варпа — без неё.
+        const bool full = (wrow + 15u < T) && (j0 + FA_BN - 1u <= past + wrow) &&
+                          (!window || (int)(past + wrow + 15u) - (int)j0 < (int)window);
+        if (!full) {
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                #pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    unsigned j = j0 + n * 8 + 2 * tg + e;
+                    if (!va || j > pa || (window && pa - j >= window)) s[n][e] = -INFINITY;
+                    if (!vb || j > pb || (window && pb - j >= window)) s[n][2 + e] = -INFINITY;
+                }
+            }
+        }
+
+        // Online softmax (основание 2), строка — 4 лейна.
+        float mxa = -INFINITY, mxb = -INFINITY;
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            mxa = fmaxf(mxa, fmaxf(s[n][0], s[n][1]));
+            mxb = fmaxf(mxb, fmaxf(s[n][2], s[n][3]));
+        }
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 1));
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 2));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 1));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2));
+        const float mna = fmaxf(ma, mxa), mnb = fmaxf(mb, mxb);
+        const float ca = mna == -INFINITY ? 1.0f : exp2f(ma - mna);
+        const float cb = mnb == -INFINITY ? 1.0f : exp2f(mb - mnb);
+        float sa = 0.0f, sb = 0.0f;
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                float p0 = mna == -INFINITY ? 0.0f : exp2f(s[n][e] - mna);
+                float p1 = mnb == -INFINITY ? 0.0f : exp2f(s[n][2 + e] - mnb);
+                s[n][e] = p0;
+                s[n][2 + e] = p1;
+                sa += p0;
+                sb += p1;
+            }
+        }
+        sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+        sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+        sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+        sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+        la = la * ca + sa;
+        lb = lb * cb + sb;
+        ma = mna;
+        mb = mnb;
+        // O = O·c + P·V (p = hi + lo), V через ldmatrix.trans. P·V плитки — в свежем аккумуляторе,
+        // в O — обычным FMA F32: аккумулятор mma складывает с усечением, и за тысячи плиток
+        // (200K ключей) ошибка копилась бы линейно (~6·10⁻⁴ отн.); так — как у F32-пути.
+        unsigned ph[2][4], pl[2][4];
+        #pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            ink2_split2(s[2 * kk][0], s[2 * kk][1], ph[kk][0], pl[kk][0]);
+            ink2_split2(s[2 * kk][2], s[2 * kk][3], ph[kk][1], pl[kk][1]);
+            ink2_split2(s[2 * kk + 1][0], s[2 * kk + 1][1], ph[kk][2], pl[kk][2]);
+            ink2_split2(s[2 * kk + 1][2], s[2 * kk + 1][3], ph[kk][3], pl[kk][3]);
+        }
+        #pragma unroll
+        for (int np = 0; np < 8; ++np) {
+            float pv[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                unsigned vb4[4];
+                ink2_ldm4t(vb4, ink2_smem(vs + (kk * 16 + (lane & 15)) * FA_LD + np * 16 + (lane >> 4) * 8));
+                ink2_mma(pv[0], pl[kk], vb4[0], vb4[1]);
+                ink2_mma(pv[0], ph[kk], vb4[0], vb4[1]);
+                ink2_mma(pv[1], pl[kk], vb4[2], vb4[3]);
+                ink2_mma(pv[1], ph[kk], vb4[2], vb4[3]);
+            }
+            #pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                o[2 * np + x][0] = fmaf(o[2 * np + x][0], ca, pv[x][0]);
+                o[2 * np + x][1] = fmaf(o[2 * np + x][1], ca, pv[x][1]);
+                o[2 * np + x][2] = fmaf(o[2 * np + x][2], cb, pv[x][2]);
+                o[2 * np + x][3] = fmaf(o[2 * np + x][3], cb, pv[x][3]);
+            }
+        }
+    }
+
+    // Выход: S = 1 — синк, нормировка, гейт → out; иначе часть (m — в натуральных единицах).
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const unsigned t = half ? tb : ta;
+        if (t >= T) continue;
+        const float m = half ? mb : ma, l = half ? lb : la;
+        const int oi = half ? 2 : 0;
+        if (S > 1) {
+            float* d = PF(8) + (((unsigned long long)t * nh + h) * S + z) * 130;
+            #pragma unroll
+            for (int nd = 0; nd < 16; ++nd)
+                *(float2*)(d + 2 + nd * 8 + 2 * tg) = make_float2(o[nd][oi], o[nd][oi + 1]);
+            if (tg == 0) { d[0] = l > 0.0f ? m * FA_LN2 : -INFINITY; d[1] = l; }
+        } else {
+            const float sk = CPF(3)[(unsigned long long)t * nh + h] * FA_L2E;
+            const float M = l > 0.0f ? fmaxf(m, sk) : sk;
+            const float c = l > 0.0f ? exp2f(m - M) : 0.0f;
+            const float inv = c / (l * c + exp2f(sk - M));
+            const float* gt = CPF(6) + (unsigned long long)t * nh * 128 + h * 128;
+            float* out = PF(7) + (unsigned long long)t * nh * 128 + h * 128;
+            #pragma unroll
+            for (int nd = 0; nd < 16; ++nd) {
+                int col = nd * 8 + 2 * tg;
+                float2 gg = *(const float2*)(gt + col);
+                *(float2*)(out + col) = make_float2(o[nd][oi] * inv * sigm(gg.x), o[nd][oi + 1] * inv * sigm(gg.y));
+            }
+        }
+    }
+}
+
 // Сборка частей ink2_attn: блок на (токен, голову), 128 потоков; синк и гейт здесь.
 extern "C" __global__ void ink2_attn_merge(Ink2Args args) {
     unsigned int t = blockIdx.x, h = blockIdx.y, nh = args.u[1], S = args.u[9], d = 128, i = threadIdx.x;

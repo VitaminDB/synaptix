@@ -165,3 +165,12 @@ pub fn prof_report() -> String {
     p.clear();
     s
 }
+
+/// Число частей по ключам для `ink2_attn_fa` (префилл): `n` запросов, `nh` голов, `keys` —
+/// ключей на блок запросов. Цель — ~1024 блока на карту, часть не короче 1024 ключей
+/// (32 плитки), буфер частей `[n, nh, S, 130]` F32 — не больше 64 МБ.
+pub fn attn_fa_splits(n: usize, nh: usize, keys: usize) -> usize {
+    let base = n.div_ceil(64) * nh;
+    let by_mem = (64usize << 20) / (n * nh * 130 * 4).max(1);
+    1024usize.div_ceil(base.max(1)).min(keys.div_ceil(1024)).min(by_mem).clamp(1, 64)
+}

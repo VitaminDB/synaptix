@@ -878,14 +878,29 @@ impl Inkling2Model {
         if std::env::var_os("INK2_HOST_POS").is_none() { a.a[10] = addr(&cache.pos_dev)?; }
         // Части по ключам на декоде: число фиксировано от ёмкости окна (граф), ~64 позиции на часть.
         let span = if l.swa { t.sliding_window_size.min(cache.capacity) } else { cache.capacity };
-        let splits = if n == 1 { span.div_ceil(64).clamp(1, 32) } else { 1 };
+        // Префилл (T > 1) — flash-ядро на тензорных ядрах ink2_attn_fa (bias, окно, кольцо, синк, гейт);
+        // части по ключам — от длины контекста, сборка — ink2_attn_merge. INK2_OLD_ATTN=1 — прежнее ядро.
+        // Декод (T = 1): прежнее ink2_attn, число частей фиксировано от ёмкости (CUDA-граф).
+        let fa = n > 1 && d == 128 && dr == 16 && std::env::var_os("INK2_OLD_ATTN").is_none();
+        let splits = if fa {
+            let keys = if l.swa { (t.sliding_window_size + 64).min(past + n) } else { past + n };
+            kern::attn_fa_splits(n, nh, keys)
+        } else if n == 1 {
+            span.div_ceil(64).clamp(1, 32)
+        } else {
+            1
+        };
         let parts = if splits > 1 { Some(empty(vec![n * nh * splits * 130], DType::F32, dev)?) } else { None };
         if let Some(p) = &parts {
             a.a[8] = addr(p)?;
-            a.u[9] = splits as u32;
         }
+        a.u[9] = splits as u32;
         kern::stage("k_attn", dev, || -> R<()> {
-            launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
+            if fa {
+                launch(dev, "ink2_attn_fa", &a, ((n as u32).div_ceil(64), nh as u32, splits as u32), 128)?;
+            } else {
+                launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
+            }
             if parts.is_some() {
                 launch(dev, "ink2_attn_merge", &a, (n as u32, nh as u32, 1), 128)?;
             }
