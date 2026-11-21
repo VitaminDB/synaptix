@@ -143,12 +143,63 @@ pub struct Layer {
     lp: Option<LoopLayer>,
 }
 
+/// Формат KV слотов полного внимания (SWA-кольца всегда BF16: они малы).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFormat {
+    /// BF16, 2 байта на элемент.
+    Bf16,
+    /// MXFP8: E4M3 + масштаб E8M0 на 32 канала (8,25 бита на элемент).
+    Mxfp8,
+    /// INT8 + масштаб E8M0 на 32 канала (8,25 бита на элемент).
+    Int8,
+}
+
+impl KvFormat {
+    /// Код формата для ядер (`u11`).
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Bf16 => 0,
+            Self::Mxfp8 => 1,
+            Self::Int8 => 2,
+        }
+    }
+
+    /// Байт на элемент KV (с масштабами).
+    pub fn bytes_per_elem(self) -> f64 {
+        match self {
+            Self::Bf16 => 2.0,
+            Self::Mxfp8 | Self::Int8 => 1.0 + 1.0 / 32.0,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Mxfp8 => "mxfp8",
+            Self::Int8 => "int8",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bf16" => Some(Self::Bf16),
+            "mxfp8" | "fp8" => Some(Self::Mxfp8),
+            "int8" | "q8" => Some(Self::Int8),
+            _ => None,
+        }
+    }
+}
+
 /// Кэш одного слота (физический слой на своём проходе цикла).
 pub struct SlotCache {
     /// Кольцо KV SWA-слоя (окно + запас на чанк префилла); 0 — линейный кэш на весь контекст.
     ring: usize,
+    /// Формат KV слота: у квантованного `k`/`v` — байты `[nkv, cap, d]` U8, масштабы E8M0 — в `scales`.
+    fmt: KvFormat,
     k: Tensor,
     v: Tensor,
+    /// Масштабы квант-KV `[2, nkv, cap, d/32]` U8 (k, затем v).
+    scales: Option<Tensor>,
     k_state: Tensor,
     v_state: Tensor,
     attn_state: Tensor,
@@ -197,6 +248,9 @@ impl ModelCache {
             for t in [&mut s.k, &mut s.v, &mut s.k_state, &mut s.v_state, &mut s.attn_state, &mut s.ffn_state] {
                 moved += move_tensor(t, Device::Cpu)?;
             }
+            if let Some(t) = s.scales.as_mut() {
+                moved += move_tensor(t, Device::Cpu)?;
+            }
         }
         for t in [&mut self.pos_dev, &mut self.tok_dev] {
             moved += move_tensor(t, Device::Cpu)?;
@@ -210,6 +264,9 @@ impl ModelCache {
         let mut moved = 0;
         for s in self.slots.iter_mut() {
             for t in [&mut s.k, &mut s.v, &mut s.k_state, &mut s.v_state, &mut s.attn_state, &mut s.ffn_state] {
+                moved += move_tensor(t, device)?;
+            }
+            if let Some(t) = s.scales.as_mut() {
                 moved += move_tensor(t, device)?;
             }
         }
@@ -253,6 +310,8 @@ pub struct Inkling2Model {
     layers: Vec<Layer>,
     /// Пул слотов zero-copy (режим экспертов в RAM).
     zc_pool: Option<std::sync::Arc<ZcPool>>,
+    /// Формат KV слотов полного внимания у новых кэшей ([`Self::make_cache`]).
+    kv_fmt: KvFormat,
 }
 
 fn lerr(e: impl std::fmt::Display) -> LoadError {
@@ -405,7 +464,7 @@ impl Inkling2Model {
                 lp,
             });
         }
-        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, zc_pool: None })
+        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, zc_pool: None, kv_fmt: KvFormat::Bf16 })
     }
 
     /// Модель целиком, эксперты резидентны на карте.
@@ -467,6 +526,15 @@ impl Inkling2Model {
         Some(acc)
     }
 
+    /// Формат KV полных слотов для кэшей, созданных после вызова.
+    pub fn set_kv_format(&mut self, f: KvFormat) {
+        self.kv_fmt = f;
+    }
+
+    pub fn kv_format(&self) -> KvFormat {
+        self.kv_fmt
+    }
+
     /// Физический слой слота кэша.
     fn slot_phys(&self, slot: usize) -> usize {
         let n = self.cfg.text.num_hidden_layers;
@@ -492,10 +560,17 @@ impl Inkling2Model {
         for si in 0..self.cfg.num_slots() {
             let ring = self.slot_ring(si, capacity);
             let cap = if ring > 0 { ring } else { capacity };
+            let fmt = if self.cfg.is_swa(self.slot_phys(si)) { KvFormat::Bf16 } else { self.kv_fmt };
+            let (kdt, scales) = match fmt {
+                KvFormat::Bf16 => (DType::BF16, None),
+                _ => (DType::U8, Some(z(vec![2, nkv, cap, d / 32], DType::U8)?)),
+            };
             slots.push(SlotCache {
                 ring,
-                k: z(vec![nkv, cap, d], DType::BF16)?,
-                v: z(vec![nkv, cap, d], DType::BF16)?,
+                fmt,
+                k: z(vec![nkv, cap, d], kdt)?,
+                v: z(vec![nkv, cap, d], kdt)?,
+                scales,
                 k_state: z(vec![k - 1, nkv * d], DType::F32)?,
                 v_state: z(vec![k - 1, nkv * d], DType::F32)?,
                 attn_state: z(vec![k - 1, h], DType::F32)?,
@@ -548,14 +623,10 @@ impl Inkling2Model {
                 continue;
             }
             for kv in [&mut s.k, &mut s.v] {
-                let (nkv, d) = (kv.dims()[0], kv.dims()[2]);
-                if used > 0 {
-                    let head = kv.narrow(1, 0, used).map_err(fe)?;
-                    let pad = Tensor::zeros(vec![nkv, capacity - used, d], DType::BF16, self.device).map_err(fe)?;
-                    *kv = Tensor::cat(&[&head, &pad], 1).map_err(fe)?.contiguous().map_err(fe)?;
-                } else {
-                    *kv = Tensor::zeros(vec![nkv, capacity, d], DType::BF16, self.device).map_err(fe)?;
-                }
+                grow_rows(kv, 1, used, capacity)?;
+            }
+            if let Some(sc) = s.scales.as_mut() {
+                grow_rows(sc, 2, used, capacity)?;
             }
         }
         cache.capacity = capacity;
@@ -862,6 +933,10 @@ impl Inkling2Model {
         a.u[7] = (!l.swa) as u32;
         a.u[9] = sc.ring as u32;
         a.u[8] = t.log_scaling_n_floor as u32;
+        if let Some(scl) = &sc.scales {
+            a.a[11] = addr(scl)?;
+            a.u[11] = sc.fmt.code();
+        }
         a.f[0] = t.qk_l2_clip_threshold;
         a.f[1] = t.rel_l2_clip_threshold;
         a.f[2] = eps;
@@ -889,6 +964,10 @@ impl Inkling2Model {
         a.u[7] = if l.swa { t.sliding_window_size as u32 } else { 0 };
         a.u[10] = sc.ring as u32;
         a.u[8] = l.extent as u32;
+        if let Some(scl) = &sc.scales {
+            a.a[11] = addr(scl)?;
+            a.u[11] = sc.fmt.code();
+        }
         a.f[0] = 1.0 / (d as f32).sqrt();
         a.a[10] = addr(&cache.pos_dev)?;
         // Части по ключам на декоде: число фиксировано от ёмкости окна (граф), ~64 позиции на часть.
@@ -1116,6 +1195,22 @@ impl Inkling2Model {
         launch(self.device, "ink2_act", &a, ((inter as u32).div_ceil(256), rows as u32, 1), 256)?;
         Ok(out)
     }
+}
+
+/// Дорастить по оси `axis` (ёмкость) тензор `[.., cap, ..]` до `capacity`: первые `used`
+/// позиций копируются, остальное — нули (BF16 KV, U8 квант-KV и его масштабы).
+fn grow_rows(t: &mut Tensor, axis: usize, used: usize, capacity: usize) -> R<()> {
+    let mut shape = t.dims().to_vec();
+    if used == 0 {
+        shape[axis] = capacity;
+        *t = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
+        return Ok(());
+    }
+    let head = t.narrow(axis, 0, used).map_err(fe)?;
+    shape[axis] = capacity - used;
+    let pad = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
+    *t = Tensor::cat(&[&head, &pad], axis).map_err(fe)?.contiguous().map_err(fe)?;
+    Ok(())
 }
 
 /// Перевезти тензор на `dev` (карта ↔ host-RAM); байты переезда, 0 — уже там.

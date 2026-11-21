@@ -12,7 +12,7 @@ pub mod vision;
 
 pub use config::Inkling2Config;
 pub use loader::{Inkling2Weights, LoadError};
-pub use model::{Inkling2Model, ModelCache};
+pub use model::{Inkling2Model, KvFormat, ModelCache};
 pub use pipeline::{Inkling2Pipeline, Inkling2Session, PipelineError};
 pub use preprocess::{ImageLimits, PreparedImage};
 pub use vision::VisionTower;

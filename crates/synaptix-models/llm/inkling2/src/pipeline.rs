@@ -20,7 +20,7 @@ use crate::loader::{Inkling2Weights, LoadError};
 use synaptix_llm_common::expert_mirror::{self as em, ExpertStacks};
 use synaptix_llm_common::moe::ExpertSource;
 use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
-use crate::model::{Inkling2Model, ModelCache};
+use crate::model::{Inkling2Model, KvFormat, ModelCache};
 use crate::preprocess::{load_image, ImageLimits};
 use crate::vision::{expand_image_tokens, prefill_with_images, ImageSpan, VisionTower, IMAGE_TOKEN_ID};
 use synaptix_core::tensor::Tensor;
@@ -182,7 +182,6 @@ impl Inkling2Pipeline {
         let ctx = ctx.unwrap_or_else(planned_ctx).max(2);
         let stacks = w.expert_stacks().map(Arc::new);
         let experts_bytes: usize = stacks.as_deref().map_or(0, |s| em::mirror_ranges_natural(s, device).iter().map(|r| r.bytes.len()).sum());
-        let reserve = kv_fixed_bytes(&config) + ctx * kv_bytes_per_token(&config) + activation_reserve();
         let free = match device {
             Device::Cuda(ord) => {
                 let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
@@ -191,6 +190,32 @@ impl Inkling2Pipeline {
             _ => usize::MAX,
         };
         let zc_ok = stacks.as_deref().is_some_and(|s| em::experts_zc_capable(s)) && device.is_cuda();
+        // Байт слота zero-copy (gate_up + down всех слоёв) — нужен и для выбора формата KV.
+        let t = &config.text;
+        let (hidden, inter, ne) = (t.hidden_size, t.intermediate_size, t.n_routed_experts);
+        let mut dtypes = Vec::with_capacity(t.num_hidden_layers);
+        let mut per_slot = 0usize;
+        for l in 0..t.num_hidden_layers {
+            let dt = w.expert_dtype(l);
+            if let Some(dt) = dt {
+                let b = |n, k| synaptix_core::quant::matrix_blob_bytes(dt, n, k).map(|(p, s)| p + s).unwrap_or(0);
+                per_slot += b(2 * inter, hidden) + b(hidden, inter);
+            }
+            dtypes.push(dt);
+        }
+        // Формат KV полных слотов: BF16, пока он помещается (с экспертами в RAM и минимумом
+        // слотов); иначе MXFP8. `SYN_INKLING2_KV=bf16|mxfp8|int8` — вручную.
+        let min_slots = env_usize("SYN_INKLING2_ZC_MIN_SLOTS").unwrap_or(8);
+        let need = |f: KvFormat| {
+            kv_fixed_bytes(&config) + ctx * kv_bytes_per_token(&config, f) + activation_reserve() + zc_headroom() + min_slots * per_slot
+        };
+        let kv_fmt = match std::env::var("SYN_INKLING2_KV").ok().as_deref().and_then(KvFormat::parse) {
+            Some(f) => f,
+            None if free < need(KvFormat::Bf16) => KvFormat::Mxfp8,
+            None => KvFormat::Bf16,
+        };
+        model.set_kv_format(kv_fmt);
+        let reserve = kv_fixed_bytes(&config) + ctx * kv_bytes_per_token(&config, kv_fmt) + activation_reserve();
         let mode = match expert_mode_env() {
             Some(ExpertMode::Zc) if zc_ok => ExpertMode::Zc,
             Some(ExpertMode::Zc) => return Err(PipelineError::Load("zero-copy экспертов: нужен .syn-бандл NVFP4/MXFP8 и CUDA".into())),
@@ -199,8 +224,9 @@ impl Inkling2Pipeline {
             None => ExpertMode::Resident,
         };
         eprintln!(
-            "[inkling2] эксперты {:.1} ГБ, KV на {ctx} ток. + запас {:.1} ГБ, свободно {:.1} ГБ → {}",
+            "[inkling2] эксперты {:.1} ГБ, KV {} на {ctx} ток. + запас {:.1} ГБ, свободно {:.1} ГБ → {}",
             experts_bytes as f64 / GB,
+            kv_fmt.name(),
             reserve as f64 / GB,
             free as f64 / GB,
             if mode == ExpertMode::Zc { "zero-copy (эксперты в RAM, слоты VRAM)" } else { "эксперты на карте" }
@@ -225,20 +251,15 @@ impl Inkling2Pipeline {
         mirror.resume();
         wait_mirror()?;
         // Слоты: всё, что свободно после весов, KV на `ctx`, активаций и запаса соседям.
-        let t = &config.text;
-        let (hidden, inter, ne) = (t.hidden_size, t.intermediate_size, t.n_routed_experts);
-        let mut dtypes = Vec::with_capacity(t.num_hidden_layers);
-        let mut per_slot = 0usize;
-        for l in 0..t.num_hidden_layers {
-            let dt = w.expert_dtype(l).ok_or_else(|| PipelineError::Load(format!("слой {l}: формат экспертов")))?;
-            let b = |n, k| synaptix_core::quant::matrix_blob_bytes(dt, n, k).map(|(p, s)| p + s).unwrap_or(0);
-            per_slot += b(2 * inter, hidden) + b(hidden, inter);
-            dtypes.push(dt);
-        }
+        let dtypes: Vec<_> = dtypes
+            .into_iter()
+            .enumerate()
+            .map(|(l, dt)| dt.ok_or_else(|| PipelineError::Load(format!("слой {l}: формат экспертов"))))
+            .collect::<Result<_, _>>()?;
         let avail = free.saturating_sub(reserve + zc_headroom());
         let slots = env_usize("SYN_INKLING2_ZC_SLOTS").unwrap_or(avail / per_slot.max(1)).min(ne);
         let pool = ZcPool::new(device);
-        pool.set_min_slots(env_usize("SYN_INKLING2_ZC_MIN_SLOTS").unwrap_or(8));
+        pool.set_min_slots(min_slots);
         pool.set_slots_per_layer(slots);
         let src = em::BundleExperts::new(stacks.clone());
         let mut layers = Vec::with_capacity(t.num_hidden_layers);
@@ -281,7 +302,12 @@ impl Inkling2Pipeline {
     /// Байт KV на токен контекста: растут только слоты полного внимания (у SWA — кольцо
     /// фиксированного размера, см. [`Self::kv_fixed_bytes`]).
     pub fn kv_bytes_per_token(&self) -> usize {
-        kv_bytes_per_token(&self.config)
+        kv_bytes_per_token(&self.config, self.model.kv_format())
+    }
+
+    /// Формат KV слотов полного внимания (выбран при загрузке).
+    pub fn kv_format(&self) -> KvFormat {
+        self.model.kv_format()
     }
 
     /// Слотов полного внимания (физический полный слой × его проходы).
@@ -531,9 +557,9 @@ fn wait_mirror() -> Result<(), PipelineError> {
     }
 }
 
-fn kv_bytes_per_token(cfg: &Inkling2Config) -> usize {
+fn kv_bytes_per_token(cfg: &Inkling2Config, f: KvFormat) -> usize {
     let t = &cfg.text;
-    full_slots(cfg) * 2 * t.num_key_value_heads * t.head_dim * 2
+    full_slots(cfg) * 2 * t.num_key_value_heads * t.head_dim * (f.bytes_per_elem() * 32.0) as usize / 32
 }
 
 fn full_slots(cfg: &Inkling2Config) -> usize {
