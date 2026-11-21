@@ -16,6 +16,7 @@ use synaptix_core::dtype::DType;
 use synaptix_core::tensor::quant::QuantWeight;
 use synaptix_core::tensor::Tensor;
 use synaptix_io::weights::safetensors::{scan_shards, SafetensorsLoader};
+use synaptix_io::weights::syn_bundle::SynBundleLoader;
 use synaptix_io::weights::WeightLoader;
 use synaptix_kernels_cpu::quant::dequant::{nvfp4_scale_bytes, nvfp4_scale_index, nvfp4_sf_inner_dim};
 
@@ -35,6 +36,8 @@ pub const LLM: &str = "model.llm";
 
 pub struct Inkling2Weights {
     loader: Arc<SafetensorsLoader>,
+    /// `.syn`-бандл (упакован [`crate::pack`]); `loader` тогда смотрит в тот же mmap.
+    bundle: Option<SynBundleLoader>,
     pub config: Inkling2Config,
     pub tokenizer_json: Vec<u8>,
     pub chat_template: Option<String>,
@@ -57,7 +60,7 @@ impl Inkling2Weights {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         let path = path.as_ref();
         if !path.is_dir() {
-            return Err(LoadError::Io(format!("{}: ждём HF-каталог", path.display())));
+            return Self::open_bundle(path);
         }
         let cfg = std::fs::read(path.join("config.json")).map_err(|e| LoadError::Io(format!("config.json: {e}")))?;
         let config = Inkling2Config::from_bytes(&cfg).map_err(LoadError::Config)?;
@@ -73,15 +76,45 @@ impl Inkling2Weights {
             return Err(LoadError::Io(format!("нет .safetensors в {}", path.display())));
         }
         let loader = SafetensorsLoader::open_sharded(&shards).map_err(|e| LoadError::Io(e.to_string()))?;
-        Ok(Self { loader: Arc::new(loader), config, tokenizer_json, chat_template })
+        Ok(Self { loader: Arc::new(loader), bundle: None, config, tokenizer_json, chat_template })
+    }
+
+    fn open_bundle(path: &Path) -> Result<Self, LoadError> {
+        let b = SynBundleLoader::open(path).map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?;
+        let cfg = b.read_file("config.json").ok_or_else(|| LoadError::Io("в бандле нет config.json".into()))?;
+        let config = Inkling2Config::from_bytes(&cfg).map_err(LoadError::Config)?;
+        let tokenizer_json = b.read_file("tokenizer.json").unwrap_or_default();
+        let chat_template = b.read_file("chat_template.jinja").and_then(|v| String::from_utf8(v).ok());
+        let loader = SafetensorsLoader::open_bundle(path, None).map_err(|e| LoadError::Io(e.to_string()))?;
+        Ok(Self { loader: Arc::new(loader), bundle: Some(b), config, tokenizer_json, chat_template })
+    }
+
+    pub fn is_bundle(&self) -> bool {
+        self.bundle.is_some()
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.loader.tensor_info(name).is_some()
+        match &self.bundle {
+            Some(b) => b.contains(name),
+            None => self.loader.tensor_info(name).is_some(),
+        }
     }
 
     pub fn tensor(&self, name: &str, device: Device, dtype: DType) -> Result<Tensor, LoadError> {
-        self.loader.load_to(name, device, dtype).map_err(|e| LoadError::Weights(format!("{name}: {e}")))
+        let r = match &self.bundle {
+            Some(b) => b.load_to(name, device, dtype),
+            None => self.loader.load_to(name, device, dtype),
+        };
+        r.map_err(|e| LoadError::Weights(format!("{name}: {e}")))
+    }
+
+    /// Квантованная в бандле матрица и её общий множитель; `None` — плотная.
+    pub fn quant(&self, name: &str, device: Device) -> Result<Option<(QuantWeight, f32)>, LoadError> {
+        let Some(b) = &self.bundle else { return Ok(None) };
+        let Some(q) = b.load_quant(name, device) else { return Ok(None) };
+        let q = q.map_err(|e| LoadError::Weights(format!("{name}: {e}")))?;
+        let alpha = if self.contains(&format!("{name}_alpha")) { self.host_f32(&format!("{name}_alpha"))?[0] } else { 1.0 };
+        Ok(Some((q, alpha)))
     }
 
     /// Тензор в F32 на хосте.
@@ -100,6 +133,19 @@ impl Inkling2Weights {
     /// Эксперты слоя `layer`: NVFP4 (modelopt) или MXFP8.
     pub fn experts(&self, layer: usize, device: Device) -> Result<ExpertStack, LoadError> {
         let p = format!("{LLM}.layers.{layer}.mlp.experts");
+        if let Some(b) = &self.bundle {
+            let stack = |short: &str| -> Result<(Vec<QuantWeight>, Vec<f32>), LoadError> {
+                let name = format!("{p}.{short}");
+                let w = b
+                    .load_quant_stack(&name, device)
+                    .ok_or_else(|| LoadError::Weights(format!("{name}: не квант-стопка")))?
+                    .map_err(|e| LoadError::Weights(format!("{name}: {e}")))?;
+                Ok((w, self.host_f32(&format!("{name}_alpha"))?))
+            };
+            let (gate_up, alpha_gate_up) = stack("gate_up")?;
+            let (down, alpha_down) = stack("down")?;
+            return Ok(ExpertStack { gate_up, down, alpha_gate_up, alpha_down });
+        }
         let (gate_up, alpha_gate_up) = self.expert_matrix(&format!("{p}.w13_weight"), true, device)?;
         let (down, alpha_down) = self.expert_matrix(&format!("{p}.w2_weight"), false, device)?;
         Ok(ExpertStack { gate_up, down, alpha_gate_up, alpha_down })

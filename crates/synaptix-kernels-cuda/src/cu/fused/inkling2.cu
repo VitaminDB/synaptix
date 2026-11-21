@@ -243,11 +243,13 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
 }
 
 // Активация эксперта: g = α·gu[:I], u = α·gu[I:]; out = tanh(g/cg)·cg·σ(g)·tanh(u/cu)·cu (BF16).
-// a0 gu bf16 [R,2I], a1 alpha f32 [R], a2 out bf16 [R,I]; u0 R, u1 I; f0 cg, f1 cu.
+// α — a1[r] либо, при a3 ≠ 0, a1[idx[r]] (таблица множителей по экспертам, idx = a3 u32).
+// a0 gu bf16 [R,2I], a1 alpha f32, a2 out bf16 [R,I], a3 idx u32 [R]|0; u0 R, u1 I; f0 cg, f1 cu.
 extern "C" __global__ void ink2_act(Ink2Args args) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y, I = args.u[1];
     if (i >= I) return;
-    float a = CPF(1)[r];
+    const unsigned int* idx = (const unsigned int*)args.a[3];
+    float a = CPF(1)[idx ? idx[r] : r];
     const __nv_bfloat16* gu = CPB(0) + (unsigned long long)r * 2 * I;
     float g = __bfloat162float(gu[i]) * a, u = __bfloat162float(gu[I + i]) * a;
     float cg = args.f[0], cu = args.f[1];
@@ -256,7 +258,8 @@ extern "C" __global__ void ink2_act(Ink2Args args) {
 }
 
 // Маршрут: s = σ(logit); выбор top-k по s + bias; вес = s/(Σ s + 1e-20)·scale.
-// a0 logits f32 [T,E], a1 bias f32 [E], a2 idx u32 [T,k], a3 w f32 [T,k]; u0 T, u1 E (≤1024), u2 k; f0 scale.
+// a0 logits f32 [T,E], a1 bias f32 [E], a2 idx u32 [T,k], a3 w f32 [T,k], a4 множитель веса по эксперту f32 [E]|0;
+// u0 T, u1 E (≤1024), u2 k; f0 scale.
 extern "C" __global__ void ink2_route(Ink2Args args) {
     __shared__ float key[1024];
     __shared__ float bv[32];
@@ -297,7 +300,8 @@ extern "C" __global__ void ink2_route(Ink2Args args) {
         for (unsigned int k = 0; k < K; ++k) sum += sel_s[k];
         for (unsigned int k = 0; k < K; ++k) {
             ((unsigned int*)args.a[2])[t * K + k] = (unsigned int)sel_i[k];
-            PF(3)[t * K + k] = sel_s[k] / (sum + 1e-20f) * args.f[0];
+            float m = args.a[4] ? CPF(4)[sel_i[k]] : 1.0f;
+            PF(3)[t * K + k] = sel_s[k] / (sum + 1e-20f) * args.f[0] * m;
         }
     }
 }

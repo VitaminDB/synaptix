@@ -5,7 +5,10 @@ pub mod config;
 pub mod kern;
 pub mod loader;
 pub mod model;
+pub mod pack;
+pub mod pipeline;
 
 pub use config::Inkling2Config;
 pub use loader::{Inkling2Weights, LoadError};
 pub use model::{Inkling2Model, ModelCache};
+pub use pipeline::{Inkling2Pipeline, Inkling2Session, PipelineError};

@@ -7,7 +7,7 @@
 use synaptix_core::backend::Ink2Launch;
 use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
-use synaptix_core::tensor::quant::QuantWeight;
+use synaptix_core::tensor::quant::{ExpertTable, QuantWeight};
 use synaptix_core::tensor::Tensor;
 use synaptix_llm_common::ModelError;
 use synaptix_nn::linear::Linear;
@@ -17,24 +17,36 @@ use crate::config::Inkling2Config;
 use crate::kern::{self, addr, bf16c, empty, f32c, fe, launch, R};
 use crate::loader::{ExpertStack, Inkling2Weights, LoadError, LLM};
 
-/// Плотная проекция с BF16-весом `[out, in]`.
-pub struct Lin(Linear);
+/// Проекция: BF16-вес `[out, in]` либо квант-вес бандла с общим множителем.
+pub enum Lin {
+    Dense(Linear),
+    Quant(synaptix_llm_common::QLinear, f32),
+}
 
 impl Lin {
     fn load(w: &Inkling2Weights, name: &str, dev: Device) -> Result<Self, LoadError> {
+        if let Some((q, alpha)) = w.quant(name, dev)? {
+            return Ok(Self::Quant(synaptix_llm_common::QLinear::Quant(q), alpha));
+        }
         let t = w.tensor(name, dev, DType::BF16)?;
-        Ok(Self(Linear::new(t, None).map_err(|e| LoadError::Weights(format!("{name}: {e}")))?))
+        Ok(Self::Dense(Linear::new(t, None).map_err(|e| LoadError::Weights(format!("{name}: {e}")))?))
     }
 
-    /// `x [T, in]` (любой dtype) → `[T, out]` F32.
+    /// `x [T, in]` (любой dtype) → `[T, out]` в dtype движка (BF16).
+    fn raw(&self, x: &Tensor) -> R<Tensor> {
+        let x = bf16c(x)?;
+        match self {
+            Self::Dense(l) => l.forward(&x).map_err(fe),
+            Self::Quant(q, a) => {
+                let y = q.forward(&x)?;
+                if *a == 1.0 { Ok(y) } else { y.mul_scalar(*a).map_err(fe) }
+            }
+        }
+    }
+
+    /// `x [T, in]` → `[T, out]` F32.
     fn f32(&self, x: &Tensor) -> R<Tensor> {
-        let x = bf16c(x)?;
-        f32c(&self.0.forward(&x).map_err(fe)?)
-    }
-
-    fn bf16(&self, x: &Tensor) -> R<Tensor> {
-        let x = bf16c(x)?;
-        bf16c(&self.0.forward(&x).map_err(fe)?)
+        f32c(&self.raw(x)?)
     }
 }
 
@@ -53,10 +65,15 @@ struct LoopLayer {
 }
 
 struct Experts {
-    gate_up: Vec<QuantWeight>,
-    down: Vec<QuantWeight>,
+    /// Таблицы адресов весов экспертов на карте (плотная активация).
+    gate_up: ExpertTable,
+    down: ExpertTable,
     alpha_gate_up: Vec<f32>,
-    alpha_down: Vec<f32>,
+    /// Множители на карте `[E]`: gate_up — для активации, down — в вес маршрута.
+    alpha_gate_up_dev: Tensor,
+    alpha_down_dev: Tensor,
+    /// Держит веса живыми (таблицы — только адреса).
+    _weights: (Vec<QuantWeight>, Vec<QuantWeight>),
 }
 
 pub struct Layer {
@@ -275,7 +292,20 @@ impl Inkling2Model {
                 ffn_norm: f32t(&format!("{p}.mlp_norm.weight"))?,
                 router_t,
                 router_bias,
-                experts: Experts { gate_up, down, alpha_gate_up, alpha_down },
+                experts: {
+                    let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
+                    let dn_refs: Vec<&QuantWeight> = down.iter().collect();
+                    let gt = ExpertTable::build_dense(&gu_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица gate_up")))?;
+                    let dt = ExpertTable::build_dense(&dn_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица down")))?;
+                    Experts {
+                        gate_up: gt,
+                        down: dt,
+                        alpha_gate_up_dev: dev_f32(alpha_gate_up.clone(), vec![e], dev)?,
+                        alpha_down_dev: dev_f32(alpha_down, vec![e], dev)?,
+                        alpha_gate_up,
+                        _weights: (gate_up, down),
+                    }
+                },
                 lp,
             });
         }
@@ -299,6 +329,28 @@ impl Inkling2Model {
             });
         }
         Ok(ModelCache { slots, seq_len: 0, capacity })
+    }
+
+    /// Расширить кэш до `capacity` позиций: KV копируется, состояния свёрток те же.
+    pub fn grow_cache(&self, cache: &mut ModelCache, capacity: usize) -> R<()> {
+        if capacity <= cache.capacity {
+            return Ok(());
+        }
+        let used = cache.seq_len;
+        for s in cache.slots.iter_mut() {
+            for kv in [&mut s.k, &mut s.v] {
+                let (nkv, d) = (kv.dims()[0], kv.dims()[2]);
+                if used > 0 {
+                    let head = kv.narrow(1, 0, used).map_err(fe)?;
+                    let pad = Tensor::zeros(vec![nkv, capacity - used, d], DType::BF16, self.device).map_err(fe)?;
+                    *kv = Tensor::cat(&[&head, &pad], 1).map_err(fe)?.contiguous().map_err(fe)?;
+                } else {
+                    *kv = Tensor::zeros(vec![nkv, capacity, d], DType::BF16, self.device).map_err(fe)?;
+                }
+            }
+        }
+        cache.capacity = capacity;
+        Ok(())
     }
 
     /// Прогон токенов `ids` с позиции `cache.seq_len`. Возвращает логиты
@@ -358,7 +410,7 @@ impl Inkling2Model {
         let out = if all_logits { out } else { f32c(&out.narrow(0, n - 1, 1).map_err(fe)?)? };
         let rows = out.dims()[0];
         let xn = kern::rms(&out, Some(&self.norm), t.rms_norm_eps, true)?;
-        let logits = bf16c(&self.unembed.0.forward(&xn).map_err(fe)?)?;
+        let logits = bf16c(&self.unembed.raw(&xn)?)?;
         let vu = t.unpadded_vocab_size;
         let res = empty(vec![rows, vu], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -520,82 +572,64 @@ impl Inkling2Model {
         f32c(&ffn_inp.add(&y).map_err(fe)?)
     }
 
-    /// MoE: `xn [T, H]` BF16 → `[T, H]` F32.
+    /// MoE: `xn [T, H]` BF16 → `[T, H]` F32. Декод (T = 1) — целиком на карте,
+    /// без чтения маршрута хостом; префилл — групповой GEMM по экспертам.
     fn moe(&self, l: &Layer, xn: &Tensor) -> R<Tensor> {
         let t = &self.cfg.text;
         let n = xn.dims()[0];
         let (e, k, hdim, inter) = (t.n_routed_experts, t.num_experts_per_tok, t.hidden_size, t.intermediate_size);
         let dev = self.device;
+        let ex = &l.experts;
         let xf = f32c(xn)?;
         let logits = f32c(&xf.matmul(&l.router_t).map_err(fe)?)?;
-        let idx = empty(vec![n, k], DType::U32, dev)?;
-        let wts = empty(vec![n, k], DType::F32, dev)?;
+        let idx = empty(vec![n * k], DType::U32, dev)?;
+        let wts = empty(vec![n * k], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(&logits)?;
         a.a[1] = addr(&l.router_bias)?;
         a.a[2] = addr(&idx)?;
         a.a[3] = addr(&wts)?;
+        a.a[4] = addr(&ex.alpha_down_dev)?;
         a.u[0] = n as u32;
         a.u[1] = e as u32;
         a.u[2] = k as u32;
         a.f[0] = t.route_scale;
         launch(dev, "ink2_route", &a, (n as u32, 1, 1), 128)?;
-        let idx_h: Vec<u32> = idx.reshape(vec![n * k]).map_err(fe)?.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
-        let w_h: Vec<f32> = wts.reshape(vec![n * k]).map_err(fe)?.to_device(Device::Cpu).map_err(fe)?.to_vec1::<f32>().map_err(fe)?;
-        let ex = &l.experts;
+        if n == 1 {
+            let gu = ex.gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
+            let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
+            let mut acc = Tensor::zeros(vec![hdim], DType::F32, dev).map_err(fe)?;
+            ex.down.gemv_indexed_dense_acc(&idx, &h, true, &wts, &mut acc).map_err(fe)?;
+            return acc.reshape(vec![1, hdim]).map_err(fe);
+        }
+        let idx_h: Vec<u32> = idx.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
         let pairs = n * k;
-        // Строки выхода экспертов в порядке групп; rowmap[пара] — строка пары.
+        let mut order: Vec<usize> = (0..pairs).collect();
+        order.sort_by_key(|&p| (idx_h[p], p));
         let mut rowmap = vec![0u32; pairs];
-        let (y, alpha_rows_down): (Tensor, Vec<f32>) = if pairs <= 64 {
-            let gu_w: Vec<&QuantWeight> = idx_h.iter().map(|&i| &ex.gate_up[i as usize]).collect();
-            let rows: Vec<usize> = (0..pairs).map(|p| p / k).collect();
-            let gu = QuantWeight::gemv_batched_dense(&gu_w, xn, &rows).map_err(fe)?;
-            let alpha: Vec<f32> = idx_h.iter().map(|&i| ex.alpha_gate_up[i as usize]).collect();
-            let hact = self.act(&gu, &alpha, inter)?;
-            let dn_w: Vec<&QuantWeight> = idx_h.iter().map(|&i| &ex.down[i as usize]).collect();
-            let rows: Vec<usize> = (0..pairs).collect();
-            let y = QuantWeight::gemv_batched_dense(&dn_w, &hact, &rows).map_err(fe)?;
-            for (p, r) in rowmap.iter_mut().enumerate() {
-                *r = p as u32;
+        let mut rows = Vec::with_capacity(pairs);
+        let mut alpha_rows = Vec::with_capacity(pairs);
+        let mut segments: Vec<(u32, u32, u32)> = Vec::new();
+        for (pos, &p) in order.iter().enumerate() {
+            let ei = idx_h[p];
+            rowmap[p] = pos as u32;
+            rows.push((p / k) as u32);
+            alpha_rows.push(ex.alpha_gate_up[ei as usize]);
+            match segments.last_mut() {
+                Some(s) if s.0 == ei => s.2 = pos as u32 + 1,
+                _ => segments.push((ei, pos as u32, pos as u32 + 1)),
             }
-            (y, idx_h.iter().map(|&i| ex.alpha_down[i as usize]).collect())
-        } else {
-            let mut groups: Vec<Vec<usize>> = vec![Vec::new(); e];
-            for (p, &i) in idx_h.iter().enumerate() {
-                groups[i as usize].push(p);
-            }
-            let mut parts: Vec<Tensor> = Vec::new();
-            let mut alpha_rows = vec![0f32; pairs];
-            let mut row = 0usize;
-            for (ei, g) in groups.iter().enumerate() {
-                if g.is_empty() {
-                    continue;
-                }
-                let toks: Vec<u32> = g.iter().map(|&p| (p / k) as u32).collect();
-                let tt = Tensor::from_vec(toks, vec![g.len()], dev).map_err(fe)?;
-                let xe = bf16c(&xn.index_select(0, &tt).map_err(fe)?)?;
-                let wgu = ex.gate_up[ei].dequantize(DType::BF16).map_err(fe)?;
-                let gu = bf16c(&Linear::new(wgu, None).map_err(fe)?.forward(&xe).map_err(fe)?)?;
-                let hact = self.act(&gu, &vec![ex.alpha_gate_up[ei]; g.len()], inter)?;
-                let wd = ex.down[ei].dequantize(DType::BF16).map_err(fe)?;
-                let ye = bf16c(&Linear::new(wd, None).map_err(fe)?.forward(&hact).map_err(fe)?)?;
-                for &p in g {
-                    rowmap[p] = row as u32;
-                    alpha_rows[row] = ex.alpha_down[ei];
-                    row += 1;
-                }
-                parts.push(ye);
-            }
-            let refs: Vec<&Tensor> = parts.iter().collect();
-            (bf16c(&Tensor::cat(&refs, 0).map_err(fe)?)?, alpha_rows)
-        };
-        let wcomb: Vec<f32> = (0..pairs).map(|p| w_h[p] * alpha_rows_down[rowmap[p] as usize]).collect();
-        let wt = Tensor::from_vec(wcomb, vec![pairs], dev).map_err(fe)?;
+        }
+        let row_idx = Tensor::from_vec(rows, vec![pairs], dev).map_err(fe)?;
+        let gu = ex.gate_up.gemm_grouped_dense_rows(xn, Some(&row_idx), &segments, false).map_err(fe)?;
+        let at = Tensor::from_vec(alpha_rows, vec![pairs], dev).map_err(fe)?;
+        let h = self.act(&gu, &at, None, inter)?;
+        let y = bf16c(&ex.down.gemm_grouped_dense_rows(&h, None, &segments, false).map_err(fe)?)?;
         let rm = Tensor::from_vec(rowmap, vec![pairs], dev).map_err(fe)?;
         let out = empty(vec![n, hdim], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(&y)?;
-        a.a[1] = addr(&wt)?;
+        a.a[1] = addr(&wts)?;
         a.a[2] = addr(&rm)?;
         a.a[3] = addr(&out)?;
         a.u[0] = n as u32;
@@ -605,16 +639,16 @@ impl Inkling2Model {
         Ok(out)
     }
 
-    /// Активация экспертов: `gu [R, 2I]` BF16, множитель на строку → `[R, I]` BF16.
-    fn act(&self, gu: &Tensor, alpha: &[f32], inter: usize) -> R<Tensor> {
+    /// Активация экспертов: `gu [R, 2I]`, множитель — `alpha[r]` либо `alpha[idx[r]]` → `[R, I]` BF16.
+    fn act(&self, gu: &Tensor, alpha: &Tensor, idx: Option<&Tensor>, inter: usize) -> R<Tensor> {
         let gu = bf16c(gu)?;
         let rows = gu.dims()[0];
-        let at = Tensor::from_vec(alpha.to_vec(), vec![rows], self.device).map_err(fe)?;
         let out = empty(vec![rows, inter], DType::BF16, self.device)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(&gu)?;
-        a.a[1] = addr(&at)?;
+        a.a[1] = addr(alpha)?;
         a.a[2] = addr(&out)?;
+        a.a[3] = match idx { Some(i) => addr(i)?, None => 0 };
         a.u[0] = rows as u32;
         a.u[1] = inter as u32;
         a.f[0] = self.cfg.text.mlp_gate_softcap;
