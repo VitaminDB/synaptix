@@ -499,3 +499,149 @@ extern "C" __global__ void ink2_mix_out(Ink2Args args) {
         PF(9)[((unsigned long long)j * T + t) * H + i] = a;
     }
 }
+
+// Отладка: прежний блочный выбор top-k (сверка с варповым).
+extern "C" __global__ void ink2_route_blk(Ink2Args args) {
+    __shared__ float key[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    __shared__ float sel_s[16];
+    __shared__ int sel_i[16];
+    unsigned int t = blockIdx.x, E = args.u[1], K = args.u[2];
+    const float* lg = CPF(0) + (unsigned long long)t * E;
+    for (unsigned int e = threadIdx.x; e < E; e += blockDim.x) key[e] = sigm(lg[e]) + CPF(1)[e];
+    __syncthreads();
+    for (unsigned int k = 0; k < K; ++k) {
+        float best = -INFINITY;
+        int idx = -1;
+        for (unsigned int e = threadIdx.x; e < E; e += blockDim.x) {
+            if (key[e] > best) { best = key[e]; idx = (int)e; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            float ob = __shfl_xor_sync(0xffffffffu, best, o);
+            int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+            if (ob > best || (ob == best && oi >= 0 && (idx < 0 || oi < idx))) { best = ob; idx = oi; }
+        }
+        int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        if (lane == 0) { bv[wid] = best; bi[wid] = idx; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int nw = (blockDim.x + 31) >> 5;
+            float b = bv[0];
+            int ii = bi[0];
+            for (int w = 1; w < nw; ++w) if (bv[w] > b || (bv[w] == b && bi[w] >= 0 && bi[w] < ii)) { b = bv[w]; ii = bi[w]; }
+            sel_i[k] = ii;
+            sel_s[k] = sigm(lg[ii]);
+            key[ii] = -INFINITY;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (unsigned int k = 0; k < K; ++k) sum += sel_s[k];
+        for (unsigned int k = 0; k < K; ++k) {
+            ((unsigned int*)args.a[2])[t * K + k] = (unsigned int)sel_i[k];
+            float m = args.a[4] ? CPF(4)[sel_i[k]] : 1.0f;
+            PF(3)[t * K + k] = sel_s[k] / (sum + 1e-20f) * args.f[0] * m;
+        }
+    }
+}
+
+
+// Отладка: исходные ink2_mix / ink2_attn (сверка).
+extern "C" __global__ void ink2_mix_orig(Ink2Args args) {
+    __shared__ float red[32];
+    __shared__ float inv[8];
+    __shared__ float prob[4][8];
+    unsigned int t = blockIdx.x, ns = args.u[0], T = args.u[1], H = args.u[2], nq = args.u[3];
+    const float* q = CPF(8);
+    for (unsigned int s = 0; s < ns; ++s) {
+        const float* x = CPF(s) + (unsigned long long)t * H;
+        float ss = 0.0f;
+        float dq[4] = {0.f, 0.f, 0.f, 0.f};
+        for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+            float v = x[i];
+            ss += v * v;
+            for (unsigned int j = 0; j < nq; ++j) dq[j] += v * q[j * H + i];
+        }
+        ss = block_sum(ss, red);
+        float iv = rsqrtf(ss / (float)H + 1e-6f);
+        for (unsigned int j = 0; j < nq; ++j) {
+            float d = block_sum(dq[j], red);
+            if (threadIdx.x == 0) prob[j][s] = d * iv * rsqrtf((float)H);
+        }
+        if (threadIdx.x == 0) inv[s] = iv;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        unsigned int j = threadIdx.x;
+        float m = -INFINITY;
+        for (unsigned int s = 0; s < ns; ++s) m = fmaxf(m, prob[j][s]);
+        float l = 0.0f;
+        for (unsigned int s = 0; s < ns; ++s) { float e = expf(prob[j][s] - m); prob[j][s] = e; l += e; }
+        for (unsigned int s = 0; s < ns; ++s) prob[j][s] /= l;
+    }
+    __syncthreads();
+    for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
+        float xs[8];
+        for (unsigned int s = 0; s < ns; ++s) xs[s] = CPF(s)[(unsigned long long)t * H + i] * inv[s];
+        for (unsigned int j = 0; j < nq; ++j) {
+            float acc = 0.0f;
+            for (unsigned int s = 0; s < ns; ++s) acc += prob[j][s] * xs[s];
+            PF(9)[((unsigned long long)j * T + t) * H + i] = acc;
+        }
+    }
+}
+extern "C" __global__ void ink2_attn_orig(Ink2Args args) {
+    __shared__ float sm_m[4], sm_l[4];
+    __shared__ float sm_acc[4][128];
+    unsigned int t = blockIdx.x, h = blockIdx.y;
+    unsigned int nh = args.u[1], nkv = args.u[2], d = 128, dr = args.u[4], cap = args.u[5];
+    unsigned int window = args.u[7], extent = args.u[8];
+    unsigned int pos = args.u[6] + t;
+    unsigned int kvh = h / (nh / nkv);
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    unsigned long long qo = ((unsigned long long)t * nh + h) * d;
+    float q[4];
+    for (int j = 0; j < 4; ++j) q[j] = CPF(0)[qo + lane * 4 + j] * args.f[0];
+    float rr = lane < (int)dr ? CPF(1)[((unsigned long long)t * nh + h) * dr + lane] : 0.0f;
+    const float* proj = CPF(2);
+    const __nv_bfloat16* kc = CPB(4) + (unsigned long long)kvh * cap * d;
+    const __nv_bfloat16* vc = CPB(5) + (unsigned long long)kvh * cap * d;
+    unsigned int lo = (window && pos + 1 > window) ? pos + 1 - window : 0;
+    float m = -INFINITY, l = 0.0f, acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (unsigned int j = lo + wid; j <= pos; j += 4) {
+        const __nv_bfloat16* kr = kc + (unsigned long long)j * d + lane * 4;
+        float2 k01 = __bfloat1622float2(*(const __nv_bfloat162*)kr);
+        float2 k23 = __bfloat1622float2(*(const __nv_bfloat162*)(kr + 2));
+        float part = q[0] * k01.x + q[1] * k01.y + q[2] * k23.x + q[3] * k23.y;
+        unsigned int dist = pos - j;
+        if (dist < extent && lane < (int)dr) part += rr * proj[(unsigned long long)lane * extent + dist];
+        float s = warp_sum(part);
+        float mn = fmaxf(m, s);
+        float corr = expf(m - mn), p = expf(s - mn);
+        const __nv_bfloat16* vr = vc + (unsigned long long)j * d + lane * 4;
+        float2 v01 = __bfloat1622float2(*(const __nv_bfloat162*)vr);
+        float2 v23 = __bfloat1622float2(*(const __nv_bfloat162*)(vr + 2));
+        acc[0] = acc[0] * corr + p * v01.x;
+        acc[1] = acc[1] * corr + p * v01.y;
+        acc[2] = acc[2] * corr + p * v23.x;
+        acc[3] = acc[3] * corr + p * v23.y;
+        l = l * corr + p;
+        m = mn;
+    }
+    if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+    for (int j = 0; j < 4; ++j) sm_acc[wid][lane * 4 + j] = acc[j];
+    __syncthreads();
+    float sink = CPF(3)[(unsigned long long)t * nh + h];
+    float M = sink;
+    for (int w = 0; w < 4; ++w) M = fmaxf(M, sm_m[w]);
+    float L = expf(sink - M);
+    for (int w = 0; w < 4; ++w) if (sm_l[w] > 0.0f) L += sm_l[w] * expf(sm_m[w] - M);
+    unsigned int i = threadIdx.x;  // 128 потоков — по измерению
+    float o = 0.0f;
+    for (int w = 0; w < 4; ++w) if (sm_l[w] > 0.0f) o += sm_acc[w][i] * expf(sm_m[w] - M);
+    o /= L;
+    float g = CPF(6)[(unsigned long long)t * nh * d + h * d + i];
+    PF(7)[(unsigned long long)t * nh * d + h * d + i] = o * sigm(g);
+}

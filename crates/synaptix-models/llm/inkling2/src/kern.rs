@@ -75,6 +75,14 @@ pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     a.u[2] = h as u32;
     a.u[3] = nq as u32;
     let dev = states[0].device();
+    if std::env::var_os("INK2_ORIG_MIX").is_some() {
+        launch(dev, "ink2_mix_orig", &a, (t as u32, 1, 1), 256)?;
+        return Ok(out);
+    }
+    if std::env::var_os("INK2_OLD_MIX").is_some() {
+        launch(dev, "ink2_mix", &a, (t as u32, 1, 1), 1024)?;
+        return Ok(out);
+    }
     let b = (h as u32).div_ceil(256);
     let part = empty(vec![t * b as usize * 40], DType::F32, dev)?;
     a.a[10] = addr(&part)?;
