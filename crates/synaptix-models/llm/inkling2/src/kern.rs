@@ -74,7 +74,13 @@ pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     a.u[1] = t as u32;
     a.u[2] = h as u32;
     a.u[3] = nq as u32;
-    launch(states[0].device(), "ink2_mix", &a, (t as u32, 1, 1), 256)?;
+    let dev = states[0].device();
+    let b = (h as u32).div_ceil(256);
+    let part = empty(vec![t * b as usize * 40], DType::F32, dev)?;
+    a.a[10] = addr(&part)?;
+    a.u[4] = b;
+    launch(dev, "ink2_mix_part", &a, (t as u32, b, 1), 256)?;
+    launch(dev, "ink2_mix_out", &a, (t as u32, b, 1), 256)?;
     Ok(out)
 }
 
@@ -105,4 +111,49 @@ pub fn conv(x: &Tensor, w: &Tensor, state: &Tensor, dynamic: Option<(&Tensor, us
     a.f[0] = scale;
     launch(x.device(), "ink2_conv", &a, ((c as u32).div_ceil(256), 1, 1), 256)?;
     Ok(out)
+}
+
+static PROF: std::sync::Mutex<Vec<(&'static str, f64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INK2_PROF").is_some())
+}
+
+fn sync(dev: Device) {
+    if let Device::Cuda(o) = dev {
+        if let Ok(s) = synaptix_core::device::cuda::default_stream(o) {
+            let _ = s.synchronize();
+        }
+    }
+}
+
+/// Этап с замером (`INK2_PROF`): синхронизация карты до и после — время ядер этапа.
+pub fn stage<T>(name: &'static str, dev: Device, f: impl FnOnce() -> T) -> T {
+    if !prof_on() {
+        return f();
+    }
+    sync(dev);
+    let t = std::time::Instant::now();
+    let out = f();
+    sync(dev);
+    let dt = t.elapsed().as_secs_f64();
+    let mut p = PROF.lock().unwrap();
+    match p.iter_mut().find(|e| e.0 == name) {
+        Some(e) => {
+            e.1 += dt;
+            e.2 += 1;
+        }
+        None => p.push((name, dt, 1)),
+    }
+    out
+}
+
+pub fn prof_report() -> String {
+    let mut p = PROF.lock().unwrap();
+    p.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let total: f64 = p.iter().map(|e| e.1).sum();
+    let s = p.iter().map(|(n, t, c)| format!("  {n}: {:.1} мс ({:.1}%), {c}\n", t * 1e3, 100.0 * t / total.max(1e-12))).collect();
+    p.clear();
+    s
 }

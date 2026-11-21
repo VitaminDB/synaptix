@@ -21,6 +21,7 @@ serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 half                = { workspace = true }
 rayon               = { workspace = true }
+cudarc              = { workspace = true }
 
 [dev-dependencies]
 synaptix-kernels-cuda = { workspace = true }

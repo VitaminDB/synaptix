@@ -206,7 +206,7 @@ impl Inkling2Pipeline {
             if !sink.on_token(tok) || eos.contains(&tok) || out.len() >= cfg.max_new_tokens {
                 break;
             }
-            let l = no_grad(|| self.model.forward(&[tok], &mut s.cache, false))?;
+            let l = no_grad(|| self.model.decode(tok, &mut s.cache))?;
             s.ids.push(tok);
             tok = sampler.sample(&l)?;
         }

@@ -29,6 +29,8 @@ pub enum Fmt {
     Keep,
     Nvfp4,
     Mxfp8,
+    /// int8 с масштабом на строку (`DType::Q8Row`).
+    Q8row,
 }
 
 impl Fmt {
@@ -37,7 +39,8 @@ impl Fmt {
             "keep" | "bf16" | "none" => Ok(Self::Keep),
             "nvfp4" => Ok(Self::Nvfp4),
             "mxfp8" => Ok(Self::Mxfp8),
-            o => Err(format!("формат {o}: keep | nvfp4 | mxfp8")),
+            "q8row" => Ok(Self::Q8row),
+            o => Err(format!("формат {o}: keep | nvfp4 | mxfp8 | q8row")),
         }
     }
 }
@@ -161,9 +164,9 @@ impl Inkling2Stream {
             let fits = shape.len() == 2 && shape[0] % 64 == 0 && shape[1] % 64 == 0;
             if quant != Fmt::Keep && fits {
                 let (n, k) = (shape[0], shape[1]);
-                let fmt_key = if quant == Fmt::Nvfp4 { "nvfp4" } else { "mxfp8" };
+                let fmt_key = match quant { Fmt::Nvfp4 => "nvfp4", Fmt::Q8row => "q8row", _ => "mxfp8" };
                 manifest.tensors.insert(name.clone(), QuantEntry { format: fmt_key.into(), shape: vec![n, k] });
-                let (pk, sc) = if quant == Fmt::Nvfp4 { (k / 2, nvfp4_scale_bytes(n, k)) } else { (k, n * k / 32) };
+                let (pk, sc) = match quant { Fmt::Nvfp4 => (k / 2, nvfp4_scale_bytes(n, k)), Fmt::Q8row => (k, n * 4), _ => (k, n * k / 32) };
                 plan.push(StreamTensor { name: format!("{name}{PACKED_SUFFIX}"), dtype: StDtype::U8, shape: vec![n, pk] });
                 items.push(Item::Dense { src: name.clone(), part: Part::Packed, target: quant });
                 plan.push(StreamTensor { name: format!("{name}{SCALES_SUFFIX}"), dtype: StDtype::U8, shape: vec![sc] });
@@ -275,6 +278,9 @@ impl Inkling2Stream {
         let p = if target == Fmt::Nvfp4 {
             let (p, s, g) = nvfp4_alpha(&w, n, k)?;
             Packed { packed: p, scales: s, alpha: vec![g] }
+        } else if target == Fmt::Q8row {
+            let (p, sc) = synaptix_core::quant::q8row::quantize(&w, n, k, None);
+            Packed { packed: p, scales: sc.iter().flat_map(|v| v.to_le_bytes()).collect(), alpha: vec![1.0] }
         } else {
             let (p, s) = quantize_mxfp8_rows(&w, n, k).map_err(|e| e.to_string())?;
             Packed { packed: p, scales: s, alpha: vec![1.0] }

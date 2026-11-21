@@ -32,6 +32,14 @@ impl Lin {
         Ok(Self::Dense(Linear::new(t, None).map_err(|e| LoadError::Weights(format!("{name}: {e}")))?))
     }
 
+    /// Плотные BF16-матрицы с общим входом, склеенные по выходам — один GEMV вместо нескольких.
+    fn cat(w: &Inkling2Weights, names: &[String], dev: Device) -> Result<Self, LoadError> {
+        let ts: Vec<Tensor> = names.iter().map(|n| w.tensor(n, dev, DType::BF16)).collect::<Result<_, _>>()?;
+        let refs: Vec<&Tensor> = ts.iter().collect();
+        let t = Tensor::cat(&refs, 0).map_err(lerr)?.contiguous().map_err(lerr)?;
+        Ok(Self::Dense(Linear::new(t, None).map_err(lerr)?))
+    }
+
     /// `x [T, in]` (любой dtype) → `[T, out]` в dtype движка (BF16).
     fn raw(&self, x: &Tensor) -> R<Tensor> {
         let x = bf16c(x)?;
@@ -51,11 +59,12 @@ impl Lin {
 }
 
 /// Контроллер входа повторного прохода: `(1 − tanh(F·d))·x + tanh(G·d)·m`,
-/// `d = Down·[rms(x); rms(m)]`. Веса F32, транспонированы под `x · W`.
+/// `d = Down·[rms(x); rms(m)]`. Веса F32: down `[R, 2H]`, gain/forget транспонированы в `[R, H]`.
 struct Ctrl {
-    down_t: Tensor,
-    gain_t: Tensor,
-    forget_t: Tensor,
+    down: Tensor,
+    gain: Tensor,
+    forget: Tensor,
+    rank: usize,
 }
 
 struct LoopLayer {
@@ -80,17 +89,16 @@ pub struct Layer {
     swa: bool,
     attn_norm: Option<Tensor>,
     qkv_norm: Option<[Tensor; 3]>,
-    wq: Lin,
-    wk: Lin,
-    wv: Lin,
+    /// Слитые проекции с общим входом: `pa` = q | r | gate | sink (вход q),
+    /// `pk` = k | отводы k-свёртки, `pv` = v | отводы v-свёртки.
+    pa: Lin,
+    pk: Lin,
+    pv: Lin,
     wo: Lin,
-    wr: Lin,
-    wgate: Lin,
-    wsink: Lin,
+
     k_conv: Tensor,
     v_conv: Tensor,
-    k_conv_proj: Option<Lin>,
-    v_conv_proj: Option<Lin>,
+    dyn_conv: bool,
     q_clip: Tensor,
     r_clip: Tensor,
     rel_proj: Tensor,
@@ -100,7 +108,7 @@ pub struct Layer {
     attn_post_conv: Tensor,
     ffn_post_conv: Tensor,
     ffn_norm: Tensor,
-    router_t: Tensor,
+    router: Tensor,
     router_bias: Tensor,
     experts: Experts,
     lp: Option<LoopLayer>,
@@ -116,14 +124,36 @@ pub struct SlotCache {
     ffn_state: Tensor,
 }
 
+/// CUDA-граф шага декода. Сырые указатели драйвера не `Send`; граф запускается
+/// только через `&mut ModelCache` — по одному потоку за раз.
+pub struct GraphHandle(std::sync::Arc<cudarc::driver::CudaGraph>);
+// SAFETY: доступ исключительный (через `&mut` кэша), драйвер допускает вызовы из разных потоков по очереди.
+unsafe impl Send for GraphHandle {}
+unsafe impl Sync for GraphHandle {}
+
 pub struct ModelCache {
     pub slots: Vec<SlotCache>,
     pub seq_len: usize,
     pub capacity: usize,
+    /// Позиция начала прогона (U32 `[1]`): ядра читают её с карты, поэтому шаг
+    /// декода от позиции не зависит и записывается в граф один раз.
+    pos_dev: Tensor,
+    /// Токен шага декода (U32 `[1]`) и логиты шага (F32 `[1, V]`) — постоянные буферы графа.
+    tok_dev: Tensor,
+    out_dev: Option<Tensor>,
+    graph: Option<GraphHandle>,
+    warm: u32,
 }
 
 impl ModelCache {
+    /// Граф держит адреса KV и состояний: после их замены он негоден.
+    fn drop_graph(&mut self) {
+        self.graph = None;
+        self.warm = 0;
+    }
+
     pub fn reset(&mut self) -> R<()> {
+        self.drop_graph();
         self.seq_len = 0;
         for s in self.slots.iter_mut() {
             for t in [&mut s.k_state, &mut s.v_state, &mut s.attn_state, &mut s.ffn_state] {
@@ -229,8 +259,8 @@ impl Inkling2Model {
                 (
                     conv_w(w, &format!("{a}.k_sconv.static_w"), k, dev)?,
                     conv_w(w, &format!("{a}.v_sconv.static_w"), k, dev)?,
-                    Some(Lin::load(w, &format!("{a}.k_sconv.weight_proj"), dev)?),
-                    Some(Lin::load(w, &format!("{a}.v_sconv.weight_proj"), dev)?),
+                    Some(format!("{a}.k_sconv.weight_proj")),
+                    Some(format!("{a}.v_sconv.weight_proj")),
                 )
             };
             let attn_res_q = if i > 0 {
@@ -243,7 +273,7 @@ impl Inkling2Model {
             let ffn_res_q = dev_f32(w.host_f32(&format!("{LLM}.attn_res.mlp_queries.{i}"))?, vec![1, h], dev)?;
             let router = w.host_f32(&format!("{p}.mlp.gate.weight"))?;
             let e = t.n_routed_experts;
-            let router_t = dev_t(&router, e, h, dev)?;
+            let router = dev_f32(router, vec![e, h], dev)?;
             let router_bias = dev_f32(w.host_f32(&format!("{p}.mlp.gate.bias"))?, vec![e], dev)?;
             let ExpertStack { gate_up, down, alpha_gate_up, alpha_down } = w.experts(i, dev)?;
             let lp = if let (Some((q, kv)), true) = (&msg, cfg.loop_layer(i)) {
@@ -256,9 +286,10 @@ impl Inkling2Model {
                 let ctrl = |name: &str| -> Result<Ctrl, LoadError> {
                     let c = format!("{p}.controllers.{name}");
                     Ok(Ctrl {
-                        down_t: dev_t(&w.host_f32(&format!("{c}.down_weight"))?, rank, 2 * h, dev)?,
-                        gain_t: dev_t(&w.host_f32(&format!("{c}.gain_weight"))?, h, rank, dev)?,
-                        forget_t: dev_t(&w.host_f32(&format!("{c}.forget_weight"))?, h, rank, dev)?,
+                        down: dev_f32(w.host_f32(&format!("{c}.down_weight"))?, vec![rank, 2 * h], dev)?,
+                        gain: dev_t(&w.host_f32(&format!("{c}.gain_weight"))?, h, rank, dev)?,
+                        forget: dev_t(&w.host_f32(&format!("{c}.forget_weight"))?, h, rank, dev)?,
+                        rank,
                     })
                 };
                 Some(LoopLayer { msg_q: dev_f32(mq, vec![4, h], dev)?, ctrl: [ctrl("attn")?, ctrl("k")?, ctrl("v")?, ctrl("mlp")?] })
@@ -270,17 +301,14 @@ impl Inkling2Model {
                 swa,
                 attn_norm,
                 qkv_norm,
-                wq: Lin::load(w, &format!("{a}.wq_du.weight"), dev)?,
-                wk: Lin::load(w, &format!("{a}.wk_dv.weight"), dev)?,
-                wv: Lin::load(w, &format!("{a}.wv_dv.weight"), dev)?,
+                pa: Lin::cat(w, &[format!("{a}.wq_du.weight"), format!("{a}.wr_du.weight"), format!("{a}.gate_attn.weight"), format!("{a}.attn_sink_proj.weight")], dev)?,
+                pk: Lin::cat(w, &[&[format!("{a}.wk_dv.weight")][..], k_conv_proj.as_slice()].concat(), dev)?,
+                pv: Lin::cat(w, &[&[format!("{a}.wv_dv.weight")][..], v_conv_proj.as_slice()].concat(), dev)?,
                 wo: Lin::load(w, &format!("{a}.wo_ud.weight"), dev)?,
-                wr: Lin::load(w, &format!("{a}.wr_du.weight"), dev)?,
-                wgate: Lin::load(w, &format!("{a}.gate_attn.weight"), dev)?,
-                wsink: Lin::load(w, &format!("{a}.attn_sink_proj.weight"), dev)?,
+
                 k_conv,
                 v_conv,
-                k_conv_proj,
-                v_conv_proj,
+                dyn_conv: !swa,
                 q_clip: f32t(&format!("{a}.q_l2_clip.scale"))?,
                 r_clip: f32t(&format!("{a}.rel_l2_clip.scale"))?,
                 rel_proj: f32t(&format!("{a}.rel_logits_proj.proj"))?,
@@ -290,7 +318,7 @@ impl Inkling2Model {
                 attn_post_conv: conv_w(w, &format!("{p}.attn_sconv.weight"), k, dev)?,
                 ffn_post_conv: conv_w(w, &format!("{p}.mlp_sconv.weight"), k, dev)?,
                 ffn_norm: f32t(&format!("{p}.mlp_norm.weight"))?,
-                router_t,
+                router,
                 router_bias,
                 experts: {
                     let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
@@ -328,7 +356,16 @@ impl Inkling2Model {
                 ffn_state: z(vec![k - 1, h], DType::F32)?,
             });
         }
-        Ok(ModelCache { slots, seq_len: 0, capacity })
+        Ok(ModelCache {
+            slots,
+            seq_len: 0,
+            capacity,
+            pos_dev: z(vec![1], DType::U32)?,
+            tok_dev: z(vec![1], DType::U32)?,
+            out_dev: None,
+            graph: None,
+            warm: 0,
+        })
     }
 
     /// Расширить кэш до `capacity` позиций: KV копируется, состояния свёрток те же.
@@ -336,6 +373,7 @@ impl Inkling2Model {
         if capacity <= cache.capacity {
             return Ok(());
         }
+        cache.drop_graph();
         let used = cache.seq_len;
         for s in cache.slots.iter_mut() {
             for kv in [&mut s.k, &mut s.v] {
@@ -357,15 +395,78 @@ impl Inkling2Model {
     /// `[1, V]` последнего токена (или всех `[T, V]` при `all_logits`), F32,
     /// словарь без паддинга.
     pub fn forward(&self, ids: &[u32], cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
-        let t = &self.cfg.text;
         let n = ids.len();
         let past = cache.seq_len;
         if past + n > cache.capacity {
             return Err(ModelError::Forward(format!("inkling2: кэш {} < {}", cache.capacity, past + n)));
         }
+        cache.pos_dev.write_host_u32(&[past as u32]).map_err(fe)?;
+        let idt = Tensor::from_vec(ids.to_vec(), vec![n], self.device).map_err(fe)?;
+        let out = self.forward_dev(&idt, cache, all_logits)?;
+        cache.seq_len = past + n;
+        Ok(out)
+    }
+
+    /// Шаг декода одного токена: после прогрева — проигрыш CUDA-графа.
+    /// Возвращает логиты `[1, V]` (буфер графа: годен до следующего шага).
+    pub fn decode(&self, tok: u32, cache: &mut ModelCache) -> R<Tensor> {
+        let past = cache.seq_len;
+        if past + 1 > cache.capacity {
+            return Err(ModelError::Forward(format!("inkling2: кэш {} < {}", cache.capacity, past + 1)));
+        }
+        let graph_on = std::env::var("SYN_INKLING2_GRAPH").as_deref() != Ok("0") && self.device.is_cuda();
+        cache.pos_dev.write_host_u32(&[past as u32]).map_err(fe)?;
+        cache.tok_dev.write_host_u32(&[tok]).map_err(fe)?;
+        if let (true, Some(g)) = (graph_on, &cache.graph) {
+            g.0.launch().map_err(|e| ModelError::Forward(format!("граф декода: {e:?}")))?;
+            cache.seq_len = past + 1;
+            return Ok(cache.out_dev.clone().expect("буфер графа"));
+        }
+        if !graph_on || cache.warm < 2 {
+            let tokt = cache.tok_dev.clone();
+            let out = self.forward_dev(&tokt, cache, false)?;
+            cache.warm += 1;
+            cache.seq_len = past + 1;
+            return Ok(out);
+        }
+        let Device::Cuda(ord) = self.device else { unreachable!() };
+        let vu = self.cfg.text.unpadded_vocab_size;
+        if cache.out_dev.is_none() {
+            cache.out_dev = Some(Tensor::zeros(vec![1, vu], DType::F32, self.device).map_err(fe)?);
+        }
+        let stream = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        let tokt = cache.tok_dev.clone();
+        let out_buf = cache.out_dev.clone().expect("буфер");
+        let mut err: Option<ModelError> = None;
+        let mut cap = synaptix_infer::graph_capture::GraphCapturer::new(0);
+        let res = cap.capture_with(&stream, |_| {
+            let r = self.forward_dev(&tokt, cache, false).and_then(|l| copy_into(&out_buf, &l));
+            r.map_err(|e| {
+                let m = e.to_string();
+                err = Some(e);
+                synaptix_infer::InferError::Other(m)
+            })
+        });
+        match (res, err) {
+            (Ok(g), None) => {
+                g.launch().map_err(|e| ModelError::Forward(format!("граф декода: {e:?}")))?;
+                cache.graph = Some(GraphHandle(g));
+                cache.seq_len = past + 1;
+                Ok(out_buf)
+            }
+            (_, Some(e)) => Err(e),
+            (Err(e), None) => Err(ModelError::Forward(format!("граф декода: захват: {e}"))),
+        }
+    }
+
+    /// Прогон по токенам на карте (`idt` U32 `[T]`) с позиции из `cache.pos_dev`;
+    /// хост в нём не участвует, кроме маршрута MoE префилла (T > 1).
+    fn forward_dev(&self, idt: &Tensor, cache: &mut ModelCache, all_logits: bool) -> R<Tensor> {
+        let t = &self.cfg.text;
+        let n = idt.dims()[0];
+        let past = cache.seq_len;
         let dev = self.device;
-        let idt = Tensor::from_vec(ids.to_vec(), vec![n], dev).map_err(fe)?;
-        let x = synaptix_ops::embed::token_embedding(&idt, &self.embed).map_err(fe)?;
+        let x = self.embed.embed_gather(idt).map_err(fe)?;
         let x = f32c(&x.reshape(vec![n, t.hidden_size]).map_err(fe)?)?;
         let mut cur = kern::rms(&x, Some(&self.embed_norm), t.rms_norm_eps, false)?;
 
@@ -422,20 +523,35 @@ impl Inkling2Model {
         a.u[3] = 1;
         a.f[0] = t.final_logit_softcapping;
         launch(dev, "ink2_logits", &a, ((vu as u32).div_ceil(256), rows as u32, 1), 256)?;
-        cache.seq_len = past + n;
         Ok(res)
     }
 
     fn control(&self, x: &Tensor, m: &Tensor, c: &Ctrl) -> R<Tensor> {
-        let eps = 1e-6;
-        let xr = kern::rms(x, None, eps, false)?;
-        let mr = kern::rms(m, None, eps, false)?;
-        let cat = Tensor::cat(&[&xr, &mr], 1).map_err(fe)?;
-        let d = cat.matmul(&c.down_t).map_err(fe)?;
-        let gain = d.matmul(&c.gain_t).map_err(fe)?.tanh().map_err(fe)?;
-        let forget = d.matmul(&c.forget_t).map_err(fe)?.tanh().map_err(fe)?;
-        let keep = x.sub(&forget.mul(x).map_err(fe)?).map_err(fe)?;
-        f32c(&keep.add(&gain.mul(m).map_err(fe)?).map_err(fe)?)
+        let (n, h) = (x.dims()[0], x.dims()[1]);
+        let dev = self.device;
+        let d = empty(vec![n, c.rank], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = addr(x)?;
+        a.a[1] = addr(m)?;
+        a.a[2] = addr(&c.down)?;
+        a.a[3] = addr(&d)?;
+        a.u[0] = n as u32;
+        a.u[1] = h as u32;
+        a.u[2] = c.rank as u32;
+        launch(dev, "ink2_ctrl_down", &a, (n as u32, c.rank as u32, 1), 256)?;
+        let out = empty(vec![n, h], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = addr(x)?;
+        a.a[1] = addr(m)?;
+        a.a[2] = addr(&d)?;
+        a.a[3] = addr(&c.gain)?;
+        a.a[4] = addr(&c.forget)?;
+        a.a[5] = addr(&out)?;
+        a.u[0] = n as u32;
+        a.u[1] = h as u32;
+        a.u[2] = c.rank as u32;
+        launch(dev, "ink2_ctrl_out", &a, ((h as u32).div_ceil(256), n as u32, 1), 256)?;
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -453,7 +569,7 @@ impl Inkling2Model {
         if let Some(q) = &l.attn_res_q {
             let mut states: Vec<&Tensor> = blocks.iter().collect();
             states.push(&cur);
-            let mixed = kern::mix(&states, q)?;
+            let mixed = kern::stage("mix", dev, || kern::mix(&states, q))?;
             for (j, inp) in inputs.iter_mut().enumerate() {
                 *inp = f32c(&kern::pick(&mixed, if l.swa { 0 } else { j })?)?;
             }
@@ -462,7 +578,7 @@ impl Inkling2Model {
             let lp = l.lp.as_ref().expect("контроллеры есть, раз есть сообщения");
             for (j, inp) in inputs.iter_mut().enumerate() {
                 let msg = f32c(&kern::pick(m, j)?)?;
-                *inp = self.control(inp, &msg, &lp.ctrl[j])?;
+                *inp = kern::stage("control", dev, || self.control(inp, &msg, &lp.ctrl[j]))?;
             }
         }
         let normed: [Tensor; 3] = if l.swa {
@@ -481,21 +597,21 @@ impl Inkling2Model {
         let sc = &mut cache.slots[slot];
         let k_scale = 1.0 / ((t.sconv_kernel_size + 1) as f32).sqrt();
         let kd_scale = 1.0 / ((2 * t.sconv_kernel_size + 1) as f32).sqrt();
-        let q = l.wq.f32(&normed[0])?;
-        let kraw = l.wk.f32(&normed[1])?;
-        let vraw = l.wv.f32(&normed[2])?;
-        let (kc, vc) = match (&l.k_conv_proj, &l.v_conv_proj) {
-            (Some(kp), Some(vp)) => {
-                let kdyn = kp.f32(&normed[1])?;
-                let vdyn = vp.f32(&normed[2])?;
-                (
-                    kern::conv(&kraw, &l.k_conv, &sc.k_state, Some((&kdyn, nkv)), kd_scale)?,
-                    kern::conv(&vraw, &l.v_conv, &sc.v_state, Some((&vdyn, nkv)), kd_scale)?,
-                )
-            }
-            _ => (kern::conv(&kraw, &l.k_conv, &sc.k_state, None, k_scale)?, kern::conv(&vraw, &l.v_conv, &sc.v_state, None, k_scale)?),
+        let col = |y: &Tensor, off: usize, len: usize| -> R<Tensor> { y.narrow(1, off, len).map_err(fe)?.contiguous().map_err(fe) };
+        let ya = kern::stage("proj_a", dev, || l.pa.f32(&normed[0]))?;
+        let (q, r, gate, sink) = (col(&ya, 0, nh * d)?, col(&ya, nh * d, nh * dr)?, col(&ya, nh * d + nh * dr, nh * d)?, col(&ya, 2 * nh * d + nh * dr, nh)?);
+        let (yk, yv) = kern::stage("proj_kv", dev, || -> R<_> { Ok((l.pk.f32(&normed[1])?, l.pv.f32(&normed[2])?)) })?;
+        let kk = t.sconv_kernel_size;
+        let (kc, vc) = if l.dyn_conv {
+            let (kraw, kdyn) = (col(&yk, 0, nkv * d)?, col(&yk, nkv * d, nkv * kk)?);
+            let (vraw, vdyn) = (col(&yv, 0, nkv * d)?, col(&yv, nkv * d, nkv * kk)?);
+            (
+                kern::conv(&kraw, &l.k_conv, &sc.k_state, Some((&kdyn, nkv)), kd_scale)?,
+                kern::conv(&vraw, &l.v_conv, &sc.v_state, Some((&vdyn, nkv)), kd_scale)?,
+            )
+        } else {
+            (kern::conv(&yk, &l.k_conv, &sc.k_state, None, k_scale)?, kern::conv(&yv, &l.v_conv, &sc.v_state, None, k_scale)?)
         };
-        let r = l.wr.f32(&normed[0])?;
         let q_out = empty(vec![n, nh * d], DType::F32, dev)?;
         let r_out = empty(vec![n, nh * dr], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -522,10 +638,9 @@ impl Inkling2Model {
         a.f[1] = t.rel_l2_clip_threshold;
         a.f[2] = eps;
         a.f[3] = t.log_scaling_alpha;
-        launch(dev, "ink2_qkv", &a, (n as u32, (nh + 2 * nkv) as u32, 1), d as u32)?;
+        a.a[10] = addr(&cache.pos_dev)?;
+        kern::stage("k_qkv", dev, || launch(dev, "ink2_qkv", &a, (n as u32, (nh + 2 * nkv) as u32, 1), d as u32))?;
 
-        let sink = l.wsink.f32(&normed[0])?;
-        let gate = l.wgate.f32(&normed[0])?;
         let att = empty(vec![n, nh * d], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(&q_out)?;
@@ -546,8 +661,23 @@ impl Inkling2Model {
         a.u[7] = if l.swa { t.sliding_window_size as u32 } else { 0 };
         a.u[8] = l.extent as u32;
         a.f[0] = 1.0 / (d as f32).sqrt();
-        launch(dev, "ink2_attn", &a, (n as u32, nh as u32, 1), 128)?;
-        let o = l.wo.f32(&att)?;
+        a.a[10] = addr(&cache.pos_dev)?;
+        // Части по ключам на декоде: число фиксировано от ёмкости окна (граф), ~64 позиции на часть.
+        let span = if l.swa { t.sliding_window_size.min(cache.capacity) } else { cache.capacity };
+        let splits = if n == 1 { span.div_ceil(64).clamp(1, 32) } else { 1 };
+        let parts = if splits > 1 { Some(empty(vec![n * nh * splits * 130], DType::F32, dev)?) } else { None };
+        if let Some(p) = &parts {
+            a.a[8] = addr(p)?;
+            a.u[9] = splits as u32;
+        }
+        kern::stage("k_attn", dev, || -> R<()> {
+            launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
+            if parts.is_some() {
+                launch(dev, "ink2_attn_merge", &a, (n as u32, nh as u32, 1), 128)?;
+            }
+            Ok(())
+        })?;
+        let o = kern::stage("proj_o", dev, || l.wo.f32(&att))?;
         let mut cur = kern::conv(&o, &l.attn_post_conv, &sc.attn_state, None, k_scale)?;
 
         if ip % t.n_layers_per_attn_res_block == 0 {
@@ -565,7 +695,7 @@ impl Inkling2Model {
             m = self.control(&m, &mm, &lp.ctrl[3])?;
         }
         let xn = kern::rms(&m, Some(&l.ffn_norm), eps, true)?;
-        let y = self.moe(l, &xn)?;
+        let y = kern::stage("moe", dev, || self.moe(l, &xn))?;
         let sc = &mut cache.slots[slot];
         let y = kern::conv(&y, &l.ffn_post_conv, &sc.ffn_state, None, k_scale)?;
         let _ = h;
@@ -581,7 +711,15 @@ impl Inkling2Model {
         let dev = self.device;
         let ex = &l.experts;
         let xf = f32c(xn)?;
-        let logits = f32c(&xf.matmul(&l.router_t).map_err(fe)?)?;
+        let logits = empty(vec![n, e], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = addr(&xf)?;
+        a.a[1] = addr(&l.router)?;
+        a.a[2] = addr(&logits)?;
+        a.u[0] = n as u32;
+        a.u[1] = hdim as u32;
+        a.u[2] = e as u32;
+        launch(dev, "ink2_router", &a, (n as u32, (e as u32).div_ceil(8), 1), 256)?;
         let idx = empty(vec![n * k], DType::U32, dev)?;
         let wts = empty(vec![n * k], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -594,7 +732,7 @@ impl Inkling2Model {
         a.u[1] = e as u32;
         a.u[2] = k as u32;
         a.f[0] = t.route_scale;
-        launch(dev, "ink2_route", &a, (n as u32, 1, 1), 128)?;
+        launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?;
         if n == 1 {
             let gu = ex.gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
             let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
@@ -656,4 +794,17 @@ impl Inkling2Model {
         launch(self.device, "ink2_act", &a, ((inter as u32).div_ceil(256), rows as u32, 1), 256)?;
         Ok(out)
     }
+}
+
+/// D2D-копия `src` в постоянный буфер `dst` той же формы (на default-стриме).
+fn copy_into(dst: &Tensor, src: &Tensor) -> R<()> {
+    let src = if src.is_contiguous() { src.clone() } else { src.contiguous().map_err(fe)? };
+    let (d, dl) = dst.cuda_region().map_err(fe)?;
+    let (s, sl) = src.cuda_region().map_err(fe)?;
+    if dl != sl {
+        return Err(ModelError::Shape("inkling2: размеры буферов графа".into()));
+    }
+    let Device::Cuda(ord) = dst.device() else { return Err(ModelError::Forward("не CUDA".into())) };
+    let ds = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+    synaptix_core::device::cuda::dtod_into_region(&ds, d, s, dl).map_err(fe)
 }

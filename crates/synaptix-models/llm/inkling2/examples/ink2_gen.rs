@@ -36,12 +36,13 @@ fn main() {
     let mut out = vec![order[0] as u32];
     let t2 = Instant::now();
     while out.len() < n_new {
-        let l = model.forward(&[*out.last().unwrap()], &mut cache, false).expect("step");
+        let l = model.decode(*out.last().unwrap(), &mut cache).expect("step");
         let v = l.to_device(Device::Cpu).unwrap().reshape(vec![l.dims()[1]]).unwrap().to_vec1::<f32>().unwrap();
         let best = v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         out.push(best as u32);
     }
     eprintln!("декод {} ток. {:.2} ток/с", out.len() - 1, (out.len() - 1) as f32 / t2.elapsed().as_secs_f32());
+    eprint!("{}", synaptix_llm_inkling2::kern::prof_report());
     println!("gen ids {:?}", out);
     println!("text {:?}", tok.decode(&out, false).unwrap_or_default());
 }
