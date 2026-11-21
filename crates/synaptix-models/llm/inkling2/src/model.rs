@@ -1078,19 +1078,16 @@ impl Inkling2Model {
         a.u[1] = e as u32;
         a.u[2] = k as u32;
         a.f[0] = t.route_scale;
-        // Декод: накопитель взвешенной суммы экспертов обнуляет сам ink2_route.
-        let acc0 = if n == 1 { Some(empty(vec![hdim], DType::F32, dev)?) } else { None };
-        if let Some(acc) = &acc0 {
-            a.a[5] = addr(acc)?;
-            a.u[3] = hdim as u32;
-        }
         launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?;
-        if let Some(mut acc) = acc0 {
-            match &ex.store {
+        if n == 1 {
+            // Декод — та же схема, что у префилла и эталона: выход эксперта в BF16 по парам
+            // `[k, H]`, затем `ink2_combine` в фиксированном порядке k = 0..K−1 (F32) с весами
+            // маршрута (alpha_down уже в `wts`). Без атомарного накопления — детерминированно.
+            let y = match &ex.store {
                 ExpertStore::Resident { gate_up, down, .. } => {
                     let gu = gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
                     let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
-                    down.gemv_indexed_dense_acc(&idx, &h, true, &wts, &mut acc).map_err(fe)?;
+                    down.gemv_indexed_dense(&idx, &h, true).map_err(fe)?
                 }
                 ExpertStore::Zc(z) => {
                     // Те же ядра по таблицам пар: запись `p` — эксперт `idx[p]` (слот или RAM);
@@ -1099,11 +1096,11 @@ impl Inkling2Model {
                     let (gu_t, dn_t, iota) = z.stage(pool, &idx)?;
                     let gu = gu_t.gemv_indexed_dense(&iota, xn, false).map_err(fe)?;
                     let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
-                    dn_t.gemv_indexed_dense_acc(&iota, &h, true, &wts, &mut acc).map_err(fe)?;
+                    dn_t.gemv_indexed_dense(&iota, &h, true).map_err(fe)?
                 }
                 ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
-            }
-            return acc.reshape(vec![1, hdim]).map_err(fe);
+            };
+            return self.combine(&y, &wts, None, n, hdim, k);
         }
         let idx_h: Vec<u32> = idx.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
         // Zero-copy: эксперты, уже лежащие в слотах, считаются первыми — подкачка
@@ -1155,16 +1152,22 @@ impl Inkling2Model {
             ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
         };
         let rm = Tensor::from_vec(rowmap, vec![pairs], dev).map_err(fe)?;
-        let out = empty(vec![n, hdim], DType::F32, dev)?;
+        self.combine(&y, &wts, Some(&rm), n, hdim, k)
+    }
+
+    /// Сборка MoE: `out[t] = Σ_k w[t·K+k] · y[rowmap[t·K+k]]` (F32, порядок k = 0..K−1).
+    /// `y` — `[P, H]` BF16; `rowmap` = None — тождественный (строка пары `p` = `p`).
+    fn combine(&self, y: &Tensor, wts: &Tensor, rowmap: Option<&Tensor>, n: usize, hdim: usize, k: usize) -> R<Tensor> {
+        let out = empty(vec![n, hdim], DType::F32, self.device)?;
         let mut a = Ink2Launch::default();
-        a.a[0] = addr(&y)?;
-        a.a[1] = addr(&wts)?;
-        a.a[2] = addr(&rm)?;
+        a.a[0] = addr(y)?;
+        a.a[1] = addr(wts)?;
+        a.a[2] = match rowmap { Some(r) => addr(r)?, None => 0 };
         a.a[3] = addr(&out)?;
         a.u[0] = n as u32;
         a.u[1] = hdim as u32;
         a.u[2] = k as u32;
-        launch(dev, "ink2_combine", &a, ((hdim as u32).div_ceil(256), n as u32, 1), 256)?;
+        launch(self.device, "ink2_combine", &a, ((hdim as u32).div_ceil(256), n as u32, 1), 256)?;
         Ok(out)
     }
 

@@ -787,15 +787,12 @@ extern "C" __global__ void ink2_act(Ink2Args args) {
 
 // Маршрут: s = σ(logit); выбор top-k по s + bias; вес = s/(Σ s + 1e-20)·scale.
 // a0 logits f32 [T,E], a1 bias f32 [E], a2 idx u32 [T,k], a3 w f32 [T,k], a4 множитель веса по эксперту f32 [E]|0;
-// a5 f32 [u3]|0 — обнулить (накопитель MoE декода: без отдельного memset в графе);
 // u0 T, u1 E (≤1024), u2 k; f0 scale.
 extern "C" __global__ void ink2_route(Ink2Args args) {
     // Один варп на токен: у лейна E/32 ключей в регистрах, k раундов argmax по варпу.
     unsigned int t = blockIdx.x, E = args.u[1], K = args.u[2];
     int lane = threadIdx.x & 31;
     if (threadIdx.x >= 32) return;
-    if (args.a[5] && t == 0)
-        for (unsigned int i = lane; i < args.u[3]; i += 32) PF(5)[i] = 0.0f;
     const float* lg = CPF(0) + (unsigned long long)t * E;
     if (E <= 128 && K <= 32) {
         // E ≤ 128: ключи и σ — в регистрах (развёрнуто, без local memory), σ выбранного берётся
@@ -871,7 +868,9 @@ extern "C" __global__ void ink2_route(Ink2Args args) {
 }
 
 // Сборка MoE: out[t] = Σ_k w[t·K+k]·y[rowmap[t·K+k]] (F32).
-// a0 y bf16 [P,H], a1 w f32 [T·K], a2 rowmap u32 [T·K], a3 out f32 [T,H]; u0 T, u1 H, u2 K.
+// Порядок суммы фиксирован (k = 0..K−1) — результат детерминирован (и префилл, и декод).
+// a0 y bf16 [P,H], a1 w f32 [T·K], a2 rowmap u32 [T·K] (0 — тождественный: строка p = t·K+k),
+// a3 out f32 [T,H]; u0 T, u1 H, u2 K.
 extern "C" __global__ void ink2_combine(Ink2Args args) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, H = args.u[1], K = args.u[2];
     if (i >= H) return;
@@ -879,7 +878,8 @@ extern "C" __global__ void ink2_combine(Ink2Args args) {
     float acc = 0.0f;
     for (unsigned int k = 0; k < K; ++k) {
         unsigned int p = t * K + k;
-        acc += CPF(1)[p] * __bfloat162float(CPB(0)[(unsigned long long)rm[p] * H + i]);
+        unsigned long long r = rm ? rm[p] : p;
+        acc += CPF(1)[p] * __bfloat162float(CPB(0)[r * H + i]);
     }
     PF(3)[(unsigned long long)t * H + i] = acc;
 }

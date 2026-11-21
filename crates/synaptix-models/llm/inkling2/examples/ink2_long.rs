@@ -9,6 +9,9 @@
 //! после всего контекста, VRAM и попадания в слоты zero-copy. `--save-decode`
 //! пишет логиты шагов декода, `--ref-decode` гонит те же токены
 //! (teacher forcing) и считает KL шагов к сохранённым — сверка путей декода.
+//! `--ref-decode f.bin --prefill-rows g.bin` — вместо декода считает логиты тех же
+//! шагов префиллом (одним куском по токенам эталона) и пишет их в формате
+//! `--save-decode`: эталон схемы префилла для сверки декода.
 
 use std::io::{Read, Write};
 use std::time::Instant;
@@ -50,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gen: usize = arg(&args, "--gen").and_then(|v| v.parse().ok()).unwrap_or(48);
     let save = arg(&args, "--save-decode");
     let refd = arg(&args, "--ref-decode");
+    let prefill_rows = arg(&args, "--prefill-rows");
     let dev = Device::Cuda(0);
 
     let t0 = Instant::now();
@@ -114,6 +118,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ref_rows = Some((toks, rows));
     }
     let mut lv = logits.unwrap().to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    if let Some(f) = &prefill_rows {
+        let (toks, _) = ref_rows.as_ref().ok_or("--prefill-rows нужен --ref-decode")?;
+        let steps = toks.len().min(gen);
+        let mut rows = lv.clone();
+        if steps > 1 {
+            let l = p.model.forward(&toks[..steps - 1], &mut s.cache, true)?;
+            rows.extend(l.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?);
+        }
+        let mut w = std::io::BufWriter::new(std::fs::File::create(f)?);
+        w.write_all(&(steps as u64).to_le_bytes())?;
+        for t in &toks[..steps] {
+            w.write_all(&t.to_le_bytes())?;
+        }
+        for r in rows.chunks_exact_mut(vocab) {
+            log_softmax(r);
+            for x in r.iter() {
+                w.write_all(&x.to_le_bytes())?;
+            }
+        }
+        eprintln!("логиты шагов префиллом ({steps}) → {f}");
+        return Ok(());
+    }
     let mut out = Vec::new();
     let mut rows_out: Vec<f32> = Vec::new();
     let mut kls = Vec::new();
