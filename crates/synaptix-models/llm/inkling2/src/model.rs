@@ -1206,7 +1206,7 @@ fn grow_rows(t: &mut Tensor, axis: usize, used: usize, capacity: usize) -> R<()>
         *t = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
         return Ok(());
     }
-    let head = t.narrow(axis, 0, used).map_err(fe)?;
+    let head = t.narrow(axis, 0, used).and_then(|h| h.contiguous()).map_err(fe)?;
     shape[axis] = capacity - used;
     let pad = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
     *t = Tensor::cat(&[&head, &pad], axis).map_err(fe)?.contiguous().map_err(fe)?;

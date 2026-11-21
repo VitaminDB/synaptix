@@ -20,7 +20,7 @@ use crate::loader::{Inkling2Weights, LoadError};
 use synaptix_llm_common::expert_mirror::{self as em, ExpertStacks};
 use synaptix_llm_common::moe::ExpertSource;
 use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
-use crate::model::{Inkling2Model, KvFormat, ModelCache};
+use crate::model::{EmbedPatch, Inkling2Model, KvFormat, ModelCache};
 use crate::preprocess::{load_image, ImageLimits};
 use crate::vision::{expand_image_tokens, prefill_with_images, ImageSpan, VisionTower, IMAGE_TOKEN_ID};
 use synaptix_core::tensor::Tensor;
@@ -97,6 +97,9 @@ pub struct Inkling2Session {
     pub cache: ModelCache,
     /// Токены, чьё состояние лежит в `cache` (промпт и ответ прошлого хода).
     pub ids: Vec<u32>,
+    /// Картинки в `ids`: (первая строка, отпечаток признаков от вызывающего).
+    /// Та же разметка с другой картинкой кэш не берёт.
+    pub images: Vec<(usize, u64)>,
     /// Байт KV на позицию контекста (для учёта VRAM фасадом).
     kv_bytes_per_token: usize,
 }
@@ -126,6 +129,7 @@ impl Inkling2Session {
     /// состояний — в начале хода).
     pub fn invalidate(&mut self) {
         self.ids.clear();
+        self.images.clear();
         self.cache.seq_len = 0;
     }
 
@@ -324,6 +328,7 @@ impl Inkling2Pipeline {
         Ok(Inkling2Session {
             cache: self.model.make_cache(ctx.max(2))?,
             ids: Vec::new(),
+            images: Vec::new(),
             kv_bytes_per_token: self.kv_bytes_per_token(),
         })
     }
@@ -470,6 +475,41 @@ impl Inkling2Pipeline {
         cfg: &GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        self.cached_turn(s, prompt_ids, &[], cfg, sink)
+    }
+
+    /// Ход в сессии по промпту с картинками (как
+    /// [`Self::generate_media_streaming`]: по плейсхолдеру на картинку, в
+    /// порядке `images`; у картинки — признаки и отпечаток от вызывающего).
+    /// Кэш берётся, если развёрнутый промпт целиком продолжает посчитанное и
+    /// картинки в посчитанном префиксе — те же. В статистике `prompt_tokens`
+    /// — длина развёрнутого промпта (строки картинок), из кэша — в тех же
+    /// единицах.
+    pub fn generate_cached_media_streaming(
+        &self,
+        s: &mut Inkling2Session,
+        prompt_ids: &[u32],
+        images: &[(&Tensor, u64)],
+        cfg: &GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        let ids = self.image_parts(prompt_ids)?;
+        let counts: Vec<usize> = images.iter().map(|(t, _)| t.dims()[0]).collect();
+        let (ids, starts) = expand_image_tokens(&ids, IMAGE_TOKEN_ID, &counts)?;
+        let spans: Vec<(usize, &Tensor, u64)> = starts.into_iter().zip(images).map(|(at, (t, fp))| (at, *t, *fp)).collect();
+        self.cached_turn(s, &ids, &spans, cfg, sink)
+    }
+
+    /// Общий ход в сессии; `images` — (строка, признаки, отпечаток) картинок
+    /// в `prompt_ids` (уже развёрнутых).
+    fn cached_turn(
+        &self,
+        s: &mut Inkling2Session,
+        prompt_ids: &[u32],
+        images: &[(usize, &Tensor, u64)],
+        cfg: &GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
         if prompt_ids.is_empty() {
             return Err(PipelineError::Model(ModelError::Forward("пустой промпт".into())));
         }
@@ -477,12 +517,21 @@ impl Inkling2Pipeline {
         if need > s.cache.capacity {
             self.grow_session(s, need)?;
         }
-        // Кэш годен, только если промпт продолжает его целиком и хоть один токен остаётся на префилл.
-        let reuse = s.reusable(prompt_ids);
+        // Кэш годен, только если промпт продолжает его целиком и хоть один токен остаётся на префилл,
+        // а картинки посчитанного префикса — те же (та же разметка — ещё не та же картинка).
+        let mut reuse = s.reusable(prompt_ids);
+        let same_images = s.images.iter().filter(|(at, _)| *at < reuse).enumerate().all(|(k, &(at, fp))| {
+            images.get(k).is_some_and(|&(at2, _, fp2)| at2 == at && fp2 == fp)
+        });
+        if !same_images {
+            reuse = 0;
+        }
         if reuse == 0 {
             s.cache.reset()?;
             s.ids.clear();
+            s.images.clear();
         }
+        s.images.retain(|(at, _)| *at < reuse);
         let eos = eos_set(cfg);
         let mut sampler = TokenSampler::new(cfg, prompt_ids);
         let t0 = Instant::now();
@@ -497,7 +546,15 @@ impl Inkling2Pipeline {
                 return Err(PipelineError::Model(ModelError::Forward(INTERRUPTED.into())));
             }
             let end = (off + chunk).min(prompt_ids.len());
-            let res = no_grad(|| self.model.forward(&prompt_ids[off..end], &mut s.cache, false));
+            // Строки картинок этого куска — готовые признаки.
+            let mut patches = Vec::new();
+            for &(at, t, _) in images {
+                let (a, b) = (at.max(off), (at + t.dims()[0]).min(end));
+                if a < b {
+                    patches.push(EmbedPatch { row: a - off, embeds: t.narrow(0, a - at, b - a).and_then(|x| x.contiguous()).map_err(|e| ModelError::Forward(e.to_string()))? });
+                }
+            }
+            let res = no_grad(|| self.model.forward_with_embeds(&prompt_ids[off..end], &patches, &mut s.cache, false));
             match res {
                 Ok(l) => logits = Some(l),
                 Err(e) => {
@@ -510,6 +567,7 @@ impl Inkling2Pipeline {
             synaptix_llm_common::prefill_progress::add(end - off);
             off = end;
         }
+        s.images.extend(images.iter().filter(|(at, _, _)| *at >= reuse).map(|&(at, _, fp)| (at, fp)));
         let prefill_ms = t0.elapsed().as_millis();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
         let stats = |out: &Vec<u32>, decode_ms| GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: out.len(), prefill_ms, decode_ms };

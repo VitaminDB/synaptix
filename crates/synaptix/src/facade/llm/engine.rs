@@ -913,13 +913,21 @@ struct MediaSig {
 /// приходят из кэша башни, так что одна и та же картинка даёт одни и те же
 /// байты.
 fn media_sigs(pairs: &[(u32, &Tensor)], ids: &[u32]) -> Result<Vec<MediaSig>, LlmError> {
-    use std::hash::{Hash, Hasher};
     let mut out = Vec::new();
     for (pad, embeds) in pairs {
         let rows = ids.iter().filter(|t| *t == pad).count().min(embeds.dims()[0]);
         if rows == 0 {
             continue;
         }
+        out.push(MediaSig { pad: *pad, rows, hash: embeds_hash(embeds, rows)? });
+    }
+    Ok(out)
+}
+
+/// Хэш первых `rows` строк эмбеддингов (см. [`media_sigs`]).
+fn embeds_hash(embeds: &Tensor, rows: usize) -> Result<u64, LlmError> {
+    use std::hash::{Hash, Hasher};
+    {
         let host = embeds
             .narrow(0, 0, rows)
             .and_then(|t| t.contiguous())
@@ -933,9 +941,8 @@ fn media_sigs(pairs: &[(u32, &Tensor)], ids: &[u32]) -> Result<Vec<MediaSig>, Ll
         for v in &host {
             v.to_bits().hash(&mut h);
         }
-        out.push(MediaSig { pad: *pad, rows, hash: h.finish() });
+        Ok(h.finish())
     }
-    Ok(out)
 }
 
 /// Что, кроме основного KV, нужно донести до следующего хода.
@@ -1427,7 +1434,7 @@ impl Llm {
     /// Умеет ли сессия префикс-KV этой модели продолжать промпт с
     /// медиа-вложениями (см. [`LlmGeneration::generate_streaming_cached_media`]).
     /// Все архитектуры с сессией и башней зрения: гибрид Qwen3.6/3.8,
-    /// Muse-Glimmer, Gemma-4, Qwen4Exp.
+    /// Muse-Glimmer, Gemma-4, Qwen4Exp, Inkling-2.
     pub fn kv_session_media_ok(&self) -> bool {
         self.pipeline
             .lock()
@@ -1438,6 +1445,7 @@ impl Llm {
                         | LlmPipeline::MuseGlimmer(_)
                         | LlmPipeline::Gemma4(_)
                         | LlmPipeline::Qwen4Exp(_)
+                        | LlmPipeline::Inkling2(_)
                 )
             })
             .unwrap_or(false)
@@ -3183,6 +3191,26 @@ impl<'a> LlmGeneration<'a> {
                     Ok(()) => Ok(reuse),
                     Err(e) => Err(LlmError(e.to_string())),
                 }
+            }
+            // Inkling-2: картинки и их отпечатки — в своей сессии, свёртки
+            // не откатываются (кэш — только если промпт продолжает
+            // посчитанное целиком). Из кэша — в токенах `prompt_ids`:
+            // пересчитано столько же, сколько у развёрнутого промпта.
+            LlmPipeline::Inkling2(p) => {
+                let SessionKind::Inkling2(s) = &mut session.kind else {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                };
+                if media.iter().any(|m| m.kind != MediaKind::Image) {
+                    return Err(LlmError("Inkling-2 принимает только картинки".into()));
+                }
+                let images = media
+                    .iter()
+                    .map(|m| Ok((&m.embeds, embeds_hash(&m.embeds, m.embeds.dims()[0])?)))
+                    .collect::<Result<Vec<_>, LlmError>>()?;
+                let (_, st, reuse) = p
+                    .generate_cached_media_streaming(s, prompt_ids, &images, &cfg, &mut sink)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(prompt_ids.len().saturating_sub(st.prompt_tokens - reuse))
             }
             _ => Err(LlmError("префикс-KV с медиа: архитектура не поддержана".into())),
         }
