@@ -12,6 +12,14 @@
 // шанс), переписывает таблицы (вытесненный — обратно на RAM) и пишет, что
 // копировать. zc_copy: широкими загрузками (~46 ГБ/с) RAM → слот. На выходе
 // eff_* [pairs] — адреса по парам для индексных GEMV. Хост не участвует.
+//
+// Двухблобные форматы (NVFP4, MXFP8 — packed и scales раздельно): слот —
+// [gu_p | gu_s | dn_p | dn_s], gu_bytes/dn_bytes — размеры packed,
+// gu_s_bytes/dn_s_bytes — масштабов. tab_* хранят адрес packed (слот или
+// RAM с меткой), масштабы резидента — сразу за packed в слоте, масштабы в
+// RAM — host_*_s. Выходы eff_*_s и источники копии cp_src_*_s пишутся при
+// eff_gu_s != 0 / cp_src_gu_s != 0. У одноблобных все *_s нулевые — путь
+// прежний.
 
 struct ZcArgs {
     unsigned long long idx, tab_gu, tab_dn, host_gu, host_dn, owner, used, clock, stats;
@@ -22,7 +30,35 @@ struct ZcArgs {
     // x — f16), top-k → idx[t·k], softmax по top-k → wts[t·k].
     unsigned long long router_w, x, logits, wts;
     unsigned int rows, k, H, _pad2;
+    // Двухблобные форматы (см. шапку). Только в конец: раскладка = ZcLaunch.
+    unsigned long long host_gu_s, host_dn_s, eff_gu_s, eff_dn_s, cp_src_gu_s, cp_src_dn_s;
+    unsigned long long gu_s_bytes, dn_s_bytes;
 };
+
+// Смещение down в слоте: за packed и масштабами gate_up.
+__device__ __forceinline__ unsigned long long zc_dn_off(const ZcArgs& a) { return a.gu_bytes + a.gu_s_bytes; }
+
+// Адреса масштабов пары `p` эксперта `e`: `slot_gu` — адрес gate_up в слоте
+// (0 — эксперт читается из RAM).
+__device__ __forceinline__ void zc_eff_s(const ZcArgs& a, unsigned int p, unsigned int e, unsigned long long slot_gu) {
+    if (a.eff_gu_s == 0ull) return;
+    unsigned long long* egs = (unsigned long long*)a.eff_gu_s;
+    unsigned long long* eds = (unsigned long long*)a.eff_dn_s;
+    if (slot_gu != 0ull) {
+        egs[p] = slot_gu + a.gu_bytes;
+        eds[p] = slot_gu + zc_dn_off(a) + a.dn_bytes;
+    } else {
+        egs[p] = ((const unsigned long long*)a.host_gu_s)[e];
+        eds[p] = ((const unsigned long long*)a.host_dn_s)[e];
+    }
+}
+
+// Источники копии масштабов промаха (RAM).
+__device__ __forceinline__ void zc_cp_s(const ZcArgs& a, unsigned int p, unsigned int e) {
+    if (a.cp_src_gu_s == 0ull) return;
+    ((unsigned long long*)a.cp_src_gu_s)[p] = ((const unsigned long long*)a.host_gu_s)[e];
+    ((unsigned long long*)a.cp_src_dn_s)[p] = ((const unsigned long long*)a.host_dn_s)[e];
+}
 
 #include <cuda_fp16.h>
 
@@ -157,9 +193,10 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
             used[s] = 1;
             unsigned long long dst = a.slot_base + (unsigned long long)s * a.slot_bytes;
             tg[e] = dst;
-            td[e] = dst + a.gu_bytes;
+            td[e] = dst + zc_dn_off(a);
             csg[p] = hg[e];
             csd[p] = hd[e];
+            zc_cp_s(a, p, e);
             cdst[p] = dst;
             --budget;
         }
@@ -177,11 +214,19 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
     for (unsigned int p = 0; p < a.pairs; ++p) {
         cdst[p] = 0ull;
         unsigned int e = idx[p];
-        if (e >= a.experts) { eg[p] = eg[0]; ed[p] = ed[0]; continue; }
+        if (e >= a.experts) {
+            eg[p] = eg[0]; ed[p] = ed[0];
+            if (a.eff_gu_s != 0ull) {
+                ((unsigned long long*)a.eff_gu_s)[p] = ((unsigned long long*)a.eff_gu_s)[0];
+                ((unsigned long long*)a.eff_dn_s)[p] = ((unsigned long long*)a.eff_dn_s)[0];
+            }
+            continue;
+        }
         unsigned long long g = tg[e];
         if ((g & 1ull) == 0ull) {
             eg[p] = g;
             ed[p] = td[e];
+            zc_eff_s(a, p, e, g);
             // повтор эксперта в шаге (у пары токенов) — не попадание сверх первого
             bool dup = false;
             for (unsigned int q = 0; q < p; ++q) dup |= (idx[q] == e);
@@ -203,6 +248,7 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
             // все слоты заняты шагом (слотов меньше пар) — читаем из RAM как есть
             eg[p] = g & ~1ull;
             ed[p] = td[e] & ~1ull;
+            zc_eff_s(a, p, e, 0ull);
             continue;
         }
         int old = owner[s];
@@ -214,11 +260,13 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
         used[s] = 2;
         unsigned long long dst = a.slot_base + (unsigned long long)s * a.slot_bytes;
         tg[e] = dst;
-        td[e] = dst + a.gu_bytes;
+        td[e] = dst + zc_dn_off(a);
         eg[p] = dst;
-        ed[p] = dst + a.gu_bytes;
+        ed[p] = dst + zc_dn_off(a);
+        zc_eff_s(a, p, e, dst);
         csg[p] = hg[e];
         csd[p] = hd[e];
+        zc_cp_s(a, p, e);
         cdst[p] = dst;
     }
     // 3) отметки шага → обычный бит обращения.
@@ -264,9 +312,11 @@ extern "C" __global__ void zc_lru_w(ZcArgs a) {
         used[(g - a.slot_base) / a.slot_bytes] = 2;
         eg[lane] = g;
         ed[lane] = td[e];
+        zc_eff_s(a, lane, e, g);
     } else if (active && !valid) {
         eg[lane] = hg[0];
         ed[lane] = hd[0];
+        zc_eff_s(a, lane, 0u, 0ull);
     }
     if (active) cdst[lane] = 0ull;
     const unsigned int same = __match_any_sync(0xffffffffu, e);
@@ -284,6 +334,7 @@ extern "C" __global__ void zc_lru_w(ZcArgs a) {
             if ((gm & 1ull) == 0ull) {          // тот же эксперт уже поднят парой раньше
                 eg[p] = gm;
                 ed[p] = td[em];
+                zc_eff_s(a, p, em, gm);
                 continue;
             }
             unsigned int s = 0;
@@ -299,6 +350,7 @@ extern "C" __global__ void zc_lru_w(ZcArgs a) {
             if (!found) {
                 eg[p] = gm & ~1ull;
                 ed[p] = td[em] & ~1ull;
+                zc_eff_s(a, p, em, 0ull);
                 continue;
             }
             const int old = owner[s];
@@ -310,11 +362,13 @@ extern "C" __global__ void zc_lru_w(ZcArgs a) {
             used[s] = 2;
             const unsigned long long dst = a.slot_base + (unsigned long long)s * a.slot_bytes;
             tg[em] = dst;
-            td[em] = dst + a.gu_bytes;
+            td[em] = dst + zc_dn_off(a);
             eg[p] = dst;
-            ed[p] = dst + a.gu_bytes;
+            ed[p] = dst + zc_dn_off(a);
+            zc_eff_s(a, p, em, dst);
             csg[p] = hg[em];
             csd[p] = hd[em];
+            zc_cp_s(a, p, em);
             cdst[p] = dst;
         }
         stats[0] += (unsigned int)__popc(hitmask);
@@ -335,9 +389,20 @@ extern "C" __global__ void zc_copy(ZcArgs a) {
     const uint4* sg = (const uint4*)((const unsigned long long*)a.cp_src_gu)[p];
     const uint4* sd = (const uint4*)((const unsigned long long*)a.cp_src_dn)[p];
     uint4* dg = (uint4*)dst;
-    uint4* dd = (uint4*)(dst + a.gu_bytes);
+    uint4* dd = (uint4*)(dst + zc_dn_off(a));
     const unsigned long long ng = a.gu_bytes / 16ull, nd = a.dn_bytes / 16ull;
     const unsigned long long stride = (unsigned long long)gridDim.y * blockDim.x;
-    for (unsigned long long i = (unsigned long long)blockIdx.y * blockDim.x + threadIdx.x; i < ng; i += stride) dg[i] = sg[i];
-    for (unsigned long long i = (unsigned long long)blockIdx.y * blockDim.x + threadIdx.x; i < nd; i += stride) dd[i] = sd[i];
+    const unsigned long long i0 = (unsigned long long)blockIdx.y * blockDim.x + threadIdx.x;
+    for (unsigned long long i = i0; i < ng; i += stride) dg[i] = sg[i];
+    for (unsigned long long i = i0; i < nd; i += stride) dd[i] = sd[i];
+    if (a.cp_src_gu_s != 0ull) {
+        // Масштабы: сразу за packed своей матрицы в слоте.
+        const uint4* sgs = (const uint4*)((const unsigned long long*)a.cp_src_gu_s)[p];
+        const uint4* sds = (const uint4*)((const unsigned long long*)a.cp_src_dn_s)[p];
+        uint4* dgs = (uint4*)(dst + a.gu_bytes);
+        uint4* dds = (uint4*)(dst + zc_dn_off(a) + a.dn_bytes);
+        const unsigned long long ngs = a.gu_s_bytes / 16ull, nds = a.dn_s_bytes / 16ull;
+        for (unsigned long long i = i0; i < ngs; i += stride) dgs[i] = sgs[i];
+        for (unsigned long long i = i0; i < nds; i += stride) dds[i] = sds[i];
+    }
 }

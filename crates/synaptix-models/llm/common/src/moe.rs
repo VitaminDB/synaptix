@@ -907,6 +907,14 @@ pub trait ExpertSource: Send + Sync {
     fn blob_addrs(&self, _layer: usize, _expert: usize) -> Option<(u64, u64)> {
         None
     }
+
+    /// Адреса блобов эксперта в закреплённом зеркале с раздельными масштабами
+    /// (NVFP4, MXFP8): packed и scales gate_up и down. По умолчанию — через
+    /// [`Self::blob_addrs`] с нулевыми масштабами (одноблобные форматы), так
+    /// что прежние источники работают без изменений.
+    fn blob_addrs4(&self, layer: usize, expert: usize) -> Option<crate::moe_zc::ExpertBlobs> {
+        self.blob_addrs(layer, expert).map(|(gu, dn)| crate::moe_zc::ExpertBlobs { gu, gu_s: 0, dn, dn_s: 0 })
+    }
 }
 
 enum ExpertStore {
@@ -1968,7 +1976,7 @@ impl MoeFfn {
             let probe = source.fetch(self.layer_id, 0, Device::Cpu)?;
             let (Some(gq), Some(dq)) = (probe.0.quant_weight(), probe.1.quant_weight()) else { return Ok(None) };
             let dtype = gq.dtype();
-            if !dtype.is_block_quant() || dq.dtype() != dtype {
+            if !crate::moe_zc::zc_format(dtype) || dq.dtype() != dtype {
                 return Ok(None);
             }
             let seed = self.zc_seed.lock().ok().map(|s| s.clone()).filter(|s| s.len() == *count);

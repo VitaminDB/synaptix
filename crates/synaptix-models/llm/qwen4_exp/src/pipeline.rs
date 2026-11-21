@@ -285,12 +285,20 @@ impl Qwen4ExpPipeline {
         let expert_source: Option<Arc<dyn ExpertSource>> = lazy
             .then(|| Arc::new(em::BundleExperts::new(stacks.clone().expect("lazy"))) as Arc<dyn ExpertSource>);
         let (host_mirror, mirror_budget) =
-            match lazy.then(|| em::host_mirror(&em::mirror_ranges(&**stacks.as_ref().expect("lazy"), device), "qwen4_exp")).flatten() {
+            match lazy
+                .then(|| {
+                    let s = &**stacks.as_ref().expect("lazy");
+                    // NVFP4 для zero-copy — зеркало в натуральной раскладке.
+                    let ranges = if zc_split_on() { em::mirror_ranges_natural(s, device) } else { em::mirror_ranges(s, device) };
+                    em::host_mirror(&ranges, "qwen4_exp")
+                })
+                .flatten()
+            {
                 Some((g, b)) => (Some(g), Some(b as u64)),
                 None => (None, None),
             };
         let experts_bytes: u64 = stacks.as_deref().map_or(0, |s| s.total_bytes(device));
-        let one_blob = stacks.as_deref().is_some_and(|s| em::experts_one_blob(s));
+        let one_blob = stacks.as_deref().is_some_and(|s| if zc_split_on() { em::experts_zc_capable(s) } else { em::experts_one_blob(s) });
         if let Some(cache) = &expert_cache {
             eprintln!(
                 "[qwen4_exp] эксперты {}, на карте кэш {:.1} ГБ",
@@ -1404,6 +1412,14 @@ fn is_oom<E: std::fmt::Display>(e: &E) -> bool {
 /// NVFP4-бандл идёт прежним путём.
 fn zc_on() -> bool {
     std::env::var("SYN_QWEN4EXP_ZC").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+/// Zero-copy и для экспертов NVFP4/MXFP8 (packed + scales):
+/// `SYN_QWEN4EXP_ZC_SPLIT=1`, по умолчанию выкл. Зеркало RAM тогда хранит
+/// NVFP4 в натуральной раскладке (ядра GEMV читают его напрямую), обычная
+/// подкачка перемешивает на карте.
+fn zc_split_on() -> bool {
+    std::env::var("SYN_QWEN4EXP_ZC_SPLIT").map(|v| v.trim() == "1").unwrap_or(false)
 }
 
 /// Потолок старого кэша экспертов при zero-copy: он нужен только префиллу

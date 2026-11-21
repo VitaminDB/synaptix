@@ -8,8 +8,10 @@
 //!   идёт «страничный кэш → копия в pinned → DMA» и упирается в 8–12 ГБ/с, из
 //!   зеркала DMA идёт напрямую (~40 ГБ/с); NVFP4 зеркало хранит сразу в
 //!   перемешанной раскладке ядер;
-//! - адреса одноблобных экспертов (IQ3_S-128, SQ, ggml) в зеркале — для
-//!   декода без синхронизаций (zero-copy, [`crate::moe_zc`]).
+//! - адреса экспертов в зеркале — для декода без синхронизаций (zero-copy,
+//!   [`crate::moe_zc`]): одноблобные (IQ3_S-128, SQ, ggml) — в любом
+//!   зеркале, NVFP4/MXFP8 (packed + scales) — в зеркале с натуральной
+//!   раскладкой packed ([`mirror_ranges_natural`]).
 //!
 //! Модель описывает, где её стопки, трейтом [`BundleStacks`].
 
@@ -54,14 +56,39 @@ pub fn experts_one_blob(src: &dyn BundleStacks) -> bool {
         .is_some_and(|k| !k.has_scales())
 }
 
+/// Эксперты годятся для zero-copy ([`crate::moe_zc`]): одноблобный формат
+/// (любое зеркало) или NVFP4/MXFP8 (packed + scales; NVFP4 — только с
+/// зеркалом [`mirror_ranges_natural`]).
+pub fn experts_zc_capable(src: &dyn BundleStacks) -> bool {
+    use synaptix_bundle::inspect::QuantKind;
+    (0..src.expert_layers())
+        .find_map(|l| src.stack_key(l, "gate_up_proj"))
+        .and_then(|k| src.bundle().quant_kind(&k))
+        .is_some_and(|k| !k.has_scales() || matches!(k, QuantKind::Nvfp4 | QuantKind::Mxfp8))
+}
+
 /// Диапазоны mmap всех стопок (packed + scales) в порядке слоёв — под
 /// зеркало. NVFP4 на карте с FP4 MMA зеркало хранит перемешанным, как его
 /// читают ядра; без FP4 MMA и у прочих форматов — байт в байт.
 pub fn mirror_ranges<'a>(src: &'a dyn BundleStacks, device: Device) -> Vec<MirrorRange<'a>> {
+    mirror_ranges_with(src, device, false)
+}
+
+/// Как [`mirror_ranges`], но NVFP4 зеркалится байт в байт (натуральная
+/// раскладка packed) и на картах с FP4 MMA — зеркало для zero-copy
+/// NVFP4/MXFP8 ([`crate::moe_zc`]): ядра `GEMV_SYN` читают эксперта прямо из
+/// RAM, а `mirror_addr` отдаёт адрес. Обычная подкачка из такого зеркала
+/// тоже работает (перемешивание — на карте, как без зеркала).
+pub fn mirror_ranges_natural<'a>(src: &'a dyn BundleStacks, device: Device) -> Vec<MirrorRange<'a>> {
+    mirror_ranges_with(src, device, true)
+}
+
+fn mirror_ranges_with<'a>(src: &'a dyn BundleStacks, device: Device, natural: bool) -> Vec<MirrorRange<'a>> {
     let l = src.bundle();
-    let nvfp4_native = synaptix_core::backend::registry::backend_for(device)
-        .map(|b| b.quant_native(DType::NVFP4, device))
-        .unwrap_or(false);
+    let nvfp4_native = !natural
+        && synaptix_core::backend::registry::backend_for(device)
+            .map(|b| b.quant_native(DType::NVFP4, device))
+            .unwrap_or(false);
     let mut out = Vec::new();
     for layer in 0..src.expert_layers() {
         for name in ["gate_up_proj", "down_proj"] {
@@ -163,24 +190,40 @@ impl<S: BundleStacks> BundleExperts<S> {
         Self { stacks }
     }
 
-    /// Блоб эксперта (срез mmap) — только одноблобные форматы.
-    fn blob_slice(&self, key: &str, expert: usize) -> Option<&[u8]> {
+    /// Блобы эксперта (срезы mmap): packed и, у NVFP4/MXFP8, масштабы.
+    /// `None` — формат с масштабами, но не NVFP4/MXFP8.
+    fn blob_slices(&self, key: &str, expert: usize) -> Option<(&[u8], Option<&[u8]>)> {
+        use synaptix_bundle::inspect::QuantKind;
         let l = self.stacks.bundle();
-        if l.quant_kind(key)?.has_scales() {
+        let kind = l.quant_kind(key)?;
+        let (slices, _, _) = l.quant_dims(key)?;
+        let Ok((packed, scales)) = l.quant_blob_slices(key)? else { return None };
+        let slices = slices.max(1);
+        let per = packed.len() / slices;
+        let p = packed.get(expert * per..(expert + 1) * per)?;
+        if !kind.has_scales() {
+            return Some((p, None));
+        }
+        if !matches!(kind, QuantKind::Nvfp4 | QuantKind::Mxfp8) {
             return None;
         }
-        let (slices, _, _) = l.quant_dims(key)?;
-        let Ok((packed, _)) = l.quant_blob_slices(key)? else { return None };
-        let per = packed.len() / slices.max(1);
-        packed.get(expert * per..(expert + 1) * per)
+        let sper = scales.len() / slices;
+        Some((p, Some(scales.get(expert * sper..(expert + 1) * sper)?)))
     }
 }
 
 impl<S: BundleStacks + 'static> ExpertSource for BundleExperts<S> {
     fn blob_addrs(&self, layer: usize, expert: usize) -> Option<(u64, u64)> {
-        let gu = self.blob_slice(&self.stacks.stack_key(layer, "gate_up_proj")?, expert)?;
-        let dn = self.blob_slice(&self.stacks.stack_key(layer, "down_proj")?, expert)?;
-        Some((synaptix_core::device::cuda::mirror_addr(gu)?, synaptix_core::device::cuda::mirror_addr(dn)?))
+        let b = self.blob_addrs4(layer, expert)?;
+        (b.gu_s == 0 && b.dn_s == 0).then_some((b.gu, b.dn))
+    }
+
+    /// Адреса в зеркале; packed NVFP4 — только из натурального зеркала
+    /// ([`mirror_ranges_natural`]): перемешанное `mirror_addr` не отдаёт.
+    fn blob_addrs4(&self, layer: usize, expert: usize) -> Option<crate::moe_zc::ExpertBlobs> {
+        let (gu, gu_s) = self.blob_slices(&self.stacks.stack_key(layer, "gate_up_proj")?, expert)?;
+        let (dn, dn_s) = self.blob_slices(&self.stacks.stack_key(layer, "down_proj")?, expert)?;
+        crate::moe_zc::ExpertBlobs::from_mirror(gu, gu_s, dn, dn_s)
     }
 
     fn fetch(&self, layer: usize, expert: usize, device: Device) -> Result<(QLinear, QLinear), ModelError> {

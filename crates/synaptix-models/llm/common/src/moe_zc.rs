@@ -11,8 +11,44 @@
 //! 3. индексные GEMV gate_up / down по адресам пар.
 //!
 //! Хост в шаге не участвует вовсе; затравка слотов — частоты выбора на
-//! префилле. Только одноблобные форматы (IQ3_S-128, SQ, типы ggml): блоб
-//! эксперта в зеркале байт в байт тот, что читает ядро.
+//! префилле. Форматы ([`zc_format`]):
+//!
+//! - одноблобные (IQ3_S-128, SQ, типы ggml): блоб эксперта в зеркале байт в
+//!   байт тот, что читает ядро; слот — `[gate_up | down]`;
+//! - с раздельными масштабами (NVFP4, MXFP8): два блоба на матрицу, слот —
+//!   `[gu_packed | gu_scales | dn_packed | dn_scales]`. NVFP4 читается в
+//!   натуральной раскладке packed (зеркало — [`crate::expert_mirror::mirror_ranges_natural`],
+//!   не перемешанное), масштабы — тайловые E4M3; MXFP8 — `[N, K]` + E8M0
+//!   `[N, K/32]`. Таблицы шага несут адреса и packed, и масштабов
+//!   ([`ExpertTable::from_tensors_dense`]), GEMV — ядра `GEMV_SYN`.
+//!
+//! # Подключение из своей модели (без [`crate::moe::MoeFfn`])
+//!
+//! ```ignore
+//! use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
+//! // 1. Пул на модель: слотов на слой (сколько VRAM отдать кэшу экспертов).
+//! let pool = ZcPool::new(device);
+//! pool.set_slots_per_layer(64);
+//! // 2. Адреса экспертов слоя в закреплённой RAM: из зеркала бандла
+//! //    (`BundleExperts::blob_addrs4`, зеркало `mirror_ranges_natural`) или
+//! //    из своих pinned-буферов (`ExpertBlobs { gu, gu_s, dn, dn_s }`).
+//! let blobs: Vec<ExpertBlobs> = (0..experts).map(|e| src.blob_addrs4(layer, e)).collect::<Option<_>>()?;
+//! let zc = ZcLayer::build_from_blobs(&blobs, DType::NVFP4, (2 * inter, hidden), (hidden, inter), &pool, None)?
+//!     .expect("слотов/зеркала хватает");
+//! // 3. Шаг: свой роутинг даёт idx (U32 [pairs] на карте) → кэш на карте
+//! //    обновлён, промахи скопированы → таблицы по ПАРАМ (не по экспертам).
+//! let (gu_t, dn_t, iota) = zc.stage(&pool, &idx)?;
+//! let gu = gu_t.gemv_indexed_dense(&iota, &x_rows, true)?;   // [pairs, 2·inter]
+//! let h = swiglu(&gu);                                       // своя активация
+//! let rows = dn_t.gemv_indexed_dense(&iota, &h, true)?;      // [pairs, hidden]
+//! // Веса пар, alpha эксперта и т. п. модель применяет сама по своему idx.
+//! ```
+//!
+//! Таблицы `gu_t`/`dn_t` индексируются номером пары (`iota`), а не
+//! эксперта: запись `p` — адрес эксперта `idx[p]` (слот VRAM или RAM).
+//! Шаг ставится только в default-стрим, хост не синхронизируется — годится
+//! для захвата CUDA-графом (адреса таблиц стабильны, пока
+//! [`ZC_GENERATION`] не изменилось).
 
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +70,37 @@ fn addr(t: &Tensor) -> Result<u64, ModelError> {
     t.device_address().ok_or_else(|| zerr("тензор не на карте"))
 }
 
+/// Формат годится для zero-copy: одноблобный или с раздельными масштабами
+/// (NVFP4, MXFP8).
+pub fn zc_format(dtype: DType) -> bool {
+    dtype.is_block_quant() || matches!(dtype, DType::NVFP4 | DType::MXFP8)
+}
+
+/// Адреса блобов эксперта в закреплённой RAM (единая адресация: ядра читают
+/// их напрямую). `gu_s`/`dn_s` — масштабы у NVFP4/MXFP8; у одноблобных
+/// форматов 0 (не читаются). Все адреса выровнены на 16.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpertBlobs {
+    pub gu: u64,
+    pub gu_s: u64,
+    pub dn: u64,
+    pub dn_s: u64,
+}
+
+impl ExpertBlobs {
+    /// Адреса по срезам mmap, покрытым закреплённым зеркалом
+    /// (`mirror_addr`). `None` — какой-то срез не в зеркале (или зеркало
+    /// ещё не догнало его, или хранит его перемешанным).
+    pub fn from_mirror(gu: &[u8], gu_s: Option<&[u8]>, dn: &[u8], dn_s: Option<&[u8]>) -> Option<Self> {
+        use synaptix_core::device::cuda::mirror_addr;
+        let opt = |b: Option<&[u8]>| match b {
+            Some(b) => mirror_addr(b),
+            None => Some(0),
+        };
+        Some(Self { gu: mirror_addr(gu)?, gu_s: opt(gu_s)?, dn: mirror_addr(dn)?, dn_s: opt(dn_s)? })
+    }
+}
+
 /// Общее для слоёв: размер пула слотов и тождественные индексы.
 /// Поколение слотов zero-copy: растёт при каждой сборке и роспуске слоя.
 /// Захваченные CUDA-графы шага декода помнят адреса таблиц слоя и годятся,
@@ -44,12 +111,20 @@ pub struct ZcPool {
     pub device: Device,
     /// Слотов на слой; 0 — размер ещё не назначен (слои не собираются).
     slots_per_layer: std::sync::atomic::AtomicUsize,
+    /// Меньше стольких слотов слой не собирается (по умолчанию 64).
+    min_slots: std::sync::atomic::AtomicUsize,
     iota: Mutex<Vec<Option<Tensor>>>,
 }
 
 impl ZcPool {
     pub fn new(device: Device) -> Arc<Self> {
-        Arc::new(Self { device, slots_per_layer: Default::default(), iota: Mutex::new(Vec::new()) })
+        Arc::new(Self { device, slots_per_layer: Default::default(), min_slots: 64.into(), iota: Mutex::new(Vec::new()) })
+    }
+
+    /// Порог слотов на слой, ниже которого слой не собирается (по умолчанию
+    /// 64: при меньшем числе часы вытесняют почти на каждом шаге).
+    pub fn set_min_slots(&self, n: usize) {
+        self.min_slots.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn slots_per_layer(&self) -> usize {
@@ -94,6 +169,8 @@ pub struct ZcLayer {
     tab_dn: Tensor,
     host_gu: Tensor,
     host_dn: Tensor,
+    /// Адреса масштабов в RAM (только NVFP4/MXFP8).
+    host_s: Option<(Tensor, Tensor)>,
     owner: Tensor,
     used: Tensor,
     clock: Tensor,
@@ -105,6 +182,9 @@ pub struct ZcLayer {
     dtype: DType,
     gu_bytes: usize,
     dn_bytes: usize,
+    /// Масштабы gate_up / down (0 — одноблобный формат).
+    gu_s_bytes: usize,
+    dn_s_bytes: usize,
     experts: usize,
     n_slots: usize,
     /// Частоты выбора на префилле — затравка следующей сборки.
@@ -151,32 +231,62 @@ impl ZcLayer {
         pool: &ZcPool,
         seed_counts: Option<&[f32]>,
     ) -> Result<Option<Self>, ModelError> {
-        let Device::Cuda(ord) = pool.device else { return Ok(None) };
-        let n_slots = pool.slots_per_layer().min(experts);
-        if n_slots < 64 {
+        if !matches!(pool.device, Device::Cuda(_)) || pool.slots_per_layer().min(experts) < pool.min_slots.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(None);
         }
-        let mut host = Vec::with_capacity(experts);
+        let mut blobs = Vec::with_capacity(experts);
         for e in 0..experts {
-            match source.blob_addrs(layer, e) {
-                Some(a) if a.0 % 16 == 0 && a.1 % 16 == 0 => host.push(a),
-                _ => return Ok(None),
+            match source.blob_addrs4(layer, e) {
+                Some(b) => blobs.push(b),
+                None => return Ok(None),
             }
         }
-        let row = |shape: (usize, usize)| synaptix_core::quant::block_row_bytes(dtype, shape.1).map(|r| r * shape.0);
-        let (Some(gu_bytes), Some(dn_bytes)) = (row(gu_shape), row(dn_shape)) else { return Ok(None) };
-        if gu_bytes % 16 != 0 || dn_bytes % 16 != 0 {
+        Self::build_from_blobs(&blobs, dtype, gu_shape, dn_shape, pool, seed_counts)
+    }
+
+    /// Собрать слой по готовым адресам экспертов в закреплённой RAM — для
+    /// модели без [`ExpertSource`]. `gu_shape`/`dn_shape` — `(N, K)` матриц
+    /// gate_up и down; формат — [`zc_format`]. Самые частые по `seed_counts`
+    /// эксперты сразу копируются в слоты. `None` — формат/размеры не годятся
+    /// (блобы не кратны 16, адрес не выровнен, нет адреса масштабов у
+    /// NVFP4/MXFP8), размер пула не назначен или слотов меньше порога пула.
+    pub fn build_from_blobs(
+        blobs: &[ExpertBlobs],
+        dtype: DType,
+        gu_shape: (usize, usize),
+        dn_shape: (usize, usize),
+        pool: &ZcPool,
+        seed_counts: Option<&[f32]>,
+    ) -> Result<Option<Self>, ModelError> {
+        let Device::Cuda(ord) = pool.device else { return Ok(None) };
+        let experts = blobs.len();
+        let n_slots = pool.slots_per_layer().min(experts);
+        if experts == 0 || n_slots < pool.min_slots.load(std::sync::atomic::Ordering::Relaxed).min(experts) || !zc_format(dtype) {
             return Ok(None);
         }
-        let slot_bytes = gu_bytes + dn_bytes;
+        let sizes = |shape: (usize, usize)| synaptix_core::quant::matrix_blob_bytes(dtype, shape.0, shape.1);
+        let (Some((gu_bytes, gu_s_bytes)), Some((dn_bytes, dn_s_bytes))) = (sizes(gu_shape), sizes(dn_shape)) else { return Ok(None) };
+        if (gu_bytes | dn_bytes | gu_s_bytes | dn_s_bytes) % 16 != 0 || gu_bytes == 0 || dn_bytes == 0 {
+            return Ok(None);
+        }
+        let split = gu_s_bytes > 0;
+        if split != (dn_s_bytes > 0) {
+            return Ok(None);
+        }
+        let ok = |a: u64| a != 0 && a % 16 == 0;
+        if !blobs.iter().all(|b| ok(b.gu) && ok(b.dn) && (!split || (ok(b.gu_s) && ok(b.dn_s)))) {
+            return Ok(None);
+        }
+        let slot_bytes = gu_bytes + gu_s_bytes + dn_bytes + dn_s_bytes;
+        let dn_off = gu_bytes + gu_s_bytes;
         let slots = Tensor::zeros(vec![n_slots * slot_bytes], DType::U8, pool.device).map_err(zerr)?;
         let slot_base = addr(&slots)?;
         // Затравка: частые — в слоты.
-        let seed = seed_counts.map(|c| c.to_vec()).unwrap_or_else(|| vec![0.0; experts]);
+        let seed = seed_counts.filter(|c| c.len() == experts).map(|c| c.to_vec()).unwrap_or_else(|| vec![0.0; experts]);
         let mut order: Vec<usize> = (0..experts).collect();
         order.sort_by(|a, b| seed[*b].total_cmp(&seed[*a]));
-        let mut tab_gu: Vec<i64> = host.iter().map(|a| (a.0 | 1) as i64).collect();
-        let mut tab_dn: Vec<i64> = host.iter().map(|a| (a.1 | 1) as i64).collect();
+        let mut tab_gu: Vec<i64> = blobs.iter().map(|a| (a.gu | 1) as i64).collect();
+        let mut tab_dn: Vec<i64> = blobs.iter().map(|a| (a.dn | 1) as i64).collect();
         let mut owner = vec![-1i32; n_slots];
         let mut copies = 0usize;
         // Буфер слотов выделен и обнулён в default-стриме: копии loader-стрима
@@ -188,10 +298,16 @@ impl ZcLayer {
                 break;
             }
             let dst = slot_base + (s * slot_bytes) as u64;
-            synaptix_core::device::cuda::loader_copy_from_pinned(ord, dst, host[e].0, gu_bytes).map_err(zerr)?;
-            synaptix_core::device::cuda::loader_copy_from_pinned(ord, dst + gu_bytes as u64, host[e].1, dn_bytes).map_err(zerr)?;
+            let b = &blobs[e];
+            let cp = |off: usize, src: u64, len: usize| synaptix_core::device::cuda::loader_copy_from_pinned(ord, dst + off as u64, src, len).map_err(zerr);
+            cp(0, b.gu, gu_bytes)?;
+            cp(dn_off, b.dn, dn_bytes)?;
+            if split {
+                cp(gu_bytes, b.gu_s, gu_s_bytes)?;
+                cp(dn_off + dn_bytes, b.dn_s, dn_s_bytes)?;
+            }
             tab_gu[e] = dst as i64;
-            tab_dn[e] = (dst + gu_bytes as u64) as i64;
+            tab_dn[e] = (dst + dn_off as u64) as i64;
             owner[s] = e as i32;
             copies += 1;
         }
@@ -200,11 +316,17 @@ impl ZcLayer {
         }
         let dev = pool.device;
         let t_i64 = |v: Vec<i64>| Tensor::from_vec::<_, i64>(v, vec![experts], dev).map_err(zerr);
+        let host_s = if split {
+            Some((t_i64(blobs.iter().map(|a| a.gu_s as i64).collect())?, t_i64(blobs.iter().map(|a| a.dn_s as i64).collect())?))
+        } else {
+            None
+        };
         let me = Self {
             tab_gu: t_i64(tab_gu)?,
             tab_dn: t_i64(tab_dn)?,
-            host_gu: t_i64(host.iter().map(|a| a.0 as i64).collect())?,
-            host_dn: t_i64(host.iter().map(|a| a.1 as i64).collect())?,
+            host_gu: t_i64(blobs.iter().map(|a| a.gu as i64).collect())?,
+            host_dn: t_i64(blobs.iter().map(|a| a.dn as i64).collect())?,
+            host_s,
             owner: Tensor::from_vec::<_, i32>(owner, vec![n_slots], dev).map_err(zerr)?,
             used: Tensor::zeros(vec![n_slots], DType::U8, dev).map_err(zerr)?,
             clock: Tensor::zeros(vec![1], DType::U32, dev).map_err(zerr)?,
@@ -216,6 +338,8 @@ impl ZcLayer {
             dtype,
             gu_bytes,
             dn_bytes,
+            gu_s_bytes,
+            dn_s_bytes,
             experts,
             n_slots,
             seed,
@@ -224,6 +348,53 @@ impl ZcLayer {
             pending: Mutex::new(None),
         };
         Ok(Some(me))
+    }
+
+    /// Общая часть аргументов ядер: таблицы, слоты, размеры.
+    fn launch_base(&self) -> Result<ZcLaunch, ModelError> {
+        let (hgs, hds) = match &self.host_s {
+            Some((g, d)) => (addr(g)?, addr(d)?),
+            None => (0, 0),
+        };
+        Ok(ZcLaunch {
+            tab_gu: addr(&self.tab_gu)?,
+            tab_dn: addr(&self.tab_dn)?,
+            host_gu: addr(&self.host_gu)?,
+            host_dn: addr(&self.host_dn)?,
+            owner: addr(&self.owner)?,
+            used: addr(&self.used)?,
+            clock: addr(&self.clock)?,
+            stats: addr(&self.stats)?,
+            slot_base: self.slot_base,
+            slot_bytes: self.slot_bytes() as u64,
+            gu_bytes: self.gu_bytes as u64,
+            dn_bytes: self.dn_bytes as u64,
+            experts: self.experts as u32,
+            slots: self.n_slots as u32,
+            host_gu_s: hgs,
+            host_dn_s: hds,
+            gu_s_bytes: self.gu_s_bytes as u64,
+            dn_s_bytes: self.dn_s_bytes as u64,
+            ..Default::default()
+        })
+    }
+
+    /// Масштабы отдельным блобом (NVFP4, MXFP8).
+    pub fn split_scales(&self) -> bool {
+        self.host_s.is_some()
+    }
+
+    /// Байт на слот (packed и масштабы обеих матриц).
+    pub fn slot_bytes(&self) -> usize {
+        self.gu_bytes + self.gu_s_bytes + self.dn_bytes + self.dn_s_bytes
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn experts(&self) -> usize {
+        self.experts
     }
 
     /// Частоты префилла — затравка следующей сборки.
@@ -249,36 +420,32 @@ impl ZcLayer {
         self.resolve_pending()?;
         let pairs = idx.numel();
         let dev = pool.device;
+        let split = self.split_scales();
         let eff_gu = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
         let eff_dn = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
-        let cp = Tensor::zeros(vec![3, pairs], DType::I64, dev).map_err(zerr)?;
-        let cpa = addr(&cp)?;
-        let a = ZcLaunch {
-            idx: addr(idx)?,
-            tab_gu: addr(&self.tab_gu)?,
-            tab_dn: addr(&self.tab_dn)?,
-            host_gu: addr(&self.host_gu)?,
-            host_dn: addr(&self.host_dn)?,
-            owner: addr(&self.owner)?,
-            used: addr(&self.used)?,
-            clock: addr(&self.clock)?,
-            stats: addr(&self.stats)?,
-            eff_gu: addr(&eff_gu)?,
-            eff_dn: addr(&eff_dn)?,
-            cp_src_gu: cpa,
-            cp_src_dn: cpa + 8 * pairs as u64,
-            cp_dst: cpa + 16 * pairs as u64,
-            slot_base: self.slot_base,
-            slot_bytes: (self.gu_bytes + self.dn_bytes) as u64,
-            gu_bytes: self.gu_bytes as u64,
-            dn_bytes: self.dn_bytes as u64,
-            pairs: pairs as u32,
-            experts: self.experts as u32,
-            slots: self.n_slots as u32,
-            _pad: 0,
-            ..Default::default()
+        // Масштабы — отдельными тензорами: таблица GEMV берёт хранилище целиком.
+        let eff_s = if split {
+            Some((Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?, Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?))
+        } else {
+            None
         };
-        let mut a = a;
+        let cp = Tensor::zeros(vec![if split { 5 } else { 3 }, pairs], DType::I64, dev).map_err(zerr)?;
+        let cpa = addr(&cp)?;
+        let row = 8 * pairs as u64;
+        let mut a = self.launch_base()?;
+        a.idx = addr(idx)?;
+        a.eff_gu = addr(&eff_gu)?;
+        a.eff_dn = addr(&eff_dn)?;
+        a.cp_src_gu = cpa;
+        a.cp_src_dn = cpa + row;
+        a.cp_dst = cpa + 2 * row;
+        a.pairs = pairs as u32;
+        if let Some((g, d)) = &eff_s {
+            a.eff_gu_s = addr(g)?;
+            a.eff_dn_s = addr(d)?;
+            a.cp_src_gu_s = cpa + 3 * row;
+            a.cp_src_dn_s = cpa + 4 * row;
+        }
         let mut _logits = None;
         if let Some((router, x, wts)) = route {
             let rows = x.dims()[0];
@@ -295,8 +462,18 @@ impl ZcLayer {
         }
         synaptix_core::tensor::ops::moe_zc_lru(dev, &a).map_err(zerr)?;
         drop(cp);
-        let gu = ExpertTable::from_tensor_dense(self.gu_shape.0, self.gu_shape.1, self.dtype, eff_gu).ok_or_else(|| zerr("таблица gate_up"))?;
-        let dn = ExpertTable::from_tensor_dense(self.dn_shape.0, self.dn_shape.1, self.dtype, eff_dn).ok_or_else(|| zerr("таблица down"))?;
+        let (gu, dn) = match eff_s {
+            Some((gs, ds)) => (
+                ExpertTable::from_tensors_dense(self.gu_shape.0, self.gu_shape.1, self.dtype, eff_gu, gs),
+                ExpertTable::from_tensors_dense(self.dn_shape.0, self.dn_shape.1, self.dtype, eff_dn, ds),
+            ),
+            None => (
+                ExpertTable::from_tensor_dense(self.gu_shape.0, self.gu_shape.1, self.dtype, eff_gu),
+                ExpertTable::from_tensor_dense(self.dn_shape.0, self.dn_shape.1, self.dtype, eff_dn),
+            ),
+        };
+        let gu = gu.ok_or_else(|| zerr("таблица gate_up"))?;
+        let dn = dn.ok_or_else(|| zerr("таблица down"))?;
         Ok((gu, dn, pool.iota(pairs)?))
     }
 
@@ -329,8 +506,8 @@ impl ZcLayer {
                 logits: Tensor::zeros(vec![r, self.experts], DType::F32, dev).map_err(zerr)?,
                 idx: Tensor::zeros(vec![r * kpf], DType::U32, dev).map_err(zerr)?,
                 wts: Tensor::zeros(vec![r * kpf], DType::F32, dev).map_err(zerr)?,
-                cp: Tensor::zeros(vec![3, r * kpf], DType::I64, dev).map_err(zerr)?,
-                eff: Tensor::zeros(vec![2, r * kpf], DType::I64, dev).map_err(zerr)?,
+                cp: Tensor::zeros(vec![if self.split_scales() { 5 } else { 3 }, r * kpf], DType::I64, dev).map_err(zerr)?,
+                eff: Tensor::zeros(vec![if self.split_scales() { 4 } else { 2 }, r * kpf], DType::I64, dev).map_err(zerr)?,
                 rows: r,
                 k: kpf,
             });
@@ -339,38 +516,30 @@ impl ZcLayer {
         let pairs = rows * kpf;
         let cpa = addr(&sc.cp)?;
         let cap = (sc.rows * kpf) as u64;
-        let a = ZcLaunch {
-            idx: addr(&sc.idx)?,
-            tab_gu: addr(&self.tab_gu)?,
-            tab_dn: addr(&self.tab_dn)?,
-            host_gu: addr(&self.host_gu)?,
-            host_dn: addr(&self.host_dn)?,
-            owner: addr(&self.owner)?,
-            used: addr(&self.used)?,
-            clock: addr(&self.clock)?,
-            stats: addr(&self.stats)?,
-            eff_gu: addr(&sc.eff)?,
-            eff_dn: addr(&sc.eff)? + 8 * cap,
-            cp_src_gu: cpa,
-            cp_src_dn: cpa + 8 * cap,
-            cp_dst: cpa + 16 * cap,
-            slot_base: self.slot_base,
-            slot_bytes: (self.gu_bytes + self.dn_bytes) as u64,
-            gu_bytes: self.gu_bytes as u64,
-            dn_bytes: self.dn_bytes as u64,
-            pairs: pairs as u32,
-            experts: self.experts as u32,
-            slots: self.n_slots as u32,
-            _pad: 1,
-            router_w: addr(router)?,
-            x: addr(x)?,
-            logits: addr(&sc.logits)?,
-            wts: addr(&sc.wts)?,
-            rows: rows as u32,
-            k: kpf as u32,
-            h: h as u32,
-            _pad2: budget as u32,
-        };
+        let mut a = self.launch_base()?;
+        a.idx = addr(&sc.idx)?;
+        a.eff_gu = addr(&sc.eff)?;
+        a.eff_dn = addr(&sc.eff)? + 8 * cap;
+        a.cp_src_gu = cpa;
+        a.cp_src_dn = cpa + 8 * cap;
+        a.cp_dst = cpa + 16 * cap;
+        a.pairs = pairs as u32;
+        a._pad = 1;
+        a.router_w = addr(router)?;
+        a.x = addr(x)?;
+        a.logits = addr(&sc.logits)?;
+        a.wts = addr(&sc.wts)?;
+        a.rows = rows as u32;
+        a.k = kpf as u32;
+        a.h = h as u32;
+        a._pad2 = budget as u32;
+        if self.split_scales() {
+            // Таблицы eff в упреждении не пишутся, но адреса — в свой скретч.
+            a.eff_gu_s = addr(&sc.eff)? + 16 * cap;
+            a.eff_dn_s = addr(&sc.eff)? + 24 * cap;
+            a.cp_src_gu_s = cpa + 24 * cap;
+            a.cp_src_dn_s = cpa + 32 * cap;
+        }
         // Второй стрим стартует после всего, что уже поставлено в default
         // (вход `x`, прошлые шаги слоя), и считает параллельно дальнейшему.
         synaptix_core::device::cuda::loader_wait_default(self.ord).map_err(zerr)?;

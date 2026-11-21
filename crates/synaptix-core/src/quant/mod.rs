@@ -63,6 +63,19 @@ pub fn block_row_bytes(dtype: DType, k: usize) -> Option<usize> {
     }
 }
 
+/// Байт матрицы `[n, k]` в квант-формате: `(packed, scales)`. Одноблобные
+/// (SQ, ggml) — `(n · row_bytes, 0)`; NVFP4 — packed `n·k/2` в натуральной
+/// раскладке и тайловые E4M3-масштабы (строки дополнены до 128); MXFP8 —
+/// `n·k` и E8M0 `n·k/32`. `None` — формат не квантованный или `k` не кратен
+/// блоку.
+pub fn matrix_blob_bytes(dtype: DType, n: usize, k: usize) -> Option<(usize, usize)> {
+    match dtype {
+        DType::NVFP4 if k % 16 == 0 => Some((n * k / 2, k.div_ceil(64) * 4 * n.div_ceil(128) * 128)),
+        DType::MXFP8 if k % 32 == 0 => Some((n * k, n * k / 32)),
+        _ => block_row_bytes(dtype, k).map(|r| (n * r, 0)),
+    }
+}
+
 /// Деквант строки `[k]` одноблобного формата в f32 (CPU-эталон).
 pub fn dequant_row_f32(dtype: DType, src: &[u8], k: usize, dst: &mut [f32]) -> crate::error::Result<()> {
     match dtype {
@@ -111,5 +124,9 @@ mod tests {
         assert_eq!(block_row_bytes(DType::Ggml(GgmlType::Q4K), 4096), Some(16 * 144));
         assert_eq!(block_row_bytes(DType::Ggml(GgmlType::Q4K), 4000), None);
         assert_eq!(block_row_bytes(DType::NVFP4, 4096), None);
+        assert_eq!(matrix_blob_bytes(DType::NVFP4, 256, 512), Some((256 * 256, 8 * 4 * 256)));
+        assert_eq!(matrix_blob_bytes(DType::NVFP4, 100, 64), Some((3200, 4 * 128)));
+        assert_eq!(matrix_blob_bytes(DType::MXFP8, 64, 256), Some((64 * 256, 64 * 8)));
+        assert_eq!(matrix_blob_bytes(DType::Sq { bits: 4 }, 2, 4096), Some((2 * 16 * 148, 0)));
     }
 }

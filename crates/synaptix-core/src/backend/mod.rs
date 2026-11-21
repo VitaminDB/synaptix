@@ -129,7 +129,24 @@ pub struct ZcLaunch {
     pub k: u32,
     pub h: u32,
     pub _pad2: u32,
+    /// Двухблобные форматы (NVFP4, MXFP8): слот `[gu_p | gu_s | dn_p | dn_s]`,
+    /// `gu_bytes`/`dn_bytes` — packed, `gu_s_bytes`/`dn_s_bytes` — масштабы.
+    /// `host_*_s` — I64 `[E]` адресов масштабов в закреплённой RAM; `eff_*_s` —
+    /// выход `[pairs]` адресов масштабов по парам (пишется при `eff_gu_s != 0`);
+    /// `cp_src_*_s` — скретч `[pairs]` источников копии масштабов. У одноблобных
+    /// форматов всё нулевое — путь прежний.
+    pub host_gu_s: u64,
+    pub host_dn_s: u64,
+    pub eff_gu_s: u64,
+    pub eff_dn_s: u64,
+    pub cp_src_gu_s: u64,
+    pub cp_src_dn_s: u64,
+    pub gu_s_bytes: u64,
+    pub dn_s_bytes: u64,
 }
+
+// Раскладка обязана совпадать с `ZcArgs` (`moe_zc_stage.cu`).
+const _: () = assert!(std::mem::size_of::<ZcLaunch>() == 272);
 
 /// Аргументы ядер Inkling-2 (`inkling2.cu`, структура `Ink2Args`): адреса на
 /// устройстве, числа и размеры — смысл полей у каждого ядра свой.

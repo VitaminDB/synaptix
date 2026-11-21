@@ -998,6 +998,12 @@ impl Backend for CudaBackend {
                 }
             }
         };
+        if (a.gu_bytes | a.dn_bytes | a.gu_s_bytes | a.dn_s_bytes) % 16 != 0 {
+            return Err(SynaptixError::Unsupported("moe_zc_lru: размеры блобов не кратны 16"));
+        }
+        if (a.gu_s_bytes | a.dn_s_bytes) != 0 && (a.host_gu_s == 0 || a.host_dn_s == 0 || a.cp_src_gu_s == 0 || a.cp_src_dn_s == 0) {
+            return Err(SynaptixError::Unsupported("moe_zc_lru: масштабы без адресов в RAM или скретча копии"));
+        }
         let arg = Arg(*a);
         if a.router_w != 0 {
             if a.experts > 1024 || a.k == 0 || a.k > 64 || a.h % 4 != 0 || a.rows * a.k != a.pairs {

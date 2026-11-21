@@ -822,6 +822,19 @@ impl ExpertTable {
         Some(Self { w_table, s_table, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
     }
 
+    /// Как [`Self::from_addrs_dense`], но с раздельными масштабами (NVFP4 —
+    /// packed натуральный + тайловые E4M3, MXFP8 — packed + E8M0): `w[e]` и
+    /// `s[e]` — адреса блобов эксперта `e` (карта или закреплённая RAM).
+    pub fn from_addrs_dense_split(n: usize, k: usize, device: Device, dtype: DType, w: Vec<i64>, s: Vec<i64>) -> Option<Self> {
+        if w.is_empty() || w.len() != s.len() || !device.is_cuda() || !matches!(dtype, DType::NVFP4 | DType::MXFP8) {
+            return None;
+        }
+        let count = w.len();
+        let w_table = Tensor::from_vec::<_, i64>(w, vec![count], device).ok()?;
+        let s_table = Tensor::from_vec::<_, i64>(s, vec![count], device).ok()?;
+        Some(Self { w_table, s_table, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
+    }
+
     /// Портируемая таблица поверх готового тензора адресов I64[count]
     /// (у одноблобных форматов масштабы внутри блоба: s_table = w_table).
     pub fn from_tensor_dense(n: usize, k: usize, dtype: DType, table: Tensor) -> Option<Self> {
@@ -831,6 +844,24 @@ impl ExpertTable {
         let count = table.numel();
         let device = table.device();
         Some(Self { w_table: table.clone(), s_table: table, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
+    }
+
+    /// Портируемая таблица поверх готовых тензоров адресов I64[count] с
+    /// раздельными масштабами (NVFP4, MXFP8): `w` — packed в натуральной
+    /// раскладке (выровнен на 16), `s` — масштабы своего эксперта (NVFP4 —
+    /// тайловые E4M3, MXFP8 — E8M0 `[N, K/32]`). Адреса могут указывать и на
+    /// закреплённую RAM. Для одноблобных форматов `s` игнорируется
+    /// (= [`Self::from_tensor_dense`]).
+    pub fn from_tensors_dense(n: usize, k: usize, dtype: DType, w: Tensor, s: Tensor) -> Option<Self> {
+        if !matches!(dtype, DType::NVFP4 | DType::MXFP8) {
+            return Self::from_tensor_dense(n, k, dtype, w);
+        }
+        if w.dtype() != DType::I64 || s.dtype() != DType::I64 || !w.device().is_cuda() || s.device() != w.device() || s.numel() != w.numel() {
+            return None;
+        }
+        let count = w.numel();
+        let device = w.device();
+        Some(Self { w_table: w, s_table: s, n, k, count, device, dense: Some(dtype), _keep: Vec::new() })
     }
 
     /// Переписать адрес эксперта `i` в порядке default-стрима (ядра,
