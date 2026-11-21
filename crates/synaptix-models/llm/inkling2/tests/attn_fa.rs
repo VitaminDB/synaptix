@@ -293,7 +293,7 @@ fn attn_fa_bench() {
             a.a[i] = ad(x);
         }
         a.a[10] = ad(&pos);
-        a.u = [t as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, if swa { 1024 } else { 0 }, 1024, 1, if swa { 1536 } else { 0 }, 0];
+        a.u = [t as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, if swa { 1024 } else { 0 }, 1024, 1, if swa { 1536 } else { 0 }, 0, 0, 0, 0, 0];
         a.f[0] = 1.0 / (D as f32).sqrt();
         let time = |f: &dyn Fn(), reps: usize| {
             f();

@@ -56,6 +56,32 @@ pub fn rms(x: &Tensor, w: Option<&Tensor>, eps: f32, out_bf16: bool) -> R<Tensor
     Ok(out)
 }
 
+/// RMS-норма `nz` входов одним запуском: вход `j` — строки `[T, H]` с `j·x_z·T·H` элемента `x`
+/// (F32), вес — `ws[j]`. Выходы — отдельные `[T, H]` BF16.
+pub fn rms_z(x: &Tensor, x_z: usize, t: usize, ws: &[&Tensor], eps: f32) -> R<Vec<Tensor>> {
+    let h = *x.dims().last().expect("ранг ≥ 1");
+    let nz = ws.len();
+    if nz == 0 || nz > 3 {
+        return Err(ModelError::Forward(format!("inkling2 rms_z: {nz} входов")));
+    }
+    let outs: Vec<Tensor> = (0..nz).map(|_| empty(vec![t, h], DType::BF16, x.device())).collect::<R<_>>()?;
+    let mut a = Ink2Launch::default();
+    a.a[0] = addr(x)?;
+    a.a[1] = addr(ws[0])?;
+    a.a[2] = addr(&outs[0])?;
+    for j in 1..nz {
+        a.a[3 + j] = addr(ws[j])?;
+        a.a[5 + j] = addr(&outs[j])?;
+    }
+    a.u[0] = t as u32;
+    a.u[1] = h as u32;
+    a.u[2] = 1;
+    a.u[3] = (x_z * t * h) as u32;
+    a.f[0] = eps;
+    launch(x.device(), "ink2_rms", &a, (t as u32, 1, nz as u32), 256)?;
+    Ok(outs)
+}
+
 /// Внимание по глубине: состояния (`[T, H]` F32), запросы `[nq, H]` → `[nq, T, H]`.
 /// Два прохода по кускам H: частичные суммы (`ink2_mix_part`), softmax и выход (`ink2_mix_out`).
 pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
@@ -92,26 +118,77 @@ pub fn pick(mixed: &Tensor, j: usize) -> R<Tensor> {
     t.reshape(vec![tt, h]).map_err(fe)
 }
 
-/// Короткая свёртка с остатком: `x [T, C]` F32, `w [C, K]` F32, состояние `[K-1, C]`.
-pub fn conv(x: &Tensor, w: &Tensor, state: &Tensor, dynamic: Option<(&Tensor, usize)>, scale: f32) -> R<Tensor> {
-    let (t, c) = (x.dims()[0], x.dims()[1]);
-    let k = w.dims()[1];
-    let out = empty(vec![t, c], DType::F32, x.device())?;
+/// Столбцы `[off, …)` матрицы `t [T, S]` (F32 либо BF16, contiguous) для ядра: адрес первого
+/// столбца, шаг строки S и признак BF16. Без копии: ядра читают срез с шагом строки.
+pub struct Cols {
+    pub addr: u64,
+    pub stride: u32,
+    pub bf16: u32,
+}
+
+pub fn cols(t: &Tensor, off: usize) -> R<Cols> {
+    let bf16 = match t.dtype() {
+        DType::BF16 => 1,
+        DType::F32 => 0,
+        d => return Err(ModelError::Forward(format!("inkling2: вход {d:?}"))),
+    };
+    Ok(Cols { addr: addr(t)? + (off * t.dtype().bytes_for_numel(1)) as u64, stride: t.dims()[1] as u32, bf16 })
+}
+
+/// Одна короткая свёртка: вход — столбцы матрицы (F32/BF16), веса `[C, K]` F32, состояние
+/// `[K-1, C]`; динамические отводы — столбцы той же dtype, что вход, и число голов.
+pub struct ConvJob<'a> {
+    pub x: Cols,
+    pub w: &'a Tensor,
+    pub state: &'a Tensor,
+    pub dynamic: Option<(Cols, usize)>,
+}
+
+/// Короткая свёртка с остатком по `c` каналам (одна или две одной формы — один запуск);
+/// `res` — прибавить остаток F32 `[T, C]` к первой (слитое сложение с потоком). Декод (T = 1) —
+/// поток на канал; префилл — блок на (канал, токен) и отдельный запуск обновления состояния.
+pub fn conv(jobs: &[ConvJob], t: usize, c: usize, res: Option<&Tensor>, scale: f32, dev: Device) -> R<Vec<Tensor>> {
+    if jobs.is_empty() || jobs.len() > 2 {
+        return Err(ModelError::Forward(format!("inkling2 conv: {} свёрток", jobs.len())));
+    }
+    let k = jobs[0].w.dims()[1];
+    let outs: Vec<Tensor> = jobs.iter().map(|_| empty(vec![t, c], DType::F32, dev)).collect::<R<_>>()?;
     let mut a = Ink2Launch::default();
-    a.a[0] = addr(x)?;
-    a.a[1] = addr(&out)?;
-    a.a[2] = addr(state)?;
-    a.a[3] = addr(w)?;
-    if let Some((d, heads)) = dynamic {
-        a.a[4] = addr(d)?;
-        a.u[3] = heads as u32;
+    a.u[4] = jobs[0].x.bf16;
+    a.u[5] = jobs[0].x.stride;
+    for (z, (jb, out)) in jobs.iter().zip(&outs).enumerate() {
+        if jb.x.bf16 != a.u[4] || jb.x.stride != a.u[5] {
+            return Err(ModelError::Forward("inkling2 conv: входы пары разной раскладки".into()));
+        }
+        let o = if z == 0 { [0, 1, 2, 3, 4] } else { [6, 7, 8, 9, 10] };
+        a.a[o[0]] = jb.x.addr;
+        a.a[o[1]] = addr(out)?;
+        a.a[o[2]] = addr(jb.state)?;
+        a.a[o[3]] = addr(jb.w)?;
+        if let Some((d, heads)) = &jb.dynamic {
+            if d.bf16 != jb.x.bf16 {
+                return Err(ModelError::Forward("inkling2 conv: dtype отводов ≠ dtype входа".into()));
+            }
+            a.a[o[4]] = d.addr;
+            a.u[3] = *heads as u32;
+            a.u[6] = d.stride;
+        }
+    }
+    if let Some(r) = res {
+        a.a[5] = addr(r)?;
     }
     a.u[0] = t as u32;
     a.u[1] = c as u32;
     a.u[2] = k as u32;
     a.f[0] = scale;
-    launch(x.device(), "ink2_conv", &a, ((c as u32).div_ceil(256), 1, 1), 256)?;
-    Ok(out)
+    let (gx, gz) = ((c as u32).div_ceil(256), jobs.len() as u32);
+    if t == 1 {
+        launch(dev, "ink2_conv", &a, (gx, 1, gz), 256)?;
+    } else {
+        launch(dev, "ink2_conv", &a, (gx, t as u32, gz), 256)?;
+        launch(dev, "ink2_conv_state", &a, (gx, 1, gz), 256)?;
+    }
+    Ok(outs)
 }
 
 static PROF: std::sync::Mutex<Vec<(&'static str, f64, u64)>> = std::sync::Mutex::new(Vec::new());

@@ -155,7 +155,7 @@ const _: () = assert!(std::mem::size_of::<ZcLaunch>() == 272);
 pub struct Ink2Launch {
     pub a: [u64; 12],
     pub f: [f32; 4],
-    pub u: [u32; 12],
+    pub u: [u32; 16],
 }
 
 /// Аргументы слитого gated-residual Qwen4Exp (раскладка как `HcArgs` в

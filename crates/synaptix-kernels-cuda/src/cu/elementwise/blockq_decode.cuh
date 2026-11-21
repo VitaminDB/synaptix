@@ -486,6 +486,28 @@ __device__ __forceinline__ float syn_decode_e2m1(uint8_t nib) {
     const float mag = (float)((0xC8643210u >> ((nib & 7u) * 4u)) & 0xFu) * 0.5f;
     return __int_as_float(__float_as_int(mag) | ((unsigned)(nib & 8u) << 28));
 }
+// 8 значений E2M1 слова (младший ниббл — первый) × sc. На sm_100a/120a — аппаратный cvt пары
+// E2M1 → f16x2 (значения точны в f16), иначе по одному. Произведения e2m1·sc точны в f32 в обоих
+// путях, так что результат одинаков бит в бит.
+#if defined(SYN_ARCH_A) && SYN_ARCH_A && defined(SYN_CC) && SYN_CC >= 100
+#define SYN_HAVE_E2M1X2 1
+#endif
+__device__ __forceinline__ void syn_e2m1x8(unsigned w, float sc, float *y) {
+#ifdef SYN_HAVE_E2M1X2
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        unsigned h2;
+        asm("{ .reg .b8 t; .reg .b32 u; shr.b32 u, %1, %2; cvt.u8.u32 t, u; cvt.rn.f16x2.e2m1x2 %0, t; }"
+            : "=r"(h2) : "r"(w), "r"(8 * j));
+        float2 f = __half22float2(*reinterpret_cast<__half2 *>(&h2));
+        y[2 * j] = f.x * sc;
+        y[2 * j + 1] = f.y * sc;
+    }
+#else
+#pragma unroll
+    for (int j = 0; j < 8; ++j) y[j] = syn_decode_e2m1((w >> (4 * j)) & 0xFu) * sc;
+#endif
+}
 __device__ __forceinline__ unsigned syn_nvfp4_scale_off(unsigned outer, unsigned block_col, unsigned sf_inner_dim) {
     unsigned tile_row = outer >> 7, tile_col = block_col >> 2;
     unsigned local_outer = outer & 127u, local_inner = block_col & 3u;
@@ -505,8 +527,7 @@ __device__ __forceinline__ void deq_nvfp4_syn(const uint8_t *packed, const uint8
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
             unsigned w = words[h * 2 + q];
-#pragma unroll
-            for (int j = 0; j < 8; ++j) y[h * 16 + q * 8 + j] = syn_decode_e2m1((w >> (4 * j)) & 0xFu) * sc;
+            syn_e2m1x8(w, sc, y + h * 16 + q * 8);
         }
     }
 }
@@ -525,8 +546,7 @@ __device__ __forceinline__ void deq_nvfp4_shuf(const uint8_t *shuf, const uint8_
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
             unsigned w = words[h * 2 + q];
-#pragma unroll
-            for (int j = 0; j < 8; ++j) y[h * 16 + q * 8 + j] = syn_decode_e2m1((w >> (4 * j)) & 0xFu) * sc;
+            syn_e2m1x8(w, sc, y + h * 16 + q * 8);
         }
     }
 }

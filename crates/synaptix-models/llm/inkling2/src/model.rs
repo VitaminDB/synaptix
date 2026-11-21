@@ -55,26 +55,18 @@ impl Lin {
             }
         }
     }
-
-    /// `x [T, in]` → `[T, out]` F32.
-    fn f32(&self, x: &Tensor) -> R<Tensor> {
-        f32c(&self.raw(x)?)
-    }
 }
 
-/// Контроллер входа повторного прохода: `(1 − tanh(F·d))·x + tanh(G·d)·m`,
-/// `d = Down·[rms(x); rms(m)]`. Веса F32: down `[R, 2H]`, gain/forget транспонированы в `[R, H]`.
-struct Ctrl {
+/// Контроллеры входов повторного прохода (q, k, v, mlp): `(1 − tanh(F·d))·x + tanh(G·d)·m`,
+/// `d = Down·[rms(x); rms(m)]`. Веса F32 четырёх контроллеров подряд (запуск сразу на несколько —
+/// по `blockIdx.z`): down `[4, R, 2H]`, gain/forget транспонированы в `[4, R, H]`.
+struct LoopLayer {
+    /// Запросы сообщений `[4, H]`: q, k, v, mlp.
+    msg_q: Tensor,
     down: Tensor,
     gain: Tensor,
     forget: Tensor,
     rank: usize,
-}
-
-struct LoopLayer {
-    /// Запросы сообщений `[4, H]`: q, k, v, mlp.
-    msg_q: Tensor,
-    ctrl: [Ctrl; 4],
 }
 
 /// Где лежат веса экспертов слоя.
@@ -323,15 +315,15 @@ fn dev_f32(v: Vec<f32>, shape: Vec<usize>, dev: Device) -> Result<Tensor, LoadEr
     Tensor::from_vec(v, shape, dev).map_err(lerr)
 }
 
-/// Матрица `[r, c]` F32 → транспонированная `[c, r]` на карте.
-fn dev_t(v: &[f32], r: usize, c: usize, dev: Device) -> Result<Tensor, LoadError> {
+/// Матрица `[r, c]` → транспонированная `[c, r]`.
+fn transpose(v: &[f32], r: usize, c: usize) -> Vec<f32> {
     let mut t = vec![0f32; r * c];
     for i in 0..r {
         for j in 0..c {
             t[j * r + i] = v[i * c + j];
         }
     }
-    dev_f32(t, vec![c, r], dev)
+    t
 }
 
 /// Веса свёртки → `[C, K]`, последний отвод — текущий токен.
@@ -424,16 +416,20 @@ impl Inkling2Model {
                     mq.extend_from_slice(row);
                 }
                 let rank = t.loop_config.as_ref().map(|l| l.gate_rank).unwrap_or(64);
-                let ctrl = |name: &str| -> Result<Ctrl, LoadError> {
+                let (mut down, mut gain, mut forget) = (Vec::new(), Vec::new(), Vec::new());
+                for name in ["attn", "k", "v", "mlp"] {
                     let c = format!("{p}.controllers.{name}");
-                    Ok(Ctrl {
-                        down: dev_f32(w.host_f32(&format!("{c}.down_weight"))?, vec![rank, 2 * h], dev)?,
-                        gain: dev_t(&w.host_f32(&format!("{c}.gain_weight"))?, h, rank, dev)?,
-                        forget: dev_t(&w.host_f32(&format!("{c}.forget_weight"))?, h, rank, dev)?,
-                        rank,
-                    })
-                };
-                Some(LoopLayer { msg_q: dev_f32(mq, vec![4, h], dev)?, ctrl: [ctrl("attn")?, ctrl("k")?, ctrl("v")?, ctrl("mlp")?] })
+                    down.extend(w.host_f32(&format!("{c}.down_weight"))?);
+                    gain.extend(transpose(&w.host_f32(&format!("{c}.gain_weight"))?, h, rank));
+                    forget.extend(transpose(&w.host_f32(&format!("{c}.forget_weight"))?, h, rank));
+                }
+                Some(LoopLayer {
+                    msg_q: dev_f32(mq, vec![4, h], dev)?,
+                    down: dev_f32(down, vec![4, rank, 2 * h], dev)?,
+                    gain: dev_f32(gain, vec![4, rank, h], dev)?,
+                    forget: dev_f32(forget, vec![4, rank, h], dev)?,
+                    rank,
+                })
             } else {
                 None
             };
@@ -825,31 +821,44 @@ impl Inkling2Model {
         Ok(res)
     }
 
-    fn control(&self, x: &Tensor, m: &Tensor, c: &Ctrl) -> R<Tensor> {
-        let (n, h) = (x.dims()[0], x.dims()[1]);
+    /// Контроллеры `first..first+nz` слоя одним запуском на этап: вход `j` — строка `j` из `x`
+    /// (`x_z` — шаг между входами в строках `[T, H]`, 0 — общий вход), сообщение — строка
+    /// `first + j` из `msg [4, T, H]`. Выход `[nz, T, H]` F32.
+    fn control(&self, x: &Tensor, x_z: usize, msg: &Tensor, lp: &LoopLayer, first: usize, nz: usize) -> R<Tensor> {
+        let (n, h) = (msg.dims()[1], msg.dims()[2]);
         let dev = self.device;
-        let d = empty(vec![n, c.rank], DType::F32, dev)?;
+        let th = n * h;
+        let r = lp.rank;
+        let d = empty(vec![nz, n, r], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(x)?;
-        a.a[1] = addr(m)?;
-        a.a[2] = addr(&c.down)?;
+        a.a[1] = addr(msg)? + (first * th * 4) as u64;
+        a.a[2] = addr(&lp.down)? + (first * r * 2 * h * 4) as u64;
         a.a[3] = addr(&d)?;
         a.u[0] = n as u32;
         a.u[1] = h as u32;
-        a.u[2] = c.rank as u32;
-        launch(dev, "ink2_ctrl_down", &a, (n as u32, c.rank as u32, 1), 256)?;
-        let out = empty(vec![n, h], DType::F32, dev)?;
+        a.u[2] = r as u32;
+        a.u[3] = (x_z * th) as u32;
+        a.u[4] = th as u32;
+        a.u[5] = (r * 2 * h) as u32;
+        a.u[6] = (n * r) as u32;
+        launch(dev, "ink2_ctrl_down", &a, (n as u32, r as u32, nz as u32), 256)?;
+        let out = empty(vec![nz, n, h], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(x)?;
-        a.a[1] = addr(m)?;
+        a.a[1] = addr(msg)? + (first * th * 4) as u64;
         a.a[2] = addr(&d)?;
-        a.a[3] = addr(&c.gain)?;
-        a.a[4] = addr(&c.forget)?;
+        a.a[3] = addr(&lp.gain)? + (first * r * h * 4) as u64;
+        a.a[4] = addr(&lp.forget)? + (first * r * h * 4) as u64;
         a.a[5] = addr(&out)?;
         a.u[0] = n as u32;
         a.u[1] = h as u32;
-        a.u[2] = c.rank as u32;
-        launch(dev, "ink2_ctrl_out", &a, ((h as u32).div_ceil(256), n as u32, 1), 256)?;
+        a.u[2] = r as u32;
+        a.u[3] = (x_z * th) as u32;
+        a.u[4] = th as u32;
+        a.u[5] = (r * h) as u32;
+        a.u[6] = (n * r) as u32;
+        launch(dev, "ink2_ctrl_out", &a, ((h as u32).div_ceil(256), n as u32, nz as u32), 256)?;
         Ok(out)
     }
 
@@ -863,60 +872,62 @@ impl Inkling2Model {
         let dev = self.device;
         let inp_sa = cur.clone();
 
-        let mut inputs = [cur.clone(), cur.clone(), cur.clone()];
-        if let Some(q) = &l.attn_res_q {
-            let mut states: Vec<&Tensor> = blocks.iter().collect();
-            states.push(&cur);
-            let mixed = kern::stage("mix", dev, || kern::mix(&states, q))?;
-            for (j, inp) in inputs.iter_mut().enumerate() {
-                *inp = f32c(&kern::pick(&mixed, if l.swa { 0 } else { j })?)?;
+        // Входы q/k/v: строки смеси блоков (у SWA — одна на всех), затем контроллеры (проход > 0)
+        // и RMS-нормы — по одному запуску на этап для всех трёх входов (`blockIdx.z`).
+        let mixed = match &l.attn_res_q {
+            Some(q) => {
+                let mut states: Vec<&Tensor> = blocks.iter().collect();
+                states.push(&cur);
+                Some(kern::stage("mix", dev, || kern::mix(&states, q))?)
             }
-        }
-        if let Some(m) = messages {
-            let lp = l.lp.as_ref().expect("контроллеры есть, раз есть сообщения");
-            for (j, inp) in inputs.iter_mut().enumerate() {
-                let msg = f32c(&kern::pick(m, j)?)?;
-                *inp = kern::stage("control", dev, || self.control(inp, &msg, &lp.ctrl[j]))?;
-            }
-        }
-        let normed: [Tensor; 3] = if l.swa {
-            let w = l.attn_norm.as_ref().expect("SWA-норма");
-            if messages.is_some() {
-                [kern::rms(&inputs[0], Some(w), eps, true)?, kern::rms(&inputs[1], Some(w), eps, true)?, kern::rms(&inputs[2], Some(w), eps, true)?]
-            } else {
-                let x = kern::rms(&inputs[0], Some(w), eps, true)?;
-                [x.clone(), x.clone(), x]
-            }
-        } else {
-            let w = l.qkv_norm.as_ref().expect("нормы q/k/v");
-            [kern::rms(&inputs[0], Some(&w[0]), eps, true)?, kern::rms(&inputs[1], Some(&w[1]), eps, true)?, kern::rms(&inputs[2], Some(&w[2]), eps, true)?]
+            None => None,
+        };
+        let src = mixed.as_ref().unwrap_or(&cur);
+        let src_z = if mixed.is_some() && !l.swa { 1 } else { 0 };
+        let normed: [Tensor; 3] = {
+            let (x, x_z, nz) = match messages {
+                Some(m) => {
+                    let lp = l.lp.as_ref().expect("контроллеры есть, раз есть сообщения");
+                    (kern::stage("control", dev, || self.control(src, src_z, m, lp, 0, 3))?, 1, 3)
+                }
+                None => (src.clone(), src_z, if l.swa { 1 } else { 3 }),
+            };
+            let ws: Vec<&Tensor> = match (&l.attn_norm, &l.qkv_norm) {
+                (Some(w), _) => vec![w; nz],
+                (None, Some(w)) => w.iter().collect(),
+                _ => unreachable!("нормы входа"),
+            };
+            let y = kern::rms_z(&x, x_z, n, &ws, eps)?;
+            let row = |j: usize| y[j.min(nz - 1)].clone();
+            [row(0), row(1), row(2)]
         };
 
         let sc = &mut cache.slots[slot];
         let k_scale = 1.0 / ((t.sconv_kernel_size + 1) as f32).sqrt();
         let kd_scale = 1.0 / ((2 * t.sconv_kernel_size + 1) as f32).sqrt();
-        let col = |y: &Tensor, off: usize, len: usize| -> R<Tensor> { y.narrow(1, off, len).map_err(fe)?.contiguous().map_err(fe) };
-        let ya = kern::stage("proj_a", dev, || l.pa.f32(&normed[0]))?;
-        let (q, r, gate, sink) = (col(&ya, 0, nh * d)?, col(&ya, nh * d, nh * dr)?, col(&ya, nh * d + nh * dr, nh * d)?, col(&ya, 2 * nh * d + nh * dr, nh)?);
-        let (yk, yv) = kern::stage("proj_kv", dev, || -> R<_> { Ok((l.pk.f32(&normed[1])?, l.pv.f32(&normed[2])?)) })?;
-        let kk = t.sconv_kernel_size;
-        let (kc, vc) = if l.dyn_conv {
-            let (kraw, kdyn) = (col(&yk, 0, nkv * d)?, col(&yk, nkv * d, nkv * kk)?);
-            let (vraw, vdyn) = (col(&yv, 0, nkv * d)?, col(&yv, nkv * d, nkv * kk)?);
-            (
-                kern::conv(&kraw, &l.k_conv, &sc.k_state, Some((&kdyn, nkv)), kd_scale)?,
-                kern::conv(&vraw, &l.v_conv, &sc.v_state, Some((&vdyn, nkv)), kd_scale)?,
-            )
-        } else {
-            (kern::conv(&yk, &l.k_conv, &sc.k_state, None, k_scale)?, kern::conv(&yv, &l.v_conv, &sc.v_state, None, k_scale)?)
-        };
+        // Выходы слитых проекций (BF16) читаются ядрами срезами с шагом строки — без приведения и копий.
+        let ya = kern::stage("proj_a", dev, || l.pa.raw(&normed[0]))?;
+        let (q, r, gate, sink) = (kern::cols(&ya, 0)?, kern::cols(&ya, nh * d)?, kern::cols(&ya, nh * d + nh * dr)?, kern::cols(&ya, 2 * nh * d + nh * dr)?);
+        let (yk, yv) = kern::stage("proj_kv", dev, || -> R<_> { Ok((l.pk.raw(&normed[1])?, l.pv.raw(&normed[2])?)) })?;
+        let ckv = nkv * d;
+        // Свёртки k и v — одним запуском.
+        let dynk = if l.dyn_conv { Some((kern::cols(&yk, ckv)?, nkv)) } else { None };
+        let dynv = if l.dyn_conv { Some((kern::cols(&yv, ckv)?, nkv)) } else { None };
+        let jobs = [
+            kern::ConvJob { x: kern::cols(&yk, 0)?, w: &l.k_conv, state: &sc.k_state, dynamic: dynk },
+            kern::ConvJob { x: kern::cols(&yv, 0)?, w: &l.v_conv, state: &sc.v_state, dynamic: dynv },
+        ];
+        let mut kv = kern::conv(&jobs, n, ckv, None, if l.dyn_conv { kd_scale } else { k_scale }, dev)?;
+        let (vc, kc) = (kv.pop().expect("v"), kv.pop().expect("k"));
         let q_out = empty(vec![n, nh * d], DType::F32, dev)?;
         let r_out = empty(vec![n, nh * dr], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
-        a.a[0] = addr(&q)?;
+        a.a[0] = q.addr;
         a.a[1] = addr(&kc)?;
         a.a[2] = addr(&vc)?;
-        a.a[3] = addr(&r)?;
+        a.a[3] = r.addr;
+        a.u[12] = q.bf16;
+        a.u[13] = q.stride;
         a.a[4] = addr(&l.q_clip)?;
         a.a[5] = addr(&l.r_clip)?;
         a.a[6] = addr(&q_out)?;
@@ -949,10 +960,12 @@ impl Inkling2Model {
         a.a[0] = addr(&q_out)?;
         a.a[1] = addr(&r_out)?;
         a.a[2] = addr(&l.rel_proj)?;
-        a.a[3] = addr(&sink)?;
+        a.a[3] = sink.addr;
         a.a[4] = addr(&sc.k)?;
         a.a[5] = addr(&sc.v)?;
-        a.a[6] = addr(&gate)?;
+        a.a[6] = gate.addr;
+        a.u[12] = sink.bf16;
+        a.u[13] = sink.stride;
         a.a[7] = addr(&att)?;
         a.u[0] = n as u32;
         a.u[1] = nh as u32;
@@ -1000,28 +1013,28 @@ impl Inkling2Model {
             }
             Ok(())
         })?;
-        let o = kern::stage("proj_o", dev, || l.wo.f32(&att))?;
-        let mut cur = kern::conv(&o, &l.attn_post_conv, &sc.attn_state, None, k_scale)?;
-
-        if ip % t.n_layers_per_attn_res_block == 0 {
+        let o = kern::stage("proj_o", dev, || l.wo.raw(&att))?;
+        // Первый слой блока начинает новый поток; иначе остаток прибавляется в той же свёртке.
+        let first = ip % t.n_layers_per_attn_res_block == 0;
+        let job = kern::ConvJob { x: kern::cols(&o, 0)?, w: &l.attn_post_conv, state: &sc.attn_state, dynamic: None };
+        let cur = kern::conv(&[job], n, t.hidden_size, (!first).then_some(&inp_sa), k_scale, dev)?.pop().expect("свёртка");
+        if first {
             blocks.push(inp_sa.clone());
-        } else {
-            cur = f32c(&inp_sa.add(&cur).map_err(fe)?)?;
         }
         let ffn_inp = cur.clone();
         let mut states: Vec<&Tensor> = blocks.iter().collect();
         states.push(&cur);
-        let mut m = f32c(&kern::pick(&kern::mix(&states, &l.ffn_res_q)?, 0)?)?;
+        let mut m = kern::mix(&states, &l.ffn_res_q)?;
         if let Some(msg) = messages {
             let lp = l.lp.as_ref().expect("контроллеры");
-            let mm = f32c(&kern::pick(msg, 3)?)?;
-            m = self.control(&m, &mm, &lp.ctrl[3])?;
+            m = self.control(&m, 0, msg, lp, 3, 1)?;
         }
+        let m = kern::pick(&m, 0)?;
         let xn = kern::rms(&m, Some(&l.ffn_norm), eps, true)?;
         let y = kern::stage("moe", dev, || self.moe(l, &xn))?;
         let sc = &mut cache.slots[slot];
-        let y = kern::conv(&y, &l.ffn_post_conv, &sc.ffn_state, None, k_scale)?;
-        f32c(&ffn_inp.add(&y).map_err(fe)?)
+        let job = kern::ConvJob { x: kern::cols(&y, 0)?, w: &l.ffn_post_conv, state: &sc.ffn_state, dynamic: None };
+        Ok(kern::conv(&[job], n, t.hidden_size, Some(&ffn_inp), k_scale, dev)?.pop().expect("свёртка"))
     }
 
     /// MoE: `xn [T, H]` BF16 → `[T, H]` F32. Декод (T = 1) — целиком на карте,
@@ -1032,15 +1045,16 @@ impl Inkling2Model {
         let (e, k, hdim, inter) = (t.n_routed_experts, t.num_experts_per_tok, t.hidden_size, t.intermediate_size);
         let dev = self.device;
         let ex = &l.experts;
-        let xf = f32c(xn)?;
+        let xin = kern::cols(xn, 0)?;
         let logits = empty(vec![n, e], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
-        a.a[0] = addr(&xf)?;
+        a.a[0] = xin.addr;
         a.a[1] = addr(&l.router)?;
         a.a[2] = addr(&logits)?;
         a.u[0] = n as u32;
         a.u[1] = hdim as u32;
         a.u[2] = e as u32;
+        a.u[3] = xin.bf16;
         launch(dev, "ink2_router", &a, (n as u32, (e as u32).div_ceil(8), 1), 256)?;
         let idx = empty(vec![n * k], DType::U32, dev)?;
         let wts = empty(vec![n * k], DType::F32, dev)?;
@@ -1054,9 +1068,14 @@ impl Inkling2Model {
         a.u[1] = e as u32;
         a.u[2] = k as u32;
         a.f[0] = t.route_scale;
+        // Декод: накопитель взвешенной суммы экспертов обнуляет сам ink2_route.
+        let acc0 = if n == 1 { Some(empty(vec![hdim], DType::F32, dev)?) } else { None };
+        if let Some(acc) = &acc0 {
+            a.a[5] = addr(acc)?;
+            a.u[3] = hdim as u32;
+        }
         launch(dev, "ink2_route", &a, (n as u32, 1, 1), 32)?;
-        if n == 1 {
-            let mut acc = Tensor::zeros(vec![hdim], DType::F32, dev).map_err(fe)?;
+        if let Some(mut acc) = acc0 {
             match &ex.store {
                 ExpertStore::Resident { gate_up, down, .. } => {
                     let gu = gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;

@@ -15,13 +15,18 @@
 struct Ink2Args {
     unsigned long long a[12];
     float f[4];
-    unsigned int u[12];
+    unsigned int u[16];
 };
 
 #define PF(i) ((float*)args.a[i])
 #define CPF(i) ((const float*)args.a[i])
 #define CPB(i) ((const __nv_bfloat16*)args.a[i])
 #define PB(i) ((__nv_bfloat16*)args.a[i])
+
+// Элемент i входа, лежащего в F32 либо BF16 (выход GEMV как есть, без приведения и копии).
+__device__ __forceinline__ float ink2_ld(unsigned long long p, unsigned long long i, unsigned bf) {
+    return bf ? __bfloat162float(((const __nv_bfloat16*)p)[i]) : ((const float*)p)[i];
+}
 
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -118,51 +123,103 @@ __device__ __forceinline__ void ink2_kv_dec4(unsigned w, unsigned fmt, float sc,
 
 // RMS-норма строки: out = x·rsqrt(mean(x²)+eps)·w (w = 0 — без веса).
 // a0 x f32 [T,H], a1 w f32 [H]|0, a2 out; u0 T, u1 H, u2 out_bf16; f0 eps.
+// Несколько входов одним запуском (blockIdx.z = j): вход j — с j·u3 элемента a0, вес — a1 | a4 | a5,
+// выход — a2 | a6 | a7 (отдельные тензоры).
 extern "C" __global__ void ink2_rms(Ink2Args args) {
     __shared__ float red[32];
-    unsigned int t = blockIdx.x, H = args.u[1];
-    const float* x = CPF(0) + (unsigned long long)t * H;
-    const float* w = CPF(1);
+    unsigned int t = blockIdx.x, H = args.u[1], z = blockIdx.z;
+    const float* x = CPF(0) + (unsigned long long)z * args.u[3] + (unsigned long long)t * H;
+    const float* w = z == 0 ? CPF(1) : (const float*)args.a[3 + z];
+    const unsigned long long outp = z == 0 ? args.a[2] : args.a[5 + z];
     float ss = 0.0f;
     for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) ss += x[i] * x[i];
     ss = block_sum(ss, red);
     float inv = rsqrtf(ss / (float)H + args.f[0]);
     for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
         float v = x[i] * inv * (w ? w[i] : 1.0f);
-        if (args.u[2]) PB(2)[(unsigned long long)t * H + i] = __float2bfloat16(v);
-        else PF(2)[(unsigned long long)t * H + i] = v;
+        if (args.u[2]) ((__nv_bfloat16*)outp)[(unsigned long long)t * H + i] = __float2bfloat16(v);
+        else ((float*)outp)[(unsigned long long)t * H + i] = v;
     }
 }
 
 // Короткая каузальная свёртка с остатком: y_t = (Σ_j w[c,j]·x_{t-K+1+j} + x_t)·scale,
 // w[c, K-1] — текущий токен. Динамические отводы (полные слои): + Σ_lag dyn[t, h·K+lag]·x_{t-lag},
 // h = c / (C/heads). Состояние — последние K-1 входов (старший первый), обновляется.
-// a0 x f32 [T,C], a1 out f32 [T,C], a2 state f32 [K-1,C], a3 w f32 [C,K], a4 dyn f32 [T,heads·K]|0;
-// u0 T, u1 C, u2 K (≤8), u3 heads; f0 scale.
+// a0 x [T,C] (шаг строки u5, 0 — C), a1 out f32 [T,C], a2 state f32 [K-1,C], a3 w f32 [C,K],
+// a4 dyn [T,heads·K]|0 (шаг строки u6, 0 — heads·K), a5 остаток f32 [T,C]|0 (out = остаток + свёртка);
+// x и dyn — F32 либо BF16 (u4); u0 T, u1 C, u2 K (≤8), u3 heads; f0 scale.
+// Вторая свёртка той же формы в том же запуске (blockIdx.z = 1, k и v): a6 x, a7 out, a8 state,
+// a9 w, a10 dyn (без остатка).
+// gridDim.y = 1 — поток проходит все T токенов и обновляет состояние (декод); gridDim.y = T — блок
+// на токен (префилл, без цикла по T), состояние затем обновляет ink2_conv_state. Сумма для
+// токена в обоих режимах одна и та же.
+struct Ink2Conv {
+    unsigned long long x, dyn;
+    float* out;
+    float* st;
+    const float* w;
+    const float* res;
+};
+
+__device__ __forceinline__ Ink2Conv ink2_conv_args(const Ink2Args& args) {
+    const bool z = blockIdx.z != 0;
+    Ink2Conv c;
+    c.x = z ? args.a[6] : args.a[0];
+    c.out = (float*)(z ? args.a[7] : args.a[1]);
+    c.st = (float*)(z ? args.a[8] : args.a[2]);
+    c.w = (const float*)(z ? args.a[9] : args.a[3]);
+    c.dyn = z ? args.a[10] : args.a[4];
+    c.res = z ? nullptr : CPF(5);
+    return c;
+}
+
 extern "C" __global__ void ink2_conv(Ink2Args args) {
     unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int T = args.u[0], C = args.u[1], K = args.u[2], heads = args.u[3];
     if (c >= C) return;
-    const float* x = CPF(0);
-    float* st = PF(2);
-    const float* w = CPF(3) + (unsigned long long)c * K;
-    const float* dyn = CPF(4);
+    const Ink2Conv cv = ink2_conv_args(args);
+    const unsigned bf = args.u[4];
+    const unsigned long long xs = args.u[5] ? args.u[5] : C, ds = args.u[6] ? args.u[6] : heads * K;
+    const float* w = cv.w + (unsigned long long)c * K;
     unsigned int h = heads ? c / (C / heads) : 0;
+    const bool par = gridDim.y > 1;
+    const unsigned t0 = par ? blockIdx.y : 0u, t1 = par ? blockIdx.y + 1u : T;
     float hist[8];
-    for (unsigned int j = 0; j + 1 < K; ++j) hist[j] = st[(unsigned long long)j * C + c];
-    for (unsigned int t = 0; t < T; ++t) {
-        float xt = x[(unsigned long long)t * C + c];
+    for (unsigned int j = 0; j + 1 < K; ++j) {
+        int p = (int)t0 - (int)(K - 1) + (int)j;  // позиция входа отвода j для токена t0
+        hist[j] = p >= 0 ? ink2_ld(cv.x, (unsigned long long)p * xs + c, bf) : cv.st[(unsigned long long)(p + (int)K - 1) * C + c];
+    }
+    for (unsigned int t = t0; t < t1; ++t) {
+        float xt = ink2_ld(cv.x, (unsigned long long)t * xs + c, bf);
         hist[K - 1] = xt;
         float acc = 0.0f;
         for (unsigned int j = 0; j < K; ++j) acc += w[j] * hist[j];
-        if (dyn) {
-            const float* d = dyn + (unsigned long long)t * heads * K + h * K;
-            for (unsigned int lag = 0; lag < K; ++lag) acc += d[lag] * hist[K - 1 - lag];
+        if (cv.dyn) {
+            const unsigned long long d = (unsigned long long)t * ds + h * K;
+            for (unsigned int lag = 0; lag < K; ++lag) acc += ink2_ld(cv.dyn, d + lag, bf) * hist[K - 1 - lag];
         }
-        PF(1)[(unsigned long long)t * C + c] = (acc + xt) * args.f[0];
+        // Явные _rn: без слияния в FMA — ровно как свёртка и отдельное сложение с потоком.
+        float y = __fmul_rn(acc + xt, args.f[0]);
+        if (cv.res) y = __fadd_rn(cv.res[(unsigned long long)t * C + c], y);
+        cv.out[(unsigned long long)t * C + c] = y;
         for (unsigned int j = 0; j + 1 < K; ++j) hist[j] = hist[j + 1];
     }
-    for (unsigned int j = 0; j + 1 < K; ++j) st[(unsigned long long)j * C + c] = hist[j];
+    if (!par)
+        for (unsigned int j = 0; j + 1 < K; ++j) cv.st[(unsigned long long)j * C + c] = hist[j];
+}
+
+// Состояние после префилла (режим блока на токен): последние K-1 входов. Аргументы — как у ink2_conv.
+extern "C" __global__ void ink2_conv_state(Ink2Args args) {
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int T = args.u[0], C = args.u[1], K = args.u[2];
+    if (c >= C) return;
+    const Ink2Conv cv = ink2_conv_args(args);
+    const unsigned long long xs = args.u[5] ? args.u[5] : C;
+    // Ячейка j читает вход T-K+1+j либо прежнюю ячейку T+j (> j — ещё не перезаписана).
+    for (unsigned int j = 0; j + 1 < K; ++j) {
+        int p = (int)T - (int)(K - 1) + (int)j;
+        cv.st[(unsigned long long)j * C + c] = p >= 0 ? ink2_ld(cv.x, (unsigned long long)p * xs + c, args.u[4]) : cv.st[(unsigned long long)(p + (int)K - 1) * C + c];
+    }
 }
 
 // Подготовка внимания: блок на (токен, вектор); вектора 0..nh-1 — q (и r той же
@@ -173,7 +230,8 @@ extern "C" __global__ void ink2_conv(Ink2Args args) {
 // a6 q_out f32, a7 r_out f32, a8 kcache bf16 [nkv,cap,d], a9 vcache bf16;
 // u0 T, u1 nh, u2 nkv, u3 d, u4 dr, u5 cap, u6 past (или a10 — u32 на карте), u7 full, u8 floor,
 // u9 кольцо (позиция p — ячейка p mod кольцо; 0 — линейно), u11 формат KV (0 — BF16; иначе
-// байты в a8/a9 и масштабы в a11, см. «Квантованный KV»); f0 qk_clip, f1 rel_clip, f2 eps, f3 alpha.
+// байты в a8/a9 и масштабы в a11, см. «Квантованный KV»); q и r — F32 либо BF16 (u12), шаг строки
+// у обоих u13 (0 — nh·d и nh·dr); f0 qk_clip, f1 rel_clip, f2 eps, f3 alpha.
 extern "C" __global__ void ink2_qkv(Ink2Args args) {
     __shared__ float red[32];
     unsigned int t = blockIdx.x, vi = blockIdx.y;
@@ -185,12 +243,15 @@ extern "C" __global__ void ink2_qkv(Ink2Args args) {
     unsigned int i = threadIdx.x;
     if (vi < nh) {
         unsigned long long o = ((unsigned long long)t * nh + vi) * d;
-        float v = i < d ? CPF(0)[o + i] * CPF(4)[vi * d + i] : 0.0f;
+        const unsigned qbf = args.u[12];
+        const unsigned long long qi = (unsigned long long)t * (args.u[13] ? args.u[13] : nh * d) + vi * d;
+        const unsigned long long ri = (unsigned long long)t * (args.u[13] ? args.u[13] : nh * dr) + vi * dr;
+        float v = i < d ? ink2_ld(args.a[0], qi + i, qbf) * CPF(4)[vi * d + i] : 0.0f;
         float n = sqrtf(block_sum(v * v, red));
         float k = fminf(1.0f, args.f[0] / (n + 1e-6f));
         if (i < d) PF(6)[o + i] = v * k * tau;
         unsigned long long orr = ((unsigned long long)t * nh + vi) * dr;
-        float r = i < dr ? CPF(3)[orr + i] * CPF(5)[vi * dr + i] : 0.0f;
+        float r = i < dr ? ink2_ld(args.a[3], ri + i, qbf) * CPF(5)[vi * dr + i] : 0.0f;
         float nr = sqrtf(block_sum(r * r, red));
         float kr = fminf(1.0f, args.f[1] / (nr + 1e-6f));
         if (i < dr) PF(7)[orr + i] = r * kr * tau;
@@ -230,7 +291,8 @@ extern "C" __global__ void ink2_qkv(Ink2Args args) {
 // a0 q f32 [T,nh,d], a1 r f32 [T,nh,dr], a2 proj f32 [dr,extent], a3 sink f32 [T,nh],
 // a4 kcache, a5 vcache bf16 [nkv,cap,d], a6 gate f32 [T,nh·d], a7 out f32 [T,nh·d], a8 части f32 [T,nh,S,130];
 // u0 T, u1 nh, u2 nkv, u3 d (=128), u4 dr (≤32), u5 cap, u6 past (или a10 — u32 на карте), u7 window, u8 extent,
-// u9 splits, u10 кольцо KV (0 — линейно), u11 формат KV (a11 — масштабы); f0 scale.
+// u9 splits, u10 кольцо KV (0 — линейно), u11 формат KV (a11 — масштабы); sink и gate — F32 либо
+// BF16 (u12), шаг строки у обоих u13 (0 — nh и nh·d); f0 scale.
 extern "C" __global__ void ink2_attn(Ink2Args args) {
     __shared__ float sm_m[4], sm_l[4];
     __shared__ float sm_acc[4][128];
@@ -257,29 +319,50 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
     unsigned int len = pos + 1 - lo0, chunk = (len + S - 1) / S;
     unsigned int lo = lo0 + sp * chunk, hi = min(lo + chunk, pos + 1);
     float m = -INFINITY, l = 0.0f, acc[4] = {0.f, 0.f, 0.f, 0.f};
+    // Сырые K/V (и срез proj) следующего ключа варпа грузятся до счёта текущего: задержка памяти
+    // перекрывается, порядок онлайн-softmax тот же.
+    uint2 kw = make_uint2(0u, 0u), vw = kw;
+    unsigned ksb = 0, vsb = 0;
+    float pj = 0.0f;
+    auto fetch = [&](unsigned j) {
+        unsigned long long jr = args.u[10] ? j % args.u[10] : j;
+        if (fmt) {
+            kw.x = *(const unsigned*)(k8 + jr * d + lane * 4);
+            vw.x = *(const unsigned*)(v8 + jr * d + lane * 4);
+            ksb = ks8[jr * 4 + (lane >> 3)];
+            vsb = vs8[jr * 4 + (lane >> 3)];
+        } else {
+            kw = *(const uint2*)(kc + jr * d + lane * 4);
+            vw = *(const uint2*)(vc + jr * d + lane * 4);
+        }
+        unsigned dist = pos - j;
+        pj = (dist < extent && lane < (int)dr) ? proj[(unsigned long long)lane * extent + dist] : 0.0f;
+    };
+    if (lo + wid < hi) fetch(lo + wid);
     for (unsigned int j = lo + wid; j < hi; j += 4) {
-        unsigned int jr = args.u[10] ? j % args.u[10] : j;
+        const uint2 kc0 = kw, vc0 = vw;
+        const unsigned ks0 = ksb, vs0 = vsb;
+        const float pj0 = pj;
+        if (j + 4 < hi) fetch(j + 4);
         float kf[4], vf[4];
         if (fmt) {
-            ink2_kv_dec4(*(const unsigned*)(k8 + (unsigned long long)jr * d + lane * 4), fmt, ink2_e8m0(ks8[(unsigned long long)jr * 4 + (lane >> 3)]), kf);
+            ink2_kv_dec4(kc0.x, fmt, ink2_e8m0(ks0), kf);
         } else {
-            const __nv_bfloat16* kr = kc + (unsigned long long)jr * d + lane * 4;
-            float2 k01 = __bfloat1622float2(*(const __nv_bfloat162*)kr);
-            float2 k23 = __bfloat1622float2(*(const __nv_bfloat162*)(kr + 2));
+            float2 k01 = __bfloat1622float2(*(const __nv_bfloat162*)&kc0.x);
+            float2 k23 = __bfloat1622float2(*(const __nv_bfloat162*)&kc0.y);
             kf[0] = k01.x; kf[1] = k01.y; kf[2] = k23.x; kf[3] = k23.y;
         }
         float part = q[0] * kf[0] + q[1] * kf[1] + q[2] * kf[2] + q[3] * kf[3];
         unsigned int dist = pos - j;
-        if (dist < extent && lane < (int)dr) part += rr * proj[(unsigned long long)lane * extent + dist];
+        if (dist < extent && lane < (int)dr) part += rr * pj0;
         float s = warp_sum(part);
         float mn = fmaxf(m, s);
         float corr = expf(m - mn), p = expf(s - mn);
         if (fmt) {
-            ink2_kv_dec4(*(const unsigned*)(v8 + (unsigned long long)jr * d + lane * 4), fmt, ink2_e8m0(vs8[(unsigned long long)jr * 4 + (lane >> 3)]), vf);
+            ink2_kv_dec4(vc0.x, fmt, ink2_e8m0(vs0), vf);
         } else {
-            const __nv_bfloat16* vr = vc + (unsigned long long)jr * d + lane * 4;
-            float2 v01 = __bfloat1622float2(*(const __nv_bfloat162*)vr);
-            float2 v23 = __bfloat1622float2(*(const __nv_bfloat162*)(vr + 2));
+            float2 v01 = __bfloat1622float2(*(const __nv_bfloat162*)&vc0.x);
+            float2 v23 = __bfloat1622float2(*(const __nv_bfloat162*)&vc0.y);
             vf[0] = v01.x; vf[1] = v01.y; vf[2] = v23.x; vf[3] = v23.y;
         }
         acc[0] = acc[0] * corr + p * vf[0];
@@ -303,7 +386,7 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
         if (i == 0) { pp[0] = M; pp[1] = L; }
         return;
     }
-    float sink = CPF(3)[(unsigned long long)t * nh + h];
+    float sink = ink2_ld(args.a[3], (unsigned long long)t * (args.u[13] ? args.u[13] : nh) + h, args.u[12]);
     float M = sink;
     for (int w = 0; w < 4; ++w) if (sm_l[w] > 0.0f) M = fmaxf(M, sm_m[w]);
     float L = expf(sink - M);
@@ -311,7 +394,7 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
     float o = 0.0f;
     for (int w = 0; w < 4; ++w) if (sm_l[w] > 0.0f) o += sm_acc[w][i] * expf(sm_m[w] - M);
     o /= L;
-    float g = CPF(6)[(unsigned long long)t * nh * d + h * d + i];
+    float g = ink2_ld(args.a[6], (unsigned long long)t * (args.u[13] ? args.u[13] : nh * d) + h * d + i, args.u[12]);
     PF(7)[(unsigned long long)t * nh * d + h * d + i] = o * sigm(g);
 }
 
@@ -328,7 +411,7 @@ extern "C" __global__ void ink2_attn(Ink2Args args) {
 // a8 части f32 [T,nh,S,130] (при S > 1; сборка — ink2_attn_merge с u9 = S), a10 позиция u32 | u6;
 // u0 T, u1 nh, u2 nkv, u5 cap, u7 window (0 — нет), u8 extent, u9 S (≤ 1 — сразу в out),
 // u10 кольцо KV (0 — линейно), u11 формат KV (a11 — масштабы; плитка деквантуется в BF16 shared
-// точно); f0 scale. grid = (ceil(T/64), nh, S), block = 128.
+// точно); sink и gate — F32 либо BF16 (u12), шаг строки u13 (0 — nh и nh·128); f0 scale. grid = (ceil(T/64), nh, S), block = 128.
 #define FA_BM 64
 #define FA_BN 32
 #define FA_LD 136  // bf16 на строку K/V в shared (128 + 8: без конфликтов банков у ldmatrix)
@@ -654,16 +737,16 @@ extern "C" __global__ void __launch_bounds__(128, 2) ink2_attn_fa(Ink2Args args)
                 *(float2*)(d + 2 + nd * 8 + 2 * tg) = make_float2(o[nd][oi], o[nd][oi + 1]);
             if (tg == 0) { d[0] = l > 0.0f ? m * FA_LN2 : -INFINITY; d[1] = l; }
         } else {
-            const float sk = CPF(3)[(unsigned long long)t * nh + h] * FA_L2E;
+            const float sk = ink2_ld(args.a[3], (unsigned long long)t * (args.u[13] ? args.u[13] : nh) + h, args.u[12]) * FA_L2E;
             const float M = l > 0.0f ? fmaxf(m, sk) : sk;
             const float c = l > 0.0f ? exp2f(m - M) : 0.0f;
             const float inv = c / (l * c + exp2f(sk - M));
-            const float* gt = CPF(6) + (unsigned long long)t * nh * 128 + h * 128;
+            const unsigned long long gt = (unsigned long long)t * (args.u[13] ? args.u[13] : nh * 128) + h * 128;
             float* out = PF(7) + (unsigned long long)t * nh * 128 + h * 128;
             #pragma unroll
             for (int nd = 0; nd < 16; ++nd) {
                 int col = nd * 8 + 2 * tg;
-                float2 gg = *(const float2*)(gt + col);
+                float2 gg = make_float2(ink2_ld(args.a[6], gt + col, args.u[12]), ink2_ld(args.a[6], gt + col + 1, args.u[12]));
                 *(float2*)(out + col) = make_float2(o[nd][oi] * inv * sigm(gg.x), o[nd][oi + 1] * inv * sigm(gg.y));
             }
         }
@@ -674,7 +757,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) ink2_attn_fa(Ink2Args args)
 extern "C" __global__ void ink2_attn_merge(Ink2Args args) {
     unsigned int t = blockIdx.x, h = blockIdx.y, nh = args.u[1], S = args.u[9], d = 128, i = threadIdx.x;
     const float* pp = CPF(8) + ((unsigned long long)t * nh + h) * S * 130;
-    float sink = CPF(3)[(unsigned long long)t * nh + h];
+    float sink = ink2_ld(args.a[3], (unsigned long long)t * (args.u[13] ? args.u[13] : nh) + h, args.u[12]);
     float M = sink;
     for (unsigned int s = 0; s < S; ++s) if (pp[s * 130 + 1] > 0.0f) M = fmaxf(M, pp[s * 130]);
     float L = expf(sink - M), o = 0.0f;
@@ -683,7 +766,7 @@ extern "C" __global__ void ink2_attn_merge(Ink2Args args) {
         if (ls > 0.0f) { float c = expf(pp[s * 130] - M); L += ls * c; o += pp[s * 130 + 2 + i] * c; }
     }
     o /= L;
-    float g = CPF(6)[(unsigned long long)t * nh * d + h * d + i];
+    float g = ink2_ld(args.a[6], (unsigned long long)t * (args.u[13] ? args.u[13] : nh * d) + h * d + i, args.u[12]);
     PF(7)[(unsigned long long)t * nh * d + h * d + i] = o * sigm(g);
 }
 
@@ -704,12 +787,15 @@ extern "C" __global__ void ink2_act(Ink2Args args) {
 
 // Маршрут: s = σ(logit); выбор top-k по s + bias; вес = s/(Σ s + 1e-20)·scale.
 // a0 logits f32 [T,E], a1 bias f32 [E], a2 idx u32 [T,k], a3 w f32 [T,k], a4 множитель веса по эксперту f32 [E]|0;
+// a5 f32 [u3]|0 — обнулить (накопитель MoE декода: без отдельного memset в графе);
 // u0 T, u1 E (≤1024), u2 k; f0 scale.
 extern "C" __global__ void ink2_route(Ink2Args args) {
     // Один варп на токен: у лейна E/32 ключей в регистрах, k раундов argmax по варпу.
     unsigned int t = blockIdx.x, E = args.u[1], K = args.u[2];
     int lane = threadIdx.x & 31;
     if (threadIdx.x >= 32) return;
+    if (args.a[5] && t == 0)
+        for (unsigned int i = lane; i < args.u[3]; i += 32) PF(5)[i] = 0.0f;
     const float* lg = CPF(0) + (unsigned long long)t * E;
     float key[32];
     unsigned int per = (E + 31) / 32;
@@ -774,12 +860,15 @@ extern "C" __global__ void ink2_logits(Ink2Args args) {
 // Контроллер, шаг 1: d[t, r] = Σ_j down[r, j]·z_t[j], z_t = [x_t·inv_x; m_t·inv_m] (RMS без веса, eps 1e-6).
 // Блок на (токен, строку ранга).
 // a0 x f32 [T,H], a1 m f32 [T,H], a2 down f32 [R, 2H], a3 d f32 [T,R]; u0 T, u1 H, u2 R.
+// Несколько контроллеров одним запуском (blockIdx.z = j): шаги между ними (в элементах) — x u3,
+// m u4, down u5, d u6.
 extern "C" __global__ void ink2_ctrl_down(Ink2Args args) {
     __shared__ float red[32];
     unsigned int t = blockIdx.x, r = blockIdx.y, H = args.u[1], R = args.u[2];
-    const float* x = CPF(0) + (unsigned long long)t * H;
-    const float* m = CPF(1) + (unsigned long long)t * H;
-    const float* w = CPF(2) + (unsigned long long)r * 2 * H;
+    const unsigned long long z = blockIdx.z;
+    const float* x = CPF(0) + z * args.u[3] + (unsigned long long)t * H;
+    const float* m = CPF(1) + z * args.u[4] + (unsigned long long)t * H;
+    const float* w = CPF(2) + z * args.u[5] + (unsigned long long)r * 2 * H;
     float sx = 0.0f, sm = 0.0f, ax = 0.0f, am = 0.0f;
     for (unsigned int i = threadIdx.x; i < H; i += blockDim.x) {
         float xv = x[i], mv = m[i];
@@ -792,38 +881,43 @@ extern "C" __global__ void ink2_ctrl_down(Ink2Args args) {
     sm = block_sum(sm, red);
     ax = block_sum(ax, red);
     am = block_sum(am, red);
-    if (threadIdx.x == 0) PF(3)[(unsigned long long)t * R + r] = ax * rsqrtf(sx / (float)H + 1e-6f) + am * rsqrtf(sm / (float)H + 1e-6f);
+    if (threadIdx.x == 0) PF(3)[z * args.u[6] + (unsigned long long)t * R + r] = ax * rsqrtf(sx / (float)H + 1e-6f) + am * rsqrtf(sm / (float)H + 1e-6f);
 }
 
 // Контроллер, шаг 2: out = (1 − tanh(F·d))·x + tanh(G·d)·m. Поток на канал; gain/forget
 // транспонированы — `[R, H]`, чтение подряд по каналам.
 // a0 x, a1 m f32 [T,H], a2 d f32 [T,R], a3 gain f32 [R,H], a4 forget f32 [R,H], a5 out f32 [T,H]; u0 T, u1 H, u2 R (≤128).
+// Несколько контроллеров (blockIdx.z = j): шаги x u3, m u4, gain/forget u5, d u6, выход — T·H.
 extern "C" __global__ void ink2_ctrl_out(Ink2Args args) {
     __shared__ float d[128];
     unsigned int t = blockIdx.y, H = args.u[1], R = args.u[2];
-    for (unsigned int r = threadIdx.x; r < R; r += blockDim.x) d[r] = CPF(2)[(unsigned long long)t * R + r];
+    const unsigned long long z = blockIdx.z;
+    for (unsigned int r = threadIdx.x; r < R; r += blockDim.x) d[r] = CPF(2)[z * args.u[6] + (unsigned long long)t * R + r];
     __syncthreads();
     unsigned int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= H) return;
+    const float* gw = CPF(3) + z * args.u[5];
+    const float* fw = CPF(4) + z * args.u[5];
     float ag = 0.0f, af = 0.0f;
     for (unsigned int r = 0; r < R; ++r) {
-        ag += CPF(3)[(unsigned long long)r * H + h] * d[r];
-        af += CPF(4)[(unsigned long long)r * H + h] * d[r];
+        ag += gw[(unsigned long long)r * H + h] * d[r];
+        af += fw[(unsigned long long)r * H + h] * d[r];
     }
     unsigned long long o = (unsigned long long)t * H + h;
-    PF(5)[o] = (1.0f - tanhf(af)) * CPF(0)[o] + tanhf(ag) * CPF(1)[o];
+    PF(5)[z * args.u[0] * H + o] = (1.0f - tanhf(af)) * CPF(0)[z * args.u[3] + o] + tanhf(ag) * CPF(1)[z * args.u[4] + o];
 }
 
-// Логиты роутера: l[t, e] = w[e]·x_t, варп на эксперта. a0 x f32 [T,H], a1 w f32 [E,H], a2 l f32 [T,E]; u0 T, u1 H, u2 E.
+// Логиты роутера: l[t, e] = w[e]·x_t, варп на эксперта. a0 x [T,H] F32 либо BF16 (u3), a1 w f32 [E,H],
+// a2 l f32 [T,E]; u0 T, u1 H, u2 E.
 extern "C" __global__ void ink2_router(Ink2Args args) {
     unsigned int t = blockIdx.x, H = args.u[1], E = args.u[2];
     int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     unsigned int e = blockIdx.y * 8 + wid;
     if (e >= E) return;
-    const float* x = CPF(0) + (unsigned long long)t * H;
     const float* w = CPF(1) + (unsigned long long)e * H;
+    const unsigned long long xo = (unsigned long long)t * H;
     float acc = 0.0f;
-    for (unsigned int i = lane; i < H; i += 32) acc += w[i] * x[i];
+    for (unsigned int i = lane; i < H; i += 32) acc += w[i] * ink2_ld(args.a[0], xo + i, args.u[3]);
     acc = warp_sum(acc);
     if (lane == 0) PF(2)[(unsigned long long)t * E + e] = acc;
 }

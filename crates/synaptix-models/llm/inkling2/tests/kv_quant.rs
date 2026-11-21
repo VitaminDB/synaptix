@@ -112,7 +112,7 @@ fn write_kv(rng: &mut Rng, nkv: usize, cap: usize, n: usize, fmt: u32) -> Kv {
     for (i, t) in [&q, &k, &v, &r, &qs, &rs, &qo, &ro].iter().enumerate() {
         a.a[i] = ad(t);
     }
-    a.u = [n as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, 1, 8192, 0, 0, 0];
+    a.u = [n as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, 1, 8192, 0, 0, 0, 0, 0, 0, 0];
     a.f = [1e30, 1e30, 1e-6, 0.1];
     let mut ab = a;
     ab.a[8] = ad(&kb);
@@ -147,7 +147,7 @@ fn attn(kernel: &str, rng_seed: u64, nh: usize, nkv: usize, cap: usize, past: us
     if let Some(s) = sc {
         a.a[11] = ad(s);
     }
-    a.u = [t as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, 0, 1024, splits as u32, 0, fmt];
+    a.u = [t as u32, nh as u32, nkv as u32, D as u32, DR as u32, cap as u32, 0, 0, 1024, splits as u32, 0, fmt, 0, 0, 0, 0];
     a.f[0] = 1.0 / (D as f32).sqrt();
     if kernel == "ink2_attn_fa" {
         launch(kernel, &a, (t.div_ceil(64) as u32, nh as u32, splits as u32), 128);
