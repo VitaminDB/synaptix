@@ -131,6 +131,16 @@ pub struct ZcLaunch {
     pub _pad2: u32,
 }
 
+/// Аргументы ядер Inkling-2 (`inkling2.cu`, структура `Ink2Args`): адреса на
+/// устройстве, числа и размеры — смысл полей у каждого ядра свой.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ink2Launch {
+    pub a: [u64; 12],
+    pub f: [f32; 4],
+    pub u: [u32; 12],
+}
+
 /// Аргументы слитого gated-residual Qwen4Exp (раскладка как `HcArgs` в
 /// `qwen4_decode.cu`); все указатели — адреса на устройстве.
 #[repr(C)]
@@ -410,6 +420,12 @@ pub trait Backend: Send + Sync + 'static {
     /// Слитый shared-эксперт MoE на декоде (два ядра, см. `SeLaunch`).
     fn moe_shared_fused(&self, _device: crate::device::Device, _a: &SeLaunch) -> Result<()> {
         Err(SynaptixError::Unsupported("moe_shared_fused не поддержан этим backend"))
+    }
+
+    /// Ядро Inkling-2 `kernel` из `inkling2.cu` с сеткой `grid` и блоком `block`.
+    /// Default — `Unsupported`.
+    fn inkling2_launch(&self, _device: crate::device::Device, _kernel: &str, _a: &Ink2Launch, _grid: (u32, u32, u32), _block: u32) -> Result<()> {
+        Err(SynaptixError::Unsupported("inkling2_launch не поддержан этим backend"))
     }
 
     /// Слитый gated-residual Qwen4Exp на декоде (два ядра, см. `HcLaunch`).

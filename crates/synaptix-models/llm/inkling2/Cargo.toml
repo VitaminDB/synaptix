@@ -1,0 +1,26 @@
+[package]
+name = "synaptix-llm-inkling2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Inkling-2 (thinkingmachines): зацикленный трансформер — блочные attention-residuals, SWA/полное внимание с относительным bias и синком, короткие свёртки, MoE 128/8 с softcap-SwiGLU, контроллеры проходов"
+
+[dependencies]
+synaptix-core       = { workspace = true }
+synaptix-ops        = { workspace = true }
+synaptix-nn         = { workspace = true }
+synaptix-io         = { workspace = true }
+synaptix-bundle     = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-tokenizer  = { workspace = true }
+synaptix-infer      = { workspace = true }
+synaptix-kernels-cpu = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+half                = { workspace = true }
+rayon               = { workspace = true }
+
+[dev-dependencies]
+synaptix-kernels-cuda = { workspace = true }

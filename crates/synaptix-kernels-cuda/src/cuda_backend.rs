@@ -933,6 +933,16 @@ impl Backend for CudaBackend {
         crate::kernels::qwen4_decode::nvfp4_gemv_a16(&kern, &stream, w, s, x, out, n as u32, k as u32, m as u32)
     }
 
+    fn inkling2_launch(&self, device: synaptix_core::device::Device, kernel: &str, a: &synaptix_core::backend::Ink2Launch, grid: (u32, u32, u32), block: u32) -> Result<()> {
+        let synaptix_core::device::Device::Cuda(ord) = device else {
+            return Err(SynaptixError::Unsupported("inkling2_launch: не CUDA"));
+        };
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::kernels::inkling2::Inkling2Kernels::for_context(&ctx)?;
+        k.launch(&stream, kernel, a, grid, block)
+    }
+
     fn moe_shared_fused(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::SeLaunch) -> Result<()> {
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_shared_fused: не CUDA"));

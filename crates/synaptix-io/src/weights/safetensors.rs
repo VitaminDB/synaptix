@@ -69,6 +69,10 @@ struct Entry {
     dtype: DType,
     shape: Vec<usize>,
     data: &'static [u8],
+    /// Байтовый тип без числового аналога в движке (FP8 E4M3/E5M2, E8M0):
+    /// виден как `U8` через [`SafetensorsLoader::raw_bytes`], а чтение
+    /// числами — ошибка, а не тихие байты вместо значений.
+    opaque: Option<&'static str>,
 }
 
 pub struct SafetensorsLoader {
@@ -283,6 +287,11 @@ impl SafetensorsLoader {
             }
             return Err(IoError::Safetensors(format!("tensor not found: {key}")));
         };
+        if let (Some(kind), Some(d)) = (entry.opaque, dtype) {
+            if d != DType::U8 {
+                return Err(IoError::Safetensors(format!("{key}: {kind} не читается как {d:?} — только сырые байты (raw_bytes)")));
+            }
+        }
         // zero-copy: H2D напрямую из mmap-слайса. Индекс с dtype/shape/slice разобран
         // один раз в open(), без повторного SafeTensors::deserialize на каждый тензор
         // (для 5947-тензорного LTX это убирает ~5947 разборов 872KB-заголовка).
@@ -324,11 +333,20 @@ fn index_shard(
     let st = SafeTensors::deserialize(shard.data)
         .map_err(|e| IoError::Safetensors(e.to_string()))?;
     for (name, view) in st.tensors() {
-        let dtype = st_dtype_to_synaptix(view.dtype())
-            .ok_or_else(|| IoError::Safetensors(format!("unsupported dtype {:?}", view.dtype())))?;
+        let opaque = match view.dtype() {
+            safetensors::Dtype::F8_E4M3 => Some("F8_E4M3"),
+            safetensors::Dtype::F8_E5M2 => Some("F8_E5M2"),
+            safetensors::Dtype::F8_E8M0 => Some("F8_E8M0"),
+            _ => None,
+        };
+        let dtype = match opaque {
+            Some(_) => DType::U8,
+            None => st_dtype_to_synaptix(view.dtype())
+                .ok_or_else(|| IoError::Safetensors(format!("unsupported dtype {:?}", view.dtype())))?,
+        };
         // SAFETY: view.data() заимствует shard.data (он `&'static`), поэтому слайс
         // переживает локальный `st`; шард держится в loader'е, пока жив слайс.
-        entries.insert(name, Entry { dtype, shape: view.shape().to_vec(), data: view.data() });
+        entries.insert(name, Entry { dtype, shape: view.shape().to_vec(), data: view.data(), opaque });
     }
     if let Ok((_, meta)) = SafeTensors::read_metadata(shard.data) {
         if let Some(m) = meta.metadata() {
