@@ -282,6 +282,22 @@ extern "C" __global__ void ink2_qkv(Ink2Args args) {
     }
 }
 
+// Перевод KV полного слота BF16 → MXFP8/INT8 (рост сессии без потери префикса): строка
+// (позиция, голова) — блок из d потоков, кодирование то же, что у записи в ink2_qkv.
+// a0 src bf16 [nkv,cap_old,d], a1 dst u8 [nkv,cap_new,d], a2 масштабы u8 [nkv,cap_new,d/32]
+// (половина k или v общего тензора [2,nkv,cap,d/32]); u0 nkv, u1 used, u2 cap_old, u3 cap_new,
+// u4 d, u5 формат. Сетка (used, nkv).
+extern "C" __global__ void ink2_kv_requant(Ink2Args args) {
+    unsigned int p = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    unsigned int capo = args.u[2], capn = args.u[3], d = args.u[4];
+    float x = __bfloat162float(CPB(0)[((unsigned long long)h * capo + p) * d + i]);
+    unsigned sb;
+    unsigned char b = ink2_kv_enc(x, args.u[5], sb);
+    unsigned long long row = (unsigned long long)h * capn + p;
+    ((unsigned char*)args.a[1])[row * d + i] = b;
+    if ((i & 31u) == 0u) ((unsigned char*)args.a[2])[row * (d / 32) + i / 32] = (unsigned char)sb;
+}
+
 // Внимание: блок на (токен, голову, часть ключей), 4 варпа делят ключи части; лейн держит
 // 4 из 128 измерений. Логит = q·k·scale + bias(dist), bias = Σ_c r[c]·proj[c, dist] при
 // dist < extent, иначе 0; лишний логит синка с нулевым value; окно window (0 — нет).

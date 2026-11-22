@@ -561,6 +561,8 @@ impl LlmPipeline {
         match self {
             Self::Qwen3(p) => p.model.kv_bytes_per_token(),
             Self::Qwen4Exp(p) => p.kv_bytes_per_token(),
+            // Ставка новой сессии (BF16); память под неё пайплайн освобождает
+            // сам — переводом экспертов в zero-copy, затем KV в MXFP8.
             Self::Inkling2(p) => p.kv_bytes_per_token(),
             // Кэш MTP-головы растёт вместе с контекстом (у Qwen3.8-27B — плотный
             // слой, 4 КБ на токен: на 262К это гигабайт, которого плану
@@ -590,7 +592,8 @@ impl LlmPipeline {
             // Ветка MoE блок целиком на хост не переносит — оффлоада блоков нет.
             Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some((p.model.block_bytes(), p.model.block_count())),
-            // У Qwen4Exp свой оффлоад — кэш экспертов; Inkling-2 целиком на карте.
+            // У Qwen4Exp свой оффлоад — кэш экспертов; у Inkling-2 — свой режим
+            // памяти по длине сессии (эксперты zero-copy, KV MXFP8).
             Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
         }
     }
@@ -3697,8 +3700,9 @@ pub fn load_llm(
         }
         // Веса modelopt NVFP4/MXFP8 исполняются как лежат — профиль точности
         // не применяется; MTP-голова в `mtp.safetensors` не грузится.
-        // Ёмкость контекста решает, резидентны эксперты или идут zero-copy
-        // из закреплённой RAM: на 200K KV и экспертам вместе карты мало.
+        // Ёмкость контекста — только предел роста сессий: режим памяти
+        // (эксперты на карте / zero-copy, KV BF16 / MXFP8) следует за
+        // фактической длиной сессии на карте (`synaptix_llm_inkling2::experts`).
         LlmArch::Inkling2 => Inkling2Pipeline::load_with_ctx(path, device, max_seq)
             .map(LlmPipeline::Inkling2)
             .map_err(|e| LlmError(format!("load inkling2: {e}")))?,

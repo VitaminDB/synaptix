@@ -12,7 +12,7 @@ use crate::kernels::compile::{compile_module, load_fn};
 
 const NAMES: &[&str] = &[
     "ink2_rms", "ink2_conv", "ink2_conv_state", "ink2_qkv", "ink2_attn", "ink2_act", "ink2_route", "ink2_combine", "ink2_logits",
-    "ink2_ctrl_down", "ink2_ctrl_out", "ink2_router", "ink2_attn_merge", "ink2_mix_part", "ink2_mix_out", "ink2_attn_fa",
+    "ink2_ctrl_down", "ink2_ctrl_out", "ink2_router", "ink2_attn_merge", "ink2_mix_part", "ink2_mix_out", "ink2_attn_fa", "ink2_kv_requant",
 ];
 
 pub struct Inkling2Kernels {

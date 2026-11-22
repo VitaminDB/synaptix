@@ -230,3 +230,73 @@ fn kv_quant_write_and_read() {
         }
     }
 }
+
+/// Перевод BF16-кэша в квант-формат при росте сессии (`ink2_kv_requant`): байты и масштабы
+/// против записи тем же форматом сразу (`ink2_qkv`) — отличия только от двойного округления
+/// (BF16, затем E4M3/INT8: масштаб — если округление amax переходит степень двойки, байт — на
+/// границе округления), раскладка с новой ёмкостью, хвост за `used` — нули.
+#[test]
+fn kv_requant_matches_direct_write() {
+    if !setup() {
+        return;
+    }
+    let (nkv, cap, n, cap2) = (8usize, 96usize, 80usize, 160usize);
+    for fmt in [1u32, 2] {
+        let mut rng = Rng(11 + fmt as u64);
+        let kv = write_kv(&mut rng, nkv, cap, n, fmt);
+        let sc2 = Tensor::zeros(vec![2, nkv, cap2, D / 32], DType::U8, Device::Cuda(0)).unwrap();
+        let mut outs = Vec::new();
+        for (j, src) in [&kv.kb, &kv.vb].into_iter().enumerate() {
+            let dst = Tensor::zeros(vec![nkv, cap2, D], DType::U8, Device::Cuda(0)).unwrap();
+            let mut a = Ink2Launch::default();
+            a.a[0] = ad(src);
+            a.a[1] = ad(&dst);
+            a.a[2] = ad(&sc2) + (j * nkv * cap2 * (D / 32)) as u64;
+            a.u[0] = nkv as u32;
+            a.u[1] = n as u32;
+            a.u[2] = cap as u32;
+            a.u[3] = cap2 as u32;
+            a.u[4] = D as u32;
+            a.u[5] = fmt;
+            launch("ink2_kv_requant", &a, (n as u32, nkv as u32, 1), D as u32);
+            outs.push(dst);
+        }
+        let (s_dir, s_req) = (host_u8(&kv.sc), host_u8(&sc2));
+        let half = |s: &[u8], j: usize, c: usize| s[j * nkv * c * (D / 32)..(j + 1) * nkv * c * (D / 32)].to_vec();
+        for (j, (direct, req)) in [(&kv.k8, &outs[0]), (&kv.v8, &outs[1])].into_iter().enumerate() {
+            let (bd, br) = (host_u8(direct), host_u8(req));
+            let (sd, sr) = (half(&s_dir, j, cap), half(&s_req, j, cap2));
+            let bf = host_f32(if j == 0 { &kv.kb } else { &kv.vb });
+            let (mut diff_b, mut diff_s, mut worst) = (0usize, 0usize, 0f64);
+            for h in 0..nkv {
+                for p in 0..cap2 {
+                    let r2 = (h * cap2 + p) * D;
+                    if p >= n {
+                        assert!(br[r2..r2 + D].iter().all(|&b| b == 0), "хвост за used не нулевой");
+                        continue;
+                    }
+                    let r1 = (h * cap + p) * D;
+                    diff_b += bd[r1..r1 + D].iter().zip(&br[r2..r2 + D]).filter(|(a, b)| a != b).count();
+                    diff_s += sd[r1 / 32..r1 / 32 + 4].iter().zip(&sr[r2 / 32..r2 / 32 + 4]).filter(|(a, b)| a != b).count();
+                    // Ошибка перевода относительно BF16-строки (норма строки).
+                    let y = dequant(&br[r2..r2 + D], &sr[r2 / 32..r2 / 32 + 4], fmt);
+                    let x = &bf[r1..r1 + D];
+                    let num: f64 = x.iter().zip(&y).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+                    let den: f64 = x.iter().map(|a| (*a as f64).powi(2)).sum();
+                    worst = worst.max((num / den.max(1e-30)).sqrt());
+                }
+            }
+            let total = nkv * n * D;
+            println!(
+                "fmt {fmt} {}: байтов отличается от прямой записи {diff_b}/{total}, масштабов {diff_s}/{}, худшая отн. ошибка к BF16 {:.4}",
+                if j == 0 { "k" } else { "v" },
+                nkv * n * 4,
+                worst
+            );
+            // Масштаб расходится, только когда BF16-округление amax переходит степень двойки.
+            assert!(diff_s * 100 < nkv * n * 4, "масштабов отличается слишком много: {diff_s}");
+            assert!(diff_b * 10 < total, "слишком много отличий байтов: {diff_b}/{total}");
+            assert!(worst < if fmt == 1 { 0.07 } else { 0.04 });
+        }
+    }
+}

@@ -2,6 +2,7 @@
 //! Схема и проверка паритета — `docs/INKLING2-MINI-PORT.md`.
 
 pub mod config;
+pub mod experts;
 pub mod kern;
 pub mod loader;
 pub mod model;
@@ -13,6 +14,7 @@ pub mod vision;
 pub use config::Inkling2Config;
 pub use loader::{Inkling2Weights, LoadError};
 pub use model::{Inkling2Model, KvFormat, ModelCache};
+pub use experts::ExpertMode;
 pub use pipeline::{Inkling2Pipeline, Inkling2Session, PipelineError};
 pub use preprocess::{ImageLimits, PreparedImage};
 pub use vision::VisionTower;

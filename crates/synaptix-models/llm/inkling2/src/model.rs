@@ -70,7 +70,7 @@ struct LoopLayer {
 }
 
 /// Где лежат веса экспертов слоя.
-enum ExpertStore {
+pub(crate) enum ExpertStore {
     /// Ещё не подняты ([`Inkling2Model::load_base`]).
     Pending,
     /// Все эксперты на карте: таблицы адресов (плотная активация) и сами веса.
@@ -86,8 +86,8 @@ enum ExpertStore {
     Zc(ZcLayer),
 }
 
+/// Множители экспертов слоя (сами веса — в [`ExpertRt`]: режим меняется на ходу).
 struct Experts {
-    store: ExpertStore,
     alpha_gate_up: Vec<f32>,
     /// Множители на карте `[E]`: gate_up — для активации, down — в вес маршрута.
     alpha_gate_up_dev: Tensor,
@@ -95,15 +95,71 @@ struct Experts {
 }
 
 impl Experts {
-    fn new(store: ExpertStore, alpha_gate_up: Vec<f32>, alpha_down: Vec<f32>, dev: Device) -> Result<Self, LoadError> {
+    fn new(alpha_gate_up: Vec<f32>, alpha_down: Vec<f32>, dev: Device) -> Result<Self, LoadError> {
         let e = alpha_gate_up.len();
         Ok(Self {
-            store,
             alpha_gate_up_dev: dev_f32(alpha_gate_up.clone(), vec![e], dev)?,
             alpha_down_dev: dev_f32(alpha_down, vec![alpha_gate_up.len()], dev)?,
             alpha_gate_up,
         })
     }
+}
+
+/// Веса экспертов всех слоёв и пул слотов zero-copy. Режим (на карте /
+/// zero-copy, число слотов) меняется на ходу по длине контекста
+/// (`crate::experts::ExpertHub`), поэтому состояние общее и под замком:
+/// прямой проход берёт его на чтение на время MoE слоя.
+pub(crate) struct ExpertRt {
+    /// По слою на физический слой (`stores[i]` — слой `i`).
+    pub(crate) stores: Vec<ExpertStore>,
+    /// Пул слотов zero-copy (режим экспертов в RAM).
+    pub(crate) pool: Option<std::sync::Arc<ZcPool>>,
+}
+
+pub(crate) type SharedExperts = std::sync::Arc<std::sync::RwLock<ExpertRt>>;
+
+/// Резидентные эксперты всех `layers` слоёв (веса — в пул весов карты).
+/// Читаются срезами бандла; если стопки лежат в закреплённом зеркале, копия
+/// идёт оттуда (DMA, без страничного кэша).
+pub(crate) fn build_resident(w: &Inkling2Weights, dev: Device, layers: usize) -> Result<Vec<ExpertStore>, LoadError> {
+    let _guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(dev);
+    let mut out = Vec::with_capacity(layers);
+    for i in 0..layers {
+        let ExpertStack { gate_up, down, .. } = w.experts(i, dev)?;
+        let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
+        let dn_refs: Vec<&QuantWeight> = down.iter().collect();
+        let gt = ExpertTable::build_dense(&gu_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица gate_up")))?;
+        let dt = ExpertTable::build_dense(&dn_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица down")))?;
+        out.push(ExpertStore::Resident { gate_up: gt, down: dt, _weights: (gate_up, down) });
+    }
+    Ok(out)
+}
+
+/// Поставить экспертов всех слоёв (и пул слотов zero-copy). Захваченные
+/// графы декода держат адреса таблиц прежних слоёв: поколение zero-copy
+/// растёт, и графы переснимаются.
+pub(crate) fn set_experts(xrt: &SharedExperts, stores: Vec<ExpertStore>, pool: Option<std::sync::Arc<ZcPool>>) {
+    let mut g = xrt.write().unwrap_or_else(|e| e.into_inner());
+    g.stores = stores;
+    g.pool = pool;
+    synaptix_llm_common::moe_zc::ZC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Снять экспертов всех слоёв (после синхронизации карты: ничего в потоке
+/// их уже не читает). Возвращает частоты выбора экспертов слоёв zero-copy —
+/// затравку следующей сборки.
+pub(crate) fn take_experts(xrt: &SharedExperts, dev: Device) -> Vec<Option<Vec<f32>>> {
+    let mut g = xrt.write().unwrap_or_else(|e| e.into_inner());
+    let seeds = g.stores.iter().map(|s| match s { ExpertStore::Zc(z) => Some(z.counts().to_vec()), _ => None }).collect();
+    if let Device::Cuda(o) = dev {
+        let _ = synaptix_core::device::cuda::synchronize_all(o);
+    }
+    for s in g.stores.iter_mut() {
+        *s = ExpertStore::Pending;
+    }
+    g.pool = None;
+    synaptix_llm_common::moe_zc::ZC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    seeds
 }
 
 pub struct Layer {
@@ -283,6 +339,24 @@ impl ModelCache {
         self.slots.first().is_some_and(|s| s.k.device() == Device::Cpu)
     }
 
+    /// Формат KV полных слотов (`None` — их нет).
+    pub fn full_format(&self) -> Option<KvFormat> {
+        self.slots.iter().find(|s| s.ring == 0 && s.fmt != KvFormat::Bf16).map(|s| s.fmt).or_else(|| self.slots.first().map(|_| KvFormat::Bf16))
+    }
+
+    /// Байт KV полных слотов (растущая часть кэша: K, V и масштабы),
+    /// где бы кэш ни лежал.
+    pub fn full_kv_bytes(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.ring == 0)
+            .map(|s| {
+                let b = |t: &Tensor| t.dtype().bytes_for_numel(t.numel());
+                b(&s.k) + b(&s.v) + s.scales.as_ref().map_or(0, b)
+            })
+            .sum()
+    }
+
     pub fn reset(&mut self) -> R<()> {
         self.drop_graph();
         self.seq_len = 0;
@@ -446,8 +520,8 @@ pub struct Inkling2Model {
     norm: Tensor,
     output_q: Tensor,
     layers: Vec<Layer>,
-    /// Пул слотов zero-copy (режим экспертов в RAM).
-    zc_pool: Option<std::sync::Arc<ZcPool>>,
+    /// Веса экспертов и пул zero-copy (режим меняется на ходу).
+    pub(crate) xrt: SharedExperts,
     /// Формат KV слотов полного внимания у новых кэшей ([`Self::make_cache`]).
     kv_fmt: KvFormat,
 }
@@ -602,11 +676,13 @@ impl Inkling2Model {
                 ffn_norm: f32t(&format!("{p}.mlp_norm.weight"))?,
                 router,
                 router_bias,
-                experts: Experts::new(ExpertStore::Pending, alpha_gate_up, alpha_down, dev)?,
+                experts: Experts::new(alpha_gate_up, alpha_down, dev)?,
                 lp,
             });
         }
-        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, zc_pool: None, kv_fmt: KvFormat::Bf16 })
+        let stores = (0..layers.len()).map(|_| ExpertStore::Pending).collect();
+        let xrt = std::sync::Arc::new(std::sync::RwLock::new(ExpertRt { stores, pool: None }));
+        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, xrt, kv_fmt: KvFormat::Bf16 })
     }
 
     /// Модель целиком, эксперты резидентны на карте.
@@ -618,15 +694,8 @@ impl Inkling2Model {
 
     /// Поднять экспертов всех слоёв на карту (резидентный режим).
     pub fn load_resident_experts(&mut self, w: &Inkling2Weights) -> Result<(), LoadError> {
-        let dev = self.device;
-        for (i, l) in self.layers.iter_mut().enumerate() {
-            let ExpertStack { gate_up, down, alpha_gate_up, alpha_down } = w.experts(i, dev)?;
-            let gu_refs: Vec<&QuantWeight> = gate_up.iter().collect();
-            let dn_refs: Vec<&QuantWeight> = down.iter().collect();
-            let gt = ExpertTable::build_dense(&gu_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица gate_up")))?;
-            let dt = ExpertTable::build_dense(&dn_refs).ok_or_else(|| LoadError::Weights(format!("слой {i}: таблица down")))?;
-            l.experts = Experts::new(ExpertStore::Resident { gate_up: gt, down: dt, _weights: (gate_up, down) }, alpha_gate_up, alpha_down, dev)?;
-        }
+        let stores = build_resident(w, self.device, self.layers.len())?;
+        set_experts(&self.xrt, stores, None);
         Ok(())
     }
 
@@ -636,30 +705,35 @@ impl Inkling2Model {
         if layers.len() != self.layers.len() {
             return Err(LoadError::Weights(format!("zero-copy: слоёв {} из {}", layers.len(), self.layers.len())));
         }
-        for (l, z) in self.layers.iter_mut().zip(layers) {
-            l.experts.store = ExpertStore::Zc(z);
-        }
-        self.zc_pool = Some(pool);
+        set_experts(&self.xrt, layers.into_iter().map(ExpertStore::Zc).collect(), Some(pool));
         Ok(())
     }
 
     /// Эксперты в RAM (zero-copy), а не на карте.
     pub fn zc_active(&self) -> bool {
-        self.zc_pool.is_some()
+        self.xrt.read().map(|g| g.pool.is_some()).unwrap_or(false)
+    }
+
+    /// Эксперты подняты (на карте или zero-copy).
+    pub fn experts_ready(&self) -> bool {
+        self.xrt.read().map(|g| g.stores.iter().all(|s| !matches!(s, ExpertStore::Pending))).unwrap_or(false)
     }
 
     /// Слотов VRAM на слой в режиме zero-copy.
     pub fn zc_slots(&self) -> Option<usize> {
-        self.zc_pool.as_ref().map(|p| p.slots_per_layer())
+        let g = self.xrt.read().ok()?;
+        g.pool.as_ref()?;
+        g.stores.iter().find_map(|s| match s { ExpertStore::Zc(z) => Some(z.slots()), _ => None })
     }
 
     /// Счётчики zero-copy по всем слоям: (попадания в слоты, выборы
     /// экспертов). Синхронное чтение — только для журналов и замеров.
     pub fn zc_stats(&self) -> Option<(u64, u64)> {
-        self.zc_pool.as_ref()?;
+        let g = self.xrt.read().ok()?;
+        g.pool.as_ref()?;
         let mut acc = (0, 0);
-        for l in &self.layers {
-            if let ExpertStore::Zc(z) = &l.experts.store {
+        for s in &g.stores {
+            if let ExpertStore::Zc(z) = s {
                 let (h, p) = z.stats();
                 acc.0 += h;
                 acc.1 += p;
@@ -694,6 +768,11 @@ impl Inkling2Model {
     }
 
     pub fn make_cache(&self, capacity: usize) -> R<ModelCache> {
+        self.make_cache_fmt(capacity, self.kv_fmt)
+    }
+
+    /// Кэш на `capacity` позиций с KV полных слотов в формате `fmt`.
+    pub fn make_cache_fmt(&self, capacity: usize, fmt_full: KvFormat) -> R<ModelCache> {
         let t = &self.cfg.text;
         let (nkv, d, h, k) = (t.num_key_value_heads, t.head_dim, t.hidden_size, t.sconv_kernel_size);
         let dev = self.device;
@@ -702,7 +781,7 @@ impl Inkling2Model {
         for si in 0..self.cfg.num_slots() {
             let ring = self.slot_ring(si, capacity);
             let cap = if ring > 0 { ring } else { capacity };
-            let fmt = if self.cfg.is_swa(self.slot_phys(si)) { KvFormat::Bf16 } else { self.kv_fmt };
+            let fmt = if self.cfg.is_swa(self.slot_phys(si)) { KvFormat::Bf16 } else { fmt_full };
             let (kdt, scales) = match fmt {
                 KvFormat::Bf16 => (DType::BF16, None),
                 _ => (DType::U8, Some(z(vec![2, nkv, cap, d / 32], DType::U8)?)),
@@ -826,8 +905,23 @@ impl Inkling2Model {
 
     /// Расширить кэш до `capacity` позиций: KV копируется, состояния свёрток те же.
     pub fn grow_cache(&self, cache: &mut ModelCache, capacity: usize) -> R<()> {
-        if capacity <= cache.capacity {
+        self.grow_cache_fmt(cache, capacity, None)
+    }
+
+    /// Как [`Self::grow_cache`], но KV полных слотов ещё и переводится в
+    /// формат `fmt` (если он другой): BF16 → MXFP8/INT8 переквантуется на
+    /// карте (`ink2_kv_requant`, то же кодирование, что у записи `ink2_qkv`).
+    /// Позиции, `seq_len` и точка возврата остаются годными: снимок полные
+    /// слоты не хранит. Слоты идут по одному — пик памяти сверх итоговой
+    /// ёмкости не больше одного тензора K или V прежнего кэша.
+    pub fn grow_cache_fmt(&self, cache: &mut ModelCache, capacity: usize, fmt: Option<KvFormat>) -> R<()> {
+        let capacity = capacity.max(cache.capacity);
+        let convert = fmt.is_some_and(|f| cache.full_format().is_some_and(|c| c != f));
+        if capacity == cache.capacity && !convert {
             return Ok(());
+        }
+        if cache.is_parked() {
+            return Err(ModelError::Forward("inkling2: рост кэша в RAM (unpark_to перед ростом)".into()));
         }
         cache.drop_graph();
         let used = cache.seq_len;
@@ -854,6 +948,11 @@ impl Inkling2Model {
                     *kv = Tensor::from_vec(buf, vec![nkv, ring, d], self.device).map_err(fe)?;
                 }
                 s.ring = ring;
+                continue;
+            }
+            let swa = self.cfg.is_swa(self.slot_phys(si));
+            if let Some(f) = fmt.filter(|&f| !swa && f != s.fmt) {
+                requant_slot(s, f, used, capacity, self.device)?;
                 continue;
             }
             for kv in [&mut s.k, &mut s.v] {
@@ -1269,7 +1368,7 @@ impl Inkling2Model {
         }
         let m = kern::pick(&m, 0)?;
         let xn = kern::rms(&m, Some(&l.ffn_norm), eps, true)?;
-        let y = kern::stage("moe", dev, || self.moe(l, &xn))?;
+        let y = kern::stage("moe", dev, || self.moe(ip, l, &xn))?;
         let sc = &mut cache.slots[slot];
         let job = kern::ConvJob { x: kern::cols(&y, 0)?, w: &l.ffn_post_conv, state: &sc.ffn_state, dynamic: None };
         Ok(kern::conv(&[job], n, t.hidden_size, Some(&ffn_inp), k_scale, dev)?.pop().expect("свёртка"))
@@ -1277,12 +1376,14 @@ impl Inkling2Model {
 
     /// MoE: `xn [T, H]` BF16 → `[T, H]` F32. Декод (T = 1) — целиком на карте,
     /// без чтения маршрута хостом; префилл — групповой GEMM по экспертам.
-    fn moe(&self, l: &Layer, xn: &Tensor) -> R<Tensor> {
+    fn moe(&self, ip: usize, l: &Layer, xn: &Tensor) -> R<Tensor> {
         let t = &self.cfg.text;
         let n = xn.dims()[0];
         let (e, k, hdim, inter) = (t.n_routed_experts, t.num_experts_per_tok, t.hidden_size, t.intermediate_size);
         let dev = self.device;
         let ex = &l.experts;
+        let rt = self.xrt.read().unwrap_or_else(|e| e.into_inner());
+        let store = &rt.stores[ip];
         let xin = kern::cols(xn, 0)?;
         let logits = empty(vec![n, e], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
@@ -1311,7 +1412,7 @@ impl Inkling2Model {
             // Декод — та же схема, что у префилла и эталона: выход эксперта в BF16 по парам
             // `[k, H]`, затем `ink2_combine` в фиксированном порядке k = 0..K−1 (F32) с весами
             // маршрута (alpha_down уже в `wts`). Без атомарного накопления — детерминированно.
-            let y = match &ex.store {
+            let y = match store {
                 ExpertStore::Resident { gate_up, down, .. } => {
                     let gu = gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
                     let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
@@ -1320,7 +1421,7 @@ impl Inkling2Model {
                 ExpertStore::Zc(z) => {
                     // Те же ядра по таблицам пар: запись `p` — эксперт `idx[p]` (слот или RAM);
                     // alpha и вес маршрута — по настоящему `idx`.
-                    let pool = self.zc_pool.as_ref().expect("пул zero-copy");
+                    let pool = rt.pool.as_ref().expect("пул zero-copy");
                     let (gu_t, dn_t, iota) = z.stage(pool, &idx)?;
                     let gu = gu_t.gemv_indexed_dense(&iota, xn, false).map_err(fe)?;
                     let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
@@ -1333,7 +1434,7 @@ impl Inkling2Model {
         let idx_h: Vec<u32> = idx.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
         // Zero-copy: эксперты, уже лежащие в слотах, считаются первыми — подкачка
         // промахов вытесняет только тех, чей GEMM уже поставлен в поток.
-        let resident: Option<Vec<bool>> = match &ex.store {
+        let resident: Option<Vec<bool>> = match store {
             ExpertStore::Zc(z) => {
                 let mut r = vec![false; e];
                 for o in z.slot_owners()? {
@@ -1365,7 +1466,7 @@ impl Inkling2Model {
                 _ => segments.push((ei, pos as u32, pos as u32 + 1)),
             }
         }
-        let y = match &ex.store {
+        let y = match store {
             ExpertStore::Resident { gate_up, down, .. } => {
                 let row_idx = Tensor::from_vec(rows, vec![pairs], dev).map_err(fe)?;
                 let at = Tensor::from_vec(alpha_rows, vec![pairs], dev).map_err(fe)?;
@@ -1375,7 +1476,8 @@ impl Inkling2Model {
             }
             ExpertStore::Zc(z) => {
                 let r = resident.as_ref().expect("резиденты слоя");
-                self.moe_zc_prefill(z, xn, &rows, &alpha_rows, &segments, r, inter)?
+                let pool = rt.pool.as_ref().expect("пул zero-copy");
+                self.moe_zc_prefill(z, pool, xn, &rows, &alpha_rows, &segments, r, inter)?
             }
             ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
         };
@@ -1404,8 +1506,7 @@ impl Inkling2Model {
     /// слоты, её промахи копируются в слоты прошлых групп (их GEMM в потоке
     /// раньше). Групповой GEMM — тот же, что у резидентного пути, по таблице группы.
     #[allow(clippy::too_many_arguments)]
-    fn moe_zc_prefill(&self, z: &ZcLayer, xn: &Tensor, row_idx: &[u32], alpha_rows: &[f32], segments: &[(u32, u32, u32)], resident: &[bool], inter: usize) -> R<Tensor> {
-        let pool = self.zc_pool.as_ref().expect("пул zero-copy");
+    fn moe_zc_prefill(&self, z: &ZcLayer, pool: &ZcPool, xn: &Tensor, row_idx: &[u32], alpha_rows: &[f32], segments: &[(u32, u32, u32)], resident: &[bool], inter: usize) -> R<Tensor> {
         let dev = self.device;
         let cap = z.slots().max(1);
         // Группы: сначала все попадания одной группой (сколько бы их ни было — они
@@ -1455,6 +1556,39 @@ impl Inkling2Model {
         launch(self.device, "ink2_act", &a, ((inter as u32).div_ceil(256), rows as u32, 1), 256)?;
         Ok(out)
     }
+}
+
+/// Перевести KV полного слота в формат `fmt` с ёмкостью `capacity`: первые
+/// `used` позиций переквантуются на карте (`ink2_kv_requant`: BF16 → MXFP8/INT8
+/// тем же кодированием, что у записи; квант → квант того же формата — копией).
+/// K, V и масштабы — по очереди: прежний тензор отдаётся сразу после своего.
+fn requant_slot(s: &mut SlotCache, fmt: KvFormat, used: usize, capacity: usize, dev: Device) -> R<()> {
+    let (nkv, cap_old, d) = (s.k.dims()[0], s.k.dims()[1], s.k.dims()[2]);
+    let used = used.min(cap_old);
+    if s.fmt != KvFormat::Bf16 || fmt == KvFormat::Bf16 {
+        return Err(ModelError::Forward(format!("inkling2: перевод KV {} → {} не поддержан", s.fmt.name(), fmt.name())));
+    }
+    let scales = Tensor::zeros(vec![2, nkv, capacity, d / 32], DType::U8, dev).map_err(fe)?;
+    for (j, kv) in [&mut s.k, &mut s.v].into_iter().enumerate() {
+        let fresh = Tensor::zeros(vec![nkv, capacity, d], DType::U8, dev).map_err(fe)?;
+        if used > 0 {
+            let mut a = Ink2Launch::default();
+            a.a[0] = addr(kv)?;
+            a.a[1] = addr(&fresh)?;
+            a.a[2] = addr(&scales)? + (j * nkv * capacity * (d / 32)) as u64;
+            a.u[0] = nkv as u32;
+            a.u[1] = used as u32;
+            a.u[2] = cap_old as u32;
+            a.u[3] = capacity as u32;
+            a.u[4] = d as u32;
+            a.u[5] = fmt.code();
+            launch(dev, "ink2_kv_requant", &a, (used as u32, nkv as u32, 1), d as u32)?;
+        }
+        *kv = fresh;
+    }
+    s.scales = Some(scales);
+    s.fmt = fmt;
+    Ok(())
 }
 
 /// Дорастить по оси `axis` (ёмкость) тензор `[.., cap, ..]` до `capacity`: первые `used`
