@@ -70,8 +70,11 @@ pub fn arch_key(path: &Path) -> Option<String> {
 pub fn config_max_seq(path: &Path) -> Option<usize> {
     let bytes = read_model_file(path, "config.json")?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    // Окно позиций: `max_position_embeddings`, а у моделей без него (Inkling-2:
+    // позиции через относительный bias) — `model_max_length`.
     let field = |v: &serde_json::Value| {
         v.get("max_position_embeddings")
+            .or_else(|| v.get("model_max_length"))
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
     };
@@ -191,5 +194,19 @@ mod tests {
         assert_eq!(config_max_seq(&y), Some(131072));
         let _ = std::fs::remove_dir_all(d);
         let _ = std::fs::remove_dir_all(y);
+    }
+
+    #[test]
+    fn model_max_length_in_text_config() {
+        // Inkling-2: окно — `text_config.model_max_length`; `max_position_embeddings`
+        // есть только у MTP-драфтера и окном основной модели не считается.
+        let d = model_dir(
+            "inkling",
+            r#"{"model_type": "inkling2_loop",
+                "text_config": {"model_max_length": 1048576, "hidden_size": 2304},
+                "mtp_config": {"max_position_embeddings": 4096}}"#,
+        );
+        assert_eq!(config_max_seq(&d), Some(1048576));
+        let _ = std::fs::remove_dir_all(d);
     }
 }
