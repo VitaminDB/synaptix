@@ -1,8 +1,10 @@
 //! Генерация Inkling-2: токенизатор, шаблон чата, сессия с префиксным кэшем.
 //!
-//! Состояние коротких свёрток назад не откатывается, поэтому кэш сессии
-//! годен, только если новый промпт целиком продолжает уже посчитанные токены
-//! (как у LFM3); иначе ход считается с нуля.
+//! Состояние коротких свёрток и кольца SWA назад не откатываются, поэтому
+//! кэш сессии берётся либо целиком (новый промпт продолжает всё посчитанное),
+//! либо от точки возврата — снимка этих состояний на конце промпта прошлого
+//! хода (или на границе, названной вызывающим), как у Qwen4Exp. Иначе ход
+//! считается с нуля.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use crate::loader::{Inkling2Weights, LoadError};
 use synaptix_llm_common::expert_mirror::{self as em, ExpertStacks};
 use synaptix_llm_common::moe::ExpertSource;
 use synaptix_llm_common::moe_zc::{ExpertBlobs, ZcLayer, ZcPool};
-use crate::model::{EmbedPatch, Inkling2Model, KvFormat, ModelCache};
+use crate::model::{CacheSnapshot, EmbedPatch, Inkling2Model, KvFormat, ModelCache};
 use crate::preprocess::{load_image, ImageLimits};
 use crate::vision::{expand_image_tokens, prefill_with_images, ImageSpan, VisionTower, IMAGE_TOKEN_ID};
 use synaptix_core::tensor::Tensor;
@@ -93,6 +95,13 @@ fn zc_headroom() -> usize {
 const GB: f64 = (1u64 << 30) as f64;
 
 /// Кэш хода между репликами чата.
+///
+/// Точка возврата стоит на КОНЦЕ ПРОМПТА хода (или на границе, названной
+/// [`Self::set_resume_at`]), как у Qwen4Exp: клиент убирает из истории
+/// размышления прошлых ответов, и новый промпт продолжает прошлый промпт, но
+/// не сгенерированный ответ. Снимок ([`CacheSnapshot`]) держит то, что ход
+/// после точки портит безвозвратно (состояния свёрток, кольца SWA); KV полных
+/// слотов ниже точки цел и возвращается уменьшением `seq_len`.
 pub struct Inkling2Session {
     pub cache: ModelCache,
     /// Токены, чьё состояние лежит в `cache` (промпт и ответ прошлого хода).
@@ -100,8 +109,21 @@ pub struct Inkling2Session {
     /// Картинки в `ids`: (первая строка, отпечаток признаков от вызывающего).
     /// Та же разметка с другой картинкой кэш не берёт.
     pub images: Vec<(usize, u64)>,
+    /// Точка возврата: снимок, токены промпта до неё и картинки в них.
+    /// Строки полных слотов ниже точки в `cache` обязаны быть целы: сброс кэша
+    /// снимок выбрасывает.
+    snap: Option<SessionSnap>,
+    /// Где поставить точку возврата этого хода, если не на конце промпта.
+    /// Действует на один ход.
+    resume_at: Option<usize>,
     /// Байт KV на позицию контекста (для учёта VRAM фасадом).
     kv_bytes_per_token: usize,
+}
+
+struct SessionSnap {
+    ids: Vec<u32>,
+    images: Vec<(usize, u64)>,
+    cache: CacheSnapshot,
 }
 
 impl Inkling2Session {
@@ -109,14 +131,14 @@ impl Inkling2Session {
         self.cache.capacity
     }
 
+    /// Токенов в кэше: всё посчитанное либо промпт до точки возврата.
     pub fn cached_tokens(&self) -> usize {
-        self.ids.len()
+        self.ids.len().max(self.snap.as_ref().map_or(0, |s| s.ids.len()))
     }
 
-    /// Сколько токенов `prompt_ids` возьмётся из кэша: всё посчитанное, если
-    /// промпт его целиком продолжает (и хоть один токен остаётся на
-    /// префилл), иначе 0 — состояние свёрток назад не откатить.
-    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+    /// Всё посчитанное, если промпт его целиком продолжает (и хоть один токен
+    /// остаётся на префилл), иначе 0.
+    fn reusable_all(&self, prompt_ids: &[u32]) -> usize {
         let n = self.ids.len();
         if n > 0 && n < prompt_ids.len() && prompt_ids[..n] == self.ids[..] && self.cache.seq_len == n {
             n
@@ -125,32 +147,80 @@ impl Inkling2Session {
         }
     }
 
+    /// Промпт до точки возврата, если новый промпт его продолжает, иначе 0.
+    fn reusable_snap(&self, prompt_ids: &[u32]) -> usize {
+        match &self.snap {
+            Some(s) if !s.ids.is_empty() && s.ids.len() < prompt_ids.len() && prompt_ids[..s.ids.len()] == s.ids[..] => s.ids.len(),
+            _ => 0,
+        }
+    }
+
+    /// Сколько токенов `prompt_ids` возьмётся из кэша: всё посчитанное, если
+    /// промпт его целиком продолжает; иначе промпт до точки возврата, если
+    /// промпт продолжает его; иначе 0 — середину свёрток не откатить. Хоть
+    /// один токен всегда остаётся на префилл.
+    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+        self.reusable_all(prompt_ids).max(self.reusable_snap(prompt_ids))
+    }
+
+    /// Поставить точку возврата следующего хода после `at` токенов промпта,
+    /// а не на его конце (как у Qwen4Exp). Вызывающий называет конец истории
+    /// перед приглашением к ответу: следующий промпт может разойтись с этим
+    /// сразу за историей. Граница вне хвоста, который ход префиллит, не
+    /// действует (если на ней уже стоит точка — она остаётся). На один ход.
+    pub fn set_resume_at(&mut self, at: Option<usize>) {
+        self.resume_at = at;
+    }
+
+    /// Граница точки возврата следующего хода (см. [`Self::set_resume_at`]).
+    pub fn resume_at(&self) -> Option<usize> {
+        self.resume_at
+    }
+
+    /// Позиция точки возврата и байты её снимка (на карте ли).
+    pub fn snapshot_info(&self) -> Option<(usize, usize, bool)> {
+        self.snap.as_ref().map(|s| (s.cache.pos(), s.cache.bytes(), s.cache.on_device()))
+    }
+
     /// Забыть посчитанное: следующий ход считается с нуля (обнуление
     /// состояний — в начале хода).
     pub fn invalidate(&mut self) {
         self.ids.clear();
         self.images.clear();
+        self.snap = None;
         self.cache.seq_len = 0;
     }
 
-    /// VRAM под KV сессии (состояния свёрток — копейки, не в счёт); 0 — кэш в RAM.
+    /// VRAM под KV сессии (состояния свёрток — копейки, не в счёт) и снимок
+    /// точки возврата на карте; 0 — кэш в RAM.
     pub fn device_bytes(&self) -> usize {
         if self.cache.is_parked() {
             return 0;
         }
-        self.cache.capacity * self.kv_bytes_per_token
+        self.cache.capacity * self.kv_bytes_per_token + self.snap.as_ref().map_or(0, |s| s.cache.device_bytes())
     }
 
     /// Переселить KV и состояния свёрток в host-RAM (на время вложенной
     /// генерации): позиция и токены сессии сохраняются, следующий ход после
-    /// [`Self::unpark_to`] продолжает кэш. Возвращает байты, ушедшие с карты.
+    /// [`Self::unpark_to`] продолжает кэш. Снимок точки возврата уезжает в
+    /// закреплённую RAM и там остаётся (восстановление идёт прямо оттуда).
+    /// Возвращает байты, ушедшие с карты.
     pub fn park_to_host(&mut self) -> Result<usize, PipelineError> {
-        Ok(self.cache.park_to_host()?)
+        let mut moved = 0;
+        if let Some(s) = self.snap.as_mut() {
+            moved += s.cache.park_to_host()?;
+        }
+        Ok(moved + self.cache.park_to_host()?)
     }
 
-    /// Обратный переезд; граф декода переснимется на первом шаге.
+    /// Обратный переезд; граф декода переснимется на первом шаге. Снимок,
+    /// уехавший с карты, возвращается туда же, если там есть место.
     pub fn unpark_to(&mut self, device: Device) -> Result<usize, PipelineError> {
-        Ok(self.cache.unpark_to(device)?)
+        let mut moved = self.cache.unpark_to(device)?;
+        if let Some(s) = self.snap.as_mut() {
+            moved += s.cache.unpark()?;
+        }
+        Ok(moved)
     }
 
     pub fn is_parked(&self) -> bool {
@@ -329,6 +399,8 @@ impl Inkling2Pipeline {
             cache: self.model.make_cache(ctx.max(2))?,
             ids: Vec::new(),
             images: Vec::new(),
+            snap: None,
+            resume_at: None,
             kv_bytes_per_token: self.kv_bytes_per_token(),
         })
     }
@@ -496,6 +568,21 @@ impl Inkling2Pipeline {
         let ids = self.image_parts(prompt_ids)?;
         let counts: Vec<usize> = images.iter().map(|(t, _)| t.dims()[0]).collect();
         let (ids, starts) = expand_image_tokens(&ids, IMAGE_TOKEN_ID, &counts)?;
+        // Граница точки возврата названа в токенах `prompt_ids` — перевести в строки
+        // развёрнутого промпта: развернуть её префикс так же и проверить, что он префикс
+        // развёрнутого целого (граница не посреди текстовой части с картинкой).
+        if let Some(at) = s.resume_at.filter(|&at| at > 0 && at < prompt_ids.len()) {
+            let head = &prompt_ids[..at];
+            let k = head.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count().min(counts.len());
+            let mapped = self
+                .image_parts(head)
+                .ok()
+                .and_then(|h| expand_image_tokens(&h, IMAGE_TOKEN_ID, &counts[..k]).ok())
+                .map(|(h, _)| h)
+                .filter(|h| h.len() < ids.len() && ids[..h.len()] == h[..])
+                .map(|h| h.len());
+            s.resume_at = mapped;
+        }
         let spans: Vec<(usize, &Tensor, u64)> = starts.into_iter().zip(images).map(|(at, (t, fp))| (at, *t, *fp)).collect();
         self.cached_turn(s, &ids, &spans, cfg, sink)
     }
@@ -510,64 +597,10 @@ impl Inkling2Pipeline {
         cfg: &GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
-        if prompt_ids.is_empty() {
-            return Err(PipelineError::Model(ModelError::Forward("пустой промпт".into())));
-        }
-        let need = prompt_ids.len() + cfg.max_new_tokens + 1;
-        if need > s.cache.capacity {
-            self.grow_session(s, need)?;
-        }
-        // Кэш годен, только если промпт продолжает его целиком и хоть один токен остаётся на префилл,
-        // а картинки посчитанного префикса — те же (та же разметка — ещё не та же картинка).
-        let mut reuse = s.reusable(prompt_ids);
-        let same_images = s.images.iter().filter(|(at, _)| *at < reuse).enumerate().all(|(k, &(at, fp))| {
-            images.get(k).is_some_and(|&(at2, _, fp2)| at2 == at && fp2 == fp)
-        });
-        if !same_images {
-            reuse = 0;
-        }
-        if reuse == 0 {
-            s.cache.reset()?;
-            s.ids.clear();
-            s.images.clear();
-        }
-        s.images.retain(|(at, _)| *at < reuse);
         let eos = eos_set(cfg);
         let mut sampler = TokenSampler::new(cfg, prompt_ids);
         let t0 = Instant::now();
-        let chunk = prefill_chunk().max(1);
-        let mut off = reuse;
-        let mut logits = None;
-        s.ids.truncate(reuse);
-        while off < prompt_ids.len() {
-            if sink.interrupted() {
-                s.ids.clear();
-                s.cache.seq_len = 0;
-                return Err(PipelineError::Model(ModelError::Forward(INTERRUPTED.into())));
-            }
-            let end = (off + chunk).min(prompt_ids.len());
-            // Строки картинок этого куска — готовые признаки.
-            let mut patches = Vec::new();
-            for &(at, t, _) in images {
-                let (a, b) = (at.max(off), (at + t.dims()[0]).min(end));
-                if a < b {
-                    patches.push(EmbedPatch { row: a - off, embeds: t.narrow(0, a - at, b - a).and_then(|x| x.contiguous()).map_err(|e| ModelError::Forward(e.to_string()))? });
-                }
-            }
-            let res = no_grad(|| self.model.forward_with_embeds(&prompt_ids[off..end], &patches, &mut s.cache, false));
-            match res {
-                Ok(l) => logits = Some(l),
-                Err(e) => {
-                    s.ids.clear();
-                    s.cache.seq_len = 0;
-                    return Err(e.into());
-                }
-            }
-            s.ids.extend_from_slice(&prompt_ids[off..end]);
-            synaptix_llm_common::prefill_progress::add(end - off);
-            off = end;
-        }
-        s.images.extend(images.iter().filter(|(at, _, _)| *at >= reuse).map(|&(at, _, fp)| (at, fp)));
+        let (logits, reuse) = self.prefill_turn(s, prompt_ids, images, cfg.max_new_tokens, sink)?;
         let prefill_ms = t0.elapsed().as_millis();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
         let stats = |out: &Vec<u32>, decode_ms| GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: out.len(), prefill_ms, decode_ms };
@@ -575,7 +608,6 @@ impl Inkling2Pipeline {
             let st = stats(&out, 0);
             return Ok((out, st, reuse));
         }
-        let logits = logits.expect("префилл непустой");
         let t1 = Instant::now();
         let mut tok = sampler.sample(&logits)?;
         loop {
@@ -588,6 +620,129 @@ impl Inkling2Pipeline {
             tok = sampler.sample(&l)?;
         }
         Ok((out.clone(), stats(&out, t1.elapsed().as_millis()), reuse))
+    }
+
+    /// Только префилл хода в сессии (кэш, точка возврата — как у
+    /// [`Self::generate_cached_streaming`]): логиты последней позиции промпта
+    /// `[1, V]` F32 и сколько токенов взято из кэша. Для проверок.
+    pub fn prefill_cached(&self, s: &mut Inkling2Session, prompt_ids: &[u32]) -> Result<(Tensor, usize), PipelineError> {
+        self.prefill_turn(s, prompt_ids, &[], 1, &mut |_: u32| true)
+    }
+
+    /// Префилл хода: выбор кэша (целиком / от точки возврата / с нуля),
+    /// прогон хвоста с границей чанка на новой точке возврата. Логиты
+    /// последней позиции промпта и сколько токенов взято из кэша.
+    fn prefill_turn(
+        &self,
+        s: &mut Inkling2Session,
+        prompt_ids: &[u32],
+        images: &[(usize, &Tensor, u64)],
+        max_new: usize,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Tensor, usize), PipelineError> {
+        if prompt_ids.is_empty() {
+            return Err(PipelineError::Model(ModelError::Forward("пустой промпт".into())));
+        }
+        let need = prompt_ids.len() + max_new + 1;
+        if need > s.cache.capacity {
+            self.grow_session(s, need)?;
+        }
+        // Картинки посчитанного префикса — те же (та же разметка — ещё не та же картинка).
+        let same_images = |upto: usize, have: &[(usize, u64)]| {
+            have.iter().filter(|(at, _)| *at < upto).enumerate().all(|(k, &(at, fp))| {
+                images.get(k).is_some_and(|&(at2, _, fp2)| at2 == at && fp2 == fp)
+            })
+        };
+        // Кэш берётся целиком, если промпт продолжает всё посчитанное; иначе — от точки
+        // возврата, если промпт продолжает её промпт; иначе — с нуля.
+        let all = s.reusable_all(prompt_ids);
+        let at_snap = s.reusable_snap(prompt_ids);
+        let (reuse, restore) = if all > 0 && same_images(all, &s.images) {
+            (all, false)
+        } else if at_snap > 0 && s.snap.as_ref().is_some_and(|sn| same_images(at_snap, &sn.images)) {
+            (at_snap, true)
+        } else {
+            (0, false)
+        };
+        let resume = s.resume_at.take();
+        if reuse == 0 {
+            s.cache.reset()?;
+            s.ids.clear();
+            s.images.clear();
+            s.snap = None;
+        } else if restore {
+            let sn = s.snap.as_ref().expect("точка возврата");
+            if let Err(e) = self.model.restore(&mut s.cache, &sn.cache) {
+                s.ids.clear();
+                s.images.clear();
+                s.snap = None;
+                s.cache.seq_len = 0;
+                return Err(e.into());
+            }
+            s.ids = sn.ids.clone();
+            s.images = sn.images.clone();
+        }
+        s.images.retain(|(at, _)| *at < reuse);
+        // Где снять новую точку возврата: на границе вызывающего внутри хвоста, иначе на конце
+        // промпта. Граница, на которой точка уже стоит (второй проход того же хода, пересчёт
+        // после закрытия размышлений по бюджету), оставляет её как есть.
+        let split = resume.filter(|&at| at > reuse && at < prompt_ids.len());
+        let keep = split.is_none() && resume.is_some_and(|at| at <= reuse && s.snap.as_ref().is_some_and(|sn| sn.ids.len() == at));
+        let snap_at = if keep { None } else { Some(split.unwrap_or(prompt_ids.len())) };
+        let chunk = prefill_chunk().max(1);
+        let mut off = reuse;
+        let mut logits = None;
+        s.ids.truncate(reuse);
+        let fail = |s: &mut Inkling2Session| {
+            s.ids.clear();
+            s.images.clear();
+            s.cache.seq_len = 0;
+        };
+        while off < prompt_ids.len() {
+            if sink.interrupted() {
+                fail(s);
+                return Err(PipelineError::Model(ModelError::Forward(INTERRUPTED.into())));
+            }
+            let mut end = (off + chunk).min(prompt_ids.len());
+            // Граница чанка — точно на точке возврата.
+            if let Some(p) = snap_at.filter(|&p| p > off) {
+                end = end.min(p);
+            }
+            // Строки картинок этого куска — готовые признаки.
+            let mut patches = Vec::new();
+            for &(at, t, _) in images {
+                let (a, b) = (at.max(off), (at + t.dims()[0]).min(end));
+                if a < b {
+                    patches.push(EmbedPatch { row: a - off, embeds: t.narrow(0, a - at, b - a).and_then(|x| x.contiguous()).map_err(|e| ModelError::Forward(e.to_string()))? });
+                }
+            }
+            let res = no_grad(|| self.model.forward_with_embeds(&prompt_ids[off..end], &patches, &mut s.cache, false));
+            match res {
+                Ok(l) => logits = Some(l),
+                Err(e) => {
+                    fail(s);
+                    return Err(e.into());
+                }
+            }
+            s.ids.extend_from_slice(&prompt_ids[off..end]);
+            synaptix_llm_common::prefill_progress::add(end - off);
+            off = end;
+            if snap_at == Some(end) {
+                match self.model.snapshot(&s.cache) {
+                    Ok(cache) => {
+                        let imgs = s.images.iter().copied().chain(images.iter().filter(|(at, _, _)| *at >= reuse).map(|&(at, _, fp)| (at, fp))).filter(|(at, _)| *at < end).collect();
+                        s.snap = Some(SessionSnap { ids: prompt_ids[..end].to_vec(), images: imgs, cache });
+                    }
+                    // Без снимка ход идёт дальше, следующий — по всему посчитанному либо с нуля.
+                    Err(e) => {
+                        eprintln!("[inkling2] точка возврата на {end} не снята: {e}");
+                        s.snap = None;
+                    }
+                }
+            }
+        }
+        s.images.extend(images.iter().filter(|(at, _, _)| *at >= reuse).map(|&(at, _, fp)| (at, fp)));
+        Ok((logits.expect("префилл непустой"), reuse))
     }
 }
 

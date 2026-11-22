@@ -293,6 +293,142 @@ impl ModelCache {
         }
         Ok(())
     }
+
+    /// Куски снимка в позиции `pos` с окном SWA `window`: (адрес на карте, байт)
+    /// в каноническом порядке хранения — по слотам: четыре состояния свёрток,
+    /// затем у SWA-слота строки K и V позиций `[pos − W, pos)` (W = min(pos,
+    /// window)) по головам. Раскладка снимка от кольца не зависит: строка `p`
+    /// лежит в кольце по `p % ring`, в линейном слоте — по `p` (слот, бывший
+    /// линейным, после роста кэша становится кольцом).
+    fn snap_pieces(&self, swa: &[bool], pos: usize, window: usize) -> R<Vec<(u64, usize)>> {
+        let w = pos.min(window);
+        let lo = pos - w;
+        let mut out = Vec::new();
+        for (s, &is_swa) in self.slots.iter().zip(swa) {
+            for t in [&s.k_state, &s.v_state, &s.attn_state, &s.ffn_state] {
+                out.push(t.cuda_region().map_err(fe)?);
+            }
+            if !is_swa || w == 0 {
+                continue;
+            }
+            let (nkv, cap, d) = (s.k.dims()[0], s.k.dims()[1], s.k.dims()[2]);
+            let row = s.k.dtype().bytes_for_numel(d);
+            for t in [&s.k, &s.v] {
+                let (base, _) = t.cuda_region().map_err(fe)?;
+                for h in 0..nkv {
+                    let head = base + (h * cap * row) as u64;
+                    if s.ring == 0 {
+                        out.push((head + (lo * row) as u64, w * row));
+                        continue;
+                    }
+                    // Строки lo..pos в кольце: один отрезок или два с переходом через конец.
+                    let a = lo % s.ring;
+                    let first = w.min(s.ring - a);
+                    out.push((head + (a * row) as u64, first * row));
+                    if first < w {
+                        out.push((head, (w - first) * row));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Где лежит снимок точки возврата.
+enum SnapStore {
+    /// На карте одним буфером U8.
+    Device(Tensor),
+    /// В закреплённой RAM (карта занята либо сессия уехала в RAM).
+    Host(synaptix_core::memory::pinned::PinnedBuf),
+}
+
+/// Снимок кэша в позиции `pos`: всё, что ход после неё портит безвозвратно, —
+/// состояния коротких свёрток всех слотов и строки колец SWA в окне перед
+/// `pos` (кольцо перезаписывается по кругу). KV полных слотов линейный и
+/// ниже `pos` не переписывается — его не копируем, достаточно вернуть
+/// `seq_len`.
+pub struct CacheSnapshot {
+    pos: usize,
+    bytes: usize,
+    /// Карта кэша (порядок копий с закреплённого буфера).
+    ord: usize,
+    /// Снимок был на карте и уехал в RAM вместе с кэшем ([`Self::park_to_host`]).
+    parked: bool,
+    store: SnapStore,
+}
+
+/// Снимок держать на карте, если после него там остаётся столько свободного.
+/// `SYN_INKLING2_SNAP=device|host` — выбрать вручную.
+const SNAP_DEVICE_MARGIN: usize = 1 << 30;
+
+impl CacheSnapshot {
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn on_device(&self) -> bool {
+        matches!(self.store, SnapStore::Device(_))
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        if self.on_device() { self.bytes } else { 0 }
+    }
+
+    /// Перевезти снимок в закреплённую RAM (на время вложенной генерации).
+    /// Возвращает байты, ушедшие с карты.
+    pub fn park_to_host(&mut self) -> R<usize> {
+        let SnapStore::Device(t) = &self.store else { return Ok(0) };
+        let Device::Cuda(ord) = t.device() else { return Ok(0) };
+        let mut buf = synaptix_core::memory::pinned::PinnedBuf::new_uninit(self.bytes);
+        let (src, _) = t.cuda_region().map_err(fe)?;
+        let st = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        // SAFETY: буфер снимка жив, хост-буфер своей длины; ждём копию до отдачи буфера карты.
+        unsafe { cudarc::driver::result::memcpy_dtoh_async(buf.as_mut_slice(), src, st.cu_stream()) }
+            .map_err(|e| ModelError::Forward(format!("снимок в RAM: {e:?}")))?;
+        synaptix_core::device::cuda::synchronize(ord).map_err(fe)?;
+        self.store = SnapStore::Host(buf);
+        self.parked = true;
+        Ok(self.bytes)
+    }
+
+    /// Вернуть на карту снимок, уехавший с неё в [`Self::park_to_host`].
+    /// Места нет — остаётся в RAM (восстановление идёт и оттуда). Возвращает
+    /// байты, вернувшиеся на карту.
+    pub fn unpark(&mut self) -> R<usize> {
+        let SnapStore::Host(host) = &self.store else { return Ok(0) };
+        if !self.parked {
+            return Ok(0);
+        }
+        self.parked = false;
+        let ord = self.ord;
+        let free = synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0);
+        if free < self.bytes + SNAP_DEVICE_MARGIN {
+            return Ok(0);
+        }
+        let Ok(buf) = empty(vec![self.bytes.max(1)], DType::U8, Device::Cuda(ord)) else { return Ok(0) };
+        let (dst, _) = buf.cuda_region().map_err(fe)?;
+        let st = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        // SAFETY: свежий буфер своей длины; хост-буфер жив до синхронизации ниже.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, &host.as_slice()[..self.bytes], st.cu_stream()) }
+            .map_err(|e| ModelError::Forward(format!("снимок на карту: {e:?}")))?;
+        synaptix_core::device::cuda::synchronize(ord).map_err(fe)?;
+        self.store = SnapStore::Device(buf);
+        Ok(self.bytes)
+    }
+}
+
+impl Drop for CacheSnapshot {
+    fn drop(&mut self) {
+        // Копии с закреплённого буфера асинхронны: не отдавать его, пока они идут.
+        if let SnapStore::Host(_) = self.store {
+            let _ = synaptix_core::device::cuda::synchronize(self.ord);
+        }
+    }
 }
 
 /// Готовые эмбеддинги (F32 `[len, H]` на карте) вместо строк чанка с `row`.
@@ -594,6 +730,98 @@ impl Inkling2Model {
             warm: 0,
             zc_gen: 0,
         })
+    }
+
+    /// SWA ли слот (по слотам кэша).
+    fn swa_slots(&self) -> Vec<bool> {
+        (0..self.cfg.num_slots()).map(|si| self.cfg.is_swa(self.slot_phys(si))).collect()
+    }
+
+    /// Снять точку возврата в текущей позиции кэша (`seq_len`): копии ставятся
+    /// в поток по порядку с ядрами, так что снимок — ровно состояние после
+    /// последнего прогона. Хранится на карте, если после него там остаётся
+    /// запас, иначе — в закреплённой RAM.
+    pub fn snapshot(&self, cache: &ModelCache) -> R<CacheSnapshot> {
+        let Device::Cuda(ord) = self.device else {
+            return Err(ModelError::Forward("inkling2: снимок кэша — только на CUDA".into()));
+        };
+        if cache.is_parked() {
+            return Err(ModelError::Forward("inkling2: снимок припаркованного кэша".into()));
+        }
+        let pos = cache.seq_len;
+        let pieces = cache.snap_pieces(&self.swa_slots(), pos, self.cfg.text.sliding_window_size)?;
+        let bytes: usize = pieces.iter().map(|p| p.1).sum();
+        let on_device = match std::env::var("SYN_INKLING2_SNAP").ok().as_deref().map(str::trim) {
+            Some("host" | "ram") => false,
+            Some("device" | "vram" | "gpu") => true,
+            _ => synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f).unwrap_or(0) >= bytes + SNAP_DEVICE_MARGIN,
+        };
+        let st = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        let store = if on_device {
+            let buf = empty(vec![bytes.max(1)], DType::U8, self.device)?;
+            let (base, _) = buf.cuda_region().map_err(fe)?;
+            let mut off = 0u64;
+            for &(src, len) in &pieces {
+                synaptix_core::device::cuda::dtod_into_region(&st, base + off, src, len).map_err(fe)?;
+                off += len as u64;
+            }
+            SnapStore::Device(buf)
+        } else {
+            let mut buf = synaptix_core::memory::pinned::PinnedBuf::new_uninit(bytes.max(1));
+            let mut off = 0usize;
+            for &(src, len) in &pieces {
+                // SAFETY: куски — регионы живых буферов кэша; хост-буфер живёт в снимке,
+                // а его отдача ждёт поток (Drop снимка).
+                unsafe { cudarc::driver::result::memcpy_dtoh_async(&mut buf.as_mut_slice()[off..off + len], src, st.cu_stream()) }
+                    .map_err(|e| ModelError::Forward(format!("снимок кэша в RAM: {e:?}")))?;
+                off += len;
+            }
+            SnapStore::Host(buf)
+        };
+        Ok(CacheSnapshot { pos, bytes, ord, parked: false, store })
+    }
+
+    /// Вернуть кэш в точку снимка: состояния и строки колец копируются в те же
+    /// буферы (граф декода остаётся годным — адреса прежние), `seq_len` — на
+    /// позицию снимка. Годен, только если с момента снимка кэш не сбрасывался
+    /// (строки полных слотов ниже позиции целы) — за этим следит сессия.
+    pub fn restore(&self, cache: &mut ModelCache, snap: &CacheSnapshot) -> R<()> {
+        let Device::Cuda(ord) = self.device else {
+            return Err(ModelError::Forward("inkling2: снимок кэша — только на CUDA".into()));
+        };
+        if cache.is_parked() {
+            return Err(ModelError::Forward("inkling2: кэш в RAM (unpark_to перед ходом)".into()));
+        }
+        if snap.pos > cache.capacity {
+            return Err(ModelError::Forward(format!("inkling2: снимок на {} за ёмкостью {}", snap.pos, cache.capacity)));
+        }
+        let pieces = cache.snap_pieces(&self.swa_slots(), snap.pos, self.cfg.text.sliding_window_size)?;
+        let bytes: usize = pieces.iter().map(|p| p.1).sum();
+        if bytes != snap.bytes {
+            return Err(ModelError::Forward(format!("inkling2: снимок {} Б, кэшу нужно {bytes}", snap.bytes)));
+        }
+        let st = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        match &snap.store {
+            SnapStore::Device(buf) => {
+                let (base, _) = buf.cuda_region().map_err(fe)?;
+                let mut off = 0u64;
+                for &(dst, len) in &pieces {
+                    synaptix_core::device::cuda::dtod_into_region(&st, dst, base + off, len).map_err(fe)?;
+                    off += len as u64;
+                }
+            }
+            SnapStore::Host(buf) => {
+                let mut off = 0usize;
+                for &(dst, len) in &pieces {
+                    // SAFETY: регионы буферов кэша; хост-буфер живёт в снимке до конца копий (Drop ждёт поток).
+                    unsafe { cudarc::driver::result::memcpy_htod_async(dst, &buf.as_slice()[off..off + len], st.cu_stream()) }
+                        .map_err(|e| ModelError::Forward(format!("снимок кэша из RAM: {e:?}")))?;
+                    off += len;
+                }
+            }
+        }
+        cache.seq_len = snap.pos;
+        Ok(())
     }
 
     /// Расширить кэш до `capacity` позиций: KV копируется, состояния свёрток те же.
@@ -1230,18 +1458,29 @@ impl Inkling2Model {
 }
 
 /// Дорастить по оси `axis` (ёмкость) тензор `[.., cap, ..]` до `capacity`: первые `used`
-/// позиций копируются, остальное — нули (BF16 KV, U8 квант-KV и его масштабы).
+/// позиций копируются, остальное — нули (BF16 KV, U8 квант-KV и его масштабы). Копии —
+/// сырыми D2D по отрезкам (`narrow`/`cat` по U8 на карте не поддержаны).
 fn grow_rows(t: &mut Tensor, axis: usize, used: usize, capacity: usize) -> R<()> {
     let mut shape = t.dims().to_vec();
-    if used == 0 {
-        shape[axis] = capacity;
-        *t = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
-        return Ok(());
+    let cap_old = shape[axis];
+    shape[axis] = capacity;
+    let fresh = Tensor::zeros(shape.clone(), t.dtype(), t.device()).map_err(fe)?;
+    let used = used.min(cap_old);
+    if used > 0 {
+        let Device::Cuda(ord) = t.device() else {
+            return Err(ModelError::Forward("inkling2: рост кэша — только на CUDA".into()));
+        };
+        let outer: usize = shape[..axis].iter().product();
+        let row = t.dtype().bytes_for_numel(shape[axis + 1..].iter().product());
+        let (src, _) = t.cuda_region().map_err(fe)?;
+        let (dst, _) = fresh.cuda_region().map_err(fe)?;
+        let st = synaptix_core::device::cuda::default_stream(ord).map_err(fe)?;
+        for o in 0..outer {
+            synaptix_core::device::cuda::dtod_into_region(&st, dst + (o * capacity * row) as u64, src + (o * cap_old * row) as u64, used * row)
+                .map_err(fe)?;
+        }
     }
-    let head = t.narrow(axis, 0, used).and_then(|h| h.contiguous()).map_err(fe)?;
-    shape[axis] = capacity - used;
-    let pad = Tensor::zeros(shape, t.dtype(), t.device()).map_err(fe)?;
-    *t = Tensor::cat(&[&head, &pad], axis).map_err(fe)?.contiguous().map_err(fe)?;
+    *t = fresh;
     Ok(())
 }
 

@@ -974,7 +974,9 @@ enum SessionKind {
     Qwen4Exp(Box<Qwen4ExpSession>),
     /// Inkling-2: KV всех слотов цикла и состояния коротких свёрток — свой
     /// тип пайплайна ([`Inkling2Session`]), общий `LlmKvCache` пустой. Свёртки
-    /// назад не откатываются: кэш годен, только если промпт его продолжает.
+    /// и кольца SWA назад не откатываются: кэш берётся целиком, если промпт
+    /// его продолжает, либо от точки возврата (снимок на конце прошлого
+    /// промпта или на границе [`LlmKvSession::set_resume_at`]), как у Qwen4Exp.
     Inkling2(Box<Inkling2Session>),
 }
 
@@ -997,7 +999,18 @@ impl LlmKvSession {
     pub fn set_resume_at(&mut self, at: Option<usize>) {
         match &mut self.kind {
             SessionKind::Qwen4Exp(s) => s.set_resume_at(at),
+            SessionKind::Inkling2(s) => s.set_resume_at(at),
             _ => self.resume_at = at,
+        }
+    }
+
+    /// Граница точки возврата следующего хода (см. [`Self::set_resume_at`]):
+    /// у Qwen4Exp и Inkling-2 она живёт в их сессии.
+    fn resume_at(&self) -> Option<usize> {
+        match &self.kind {
+            SessionKind::Qwen4Exp(s) => s.resume_at(),
+            SessionKind::Inkling2(s) => s.resume_at(),
+            _ => self.resume_at,
         }
     }
 
@@ -2452,7 +2465,7 @@ impl<'a> LlmGeneration<'a> {
             Some(m) => (m.open, Some(m.close)),
             None => (None, None),
         };
-        let resume = session.resume_at;
+        let resume = session.resume_at();
         // Учёт хода: токены, размышления, кто остановил.
         struct Track {
             n: usize,
@@ -2539,7 +2552,7 @@ impl<'a> LlmGeneration<'a> {
                 self.opts.max_new_tokens = max_new.saturating_sub(tr.n).max(1);
                 // Точка возврата сессии — не дальше конца исходного промпта:
                 // следующий ход истории размышлений не несёт.
-                session.resume_at = Some(resume.unwrap_or(prompt_ids.len()).min(prompt_ids.len()));
+                session.set_resume_at(Some(resume.unwrap_or(prompt_ids.len()).min(prompt_ids.len())));
                 total_prompt = prompt2.len() - tr.n;
                 let r = self.generate_streaming_cached_split(session, &prompt2, tokenizer, |id, s| {
                     feed(&mut tr, id, s, 0, &mut on_token)
@@ -2593,12 +2606,12 @@ impl<'a> LlmGeneration<'a> {
             && self.opts.max_new_tokens > 1
             && self.model.regrow_after_prefill.swap(false, std::sync::atomic::Ordering::Relaxed);
         if split {
-            let resume = session.resume_at;
+            let resume = session.resume_at();
             let max_new = self.opts.max_new_tokens;
             self.opts.max_new_tokens = 1;
             let r = self.generate_streaming_cached_pass(session, prompt_ids, tokenizer, |_, _| false);
             self.opts.max_new_tokens = max_new;
-            session.resume_at = resume;
+            session.set_resume_at(resume);
             let reused = r?;
             self.generate_streaming_cached_pass(session, prompt_ids, tokenizer, on_token)?;
             return Ok(reused);
@@ -3192,9 +3205,10 @@ impl<'a> LlmGeneration<'a> {
                     Err(e) => Err(LlmError(e.to_string())),
                 }
             }
-            // Inkling-2: картинки и их отпечатки — в своей сессии, свёртки
-            // не откатываются (кэш — только если промпт продолжает
-            // посчитанное целиком). Из кэша — в токенах `prompt_ids`:
+            // Inkling-2: картинки и их отпечатки — в своей сессии (и в точке
+            // возврата), кэш — целиком либо от точки возврата; граница
+            // `set_resume_at` переводится в строки развёрнутого промпта
+            // внутри хода. Из кэша — в токенах `prompt_ids`:
             // пересчитано столько же, сколько у развёрнутого промпта.
             LlmPipeline::Inkling2(p) => {
                 let SessionKind::Inkling2(s) = &mut session.kind else {

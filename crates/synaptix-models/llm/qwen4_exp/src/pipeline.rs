@@ -199,6 +199,11 @@ impl Qwen4ExpSession {
         self.resume_at = at;
     }
 
+    /// Граница точки возврата следующего хода (см. [`Self::set_resume_at`]).
+    pub fn resume_at(&self) -> Option<usize> {
+        self.resume_at
+    }
+
     pub fn cached_tokens(&self) -> usize {
         self.ids.len()
     }
