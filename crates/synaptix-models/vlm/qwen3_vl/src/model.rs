@@ -439,6 +439,46 @@ impl VisionTower {
 /// результата не меняет, а пик падает пропорционально чанку.
 pub const ATTN_Q_CHUNK: usize = 1024;
 
+/// Flash-внимание без маски на CUDA (BF16/F16): матрица score'ов не
+/// материализуется вовсе, пик — только Q/K/V/выход. Когда башня делит
+/// карту с 35B-A3B (22 из 24 ГБ), даже кусок score'ов `[16, 1024, 3192]`
+/// F32 = 209 МБ уже не выкраивается. `head_dim` башни (72) дополняется
+/// нулями до кратного 128 — нули не меняют ни `q·k`, ни лишние столбцы
+/// выхода, которые отрезаются. `None` — backend не умеет (CPU, F32, нет
+/// ядра): тогда явный softmax порциями.
+fn attention_flash(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Option<Tensor>, VisionError> {
+    if !q.device().is_cuda() || !matches!(q.dtype(), DType::BF16 | DType::F16) {
+        return Ok(None);
+    }
+    let e = |r: Result<Tensor, synaptix_core::error::SynaptixError>| {
+        r.map_err(|err| VisionError::Forward(err.to_string()))
+    };
+    let d = q.dims();
+    let (h, n, hd) = (d[0], d[1], d[2]);
+    let pd = hd.div_ceil(128) * 128;
+    let prep = |t: &Tensor| -> Result<Tensor, VisionError> {
+        let t = e(t.contiguous())?;
+        let t = if pd == hd {
+            t
+        } else {
+            let z = e(Tensor::zeros((h, n, pd - hd), t.dtype(), t.device()))?;
+            e(e(Tensor::cat(&[&t, &z], 2))?.contiguous())?
+        };
+        e(t.reshape(vec![1, h, n, pd]))
+    };
+    let (qp, kp, vp) = (prep(q)?, prep(k)?, prep(v)?);
+    let o = match qp.flash_attention(&kp, &vp, scale, false) {
+        Ok(o) => o,
+        Err(synaptix_core::error::SynaptixError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(VisionError::Forward(err.to_string())),
+    };
+    let o = e(o.reshape(vec![h, n, pd]))?;
+    if pd == hd {
+        return Ok(Some(o));
+    }
+    Ok(Some(e(e(o.narrow(2, 0, hd))?.contiguous())?))
+}
+
 /// Внимание `[heads, N, hd]` с разрезом по строкам запросов (см.
 /// [`ATTN_Q_CHUNK`]). При `chunk >= N` — один вызов без копий.
 pub fn attention_chunked(
@@ -452,6 +492,9 @@ pub fn attention_chunked(
         r.map_err(|err| VisionError::Forward(err.to_string()))
     };
     let n = q.dims()[1];
+    if let Some(o) = attention_flash(q, k, v, scale)? {
+        return Ok(o);
+    }
     let chunk = chunk.max(1);
     if n <= chunk {
         return e(scaled_dot_attention(q, k, v, scale, None));
@@ -507,6 +550,59 @@ mod tests {
                 assert!((x - y).abs() < 1e-5, "{x} vs {y}");
             }
         }
+    }
+
+    /// Flash-путь на CUDA (head_dim 72 дополняется до 128) совпадает с
+    /// явным softmax на CPU в пределах BF16. Без карты тест пропускается.
+    #[test]
+    fn flash_attention_matches_explicit_on_cuda() {
+        synaptix_kernels_cpu::ensure_registered();
+        synaptix_kernels_cuda::ensure_registered();
+        let dev = Device::Cuda(0);
+        if Tensor::zeros(vec![1], DType::F32, dev).is_err() {
+            eprintln!("нет CUDA — пропуск");
+            return;
+        }
+        let (nh, n, hd) = (16usize, 1500usize, 72usize);
+        let mut seed = 777u32;
+        let mut rnd = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5) * 4.0
+                })
+                .collect()
+        };
+        let data: Vec<Vec<f32>> = (0..3).map(|_| rnd(nh * n * hd)).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        // Эталон — те же BF16-округлённые входы, явный softmax в F32 на CPU.
+        let cpu = |d: &Vec<f32>| {
+            Tensor::from_vec(d.clone(), vec![nh, n, hd], Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+        };
+        let reference = attention_chunked(&cpu(&data[0]), &cpu(&data[1]), &cpu(&data[2]), scale, 256).unwrap();
+        let gpu = |d: &Vec<f32>| {
+            Tensor::from_vec(d.clone(), vec![nh, n, hd], dev).unwrap().to_dtype(DType::BF16).unwrap()
+        };
+        let got = attention_flash(&gpu(&data[0]), &gpu(&data[1]), &gpu(&data[2]), scale)
+            .unwrap()
+            .expect("flash-ядро должно быть на CUDA");
+        assert_eq!(got.dims(), &[nh, n, hd]);
+        let got = got.to_dtype(DType::F32).unwrap().to_device(Device::Cpu).unwrap();
+        let a = reference.to_vec3::<f32>().unwrap();
+        let b = got.to_vec3::<f32>().unwrap();
+        let mut max_err = 0f32;
+        for (ra, rb) in a.iter().flatten().zip(b.iter().flatten()) {
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                max_err = max_err.max((x - y).abs());
+            }
+        }
+        eprintln!("max |flash − explicit| = {max_err}");
+        assert!(max_err < 2e-2, "расхождение {max_err}");
     }
 
     #[test]

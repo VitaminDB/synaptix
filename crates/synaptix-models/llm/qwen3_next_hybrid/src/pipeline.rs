@@ -677,7 +677,27 @@ impl HybridPipeline {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo), PipelineError> {
+        self.encode_video_limited(path, None)
+    }
+
+    /// Потолок vision-токенов видео по умолчанию (на все группы кадров).
+    pub fn video_token_budget() -> usize {
+        synaptix_vlm_qwen3::VideoLimits::default().max_total_tokens
+    }
+
+    /// [`Self::encode_video`] с потолком vision-токенов на всё видео
+    /// (`None` — умолчание) — фасад урезает бюджет, когда башне не хватает
+    /// VRAM рядом с весами LLM.
+    pub fn encode_video_limited(
+        &self,
+        path: impl AsRef<Path>,
+        max_total_tokens: Option<usize>,
+    ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo), PipelineError> {
         use synaptix_core::grad::no_grad;
+        let mut limits = synaptix_vlm_qwen3::VideoLimits::default();
+        if let Some(cap) = max_total_tokens {
+            limits.max_total_tokens = cap.max(limits.min_group_tokens);
+        }
         let tower = self
             .vision
             .as_ref()
@@ -686,7 +706,7 @@ impl HybridPipeline {
             synaptix_vlm_qwen3::prepare_video(
                 path,
                 &tower.config,
-                synaptix_vlm_qwen3::VideoLimits::default(),
+                limits,
                 self.model.device,
             )
             .map_err(|e| PipelineError::Load(format!("video: {e}")))?;

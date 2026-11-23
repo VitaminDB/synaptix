@@ -2150,10 +2150,30 @@ impl Llm {
                     .map_err(|e| LlmError(format!("video encode: {e}")))?;
                 (embeds, info.prompt_block(), (0, 0), info.groups)
             }
+            // Как у картинок: 35B-A3B занимает почти всю карту, и башне на
+            // крупном клипе может не хватить VRAM — тогда тот же клип с вдвое
+            // меньшим бюджетом токенов (кадры те же, разрешение ниже), пока
+            // не влезет.
             LlmPipeline::Hybrid(h) => {
-                let (embeds, info) = h
-                    .encode_video(path)
-                    .map_err(|e| LlmError(format!("video encode: {e}")))?;
+                let mut cap: Option<usize> = None;
+                let (embeds, info) = loop {
+                    match h.encode_video_limited(path, cap) {
+                        Ok(v) => break v,
+                        Err(e) if is_oom(&e.to_string()) => {
+                            let used = cap.unwrap_or_else(HybridPipeline::video_token_budget);
+                            if used <= MIN_VIDEO_TOKENS_ON_OOM {
+                                return Err(LlmError(format!("video encode: {e}")));
+                            }
+                            let next = (used / 2).max(MIN_VIDEO_TOKENS_ON_OOM);
+                            eprintln!("[synaptix] видео {used} токенов не влезло в VRAM — повтор с {next}");
+                            if let Device::Cuda(o) = self.device {
+                                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+                            }
+                            cap = Some(next);
+                        }
+                        Err(e) => return Err(LlmError(format!("video encode: {e}"))),
+                    }
+                };
                 (embeds, info.prompt_block(), info.grid_hw, info.groups)
             }
             LlmPipeline::Qwen4Exp(q) => {
@@ -3762,6 +3782,9 @@ fn vision_bytes(path: &Path) -> usize {
 
 /// Нижний предел токенов картинки при повторах после нехватки VRAM.
 const MIN_IMAGE_TOKENS_ON_OOM: usize = 256;
+/// Нижняя планка бюджета видео при повторах после OOM: 4 группы × 64 токена
+/// — ниже кадры сливаются в неразличимые миниатюры.
+const MIN_VIDEO_TOKENS_ON_OOM: usize = 256;
 
 /// Ошибка — нехватка памяти устройства (CUDA OOM в любом из видов текста).
 fn is_oom(msg: &str) -> bool {
