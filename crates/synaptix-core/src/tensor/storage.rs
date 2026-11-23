@@ -2,16 +2,18 @@ use crate::device::Device;
 
 pub struct CpuBuf {
     pub(crate) bytes: Vec<u8>,
+    /// Буфер выхода операции из пула (`alloc_uninit_cpu`): при освобождении — обратно в пул.
+    pub(crate) pooled: bool,
 }
 
 impl CpuBuf {
     pub fn alloc_zeros(n_bytes: usize) -> Self {
-        Self { bytes: vec![0u8; n_bytes] }
+        Self { bytes: vec![0u8; n_bytes], pooled: false }
     }
 
-    pub fn from_vec(bytes: Vec<u8>) -> Self { Self { bytes } }
+    pub fn from_vec(bytes: Vec<u8>) -> Self { Self { bytes, pooled: false } }
 
-    pub fn into_vec(self) -> Vec<u8> { self.bytes }
+    pub fn into_vec(mut self) -> Vec<u8> { std::mem::take(&mut self.bytes) }
 
     pub fn byte_len(&self) -> usize { self.bytes.len() }
 
@@ -19,6 +21,14 @@ impl CpuBuf {
     pub fn as_bytes_mut(&mut self) -> &mut [u8] { &mut self.bytes }
     pub fn as_ptr(&self) -> *const u8 { self.bytes.as_ptr() }
     pub fn as_mut_ptr(&mut self) -> *mut u8 { self.bytes.as_mut_ptr() }
+}
+
+impl Drop for CpuBuf {
+    fn drop(&mut self) {
+        if self.pooled {
+            crate::memory::arena::pool::put(std::mem::take(&mut self.bytes));
+        }
+    }
 }
 
 impl std::fmt::Debug for CpuBuf {

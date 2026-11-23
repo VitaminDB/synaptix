@@ -349,6 +349,15 @@ pub(crate) fn unary_f32(op: UnaryOp, half_consts: bool, s: &[f32], d: &mut [f32]
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(op, UnaryOp::GeluExact) && !half_consts {
+            // Та же формула (A&S 7.1.26), но в F32 NEON вместо скалярной f64-экспоненты:
+            // расхождение ~1e-7 (уровень ошибки самой аппроксимации), в разы быстрее.
+            unsafe { arm::gelu_exact(s, d) };
+            return;
+        }
+    }
     for (o, &x) in d.iter_mut().zip(s) {
         *o = unary_scalar_f32(op, half_consts, x);
     }
@@ -991,6 +1000,64 @@ mod arm {
         }};
     }
 
+    /// `exp` по 4 полосам (Cephes): 1–2 ulp на [-87, 88].
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+        let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
+        let x = vminq_f32(x, vdupq_n_f32(88.0));
+        let n = vcvtnq_s32_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+        let fx = vcvtq_f32_s32(n);
+        let r = vfmsq_f32(x, fx, vdupq_n_f32(0.693_359_4));
+        let r = vfmsq_f32(r, fx, vdupq_n_f32(-2.121_944_4e-4));
+        let mut y = vdupq_n_f32(1.987_569_2e-4);
+        y = vfmaq_f32(vdupq_n_f32(1.398_199_9e-3), y, r);
+        y = vfmaq_f32(vdupq_n_f32(8.333_452e-3), y, r);
+        y = vfmaq_f32(vdupq_n_f32(4.166_579_6e-2), y, r);
+        y = vfmaq_f32(vdupq_n_f32(1.666_666_5e-1), y, r);
+        y = vfmaq_f32(vdupq_n_f32(0.5), y, r);
+        y = vfmaq_f32(r, y, vmulq_f32(r, r));
+        y = vaddq_f32(y, vdupq_n_f32(1.0));
+        let e = vshlq_n_s32::<23>(vaddq_s32(n, vdupq_n_s32(127)));
+        vmulq_f32(y, vreinterpretq_f32_s32(e))
+    }
+
+    /// Точный (erf) GELU: `0.5·x·(1 + erf(x/√2))`, erf — A&S 7.1.26 как в скалярном пути.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn gelu_exact(s: &[f32], d: &mut [f32]) {
+        let n = s.len().min(d.len());
+        let sp = s.as_ptr();
+        let dp = d.as_mut_ptr();
+        let one = vdupq_n_f32(1.0);
+        let half = vdupq_n_f32(0.5);
+        let inv_sqrt2 = vdupq_n_f32(std::f32::consts::FRAC_1_SQRT_2);
+        let mut i = 0;
+        while i + 4 <= n {
+            let x = vld1q_f32(sp.add(i));
+            let z = vmulq_f32(x, inv_sqrt2);
+            let az = vabsq_f32(z);
+            let t = vdivq_f32(one, vfmaq_f32(one, az, vdupq_n_f32(0.327_591_1)));
+            let mut p = vdupq_n_f32(1.061_405_429);
+            p = vfmaq_f32(vdupq_n_f32(-1.453_152_027), p, t);
+            p = vfmaq_f32(vdupq_n_f32(1.421_413_741), p, t);
+            p = vfmaq_f32(vdupq_n_f32(-0.284_496_736), p, t);
+            p = vfmaq_f32(vdupq_n_f32(0.254_829_592), p, t);
+            p = vmulq_f32(p, t);
+            let e = exp4(vnegq_f32(vmulq_f32(az, az)));
+            // 1 + erf(z): при z < 0 это p·e без вычитания близких (точнее скалярного пути),
+            // при z ≥ 0 — 2 − p·e.
+            let pe = vmulq_f32(p, e);
+            let neg = vcltq_f32(z, vdupq_n_f32(0.0));
+            let ope = vbslq_f32(neg, pe, vsubq_f32(vdupq_n_f32(2.0), pe));
+            vst1q_f32(dp.add(i), vmulq_f32(vmulq_f32(half, x), ope));
+            i += 4;
+        }
+        while i < n {
+            *dp.add(i) = super::unary_scalar_f32(synaptix_core::backend::UnaryOp::GeluExact, false, *sp.add(i));
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "neon")]
     pub unsafe fn unary(op: VUnary, s: &[f32], d: &mut [f32]) {
         let n = s.len();
@@ -1226,16 +1293,24 @@ mod tests {
             DType::F32 => {
                 let g: &[f32] = bytemuck::cast_slice(got);
                 let w: &[f32] = bytemuck::cast_slice(want);
+                // aarch64: точный GELU считается в F32 NEON (эталон — f64-erf с F32-округлением,
+                // сам с ошибкой ~1e-7): допуск 2e-7·max(1, |w|).
+                let gelu = cfg!(target_arch = "aarch64") && ctx.contains("GeluExact");
                 for i in 0..g.len() {
-                    let ok = g[i].to_bits() == w[i].to_bits() || (g[i].is_nan() && w[i].is_nan());
+                    let close = gelu && (g[i] - w[i]).abs() <= 2e-7 * w[i].abs().max(1.0);
+                    let ok = g[i].to_bits() == w[i].to_bits() || (g[i].is_nan() && w[i].is_nan()) || close;
                     assert!(ok, "{ctx}: idx {i} got {} want {}", g[i], w[i]);
                 }
             }
             DType::F64 => {
                 let g: &[f64] = bytemuck::cast_slice(got);
                 let w: &[f64] = bytemuck::cast_slice(want);
+                // aarch64: точный GELU считается в F32 NEON (эталон — f64-erf с F32-округлением,
+                // сам с ошибкой ~1e-7): допуск 2e-7·max(1, |w|).
+                let gelu = cfg!(target_arch = "aarch64") && ctx.contains("GeluExact");
                 for i in 0..g.len() {
-                    let ok = g[i].to_bits() == w[i].to_bits() || (g[i].is_nan() && w[i].is_nan());
+                    let close = gelu && (g[i] - w[i]).abs() <= 2e-7 * w[i].abs().max(1.0);
+                    let ok = g[i].to_bits() == w[i].to_bits() || (g[i].is_nan() && w[i].is_nan()) || close;
                     assert!(ok, "{ctx}: idx {i} got {} want {}", g[i], w[i]);
                 }
             }

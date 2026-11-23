@@ -433,10 +433,16 @@ pub(crate) fn run_linear_epilogue(
 /// загрузке, а активация `x` (F16) квантуется на лету в backend.
 #[allow(dead_code)]
 pub(crate) fn run_linear_quant(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
+    run_linear_quant_bias(x, w, None)
+}
+
+/// [`run_linear_quant`] с `bias` в эпилоге ядра (если backend умеет; иначе — отдельным сложением).
+pub(crate) fn run_linear_quant_bias(x: &Tensor, w: &QuantWeight, bias: Option<&Tensor>) -> Result<Tensor> {
     if x.device() != w.device() {
         return Err(SynaptixError::device_mismatch(x.device(), w.device()));
     }
-    if !matches!(x.dtype(), DType::F16 | DType::BF16) {
+    // CPU-ядра принимают и F32 (выход того же типа).
+    if !matches!(x.dtype(), DType::F16 | DType::BF16) && !(x.dtype() == DType::F32 && x.device().is_cpu()) {
         return Err(SynaptixError::Unsupported(
             "linear_quant: активация x должна быть F16 или BF16",
         ));
@@ -467,13 +473,27 @@ pub(crate) fn run_linear_quant(x: &Tensor, w: &QuantWeight) -> Result<Tensor> {
     // выхода (217MB на 26520) на КАЖДЫЙ вызов; все quant-пути пишут out целиком.
     let mut storage = backend.alloc_uninit(out_bytes, x.device())?;
     let stream = Stream::default_for(x.device())?;
+    if let Some(b) = bias {
+        let bc = b.contiguous_view()?;
+        if bc.dtype() == x.dtype() && bc.numel() == w.n() && bc.device() == x.device() {
+            match backend.linear_quant_bias((&x_contig.storage, &x_contig.layout), w, (&bc.storage, &bc.layout), (&mut storage, &out_layout), &stream) {
+                Ok(()) => return Ok(Tensor::from_parts(Arc::new(storage), out_layout)),
+                Err(SynaptixError::Unsupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
     backend.linear_quant(
         (&x_contig.storage, &x_contig.layout),
         w,
         (&mut storage, &out_layout),
         &stream,
     )?;
-    Ok(Tensor::from_parts(Arc::new(storage), out_layout))
+    let y = Tensor::from_parts(Arc::new(storage), out_layout);
+    match bias {
+        Some(b) => y.broadcast_add(b),
+        None => Ok(y),
+    }
 }
 
 /// Квантует плотный вес `w[N,K]` (F16) в [`QuantWeight`] NVFP4 на загрузке
@@ -2817,9 +2837,12 @@ impl Tensor {
         if self.rank() != 4 {
             return Err(SynaptixError::Unsupported("flash_bshd: q rank != 4"));
         }
-        let q = if self.is_contiguous() { self.clone() } else { self.contiguous()? };
-        let k_c = if k.is_contiguous() { k.clone() } else { k.contiguous()? };
-        let v_c = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+        // CPU-ядро читает любые шаги по B/S/H (нужен только единичный шаг по Dh): виды
+        // q/k/v из общей проекции `[B, S, 3, H, Dh]` идут без копий.
+        let pass = |t: &Tensor| t.is_contiguous() || (t.device().is_cpu() && t.layout.strides().as_slice().last() == Some(&1));
+        let q = if pass(self) { self.clone() } else { self.contiguous()? };
+        let k_c = if pass(k) { k.clone() } else { k.contiguous()? };
+        let v_c = if pass(v) { v.clone() } else { v.contiguous()? };
         let out_layout = Layout::contiguous(Shape::new(q.dims().to_vec()), self.dtype());
         let out_bytes = self.dtype().bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(self.device())?;

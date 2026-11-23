@@ -1,6 +1,17 @@
 pub const QK: usize = 32;
 
 pub fn quantize_act(x: &[f32], q: &mut [i8], s: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON есть на любом aarch64; длины — кратны QK по контракту.
+        unsafe { quantize_act_neon(x, q, s) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    quantize_act_scalar(x, q, s)
+}
+
+pub fn quantize_act_scalar(x: &[f32], q: &mut [i8], s: &mut [f32]) {
     for (b, (xc, qc)) in x.chunks_exact(QK).zip(q.chunks_exact_mut(QK)).enumerate() {
         let amax = xc.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
@@ -8,6 +19,36 @@ pub fn quantize_act(x: &[f32], q: &mut [i8], s: &mut [f32]) {
         for (o, &v) in qc.iter_mut().zip(xc) {
             *o = (v * inv).round() as i8;
         }
+        s[b] = d;
+    }
+}
+
+/// Бит-в-бит со скалярным путём: тот же `amax / 127`, то же `v * inv` в F32 и округление
+/// половин от нуля (`vcvtaq` = `f32::round`), значения в ±127 — насыщение не срабатывает.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_act_neon(x: &[f32], q: &mut [i8], s: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let nb = (x.len() / QK).min(q.len() / QK).min(s.len());
+    for b in 0..nb {
+        let xp = x.as_ptr().add(b * QK);
+        let v: [float32x4_t; 8] = std::array::from_fn(|i| vld1q_f32(xp.add(4 * i)));
+        let mut m = vabsq_f32(v[0]);
+        for vi in &v[1..] {
+            m = vmaxq_f32(m, vabsq_f32(*vi));
+        }
+        let amax = vmaxvq_f32(m);
+        let d = amax / 127.0;
+        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let iv = vdupq_n_f32(inv);
+        let r: [int32x4_t; 8] = std::array::from_fn(|i| vcvtaq_s32_f32(vmulq_f32(v[i], iv)));
+        let h0 = vcombine_s16(vqmovn_s32(r[0]), vqmovn_s32(r[1]));
+        let h1 = vcombine_s16(vqmovn_s32(r[2]), vqmovn_s32(r[3]));
+        let h2 = vcombine_s16(vqmovn_s32(r[4]), vqmovn_s32(r[5]));
+        let h3 = vcombine_s16(vqmovn_s32(r[6]), vqmovn_s32(r[7]));
+        let qp = q.as_mut_ptr().add(b * QK);
+        vst1q_s8(qp, vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1)));
+        vst1q_s8(qp.add(16), vcombine_s8(vqmovn_s16(h2), vqmovn_s16(h3)));
         s[b] = d;
     }
 }
@@ -189,6 +230,21 @@ pub fn dot(xq: &[i8], xs: &[f32], w: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantize_act_matches_scalar() {
+        let k = 1024;
+        let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.7311).sin() * (1.0 + (i % 97) as f32) * if i % 64 < 32 { 1e-3 } else { 1.0 }).collect();
+        let (mut q1, mut q2) = (vec![0i8; k], vec![0i8; k]);
+        let (mut s1, mut s2) = (vec![0f32; k / QK], vec![0f32; k / QK]);
+        quantize_act(&x, &mut q1, &mut s1);
+        quantize_act_scalar(&x, &mut q2, &mut s2);
+        assert_eq!(q1, q2);
+        assert_eq!(s1, s2);
+        let z = vec![0f32; 64];
+        quantize_act(&z, &mut q1[..64], &mut s1[..2]);
+        assert!(q1[..64].iter().all(|&v| v == 0) && s1[..2] == [0.0, 0.0]);
+    }
 
     #[test]
     fn dot4_matches_dot() {

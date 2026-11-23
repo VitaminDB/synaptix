@@ -21,6 +21,13 @@ use synaptix_ops::norm::layer_norm;
 use crate::loader::{dec_layer, enc_layer, WhisperWeights};
 use crate::Result;
 
+/// Участок профиля (`SYNAPTIX_PROFILE=1`).
+macro_rules! p {
+    ($name:literal, $e:expr) => {
+        synaptix_core::prof::span($name, || $e)
+    };
+}
+
 /// Layer-norm параметры (gain + bias).
 struct LayerNorm {
     weight: Tensor,
@@ -37,26 +44,87 @@ impl LayerNorm {
 /// Multi-head attention Whisper. Используется и как self-, и как cross-attention:
 /// query берётся из `x`, key/value — из `kv_source` (для self-attn это тот же `x`).
 pub struct WhisperAttention {
-    q: QuantLinear,
-    k: QuantLinear,
-    v: QuantLinear,
+    proj: Qkv,
     out: QuantLinear,
     num_heads: usize,
     head_dim: usize,
     scale: f32,
 }
 
+/// q/k/v-проекции: раздельные или (CPU, self-attention) одной матрицей `[3·D, D]` —
+/// один GEMM/GEMV вместо трёх (вход квантуется и раздаётся потокам один раз).
+/// Строки весов те же, поэтому выход совпадает с раздельными проекциями.
+enum Qkv {
+    Split { q: QuantLinear, k: QuantLinear, v: QuantLinear },
+    Fused(QuantLinear),
+}
+
 impl WhisperAttention {
+    fn d(&self) -> usize {
+        self.num_heads * self.head_dim
+    }
+
+    /// Часть `i` (0 — q, 1 — k, 2 — v) выхода общей проекции, `[B, S, D]` contiguous.
+    fn part(&self, y: &Tensor, i: usize) -> Result<Tensor> {
+        let last = y.rank() - 1;
+        Ok(y.narrow(last, i * self.d(), self.d())?.contiguous()?)
+    }
+
+    fn q_lin(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.proj {
+            Qkv::Split { q, .. } => Ok(q.forward(x)?),
+            Qkv::Fused(f) => self.part(&f.forward(x)?, 0),
+        }
+    }
+
+    fn kv_lin(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match &self.proj {
+            Qkv::Split { k, v, .. } => Ok((k.forward(x)?, v.forward(x)?)),
+            Qkv::Fused(f) => {
+                let y = f.forward(x)?;
+                Ok((self.part(&y, 1)?, self.part(&y, 2)?))
+            }
+        }
+    }
+
+    /// q, k, v одного входа видами `[B, S, H, Dh]` (у общей проекции — без копий).
+    fn qkv_bshd(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match &self.proj {
+            Qkv::Split { q, k, v } => Ok((self.bshd(&q.forward(x)?)?, self.bshd(&k.forward(x)?)?, self.bshd(&v.forward(x)?)?)),
+            Qkv::Fused(f) => {
+                let y = f.forward(x)?;
+                let d = y.dims();
+                let y = y.reshape(vec![d[0], d[1], 3, self.num_heads, self.head_dim])?;
+                let part = |i: usize| -> Result<Tensor> { Ok(y.narrow(2, i, 1)?.squeeze(2)?) };
+                Ok((part(0)?, part(1)?, part(2)?))
+            }
+        }
+    }
+
     /// q-проекция с разбивкой на головы → `[B, H, S, Dh]`.
     fn q_heads(&self, x: &Tensor) -> Result<Tensor> {
-        split_heads(&self.q.forward(x)?, self.num_heads, self.head_dim)
+        split_heads(&self.q_lin(x)?, self.num_heads, self.head_dim)
     }
 
     /// k/v-проекции с разбивкой на головы → (`[B, H, S, Dh]`, `[B, H, S, Dh]`).
     fn kv_heads(&self, src: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = split_heads(&self.k.forward(src)?, self.num_heads, self.head_dim)?;
-        let v = split_heads(&self.v.forward(src)?, self.num_heads, self.head_dim)?;
-        Ok((k, v))
+        let (k, v) = self.kv_lin(src)?;
+        Ok((split_heads(&k, self.num_heads, self.head_dim)?, split_heads(&v, self.num_heads, self.head_dim)?))
+    }
+
+    /// `[B, S, H*Dh]` → вид `[B, S, H, Dh]` без копии (раскладка flash_bshd).
+    fn bshd(&self, x: &Tensor) -> Result<Tensor> {
+        let d = x.dims();
+        Ok(x.reshape(vec![d[0], d[1], self.num_heads, self.head_dim])?)
+    }
+
+    /// CPU: внимание по видам `[B, S, H, Dh]` потоковым ядром (без матрицы оценок
+    /// `[H, S, T]`, транспонирования K и разбивки/сборки голов) + out-проекция.
+    fn attend_bshd(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let o = q.flash_attention_bshd(k, v, self.scale, false)?;
+        let d = o.dims();
+        let o = o.reshape(vec![d[0], d[1], d[2] * d[3]])?;
+        Ok(self.out.forward(&o)?)
     }
 
     /// scaled-dot-attention + merge + out-проекция.
@@ -77,14 +145,23 @@ impl WhisperAttention {
     /// GEMM + материализацию [S,S] scores в scaled_dot (узкое место профиля энкодера).
     /// На CPU / прочих dtype — обычный scaled_dot (bit-exact reference-путь).
     fn forward_full(&self, x: &Tensor) -> Result<Tensor> {
-        let q = self.q_heads(x)?;
-        let (k, v) = self.kv_heads(x)?;
+        if x.device().is_cpu() {
+            let (q, k, v) = p!("enc.qkv", self.qkv_bshd(x))?;
+            let o = p!("enc.attn", q.flash_attention_bshd(&k, &v, self.scale, false))?;
+            let d = o.dims();
+            let o = o.reshape(vec![d[0], d[1], d[2] * d[3]])?;
+            return Ok(p!("enc.out", self.out.forward(&o))?);
+        }
+        let q = p!("enc.qkv", self.q_heads(x))?;
+        let (k, v) = p!("enc.qkv", self.kv_heads(x))?;
         if matches!(x.device(), Device::Cuda(_)) && matches!(x.dtype(), DType::F16 | DType::BF16) {
             let attn = q.flash_attention(&k, &v, self.scale, false)?;
             let attn = merge_heads(&attn)?;
             Ok(self.out.forward(&attn)?)
         } else {
-            self.attend(&q, &k, &v, None)
+            let attn = p!("enc.attn", scaled_dot_attention(&q, &k, &v, self.scale, None))?;
+            let attn = p!("enc.merge", merge_heads(&attn))?;
+            Ok(p!("enc.out", self.out.forward(&attn))?)
         }
     }
 
@@ -157,14 +234,16 @@ pub struct EncoderLayer {
 impl EncoderLayer {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x;
-        let h = self.self_attn_ln.forward(x)?;
+        let h = p!("enc.ln", self.self_attn_ln.forward(x))?;
         let h = self.self_attn.forward_full(&h)?;
-        let x = residual.add(&h)?;
+        let x = p!("enc.add", residual.add(&h))?;
 
         let residual = &x;
-        let h = self.final_ln.forward(&x)?;
-        let h = self.fc2.forward(&gelu_exact(&self.fc1.forward(&h)?)?)?;
-        Ok(residual.add(&h)?)
+        let h = p!("enc.ln", self.final_ln.forward(&x))?;
+        let h = p!("enc.fc1", self.fc1.forward(&h))?;
+        let h = p!("enc.gelu", gelu_exact(&h))?;
+        let h = p!("enc.fc2", self.fc2.forward(&h))?;
+        Ok(p!("enc.add", residual.add(&h))?)
     }
 }
 
@@ -174,9 +253,10 @@ impl EncoderLayer {
         let h = self.self_attn_ln.forward(x)?;
         v.push(("ln1", h.clone()));
         let a = &self.self_attn;
-        v.push(("q", a.q.forward(&h)?));
-        v.push(("k", a.k.forward(&h)?));
-        v.push(("v", a.v.forward(&h)?));
+        v.push(("q", a.q_lin(&h)?));
+        let (kk, vv) = a.kv_lin(&h)?;
+        v.push(("k", kk));
+        v.push(("v", vv));
         let q = a.q_heads(&h)?;
         let (k, vv) = a.kv_heads(&h)?;
         let att = merge_heads(&scaled_dot_attention(&q, &k, &vv, a.scale, None)?)?;
@@ -228,16 +308,19 @@ impl WhisperEncoder {
 
     /// mel `[B, num_mel_bins, T]` → `[B, T/2, d_model]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        let x = gelu_exact(&conv1d(mel, &self.conv1_w, Some(&self.conv1_b), 1, 1)?)?;
-        let x = gelu_exact(&conv1d(&x, &self.conv2_w, Some(&self.conv2_b), 2, 1)?)?;
-        let x = x.transpose(1, 2)?.contiguous()?;
-        let seq = x.dims()[1];
-        let pos = self.embed_positions.narrow(0, 0, seq)?.unsqueeze(0)?;
-        let mut h = x.broadcast_add(&pos)?;
+        let mut h = p!("enc.stem", (|| -> Result<Tensor> {
+            let x = gelu_exact(&conv1d(mel, &self.conv1_w, Some(&self.conv1_b), 1, 1)?)?;
+            let x = gelu_exact(&conv1d(&x, &self.conv2_w, Some(&self.conv2_b), 2, 1)?)?;
+            let x = x.transpose(1, 2)?.contiguous()?;
+            let seq = x.dims()[1];
+            let pos = self.embed_positions.narrow(0, 0, seq)?.unsqueeze(0)?;
+            Ok(x.broadcast_add(&pos)?)
+        })())?;
         for layer in &self.layers {
-            h = layer.forward(&h)?;
+            let nh = p!("enc.layer", layer.forward(&h))?;
+            p!("enc.drop", drop(std::mem::replace(&mut h, nh)));
         }
-        self.final_ln.forward(&h)
+        p!("enc.ln", self.final_ln.forward(&h))
     }
 
     pub fn load(w: &WhisperWeights) -> Result<Self> {
@@ -248,7 +331,7 @@ impl WhisperEncoder {
         for i in 0..cfg.encoder_layers {
             layers.push(EncoderLayer {
                 self_attn_ln: load_layer_norm(w, &enc_layer(i, "self_attn_layer_norm"))?,
-                self_attn: load_attention(w, &enc_layer(i, "self_attn"), heads, hd)?,
+                self_attn: load_attention(w, &enc_layer(i, "self_attn"), heads, hd, true)?,
                 final_ln: load_layer_norm(w, &enc_layer(i, "final_layer_norm"))?,
                 fc1: load_linear(w, &enc_layer(i, "fc1"), true)?,
                 fc2: load_linear(w, &enc_layer(i, "fc2"), true)?,
@@ -349,9 +432,53 @@ impl DecoderLayer {
     }
 }
 
+impl DecoderLayer {
+    /// CPU-шаг декода одного токена: K/V кэша в раскладке `[1, T, H, Dh]`, внимание
+    /// потоковым ядром по видам (без транспонирования K и разбивки голов на шаге).
+    fn decode_step_bshd(&self, h: &Tensor, kv: &mut LayerKv) -> Result<Tensor> {
+        let sa = &self.self_attn;
+        let hn = p!("dec.ln", self.self_attn_ln.forward(h))?;
+        let (q, k, v) = p!("dec.self.qkv", sa.qkv_bshd(&hn))?;
+        let (nh, hd) = (sa.num_heads, sa.head_dim);
+        let pos = kv.self_len;
+        p!("dec.self.cat", (|| -> Result<()> {
+            // Один токен: [1, 1, H*Dh] — это же [1, H, 1, Dh]; запись в слот `pos` буфера.
+            let (bk, bv) = (kv.self_k.as_mut().expect("self-K"), kv.self_v.as_mut().expect("self-V"));
+            bk.kv_append_inplace(&k.contiguous()?.reshape(vec![1, nh, 1, hd])?, pos)?;
+            bv.kv_append_inplace(&v.contiguous()?.reshape(vec![1, nh, 1, hd])?, pos)?;
+            Ok(())
+        })())?;
+        kv.self_len += 1;
+        let a = p!("dec.self.attn", (|| -> Result<Tensor> {
+            let kk = kv.self_k.as_ref().expect("self-K").narrow(2, 0, pos + 1)?;
+            let vv = kv.self_v.as_ref().expect("self-V").narrow(2, 0, pos + 1)?;
+            let o = q.contiguous()?.reshape(vec![1, nh, 1, hd])?.flash_attention(&kk, &vv, sa.scale, false)?;
+            Ok(sa.out.forward(&o.reshape(vec![1, 1, nh * hd])?)?)
+        })())?;
+        let x = p!("dec.add", h.add(&a))?;
+
+        let ca = &self.encoder_attn;
+        let hn = p!("dec.ln", self.encoder_attn_ln.forward(&x))?;
+        let q = p!("dec.cross.q", ca.q_lin(&hn))?;
+        let c = p!("dec.cross.attn", (|| -> Result<Tensor> {
+            let o = q.reshape(vec![1, nh, 1, hd])?.flash_attention(&kv.cross_k, &kv.cross_v, ca.scale, false)?;
+            Ok(ca.out.forward(&o.reshape(vec![1, 1, nh * hd])?)?)
+        })())?;
+        let x = p!("dec.add", x.add(&c))?;
+
+        let hn = p!("dec.ln", self.final_ln.forward(&x))?;
+        let m = p!("dec.mlp", self.fc2.forward(&gelu_exact(&self.fc1.forward(&hn)?)?))?;
+        Ok(p!("dec.add", x.add(&m))?)
+    }
+}
+
 /// Per-layer KV-кэш декодера. self-K/V растут по шагам (cat вдоль позиций),
 /// cross-K/V (`encoder_attn`) считаются один раз из энкодер-выхода на сегмент.
 pub struct LayerKv {
+    /// CPU-путь декода: self-K/V в заранее выделенных буферах, внимание потоковым ядром.
+    bshd: bool,
+    /// CPU: self-K/V — заранее выделенные буферы `[1, H, max_target, Dh]`, занято `self_len`.
+    self_len: usize,
     self_k: Option<Tensor>,
     self_v: Option<Tensor>,
     cross_k: Tensor,
@@ -405,7 +532,7 @@ pub struct WhisperDecoder {
     embed_positions: Tensor,
     layers: Vec<DecoderLayer>,
     final_ln: LayerNorm,
-    lm_head: Linear,
+    lm_head: QuantLinear,
 }
 
 impl WhisperDecoder {
@@ -527,10 +654,28 @@ impl WhisperDecoder {
     /// Инициализировать KV-кэш для сегмента: cross-K/V из энкодер-выхода
     /// (считаются один раз), self-K/V пустые.
     pub fn init_cache(&self, enc_out: &Tensor) -> Result<DecoderCache> {
+        p!("dec.init_cache", self.init_cache_inner(enc_out))
+    }
+
+    fn init_cache_inner(&self, enc_out: &Tensor) -> Result<DecoderCache> {
         let mut layers = Vec::with_capacity(self.layers.len());
+        let bshd = enc_out.device().is_cpu();
+        let max_target = self.embed_positions.dims()[0];
         for layer in &self.layers {
-            let (cross_k, cross_v) = layer.encoder_attn.kv_heads(enc_out)?;
-            layers.push(LayerKv { self_k: None, self_v: None, cross_k, cross_v });
+            let a = &layer.encoder_attn;
+            // cross-K/V — `[1, H, T, Dh]` подряд по голове: декод читает их на каждом шаге.
+            let (cross_k, cross_v) = a.kv_heads(enc_out)?;
+            let (self_k, self_v) = if bshd {
+                let s = &layer.self_attn;
+                let shape = vec![1, s.num_heads, max_target, s.head_dim];
+                (
+                    Some(Tensor::zeros(shape.clone(), enc_out.dtype(), enc_out.device())?),
+                    Some(Tensor::zeros(shape, enc_out.dtype(), enc_out.device())?),
+                )
+            } else {
+                (None, None)
+            };
+            layers.push(LayerKv { bshd, self_len: 0, self_k, self_v, cross_k, cross_v });
         }
         Ok(DecoderCache { layers })
     }
@@ -544,39 +689,59 @@ impl WhisperDecoder {
         pos: usize,
         cache: &mut DecoderCache,
     ) -> Result<Tensor> {
+        p!("dec.step", self.decode_step_inner(token_id, pos, cache))
+    }
+
+    fn decode_step_inner(
+        &self,
+        token_id: u32,
+        pos: usize,
+        cache: &mut DecoderCache,
+    ) -> Result<Tensor> {
         let device = cache.layers[0].cross_k.device();
         let mut h = self.embed(&[token_id], pos, device)?; // [1,1,d]
         for (layer, kv) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            if kv.bshd {
+                h = layer.decode_step_bshd(&h, kv)?;
+                continue;
+            }
             let residual = &h;
-            let hn = layer.self_attn_ln.forward(&h)?;
-            let q = layer.self_attn.q_heads(&hn)?;
-            let (k, v) = layer.self_attn.kv_heads(&hn)?;
-            let full_k = match &kv.self_k {
-                Some(prev) => Tensor::cat(&[prev, &k], 2)?,
-                None => k,
-            };
-            let full_v = match &kv.self_v {
-                Some(prev) => Tensor::cat(&[prev, &v], 2)?,
-                None => v,
-            };
-            let a = layer.self_attn.attend(&q, &full_k, &full_v, None)?;
+            let hn = p!("dec.ln", layer.self_attn_ln.forward(&h))?;
+            let q = p!("dec.self.qkv", layer.self_attn.q_heads(&hn))?;
+            let (k, v) = p!("dec.self.qkv", layer.self_attn.kv_heads(&hn))?;
+            let (full_k, full_v) = p!("dec.self.cat", (|| -> Result<(Tensor, Tensor)> {
+                let full_k = match &kv.self_k {
+                    Some(prev) => Tensor::cat(&[prev, &k], 2)?,
+                    None => k,
+                };
+                let full_v = match &kv.self_v {
+                    Some(prev) => Tensor::cat(&[prev, &v], 2)?,
+                    None => v,
+                };
+                Ok((full_k, full_v))
+            })())?;
+            let a = p!("dec.self.attn", scaled_dot_attention(&q, &full_k, &full_v, layer.self_attn.scale, None))?;
+            let a = merge_heads(&a)?;
+            let a = p!("dec.self.out", layer.self_attn.out.forward(&a))?;
             kv.self_k = Some(full_k);
             kv.self_v = Some(full_v);
-            let x = residual.add(&a)?;
+            let x = p!("dec.add", residual.add(&a))?;
 
             let residual = &x;
-            let hn = layer.encoder_attn_ln.forward(&x)?;
-            let q = layer.encoder_attn.q_heads(&hn)?;
-            let c = layer.encoder_attn.attend(&q, &kv.cross_k, &kv.cross_v, None)?;
-            let x = residual.add(&c)?;
+            let hn = p!("dec.ln", layer.encoder_attn_ln.forward(&x))?;
+            let q = p!("dec.cross.q", layer.encoder_attn.q_heads(&hn))?;
+            let c = p!("dec.cross.attn", scaled_dot_attention(&q, &kv.cross_k, &kv.cross_v, layer.encoder_attn.scale, None))?;
+            let c = merge_heads(&c)?;
+            let c = p!("dec.cross.out", layer.encoder_attn.out.forward(&c))?;
+            let x = p!("dec.add", residual.add(&c))?;
 
             let residual = &x;
-            let hn = layer.final_ln.forward(&x)?;
-            let m = layer.fc2.forward(&gelu_exact(&layer.fc1.forward(&hn)?)?)?;
-            h = residual.add(&m)?;
+            let hn = p!("dec.ln", layer.final_ln.forward(&x))?;
+            let m = p!("dec.mlp", layer.fc2.forward(&gelu_exact(&layer.fc1.forward(&hn)?)?))?;
+            h = p!("dec.add", residual.add(&m))?;
         }
-        let h = self.final_ln.forward(&h)?;
-        Ok(self.lm_head.forward(&h)?)
+        let h = p!("dec.ln", self.final_ln.forward(&h))?;
+        Ok(p!("dec.lm_head", self.lm_head.forward(&h))?)
     }
 
     /// Эмбеддинг токенов + позиционный эмбеддинг (срез `[past_len..past_len+S]`).
@@ -603,9 +768,9 @@ impl WhisperDecoder {
         for i in 0..cfg.decoder_layers {
             layers.push(DecoderLayer {
                 self_attn_ln: load_layer_norm(w, &dec_layer(i, "self_attn_layer_norm"))?,
-                self_attn: load_attention(w, &dec_layer(i, "self_attn"), heads, hd)?,
+                self_attn: load_attention(w, &dec_layer(i, "self_attn"), heads, hd, true)?,
                 encoder_attn_ln: load_layer_norm(w, &dec_layer(i, "encoder_attn_layer_norm"))?,
-                encoder_attn: load_attention(w, &dec_layer(i, "encoder_attn"), heads, hd)?,
+                encoder_attn: load_attention(w, &dec_layer(i, "encoder_attn"), heads, hd, false)?,
                 final_ln: load_layer_norm(w, &dec_layer(i, "final_layer_norm"))?,
                 fc1: load_linear(w, &dec_layer(i, "fc1"), true)?,
                 fc2: load_linear(w, &dec_layer(i, "fc2"), true)?,
@@ -613,7 +778,12 @@ impl WhisperDecoder {
         }
         let embed_tokens = w.get("model.decoder.embed_tokens.weight")?;
         // tied lm_head: проекция = embed_tokens (logits = h @ embed_tokensᵀ).
-        let lm_head = Linear::new(embed_tokens.clone(), None)?;
+        // CPU + q8row: проекция тоже int8 (51866×d F32 — самое большое чтение памяти на шаге
+        // декода); иначе — плотная, как в файле.
+        let lm_head = match w.quant {
+            Some(DType::Q8Row) if embed_tokens.device().is_cpu() => QuantLinear::build(embed_tokens.clone(), None, DType::Q8Row, w.dtype)?,
+            _ => QuantLinear::Dense(Linear::new(embed_tokens.clone(), None)?),
+        };
         Ok(Self {
             embed_tokens,
             embed_positions: w.get("model.decoder.embed_positions.weight")?,
@@ -639,7 +809,12 @@ impl WhisperModel {
 }
 
 fn load_linear(w: &WhisperWeights, prefix: &str, with_bias: bool) -> Result<QuantLinear> {
-    let weight = w.get(&format!("{prefix}.weight"))?;
+    // CPU + q8row: вес квантуется прямо из типа файла (F16) — без F32-копии всей матрицы.
+    let weight = if w.quant == Some(DType::Q8Row) && w.device.is_cpu() {
+        w.get_native(&format!("{prefix}.weight"))?
+    } else {
+        w.get(&format!("{prefix}.weight"))?
+    };
     let bias = if with_bias {
         Some(w.get(&format!("{prefix}.bias"))?)
     } else {
@@ -659,17 +834,49 @@ fn load_layer_norm(w: &WhisperWeights, prefix: &str) -> Result<LayerNorm> {
     })
 }
 
+/// q/k/v одной матрицей `[3·D, D]` (bias k — нули: в Whisper k_proj без bias).
+fn load_qkv_fused(w: &WhisperWeights, prefix: &str) -> Result<QuantLinear> {
+    let get_w = |n: &str| -> Result<Tensor> {
+        let name = format!("{prefix}.{n}.weight");
+        if w.quant == Some(DType::Q8Row) {
+            w.get_native(&name)
+        } else {
+            w.get(&name)
+        }
+    };
+    let (wq, wk, wv) = (get_w("q_proj")?, get_w("k_proj")?, get_w("v_proj")?);
+    let weight = Tensor::cat(&[&wq, &wk, &wv], 0)?;
+    let bq = w.get(&format!("{prefix}.q_proj.bias"))?;
+    let bv = w.get(&format!("{prefix}.v_proj.bias"))?;
+    let bk = Tensor::zeros(bq.dims().to_vec(), bq.dtype(), bq.device())?;
+    let bias = Tensor::cat(&[&bq, &bk, &bv], 0)?;
+    Ok(match w.quant {
+        Some(q) => QuantLinear::build(weight, Some(bias), q, w.dtype)?,
+        None => QuantLinear::dense(weight, Some(bias))?,
+    })
+}
+
 fn load_attention(
     w: &WhisperWeights,
     prefix: &str,
     num_heads: usize,
     head_dim: usize,
+    self_attn: bool,
 ) -> Result<WhisperAttention> {
+    // CPU self-attention: общая q/k/v-проекция; cross-attention — раздельные (q от декодера,
+    // k/v — от энкодера).
+    let proj = if self_attn && w.device.is_cpu() {
+        Qkv::Fused(load_qkv_fused(w, prefix)?)
+    } else {
+        Qkv::Split {
+            // k_proj без bias — характерно для Whisper.
+            q: load_linear(w, &format!("{prefix}.q_proj"), true)?,
+            k: load_linear(w, &format!("{prefix}.k_proj"), false)?,
+            v: load_linear(w, &format!("{prefix}.v_proj"), true)?,
+        }
+    };
     Ok(WhisperAttention {
-        // k_proj без bias — характерно для Whisper.
-        q: load_linear(w, &format!("{prefix}.q_proj"), true)?,
-        k: load_linear(w, &format!("{prefix}.k_proj"), false)?,
-        v: load_linear(w, &format!("{prefix}.v_proj"), true)?,
+        proj,
         out: load_linear(w, &format!("{prefix}.out_proj"), true)?,
         num_heads,
         head_dim,

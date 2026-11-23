@@ -91,10 +91,15 @@ impl GigaAm {
                 resample(pcm, sample_rate, SR).map_err(|e| GigaAmError::Audio(e.to_string()))?;
             &resampled
         };
-        let mel = self.mel_tensor(audio)?;
-        let encoded = self.model.encode(&mel)?;
-        let logits = self.model.head_logits(&encoded)?; // [1, T', C]
+        let mel = synaptix_core::prof::span("gig.mel", || self.mel_tensor(audio))?;
+        let encoded = self.model.encode(&mel);
+        synaptix_core::memory::arena::release_cpu_pool();
+        let encoded = encoded?;
+        let logits = synaptix_core::prof::span("gig.head", || self.model.head_logits(&encoded))?; // [1, T', C]
         let ids = self.greedy_ctc(&logits)?;
+        if synaptix_core::prof::enabled() {
+            eprint!("{}", synaptix_core::prof::take_report());
+        }
         Ok(self.spm.decode(&ids))
     }
 

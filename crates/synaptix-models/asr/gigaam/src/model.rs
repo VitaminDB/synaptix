@@ -20,6 +20,13 @@ use synaptix_ops::pos::rope_cache::RopeCache;
 use crate::loader::{enc_layer, GigaAmWeights};
 use crate::{GigaAmError, Result};
 
+/// Участок профиля (`SYNAPTIX_PROFILE=1`).
+macro_rules! p {
+    ($name:literal, $e:expr) => {
+        synaptix_core::prof::span($name, || $e)
+    };
+}
+
 struct Ln {
     weight: Tensor,
     bias: Tensor,
@@ -56,6 +63,14 @@ impl Conv1d {
         // Depthwise: groups == Cin == Cout, вес [C,1,K]. conv1d ждёт
         // weight[Cout,Cin/groups,K]; здесь Cin/groups==1, поэтому считаем по
         // каждому каналу свой 1-канальный conv и склеиваем по оси каналов.
+        // Depthwise (groups = C, вес [C,1,K]): одно ядро вместо C отдельных conv1d + cat.
+        if self.groups == x.dims()[1] && self.weight.dims()[1] == 1 {
+            match x.dwconv1d(&self.weight, self.bias.as_ref(), self.stride, self.padding, false) {
+                Ok(y) => return Ok(y),
+                Err(synaptix_core::error::SynaptixError::Unsupported(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let c = x.dims()[1];
         let mut chans: Vec<Tensor> = Vec::with_capacity(c);
         for ci in 0..c {
@@ -147,7 +162,7 @@ impl Attn {
         let v = self.heads(&Self::proj(x, &self.v)?)?;
 
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let attn = scaled_dot_attention(&q, &k, &v, scale, None)?; // [B,H,S,Dh]
+        let attn = p!("gig.attn", scaled_dot_attention(&q, &k, &v, scale, None))?; // [B,H,S,Dh]
         let merged = attn
             .permute(vec![0, 2, 1, 3])?
             .contiguous()?
@@ -159,30 +174,29 @@ impl Attn {
 /// ConformerConvolution: pointwise_conv1 (→2d) → GLU(dim=канал) → depthwise_conv
 /// (k5, pad2, groups=d) → LayerNorm (по каналу) → SiLU → pointwise_conv2.
 struct ConformerConv {
-    pointwise_conv1: Conv1d,
+    /// Поточечные свёртки (k = 1) — линейные слои по каналу на раскладке `[B,S,D]`:
+    /// без транспонирований вокруг них, через GEMM (и int8 при квантовании, как прочие линейные).
+    pointwise_conv1: QuantLinear,
     depthwise_conv: Conv1d,
     norm: Ln,
-    pointwise_conv2: Conv1d,
+    pointwise_conv2: QuantLinear,
 }
 
 impl ConformerConv {
-    /// Вход `[B,S,D]` → выход `[B,S,D]` (внутри работает по `[B,D,S]`).
+    /// Вход `[B,S,D]` → выход `[B,S,D]`.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.transpose(1, 2)?.contiguous()?; // [B,D,S]
-        let x = self.pointwise_conv1.forward(&x)?; // [B,2D,S]
-        let x = glu(&x, 1)?; // [B,D,S]
-        let x = self.depthwise_conv.forward(&x)?; // [B,D,S]
-        // LayerNorm по каналу: norm(x.transpose(1,2)).transpose(1,2).
-        let x = x.transpose(1, 2)?.contiguous()?; // [B,S,D]
-        let x = self.norm.forward(&x)?;
-        let x = x.transpose(1, 2)?.contiguous()?; // [B,D,S]
-        let x = x.silu()?;
-        let x = self.pointwise_conv2.forward(&x)?; // [B,D,S]
-        Ok(x.transpose(1, 2)?.contiguous()?) // [B,S,D]
+        let x = p!("gig.conv.pw1", self.pointwise_conv1.forward(x))?; // [B,S,2D]
+        let x = p!("gig.conv.glu", glu(&x, 2))?; // [B,S,D]
+        let x = p!("gig.conv.tr", x.transpose(1, 2).and_then(|t| t.contiguous()))?; // [B,D,S]
+        let x = p!("gig.conv.dw", self.depthwise_conv.forward(&x))?; // [B,D,S]
+        let x = p!("gig.conv.tr", x.transpose(1, 2).and_then(|t| t.contiguous()))?; // [B,S,D]
+        // LayerNorm по каналу.
+        let x = p!("gig.conv.ln", self.norm.forward(&x))?;
+        let x = p!("gig.conv.silu", x.silu())?;
+        Ok(p!("gig.conv.pw2", self.pointwise_conv2.forward(&x))?)
     }
 }
 
-/// Conformer-слой (Macaron): 0.5·FF1 → self-attn → conv → 0.5·FF2 → norm_out.
 struct ConformerLayer {
     norm_ff1: Ln,
     ff1: FeedForward,
@@ -198,23 +212,23 @@ struct ConformerLayer {
 impl ConformerLayer {
     fn forward(&self, x: &Tensor, rope: &RopeCache) -> Result<Tensor> {
         let residual = x.clone();
-        let h = self.norm_ff1.forward(x)?;
-        let h = self.ff1.forward(&h)?;
-        let residual = residual.add(&h.affine(0.5, 0.0)?)?;
+        let h = p!("gig.ln", self.norm_ff1.forward(x))?;
+        let h = p!("gig.ff", self.ff1.forward(&h))?;
+        let residual = p!("gig.add", h.affine(0.5, 0.0).and_then(|h| residual.add(&h)))?;
 
-        let h = self.norm_self_att.forward(&residual)?;
-        let h = self.attn.forward(&h, rope)?;
-        let residual = residual.add(&h)?;
+        let h = p!("gig.ln", self.norm_self_att.forward(&residual))?;
+        let h = p!("gig.attn_block", self.attn.forward(&h, rope))?;
+        let residual = p!("gig.add", residual.add(&h))?;
 
-        let h = self.norm_conv.forward(&residual)?;
-        let h = self.conv.forward(&h)?;
-        let residual = residual.add(&h)?;
+        let h = p!("gig.ln", self.norm_conv.forward(&residual))?;
+        let h = p!("gig.conv", self.conv.forward(&h))?;
+        let residual = p!("gig.add", residual.add(&h))?;
 
-        let h = self.norm_ff2.forward(&residual)?;
-        let h = self.ff2.forward(&h)?;
-        let residual = residual.add(&h.affine(0.5, 0.0)?)?;
+        let h = p!("gig.ln", self.norm_ff2.forward(&residual))?;
+        let h = p!("gig.ff", self.ff2.forward(&h))?;
+        let residual = p!("gig.add", h.affine(0.5, 0.0).and_then(|h| residual.add(&h)))?;
 
-        self.norm_out.forward(&residual)
+        p!("gig.ln", self.norm_out.forward(&residual))
     }
 }
 
@@ -230,7 +244,7 @@ pub struct GigaAmModel {
 impl GigaAmModel {
     /// mel `[1, feat_in, T]` → энкодер `[1, d_model, T']` (как upstream-хук).
     pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
-        let mut h = self.subsampling.forward(mel)?; // [1, T', d_model]
+        let mut h = p!("gig.subsampling", self.subsampling.forward(mel))?; // [1, T', d_model]
         for layer in &self.layers {
             h = layer.forward(&h, &self.rope)?;
         }
@@ -274,6 +288,20 @@ impl GigaAmModel {
                 None => QuantLinear::dense(weight, bias)?,
             })
         };
+        // Поточечная свёртка [C_out, C_in, 1] как линейный слой [C_out, C_in].
+        let pointwise = |prefix: &str| -> Result<QuantLinear> {
+            let weight = w.get(&format!("{prefix}.weight"))?;
+            let d = weight.dims().to_vec();
+            if d.len() != 3 || d[2] != 1 {
+                return Err(GigaAmError::Load(format!("{prefix}: ожидалась свёртка k=1, форма {d:?}")));
+            }
+            let weight = weight.reshape(vec![d[0], d[1]])?.contiguous()?;
+            let bias = Some(w.get(&format!("{prefix}.bias"))?);
+            Ok(match w.quant {
+                Some(q) => QuantLinear::build(weight, bias, q, w.dtype)?,
+                None => QuantLinear::dense(weight, bias)?,
+            })
+        };
         let ln = |prefix: &str| -> Result<Ln> {
             Ok(Ln {
                 weight: w.get(&format!("{prefix}.weight"))?,
@@ -302,13 +330,7 @@ impl GigaAmModel {
                 },
                 norm_conv: ln(&p("norm_conv"))?,
                 conv: ConformerConv {
-                    pointwise_conv1: Conv1d {
-                        weight: w.get(&p("conv.pointwise_conv1.weight"))?,
-                        bias: Some(w.get(&p("conv.pointwise_conv1.bias"))?),
-                        stride: 1,
-                        padding: 0,
-                        groups: 1,
-                    },
+                    pointwise_conv1: pointwise(&p("conv.pointwise_conv1"))?,
                     depthwise_conv: Conv1d {
                         weight: w.get(&p("conv.depthwise_conv.weight"))?,
                         bias: Some(w.get(&p("conv.depthwise_conv.bias"))?),
@@ -317,13 +339,7 @@ impl GigaAmModel {
                         groups: enc.d_model,
                     },
                     norm: ln(&p("conv.batch_norm"))?,
-                    pointwise_conv2: Conv1d {
-                        weight: w.get(&p("conv.pointwise_conv2.weight"))?,
-                        bias: Some(w.get(&p("conv.pointwise_conv2.bias"))?),
-                        stride: 1,
-                        padding: 0,
-                        groups: 1,
-                    },
+                    pointwise_conv2: pointwise(&p("conv.pointwise_conv2"))?,
                 },
                 norm_ff2: ln(&p("norm_feed_forward2"))?,
                 ff2: FeedForward {

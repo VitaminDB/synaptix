@@ -177,6 +177,10 @@ impl Backend for CpuBackend {
         crate::quant::gemv::linear_quant(x, w, out, stream)
     }
 
+    fn linear_quant_bias(&self, x: (&Storage, &Layout), w: &QuantWeight, bias: (&Storage, &Layout), out: (&mut Storage, &Layout), stream: &Stream) -> Result<()> {
+        crate::quant::gemv::linear_quant_bias(x, w, Some(bias), out, stream)
+    }
+
     fn quantize_nvfp4(&self, w: (&Storage, &Layout), n: usize, k: usize, stream: &Stream) -> Result<(Storage, Storage)> {
         crate::quant::gemv::quantize_nvfp4(w, n, k, stream)
     }

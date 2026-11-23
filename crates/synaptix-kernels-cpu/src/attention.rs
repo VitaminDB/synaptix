@@ -33,6 +33,13 @@ enum Isa {
     Neon,
 }
 
+/// Плиточный NEON-путь внимания (`SYNAPTIX_ATTN_ROWWISE=1` — построчный, для сверки).
+#[cfg(target_arch = "aarch64")]
+fn tiled_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SYNAPTIX_ATTN_ROWWISE").is_none())
+}
+
 #[allow(unreachable_code)]
 fn pick_isa() -> Isa {
     #[cfg(target_arch = "x86_64")]
@@ -57,7 +64,7 @@ fn qk(isa: Isa, q: &[f32], k: &[f32], n: usize, d: usize, s: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         Isa::Avx2 => unsafe { x86::qk(q.as_ptr(), k.as_ptr(), n, d, s.as_mut_ptr()) },
         #[cfg(target_arch = "aarch64")]
-        Isa::Neon => unsafe { arm::qk(q.as_ptr(), k.as_ptr(), n, d, s.as_mut_ptr()) },
+        Isa::Neon => unsafe { arm::qk(q.as_ptr(), k.as_ptr(), n, d, d, s.as_mut_ptr()) },
     }
 }
 
@@ -69,7 +76,7 @@ fn pv(isa: Isa, acc: &mut [f32], p: &[f32], v: &[f32], n: usize, d: usize) {
         #[cfg(target_arch = "x86_64")]
         Isa::Avx2 => unsafe { x86::pv(acc.as_mut_ptr(), p.as_ptr(), v.as_ptr(), n, d) },
         #[cfg(target_arch = "aarch64")]
-        Isa::Neon => unsafe { arm::pv(acc.as_mut_ptr(), p.as_ptr(), v.as_ptr(), n, d) },
+        Isa::Neon => unsafe { arm::pv(acc.as_mut_ptr(), p.as_ptr(), v.as_ptr(), n, d, d) },
     }
 }
 
@@ -351,13 +358,13 @@ mod arm {
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn qk(q: *const f32, k: *const f32, n: usize, d: usize, s: *mut f32) {
+    pub(super) unsafe fn qk(q: *const f32, k: *const f32, n: usize, d: usize, st: usize, s: *mut f32) {
         let mut j = 0;
         while j + 4 <= n {
-            let k0 = k.add(j * d);
-            let k1 = k0.add(d);
-            let k2 = k1.add(d);
-            let k3 = k2.add(d);
+            let k0 = k.add(j * st);
+            let k1 = k0.add(st);
+            let k2 = k1.add(st);
+            let k3 = k2.add(st);
             let mut a0 = vdupq_n_f32(0.0);
             let mut a1 = vdupq_n_f32(0.0);
             let mut a2 = vdupq_n_f32(0.0);
@@ -407,13 +414,13 @@ mod arm {
             j += 4;
         }
         while j < n {
-            *s.add(j) = dot_row(q, k.add(j * d), d);
+            *s.add(j) = dot_row(q, k.add(j * st), d);
             j += 1;
         }
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn pv(acc: *mut f32, p: *const f32, v: *const f32, n: usize, d: usize) {
+    pub(super) unsafe fn pv(acc: *mut f32, p: *const f32, v: *const f32, n: usize, d: usize, st: usize) {
         let mut c = 0;
         while c + 16 <= d {
             let mut a0 = vld1q_f32(acc.add(c));
@@ -428,8 +435,8 @@ mod arm {
             while j + 2 <= n {
                 let p0 = vdupq_n_f32(*p.add(j));
                 let p1 = vdupq_n_f32(*p.add(j + 1));
-                let v0 = v.add(j * d + c);
-                let v1 = v0.add(d);
+                let v0 = v.add(j * st + c);
+                let v1 = v0.add(st);
                 a0 = vfmaq_f32(a0, p0, vld1q_f32(v0));
                 a1 = vfmaq_f32(a1, p0, vld1q_f32(v0.add(4)));
                 a2 = vfmaq_f32(a2, p0, vld1q_f32(v0.add(8)));
@@ -442,7 +449,7 @@ mod arm {
             }
             if j < n {
                 let p0 = vdupq_n_f32(*p.add(j));
-                let v0 = v.add(j * d + c);
+                let v0 = v.add(j * st + c);
                 a0 = vfmaq_f32(a0, p0, vld1q_f32(v0));
                 a1 = vfmaq_f32(a1, p0, vld1q_f32(v0.add(4)));
                 a2 = vfmaq_f32(a2, p0, vld1q_f32(v0.add(8)));
@@ -459,12 +466,12 @@ mod arm {
             let mut b = vdupq_n_f32(0.0);
             let mut j = 0;
             while j + 2 <= n {
-                a = vfmaq_f32(a, vdupq_n_f32(*p.add(j)), vld1q_f32(v.add(j * d + c)));
-                b = vfmaq_f32(b, vdupq_n_f32(*p.add(j + 1)), vld1q_f32(v.add((j + 1) * d + c)));
+                a = vfmaq_f32(a, vdupq_n_f32(*p.add(j)), vld1q_f32(v.add(j * st + c)));
+                b = vfmaq_f32(b, vdupq_n_f32(*p.add(j + 1)), vld1q_f32(v.add((j + 1) * st + c)));
                 j += 2;
             }
             if j < n {
-                a = vfmaq_f32(a, vdupq_n_f32(*p.add(j)), vld1q_f32(v.add(j * d + c)));
+                a = vfmaq_f32(a, vdupq_n_f32(*p.add(j)), vld1q_f32(v.add(j * st + c)));
             }
             vst1q_f32(acc.add(c), vaddq_f32(a, b));
             c += 4;
@@ -472,10 +479,156 @@ mod arm {
         while c < d {
             let mut a = *acc.add(c);
             for j in 0..n {
-                a += *p.add(j) * *v.add(j * d + c);
+                a += *p.add(j) * *v.add(j * st + c);
             }
             *acc.add(c) = a;
             c += 1;
+        }
+    }
+
+    /// `kt[c][j] = k[j·kst + c]` для `j < n`, `c < d` (d кратно 4); шаг строк kt — `ld`.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn transpose_k(k: *const f32, kst: usize, n: usize, d: usize, kt: *mut f32, ld: usize) {
+        let n4 = n / 4 * 4;
+        let mut j = 0;
+        while j < n4 {
+            let r0 = k.add(j * kst);
+            let r1 = r0.add(kst);
+            let r2 = r1.add(kst);
+            let r3 = r2.add(kst);
+            let mut c = 0;
+            while c + 4 <= d {
+                let a = vld1q_f32(r0.add(c));
+                let b = vld1q_f32(r1.add(c));
+                let e = vld1q_f32(r2.add(c));
+                let f = vld1q_f32(r3.add(c));
+                let t0 = vtrn1q_f32(a, b);
+                let t1 = vtrn2q_f32(a, b);
+                let t2 = vtrn1q_f32(e, f);
+                let t3 = vtrn2q_f32(e, f);
+                let o0 = vreinterpretq_f32_f64(vtrn1q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+                let o1 = vreinterpretq_f32_f64(vtrn1q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+                let o2 = vreinterpretq_f32_f64(vtrn2q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+                let o3 = vreinterpretq_f32_f64(vtrn2q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+                vst1q_f32(kt.add(c * ld + j), o0);
+                vst1q_f32(kt.add((c + 1) * ld + j), o1);
+                vst1q_f32(kt.add((c + 2) * ld + j), o2);
+                vst1q_f32(kt.add((c + 3) * ld + j), o3);
+                c += 4;
+            }
+            j += 4;
+        }
+        while j < n {
+            for c in 0..d {
+                *kt.add(c * ld + j) = *k.add(j * kst + c);
+            }
+            j += 1;
+        }
+    }
+
+    /// Максимум `n` значений.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn max_f32(s: *const f32, n: usize) -> f32 {
+        let mut m = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut i = 0;
+        while i + 4 <= n {
+            m = vmaxq_f32(m, vld1q_f32(s.add(i)));
+            i += 4;
+        }
+        let mut r = vmaxvq_f32(m);
+        while i < n {
+            r = r.max(*s.add(i));
+            i += 1;
+        }
+        r
+    }
+
+    /// `s[r][j] = Σ_c q[r][c]·kt[c][j]` для 4 строк q (шаг `d`) и `n16` ключей (кратно 16);
+    /// `kt` — `[d][KV_BLOCK]`, `s` — 4 строки с шагом `KV_BLOCK`.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn qk4(q: *const f32, kt: *const f32, d: usize, n16: usize, s: *mut f32) {
+        let kb = super::KV_BLOCK;
+        let mut j = 0;
+        while j < n16 {
+            let z = vdupq_n_f32(0.0);
+            let mut a = [[z; 4]; 4];
+            let mut c = 0;
+            while c + 4 <= d {
+                let qv = [vld1q_f32(q.add(c)), vld1q_f32(q.add(d + c)), vld1q_f32(q.add(2 * d + c)), vld1q_f32(q.add(3 * d + c))];
+                macro_rules! step {
+                    ($l:literal) => {{
+                        let kp = kt.add((c + $l) * kb + j);
+                        let k0 = vld1q_f32(kp);
+                        let k1 = vld1q_f32(kp.add(4));
+                        let k2 = vld1q_f32(kp.add(8));
+                        let k3 = vld1q_f32(kp.add(12));
+                        for r in 0..4 {
+                            a[r][0] = vfmaq_laneq_f32::<$l>(a[r][0], k0, qv[r]);
+                            a[r][1] = vfmaq_laneq_f32::<$l>(a[r][1], k1, qv[r]);
+                            a[r][2] = vfmaq_laneq_f32::<$l>(a[r][2], k2, qv[r]);
+                            a[r][3] = vfmaq_laneq_f32::<$l>(a[r][3], k3, qv[r]);
+                        }
+                    }};
+                }
+                step!(0);
+                step!(1);
+                step!(2);
+                step!(3);
+                c += 4;
+            }
+            for r in 0..4 {
+                let sp = s.add(r * kb + j);
+                vst1q_f32(sp, a[r][0]);
+                vst1q_f32(sp.add(4), a[r][1]);
+                vst1q_f32(sp.add(8), a[r][2]);
+                vst1q_f32(sp.add(12), a[r][3]);
+            }
+            j += 16;
+        }
+    }
+
+    /// `acc[r][c] += Σ_j p[r][j]·v[j][c]` для 4 строк (acc шаг `d`, p шаг `kb`, строки v
+    /// с шагом `vst`), `n16` ключей (кратно 4), `d` кратно 16.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn pv4(acc: *mut f32, p: *const f32, kb: usize, v: *const f32, vst: usize, d: usize, n16: usize) {
+        let mut c = 0;
+        while c < d {
+            let mut a = [[vdupq_n_f32(0.0); 4]; 4];
+            for r in 0..4 {
+                for t in 0..4 {
+                    a[r][t] = vld1q_f32(acc.add(r * d + c + 4 * t));
+                }
+            }
+            let mut j = 0;
+            while j < n16 {
+                let pv = [vld1q_f32(p.add(j)), vld1q_f32(p.add(kb + j)), vld1q_f32(p.add(2 * kb + j)), vld1q_f32(p.add(3 * kb + j))];
+                macro_rules! step {
+                    ($l:literal) => {{
+                        let vp = v.add((j + $l) * vst + c);
+                        let v0 = vld1q_f32(vp);
+                        let v1 = vld1q_f32(vp.add(4));
+                        let v2 = vld1q_f32(vp.add(8));
+                        let v3 = vld1q_f32(vp.add(12));
+                        for r in 0..4 {
+                            a[r][0] = vfmaq_laneq_f32::<$l>(a[r][0], v0, pv[r]);
+                            a[r][1] = vfmaq_laneq_f32::<$l>(a[r][1], v1, pv[r]);
+                            a[r][2] = vfmaq_laneq_f32::<$l>(a[r][2], v2, pv[r]);
+                            a[r][3] = vfmaq_laneq_f32::<$l>(a[r][3], v3, pv[r]);
+                        }
+                    }};
+                }
+                step!(0);
+                step!(1);
+                step!(2);
+                step!(3);
+                j += 4;
+            }
+            for r in 0..4 {
+                for t in 0..4 {
+                    vst1q_f32(acc.add(r * d + c + 4 * t), a[r][t]);
+                }
+            }
+            c += 16;
         }
     }
 
@@ -667,6 +820,12 @@ impl OutView {
 trait KvSource: Sync {
     fn len(&self, b: usize) -> usize;
     fn load(&self, b: usize, kvh: usize, t0: usize, n: usize, k: &mut [f32], v: &mut [f32]);
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// F32 в памяти: указатели на K/V строки `t = 0` головы и шаги строк (элементы) —
+    /// плиточный путь читает их напрямую, без копии блока.
+    fn direct_f32(&self, _b: usize, _kvh: usize) -> Option<(*const f32, usize, *const f32, usize)> {
+        None
+    }
 }
 
 struct DenseKv<'a> {
@@ -693,6 +852,15 @@ impl KvSource for DenseKv<'_> {
     fn load(&self, b: usize, kvh: usize, t0: usize, n: usize, k: &mut [f32], v: &mut [f32]) {
         load_dense(&self.k, b, kvh, t0, n, k);
         load_dense(&self.v, b, kvh, t0, n, v);
+    }
+    fn direct_f32(&self, b: usize, kvh: usize) -> Option<(*const f32, usize, *const f32, usize)> {
+        if self.k.dtype != DType::F32 || self.v.dtype != DType::F32 {
+            return None;
+        }
+        // Границы видов проверены при построении (check_bounds) для всех t < len.
+        let kp = unsafe { (self.k.bytes.as_ptr() as *const f32).add(self.k.row(b, kvh, 0)) };
+        let vp = unsafe { (self.v.bytes.as_ptr() as *const f32).add(self.v.row(b, kvh, 0)) };
+        Some((kp, self.k.st, vp, self.v.st))
     }
 }
 
@@ -794,6 +962,13 @@ struct State {
     vbuf: Vec<f32>,
     s: Vec<f32>,
     tmp: Vec<f32>,
+    /// Плиточный путь: Kᵀ блока `[d][KV_BLOCK]` и оценки строк `[nq↑4][KV_BLOCK]`.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    kt: Vec<f32>,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    sm: Vec<f32>,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    tmp4: Vec<f32>,
 }
 
 impl State {
@@ -812,6 +987,96 @@ impl State {
             vbuf: vec![0.0; KV_BLOCK * d],
             s: vec![0.0; KV_BLOCK],
             tmp: vec![0.0; d],
+            kt: Vec::new(),
+            sm: Vec::new(),
+            tmp4: Vec::new(),
+        }
+    }
+
+    /// Плиточный путь (NEON, F32): все строки юнита с одним диапазоном ключей. Оценки
+    /// 4 строк × 16 ключей и PV 4 строки × 16 столбцов считаются регистровыми плитками
+    /// (FMA по полосе вектора) — на FMA приходится 1/4 загрузки, а не одна, как в
+    /// построчных dot-произведениях. Онлайн-softmax тот же.
+    #[cfg(target_arch = "aarch64")]
+    fn run_tiled<S: KvSource>(&mut self, kv: &S, bi: usize, kvh: usize, lo: usize, hi: usize) {
+        let d = self.d;
+        let nq = self.nq;
+        let nq4 = nq.div_ceil(4) * 4;
+        if self.kt.len() < d * KV_BLOCK {
+            self.kt.resize(d * KV_BLOCK, 0.0);
+        }
+        if self.sm.len() < nq4 * KV_BLOCK {
+            self.sm.resize(nq4 * KV_BLOCK, 0.0);
+        }
+        if self.q.len() < nq4 * d {
+            self.q.resize(nq4 * d, 0.0);
+            self.acc.resize(nq4 * d, 0.0);
+        }
+        // Строки-заполнители до кратного 4: нулевой q, их выход не пишется.
+        self.q[nq * d..nq4 * d].fill(0.0);
+        self.acc[nq * d..nq4 * d].fill(0.0);
+        let direct = kv.direct_f32(bi, kvh);
+        let mut t0 = lo;
+        while t0 < hi {
+            let n = KV_BLOCK.min(hi - t0);
+            let n16 = n.div_ceil(16) * 16;
+            let n4 = n / 4 * 4;
+            // K/V блока: прямо из памяти (F32) или копией в kbuf/vbuf.
+            let (kp, kst, vp, vst) = match direct {
+                // SAFETY: строки t0..t0+n существуют (t < len).
+                Some((kp, ks, vp, vs)) => unsafe { (kp.add(t0 * ks), ks, vp.add(t0 * vs), vs) },
+                None => {
+                    kv.load(bi, kvh, t0, n, &mut self.kbuf[..n * d], &mut self.vbuf[..n * d]);
+                    (self.kbuf.as_ptr(), d, self.vbuf.as_ptr(), d)
+                }
+            };
+            // SAFETY: kt ≥ d·KV_BLOCK, строки K — n штук с шагом kst.
+            unsafe { arm::transpose_k(kp, kst, n, d, self.kt.as_mut_ptr(), KV_BLOCK) };
+            for c in 0..d {
+                self.kt[c * KV_BLOCK + n..c * KV_BLOCK + n16].fill(0.0);
+            }
+            for g in 0..nq4 / 4 {
+                // SAFETY: размеры буферов выставлены выше.
+                unsafe { arm::qk4(self.q.as_ptr().add(g * 4 * d), self.kt.as_ptr(), d, n16, self.sm.as_mut_ptr().add(g * 4 * KV_BLOCK)) };
+            }
+            for r in 0..nq {
+                let srow = &mut self.sm[r * KV_BLOCK..r * KV_BLOCK + n16];
+                // SAFETY: n ≤ srow.len().
+                let bmax = unsafe { arm::max_f32(srow.as_ptr(), n) };
+                let m_old = self.m[r];
+                let m_new = m_old.max(bmax);
+                let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { (m_old - m_new).exp() };
+                let sum = exp_sum(Isa::Neon, &mut srow[..n], m_new);
+                self.l[r] = self.l[r] * alpha + sum;
+                if alpha != 1.0 {
+                    for x in self.acc[r * d..(r + 1) * d].iter_mut() {
+                        *x *= alpha;
+                    }
+                }
+                self.m[r] = m_new;
+            }
+            for g in 0..nq4 / 4 {
+                let accp = unsafe { self.acc.as_mut_ptr().add(g * 4 * d) };
+                let pp = unsafe { self.sm.as_ptr().add(g * 4 * KV_BLOCK) };
+                // SAFETY: строки V 0..n4 существуют; хвост (n − n4 < 4 строк) — через буфер с нулями.
+                unsafe { arm::pv4(accp, pp, KV_BLOCK, vp, vst, d, n4) };
+                if n4 < n {
+                    let tail = &mut self.tmp4;
+                    tail.clear();
+                    tail.resize(4 * d, 0.0);
+                    for j in n4..n {
+                        unsafe { std::ptr::copy_nonoverlapping(vp.add(j * vst), tail.as_mut_ptr().add((j - n4) * d), d) };
+                    }
+                    let mut pt = [0f32; 16];
+                    for r in 0..4 {
+                        for j in n4..n {
+                            pt[r * 4 + j - n4] = self.sm[(g * 4 + r) * KV_BLOCK + j];
+                        }
+                    }
+                    unsafe { arm::pv4(accp, pt.as_ptr(), 4, tail.as_ptr(), d, d, 4) };
+                }
+            }
+            t0 += n;
         }
     }
 
@@ -856,6 +1121,49 @@ impl State {
         let unit_hi = self.hi[..nq].iter().copied().max().unwrap_or(0);
         if unit_lo >= unit_hi {
             return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let same = self.lo[..nq].iter().all(|&x| x == unit_lo) && self.hi[..nq].iter().all(|&x| x == unit_hi);
+            if p.isa == Isa::Neon && d % 16 == 0 && nq >= 4 && same && tiled_on() {
+                self.run_tiled(kv, bi, kvh, unit_lo, unit_hi);
+                return;
+            }
+        }
+        // Построчный путь на NEON с F32-памятью: K/V читаются на месте (декод: одна строка q
+        // на всю длину кэша — копия блока стоила столько же, сколько сам счёт).
+        #[cfg(target_arch = "aarch64")]
+        {
+            if p.isa == Isa::Neon {
+                if let Some((kb0, kst, vb0, vst)) = kv.direct_f32(bi, kvh) {
+                    for r in 0..nq {
+                        let (a, e) = (self.lo[r], self.hi[r]);
+                        let mut t0 = a;
+                        while t0 < e {
+                            let cnt = KV_BLOCK.min(e - t0);
+                            let s = &mut self.s[..cnt];
+                            // SAFETY: строки t0..t0+cnt < len существуют (виды проверены).
+                            unsafe { arm::qk(self.q.as_ptr().add(r * d), kb0.add(t0 * kst), cnt, d, kst, s.as_mut_ptr()) };
+                            let bmax = unsafe { arm::max_f32(s.as_ptr(), cnt) };
+                            let m_old = self.m[r];
+                            let m_new = m_old.max(bmax);
+                            let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { (m_old - m_new).exp() };
+                            let sum = exp_sum(p.isa, s, m_new);
+                            self.l[r] = self.l[r] * alpha + sum;
+                            let acc = &mut self.acc[r * d..(r + 1) * d];
+                            if alpha != 1.0 {
+                                for x in acc.iter_mut() {
+                                    *x *= alpha;
+                                }
+                            }
+                            unsafe { arm::pv(acc.as_mut_ptr(), s.as_ptr(), vb0.add(t0 * vst), cnt, d, vst) };
+                            self.m[r] = m_new;
+                            t0 += cnt;
+                        }
+                    }
+                    return;
+                }
+            }
         }
         let mut t0 = unit_lo;
         while t0 < unit_hi {
@@ -933,7 +1241,8 @@ fn run_attention<S: KvSource>(p: &Attn, kv: &S) {
     let nkb = max_len.div_ceil(KV_BLOCK).max(1);
     let base_units = p.b * p.nkv * nqb;
     let t = threads();
-    let splits = if base_units >= 2 * t { 1 } else { (2 * t).div_ceil(base_units).min(nkb).max(1) };
+    // Юнитов с запасом (4 на поток): на big.LITTLE равные доли ждут медленные ядра.
+    let splits = if base_units >= 4 * t { 1 } else { (4 * t).div_ceil(base_units).min(nkb).max(1) };
     let blocks_per_split = nkb.div_ceil(splits);
     let span = blocks_per_split * KV_BLOCK;
     let nq_max = group * bq;

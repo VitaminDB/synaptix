@@ -36,6 +36,12 @@ fn quant_matmul_target(x: &Tensor, w: &QuantWeight, target: f32) -> Result<Tenso
     if in_dt == DType::F16 {
         return x.linear_quant(w);
     }
+    // Q8Row (CPU): активации квантуются в int8 блоками по 32 со своей шкалой внутри ядра,
+    // выход — в типе входа (F32/BF16). Предмасштаб и F16-круг (abs/max/умножения, приведения
+    // туда-обратно и F16-округление выхода) не нужны и стоили дороже самого GEMM.
+    if w.dtype() == DType::Q8Row && x.device().is_cpu() {
+        return x.linear_quant(w);
+    }
     // MXFP8 с BF16-активацией: квант и GEMM нативные, выход BF16. Пред-
     // масштаб не нужен — E8M0-шкалы блоков (2^±127) не насыщаются, в отличие
     // от e4m3-шкал NVFP4, а BF16-выход не переполняется.
@@ -144,7 +150,7 @@ impl QuantLinear {
             None => None,
         };
         let _ = (n, k);
-        let quant = weight.quantize_weight(quant_dtype)?;
+        let quant = synaptix_core::prof::span("load.quantize", || weight.quantize_weight(quant_dtype))?;
         match quant {
             Some(w) => Ok(QuantLinear::Quant { w, bias: bias_c }),
             None => {
@@ -172,7 +178,7 @@ impl QuantLinear {
             QuantLinear::Quant { w, bias } => {
                 let y = quant_matmul_target(x, w, target)?;
                 match bias {
-                    Some(b) => y.broadcast_add(b),
+                    Some(b) => synaptix_core::prof::span("qlinear.bias", || y.broadcast_add(b)),
                     None => Ok(y),
                 }
             }
@@ -256,9 +262,13 @@ impl Module for QuantLinear {
         match self {
             QuantLinear::Dense(l) => l.forward(x),
             QuantLinear::Quant { w, bias } => {
+                // Q8Row на CPU: смещение — в эпилоге GEMM, без отдельного прохода по выходу.
+                if w.dtype() == DType::Q8Row && x.device().is_cpu() {
+                    return x.linear_quant_bias(w, bias.as_ref());
+                }
                 let y = quant_matmul(x, w)?;
                 match bias {
-                    Some(b) => y.broadcast_add(b),
+                    Some(b) => synaptix_core::prof::span("qlinear.bias", || y.broadcast_add(b)),
                     None => Ok(y),
                 }
             }

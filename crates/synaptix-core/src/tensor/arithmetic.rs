@@ -3,7 +3,7 @@ use crate::dtype::DType;
 use crate::error::Result;
 use crate::tensor::Tensor;
 use crate::tensor::ops::{
-    run_binary, run_linear_quant, run_matmul, run_quantize_mxfp8,
+    run_binary, run_linear_quant, run_linear_quant_bias, run_matmul, run_quantize_mxfp8,
     run_quantize_ggml, run_quantize_nvfp4, run_quantize_sq, run_unary,
 };
 use crate::tensor::quant::QuantWeight;
@@ -24,6 +24,8 @@ impl Tensor {
     pub fn matmul(&self, rhs: &Tensor) -> Result<Self> { run_matmul(self, rhs) }
     pub fn broadcast_matmul(&self, rhs: &Tensor) -> Result<Self> { run_matmul(self, rhs) }
     pub fn linear_quant(&self, weight: &QuantWeight) -> Result<Self> { run_linear_quant(self, weight) }
+    /// `linear_quant` + `bias` `[N]` (сложение в эпилоге ядра, где backend это умеет).
+    pub fn linear_quant_bias(&self, weight: &QuantWeight, bias: Option<&Tensor>) -> Result<Self> { run_linear_quant_bias(self, weight, bias) }
     pub fn quantize_to_nvfp4(&self) -> Result<QuantWeight> { run_quantize_nvfp4(self) }
     pub fn quantize_to_mxfp8(&self) -> Result<QuantWeight> { run_quantize_mxfp8(self) }
     /// Квант в SQ`bits` (1..=8 бит, супер-блоки по 256): F16/BF16 `[n, k]`.
@@ -68,8 +70,39 @@ impl Tensor {
             return Err(crate::error::SynaptixError::Unsupported("quantize_to_q8row: вес не 2D"));
         }
         let (n, k) = (dims[0], dims[1]);
-        let w = self.to_dtype(DType::F32)?.to_device(crate::device::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        let (q, scales) = crate::quant::q8row::quantize(&w, n, k, None);
+        // CPU, плотный F32/F16/BF16: строки читаются из памяти тензора и квантуются
+        // параллельно — без полной F32-копии веса (загрузка Whisper large на телефоне).
+        let direct = match (self.storage().as_cpu(), self.layout().is_contiguous()) {
+            (Some(buf), true) if matches!(self.dtype(), DType::F32 | DType::F16 | DType::BF16) => {
+                let es = self.dtype().bytes_for_numel(1);
+                let off = self.layout().offset() * es;
+                let bytes = &buf.as_bytes()[off..off + n * k * es];
+                Some(crate::quant::q8row::quantize_rows_with(n, k, |r, dst| {
+                    let src = &bytes[r * k * es..(r + 1) * k * es];
+                    match self.dtype() {
+                        DType::F32 => dst.copy_from_slice(bytemuck::cast_slice(src)),
+                        DType::F16 => {
+                            for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                                *d = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                            }
+                        }
+                        _ => {
+                            for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                                *d = half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                            }
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
+        let (q, scales) = match direct {
+            Some(r) => r,
+            None => {
+                let w = self.to_dtype(DType::F32)?.to_device(crate::device::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                crate::quant::q8row::quantize(&w, n, k, None)
+            }
+        };
         let sb = crate::quant::q8row::scales_to_bytes(&scales);
         let dev = self.device();
         let (p, s) = if dev.is_cpu() {

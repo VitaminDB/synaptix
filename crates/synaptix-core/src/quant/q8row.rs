@@ -54,6 +54,21 @@ pub fn quantize(w: &[f32], n: usize, k: usize, h: Option<&[f32]>) -> (Vec<u8>, V
     (packed, scales)
 }
 
+/// Как [`quantize`] без важности, но строка `r` веса пишется в буфер замыканием `row(r, dst)`
+/// (вес не обязан лежать в памяти целиком в F32). Бит-в-бит с `quantize(.., None)`.
+pub fn quantize_rows_with(n: usize, k: usize, row: impl Fn(usize, &mut [f32]) + Sync) -> (Vec<u8>, Vec<f32>) {
+    let mut packed = vec![0u8; n * k];
+    let scales: Vec<f32> = packed
+        .par_chunks_mut(k.max(1))
+        .enumerate()
+        .map_init(|| vec![0f32; k], |buf, (r, q)| {
+            row(r, buf);
+            quantize_row(buf, None, q)
+        })
+        .collect();
+    (packed, scales)
+}
+
 pub fn dequant_row(src: &[u8], scale: f32, dst: &mut [f32]) {
     for (d, &b) in dst.iter_mut().zip(src) {
         *d = b as i8 as f32 * scale;

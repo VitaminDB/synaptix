@@ -58,7 +58,7 @@ pub struct WhisperPipeline {
 impl WhisperPipeline {
     fn encode(&self, mel: &Tensor) -> Result<Tensor> {
         let t0 = std::time::Instant::now();
-        let r = self.encode_inner(mel);
+        let r = synaptix_core::prof::span("encoder", || self.encode_inner(mel));
         if std::env::var_os("SYNAPTIX_TIMING").is_some() {
             eprintln!("whisper: энкодер {:.0} мс", t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -166,7 +166,7 @@ impl WhisperPipeline {
     fn mel_tensor(&self, segment: &[f32]) -> Result<Tensor> {
         let n_mels = self.config.num_mel_bins;
         let target = self.config.max_source_positions * 2;
-        let (flat, n_mels, n_frames) = whisper_log_mel(segment, n_mels, target)?;
+        let (flat, n_mels, n_frames) = synaptix_core::prof::span("mel", || whisper_log_mel(segment, n_mels, target))?;
         let t = Tensor::from_vec(flat, (1, n_mels, n_frames), self.device)?;
         Ok(t.to_dtype(self.dtype)?)
     }
@@ -515,7 +515,13 @@ impl WhisperPipeline {
     /// Транскрибировать весь аудиосигнал (16 кГц), при необходимости разбивая
     /// на 30-с сегменты. Язык: `Some("en")`/`None` (авто-детекция).
     pub fn transcribe(&self, audio: &[f32], lang: Option<&str>, task: Task) -> Result<String> {
-        Ok(self.transcribe_lang(audio, lang, task)?.0)
+        let r = self.transcribe_lang(audio, lang, task);
+        synaptix_core::memory::arena::release_cpu_pool();
+        let r = r?.0;
+        if synaptix_core::prof::enabled() {
+            eprint!("{}", synaptix_core::prof::take_report());
+        }
+        Ok(r)
     }
 
     /// Как [`transcribe`], плюс код языка (заданный или определённый по первому сегменту).
@@ -659,7 +665,7 @@ impl WhisperPipeline {
 }
 
 fn logits_to_f32(logits: &Tensor) -> Result<Vec<f32>> {
-    Ok(logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
+    synaptix_core::prof::span("dec.logits_host", || Ok(logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?))
 }
 
 fn log_softmax(scores: &[f32]) -> Vec<f32> {

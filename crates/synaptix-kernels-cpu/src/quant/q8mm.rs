@@ -31,25 +31,28 @@ fn pack_act(row: &(dyn Fn(usize, &mut [f32]) + Sync), m: usize, k: usize) -> (Ve
     let nb = k / QK;
     let mut xq = vec![0i8; mp * k];
     let mut xs = vec![0f32; mp / 2 * nb * 4];
-    xq.par_chunks_mut(2 * k).zip(xs.par_chunks_mut(nb * 4)).enumerate().for_each(|(p, (q, s))| {
-        let mut rq = vec![0i8; 2 * k];
-        let mut rs = vec![0f32; 2 * nb];
-        let mut rf = vec![0f32; k];
-        for r in 0..2 {
-            let i = 2 * p + r;
-            if i < m {
-                row(i, &mut rf);
-                quantize_act(&rf, &mut rq[r * k..(r + 1) * k], &mut rs[r * nb..(r + 1) * nb]);
+    xq.par_chunks_mut(2 * k).zip(xs.par_chunks_mut(nb * 4)).enumerate().for_each_init(
+        || (vec![0i8; 2 * k], vec![0f32; 2 * nb], vec![0f32; k]),
+        |(rq, rs, rf), (p, (q, s))| {
+            for r in 0..2 {
+                let i = 2 * p + r;
+                if i < m {
+                    row(i, rf);
+                    quantize_act(rf, &mut rq[r * k..(r + 1) * k], &mut rs[r * nb..(r + 1) * nb]);
+                } else {
+                    rq[r * k..(r + 1) * k].fill(0);
+                    rs[r * nb..(r + 1) * nb].fill(0.0);
+                }
             }
-        }
-        for st in 0..k / 8 {
-            q[st * 16..st * 16 + 8].copy_from_slice(&rq[st * 8..st * 8 + 8]);
-            q[st * 16 + 8..st * 16 + 16].copy_from_slice(&rq[k + st * 8..k + st * 8 + 8]);
-        }
-        for b in 0..nb {
-            s[b * 4..b * 4 + 4].copy_from_slice(&[rs[b], rs[b], rs[nb + b], rs[nb + b]]);
-        }
-    });
+            for st in 0..k / 8 {
+                q[st * 16..st * 16 + 8].copy_from_slice(&rq[st * 8..st * 8 + 8]);
+                q[st * 16 + 8..st * 16 + 16].copy_from_slice(&rq[k + st * 8..k + st * 8 + 8]);
+            }
+            for b in 0..nb {
+                s[b * 4..b * 4 + 4].copy_from_slice(&[rs[b], rs[b], rs[nb + b], rs[nb + b]]);
+            }
+        },
+    );
     (xq, xs)
 }
 
@@ -103,49 +106,63 @@ unsafe fn smmla(acc: std::arch::aarch64::int32x4_t, a: std::arch::aarch64::int8x
     acc
 }
 
-/// Плитка 8×4: `xp` — 4 пары активаций (шаг `2k`), `wp` — 2 пары весов; результат
-/// `f[p][q]` — 2×2 (строки пары p × строки пары q) до масштаба весов.
+/// Строка плиток 8 × полоса: `xp` — 4 пары активаций (шаг `2k`), `wp` — полоса весов
+/// парами строк (`rows` кратно 4), `ws` — шкалы строк весов. Результат с шкалами —
+/// в `ob[r * rows + j]` (r — строка плитки 0..8, j — столбец полосы).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,i8mm")]
-unsafe fn tile(xp: *const i8, xs: *const f32, wp: *const i8, k: usize) -> [[std::arch::aarch64::float32x4_t; 2]; 4] {
+unsafe fn tile_row(xp: *const i8, xs: *const f32, wp: *const i8, ws: *const f32, k: usize, rows: usize, ob: *mut f32) {
     use std::arch::aarch64::*;
     let nb = k / QK;
     let k2 = 2 * k;
     let z = vdupq_n_s32(0);
-    let mut f = [[vdupq_n_f32(0.0); 2]; 4];
-    for b in 0..nb {
-        let (mut c00, mut c01, mut c10, mut c11, mut c20, mut c21, mut c30, mut c31) = (z, z, z, z, z, z, z, z);
-        for st in 0..QK / 8 {
-            let o = (b * QK / 8 + st) * 16;
-            let w0 = vld1q_s8(wp.add(o));
-            let w1 = vld1q_s8(wp.add(k2 + o));
-            let x0 = vld1q_s8(xp.add(o));
-            let x1 = vld1q_s8(xp.add(k2 + o));
-            let x2 = vld1q_s8(xp.add(2 * k2 + o));
-            let x3 = vld1q_s8(xp.add(3 * k2 + o));
-            c00 = smmla(c00, x0, w0);
-            c01 = smmla(c01, x0, w1);
-            c10 = smmla(c10, x1, w0);
-            c11 = smmla(c11, x1, w1);
-            c20 = smmla(c20, x2, w0);
-            c21 = smmla(c21, x2, w1);
-            c30 = smmla(c30, x3, w0);
-            c31 = smmla(c31, x3, w1);
+    for jt in 0..rows / 4 {
+        let wt = wp.add(jt * 4 * k);
+        let mut f = [[vdupq_n_f32(0.0); 2]; 4];
+        for b in 0..nb {
+            let (mut c00, mut c01, mut c10, mut c11, mut c20, mut c21, mut c30, mut c31) = (z, z, z, z, z, z, z, z);
+            for st in 0..QK / 8 {
+                let o = (b * QK / 8 + st) * 16;
+                let w0 = vld1q_s8(wt.add(o));
+                let w1 = vld1q_s8(wt.add(k2 + o));
+                let x0 = vld1q_s8(xp.add(o));
+                let x1 = vld1q_s8(xp.add(k2 + o));
+                let x2 = vld1q_s8(xp.add(2 * k2 + o));
+                let x3 = vld1q_s8(xp.add(3 * k2 + o));
+                c00 = smmla(c00, x0, w0);
+                c01 = smmla(c01, x0, w1);
+                c10 = smmla(c10, x1, w0);
+                c11 = smmla(c11, x1, w1);
+                c20 = smmla(c20, x2, w0);
+                c21 = smmla(c21, x2, w1);
+                c30 = smmla(c30, x3, w0);
+                c31 = smmla(c31, x3, w1);
+            }
+            let s0 = vld1q_f32(xs.add(b * 4));
+            let s1 = vld1q_f32(xs.add((nb + b) * 4));
+            let s2 = vld1q_f32(xs.add((2 * nb + b) * 4));
+            let s3 = vld1q_f32(xs.add((3 * nb + b) * 4));
+            f[0][0] = vfmaq_f32(f[0][0], vcvtq_f32_s32(c00), s0);
+            f[0][1] = vfmaq_f32(f[0][1], vcvtq_f32_s32(c01), s0);
+            f[1][0] = vfmaq_f32(f[1][0], vcvtq_f32_s32(c10), s1);
+            f[1][1] = vfmaq_f32(f[1][1], vcvtq_f32_s32(c11), s1);
+            f[2][0] = vfmaq_f32(f[2][0], vcvtq_f32_s32(c20), s2);
+            f[2][1] = vfmaq_f32(f[2][1], vcvtq_f32_s32(c21), s2);
+            f[3][0] = vfmaq_f32(f[3][0], vcvtq_f32_s32(c30), s3);
+            f[3][1] = vfmaq_f32(f[3][1], vcvtq_f32_s32(c31), s3);
         }
-        let s0 = vld1q_f32(xs.add(b * 4));
-        let s1 = vld1q_f32(xs.add((nb + b) * 4));
-        let s2 = vld1q_f32(xs.add((2 * nb + b) * 4));
-        let s3 = vld1q_f32(xs.add((3 * nb + b) * 4));
-        f[0][0] = vfmaq_f32(f[0][0], vcvtq_f32_s32(c00), s0);
-        f[0][1] = vfmaq_f32(f[0][1], vcvtq_f32_s32(c01), s0);
-        f[1][0] = vfmaq_f32(f[1][0], vcvtq_f32_s32(c10), s1);
-        f[1][1] = vfmaq_f32(f[1][1], vcvtq_f32_s32(c11), s1);
-        f[2][0] = vfmaq_f32(f[2][0], vcvtq_f32_s32(c20), s2);
-        f[2][1] = vfmaq_f32(f[2][1], vcvtq_f32_s32(c21), s2);
-        f[3][0] = vfmaq_f32(f[3][0], vcvtq_f32_s32(c30), s3);
-        f[3][1] = vfmaq_f32(f[3][1], vcvtq_f32_s32(c31), s3);
+        // Результат SMMLA — 2×2 по строкам: [r0c0, r0c1, r1c0, r1c1].
+        for q in 0..2 {
+            let jb = jt * 4 + q * 2;
+            let w2 = vld1_f32(ws.add(jb));
+            let wv = vcombine_f32(w2, w2);
+            for p in 0..4 {
+                let v = vmulq_f32(f[p][q], wv);
+                vst1_f32(ob.add((2 * p) * rows + jb), vget_low_f32(v));
+                vst1_f32(ob.add((2 * p + 1) * rows + jb), vget_high_f32(v));
+            }
+        }
     }
-    f
 }
 
 /// `out[m, n] = x[m, k] · wᵀ` для q8row; `k % 32 == 0`. Только при [`available`].
@@ -153,58 +170,65 @@ pub fn gemm(view: &WeightView, xf: &[f32], m: usize, out: &mut [f32]) {
     let k = view.k;
     let n = view.n;
     let op = crate::gemm::blocked::SendPtr::new(out.as_mut_ptr());
-    gemm_with(view, m, &|i, r| r.copy_from_slice(&xf[i * k..(i + 1) * k]), &|i, j, v| {
-        // SAFETY: каждую (i, j) пишет одна задача.
-        unsafe { *op.ptr().add(i * n + j) = v }
+    gemm_with(view, m, &|i, r| r.copy_from_slice(&xf[i * k..(i + 1) * k]), &|i, j0, v| {
+        // SAFETY: каждый отрезок строки (i, [j0, j0 + len)) пишет одна задача.
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), op.ptr().add(i * n + j0), v.len()) }
     });
 }
 
-/// Как [`gemm`], но строки активаций и запись выхода — замыканиями (любой тип в памяти).
-pub fn gemm_with(view: &WeightView, m: usize, row: &(dyn Fn(usize, &mut [f32]) + Sync), put: &(dyn Fn(usize, usize, f32) + Sync)) {
+/// Как [`gemm`], но строки активаций читаются, а выход пишется замыканиями (любой тип в
+/// памяти): `put_row(i, j0, v)` — значения `out[i, j0..j0 + v.len()]`.
+pub fn gemm_with(view: &WeightView, m: usize, row: &(dyn Fn(usize, &mut [f32]) + Sync), put_row: &(dyn Fn(usize, usize, &[f32]) + Sync)) {
     #[cfg(target_arch = "aarch64")]
     {
         let (n, k) = (view.n, view.k);
         let nb = k / QK;
         crate::threads::pool();
-        let (xq, xs) = pack_act(row, m, k);
+        let (xq, xs) = synaptix_core::prof::span("q8mm.pack_act", || pack_act(row, m, k));
+        let _t = std::time::Instant::now();
         let mp = m.div_ceil(MT) * MT;
         // Полоса весов задачи в L2: ~128 КБ.
         let band = ((128 << 10) / k).clamp(4, 64) / 4 * 4;
-        (0..n.div_ceil(band)).into_par_iter().for_each_init(|| (Vec::new(), Vec::new()), |(wbuf, ws), bi| {
-            let (j0, j1) = (bi * band, ((bi + 1) * band).min(n));
-            pack_w(view, j0, j1, wbuf, ws);
-            let rows = (j1 - j0).div_ceil(4) * 4;
-            for it in 0..mp / MT {
-                let xp = unsafe { xq.as_ptr().add(it * MT * k) };
-                let xsp = unsafe { xs.as_ptr().add(it * (MT / 2) * nb * 4) };
-                for jt in 0..rows / 4 {
-                    let f = unsafe { tile(xp, xsp, wbuf.as_ptr().add(jt * 4 * k), k) };
-                    for (p, fp) in f.iter().enumerate() {
-                        for (q, v) in fp.iter().enumerate() {
-                            let mut a = [0f32; 4];
-                            unsafe { std::arch::aarch64::vst1q_f32(a.as_mut_ptr(), *v) };
-                            let jb = jt * 4 + q * 2;
-                            for r in 0..2 {
-                                let i = it * MT + p * 2 + r;
-                                if i >= m {
-                                    continue;
-                                }
-                                for c in 0..2 {
-                                    let j = j0 + jb + c;
-                                    if j < j1 {
-                                        put(i, j, a[r * 2 + c] * ws[jb + c]);
-                                    }
-                                }
-                            }
+        let nbands = n.div_ceil(band);
+        // Задач — с запасом на поток (big.LITTLE: мелкие задачи добирают быстрые ядра);
+        // полос мало (n = 1280 при k = 1280 — 14 полос) — режем ещё и по строкам активаций.
+        let tiles = mp / MT;
+        let want = 8 * crate::common::threads();
+        let msplit = want.div_ceil(nbands).clamp(1, tiles.max(1));
+        let mchunk = tiles.div_ceil(msplit);
+        let msplit = tiles.div_ceil(mchunk.max(1)).max(1);
+        (0..nbands * msplit).into_par_iter().for_each_init(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(wbuf, ws, ob), task| {
+                let (bi, mi) = (task / msplit, task % msplit);
+                let (j0, j1) = (bi * band, ((bi + 1) * band).min(n));
+                pack_w(view, j0, j1, wbuf, ws);
+                let rows = (j1 - j0).div_ceil(4) * 4;
+                ob.clear();
+                ob.resize(MT * rows, 0f32);
+                for it in mi * mchunk..((mi + 1) * mchunk).min(tiles) {
+                    // SAFETY: границы — по построению пачек (mp, rows кратны плиткам).
+                    unsafe {
+                        let xp = xq.as_ptr().add(it * MT * k);
+                        let xsp = xs.as_ptr().add(it * (MT / 2) * nb * 4);
+                        tile_row(xp, xsp, wbuf.as_ptr(), ws.as_ptr(), k, rows, ob.as_mut_ptr());
+                    }
+                    for r in 0..MT {
+                        let i = it * MT + r;
+                        if i < m {
+                            put_row(i, j0, &ob[r * rows..r * rows + (j1 - j0)]);
                         }
                     }
                 }
-            }
-        });
+            },
+        );
+        if synaptix_core::prof::enabled() {
+            synaptix_core::prof::add("q8mm.compute", _t.elapsed().as_secs_f64());
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (view, m, row, put);
+        let _ = (view, m, row, put_row);
         unreachable!("q8mm: только aarch64");
     }
 }

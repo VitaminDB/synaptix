@@ -351,6 +351,20 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// Как [`Self::linear_quant`], плюс `bias` `[N]` (тип выхода), прибавленный в эпилоге
+    /// GEMM — без отдельного прохода по выходу. Default — `Unsupported` (вызывающий
+    /// складывает отдельно).
+    fn linear_quant_bias(
+        &self,
+        _x: (&Storage, &Layout),
+        _w: &QuantWeight,
+        _bias: (&Storage, &Layout),
+        _out: (&mut Storage, &Layout),
+        _stream: &Stream,
+    ) -> Result<()> {
+        Err(SynaptixError::Unsupported("linear_quant_bias не поддержан этим backend"))
+    }
+
     /// Исполняет ли backend квант-формат `dtype` нативно — тензорными ядрами
     /// на устройстве `device` (NVFP4/MXFP8 — block-scale MMA Blackwell).
     /// `false` — веса в этом формате считаются обходом «деквант → плотный

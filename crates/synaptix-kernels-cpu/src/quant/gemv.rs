@@ -224,7 +224,12 @@ fn out_dims_check(x_lo: &Layout, w: &QuantWeight, out_lo: &Layout) -> Result<usi
     Ok(m)
 }
 
-pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
+pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage, &Layout), stream: &Stream) -> Result<()> {
+    linear_quant_bias(x, w, None, out, stream)
+}
+
+/// [`linear_quant`] + `bias` `[N]` в эпилоге (до приведения к типу выхода).
+pub fn linear_quant_bias(x: (&Storage, &Layout), w: &QuantWeight, bias: Option<(&Storage, &Layout)>, out: (&mut Storage, &Layout), _stream: &Stream) -> Result<()> {
     let (x_st, x_lo) = x;
     let (o_st, o_lo) = out;
     let dt = x_lo.dtype();
@@ -232,6 +237,17 @@ pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage,
         return Err(SynaptixError::Unsupported("cpu linear_quant: активация F16/BF16/F32, выход того же типа"));
     }
     let m = out_dims_check(x_lo, w, o_lo)?;
+    let bias: Option<Vec<f32>> = match bias {
+        Some((b_st, b_lo)) => {
+            if b_lo.numel() != w.n() || !b_lo.is_contiguous() {
+                return Err(SynaptixError::Unsupported("cpu linear_quant: bias [N] contiguous"));
+            }
+            let mut v = vec![0f32; w.n()];
+            to_f32(b_lo.dtype(), cpu(b_st, "cpu linear_quant: bias не на CPU")?.as_bytes(), b_lo.offset(), &mut v)?;
+            Some(v)
+        }
+        None => None,
+    };
     let packed = w.packed_arc().ok_or(SynaptixError::Unsupported("cpu linear_quant: packed освобождён"))?;
     let view = weight_view(w, &packed, w.scales_opt())?;
     let xb = cpu(x_st, "cpu linear_quant: x не на CPU")?.as_bytes();
@@ -243,16 +259,24 @@ pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage,
         let es = dt.bytes_for_numel(1);
         let optr = blocked::SendPtr::new(ob.as_mut_ptr() as *mut f32);
         let olen = ob.len();
-        super::q8mm::gemm_with(&view, m, &|i, r| { let _ = to_f32(dt, xb, xoff + i * k, r); }, &|i, j, v| {
-            let e = ooff + i * n + j;
-            debug_assert!((e + 1) * es <= olen);
-            // SAFETY: каждый элемент (i, j) пишет одна задача; границы — по out_dims_check.
-            unsafe {
-                let p = (optr.ptr() as *mut u8).add(e * es);
-                match dt {
-                    DType::BF16 => (p as *mut u16).write_unaligned(half::bf16::from_f32(v).to_bits()),
-                    DType::F16 => (p as *mut u16).write_unaligned(half::f16::from_f32(v).to_bits()),
-                    _ => (p as *mut f32).write_unaligned(v),
+        let bias = bias.as_deref();
+        super::q8mm::gemm_with(&view, m, &|i, r| { let _ = to_f32(dt, xb, xoff + i * k, r); }, &|i, j0, v| {
+            let e = ooff + i * n + j0;
+            debug_assert!((e + v.len()) * es <= olen);
+            // SAFETY: каждый отрезок строки пишет одна задача; границы — по out_dims_check.
+            let dst = unsafe { std::slice::from_raw_parts_mut((optr.ptr() as *mut u8).add(e * es), v.len() * es) };
+            match bias {
+                Some(b) => {
+                    let mut t = [0f32; 64];
+                    for (c, (tc, bc)) in v.chunks(64).zip(b[j0..j0 + v.len()].chunks(64)).enumerate() {
+                        for ((o, &a), &bb) in t.iter_mut().zip(tc).zip(bc) {
+                            *o = a + bb;
+                        }
+                        let _ = from_f32(dt, &t[..tc.len()], dst, c * 64);
+                    }
+                }
+                None => {
+                    let _ = from_f32(dt, v, dst, 0);
                 }
             }
         });
@@ -262,6 +286,13 @@ pub fn linear_quant(x: (&Storage, &Layout), w: &QuantWeight, out: (&mut Storage,
     let xf = x_rows_f32(dt, xb, x_lo.offset(), m, w.k())?;
     let mut of = vec![0f32; m * w.n()];
     gemm_quant_f32(&view, &xf, m, &mut of);
+    if let Some(b) = &bias {
+        for row in of.chunks_exact_mut(w.n()) {
+            for (o, &bb) in row.iter_mut().zip(b) {
+                *o += bb;
+            }
+        }
+    }
     let ob = cpu_mut(o_st, "cpu linear_quant: out не на CPU")?.as_bytes_mut();
     from_f32(dt, &of, ob, o_lo.offset())
 }

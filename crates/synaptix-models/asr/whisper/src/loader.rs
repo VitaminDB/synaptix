@@ -58,8 +58,14 @@ impl WhisperWeights {
 
     /// Тензор по HF-имени, приведённый к compute-dtype на целевом устройстве.
     pub fn get(&self, name: &str) -> Result<Tensor, WhisperError> {
-        self.loader
-            .load_to(name, self.device, self.dtype)
+        synaptix_core::prof::span("load.get", || self.loader.load_to(name, self.device, self.dtype))
+            .map_err(|e| WhisperError::Load(format!("'{name}': {e}")))
+    }
+
+    /// Тензор в типе файла (без приведения к compute-dtype): вес, который сразу
+    /// квантуется, не материализуется в F32 целиком.
+    pub fn get_native(&self, name: &str) -> Result<Tensor, WhisperError> {
+        synaptix_core::prof::span("load.get", || self.loader.load(name))
             .map_err(|e| WhisperError::Load(format!("'{name}': {e}")))
     }
 

@@ -19,7 +19,9 @@ pub fn scaled_dot_attention(
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
         return Err(SynaptixError::dtype_mismatch(q.dtype(), k.dtype()));
     }
-    if q.device().is_npu() && mask.is_none() && q.rank() == 4 && !synaptix_core::grad::needs_graph(&[q, k, v]) {
+    // NPU и CPU: потоковое ядро внимания (CPU — без матрицы оценок [H, S, T], транспонирования
+    // K и трёх проходов по ней; результат в пределах F32-округления от пути через matmul).
+    if (q.device().is_npu() || q.device().is_cpu()) && mask.is_none() && q.rank() == 4 && !synaptix_core::grad::needs_graph(&[q, k, v]) {
         match q.flash_attention(k, v, scale, false) {
             Ok(o) => return Ok(o),
             Err(SynaptixError::Unsupported(_)) | Err(SynaptixError::NonContiguous) => {}
