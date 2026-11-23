@@ -182,7 +182,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
         }
         let n = name(f);
         let plan = match f.arch.as_str() {
-            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" | "lfm3" | "inkling2_loop" | "inkling2" if !n.contains("embedding") => {
+            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "wemm_qwen3_5_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" | "lfm3" | "inkling2_loop" | "inkling2" if !n.contains("embedding") => {
                 Some(single(f, Task::Llm, &f.arch, "Языковая модель"))
             }
             "qwen3" if n.contains("embedding") => Some(single(f, Task::Embed, "qwen3_embedding", "Эмбеддинги для поиска по смыслу")),

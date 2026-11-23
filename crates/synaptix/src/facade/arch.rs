@@ -123,9 +123,11 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
     let key = arch_key(path)
         .ok_or_else(|| format!("config.json/arch не найдены в {}", path.display()))?;
     Ok(match key.as_str() {
+        // WeMM-Video (Tencent): тот же Qwen3.5-MoE с башней Qwen3-VL; аудио-
+        // энкодер (Whisper + Q-Former) в бандле, движком пока не исполняется.
         // MiniCPM-V 4.7: текст — Qwen3.5-гибрид (`text_config.model_type`
         // `qwen3_5_text` / `qwen3_5_moe_text`), башня зрения своя.
-        "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" => LlmArch::Hybrid,
+        "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" | "wemm_qwen3_5_moe" => LlmArch::Hybrid,
         "llama" => LlmArch::Llama,
         "lfm3" => LlmArch::Lfm3,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,

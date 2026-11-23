@@ -397,10 +397,15 @@ pub fn prepare_video(
         frames.push(chw);
     }
     let (patches, grid) = patchify_video(&frames, 3, nh, nw, cfg);
+    // Таймкод группы — середина между её первым и последним кадром, как у
+    // HF-процессора Qwen3-VL (и WeMM-Video): `(l/fps + r/fps) / 2`.
+    let fps = src_fps.max(0.01);
     let group_timestamps: Vec<f32> = (0..grid.t)
         .map(|g| {
-            let fi = (g * tps).min(got.saturating_sub(1));
-            indices[fi] as f32 / src_fps.max(0.01)
+            let last = got.saturating_sub(1);
+            let l = indices[(g * tps).min(last)] as f32;
+            let r = indices[((g + 1) * tps - 1).min(last)] as f32;
+            (l / fps + r / fps) / 2.0
         })
         .collect();
     let n = grid.patches();
