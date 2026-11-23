@@ -220,9 +220,20 @@ impl LlmTokenizer {
                     }
                     _ => opts = opts.with_var("tools", serde_json::Value::Null),
                 }
-                tmpl.render(&msgs, &opts)
-                    .map(|t| number_image_ids(&t))
-                    .map_err(|e| LlmError(e.to_string()))
+                let mut text = tmpl.render(&msgs, &opts).map_err(|e| LlmError(e.to_string()))?;
+                // Inkling-2: выключателя размышлений в шаблоне нет, а на
+                // уровне `none` модель всё равно открывает часть
+                // `<|content_thinking|>` и тратит на неё весь предел хода
+                // (ответ пустой). Без размышлений реплику модели начинаем за
+                // неё сразу с части ответа. С инструментами — нет: так модель
+                // не смогла бы выбрать часть вызова.
+                let no_tools = tools.is_none_or(|t| t.is_empty());
+                if add_generation_prompt && !enable_thinking && no_tools && self.thinking_in_parts() {
+                    use super::chat::inkling::markup;
+                    text.push_str(markup::MESSAGE);
+                    text.push_str(markup::TEXT);
+                }
+                Ok(number_image_ids(&text))
             }
             None => Ok(number_image_ids(&fallback_render(messages, add_generation_prompt))),
         }
@@ -230,6 +241,12 @@ impl LlmTokenizer {
 
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
+    }
+
+    /// Размышления — часть реплики со своей разметкой (Inkling-2), а не
+    /// блок `<think>`.
+    fn thinking_in_parts(&self) -> bool {
+        super::chat::inkling::InklingIds::detect(self).is_some()
     }
 }
 
