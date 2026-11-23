@@ -57,15 +57,8 @@ impl VisionWeights for BundleVisionWeights {
 /// тензорами `model.visual.*` в основном компоненте. Без загрузки весов —
 /// читается только заголовок safetensors (mmap).
 pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
-    let path = path.as_ref();
-    let Ok(b) = Bundle::open(path) else {
-        return false;
-    };
-    if b.meta().components.contains_key(VISION_COMPONENT) {
-        return true;
-    }
-    drop(b);
-    BundleVisionWeights::open(path)
+    // Только по тензору башни: компонент `vision` есть и у бандлов MiniCPM-V.
+    BundleVisionWeights::open(path.as_ref())
         .map(|w| w.has(&probe_key()))
         .unwrap_or(false)
 }

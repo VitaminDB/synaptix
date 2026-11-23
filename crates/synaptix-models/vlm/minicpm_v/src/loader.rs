@@ -53,18 +53,12 @@ impl VisionWeights for BundleVisionWeights {
     }
 }
 
-/// Есть ли в бандле башня MiniCPM-V: компонент `vision` или тензор
-/// патч-эмбеддинга в основном компоненте. Веса не читаются.
+/// Есть ли в бандле башня MiniCPM-V: тензор её патч-эмбеддинга в компоненте
+/// `vision` (если выделен) или в основном. Веса не читаются.
 pub fn bundle_has_vision(path: impl AsRef<Path>) -> bool {
-    let path = path.as_ref();
-    let Ok(b) = Bundle::open(path) else {
-        return false;
-    };
-    if b.meta().components.contains_key(VISION_COMPONENT) {
-        return true;
-    }
-    drop(b);
-    BundleVisionWeights::open(path)
+    // Только по тензору башни: компонент `vision` есть и у Qwen-VL-бандлов
+    // (Qwen3.5/3.6 с отдельной башней), одно имя компонента их не различает.
+    BundleVisionWeights::open(path.as_ref())
         .map(|w| w.has(&probe_key()))
         .unwrap_or(false)
 }
