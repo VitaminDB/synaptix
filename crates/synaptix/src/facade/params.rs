@@ -294,10 +294,8 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     // Модели, обученные с фиксированной системной репликой (WeMM-Video —
     // «You are a helpful assistant.» из processor_config.json): она и есть
     // стартовый промпт по умолчанию, иначе служба подставит свой.
-    let system_default = path
-        .and_then(super::arch::model_type)
-        .filter(|t| t == "wemm_qwen3_5_moe")
-        .map(|_| ParamValue::Text("You are a helpful assistant.".into()));
+    let is_wemm = path.and_then(super::arch::model_type).is_some_and(|t| t == "wemm_qwen3_5_moe");
+    let system_default = is_wemm.then(|| ParamValue::Text("You are a helpful assistant.".into()));
     let mut out = vec![
         spec("system_prompt", "Стартовый промпт", "Системное сообщение в начале диалога; у программ со своим (ассистент) добавляется к нему", ParamKind::Text { multiline: true }, system_default),
         spec("context", "Размер контекста, токенов", "Сколько токенов модель держит в памяти: промпт, история и ответ. Кэш растёт по мере разговора до этого предела", int(2048, window as i64, 1024), i(window as i64)),
@@ -320,7 +318,9 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
             "Бюджет размышлений, токенов",
             "Предел длины размышлений: по его исчерпании они закрываются, и модель переходит к ответу. 0 — авто (по глубине размышлений, не больше трёх четвертей длины ответа)",
             int(0, window as i64, 256),
-            i(0),
+            // WeMM-Video обучен отвечать без размышлений (у процессора
+            // enable_thinking=False): в размышлениях он не останавливается сам.
+            i(if is_wemm { 2048 } else { 0 }),
         ));
     }
     if let Some(r) = &profile.reasoning {

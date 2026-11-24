@@ -1930,6 +1930,9 @@ pub struct MediaEmbedding {
     /// MiniCPM-V 4.7: раскладка картинки (миниатюра и срезы) — для
     /// холстового M-RoPE; `None` у остальных архитектур и у видео.
     pub layout: Option<synaptix_llm_qwen3_next_hybrid::vlm_minicpm::ImageLayout>,
+    /// Звук дорожки видео (WeMM-Video): аудиотокены стоят внутри блоков
+    /// групп кадров; `None` — видео без звука и прочие вложения.
+    pub audio: Option<Tensor>,
 }
 
 
@@ -2084,6 +2087,7 @@ impl Llm {
                     grid_hw: (0, 0),
                     blocks: 1,
                     layout: Some(layout),
+                    audio: None,
                 });
             }
             // Модель целиком на карте (MoE 35B-A3B — 22 из 24 ГБ): башне на
@@ -2138,16 +2142,24 @@ impl Llm {
         if let LlmPipeline::Hybrid(h) = &*guard {
             prompt_block.push_str(h.media_separator());
         }
-        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None })
+        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None, audio: None })
     }
 
     /// Кодирует видео: сэмплинг кадров (ffmpeg) → vision-башня. Блок промпта
     /// несёт таймкоды кадровых групп, поэтому модель видит временну́ю шкалу.
     pub fn encode_video(&self, path: &Path) -> Result<MediaEmbedding, LlmError> {
+        self.encode_video_opts(path, true)
+    }
+
+    /// [`Self::encode_video`]; `with_audio` — у моделей с аудио-башней
+    /// (WeMM-Video) звуковая дорожка идёт в тот же блок, как
+    /// `use_audio_in_video` оригинала (нет дорожки — только кадры).
+    pub fn encode_video_opts(&self, path: &Path, with_audio: bool) -> Result<MediaEmbedding, LlmError> {
         let guard = self
             .pipeline
             .lock()
             .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let mut audio: Option<Tensor> = None;
         let (embeds, prompt_block, grid_hw, blocks) = match &*guard {
             LlmPipeline::MuseGlimmer(m) => {
                 let (embeds, info) = m
@@ -2161,9 +2173,13 @@ impl Llm {
             // не влезет.
             LlmPipeline::Hybrid(h) => {
                 let mut cap: Option<usize> = None;
+                let bundle = with_audio.then_some(self.model_path.as_path());
                 let (embeds, info) = loop {
-                    match h.encode_video_limited(path, cap) {
-                        Ok(v) => break v,
+                    match h.encode_video_with_audio(path, cap, bundle) {
+                        Ok((v, info, a)) => {
+                            audio = a;
+                            break (v, info);
+                        }
                         Err(e) if is_oom(&e.to_string()) => {
                             let used = cap.unwrap_or_else(|| h.video_token_budget());
                             if used <= MIN_VIDEO_TOKENS_ON_OOM {
@@ -2189,7 +2205,7 @@ impl Llm {
             }
             _ => return Err(LlmError("архитектура не принимает видео".into())),
         };
-        let tokens = embeds.dims()[0];
+        let tokens = embeds.dims()[0] + audio.as_ref().map_or(0, |a| a.dims()[0]);
         Ok(MediaEmbedding {
             kind: MediaKind::Video,
             embeds,
@@ -2198,6 +2214,7 @@ impl Llm {
             grid_hw,
             blocks,
             layout: None,
+            audio,
         })
     }
 }
@@ -2240,6 +2257,7 @@ impl Llm {
             grid_hw: (0, 0),
             blocks: 1,
             layout: None,
+            audio: None,
         })
     }
 }
@@ -3317,9 +3335,10 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
-        // Учёт хода, как у текстового пути (без бюджета размышлений): токены,
-        // размышления ChatML (`</think>`), кто остановил — иначе итог
-        // печатал «eos, токенов 0» и при обрыве по пределу.
+        // Учёт хода и бюджет размышлений — как у текстового пути: токены,
+        // размышления ChatML (`</think>`), кто остановил; по исчерпании
+        // бюджета размышления закрываются за модель, и ход продолжается
+        // ответом (медиа префиллятся заново вместе с размышлениями).
         self.finish = GenerationFinish::default();
         let single = |s: &str| match tokenizer.encode(s) {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),
@@ -3330,30 +3349,72 @@ impl<'a> LlmGeneration<'a> {
             let open = single("<think>").and_then(last);
             !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
         });
-        let (mut n, mut think, mut inside, mut last, mut cb_stop) = (0usize, 0usize, close.is_some(), None::<u32>, false);
-        let r = self.generate_streaming_media_raw(prompt_ids, tokenizer, media, |id, s| {
-            n += 1;
-            last = Some(id);
-            if inside {
+        let max_new = self.opts.max_new_tokens;
+        let budget = match (close, self.thinking) {
+            (Some(_), Some(b)) if b > 0 && b < max_new => b,
+            _ => 0,
+        };
+        struct T {
+            n: usize,
+            think: usize,
+            inside: bool,
+            last: Option<u32>,
+            cb_stop: bool,
+            over: bool,
+            seq: Vec<u32>,
+        }
+        let mut t = T { n: 0, think: 0, inside: close.is_some(), last: None, cb_stop: false, over: false, seq: Vec::new() };
+        let mut feed = |t: &mut T, id: u32, s: &str, budget: usize, on_token: &mut F| -> bool {
+            t.n += 1;
+            t.last = Some(id);
+            t.seq.push(id);
+            if t.inside {
                 if Some(id) == close {
-                    inside = false;
+                    t.inside = false;
                 } else {
-                    think += 1;
+                    t.think += 1;
                 }
             }
-            let go = on_token(id, s);
-            cb_stop |= !go;
-            go
-        });
-        let max_new = self.opts.max_new_tokens;
-        self.finish.tokens = n;
-        self.finish.thinking_tokens = think;
-        self.finish.thinking_open = inside;
-        self.finish.reason = if cb_stop {
+            if !on_token(id, s) {
+                t.cb_stop = true;
+                return false;
+            }
+            if budget > 0 && t.inside && t.think >= budget {
+                t.over = true;
+                return false;
+            }
+            true
+        };
+        let mut r = self.generate_streaming_media_raw(prompt_ids, tokenizer, media, |id, s| feed(&mut t, id, s, budget, &mut on_token));
+        if r.is_ok() && t.over && !t.cb_stop {
+            let forced = tokenizer.encode("\n</think>\n\n").map_err(|e| LlmError(e.to_string()))?;
+            let mut prompt2 = Vec::with_capacity(prompt_ids.len() + t.seq.len() + forced.len());
+            prompt2.extend_from_slice(prompt_ids);
+            prompt2.extend_from_slice(&t.seq);
+            let mut go = true;
+            for id in &forced {
+                prompt2.push(*id);
+                if go {
+                    let piece = tokenizer.decode(&[*id]).unwrap_or_default();
+                    go = feed(&mut t, *id, &piece, 0, &mut on_token);
+                }
+            }
+            t.inside = false;
+            self.finish.thinking_forced = true;
+            if go {
+                self.opts.max_new_tokens = max_new.saturating_sub(t.n).max(1);
+                r = self.generate_streaming_media_raw(&prompt2, tokenizer, media, |id, s| feed(&mut t, id, s, 0, &mut on_token));
+                self.opts.max_new_tokens = max_new;
+            }
+        }
+        self.finish.tokens = t.n;
+        self.finish.thinking_tokens = t.think;
+        self.finish.thinking_open = t.inside;
+        self.finish.reason = if t.cb_stop {
             FinishReason::Callback
-        } else if last.is_some_and(|t| self.stop_tokens.contains(&t)) {
+        } else if t.last.is_some_and(|x| self.stop_tokens.contains(&x)) {
             FinishReason::Eos
-        } else if n >= max_new {
+        } else if t.n >= max_new {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -3452,17 +3513,11 @@ fn hybrid_media_inputs(
     for (kind, pad) in [
         (MediaKind::Image, p.config.image_token_id),
         (MediaKind::Video, p.config.video_token_id),
-        (MediaKind::Audio, p.config.audio_token_id),
     ] {
         let Some(embeds) = concat_media(media, kind)? else { continue };
         let pad = pad.ok_or_else(|| {
             LlmError(format!("config.json без id заполнителя для {kind:?}"))
         })?;
-        if kind == MediaKind::Audio {
-            // Текстовые позиции, без сетки (см. M-RoPE пайплайна).
-            inputs.push(MediaInput::new(pad, embeds, Vec::new()));
-            continue;
-        }
         let grids: Vec<(usize, usize)> = media
             .iter()
             .filter(|m| m.kind == kind)
@@ -3474,6 +3529,23 @@ fn hybrid_media_inputs(
             .filter_map(|m| m.layout.clone())
             .collect();
         inputs.push(MediaInput { pad, embeds, grids, layouts });
+    }
+    // Звук — отдельные вложения и дорожки видео, в порядке появления в
+    // промпте; позиции у аудиотокенов текстовые (без сетки, см. M-RoPE).
+    let audio: Vec<&Tensor> = media
+        .iter()
+        .filter_map(|m| match m.kind {
+            MediaKind::Audio => Some(&m.embeds),
+            _ => m.audio.as_ref(),
+        })
+        .collect();
+    if !audio.is_empty() {
+        let pad = p
+            .config
+            .audio_token_id
+            .ok_or_else(|| LlmError("config.json без audio_token_id".into()))?;
+        let embeds = Tensor::cat(&audio, 0).map_err(|e| LlmError(e.to_string()))?;
+        inputs.push(MediaInput::new(pad, embeds, Vec::new()));
     }
     Ok(inputs)
 }

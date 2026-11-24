@@ -522,7 +522,7 @@ impl Qwen4ExpPipeline {
             .vision
             .as_ref()
             .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
-        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps } =
+        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps, .. } =
             synaptix_vlm_qwen3::prepare_video(path, &tower.config, limits, self.model.device)
                 .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
         let feats = no_grad(|| tower.forward(&patches, grid))

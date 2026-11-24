@@ -236,6 +236,10 @@ pub struct PreparedVideo {
     /// Таймкод первого кадра каждой группы, секунды — идёт в промпт
     /// (`<{t:.1} seconds>` перед блоком группы).
     pub group_timestamps: Vec<f32>,
+    /// Индексы выбранных кадров исходного видео (без добивки до группы).
+    pub frame_indices: Vec<usize>,
+    /// Частота кадров исходного видео.
+    pub fps: f64,
 }
 
 /// Индексы кадров для сэмплинга: по `target_fps`, не больше `max_frames`,
@@ -482,19 +486,20 @@ pub fn prepare_video(
     let (patches, grid) = patchify_video(&frames, 3, nh, nw, cfg);
     // Таймкод группы — середина между её первым и последним кадром, как у
     // HF-процессора Qwen3-VL (и WeMM-Video): `(l/fps + r/fps) / 2`.
-    let fps = src_fps.max(0.01);
+    let fps = src_fps.max(0.01) as f64;
     let group_timestamps: Vec<f32> = (0..grid.t)
         .map(|g| {
             let last = got.saturating_sub(1);
-            let l = indices[(g * tps).min(last)] as f32;
-            let r = indices[((g + 1) * tps - 1).min(last)] as f32;
-            (l / fps + r / fps) / 2.0
+            let l = indices[(g * tps).min(last)] as f64;
+            let r = indices[((g + 1) * tps - 1).min(last)] as f64;
+            ((l / fps + r / fps) / 2.0) as f32
         })
         .collect();
     let n = grid.patches();
     let tensor = Tensor::from_vec(patches, vec![n, cfg.patch_features()], device)
         .map_err(|e| PreprocessError::Shape(e.to_string()))?;
-    Ok(PreparedVideo { patches: tensor, grid, group_timestamps })
+    let frame_indices = indices[..got].to_vec();
+    Ok(PreparedVideo { patches: tensor, grid, group_timestamps, frame_indices, fps })
 }
 
 /// Пиксельный бюджет видео у HF-процессора Qwen3-VL: считается по всем кадрам

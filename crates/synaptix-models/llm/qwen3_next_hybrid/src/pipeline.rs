@@ -116,9 +116,12 @@ pub struct HybridPipeline {
 pub struct VideoPromptInfo {
     pub groups: usize,
     pub tokens_per_group: usize,
-    pub timestamps: Vec<f32>,
+    pub timestamps: Vec<f64>,
     /// Merged-сетка `(h, w)` одной группы кадров — для M-RoPE.
     pub grid_hw: (usize, usize),
+    /// WeMM-Video со звуком: `<|audio_pad|>` каждой группы (после её
+    /// видеотокенов, до `<|vision_end|>`); пусто — видео без звука.
+    pub audio_groups: Vec<usize>,
 }
 
 /// Вложения одной модальности для [`HybridPipeline::generate_with_media`]:
@@ -141,9 +144,9 @@ impl MediaInput {
 }
 
 impl VideoPromptInfo {
-    /// Всего vision-токенов видео.
+    /// Всего токенов видео (кадры и звук).
     pub fn tokens(&self) -> usize {
-        self.groups * self.tokens_per_group
+        self.groups * self.tokens_per_group + self.audio_groups.iter().sum::<usize>()
     }
 
     /// Блок промпта как у HF-процессора Qwen3-VL: на каждую группу кадров
@@ -156,6 +159,9 @@ impl VideoPromptInfo {
             let ts = self.timestamps.get(g).copied().unwrap_or(0.0);
             s.push_str(&format!("<{ts:.1} seconds><|vision_start|>"));
             s.push_str(&"<|video_pad|>".repeat(self.tokens_per_group));
+            if let Some(n) = self.audio_groups.get(g) {
+                s.push_str(&"<|audio_pad|>".repeat(*n));
+            }
             s.push_str("<|vision_end|>");
         }
         s
@@ -735,7 +741,27 @@ impl HybridPipeline {
         path: impl AsRef<Path>,
         max_total_tokens: Option<usize>,
     ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo), PipelineError> {
+        self.encode_video_with_audio(path, max_total_tokens, None).map(|(v, info, _)| (v, info))
+    }
+
+    /// Видео вместе со звуковой дорожкой (WeMM-Video, `use_audio_in_video`):
+    /// `bundle` — откуда грузить аудио-башню; `None` или модель без неё —
+    /// только кадры. Третий элемент — эмбеддинги звука `[Σ audio_groups,
+    /// hidden]` в порядке групп (дорожки нет — `None`).
+    pub fn encode_video_with_audio(
+        &self,
+        path: impl AsRef<Path>,
+        max_total_tokens: Option<usize>,
+        bundle: Option<&Path>,
+    ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo, Option<synaptix_core::tensor::Tensor>), PipelineError> {
         use synaptix_core::grad::no_grad;
+        let path = path.as_ref();
+        // Звук — до башни зрения: аудио-башня временная, ей нужна VRAM.
+        let audio_cfg = bundle.filter(|_| self.config.audio_token_id.is_some()).and_then(|b| Self::bundle_audio_config(b).map(|c| (b, c)));
+        let audio = match &audio_cfg {
+            Some((b, cfg)) => crate::wemm_audio::encode_video_track(b, cfg, path, self.model.device)?.map(|(e, d)| (e, d, cfg.second_per_window)),
+            None => None,
+        };
         let mut limits = synaptix_vlm_qwen3::VideoLimits::default();
         if self.config.wemm {
             // Политика WeMM-Video: 2 fps, 4…128 кадров, ≤768 токенов на
@@ -751,7 +777,7 @@ impl HybridPipeline {
             .vision
             .as_ref()
             .ok_or_else(|| PipelineError::Model("vision-башня не загружена".into()))?;
-        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps } =
+        let synaptix_vlm_qwen3::PreparedVideo { patches, grid, group_timestamps, frame_indices, fps } =
             synaptix_vlm_qwen3::prepare_video(
                 path,
                 &tower.config,
@@ -776,13 +802,32 @@ impl HybridPipeline {
             }
         }
         let m = tower.config.spatial_merge_size.max(1);
+        let tps = tower.config.temporal_patch_size.max(1);
+        let (audio_groups, audio_embeds, timestamps) = match audio {
+            Some((embeds, duration, window)) => {
+                let count = embeds.dims()[0];
+                let groups = crate::wemm_audio::video_audio_groups(grid.t, frame_indices.len(), tps, count, duration, window);
+                // Со звуком оригинал считает метку как (l + r) / (2·fps).
+                let last = frame_indices.len().saturating_sub(1);
+                let ts = (0..grid.t)
+                    .map(|g| {
+                        let l = frame_indices[(g * tps).min(last)] as f64;
+                        let r = frame_indices[((g + 1) * tps - 1).min(last)] as f64;
+                        (l + r) / (2.0 * fps)
+                    })
+                    .collect();
+                (groups, Some(embeds), ts)
+            }
+            None => (Vec::new(), None, group_timestamps.iter().map(|&t| t as f64).collect()),
+        };
         let info = VideoPromptInfo {
             groups: grid.t,
             tokens_per_group: (grid.h * grid.w) / tower.config.merge_unit(),
-            timestamps: group_timestamps,
+            timestamps,
             grid_hw: (grid.h / m, grid.w / m),
+            audio_groups,
         };
-        Ok((feats, info))
+        Ok((feats, info, audio_embeds))
     }
 
     /// Эмбеддинги промпта, где прогоны токенов-заполнителей заменены

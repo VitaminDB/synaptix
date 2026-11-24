@@ -158,6 +158,53 @@ pub fn timestamp_groups(count: usize, window: f64, duration: f64, interval: f64)
     (sizes, times)
 }
 
+/// Звуковая дорожка файла → 16 кГц моно f32; `None` — дорожки нет
+/// (у оригинала тогда `audio_fallback: no audio stream; video only`).
+pub fn decode_audio_track(path: &Path) -> Res<Option<Vec<f32>>> {
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .map_err(|e| PipelineError::Load(format!("ffprobe: {e}")))?;
+    if String::from_utf8_lossy(&probe.stdout).trim().is_empty() {
+        return Ok(None);
+    }
+    decode_audio(path).map(Some)
+}
+
+/// `wemm_media.video_ids` со звуком: аудиотокены по группам кадров —
+/// границы `floor(i · tps / sampled_fps / window)` в f32 (как у оригинала),
+/// `sampled_fps` = выбранных кадров / длительность звука; хвост (паддинг
+/// 30-секундного куска) — последней группе.
+pub fn video_audio_groups(groups: usize, sampled: usize, tps: usize, count: usize, duration: f64, window: f64) -> Vec<usize> {
+    if groups == 0 {
+        return Vec::new();
+    }
+    let sampled_fps = sampled as f64 / duration;
+    let step = (tps as f64 / sampled_fps / window) as f32;
+    let mut bounds = vec![0usize];
+    for i in 1..groups {
+        let b = ((i as f32) * step).floor().max(0.0) as usize;
+        bounds.push(b.min(count));
+    }
+    bounds.push(count);
+    bounds.windows(2).map(|w| w[1].saturating_sub(w[0])).collect()
+}
+
+/// Звуковая дорожка видео → эмбеддинги `[count, hidden]` и длительность;
+/// `None` — дорожки нет. Без PCM16 (у оригинала звук видео идёт float32).
+pub fn encode_video_track(
+    bundle: &Path,
+    cfg: &AudioConfig,
+    video: &Path,
+    device: Device,
+) -> Res<Option<(Tensor, f64)>> {
+    let Some(samples) = decode_audio_track(video)? else { return Ok(None) };
+    let duration = samples.len() as f64 / SR as f64;
+    let embeds = encode_samples(bundle, cfg, &samples, device)?;
+    Ok(Some((embeds, duration)))
+}
+
 /// Звук любого формата → 16 кГц моно f32 (ffmpeg, как torchcodec у оригинала).
 pub fn decode_audio(path: &Path) -> Res<Vec<f32>> {
     let out = std::process::Command::new("ffmpeg")
@@ -405,7 +452,26 @@ pub fn encode_audio(
     let mut samples = decode_audio(audio)?;
     let duration = samples.len() as f64 / SR as f64;
     pcm16_roundtrip(&mut samples);
-    let mels = mel_segments(&samples, cfg)?;
+    let embeds = encode_samples(bundle, cfg, &samples, device)?;
+    // Сверка с эталоном: `SYN_WEMM_AUDIO_DUMP=путь` → `путь.pcm.f32`
+    // (16 кГц после PCM16) и `путь.emb.f32` (`[tokens, hidden]`).
+    if let Some(dump) = std::env::var_os("SYN_WEMM_AUDIO_DUMP") {
+        let dump = std::path::PathBuf::from(dump);
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let emb: Vec<f32> = embeds.flatten_all().and_then(|t| t.to_vec1()).map_err(err("dump"))?;
+        let _ = std::fs::write(dump.with_extension("pcm.f32"), bytes(&samples));
+        let _ = std::fs::write(dump.with_extension("emb.f32"), bytes(&emb));
+        eprintln!("[wemm-audio] дамп → {}.{{pcm,emb}}.f32", dump.display());
+    }
+    let count = embeds.dims()[0];
+    let (groups, times) = timestamp_groups(count, cfg.second_per_window, duration, cfg.timestamp_interval);
+    Ok((embeds, AudioPromptInfo { duration, groups, times }))
+}
+
+/// 16 кГц моно → эмбеддинги аудио-башни `[куски·300, hidden]` на устройстве
+/// LLM. Башня грузится на время вызова; на CUDA при нехватке памяти — CPU F32.
+pub fn encode_samples(bundle: &Path, cfg: &AudioConfig, samples: &[f32], device: Device) -> Res<Tensor> {
+    let mels = mel_segments(samples, cfg)?;
     // `SYN_WEMM_AUDIO_CPU=1` — кодировать на CPU (проверка запасного пути).
     let force_cpu = std::env::var_os("SYN_WEMM_AUDIO_CPU").is_some();
     let embeds = match device {
@@ -426,16 +492,6 @@ pub fn encode_audio(
     // После запасного пути на CPU эмбеддинги — на устройство LLM (иначе
     // префилл падал «device mismatch: lhs=Cuda(0), rhs=Cpu»).
     let embeds = embeds.to_device(device).map_err(err("audio to device"))?;
-    // Сверка с эталоном: `SYN_WEMM_AUDIO_DUMP=путь` → `путь.pcm.f32`
-    // (16 кГц после PCM16) и `путь.emb.f32` (`[tokens, hidden]`).
-    if let Some(dump) = std::env::var_os("SYN_WEMM_AUDIO_DUMP") {
-        let dump = std::path::PathBuf::from(dump);
-        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let emb: Vec<f32> = embeds.flatten_all().and_then(|t| t.to_vec1()).map_err(err("dump"))?;
-        let _ = std::fs::write(dump.with_extension("pcm.f32"), bytes(&samples));
-        let _ = std::fs::write(dump.with_extension("emb.f32"), bytes(&emb));
-        eprintln!("[wemm-audio] дамп → {}.{{pcm,emb}}.f32", dump.display());
-    }
     let count = mels.len() * cfg.tokens_per_segment();
     if embeds.dims()[0] != count {
         return Err(PipelineError::Forward(format!(
@@ -443,8 +499,7 @@ pub fn encode_audio(
             embeds.dims()[0]
         )));
     }
-    let (groups, times) = timestamp_groups(count, cfg.second_per_window, duration, cfg.timestamp_interval);
-    Ok((embeds, AudioPromptInfo { duration, groups, times }))
+    Ok(embeds)
 }
 
 #[cfg(test)]
@@ -462,5 +517,12 @@ mod tests {
         assert_eq!(s, vec![8, 8, 9 + 275]);
         let (s, _) = timestamp_groups(300, 0.1, 0.8, 1.0);
         assert_eq!(s, vec![300]);
+    }
+
+    #[test]
+    fn video_groups_match_reference() {
+        // 5-с клип: 10 кадров, 5 групп, звук 5 с → 300 токенов:
+        // шаг 2/(10/5)/0,1 = 10 → границы 10,20,30,40 и хвост 260.
+        assert_eq!(video_audio_groups(5, 10, 2, 300, 5.0, 0.1), vec![10, 10, 10, 10, 260]);
     }
 }

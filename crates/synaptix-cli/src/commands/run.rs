@@ -50,6 +50,8 @@ pub struct RunArgs {
     pub video: Option<PathBuf>,
     /// Звук для мультимодального промпта (WeMM-Video).
     pub audio: Option<PathBuf>,
+    /// Видео без звуковой дорожки.
+    pub no_video_audio: bool,
     /// Запретить DFlash-спекуляцию (Muse Glimmer), даже если драфтер в бандле.
     pub no_dflash: bool,
     pub sampling: SamplingFlags,
@@ -160,8 +162,14 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         media.push(m);
     }
     if let Some(p) = &args.video {
-        let m = llm.encode_video(p)?;
-        eprintln!("synaptix run: video {} → {} токенов", p.display(), m.tokens);
+        let m = llm.encode_video_opts(p, !args.no_video_audio)?;
+        let audio = m.audio.as_ref().map_or(0, |a| a.dims()[0]);
+        eprintln!(
+            "synaptix run: video {} → {} токенов{}",
+            p.display(),
+            m.tokens,
+            if audio > 0 { format!(" (из них звук {audio})") } else { String::new() }
+        );
         media.push(m);
     }
     if let Some(p) = &args.audio {
