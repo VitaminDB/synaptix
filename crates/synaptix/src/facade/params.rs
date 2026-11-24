@@ -291,8 +291,15 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     let preset = profile.pick("", false).or_else(|| profile.presets.first());
     let p = |get: fn(&super::sampling::SamplingPreset) -> f64, fallback: f64| f(preset.map(get).unwrap_or(fallback));
     let window = path.and_then(super::arch::config_max_seq).unwrap_or(131072).max(2048);
+    // Модели, обученные с фиксированной системной репликой (WeMM-Video —
+    // «You are a helpful assistant.» из processor_config.json): она и есть
+    // стартовый промпт по умолчанию, иначе служба подставит свой.
+    let system_default = path
+        .and_then(super::arch::model_type)
+        .filter(|t| t == "wemm_qwen3_5_moe")
+        .map(|_| ParamValue::Text("You are a helpful assistant.".into()));
     let mut out = vec![
-        spec("system_prompt", "Стартовый промпт", "Системное сообщение в начале диалога; у программ со своим (ассистент) добавляется к нему", ParamKind::Text { multiline: true }, None),
+        spec("system_prompt", "Стартовый промпт", "Системное сообщение в начале диалога; у программ со своим (ассистент) добавляется к нему", ParamKind::Text { multiline: true }, system_default),
         spec("context", "Размер контекста, токенов", "Сколько токенов модель держит в памяти: промпт, история и ответ. Кэш растёт по мере разговора до этого предела", int(2048, window as i64, 1024), i(window as i64)),
         spec("max_tokens", "Максимум генерируемых токенов", "Предел длины одного ответа вместе с размышлениями", int(16, window as i64, 64), i(16384.min(window as i64))),
         spec("temperature", "Температура", "Выше — разнообразнее, ниже — точнее", float(0.0, 2.0, 0.05, 2), p(|s| s.temperature as f64, 0.7)),
