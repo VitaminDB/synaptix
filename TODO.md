@@ -19,8 +19,8 @@
       .syn под 24 ГБ, поддержка в synaptix и в synaptixd (`MEDIA=звук.wav synaptixctl gen …`), сверка входа и
       аудио-башни с эталоном transformers; проверка только через службу — 5 звуков `~/Videos/Test/звуки`, запрос
       `~/Videos/asset_probe/scripts/audio_svc.sh`):
-      1. MOSS-Audio-8B-Thinking (OpenMOSS, github.com/OpenMOSS/MOSS-Audio, arXiv 2606.01802) — описание звука и
-         ответы с привязкой ко времени, MMAU 77,3;
+      1. ~~MOSS-Audio-8B-Thinking~~ — сделано 24.11 (`docs/moss_audio.md`, в службе `moss-audio-8b-thinking`);
+         осталось: скорость декода MXFP8 (~56 ток/с у 8B, GEMV ≈0,5 ТБ/с);
       2. Audio Flamingo Next (NVIDIA, arXiv 2604.10905), ~8B, режим captioner;
       3. Qwen3-Omni-30B-A3B-Captioner (huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Captioner) — описание любого звука
          без промпта, клипы до 30 с, аудио-энкодер AuT.
