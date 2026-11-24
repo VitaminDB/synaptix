@@ -16,6 +16,8 @@ pub struct HybridWeights {
     /// Префикс языковой части в бандле: `model.language_model.` (Qwen3.5/3.6,
     /// WeMM) или `language_model.` (MOSS-Audio).
     lm_prefix: &'static str,
+    /// Имя головы в бандле.
+    lm_head: &'static str,
     pub tokenizer_json: Vec<u8>,
     pub device: Device,
     pub dtype: DType,
@@ -35,14 +37,21 @@ impl HybridWeights {
         let tokenizer_json = loader
             .read_file("tokenizer.json")
             .ok_or_else(|| LoadError::Io("read tokenizer.json: нет файла".into()))?;
-        let lm_prefix = if !WeightLoader::contains(&loader, &format!("{LM_PREFIX}embed_tokens.weight"))
-            && WeightLoader::contains(&loader, "language_model.embed_tokens.weight")
+        // Префикс языковой части: Qwen3.5/3.6/WeMM — `model.language_model.`,
+        // MOSS-Audio — `language_model.`, Audio Flamingo Next —
+        // `language_model.model.` (и голова `language_model.lm_head`).
+        let lm_prefix = [LM_PREFIX, "language_model.model.", "language_model."]
+            .into_iter()
+            .find(|p| WeightLoader::contains(&loader, &format!("{p}embed_tokens.weight")))
+            .unwrap_or(LM_PREFIX);
+        let lm_head = if !WeightLoader::contains(&loader, "lm_head.weight")
+            && WeightLoader::contains(&loader, "language_model.lm_head.weight")
         {
-            "language_model."
+            "language_model.lm_head.weight"
         } else {
-            LM_PREFIX
+            "lm_head.weight"
         };
-        Ok(Self { config, loader, lm_prefix, tokenizer_json, device, dtype })
+        Ok(Self { config, loader, lm_prefix, lm_head, tokenizer_json, device, dtype })
     }
 
     pub fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, LoadError> {
@@ -64,7 +73,7 @@ impl HybridWeights {
     /// `model.language_model.`, а снаружи адресуется как `model.`.
     fn bundle_key(&self, key: &str) -> String {
         if key == "lm_head.weight" {
-            return key.to_string();
+            return self.lm_head.to_string();
         }
         match key.strip_prefix("model.") {
             Some(rest) => format!("{}{rest}", self.lm_prefix),
@@ -89,7 +98,7 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
         dtype: DType,
     ) -> Result<Tensor, synaptix_llm_common::ModelError> {
         let r = if key == "lm_head.weight" {
-            HybridWeights::tensor(self, key, device, dtype)
+            HybridWeights::tensor(self, self.lm_head, device, dtype)
         } else if let Some(rest) = key.strip_prefix("model.") {
             self.lm_tensor(rest, device, dtype)
         } else {

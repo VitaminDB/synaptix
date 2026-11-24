@@ -386,6 +386,18 @@ fn optimal_profile_blackwell(path: &Path) -> OptimalProfile {
         policy.lm_head_storage = DType::BF16;
         policy.kv_dtype = KvDtypePolicy::BF16;
     }
+    // Audio Flamingo Next (языковая часть — Qwen2.5-7B): у Qwen2.5 крупные
+    // выбросы активаций, и на F16-счёте с MXFP8-эмбеддингами ответ о звуке
+    // переворачивался (24.11: бас-дроп — «high-pitched beep» вместо «low,
+    // sustained bass note» у эталона). Счёт и эмбеддинги BF16 — ответ
+    // совпадает с BF16-эталоном.
+    // KV плотный: у Qwen2 в K крупные выбросы (смещения `k_proj`), и
+    // MXFP8-кэш их съедает — именно он и переворачивал ответ.
+    if crate::facade::arch::model_type(path).as_deref() == Some("musicflamingo") {
+        policy.compute = DType::BF16;
+        policy.embed_storage = DType::BF16;
+        policy.kv_dtype = KvDtypePolicy::BF16;
+    }
     // Маленькие модели (плотный .syn до 4 ГиБ — до ~2B параметров в bf16):
     // квант на загрузке им вреден, а экономить нечего. NVFP4 ломает речь 1B
     // (MiniCPM-V 4.7 1B: «искусственный интелм из машиней»), MXFP8 подмешивает

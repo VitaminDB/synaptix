@@ -296,7 +296,12 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     // стартовый промпт по умолчанию, иначе служба подставит свой.
     let is_wemm = path.and_then(super::arch::model_type).is_some_and(|t| t == "wemm_qwen3_5_moe");
     let is_moss = path.and_then(super::arch::model_type).is_some_and(|t| t == "moss_audio");
-    let system_default = (is_wemm || is_moss).then(|| ParamValue::Text("You are a helpful assistant.".into()));
+    let is_af = path.and_then(super::arch::model_type).is_some_and(|t| t == "musicflamingo");
+    let system_default = if is_af {
+        Some(ParamValue::Text(synaptix_llm_qwen3_next_hybrid::pipeline::AF_NEXT_SYSTEM.into()))
+    } else {
+        (is_wemm || is_moss).then(|| ParamValue::Text("You are a helpful assistant.".into()))
+    };
     let mut out = vec![
         spec("system_prompt", "Стартовый промпт", "Системное сообщение в начале диалога; у программ со своим (ассистент) добавляется к нему", ParamKind::Text { multiline: true }, system_default),
         spec("context", "Размер контекста, токенов", "Сколько токенов модель держит в памяти: промпт, история и ответ. Кэш растёт по мере разговора до этого предела", int(2048, window as i64, 1024), i(window as i64)),

@@ -93,6 +93,9 @@ pub const VISION_RESERVE_BYTES: usize = 3 << 29;
 /// Потолок токенов видео WeMM-Video: 64 группы × 384 (128 кадров при
 /// total_pixels 25 165 824) — короткий клип упирается в 768 на группу.
 const WEMM_VIDEO_TOKENS: usize = 24_576;
+/// Системная реплика шаблона Audio Flamingo Next (подставляется им самим,
+/// если своей нет).
+pub const AF_NEXT_SYSTEM: &str = "You are Audio Flamingo-Next, a multimodal assistant for language and audio. On each turn you receive an optional audio clip which may contain speech, music, or ambient sounds and optional text, you will receive at least one or both; use your world knowledge and reasoning to help the user with any task. Interpret the entirety of the content of any input audio—regardless of whether the user calls it audio, speech, music, or sound.";
 
 pub struct HybridPipeline {
     pub model: DecoderModel,
@@ -713,6 +716,9 @@ impl HybridPipeline {
     /// Системная реплика по умолчанию: WeMM-Video обучен с
     /// «You are a helpful assistant.» (`processor_config.json`).
     pub fn default_system_prompt(&self) -> Option<&'static str> {
+        if self.config.af_next {
+            return Some(AF_NEXT_SYSTEM);
+        }
         (self.config.wemm || self.config.moss_audio).then_some("You are a helpful assistant.")
     }
 
@@ -740,6 +746,16 @@ impl HybridPipeline {
         if self.config.audio_token_id.is_none() {
             return Err(PipelineError::Model("config.json без audio_token_id".into()));
         }
+        if self.config.af_next {
+            let bytes = synaptix_bundle::Bundle::open(bundle)
+                .ok()
+                .and_then(|b| b.read_file("config.json").ok().map(|c| c.into_owned()))
+                .ok_or_else(|| PipelineError::Model("config.json не читается".into()))?;
+            let cfg = crate::af_audio::AfConfig::from_config_json(&bytes)
+                .ok_or_else(|| PipelineError::Model("audio_config AF-Next не разобран".into()))?;
+            let e = crate::af_audio::encode(bundle, &cfg, audio.as_ref(), self.model.device)?;
+            return Ok(AudioEncoding { embeds: e.embeds, deepstack: Vec::new(), prompt_block: e.prompt_block });
+        }
         if self.config.moss_audio {
             let bytes = synaptix_bundle::Bundle::open(bundle)
                 .ok()
@@ -759,7 +775,7 @@ impl HybridPipeline {
     /// Есть ли у модели аудио-башня (WeMM-Video, MOSS-Audio).
     pub fn has_audio_tower(&self, bundle: impl AsRef<Path>) -> bool {
         self.config.audio_token_id.is_some()
-            && (self.config.moss_audio || Self::bundle_audio_config(bundle).is_some())
+            && (self.config.moss_audio || self.config.af_next || Self::bundle_audio_config(bundle).is_some())
     }
 
     /// [`Self::encode_video`] с потолком vision-токенов на всё видео

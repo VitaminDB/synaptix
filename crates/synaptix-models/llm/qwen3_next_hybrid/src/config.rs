@@ -189,6 +189,10 @@ pub struct HybridConfig {
     pub moss_audio: bool,
     /// Нормы без «+1» (обычный Qwen3), а не `1 + w` Qwen3-Next/3.5.
     pub plain_norm: bool,
+    /// RMS-нормы q/k внутри внимания (у Qwen2 их нет).
+    pub qk_norm: bool,
+    /// Audio Flamingo Next (`model_type = musicflamingo`): башня AF3 + RoTE.
+    pub af_next: bool,
     pub vision_start_token_id: Option<u32>,
     pub vision_end_token_id: Option<u32>,
     /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
@@ -243,9 +247,18 @@ impl HybridConfig {
             .unwrap_or_else(|| root.clone());
         // Обычный Qwen3 (языковая часть MOSS-Audio): нормы без «+1», без
         // гейта выхода внимания, RoPE на всю голову, `rope_theta` в корне.
-        let plain = tc.get("model_type").and_then(|v| v.as_str()) == Some("qwen3");
+        let tc_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let plain = tc_type == "qwen3" || tc_type == "qwen2";
+        // Qwen2/2.5 (языковая часть Audio Flamingo Next): ещё и без qk-норм,
+        // со смещениями q/k/v, `head_dim` = hidden / heads.
+        let qwen2 = tc_type == "qwen2";
         if plain {
             if let Some(o) = tc.as_object_mut() {
+                if !o.contains_key("head_dim") {
+                    let h = o.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let n = o.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+                    o.insert("head_dim".into(), (h / n).into());
+                }
                 o.entry("partial_rotary_factor").or_insert(1.0.into());
                 o.entry("attn_output_gate").or_insert(false.into());
                 if !o.contains_key("rope_parameters") {
@@ -266,6 +279,8 @@ impl HybridConfig {
         cfg.video_token_id = id("video_token_id");
         cfg.audio_token_id = id("audio_token_id");
         cfg.plain_norm = plain;
+        cfg.qk_norm = !qwen2;
+        cfg.af_next = root.get("model_type").and_then(|v| v.as_str()) == Some("musicflamingo");
         // MOSS-Audio: заполнитель звука — `<|vision_pad|>` (151654, у
         // процессора `<|AUDIO|>`), id нет в config.json.
         cfg.moss_audio = root.get("model_type").and_then(|v| v.as_str()) == Some("moss_audio");
@@ -348,6 +363,8 @@ impl HybridConfig {
             wemm: false,
             moss_audio: false,
             plain_norm: false,
+            qk_norm: true,
+            af_next: false,
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,
@@ -432,7 +449,7 @@ impl HybridConfig {
             activation: common::Activation::Silu,
             sandwich_norms: false,
             post_norm_eps: None,
-            qk_norm: true,
+            qk_norm: self.qk_norm,
             attn_output_gate: self.attn_output_gate,
             attn_scale: 1.0 / (self.head_dim as f32).sqrt(),
             embed_scale: None,
