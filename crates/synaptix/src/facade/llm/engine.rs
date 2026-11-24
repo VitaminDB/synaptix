@@ -2242,6 +2242,13 @@ impl Llm {
         matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.has_audio_tower(&self.model_path))
     }
 
+    /// Медиаблок стоит вплотную к тексту, без перевода строки (шаблон Audio
+    /// Flamingo Next: `<sound>` + вопрос) — клиентам, которые сами склеивают
+    /// блок с текстом (служба).
+    pub fn media_joins_text(&self) -> bool {
+        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.af_next)
+    }
+
     /// Системная реплика, с которой модель обучалась, если её нужно ставить
     /// без явной (WeMM-Video — «You are a helpful assistant.»).
     pub fn default_system_prompt(&self) -> Option<&'static str> {

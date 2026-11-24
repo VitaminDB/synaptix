@@ -142,6 +142,22 @@ const QWEN35_INSTRUCT: SamplingPreset = preset("instruct", Some(false), 0.7, 0.8
 /// Qwen3 и Qwen3-Next: размышления на 0.6, без штрафов.
 const QWEN3_THINKING: SamplingPreset = preset("thinking", Some(true), 0.6, 0.95, 20, 0.0);
 const QWEN3_INSTRUCT: SamplingPreset = preset("instruct", Some(false), 0.7, 0.8, 20, 0.0);
+/// Audio Flamingo Next: в `generation_config` сэмплинга нет (жадный выбор),
+/// карточка советует `repetition_penalty=1.2`. Пресет Qwen3.5 (0.7 /
+/// presence 1.5) сбивал описание звука («high-pitched whoosh» вместо низкой
+/// басовой ноты у жадного эталона).
+const AF_NEXT_RECOMMENDED: SamplingPreset = SamplingPreset {
+    id: "recommended",
+    thinking: None,
+    temperature: 0.0,
+    top_p: 1.0,
+    top_k: 1,
+    min_p: 0.0,
+    presence_penalty: 0.0,
+    repetition_penalty: 1.2,
+};
+/// MOSS-Audio: сэмплинг из `infer.py` / `hf_inference.py` оригинала.
+const MOSS_AUDIO_RECOMMENDED: SamplingPreset = preset("recommended", None, 1.0, 1.0, 50, 0.0);
 /// Gemma-4 и Muse Glimmer: один набор на все задачи.
 const TOP_K64_RECOMMENDED: SamplingPreset = preset("recommended", None, 1.0, 0.95, 64, 0.0);
 /// Модель ничего не рекомендует: умеренная температура и узкое ядро — то,
@@ -161,6 +177,8 @@ pub(crate) fn profile_from_parts(
         // в нём появился `reasoning_effort`, а пресет для кода из карточки ушёл.
         Some(LlmArch::Qwen4Exp) => vec![QWEN35_THINKING, QWEN35_INSTRUCT],
         Some(LlmArch::Hybrid) if key == "qwen3_next" => vec![QWEN3_THINKING, QWEN3_INSTRUCT],
+        Some(LlmArch::Hybrid) if key == "musicflamingo" => vec![AF_NEXT_RECOMMENDED],
+        Some(LlmArch::Hybrid) if key == "moss_audio" => vec![MOSS_AUDIO_RECOMMENDED],
         Some(LlmArch::Hybrid) if reasoning.is_some() => vec![QWEN35_THINKING, QWEN35_INSTRUCT],
         Some(LlmArch::Hybrid) => vec![QWEN35_THINKING, QWEN35_THINKING_CODING, QWEN35_INSTRUCT],
         // `Qwen3` у детектора — ещё и «всё неизвестное», поэтому по ключу.
