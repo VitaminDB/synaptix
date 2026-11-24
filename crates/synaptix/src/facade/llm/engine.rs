@@ -3115,6 +3115,30 @@ impl<'a> LlmGeneration<'a> {
         prompt_ids: &[u32],
         tokenizer: &LlmTokenizer,
         media: &[&MediaEmbedding],
+        mut on_token: F,
+    ) -> Result<usize, LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        // Точка возврата исходного промпта: после закрытия размышлений по
+        // бюджету следующий ход истории размышлений не несёт.
+        let resume = session.resume_at();
+        let len = prompt_ids.len();
+        let first = self.with_think_budget(prompt_ids, tokenizer, &mut on_token, |g, ids, second, f| {
+            if second {
+                session.set_resume_at(Some(resume.unwrap_or(len).min(len)));
+            }
+            g.generate_streaming_cached_media_raw(session, ids, tokenizer, media, f)
+        });
+        first
+    }
+
+    fn generate_streaming_cached_media_raw<F>(
+        &mut self,
+        session: &mut LlmKvSession,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        media: &[&MediaEmbedding],
         on_token: F,
     ) -> Result<usize, LlmError>
     where
@@ -3335,10 +3359,25 @@ impl<'a> LlmGeneration<'a> {
     where
         F: FnMut(u32, &str) -> bool,
     {
-        // Учёт хода и бюджет размышлений — как у текстового пути: токены,
-        // размышления ChatML (`</think>`), кто остановил; по исчерпании
-        // бюджета размышления закрываются за модель, и ход продолжается
-        // ответом (медиа префиллятся заново вместе с размышлениями).
+        self.with_think_budget(prompt_ids, tokenizer, &mut on_token, |g, ids, _second, f| {
+            g.generate_streaming_media_raw(ids, tokenizer, media, f)
+        })
+        .map(|_| ())
+    }
+
+    /// Учёт хода и бюджет размышлений для медиа-путей — как у текстового:
+    /// токены, размышления ChatML (`</think>`), кто остановил; по исчерпании
+    /// бюджета размышления закрываются за модель, и ход продолжается ответом
+    /// вторым вызовом `run` (промпт + размышления + `</think>`; `second` =
+    /// true). Без этого бюджет на медиа не действовал и THINK=1 на звуке
+    /// уходил в размышления до предела.
+    fn with_think_budget<R>(
+        &mut self,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        on_token: &mut dyn FnMut(u32, &str) -> bool,
+        mut run: impl FnMut(&mut Self, &[u32], bool, &mut dyn FnMut(u32, &str) -> bool) -> Result<R, LlmError>,
+    ) -> Result<R, LlmError> {
         self.finish = GenerationFinish::default();
         let single = |s: &str| match tokenizer.encode(s) {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),
@@ -3364,7 +3403,7 @@ impl<'a> LlmGeneration<'a> {
             seq: Vec<u32>,
         }
         let mut t = T { n: 0, think: 0, inside: close.is_some(), last: None, cb_stop: false, over: false, seq: Vec::new() };
-        let mut feed = |t: &mut T, id: u32, s: &str, budget: usize, on_token: &mut F| -> bool {
+        let mut feed = |t: &mut T, id: u32, s: &str, budget: usize, on_token: &mut dyn FnMut(u32, &str) -> bool| -> bool {
             t.n += 1;
             t.last = Some(id);
             t.seq.push(id);
@@ -3385,7 +3424,7 @@ impl<'a> LlmGeneration<'a> {
             }
             true
         };
-        let mut r = self.generate_streaming_media_raw(prompt_ids, tokenizer, media, |id, s| feed(&mut t, id, s, budget, &mut on_token));
+        let mut r = run(self, prompt_ids, false, &mut |id, s| feed(&mut t, id, s, budget, on_token));
         if r.is_ok() && t.over && !t.cb_stop {
             let forced = tokenizer.encode("\n</think>\n\n").map_err(|e| LlmError(e.to_string()))?;
             let mut prompt2 = Vec::with_capacity(prompt_ids.len() + t.seq.len() + forced.len());
@@ -3396,14 +3435,14 @@ impl<'a> LlmGeneration<'a> {
                 prompt2.push(*id);
                 if go {
                     let piece = tokenizer.decode(&[*id]).unwrap_or_default();
-                    go = feed(&mut t, *id, &piece, 0, &mut on_token);
+                    go = feed(&mut t, *id, &piece, 0, on_token);
                 }
             }
             t.inside = false;
             self.finish.thinking_forced = true;
             if go {
                 self.opts.max_new_tokens = max_new.saturating_sub(t.n).max(1);
-                r = self.generate_streaming_media_raw(&prompt2, tokenizer, media, |id, s| feed(&mut t, id, s, 0, &mut on_token));
+                r = run(self, &prompt2, true, &mut |id, s| feed(&mut t, id, s, 0, on_token));
                 self.opts.max_new_tokens = max_new;
             }
         }
