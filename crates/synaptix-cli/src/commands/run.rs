@@ -194,8 +194,16 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         if let Some(sys) = args.system.clone().or_else(|| llm.default_system_prompt().map(str::to_string)) {
             msgs.push(Message::system(sys));
         }
-        msgs.push(Message::user(format!("{blocks}{}", args.prompt)));
-        tok.apply_chat_template_reasoning(&msgs, true, thinking, args.reasoning_effort.as_deref(), None)?
+        // Qwen3-Omni Captioner текста не принимает — только аудиоблок.
+        if llm.audio_only_prompt() && !media.is_empty() {
+            if !args.prompt.trim().is_empty() {
+                eprintln!("synaptix run: модель принимает только звук — текст запроса отброшен");
+            }
+            msgs.push(Message::user(blocks));
+        } else {
+            msgs.push(Message::user(format!("{blocks}{}", args.prompt)));
+        }
+        llm.finalize_prompt(tok.apply_chat_template_reasoning(&msgs, true, thinking, args.reasoning_effort.as_deref(), None)?)
     } else {
         args.prompt.clone()
     };

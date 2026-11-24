@@ -867,7 +867,10 @@ fn load_qkv_fused(w: &WhisperWeights, prefix: &str) -> Result<QuantLinear> {
     let weight = Tensor::cat(&[&wq, &wk, &wv], 0)?;
     let bq = w.get(&format!("{prefix}.q_proj.bias"))?;
     let bv = w.get(&format!("{prefix}.v_proj.bias"))?;
-    let bk = Tensor::zeros(bq.dims().to_vec(), bq.dtype(), bq.device())?;
+    let bk = match w.contains(&format!("{prefix}.k_proj.bias")) {
+        true => w.get(&format!("{prefix}.k_proj.bias"))?,
+        false => Tensor::zeros(bq.dims().to_vec(), bq.dtype(), bq.device())?,
+    };
     let bias = Tensor::cat(&[&bq, &bk, &bv], 0)?;
     Ok(match w.quant {
         Some(q) => QuantLinear::build(weight, Some(bias), q, w.dtype)?,
@@ -888,9 +891,10 @@ fn load_attention(
         Qkv::Fused(load_qkv_fused(w, prefix)?)
     } else {
         Qkv::Split {
-            // k_proj без bias — характерно для Whisper.
+            // k_proj без bias — характерно для Whisper; у энкодеров на его
+            // слоях (AuT Qwen3-Omni) bias бывает — берём, если он есть.
             q: load_linear(w, &format!("{prefix}.q_proj"), true)?,
-            k: load_linear(w, &format!("{prefix}.k_proj"), false)?,
+            k: load_linear(w, &format!("{prefix}.k_proj"), w.contains(&format!("{prefix}.k_proj.bias")))?,
             v: load_linear(w, &format!("{prefix}.v_proj"), true)?,
         }
     };

@@ -2242,11 +2242,31 @@ impl Llm {
         matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.has_audio_tower(&self.model_path))
     }
 
+    /// Модель принимает только звук, без текста (Qwen3-Omni Captioner):
+    /// клиенты отбрасывают текст запроса — реплика пользователя состоит из
+    /// одного аудиоблока, как у процессора оригинала.
+    pub fn audio_only_prompt(&self) -> bool {
+        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.audio_only)
+    }
+
+    /// Промпт после шаблона — поправки модели: Qwen3-Omni Captioner вызывают
+    /// без `enable_thinking`, и пустого блока `<think>\n\n</think>\n\n`,
+    /// который шаблон ставит при `false`, у оригинала нет (с ним модель
+    /// сразу закрывала ответ).
+    pub fn finalize_prompt(&self, prompt: String) -> String {
+        if self.audio_only_prompt() {
+            if let Some(p) = prompt.strip_suffix("<think>\n\n</think>\n\n") {
+                return p.to_string();
+            }
+        }
+        prompt
+    }
+
     /// Медиаблок стоит вплотную к тексту, без перевода строки (шаблон Audio
     /// Flamingo Next: `<sound>` + вопрос) — клиентам, которые сами склеивают
     /// блок с текстом (служба).
     pub fn media_joins_text(&self) -> bool {
-        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.af_next)
+        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.af_next || h.config.omni)
     }
 
     /// Системная реплика, с которой модель обучалась, если её нужно ставить

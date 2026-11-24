@@ -297,7 +297,12 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     let is_wemm = path.and_then(super::arch::model_type).is_some_and(|t| t == "wemm_qwen3_5_moe");
     let is_moss = path.and_then(super::arch::model_type).is_some_and(|t| t == "moss_audio");
     let is_af = path.and_then(super::arch::model_type).is_some_and(|t| t == "musicflamingo");
-    let system_default = if is_af {
+    // Qwen3-Omni: шаблон без системной реплики, Captioner её не ждёт —
+    // пустой стартовый промпт (клиенты пустой не ставят), а не общий службы.
+    let is_omni = path.and_then(super::arch::model_type).is_some_and(|t| t == "qwen3_omni_moe");
+    let system_default = if is_omni {
+        Some(ParamValue::Text(String::new()))
+    } else if is_af {
         Some(ParamValue::Text(synaptix_llm_qwen3_next_hybrid::pipeline::AF_NEXT_SYSTEM.into()))
     } else {
         (is_wemm || is_moss).then(|| ParamValue::Text("You are a helpful assistant.".into()))

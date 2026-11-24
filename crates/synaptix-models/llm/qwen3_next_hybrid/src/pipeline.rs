@@ -746,6 +746,16 @@ impl HybridPipeline {
         if self.config.audio_token_id.is_none() {
             return Err(PipelineError::Model("config.json без audio_token_id".into()));
         }
+        if self.config.omni {
+            let bytes = synaptix_bundle::Bundle::open(bundle)
+                .ok()
+                .and_then(|b| b.read_file("config.json").ok().map(|c| c.into_owned()))
+                .ok_or_else(|| PipelineError::Model("config.json не читается".into()))?;
+            let cfg = crate::omni_audio::OmniAudioConfig::from_config_json(&bytes)
+                .ok_or_else(|| PipelineError::Model("audio_config Qwen3-Omni не разобран".into()))?;
+            let e = crate::omni_audio::encode(bundle, &cfg, audio.as_ref(), self.model.device)?;
+            return Ok(AudioEncoding { embeds: e.embeds, deepstack: Vec::new(), prompt_block: e.prompt_block });
+        }
         if self.config.af_next {
             let bytes = synaptix_bundle::Bundle::open(bundle)
                 .ok()
@@ -775,7 +785,7 @@ impl HybridPipeline {
     /// Есть ли у модели аудио-башня (WeMM-Video, MOSS-Audio).
     pub fn has_audio_tower(&self, bundle: impl AsRef<Path>) -> bool {
         self.config.audio_token_id.is_some()
-            && (self.config.moss_audio || self.config.af_next || Self::bundle_audio_config(bundle).is_some())
+            && (self.config.moss_audio || self.config.af_next || self.config.omni || Self::bundle_audio_config(bundle).is_some())
     }
 
     /// [`Self::encode_video`] с потолком vision-токенов на всё видео

@@ -42,7 +42,12 @@ fn config_u64(path: &std::path::Path, key: &str) -> Option<u64> {
     let bytes = synaptix_io::weights::syn_bundle::read_model_file(path, "config.json")?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let get = |v: &serde_json::Value| v.get(key).and_then(|n| n.as_u64());
-    get(&v).or_else(|| v.get("text_config").and_then(get))
+    // Языковая часть бывает вложена: `text_config`, `language_config`
+    // (MOSS-Audio), `thinker_config.text_config` (Qwen3-Omni).
+    get(&v)
+        .or_else(|| v.get("text_config").and_then(get))
+        .or_else(|| v.get("language_config").and_then(get))
+        .or_else(|| v.get("thinker_config").and_then(|t| t.get("text_config")).and_then(get))
 }
 
 fn num_layers(path: &std::path::Path) -> Option<usize> {

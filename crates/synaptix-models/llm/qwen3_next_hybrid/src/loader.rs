@@ -40,17 +40,14 @@ impl HybridWeights {
         // Префикс языковой части: Qwen3.5/3.6/WeMM — `model.language_model.`,
         // MOSS-Audio — `language_model.`, Audio Flamingo Next —
         // `language_model.model.` (и голова `language_model.lm_head`).
-        let lm_prefix = [LM_PREFIX, "language_model.model.", "language_model."]
+        let lm_prefix = [LM_PREFIX, "language_model.model.", "language_model.", "thinker.model."]
             .into_iter()
             .find(|p| WeightLoader::contains(&loader, &format!("{p}embed_tokens.weight")))
             .unwrap_or(LM_PREFIX);
-        let lm_head = if !WeightLoader::contains(&loader, "lm_head.weight")
-            && WeightLoader::contains(&loader, "language_model.lm_head.weight")
-        {
-            "language_model.lm_head.weight"
-        } else {
-            "lm_head.weight"
-        };
+        let lm_head = ["lm_head.weight", "language_model.lm_head.weight", "thinker.lm_head.weight"]
+            .into_iter()
+            .find(|k| WeightLoader::contains(&loader, k))
+            .unwrap_or("lm_head.weight");
         Ok(Self { config, loader, lm_prefix, lm_head, tokenizer_json, device, dtype })
     }
 

@@ -193,6 +193,10 @@ pub struct HybridConfig {
     pub qk_norm: bool,
     /// Audio Flamingo Next (`model_type = musicflamingo`): башня AF3 + RoTE.
     pub af_next: bool,
+    /// Qwen3-Omni (`model_type = qwen3_omni_moe`): thinker с аудио-энкодером AuT.
+    pub omni: bool,
+    /// Модель принимает только звук, без текста (Qwen3-Omni Captioner).
+    pub audio_only: bool,
     pub vision_start_token_id: Option<u32>,
     pub vision_end_token_id: Option<u32>,
     /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
@@ -240,15 +244,18 @@ impl HybridConfig {
     pub fn from_hf_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
         let root: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|e| ConfigError::Parse(format!("config json: {e}")))?;
+        // Qwen3-Omni: языковая часть и id заполнителей — в `thinker_config`.
+        let thinker = root.get("thinker_config");
         let mut tc = root
             .get("text_config")
             .or_else(|| root.get("language_config"))
+            .or_else(|| thinker.and_then(|t| t.get("text_config")))
             .cloned()
             .unwrap_or_else(|| root.clone());
         // Обычный Qwen3 (языковая часть MOSS-Audio): нормы без «+1», без
         // гейта выхода внимания, RoPE на всю голову, `rope_theta` в корне.
         let tc_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let plain = tc_type == "qwen3" || tc_type == "qwen2";
+        let plain = tc_type == "qwen3" || tc_type == "qwen2" || tc_type == "qwen3_omni_moe_text";
         // Qwen2/2.5 (языковая часть Audio Flamingo Next): ещё и без qk-норм,
         // со смещениями q/k/v, `head_dim` = hidden / heads.
         let qwen2 = tc_type == "qwen2";
@@ -260,6 +267,12 @@ impl HybridConfig {
                     o.insert("head_dim".into(), (h / n).into());
                 }
                 o.entry("partial_rotary_factor").or_insert(1.0.into());
+                // Без `layer_types` у обычного Qwen все слои — full attention
+                // (умолчание гибрида — линейные через три).
+                if !o.contains_key("layer_types") {
+                    let n = o.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    o.insert("layer_types".into(), serde_json::json!(vec!["full_attention"; n]));
+                }
                 o.entry("attn_output_gate").or_insert(false.into());
                 if !o.contains_key("rope_parameters") {
                     let theta = o.get("rope_theta").cloned().unwrap_or(1_000_000.0.into());
@@ -277,10 +290,16 @@ impl HybridConfig {
         let id = |k: &str| root.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
         cfg.image_token_id = id("image_token_id");
         cfg.video_token_id = id("video_token_id");
-        cfg.audio_token_id = id("audio_token_id");
+        cfg.audio_token_id = id("audio_token_id")
+            .or_else(|| thinker.and_then(|t| t.get("audio_token_id")).and_then(|v| v.as_u64()).map(|v| v as u32));
         cfg.plain_norm = plain;
         cfg.qk_norm = !qwen2;
         cfg.af_next = root.get("model_type").and_then(|v| v.as_str()) == Some("musicflamingo");
+        cfg.omni = root.get("model_type").and_then(|v| v.as_str()) == Some("qwen3_omni_moe");
+        // Captioner — без talker и речевого выхода; текст он не принимает.
+        cfg.audio_only = cfg.omni
+            && root.get("enable_audio_output").and_then(|v| v.as_bool()) == Some(false)
+            && root.get("talker_config").is_none();
         // MOSS-Audio: заполнитель звука — `<|vision_pad|>` (151654, у
         // процессора `<|AUDIO|>`), id нет в config.json.
         cfg.moss_audio = root.get("model_type").and_then(|v| v.as_str()) == Some("moss_audio");
@@ -365,6 +384,8 @@ impl HybridConfig {
             plain_norm: false,
             qk_norm: true,
             af_next: false,
+            omni: false,
+            audio_only: false,
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,

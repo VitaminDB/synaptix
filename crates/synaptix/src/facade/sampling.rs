@@ -156,6 +156,8 @@ const AF_NEXT_RECOMMENDED: SamplingPreset = SamplingPreset {
     presence_penalty: 0.0,
     repetition_penalty: 1.2,
 };
+/// Qwen3-Omni (Captioner): `generation_config.json` и пример vLLM карточки.
+const OMNI_RECOMMENDED: SamplingPreset = preset("recommended", None, 0.6, 0.95, 20, 0.0);
 /// MOSS-Audio: сэмплинг из `infer.py` / `hf_inference.py` оригинала.
 const MOSS_AUDIO_RECOMMENDED: SamplingPreset = preset("recommended", None, 1.0, 1.0, 50, 0.0);
 /// Gemma-4 и Muse Glimmer: один набор на все задачи.
@@ -179,6 +181,7 @@ pub(crate) fn profile_from_parts(
         Some(LlmArch::Hybrid) if key == "qwen3_next" => vec![QWEN3_THINKING, QWEN3_INSTRUCT],
         Some(LlmArch::Hybrid) if key == "musicflamingo" => vec![AF_NEXT_RECOMMENDED],
         Some(LlmArch::Hybrid) if key == "moss_audio" => vec![MOSS_AUDIO_RECOMMENDED],
+        Some(LlmArch::Hybrid) if key == "qwen3_omni_moe" => vec![OMNI_RECOMMENDED],
         Some(LlmArch::Hybrid) if reasoning.is_some() => vec![QWEN35_THINKING, QWEN35_INSTRUCT],
         Some(LlmArch::Hybrid) => vec![QWEN35_THINKING, QWEN35_THINKING_CODING, QWEN35_INSTRUCT],
         // `Qwen3` у детектора — ещё и «всё неизвестное», поэтому по ключу.

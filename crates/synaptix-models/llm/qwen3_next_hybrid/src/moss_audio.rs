@@ -257,7 +257,7 @@ impl Tower {
     }
 
     /// Кусок mel `[n_mels, T]` → (выход `[T/8, d]`, deepstack-отводы).
-    fn chunk(&self, mel: &[f32], n_mels: usize, t: usize) -> Res<(Tensor, Vec<Tensor>)> {
+    fn chunk(&self, mel: &[f32], n_mels: usize, t: usize, valid: usize) -> Res<(Tensor, Vec<Tensor>)> {
         let e = err("moss encoder");
         let mut x = Tensor::from_vec(mel.to_vec(), vec![1, 1, n_mels, t], self.device)
             .and_then(|x| x.to_dtype(self.dtype))
@@ -274,6 +274,9 @@ impl Tower {
             .map_err(&e)?;
         let mut h = self.stem.forward(&x).map_err(&e)?;
         h = h.add(&self.positions(tt)?).map_err(&e)?;
+        // Внимание только по валидным строкам (маска паддинга оригинала).
+        let tt = valid.min(tt);
+        h = h.narrow(1, 0, tt).and_then(|t| t.contiguous()).map_err(&e)?;
         let mut taps = Vec::with_capacity(self.taps.len());
         for (i, l) in self.layers.iter().enumerate() {
             h = l.run(&h).map_err(err("moss encoder"))?;
@@ -303,13 +306,17 @@ fn encode_on(bundle: &Path, cfg: &MossAudioConfig, mel: &[f32], frames: usize, d
     let mut outs = Vec::new();
     let mut taps: Vec<Vec<Tensor>> = vec![Vec::new(); tower.taps.len()];
     let mut start = 0usize;
+    // Хвостовой кусок у оригинала добит нулями до самого длинного куска:
+    // свёртки за краем видят `gelu(bias)` по нулям, а внимание — только
+    // валидные кадры (маска). Добиваем так же, лишние строки отрезаются.
+    let pad_to = if frames > chunk { chunk } else { frames };
     while start < frames {
         let len = chunk.min(frames - start);
-        let mut part = vec![0f32; n_mels * len];
+        let mut part = vec![0f32; n_mels * pad_to];
         for m in 0..n_mels {
-            part[m * len..(m + 1) * len].copy_from_slice(&mel[m * frames + start..m * frames + start + len]);
+            part[m * pad_to..m * pad_to + len].copy_from_slice(&mel[m * frames + start..m * frames + start + len]);
         }
-        let (o, t) = no_grad(|| tower.chunk(&part, n_mels, len))?;
+        let (o, t) = no_grad(|| tower.chunk(&part, n_mels, pad_to, tokens_for_frames(len)))?;
         outs.push(o);
         for (k, x) in t.into_iter().enumerate() {
             taps[k].push(x);
