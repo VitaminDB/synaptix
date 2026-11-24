@@ -23,5 +23,5 @@
          осталось: скорость декода MXFP8 (~56 ток/с у 8B, GEMV ≈0,5 ТБ/с);
       2. ~~Audio Flamingo Next~~ — сделано 24.11: captioner (`docs/af_next.md`, в службе `af-next-captioner`);
          при надобности — тем же кодом instruct/think (`audio-flamingo-next-hf`, `-think-hf`);
-      3. Qwen3-Omni-30B-A3B-Captioner (huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Captioner) — описание любого звука
-         без промпта, клипы до 30 с, аудио-энкодер AuT.
+      3. ~~Qwen3-Omni-30B-A3B-Captioner~~ — сделано 24.11 (`docs/qwen3_omni_captioner.md`, в службе
+         `qwen3-omni-30b-a3b-captioner`); осталось: ресемплинг как librosa/soxr у оригинала.
