@@ -15,3 +15,12 @@
       пул буферов, общая q/k/v) действуют и на x86 — перемерить. Осталось x86-специфичное: префилл q8row на
       AVX-VNNI/AVX-512 (сейчас `dot4` построчно, i8mm-плитки только на ARM), плиточное внимание на AVX2/AVX-512
       (на x86 построчный путь), векторный erf-GELU. Делать после того, как CPU освободится от прогонов hexspire.
+- [ ] Модели понимания звука (задача пользователя 24.11.2026; для каждой — как WeMM-Video: скачать, изучить, бандл
+      .syn под 24 ГБ, поддержка в synaptix и в synaptixd (`MEDIA=звук.wav synaptixctl gen …`), сверка входа и
+      аудио-башни с эталоном transformers; проверка только через службу — 5 звуков `~/Videos/Test/звуки`, запрос
+      `~/Videos/asset_probe/scripts/audio_svc.sh`):
+      1. MOSS-Audio-8B-Thinking (OpenMOSS, github.com/OpenMOSS/MOSS-Audio, arXiv 2606.01802) — описание звука и
+         ответы с привязкой ко времени, MMAU 77,3;
+      2. Audio Flamingo Next (NVIDIA, arXiv 2604.10905), ~8B, режим captioner;
+      3. Qwen3-Omni-30B-A3B-Captioner (huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Captioner) — описание любого звука
+         без промпта, клипы до 30 с, аудио-энкодер AuT.
