@@ -48,6 +48,8 @@ pub struct RunArgs {
     pub image: Option<PathBuf>,
     /// Видео для мультимодального промпта (Muse Glimmer).
     pub video: Option<PathBuf>,
+    /// Звук для мультимодального промпта (WeMM-Video).
+    pub audio: Option<PathBuf>,
     /// Запретить DFlash-спекуляцию (Muse Glimmer), даже если драфтер в бандле.
     pub no_dflash: bool,
     pub sampling: SamplingFlags,
@@ -162,13 +164,27 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
         eprintln!("synaptix run: video {} → {} токенов", p.display(), m.tokens);
         media.push(m);
     }
+    if let Some(p) = &args.audio {
+        if !llm.supports_audio() {
+            return Err("модель не принимает звук (нет аудио-башни)".into());
+        }
+        let t = std::time::Instant::now();
+        let m = llm.encode_audio(p)?;
+        eprintln!(
+            "synaptix run: audio {} → {} токенов за {:.2} с",
+            p.display(),
+            m.tokens,
+            t.elapsed().as_secs_f32()
+        );
+        media.push(m);
+    }
     let chat = args.chat || !media.is_empty();
     let thinking = !args.no_think;
     let prompt = if chat {
         let blocks: String = media.iter().map(|m| m.prompt_block.as_str()).collect();
         let mut msgs = Vec::new();
-        if let Some(sys) = &args.system {
-            msgs.push(Message::system(sys.clone()));
+        if let Some(sys) = args.system.clone().or_else(|| llm.default_system_prompt().map(str::to_string)) {
+            msgs.push(Message::system(sys));
         }
         msgs.push(Message::user(format!("{blocks}{}", args.prompt)));
         tok.apply_chat_template_reasoning(&msgs, true, thinking, args.reasoning_effort.as_deref(), None)?
@@ -177,6 +193,11 @@ fn run_facade(args: &RunArgs, device: Device, precision: PrecisionConfig) -> Res
     };
     let ids = tok.encode(&prompt)?;
     eprintln!("synaptix run: prompt {} tokens", ids.len());
+    // Сверка входа с эталоном: `SYN_DUMP_IDS=файл` — id промпта через пробел.
+    if let Some(p) = std::env::var_os("SYN_DUMP_IDS") {
+        let text: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let _ = std::fs::write(p, text.join(" "));
+    }
     let mut sampling = args.sampling.clone();
     if !chat {
         sampling.temperature = sampling.temperature.or(Some(args.temperature));

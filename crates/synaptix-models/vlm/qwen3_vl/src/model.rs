@@ -125,7 +125,8 @@ impl Merger {
     fn forward(&self, x: &Tensor, eps: f32) -> Result<Tensor, VisionError> {
         let h = self.norm.forward(x, eps)?;
         let h = self.fc1.forward(&h)?;
-        let h = h.gelu_tanh().map_err(|e| VisionError::Forward(e.to_string()))?;
+        // У merger'а HF — `nn.GELU()` (точный erf), не tanh, как в блоках.
+        let h = h.gelu_exact().map_err(|e| VisionError::Forward(e.to_string()))?;
         self.fc2.forward(&h)
     }
 }
@@ -225,9 +226,20 @@ impl VisionTower {
         let dim = self.config.hidden_size;
         let coords = self.token_coords(grid);
         let mut out = vec![0f32; coords.len() * dim];
+        // `fast_pos_embed_interpolate` HF: узлы `linspace(0, side-1, n)` —
+        // концы сетки совпадают с крайними эмбеддингами (как align_corners),
+        // а не полупиксельная схема; шаг считается в f32, как у torch.
+        let lin = |i: usize, n: usize| -> f32 {
+            if n <= 1 {
+                0.0
+            } else {
+                let step = (side - 1) as f32 / (n - 1) as f32;
+                i as f32 * step
+            }
+        };
         for (i, (ph, pw)) in coords.iter().enumerate() {
-            let sy = ((*ph as f32 + 0.5) * side as f32 / grid.h as f32 - 0.5).max(0.0);
-            let sx = ((*pw as f32 + 0.5) * side as f32 / grid.w as f32 - 0.5).max(0.0);
+            let sy = lin(*ph, grid.h);
+            let sx = lin(*pw, grid.w);
             let y0 = (sy.floor() as usize).min(side - 1);
             let x0 = (sx.floor() as usize).min(side - 1);
             let y1 = (y0 + 1).min(side - 1);
@@ -424,7 +436,7 @@ impl VisionTower {
         let x = e(x.contiguous())?;
         let merged = e(x.reshape(vec![n / cfg.merge_unit(), cfg.merged_dim()]))?;
         let h = self.merger_fc1.forward(&merged)?;
-        let h = e(h.gelu_tanh())?;
+        let h = e(h.gelu_exact())?;
         Ok((self.merger_fc2.forward(&h)?, taps))
     }
 }

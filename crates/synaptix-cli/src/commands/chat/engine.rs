@@ -102,15 +102,19 @@ fn run_engine(setup: EngineSetup, cmd_rx: Receiver<EngineCmd>, evt_tx: Sender<En
                 }
             }
             EngineCmd::Attach { path, kind } => {
-                let res = llm.ensure_media_tower().and_then(|ok| {
-                    if !ok {
-                        return Err("в бандле нет башни зрения".into());
-                    }
-                    match kind {
-                        MediaKind::Image => llm.encode_image(&path, max_image_tokens),
-                        MediaKind::Video => llm.encode_video(&path),
-                    }
-                });
+                let res = if kind == MediaKind::Audio {
+                    llm.encode_audio(&path)
+                } else {
+                    llm.ensure_media_tower().and_then(|ok| {
+                        if !ok {
+                            return Err("в бандле нет башни зрения".into());
+                        }
+                        match kind {
+                            MediaKind::Image => llm.encode_image(&path, max_image_tokens),
+                            _ => llm.encode_video(&path),
+                        }
+                    })
+                };
                 match res {
                     Ok(m) => {
                         let _ = evt_tx.send(EngineEvt::Attached {

@@ -166,6 +166,8 @@ pub fn prepare_tensor(
 
 // ─────────────────────────────── Видео ───────────────────────────────
 
+use synaptix_io::image::resample::{resize_u8, Filter, Precision};
+
 /// Лимиты сэмплинга видео под бюджет контекста чата.
 ///
 /// HF-процессор Qwen3-VL берёт 2 fps и до сотен кадров при общем бюджете
@@ -184,6 +186,9 @@ pub struct VideoLimits {
     /// Нижняя планка токенов на группу кадров — чтобы долгое видео не
     /// схлопнулось в неразличимые миниатюры (тогда лучше меньше кадров).
     pub min_group_tokens: usize,
+    /// Политика кадров и пикселей модели (WeMM-Video): тогда размер кадра —
+    /// по ней, а `max_total_tokens` лишь потолок сверху (повтор при OOM).
+    pub pixel_policy: Option<VideoPixelPolicy>,
 }
 
 impl Default for VideoLimits {
@@ -193,7 +198,34 @@ impl Default for VideoLimits {
             max_frames: 64,
             max_total_tokens: 4096,
             min_group_tokens: 64,
+            pixel_policy: None,
         }
+    }
+}
+
+/// Политика видео WeMM-Video (`wemm_video_policy.py`, v2): кадров не меньше
+/// `min_frames`; на кадр — `max(min(768·32², total_pixels/n·2),
+/// min_pixels·1,05)` пикселей, размер — `smart_resize` видеопроцессора
+/// Qwen3-VL по всем кадрам сразу.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoPixelPolicy {
+    pub min_frames: usize,
+    pub total_pixels: usize,
+    pub min_pixels: usize,
+    /// Потолок merged-токенов на кадр (768).
+    pub max_frame_tokens: usize,
+}
+
+impl VideoPixelPolicy {
+    /// Значения `processor_config.json` WeMM-Video (`wemm_defaults`).
+    pub const WEMM: Self = Self { min_frames: 4, total_pixels: 25_165_824, min_pixels: 4096, max_frame_tokens: 768 };
+
+    /// Пикселей на кадр при `frames` кадрах; `unit` — сторона merged-токена.
+    pub fn frame_pixels(&self, frames: usize, unit: usize) -> usize {
+        let cap = self.max_frame_tokens * unit * unit;
+        let by_total = self.total_pixels as f64 / frames.max(1) as f64 * 2.0;
+        let floor = (self.min_pixels as f64 * 1.05) as usize;
+        ((cap as f64).min(by_total) as usize).max(floor)
     }
 }
 
@@ -218,8 +250,19 @@ pub fn sample_frame_indices(
         return Vec::new();
     }
     let tps = tps.max(1);
-    let by_fps = ((total as f32) * limits.target_fps / src_fps.max(0.01)) as usize;
-    let mut n = by_fps.min(limits.max_frames.max(tps)).min(total);
+    let mut n = match limits.pixel_policy {
+        // `video_frame_count`: min(max(desired, lower), upper, total), кратно 2.
+        Some(p) => {
+            let desired = total as f64 / src_fps.max(0.01) as f64 * limits.target_fps as f64;
+            let lower = p.min_frames.div_ceil(tps) * tps;
+            let upper = limits.max_frames.min(total) / tps * tps;
+            (desired.max(lower as f64).min(upper as f64).min(total as f64) as usize) / tps * tps
+        }
+        None => {
+            let by_fps = ((total as f32) * limits.target_fps / src_fps.max(0.01)) as usize;
+            by_fps.min(limits.max_frames.max(tps)).min(total)
+        }
+    };
     n = ((n / tps) * tps).max(tps);
     n = n.min(total);
     if n <= 1 {
@@ -354,6 +397,9 @@ fn decode_frames(
     Ok(out.stdout.chunks(frame_bytes).map(|c| c.to_vec()).collect())
 }
 
+/// Потолок памяти под кадры в исходном размере (точный ресайз на CPU).
+const NATIVE_DECODE_BYTES: usize = 1 << 31;
+
 /// Видео → патчи башни: сэмплинг кадров, общий для всех кадров
 /// `smart_resize` под бюджет токенов на группу, нормализация как у
 /// картинок, [`patchify_video`].
@@ -375,13 +421,50 @@ pub fn prepare_video(
     // Бюджет токенов делится между группами; один merged-токен = unit² px.
     let unit = cfg.size_factor();
     let per_group = (limits.max_total_tokens / groups).max(limits.min_group_tokens).max(1);
-    let px = PreprocessLimits {
-        max_pixels: per_group * unit * unit,
-        min_pixels: (limits.min_group_tokens * unit * unit).min(per_group * unit * unit),
+    let (nh, nw) = match limits.pixel_policy {
+        Some(p) => {
+            let n = indices.len();
+            let frame = p.frame_pixels(n, unit).min(per_group * unit * unit);
+            let px = VideoPixelLimits { min_pixels: n * p.min_pixels, max_pixels: n * frame };
+            smart_resize_video(n, h, w, tps, unit, px)
+        }
+        None => {
+            let px = PreprocessLimits {
+                max_pixels: per_group * unit * unit,
+                min_pixels: (limits.min_group_tokens * unit * unit).min(per_group * unit * unit),
+            };
+            smart_resize(h, w, unit, px)
+        }
     };
-    let (nh, nw) = smart_resize(h, w, unit, px);
 
-    let raw = decode_frames(path, &indices, nw, nh)?;
+    // Как видеопроцессор HF: кадры uint8 в исходном размере → бикубика с
+    // антиалиасом torchvision (бит в бит) → нормализация. ffmpeg-скейлер
+    // давал ~2 % разницы пикселей и ~16 % разницы выхода башни. Огромные
+    // кадры × много кадров — уменьшаем сразу в ffmpeg (память).
+    let native_bytes = indices.len() * w * h * 3;
+    let raw = if native_bytes <= NATIVE_DECODE_BYTES && (nw, nh) != (w, h) {
+        decode_frames(path, &indices, w, h)?
+            .into_iter()
+            .map(|hwc| {
+                let mut chw = vec![0u8; 3 * h * w];
+                for (i, px) in hwc.chunks_exact(3).enumerate() {
+                    for c in 0..3 {
+                        chw[c * h * w + i] = px[c];
+                    }
+                }
+                let out = resize_u8(&chw, 3, h, w, nh, nw, Filter::Bicubic, Precision::Torchvision);
+                let mut hwc = vec![0u8; 3 * nh * nw];
+                for i in 0..nh * nw {
+                    for c in 0..3 {
+                        hwc[i * 3 + c] = out[c * nh * nw + i];
+                    }
+                }
+                hwc
+            })
+            .collect()
+    } else {
+        decode_frames(path, &indices, nw, nh)?
+    };
     let got = raw.len().min(indices.len());
     let mut frames: Vec<Vec<f32>> = Vec::with_capacity(got);
     for rgb in raw.iter().take(got) {

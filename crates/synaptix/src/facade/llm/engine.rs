@@ -1904,6 +1904,8 @@ impl Llm {
 pub enum MediaKind {
     Image,
     Video,
+    /// Звук (аудио-башня WeMM-Video).
+    Audio,
 }
 
 /// Закодированное vision-башней вложение.
@@ -2132,7 +2134,10 @@ impl Llm {
             _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
         let tokens = embeds.dims()[0];
-        let prompt_block = guard.image_block(tokens);
+        let mut prompt_block = guard.image_block(tokens);
+        if let LlmPipeline::Hybrid(h) = &*guard {
+            prompt_block.push_str(h.media_separator());
+        }
         Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None })
     }
 
@@ -2160,7 +2165,7 @@ impl Llm {
                     match h.encode_video_limited(path, cap) {
                         Ok(v) => break v,
                         Err(e) if is_oom(&e.to_string()) => {
-                            let used = cap.unwrap_or_else(HybridPipeline::video_token_budget);
+                            let used = cap.unwrap_or_else(|| h.video_token_budget());
                             if used <= MIN_VIDEO_TOKENS_ON_OOM {
                                 return Err(LlmError(format!("video encode: {e}")));
                             }
@@ -2174,7 +2179,7 @@ impl Llm {
                         Err(e) => return Err(LlmError(format!("video encode: {e}"))),
                     }
                 };
-                (embeds, info.prompt_block(), info.grid_hw, info.groups)
+                (embeds, info.prompt_block() + h.media_separator(), info.grid_hw, info.groups)
             }
             LlmPipeline::Qwen4Exp(q) => {
                 let (embeds, info) = q
@@ -2192,6 +2197,48 @@ impl Llm {
             prompt_block,
             grid_hw,
             blocks,
+            layout: None,
+        })
+    }
+}
+
+impl Llm {
+    /// Умеет ли модель слушать звук (аудио-башня WeMM-Video в бандле).
+    pub fn supports_audio(&self) -> bool {
+        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.audio_token_id.is_some())
+            && HybridPipeline::bundle_audio_config(&self.model_path).is_some()
+    }
+
+    /// Системная реплика, с которой модель обучалась, если её нужно ставить
+    /// без явной (WeMM-Video — «You are a helpful assistant.»).
+    pub fn default_system_prompt(&self) -> Option<&'static str> {
+        match self.pipeline.lock().as_deref() {
+            Ok(LlmPipeline::Hybrid(h)) => h.default_system_prompt(),
+            _ => None,
+        }
+    }
+
+    /// Кодирует звук аудио-башней (WeMM-Video): 16 кГц моно, Whisper +
+    /// Q-Former, блок промпта с метками времени через 1 с.
+    pub fn encode_audio(&self, path: &Path) -> Result<MediaEmbedding, LlmError> {
+        let guard = self
+            .pipeline
+            .lock()
+            .map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        let LlmPipeline::Hybrid(h) = &*guard else {
+            return Err(LlmError("архитектура не принимает звук".into()));
+        };
+        let (embeds, info) = h
+            .encode_audio(&self.model_path, path)
+            .map_err(|e| LlmError(format!("audio encode: {e}")))?;
+        let tokens = embeds.dims()[0];
+        Ok(MediaEmbedding {
+            kind: MediaKind::Audio,
+            embeds,
+            tokens,
+            prompt_block: info.prompt_block() + h.media_separator(),
+            grid_hw: (0, 0),
+            blocks: 1,
             layout: None,
         })
     }
@@ -3265,6 +3312,60 @@ impl<'a> LlmGeneration<'a> {
         prompt_ids: &[u32],
         tokenizer: &LlmTokenizer,
         media: &[&MediaEmbedding],
+        mut on_token: F,
+    ) -> Result<(), LlmError>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
+        // Учёт хода, как у текстового пути (без бюджета размышлений): токены,
+        // размышления ChatML (`</think>`), кто остановил — иначе итог
+        // печатал «eos, токенов 0» и при обрыве по пределу.
+        self.finish = GenerationFinish::default();
+        let single = |s: &str| match tokenizer.encode(s) {
+            Ok(ids) if ids.len() == 1 => Some(ids[0]),
+            _ => None,
+        };
+        let close = self.thinking.and_then(|_| single("</think>")).filter(|&c| {
+            let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
+            let open = single("<think>").and_then(last);
+            !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
+        });
+        let (mut n, mut think, mut inside, mut last, mut cb_stop) = (0usize, 0usize, close.is_some(), None::<u32>, false);
+        let r = self.generate_streaming_media_raw(prompt_ids, tokenizer, media, |id, s| {
+            n += 1;
+            last = Some(id);
+            if inside {
+                if Some(id) == close {
+                    inside = false;
+                } else {
+                    think += 1;
+                }
+            }
+            let go = on_token(id, s);
+            cb_stop |= !go;
+            go
+        });
+        let max_new = self.opts.max_new_tokens;
+        self.finish.tokens = n;
+        self.finish.thinking_tokens = think;
+        self.finish.thinking_open = inside;
+        self.finish.reason = if cb_stop {
+            FinishReason::Callback
+        } else if last.is_some_and(|t| self.stop_tokens.contains(&t)) {
+            FinishReason::Eos
+        } else if n >= max_new {
+            FinishReason::Length
+        } else {
+            FinishReason::Stop
+        };
+        r
+    }
+
+    fn generate_streaming_media_raw<F>(
+        &mut self,
+        prompt_ids: &[u32],
+        tokenizer: &LlmTokenizer,
+        media: &[&MediaEmbedding],
         on_token: F,
     ) -> Result<(), LlmError>
     where
@@ -3351,11 +3452,17 @@ fn hybrid_media_inputs(
     for (kind, pad) in [
         (MediaKind::Image, p.config.image_token_id),
         (MediaKind::Video, p.config.video_token_id),
+        (MediaKind::Audio, p.config.audio_token_id),
     ] {
         let Some(embeds) = concat_media(media, kind)? else { continue };
         let pad = pad.ok_or_else(|| {
             LlmError(format!("config.json без id заполнителя для {kind:?}"))
         })?;
+        if kind == MediaKind::Audio {
+            // Текстовые позиции, без сетки (см. M-RoPE пайплайна).
+            inputs.push(MediaInput::new(pad, embeds, Vec::new()));
+            continue;
+        }
         let grids: Vec<(usize, usize)> = media
             .iter()
             .filter(|m| m.kind == kind)

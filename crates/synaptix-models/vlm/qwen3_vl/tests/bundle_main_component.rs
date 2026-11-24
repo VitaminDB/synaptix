@@ -90,7 +90,7 @@ fn tower_encodes_synthetic_video_on_cpu() {
     }
     synaptix_kernels_cpu::ensure_registered();
     let tower = load_from_bundle(&path, Device::Cpu, DType::F32).expect("load tower");
-    let limits = VideoLimits { target_fps: 2.0, max_frames: 8, max_total_tokens: 512, min_group_tokens: 16 };
+    let limits = VideoLimits { target_fps: 2.0, max_frames: 8, max_total_tokens: 512, min_group_tokens: 16, pixel_policy: None };
     let prepared = prepare_video(&video, &tower.config, limits, Device::Cpu).expect("prepare video");
     // 3 с × 2 fps = 6 кадров → 3 группы.
     assert_eq!(prepared.grid.t, 3, "групп кадров: {:?}", prepared.group_timestamps);

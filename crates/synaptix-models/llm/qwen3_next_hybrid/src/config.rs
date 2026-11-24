@@ -179,6 +179,11 @@ pub struct HybridConfig {
     pub mtp_num_hidden_layers: usize,
     pub image_token_id: Option<u32>,
     pub video_token_id: Option<u32>,
+    /// WeMM-Video: заполнитель аудиотокенов (`<|audio_pad|>`).
+    pub audio_token_id: Option<u32>,
+    /// WeMM-Video (`model_type = wemm_qwen3_5_moe`): своя политика видео,
+    /// системная реплика и `\n` после медиа, аудио-башня.
+    pub wemm: bool,
     pub vision_start_token_id: Option<u32>,
     pub vision_end_token_id: Option<u32>,
     /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
@@ -240,6 +245,8 @@ impl HybridConfig {
         let id = |k: &str| root.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
         cfg.image_token_id = id("image_token_id");
         cfg.video_token_id = id("video_token_id");
+        cfg.audio_token_id = id("audio_token_id");
+        cfg.wemm = root.get("model_type").and_then(|v| v.as_str()) == Some("wemm_qwen3_5_moe");
         cfg.vision_start_token_id = id("vision_start_token_id");
         cfg.vision_end_token_id = id("vision_end_token_id");
         cfg.mrope = mrope;
@@ -311,6 +318,8 @@ impl HybridConfig {
             mtp_num_hidden_layers: raw.mtp_num_hidden_layers,
             image_token_id: None,
             video_token_id: None,
+            audio_token_id: None,
+            wemm: false,
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,

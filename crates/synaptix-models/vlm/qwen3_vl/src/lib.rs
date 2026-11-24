@@ -11,7 +11,7 @@ pub use loader::{bundle_has_vision, load_from_bundle, BundleVisionWeights};
 pub use model::{VisionError, VisionTower, VisionWeights};
 pub use preprocess::{
     prepare_image, prepare_tensor, prepare_video, ImageGrid, PreparedImage, PreparedVideo,
-    PreprocessLimits, VideoLimits,
+    PreprocessLimits, VideoLimits, VideoPixelPolicy,
 };
 pub use pipeline::{DirWeights, H3Conditioning, H3Encoder, H3_ENCODER_LAYERS};
 pub use presentation::{H3Presentation, PresentationItem, TokenTag};

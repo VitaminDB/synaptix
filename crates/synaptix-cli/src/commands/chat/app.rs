@@ -176,8 +176,12 @@ impl App {
                 self.reset();
                 Some(EngineCmd::Reset)
             }
-            "/image" | "/video" => {
-                let kind = if head == "/image" { MediaKind::Image } else { MediaKind::Video };
+            "/image" | "/video" | "/audio" => {
+                let kind = match head {
+                    "/image" => MediaKind::Image,
+                    "/video" => MediaKind::Video,
+                    _ => MediaKind::Audio,
+                };
                 let cmd = Self::attach_cmd(arg, kind);
                 if cmd.is_some() {
                     self.busy_attach = true;

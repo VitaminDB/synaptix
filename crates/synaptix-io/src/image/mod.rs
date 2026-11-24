@@ -5,6 +5,7 @@ pub mod canny;
 pub mod jpeg;
 #[cfg(feature = "image")]
 pub mod png;
+pub mod resample;
 #[cfg(feature = "image")]
 pub mod webp;
 

@@ -150,6 +150,9 @@ enum Commands {
         /// Видео для мультимодального промпта (Muse Glimmer).
         #[arg(long)]
         video: Option<PathBuf>,
+        /// Звук для промпта (WeMM-Video: wav/mp3/flac…, сводится в моно 16 кГц).
+        #[arg(long)]
+        audio: Option<PathBuf>,
         /// Отключить DFlash-спекуляцию (Muse Glimmer).
         #[arg(long, default_value_t = false)]
         no_dflash: bool,
@@ -1360,7 +1363,7 @@ fn main() -> ExitCode {
         Commands::Run {
             model, prompt, prompt_file, max_tokens, temperature, seed, device, max_seq, attn, kv_dtype,
             quant, compute_dtype, storage_dtype, lm_head_dtype, embed_dtype, no_graph,
-            warmup, no_mtp, mtp_depth, thinking_budget, image, video, no_dflash, preset, top_k, top_p,
+            warmup, no_mtp, mtp_depth, thinking_budget, image, video, audio, no_dflash, preset, top_k, top_p,
             min_p, repetition_penalty, repeat_last_n, presence_penalty, frequency_penalty, prefill_batch,
             chat, system, no_think, reasoning_effort, stop, max_image_tokens, layer_sync, expert_cache_gb,
             host_mirror_gb, qwen4_spec, embed_host,
@@ -1391,6 +1394,7 @@ fn main() -> ExitCode {
                 thinking_budget,
                 image,
                 video,
+                audio,
                 no_dflash,
                 warmup,
                 sampling: synaptix_cli::commands::llm_facade::SamplingFlags {

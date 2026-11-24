@@ -27,6 +27,9 @@ pub struct WhisperWeights {
     /// Квантовать линейные слои при загрузке (NVFP4/MXFP8/Sq) — на лету,
     /// независимо от формата весов; `None` — плотные в `dtype`.
     pub quant: Option<DType>,
+    /// Энкодер внутри чужого бандла (аудио-башня WeMM-Video — `model.audio.*`):
+    /// HF-префикс `model.encoder.` подменяется этим.
+    encoder_prefix: Option<String>,
 }
 
 impl WhisperWeights {
@@ -53,19 +56,63 @@ impl WhisperWeights {
             .map_err(|e| WhisperError::Load(format!("safetensors header: {e}")))?;
         let names: HashSet<String> = st.names().into_iter().map(|s| s.to_string()).collect();
 
-        Ok(Self { bundle, loader, names, config, gen_config, device, dtype, quant: None })
+        Ok(Self { bundle, loader, names, config, gen_config, device, dtype, quant: None, encoder_prefix: None })
+    }
+
+    /// Только энкодер Whisper из чужого бандла: конфиг задаётся снаружи
+    /// (у WeMM-Video — `audio_config` из его config.json), тензоры
+    /// `model.encoder.*` ищутся под `encoder_prefix` (`model.audio.`).
+    pub fn open_encoder(
+        path: impl AsRef<Path>,
+        config: WhisperConfig,
+        encoder_prefix: &str,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, WhisperError> {
+        let path = path.as_ref();
+        let bundle = Bundle::open(path).map_err(|e| WhisperError::Bundle(e.to_string()))?;
+        let loader = SynBundleLoader::open(path)
+            .map_err(|e| WhisperError::Load(e.to_string()))?
+            .with_device(device);
+        let slice = bundle
+            .tensors_slice()
+            .map_err(|e| WhisperError::Bundle(e.to_string()))?;
+        let st = SafeTensors::deserialize(slice)
+            .map_err(|e| WhisperError::Load(format!("safetensors header: {e}")))?;
+        let names: HashSet<String> = st.names().into_iter().map(|s| s.to_string()).collect();
+        Ok(Self {
+            bundle,
+            loader,
+            names,
+            config,
+            gen_config: GenerationConfig::default(),
+            device,
+            dtype,
+            quant: None,
+            encoder_prefix: Some(encoder_prefix.to_string()),
+        })
+    }
+
+    /// Имя тензора в бандле с учётом `encoder_prefix`.
+    fn resolve<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        match (&self.encoder_prefix, name.strip_prefix("model.encoder.")) {
+            (Some(p), Some(rest)) => std::borrow::Cow::Owned(format!("{p}{rest}")),
+            _ => std::borrow::Cow::Borrowed(name),
+        }
     }
 
     /// Тензор по HF-имени, приведённый к compute-dtype на целевом устройстве.
     pub fn get(&self, name: &str) -> Result<Tensor, WhisperError> {
-        synaptix_core::prof::span("load.get", || self.loader.load_to(name, self.device, self.dtype))
+        let name = self.resolve(name);
+        synaptix_core::prof::span("load.get", || self.loader.load_to(&name, self.device, self.dtype))
             .map_err(|e| WhisperError::Load(format!("'{name}': {e}")))
     }
 
     /// Тензор в типе файла (без приведения к compute-dtype): вес, который сразу
     /// квантуется, не материализуется в F32 целиком.
     pub fn get_native(&self, name: &str) -> Result<Tensor, WhisperError> {
-        synaptix_core::prof::span("load.get", || self.loader.load(name))
+        let name = self.resolve(name);
+        synaptix_core::prof::span("load.get", || self.loader.load(&name))
             .map_err(|e| WhisperError::Load(format!("'{name}': {e}")))
     }
 
@@ -78,7 +125,7 @@ impl WhisperWeights {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.names.contains(name)
+        self.names.contains(self.resolve(name).as_ref())
     }
 
     pub fn read_aux(&self, name: &str) -> Result<Vec<u8>, WhisperError> {

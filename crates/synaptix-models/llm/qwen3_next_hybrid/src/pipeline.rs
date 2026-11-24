@@ -90,6 +90,9 @@ pub fn effective_prefill_chunk(requested: usize) -> usize {
 /// Сколько VRAM оставлять под башню зрения с её активациями при кэше
 /// экспертов в карте (~1.1 ГБ весов F16 у SigLIP-башни MiniCPM-V / Qwen-VL).
 pub const VISION_RESERVE_BYTES: usize = 3 << 29;
+/// Потолок токенов видео WeMM-Video: 64 группы × 384 (128 кадров при
+/// total_pixels 25 165 824) — короткий клип упирается в 768 на группу.
+const WEMM_VIDEO_TOKENS: usize = 24_576;
 
 pub struct HybridPipeline {
     pub model: DecoderModel,
@@ -681,8 +684,47 @@ impl HybridPipeline {
     }
 
     /// Потолок vision-токенов видео по умолчанию (на все группы кадров).
-    pub fn video_token_budget() -> usize {
-        synaptix_vlm_qwen3::VideoLimits::default().max_total_tokens
+    pub fn video_token_budget(&self) -> usize {
+        if self.config.wemm {
+            WEMM_VIDEO_TOKENS
+        } else {
+            synaptix_vlm_qwen3::VideoLimits::default().max_total_tokens
+        }
+    }
+
+    /// Системная реплика по умолчанию: WeMM-Video обучен с
+    /// «You are a helpful assistant.» (`processor_config.json`).
+    pub fn default_system_prompt(&self) -> Option<&'static str> {
+        self.config.wemm.then_some("You are a helpful assistant.")
+    }
+
+    /// Что ставится после каждого медиаблока перед текстом: у WeMM-Video —
+    /// `\n` (`WeMMProcessor._messages`), у HF-шаблона Qwen-VL — ничего.
+    pub fn media_separator(&self) -> &'static str {
+        if self.config.wemm { "\n" } else { "" }
+    }
+
+    /// Есть ли у модели аудио-башня (WeMM-Video) — по `audio_config`.
+    pub fn bundle_audio_config(path: impl AsRef<Path>) -> Option<crate::wemm_audio::AudioConfig> {
+        let bundle = synaptix_bundle::Bundle::open(path.as_ref()).ok()?;
+        let bytes = bundle.read_file("config.json").ok()?;
+        crate::wemm_audio::AudioConfig::from_config_json(&bytes)
+    }
+
+    /// Звук → эмбеддинги аудио-башни WeMM-Video и раскладка промпта.
+    /// Башня читается из `bundle` на время вызова и сразу выгружается.
+    pub fn encode_audio(
+        &self,
+        bundle: impl AsRef<Path>,
+        audio: impl AsRef<Path>,
+    ) -> Result<(synaptix_core::tensor::Tensor, crate::wemm_audio::AudioPromptInfo), PipelineError> {
+        let bundle = bundle.as_ref();
+        let cfg = Self::bundle_audio_config(bundle)
+            .ok_or_else(|| PipelineError::Model("в бандле нет аудио-башни (audio_config)".into()))?;
+        if self.config.audio_token_id.is_none() {
+            return Err(PipelineError::Model("config.json без audio_token_id".into()));
+        }
+        crate::wemm_audio::encode_audio(bundle, &cfg, audio.as_ref(), self.model.device)
     }
 
     /// [`Self::encode_video`] с потолком vision-токенов на всё видео
@@ -695,6 +737,13 @@ impl HybridPipeline {
     ) -> Result<(synaptix_core::tensor::Tensor, VideoPromptInfo), PipelineError> {
         use synaptix_core::grad::no_grad;
         let mut limits = synaptix_vlm_qwen3::VideoLimits::default();
+        if self.config.wemm {
+            // Политика WeMM-Video: 2 fps, 4…128 кадров, ≤768 токенов на
+            // группу при общем бюджете total_pixels (64 группы × 384).
+            limits.max_frames = 128;
+            limits.max_total_tokens = WEMM_VIDEO_TOKENS;
+            limits.pixel_policy = Some(synaptix_vlm_qwen3::VideoPixelPolicy::WEMM);
+        }
         if let Some(cap) = max_total_tokens {
             limits.max_total_tokens = cap.max(limits.min_group_tokens);
         }
@@ -712,6 +761,20 @@ impl HybridPipeline {
             .map_err(|e| PipelineError::Load(format!("video: {e}")))?;
         let feats = no_grad(|| tower.forward(&patches, grid))
             .map_err(|e| PipelineError::Forward(format!("vision forward: {e}")))?;
+        // Сверка с эталоном: `SYN_DUMP_VIDEO=путь` → патчи и выход башни (f32).
+        if let Some(dump) = std::env::var_os("SYN_DUMP_VIDEO") {
+            let dump = std::path::PathBuf::from(dump);
+            for (t, ext) in [(&patches, "patches.f32"), (&feats, "emb.f32")] {
+                if let Ok(v) = t
+                    .to_dtype(synaptix_core::dtype::DType::F32)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let _ = std::fs::write(dump.with_extension(ext), bytes);
+                }
+            }
+        }
         let m = tower.config.spatial_merge_size.max(1);
         let info = VideoPromptInfo {
             groups: grid.t,
@@ -889,10 +952,14 @@ impl HybridPipeline {
         let canvas = self.config.canvas.filter(|_| {
             mrope_enabled() && !inputs.is_empty() && inputs.iter().all(|m| !m.layouts.is_empty())
         });
-        // Без медиа — обычные позиции текстового пути.
+        // Аудиотокены WeMM-Video — обычные текстовые позиции (у оригинала
+        // `get_rope_index` их не трогает), в M-RoPE участвуют только блоки
+        // зрения. Без медиа зрения — обычные позиции текстового пути.
+        let audio_pad = self.config.audio_token_id;
+        let visual: Vec<&MediaInput> = inputs.iter().filter(|m| Some(m.pad) != audio_pad).collect();
         let mrope_on = mrope_enabled()
-            && !inputs.is_empty()
-            && (canvas.is_some() || inputs.iter().all(|m| !m.grids.is_empty()));
+            && !visual.is_empty()
+            && (canvas.is_some() || visual.iter().all(|m| !m.grids.is_empty()));
         let mrope_tables = match (&self.config.mrope, mrope_on) {
             (Some(spec), true) => {
                 let positions = match canvas {
@@ -924,11 +991,11 @@ impl HybridPipeline {
                         mrope::Positions { pos: cp.pos, max_pos: cp.max_pos }
                     }
                     None => {
-                        let grids: Vec<Vec<mrope::Grid3>> = inputs
+                        let grids: Vec<Vec<mrope::Grid3>> = visual
                             .iter()
                             .map(|m| m.grids.iter().map(|(h, w)| mrope::Grid3::image(*h, *w)).collect())
                             .collect();
-                        let runs: Vec<mrope::MediaRuns> = inputs
+                        let runs: Vec<mrope::MediaRuns> = visual
                             .iter()
                             .zip(&grids)
                             .map(|(m, g)| mrope::MediaRuns { pad: m.pad, grids: g })
