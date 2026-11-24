@@ -21,6 +21,7 @@
       `~/Videos/asset_probe/scripts/audio_svc.sh`):
       1. ~~MOSS-Audio-8B-Thinking~~ — сделано 24.11 (`docs/moss_audio.md`, в службе `moss-audio-8b-thinking`);
          осталось: скорость декода MXFP8 (~56 ток/с у 8B, GEMV ≈0,5 ТБ/с);
-      2. Audio Flamingo Next (NVIDIA, arXiv 2604.10905), ~8B, режим captioner;
+      2. ~~Audio Flamingo Next~~ — сделано 24.11: captioner (`docs/af_next.md`, в службе `af-next-captioner`);
+         при надобности — тем же кодом instruct/think (`audio-flamingo-next-hf`, `-think-hf`);
       3. Qwen3-Omni-30B-A3B-Captioner (huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Captioner) — описание любого звука
          без промпта, клипы до 30 с, аудио-энкодер AuT.
