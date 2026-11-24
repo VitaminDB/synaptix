@@ -127,7 +127,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         // энкодер (Whisper + Q-Former) в бандле, движком пока не исполняется.
         // MiniCPM-V 4.7: текст — Qwen3.5-гибрид (`text_config.model_type`
         // `qwen3_5_text` / `qwen3_5_moe_text`), башня зрения своя.
-        "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" | "wemm_qwen3_5_moe" => LlmArch::Hybrid,
+        "qwen3_next" | "qwen3_5" | "qwen3_6" | "qwen3_5_moe" | "minicpmv4_7" | "wemm_qwen3_5_moe" | "moss_audio" => LlmArch::Hybrid,
         "llama" => LlmArch::Llama,
         "lfm3" => LlmArch::Lfm3,
         "gemma" | "gemma3" | "gemma3_text" => LlmArch::Gemma3,

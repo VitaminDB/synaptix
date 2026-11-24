@@ -5,6 +5,7 @@ pub mod model;
 pub use synaptix_llm_common::mrope;
 pub mod pipeline;
 pub mod wemm_audio;
+pub mod moss_audio;
 
 /// Башня зрения MiniCPM-V 4.7 — реэкспорт для вызывающих (раскладка
 /// картинки, заполнитель), чтобы не тянуть крейт башни напрямую.

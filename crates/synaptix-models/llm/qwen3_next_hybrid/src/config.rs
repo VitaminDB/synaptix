@@ -184,6 +184,11 @@ pub struct HybridConfig {
     /// WeMM-Video (`model_type = wemm_qwen3_5_moe`): своя политика видео,
     /// системная реплика и `\n` после медиа, аудио-башня.
     pub wemm: bool,
+    /// MOSS-Audio (`model_type = moss_audio`): аудио-энкодер MOSS с
+    /// deepstack в первые слои LLM.
+    pub moss_audio: bool,
+    /// Нормы без «+1» (обычный Qwen3), а не `1 + w` Qwen3-Next/3.5.
+    pub plain_norm: bool,
     pub vision_start_token_id: Option<u32>,
     pub vision_end_token_id: Option<u32>,
     /// M-RoPE из `rope_parameters.mrope_section`; `None` — обычный 1D RoPE
@@ -231,10 +236,24 @@ impl HybridConfig {
     pub fn from_hf_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
         let root: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|e| ConfigError::Parse(format!("config json: {e}")))?;
-        let tc = root
+        let mut tc = root
             .get("text_config")
+            .or_else(|| root.get("language_config"))
             .cloned()
             .unwrap_or_else(|| root.clone());
+        // Обычный Qwen3 (языковая часть MOSS-Audio): нормы без «+1», без
+        // гейта выхода внимания, RoPE на всю голову, `rope_theta` в корне.
+        let plain = tc.get("model_type").and_then(|v| v.as_str()) == Some("qwen3");
+        if plain {
+            if let Some(o) = tc.as_object_mut() {
+                o.entry("partial_rotary_factor").or_insert(1.0.into());
+                o.entry("attn_output_gate").or_insert(false.into());
+                if !o.contains_key("rope_parameters") {
+                    let theta = o.get("rope_theta").cloned().unwrap_or(1_000_000.0.into());
+                    o.insert("rope_parameters".into(), serde_json::json!({ "rope_theta": theta }));
+                }
+            }
+        }
         let raw: TextConfigRaw = serde_json::from_value(tc)
             .map_err(|e| ConfigError::Parse(format!("text_config: {e}")))?;
         let mrope = raw.rope_parameters.mrope_section.clone().map(|section| MropeSpec {
@@ -246,6 +265,13 @@ impl HybridConfig {
         cfg.image_token_id = id("image_token_id");
         cfg.video_token_id = id("video_token_id");
         cfg.audio_token_id = id("audio_token_id");
+        cfg.plain_norm = plain;
+        // MOSS-Audio: заполнитель звука — `<|vision_pad|>` (151654, у
+        // процессора `<|AUDIO|>`), id нет в config.json.
+        cfg.moss_audio = root.get("model_type").and_then(|v| v.as_str()) == Some("moss_audio");
+        if cfg.moss_audio && cfg.audio_token_id.is_none() {
+            cfg.audio_token_id = Some(151654);
+        }
         cfg.wemm = root.get("model_type").and_then(|v| v.as_str()) == Some("wemm_qwen3_5_moe");
         cfg.vision_start_token_id = id("vision_start_token_id");
         cfg.vision_end_token_id = id("vision_end_token_id");
@@ -320,6 +346,8 @@ impl HybridConfig {
             video_token_id: None,
             audio_token_id: None,
             wemm: false,
+            moss_audio: false,
+            plain_norm: false,
             vision_start_token_id: None,
             vision_end_token_id: None,
             mrope: None,
@@ -400,7 +428,7 @@ impl HybridConfig {
             head_dim: self.head_dim,
             max_position_embeddings: self.scaled_rope().max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
-            norm_gain: common::NormGain::OnePlus,
+            norm_gain: if self.plain_norm { common::NormGain::Plain } else { common::NormGain::OnePlus },
             activation: common::Activation::Silu,
             sandwich_norms: false,
             post_norm_eps: None,

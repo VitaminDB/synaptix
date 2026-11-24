@@ -23,7 +23,7 @@ pub use generate::{
 };
 pub use model::{
     CachedDecodeGraph, DecodeGraphSlot,
-    DecodeState, DecoderModel, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
+    DecodeState, DecoderModel, Deepstack, KvCache, KvCacheLayer, LayerCache, LinearSnapshot, ModelError,
 };
 pub use moe::{MoeConfig, MoeFfn, SharedRefs, TrainExpert};
 pub use weights::{QLinear, RowSource, WeightSource};

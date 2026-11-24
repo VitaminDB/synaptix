@@ -232,6 +232,25 @@ pub struct EncoderLayer {
 }
 
 impl EncoderLayer {
+    /// Слой энкодера `i` (`model.encoder.layers.{i}.*` с учётом
+    /// `encoder_prefix` весов) — для чужих энкодеров на слоях Whisper
+    /// (MOSS-Audio: свой свёрточный стем, те же слои).
+    pub fn load_index(w: &WhisperWeights, i: usize) -> Result<Self> {
+        let cfg = &w.config;
+        Ok(Self {
+            self_attn_ln: load_layer_norm(w, &enc_layer(i, "self_attn_layer_norm"))?,
+            self_attn: load_attention(w, &enc_layer(i, "self_attn"), cfg.encoder_attention_heads, cfg.encoder_head_dim(), true)?,
+            final_ln: load_layer_norm(w, &enc_layer(i, "final_layer_norm"))?,
+            fc1: load_linear(w, &enc_layer(i, "fc1"), true)?,
+            fc2: load_linear(w, &enc_layer(i, "fc2"), true)?,
+        })
+    }
+
+    /// Прямой проход слоя: `[B, T, d_model]` → то же.
+    pub fn run(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x;
         let h = p!("enc.ln", self.self_attn_ln.forward(x))?;

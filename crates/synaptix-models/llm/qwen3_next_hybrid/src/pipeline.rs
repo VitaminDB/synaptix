@@ -113,6 +113,14 @@ pub struct HybridPipeline {
 /// Разметка видео в промпте: сколько групп кадров, сколько токенов на
 /// группу и таймкод каждой.
 #[derive(Debug, Clone)]
+/// Закодированный звук: строки для заполнителей, deepstack (MOSS-Audio) и
+/// блок промпта.
+pub struct AudioEncoding {
+    pub embeds: synaptix_core::tensor::Tensor,
+    pub deepstack: Vec<synaptix_core::tensor::Tensor>,
+    pub prompt_block: String,
+}
+
 pub struct VideoPromptInfo {
     pub groups: usize,
     pub tokens_per_group: usize,
@@ -135,11 +143,15 @@ pub struct MediaInput {
     /// MiniCPM-V 4.7: раскладка каждой картинки (миниатюра и срезы) для
     /// холстового M-RoPE; пусто у остальных архитектур.
     pub layouts: Vec<synaptix_vlm_minicpm::ImageLayout>,
+    /// Deepstack (MOSS-Audio): по тензору `[строки embeds, hidden]` на каждый
+    /// из первых блоков LLM — прибавляется к выходу блока на позициях
+    /// заполнителя `pad`; пусто — без deepstack.
+    pub deepstack: Vec<synaptix_core::tensor::Tensor>,
 }
 
 impl MediaInput {
     pub fn new(pad: u32, embeds: synaptix_core::tensor::Tensor, grids: Vec<(usize, usize)>) -> Self {
-        Self { pad, embeds, grids, layouts: Vec::new() }
+        Self { pad, embeds, grids, layouts: Vec::new(), deepstack: Vec::new() }
     }
 }
 
@@ -701,13 +713,13 @@ impl HybridPipeline {
     /// Системная реплика по умолчанию: WeMM-Video обучен с
     /// «You are a helpful assistant.» (`processor_config.json`).
     pub fn default_system_prompt(&self) -> Option<&'static str> {
-        self.config.wemm.then_some("You are a helpful assistant.")
+        (self.config.wemm || self.config.moss_audio).then_some("You are a helpful assistant.")
     }
 
     /// Что ставится после каждого медиаблока перед текстом: у WeMM-Video —
     /// `\n` (`WeMMProcessor._messages`), у HF-шаблона Qwen-VL — ничего.
     pub fn media_separator(&self) -> &'static str {
-        if self.config.wemm { "\n" } else { "" }
+        if self.config.wemm || self.config.moss_audio { "\n" } else { "" }
     }
 
     /// Есть ли у модели аудио-башня (WeMM-Video) — по `audio_config`.
@@ -717,20 +729,37 @@ impl HybridPipeline {
         crate::wemm_audio::AudioConfig::from_config_json(&bytes)
     }
 
-    /// Звук → эмбеддинги аудио-башни WeMM-Video и раскладка промпта.
-    /// Башня читается из `bundle` на время вызова и сразу выгружается.
+    /// Звук → эмбеддинги аудио-башни (WeMM-Video или MOSS-Audio), deepstack
+    /// и блок промпта. Башня читается из `bundle` на время вызова.
     pub fn encode_audio(
         &self,
         bundle: impl AsRef<Path>,
         audio: impl AsRef<Path>,
-    ) -> Result<(synaptix_core::tensor::Tensor, crate::wemm_audio::AudioPromptInfo), PipelineError> {
+    ) -> Result<AudioEncoding, PipelineError> {
         let bundle = bundle.as_ref();
-        let cfg = Self::bundle_audio_config(bundle)
-            .ok_or_else(|| PipelineError::Model("в бандле нет аудио-башни (audio_config)".into()))?;
         if self.config.audio_token_id.is_none() {
             return Err(PipelineError::Model("config.json без audio_token_id".into()));
         }
-        crate::wemm_audio::encode_audio(bundle, &cfg, audio.as_ref(), self.model.device)
+        if self.config.moss_audio {
+            let bytes = synaptix_bundle::Bundle::open(bundle)
+                .ok()
+                .and_then(|b| b.read_file("config.json").ok().map(|c| c.into_owned()))
+                .ok_or_else(|| PipelineError::Model("config.json не читается".into()))?;
+            let cfg = crate::moss_audio::MossAudioConfig::from_config_json(&bytes)
+                .ok_or_else(|| PipelineError::Model("audio_config MOSS не разобран".into()))?;
+            let e = crate::moss_audio::encode(bundle, &cfg, audio.as_ref(), self.model.device)?;
+            return Ok(AudioEncoding { embeds: e.embeds, deepstack: e.deepstack, prompt_block: e.prompt_block });
+        }
+        let cfg = Self::bundle_audio_config(bundle)
+            .ok_or_else(|| PipelineError::Model("в бандле нет аудио-башни (audio_config)".into()))?;
+        let (embeds, info) = crate::wemm_audio::encode_audio(bundle, &cfg, audio.as_ref(), self.model.device)?;
+        Ok(AudioEncoding { embeds, deepstack: Vec::new(), prompt_block: info.prompt_block() })
+    }
+
+    /// Есть ли у модели аудио-башня (WeMM-Video, MOSS-Audio).
+    pub fn has_audio_tower(&self, bundle: impl AsRef<Path>) -> bool {
+        self.config.audio_token_id.is_some()
+            && (self.config.moss_audio || Self::bundle_audio_config(bundle).is_some())
     }
 
     /// [`Self::encode_video`] с потолком vision-токенов на всё видео
@@ -1095,6 +1124,29 @@ impl HybridPipeline {
         // попали в хвост (граница может резать блок картинки пополам —
         // точка возврата ставится по чанку GDN, а не по краю блока).
         let tail_media = media_rows_for(prompt_ids, inputs, prefix, l - prefix)?;
+        // Deepstack (MOSS-Audio): позиции заполнителя по всему промпту — их
+        // абсолютные места в KV; префилл хвоста возьмёт лишь свои.
+        let ds_input = inputs.iter().find(|m| !m.deepstack.is_empty());
+        if let Some(m) = ds_input {
+            let positions: Vec<usize> = prompt_ids.iter().enumerate().filter(|(_, &t)| t == m.pad).map(|(i, _)| i).collect();
+            if positions.len() != m.embeds.dims()[0] {
+                return Err(PipelineError::Forward(format!(
+                    "deepstack: {} заполнителей, а строк {}",
+                    positions.len(),
+                    m.embeds.dims()[0]
+                )));
+            }
+            self.model.set_deepstack(Some(synaptix_llm_common::Deepstack { positions, rows: m.deepstack.clone() }));
+        }
+        struct ClearDeepstack<'a>(&'a synaptix_llm_common::DecoderModel, bool);
+        impl Drop for ClearDeepstack<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.set_deepstack(None);
+                }
+            }
+        }
+        let _clear = ClearDeepstack(&self.model, ds_input.is_some());
         let tail_refs: Vec<(u32, &Tensor)> = tail_media.iter().map(|(p, t)| (*p, t)).collect();
         let emb = self.embed_with_media(&prompt_ids[prefix..], &tail_refs)?;
         // Префилл чанками, как в текстовом пути: пик активаций гибрида

@@ -21,6 +21,7 @@ synaptix-vlm-minicpm = { workspace = true }
 synaptix-asr-whisper = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-ops       = { workspace = true }
+synaptix-audio     = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

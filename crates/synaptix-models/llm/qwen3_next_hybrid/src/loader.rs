@@ -13,6 +13,9 @@ pub const LM_PREFIX: &str = "model.language_model.";
 pub struct HybridWeights {
     pub config: HybridConfig,
     loader: SynBundleLoader,
+    /// Префикс языковой части в бандле: `model.language_model.` (Qwen3.5/3.6,
+    /// WeMM) или `language_model.` (MOSS-Audio).
+    lm_prefix: &'static str,
     pub tokenizer_json: Vec<u8>,
     pub device: Device,
     pub dtype: DType,
@@ -32,7 +35,14 @@ impl HybridWeights {
         let tokenizer_json = loader
             .read_file("tokenizer.json")
             .ok_or_else(|| LoadError::Io("read tokenizer.json: нет файла".into()))?;
-        Ok(Self { config, loader, tokenizer_json, device, dtype })
+        let lm_prefix = if !WeightLoader::contains(&loader, &format!("{LM_PREFIX}embed_tokens.weight"))
+            && WeightLoader::contains(&loader, "language_model.embed_tokens.weight")
+        {
+            "language_model."
+        } else {
+            LM_PREFIX
+        };
+        Ok(Self { config, loader, lm_prefix, tokenizer_json, device, dtype })
     }
 
     pub fn tensor(&self, key: &str, device: Device, dtype: DType) -> Result<Tensor, LoadError> {
@@ -42,7 +52,7 @@ impl HybridWeights {
     }
 
     pub fn lm_tensor(&self, suffix: &str, device: Device, dtype: DType) -> Result<Tensor, LoadError> {
-        let key = format!("{LM_PREFIX}{suffix}");
+        let key = format!("{}{suffix}", self.lm_prefix);
         self.tensor(&key, device, dtype)
     }
 
@@ -52,12 +62,12 @@ impl HybridWeights {
 
     /// Имя тензора внутри бандла: у гибрида языковая часть лежит под
     /// `model.language_model.`, а снаружи адресуется как `model.`.
-    fn bundle_key(key: &str) -> String {
+    fn bundle_key(&self, key: &str) -> String {
         if key == "lm_head.weight" {
             return key.to_string();
         }
         match key.strip_prefix("model.") {
-            Some(rest) => format!("{LM_PREFIX}{rest}"),
+            Some(rest) => format!("{}{rest}", self.lm_prefix),
             None => key.to_string(),
         }
     }
@@ -65,7 +75,7 @@ impl HybridWeights {
 
 impl synaptix_llm_common::WeightSource for HybridWeights {
     fn source_key(&self, key: &str) -> String {
-        Self::bundle_key(key)
+        self.bundle_key(key)
     }
 
     fn bundle_loader(&self) -> Option<synaptix_io::weights::syn_bundle::SynBundleLoader> {
@@ -89,7 +99,7 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
     }
 
     fn contains(&self, key: &str) -> bool {
-        HybridWeights::contains(self, &Self::bundle_key(key))
+        HybridWeights::contains(self, &self.bundle_key(key))
     }
 
     /// Готовый квант-вес из бандла, собранного с `syn-quant-v1`.
@@ -99,7 +109,7 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
         device: Device,
     ) -> Option<Result<synaptix_core::tensor::quant::QuantWeight, synaptix_llm_common::ModelError>>
     {
-        let r = self.loader.load_quant(&Self::bundle_key(key), device)?;
+        let r = self.loader.load_quant(&self.bundle_key(key), device)?;
         Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
 
@@ -111,7 +121,7 @@ impl synaptix_llm_common::WeightSource for HybridWeights {
     ) -> Option<
         Result<Vec<synaptix_core::tensor::quant::QuantWeight>, synaptix_llm_common::ModelError>,
     > {
-        let r = self.loader.load_quant_stack(&Self::bundle_key(key), device)?;
+        let r = self.loader.load_quant_stack(&self.bundle_key(key), device)?;
         Some(r.map_err(|e| synaptix_llm_common::ModelError::Load(e.to_string())))
     }
 }

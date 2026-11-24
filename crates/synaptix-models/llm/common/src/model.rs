@@ -431,6 +431,15 @@ pub struct BlockPle {
     post_norm: Tensor,
 }
 
+/// Deepstack медиа на префилл: см. [`DecoderModel::set_deepstack`].
+#[derive(Clone)]
+pub struct Deepstack {
+    /// Абсолютные позиции заполнителей в KV, по возрастанию.
+    pub positions: Vec<usize>,
+    /// По тензору `[positions.len(), hidden]` на каждый из первых блоков.
+    pub rows: Vec<Tensor>,
+}
+
 pub struct ModelPle {
     rows: std::sync::Arc<dyn crate::weights::RowSource>,
     model_proj: QLinear,
@@ -709,6 +718,10 @@ pub struct DecoderModel {
     placement: Option<crate::placement::PlacementProbe>,
     ple: Option<ModelPle>,
     ple_cur: std::sync::Mutex<Option<Tensor>>,
+    /// Deepstack медиа (MOSS-Audio, Qwen3-VL): строки, которые прибавляются к
+    /// выходу первых блоков на позициях заполнителей — ставит пайплайн на
+    /// время префилла (см. [`Self::set_deepstack`]).
+    deepstack: std::sync::Mutex<Option<Deepstack>>,
 }
 
 pub struct KvCacheLayer {
@@ -1937,6 +1950,7 @@ impl DecoderModel {
             placement,
             ple: model_ple,
             ple_cur: std::sync::Mutex::new(None),
+            deepstack: std::sync::Mutex::new(None),
         })
     }
 
@@ -2700,6 +2714,55 @@ impl DecoderModel {
         proj.add(&tok).and_then(|t| t.mul_scalar(std::f32::consts::FRAC_1_SQRT_2)).coerr()
     }
 
+    /// Deepstack на ближайшие проходы (префилл промпта с медиа): после блока
+    /// `k` к скрытым состояниям на абсолютных позициях `positions` (в KV)
+    /// прибавляется `rows[k]` (`[positions.len(), hidden]`). `None` — снять.
+    pub fn set_deepstack(&self, d: Option<Deepstack>) {
+        *self.deepstack.lock().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    /// Добавки deepstack для блоков на участке KV `[past, past+s)`: по
+    /// тензору `[batch=1, s, hidden]` на блок, `None` — участок без медиа.
+    fn deepstack_addends(&self, past: usize, s: usize) -> Result<Vec<Option<Tensor>>, ModelError> {
+        let guard = self.deepstack.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = guard.as_ref() else { return Ok(Vec::new()) };
+        // Отрезки подряд идущих позиций внутри участка: (позиция в участке, строка, длина).
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for (row, &p) in d.positions.iter().enumerate() {
+            if p < past || p >= past + s {
+                continue;
+            }
+            let at = p - past;
+            match runs.last_mut() {
+                Some((a, r, n)) if *a + *n == at && *r + *n == row => *n += 1,
+                _ => runs.push((at, row, 1)),
+            }
+        }
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let h = self.config.hidden_size;
+        let mut out = Vec::with_capacity(d.rows.len());
+        for rows in &d.rows {
+            let rows = rows.to_dtype(self.dtype).coerr()?;
+            let mut parts: Vec<Tensor> = Vec::new();
+            let mut cur = 0usize;
+            for &(at, row, n) in &runs {
+                if at > cur {
+                    parts.push(Tensor::zeros(vec![at - cur, h], self.dtype, self.device).coerr()?);
+                }
+                parts.push(rows.narrow(0, row, n).and_then(|t| t.contiguous()).coerr()?);
+                cur = at + n;
+            }
+            if cur < s {
+                parts.push(Tensor::zeros(vec![s - cur, h], self.dtype, self.device).coerr()?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            out.push(Some(Tensor::cat(&refs, 0).and_then(|t| t.reshape(vec![1, s, h])).coerr()?));
+        }
+        Ok(out)
+    }
+
     fn take_ple(&self) -> Option<Tensor> {
         self.ple_cur.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
@@ -2886,6 +2949,7 @@ impl DecoderModel {
         let dev = self.device;
         let dump_layers = dump_layers_on();
         let pli = self.take_ple();
+        let deepstack = if batch == 1 { self.deepstack_addends(past, s)? } else { Vec::new() };
 
         // Один блок (attn/linear-mixer + MLP) → новый hidden. Вынесено в замыкание,
         // чтобы общий код работал и в резидентном цикле, и в host-stream (блок
@@ -2929,6 +2993,9 @@ impl DecoderModel {
         };
         self.for_each_block(dev, s, |idx, blk| {
             hidden = step(idx, blk, &hidden, kv_cache)?;
+            if let Some(Some(a)) = deepstack.get(idx) {
+                hidden = hidden.add(a).coerr()?;
+            }
             if taps.contains(&idx) {
                 tapped.push(hidden.clone());
             }

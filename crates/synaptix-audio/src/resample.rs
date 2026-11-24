@@ -160,3 +160,62 @@ mod sinc_tests {
         assert!((rms(&out) - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.02);
     }
 }
+
+/// Передискретизация бит в бит как `torchaudio.functional.resample` по
+/// умолчанию (`sinc_interp_hann`, `lowpass_filter_width=6`, `rolloff=0.99`):
+/// ядро `[new, 2·width + orig]` в f32, вход дополняется нулями
+/// (`width` слева, `width + orig` справа), свёртка с шагом `orig`, длина
+/// выхода — `ceil(new · len / orig)` (частоты сокращены на НОД). Нужна
+/// моделям, обученным на звуке после torchaudio (MOSS-Audio).
+pub fn resample_torchaudio(input: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(AudioError::invalid_arg("sample rates must be > 0"));
+    }
+    if src_rate == dst_rate || input.is_empty() {
+        return Ok(input.to_vec());
+    }
+    let g = gcd(src_rate, dst_rate);
+    let (orig, new) = ((src_rate / g) as usize, (dst_rate / g) as usize);
+    const WIDTH: f64 = 6.0;
+    let base = (orig.min(new) as f64) * 0.99;
+    let width = (WIDTH * orig as f64 / base).ceil() as usize;
+    let taps = 2 * width + orig;
+    // Ядро в f32, как у torch (idx, t, окно и sinc считаются в f32).
+    let base32 = base as f32;
+    let lw = WIDTH as f32;
+    let mut kernel = vec![0f32; new * taps];
+    for p in 0..new {
+        for j in 0..taps {
+            let idx = (j as f32 - width as f32) / orig as f32;
+            let mut t = (-(p as f32)) / new as f32 + idx;
+            t *= base32;
+            t = t.clamp(-lw, lw);
+            let w = (t * std::f32::consts::PI / lw / 2.0).cos();
+            let window = w * w;
+            let tp = t * std::f32::consts::PI;
+            let sinc = if tp == 0.0 { 1.0 } else { tp.sin() / tp };
+            kernel[p * taps + j] = sinc * window * (base32 / orig as f32);
+        }
+    }
+    let len = input.len();
+    let padded_len = len + 2 * width + orig;
+    let at = |i: usize| -> f32 {
+        if i < width || i >= width + len { 0.0 } else { input[i - width] }
+    };
+    let frames = (padded_len - taps) / orig + 1;
+    let target = ((new as f64) * len as f64 / orig as f64).ceil() as usize;
+    let mut out = Vec::with_capacity(frames * new);
+    for f in 0..frames {
+        let start = f * orig;
+        for p in 0..new {
+            let k = &kernel[p * taps..(p + 1) * taps];
+            let mut acc = 0f32;
+            for (j, kv) in k.iter().enumerate() {
+                acc += at(start + j) * kv;
+            }
+            out.push(acc);
+        }
+    }
+    out.truncate(target);
+    Ok(out)
+}

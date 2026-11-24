@@ -15,7 +15,7 @@ pub mod words;
 
 pub use config::{GenerationConfig, WhisperConfig};
 pub use loader::WhisperWeights;
-pub use model::{WhisperDecoder, WhisperEncoder, WhisperModel};
+pub use model::{EncoderLayer, WhisperDecoder, WhisperEncoder, WhisperModel};
 pub use pipeline::{Task, TsSegment, WhisperPipeline, WordOptions, WordsResult, VERBATIM_PROMPT};
 pub use words::WordTiming;
 

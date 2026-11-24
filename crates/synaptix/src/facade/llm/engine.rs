@@ -1933,6 +1933,9 @@ pub struct MediaEmbedding {
     /// Звук дорожки видео (WeMM-Video): аудиотокены стоят внутри блоков
     /// групп кадров; `None` — видео без звука и прочие вложения.
     pub audio: Option<Tensor>,
+    /// Deepstack звука (MOSS-Audio): по тензору `[tokens, hidden]` на каждый
+    /// из первых блоков LLM; пусто у остальных.
+    pub deepstack: Vec<Tensor>,
 }
 
 
@@ -2088,6 +2091,7 @@ impl Llm {
                     blocks: 1,
                     layout: Some(layout),
                     audio: None,
+                    deepstack: Vec::new(),
                 });
             }
             // Модель целиком на карте (MoE 35B-A3B — 22 из 24 ГБ): башне на
@@ -2142,7 +2146,7 @@ impl Llm {
         if let LlmPipeline::Hybrid(h) = &*guard {
             prompt_block.push_str(h.media_separator());
         }
-        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None, audio: None })
+        Ok(MediaEmbedding { kind: MediaKind::Image, embeds, tokens, prompt_block, grid_hw, blocks: 1, layout: None, audio: None, deepstack: Vec::new() })
     }
 
     /// Кодирует видео: сэмплинг кадров (ffmpeg) → vision-башня. Блок промпта
@@ -2215,6 +2219,7 @@ impl Llm {
             blocks,
             layout: None,
             audio,
+            deepstack: Vec::new(),
         })
     }
 }
@@ -2222,8 +2227,7 @@ impl Llm {
 impl Llm {
     /// Умеет ли модель слушать звук (аудио-башня WeMM-Video в бандле).
     pub fn supports_audio(&self) -> bool {
-        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.config.audio_token_id.is_some())
-            && HybridPipeline::bundle_audio_config(&self.model_path).is_some()
+        matches!(self.pipeline.lock().as_deref(), Ok(LlmPipeline::Hybrid(h)) if h.has_audio_tower(&self.model_path))
     }
 
     /// Системная реплика, с которой модель обучалась, если её нужно ставить
@@ -2245,19 +2249,20 @@ impl Llm {
         let LlmPipeline::Hybrid(h) = &*guard else {
             return Err(LlmError("архитектура не принимает звук".into()));
         };
-        let (embeds, info) = h
+        let a = h
             .encode_audio(&self.model_path, path)
             .map_err(|e| LlmError(format!("audio encode: {e}")))?;
-        let tokens = embeds.dims()[0];
+        let tokens = a.embeds.dims()[0];
         Ok(MediaEmbedding {
             kind: MediaKind::Audio,
-            embeds,
+            embeds: a.embeds,
             tokens,
-            prompt_block: info.prompt_block() + h.media_separator(),
+            prompt_block: a.prompt_block + h.media_separator(),
             grid_hw: (0, 0),
             blocks: 1,
             layout: None,
             audio: None,
+            deepstack: a.deepstack,
         })
     }
 }
@@ -3567,7 +3572,7 @@ fn hybrid_media_inputs(
             .filter(|m| m.kind == kind)
             .filter_map(|m| m.layout.clone())
             .collect();
-        inputs.push(MediaInput { pad, embeds, grids, layouts });
+        inputs.push(MediaInput { pad, embeds, grids, layouts, deepstack: Vec::new() });
     }
     // Звук — отдельные вложения и дорожки видео, в порядке появления в
     // промпте; позиции у аудиотокенов текстовые (без сетки, см. M-RoPE).
@@ -3584,7 +3589,17 @@ fn hybrid_media_inputs(
             .audio_token_id
             .ok_or_else(|| LlmError("config.json без audio_token_id".into()))?;
         let embeds = Tensor::cat(&audio, 0).map_err(|e| LlmError(e.to_string()))?;
-        inputs.push(MediaInput::new(pad, embeds, Vec::new()));
+        let mut input = MediaInput::new(pad, embeds, Vec::new());
+        // Deepstack — у отдельного звука MOSS-Audio (у всех вложений сразу).
+        let ds: Vec<&MediaEmbedding> = media.iter().copied().filter(|m| m.kind == MediaKind::Audio && !m.deepstack.is_empty()).collect();
+        if !ds.is_empty() {
+            let k = ds[0].deepstack.len();
+            for i in 0..k {
+                let parts: Vec<&Tensor> = ds.iter().map(|m| &m.deepstack[i]).collect();
+                input.deepstack.push(Tensor::cat(&parts, 0).map_err(|e| LlmError(e.to_string()))?);
+            }
+        }
+        inputs.push(input);
     }
     Ok(inputs)
 }
