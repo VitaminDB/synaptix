@@ -214,3 +214,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Принимает ли языковая модель картинки — без загрузки, по `config.json` и
+/// бандлу; правила те же, что у [`crate::facade::llm::Llm::supports_media`]:
+/// Gemma4 — `image_token_id` и `vision_config`; Qwen-гибрид и Qwen4Exp —
+/// `image_token_id` и башня в бандле; Muse Glimmer и Inkling-2 — `vision_config`.
+/// Для каталога службы: найти модель со зрением, не поднимая все подряд.
+pub fn config_supports_media(path: &Path) -> bool {
+    let Some(bytes) = read_model_file(path, "config.json") else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    let image_token = v.get("image_token_id").is_some_and(|x| x.as_u64().is_some());
+    let vision_config = v.get("vision_config").is_some_and(|x| !x.is_null());
+    match detect_llm_arch(path) {
+        Ok(LlmArch::Gemma4) => image_token && vision_config,
+        Ok(LlmArch::MuseGlimmer | LlmArch::Inkling2) => vision_config,
+        Ok(LlmArch::Hybrid) => image_token && bundle_has_vision_hybrid(path),
+        Ok(LlmArch::Qwen4Exp) => image_token && bundle_has_vision_qwen4(path),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "engine")]
+fn bundle_has_vision_hybrid(path: &Path) -> bool {
+    synaptix_llm_qwen3_next_hybrid::pipeline::HybridPipeline::bundle_has_vision(path)
+}
+#[cfg(not(feature = "engine"))]
+fn bundle_has_vision_hybrid(_path: &Path) -> bool {
+    false
+}
+#[cfg(feature = "engine")]
+fn bundle_has_vision_qwen4(path: &Path) -> bool {
+    synaptix_llm_qwen4_exp::pipeline::Qwen4ExpPipeline::bundle_has_vision(path)
+}
+#[cfg(not(feature = "engine"))]
+fn bundle_has_vision_qwen4(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod media_tests {
+    /// На реальных бандлах библиотеки (если они есть): у Gemma-4 E4B зрение есть,
+    /// у Hy4-flash (башня в бандле, движок её пока не исполняет) — нет.
+    #[test]
+    fn media_from_config() {
+        let lib = std::path::Path::new(concat!(env!("HOME"), "/Storage/Нейросети/Модели/llm"));
+        let gemma = lib.join("gemma-4-e4b-it.syn");
+        if gemma.exists() {
+            assert!(super::config_supports_media(&gemma));
+        }
+        let hy4 = lib.join("hy4-flash.syn");
+        if hy4.exists() {
+            assert!(!super::config_supports_media(&hy4));
+        }
+        let qwen3 = lib.join("qwen3-1.7b.syn");
+        if qwen3.exists() {
+            assert!(!super::config_supports_media(&qwen3));
+        }
+    }
+}
