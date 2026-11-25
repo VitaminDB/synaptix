@@ -55,6 +55,8 @@ pub struct Hy4Pipeline {
 pub struct Hy4Session {
     pub cache: ModelCache,
     resume_at: Option<usize>,
+    parked: bool,
+    device: Device,
 }
 
 impl Hy4Session {
@@ -74,7 +76,29 @@ impl Hy4Session {
         self.cache.truncate(0);
     }
     pub fn device_bytes(&self) -> usize {
-        self.cache.device_bytes()
+        if self.parked { 0 } else { self.cache.device_bytes() }
+    }
+    /// Увести KV в RAM (освободить карту под вложенную генерацию).
+    pub fn park_to_host(&mut self) -> Result<usize, PipelineError> {
+        if self.parked {
+            return Ok(0);
+        }
+        let n = self.cache.device_bytes();
+        self.device = self.cache.move_to(Device::Cpu)?;
+        self.parked = true;
+        Ok(n)
+    }
+    /// Вернуть KV на карту.
+    pub fn unpark_to(&mut self, device: Device) -> Result<usize, PipelineError> {
+        if !self.parked {
+            return Ok(0);
+        }
+        self.cache.move_to(device)?;
+        self.parked = false;
+        Ok(self.cache.device_bytes())
+    }
+    pub fn is_parked(&self) -> bool {
+        self.parked
     }
     /// Сколько токенов `prompt_ids` можно взять из кэша.
     pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
@@ -153,7 +177,7 @@ impl Hy4Pipeline {
     }
 
     pub fn new_session(&self, ctx: usize) -> Result<Hy4Session, PipelineError> {
-        Ok(Hy4Session { cache: self.model.make_cache(ctx.max(2))?, resume_at: None })
+        Ok(Hy4Session { cache: self.model.make_cache(ctx.max(2))?, resume_at: None, parked: false, device: self.model.device })
     }
 
     /// Дорастить сессию: кэш пересоздаётся, посчитанное пересчитается в следующем ходе.
@@ -206,6 +230,9 @@ impl Hy4Pipeline {
         cfg: &GenerationConfig,
         sink: &mut dyn StreamSink,
     ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        if s.parked {
+            s.unpark_to(self.model.device)?;
+        }
         let need = prompt_ids.len() + cfg.max_new_tokens + 1;
         if need > s.cache.max_seq {
             self.grow_session(s, need.min(self.max_seq.max(need)))?;

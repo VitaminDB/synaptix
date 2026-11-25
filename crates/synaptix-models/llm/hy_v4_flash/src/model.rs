@@ -157,6 +157,21 @@ impl ModelCache {
         }
     }
 
+    /// Перенести тензоры кэша на `dev`; возвращает прежнее устройство.
+    pub fn move_to(&mut self, dev: Device) -> R<Device> {
+        let prev = self.layers.first().map(|l| l.lat.device()).unwrap_or(dev);
+        for l in &mut self.layers {
+            l.lat = l.lat.to_device(dev).map_err(fe)?;
+            if let Some(t) = &l.tok {
+                l.tok = Some(t.to_device(dev).map_err(fe)?);
+            }
+            if let Some(t) = &l.grp {
+                l.grp = Some(t.to_device(dev).map_err(fe)?);
+            }
+        }
+        Ok(prev)
+    }
+
     pub fn device_bytes(&self) -> usize {
         let b = |t: &Tensor| t.dtype().bytes_for_numel(t.numel());
         self.layers.iter().map(|l| b(&l.lat) + l.tok.as_ref().map_or(0, b) + l.grp.as_ref().map_or(0, b)).sum()

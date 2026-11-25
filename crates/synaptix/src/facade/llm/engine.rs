@@ -20,6 +20,7 @@ use synaptix_llm_gemma4::pipeline::{Gemma4Pipeline, MediaInput as Gemma4MediaInp
 use synaptix_llm_llama::pipeline::LlamaPipeline;
 use synaptix_llm_lfm3::pipeline::Lfm3Pipeline;
 use synaptix_llm_inkling2::{Inkling2Pipeline, Inkling2Session};
+use synaptix_llm_hy_v4_flash::{Hy4Pipeline, Hy4Session};
 use synaptix_llm_muse_glimmer::pipeline::MusePipeline;
 use synaptix_llm_muse_glimmer::DFlashCache;
 use synaptix_llm_qwen3::pipeline::Qwen3Pipeline;
@@ -510,6 +511,8 @@ enum LlmPipeline {
     /// Inkling-2: зацикленный трансформер со своим кэшем (KV всех слотов
     /// цикла и состояния коротких свёрток), без общего `DecoderModel`.
     Inkling2(Inkling2Pipeline),
+    /// Hy4-flash (tencent): MLA по латентному кэшу, iHC, латентный MoE, engram — свой кэш и сессия.
+    Hy4(Hy4Pipeline),
     Hybrid(HybridPipeline),
     Llama(LlamaPipeline),
     Lfm3(Lfm3Pipeline),
@@ -529,7 +532,7 @@ impl LlmPipeline {
             Self::Gemma3(p) => Some(&mut p.model),
             Self::Gemma4(p) => Some(&mut p.model),
             Self::MuseGlimmer(p) => Some(&mut p.model),
-            Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
+            Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => None,
         }
     }
 
@@ -542,7 +545,7 @@ impl LlmPipeline {
             Self::Gemma3(p) => Some(&p.model),
             Self::Gemma4(p) => Some(&p.model),
             Self::MuseGlimmer(p) => Some(&p.model),
-            Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
+            Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => None,
         }
     }
 
@@ -552,6 +555,7 @@ impl LlmPipeline {
             Self::Qwen4Exp(p) => p.rope_capacity(),
             // Позиции — относительный bias, RoPE нет: потолок — контекст модели.
             Self::Inkling2(p) => p.config.text.model_max_length.unwrap_or(1 << 20),
+            Self::Hy4(p) => p.config.max_position_embeddings,
             Self::Hybrid(p) => p.model.rope_capacity(),
             Self::Llama(p) => p.model.rope_capacity(),
             Self::Lfm3(p) => p.model.rope_capacity(),
@@ -576,6 +580,7 @@ impl LlmPipeline {
             // Ставка новой сессии (BF16); память под неё пайплайн освобождает
             // сам — переводом экспертов в zero-copy, затем KV в MXFP8.
             Self::Inkling2(p) => p.kv_bytes_per_token(),
+            Self::Hy4(p) => p.kv_bytes_per_token(),
             // Кэш MTP-головы растёт вместе с контекстом (у Qwen3.8-27B — плотный
             // слой, 4 КБ на токен: на 262К это гигабайт, которого плану
             // не хватало — сессия падала по памяти при создании).
@@ -606,7 +611,7 @@ impl LlmPipeline {
             Self::MuseGlimmer(p) => Some((p.model.block_bytes(), p.model.block_count())),
             // У Qwen4Exp свой оффлоад — кэш экспертов; у Inkling-2 — свой режим
             // памяти по длине сессии (эксперты zero-copy, KV MXFP8).
-            Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
+            Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => None,
         }
     }
 
@@ -627,7 +632,7 @@ impl LlmPipeline {
             Self::Lfm3(p) => p.model.block_bytes_max(),
             Self::Gemma3(p) => p.model.block_bytes_max(),
             Self::MuseGlimmer(p) => p.model.block_bytes_max(),
-            Self::Gemma4(_) | Self::Qwen4Exp(_) | Self::Inkling2(_) => 0,
+            Self::Gemma4(_) | Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => 0,
         }
     }
 
@@ -640,7 +645,7 @@ impl LlmPipeline {
             Self::Gemma3(p) => Some(p.model.resident_blocks()),
             Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.resident_blocks()),
-            Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
+            Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => None,
         }
     }
 
@@ -662,7 +667,7 @@ impl LlmPipeline {
             Self::Lfm3(p) => p.model.map_embeddings(),
             Self::Gemma3(p) => p.model.map_embeddings(),
             Self::MuseGlimmer(p) => p.model.map_embeddings(),
-            Self::Gemma4(_) | Self::Qwen4Exp(_) | Self::Inkling2(_) => false,
+            Self::Gemma4(_) | Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => false,
         }
     }
 
@@ -675,7 +680,7 @@ impl LlmPipeline {
             Self::Gemma3(p) => Some(p.model.set_block_residency(resident)),
             Self::Gemma4(_) => None,
             Self::MuseGlimmer(p) => Some(p.model.set_block_residency(resident)),
-            Self::Qwen4Exp(_) | Self::Inkling2(_) => None,
+            Self::Qwen4Exp(_) | Self::Inkling2(_) | Self::Hy4(_) => None,
         }
     }
 
@@ -685,6 +690,7 @@ impl LlmPipeline {
             Self::Qwen4Exp(p) => p.kv_fixed_bytes(batch, max_seq),
             // Кольца SWA-слотов (окно + чанк префилла) и состояния свёрток.
             Self::Inkling2(p) => p.kv_fixed_bytes(),
+            Self::Hy4(_) => 0,
             Self::Hybrid(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Llama(p) => p.model.kv_fixed_bytes(batch, max_seq),
             Self::Lfm3(p) => p.model.kv_fixed_bytes(batch, max_seq),
@@ -796,6 +802,10 @@ impl LlmPipeline {
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
             LlmPipeline::Inkling2(p) => p
+                .generate_streaming(prompt_ids, &cfg, sink)
+                .map(|_| ())
+                .map_err(|e| LlmError(e.to_string())),
+            LlmPipeline::Hy4(p) => p
                 .generate_streaming(prompt_ids, &cfg, sink)
                 .map(|_| ())
                 .map_err(|e| LlmError(e.to_string())),
@@ -993,6 +1003,8 @@ enum SessionKind {
     /// его продолжает, либо от точки возврата (снимок на конце прошлого
     /// промпта или на границе [`LlmKvSession::set_resume_at`]), как у Qwen4Exp.
     Inkling2(Box<Inkling2Session>),
+    /// Hy4-flash: латентный KV и ключи индексатора — своя сессия ([`Hy4Session`]).
+    Hy4(Box<Hy4Session>),
 }
 
 impl LlmKvSession {
@@ -1015,6 +1027,7 @@ impl LlmKvSession {
         match &mut self.kind {
             SessionKind::Qwen4Exp(s) => s.set_resume_at(at),
             SessionKind::Inkling2(s) => s.set_resume_at(at),
+            SessionKind::Hy4(s) => s.set_resume_at(at),
             _ => self.resume_at = at,
         }
     }
@@ -1025,6 +1038,7 @@ impl LlmKvSession {
         match &self.kind {
             SessionKind::Qwen4Exp(s) => s.resume_at(),
             SessionKind::Inkling2(s) => s.resume_at(),
+            SessionKind::Hy4(s) => s.resume_at(),
             _ => self.resume_at,
         }
     }
@@ -1035,6 +1049,7 @@ impl LlmKvSession {
             // У Qwen4Exp счёт токенов — внутри его сессии.
             SessionKind::Qwen4Exp(s) => s.cached_tokens(),
             SessionKind::Inkling2(s) => s.cached_tokens(),
+            SessionKind::Hy4(s) => s.cached_tokens(),
             _ => self.ids.len(),
         }
     }
@@ -1050,6 +1065,7 @@ impl LlmKvSession {
         match &self.kind {
             SessionKind::Qwen4Exp(s) => return s.reusable(prompt_ids),
             SessionKind::Inkling2(s) => return s.reusable(prompt_ids),
+            SessionKind::Hy4(s) => return s.reusable(prompt_ids),
             _ => {}
         }
         let n = self.ids.len();
@@ -1093,6 +1109,7 @@ impl LlmKvSession {
             // не ведётся.
             SessionKind::Qwen4Exp(s) => s.reusable(prompt_ids),
             SessionKind::Inkling2(s) => s.reusable(prompt_ids),
+            SessionKind::Hy4(s) => s.reusable(prompt_ids),
         }
     }
 
@@ -1143,6 +1160,7 @@ impl LlmKvSession {
             SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => s.invalidate(),
             SessionKind::Inkling2(s) => s.invalidate(),
+            SessionKind::Hy4(s) => s.invalidate(),
         }
     }
 
@@ -1180,6 +1198,9 @@ impl LlmKvSession {
             SessionKind::Inkling2(s) => {
                 moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
             }
+            SessionKind::Hy4(s) => {
+                moved += s.park_to_host().map_err(|e| LlmError(e.to_string()))?;
+            }
         }
         Ok(moved)
     }
@@ -1215,6 +1236,9 @@ impl LlmKvSession {
             SessionKind::Inkling2(s) => {
                 moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
             }
+            SessionKind::Hy4(s) => {
+                moved += s.unpark_to(device).map_err(|e| LlmError(e.to_string()))?;
+            }
         }
         Ok(moved)
     }
@@ -1224,6 +1248,7 @@ impl LlmKvSession {
         match &self.kind {
             SessionKind::Qwen4Exp(s) => s.is_parked(),
             SessionKind::Inkling2(s) => s.is_parked(),
+            SessionKind::Hy4(s) => s.is_parked(),
             _ => self.kv.is_parked(),
         }
     }
@@ -1248,6 +1273,7 @@ impl LlmKvSession {
             SessionKind::Plain => {}
             SessionKind::Qwen4Exp(s) => total += s.device_bytes(),
             SessionKind::Inkling2(s) => total += s.device_bytes(),
+            SessionKind::Hy4(s) => total += s.device_bytes(),
         }
         total
     }
@@ -1270,7 +1296,7 @@ impl LlmKvSession {
             }
             SessionKind::Plain => {}
             // Qwen4Exp и Inkling-2 сбрасывают свой кэш сами, внутри хода.
-            SessionKind::Qwen4Exp(_) | SessionKind::Inkling2(_) => {}
+            SessionKind::Qwen4Exp(_) | SessionKind::Inkling2(_) | SessionKind::Hy4(_) => {}
         }
     }
 }
@@ -1360,6 +1386,10 @@ impl RuntimeProbe {
             },
             LlmPipeline::Inkling2(p) => Self {
                 layers: Some(synaptix_llm_common::placement::LayerProbe::all_resident(p.config.text.num_hidden_layers)),
+                ..Default::default()
+            },
+            LlmPipeline::Hy4(p) => Self {
+                layers: Some(synaptix_llm_common::placement::LayerProbe::all_resident(p.config.num_hidden_layers)),
                 ..Default::default()
             },
             LlmPipeline::Hybrid(h) => Self { placement: h.model.placement_probe(), layers: Some(h.model.layer_probe()), speculation: h.mtp.is_some().then_some(("MTP", true, true)), ..Default::default() },
@@ -1474,6 +1504,7 @@ impl Llm {
                         | LlmPipeline::Gemma4(_)
                         | LlmPipeline::Qwen4Exp(_)
                         | LlmPipeline::Inkling2(_)
+                        | LlmPipeline::Hy4(_)
                 )
             })
             .unwrap_or(false)
@@ -1594,6 +1625,18 @@ impl Llm {
                     lora_gen: 0,
                 }))
             }
+            LlmPipeline::Hy4(p) => {
+                let session = p.new_session(ctx).map_err(|e| LlmError(e.to_string()))?;
+                Ok(Some(LlmKvSession {
+                    kv: LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx, decode_graph: Default::default() },
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Hy4(Box::new(session)),
+                    media: Vec::new(),
+                    resume_at: None,
+                    lora_gen: 0,
+                }))
+            }
         }
     }
 
@@ -1651,11 +1694,16 @@ impl Llm {
                 p.grow_session(s, ctx_tokens).map_err(|e| err(&e))?;
                 session.kv.max_seq = s.ctx_tokens();
             }
+            (LlmPipeline::Hy4(p), SessionKind::Hy4(s)) => {
+                p.grow_session(s, ctx_tokens).map_err(|e| err(&e))?;
+                session.kv.max_seq = s.ctx_tokens();
+            }
             _ => return Err(LlmError("префикс-KV: сессия от другой модели".into())),
         }
         session.ctx_tokens = match &session.kind {
             SessionKind::Qwen4Exp(s) => s.ctx_tokens(),
             SessionKind::Inkling2(s) => s.ctx_tokens(),
+            SessionKind::Hy4(s) => s.ctx_tokens(),
             _ => ctx_tokens.max(2),
         };
         Ok(())
@@ -3045,6 +3093,15 @@ impl<'a> LlmGeneration<'a> {
                     .map_err(|e| LlmError(e.to_string()))?;
                 Ok(reuse)
             }
+            LlmPipeline::Hy4(p) => {
+                let SessionKind::Hy4(s) = &mut session.kind else {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                };
+                let (_, _, reuse) = p
+                    .generate_cached_streaming(s, prompt_ids, &cfg, &mut sink)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(reuse)
+            }
             // Плотные декодеры: точка возврата — весь промпт, кэш усекается
             // по `seq_len`. Медиа у них нет, так что `session.media` пуст.
             LlmPipeline::Qwen3(p) => {
@@ -3998,6 +4055,10 @@ pub fn load_llm(
         LlmArch::Inkling2 => Inkling2Pipeline::load_with_ctx(path, device, max_seq)
             .map(LlmPipeline::Inkling2)
             .map_err(|e| LlmError(format!("load inkling2: {e}")))?,
+        // Hy4-flash: эксперты из бандла с кэшем на карте и зеркалом в RAM (сколько влезает).
+        LlmArch::Hy4Flash => Hy4Pipeline::load(path, device, max_seq)
+            .map(LlmPipeline::Hy4)
+            .map_err(|e| LlmError(format!("load hy4-flash: {e}")))?,
         LlmArch::Hybrid => HybridPipeline::load_with_precision_mtp(
             path,
             device,

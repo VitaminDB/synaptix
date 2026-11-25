@@ -111,6 +111,7 @@ pub enum LlmArch {
     MuseGlimmer,
     Qwen4Exp,
     Inkling2,
+    Hy4Flash,
 }
 
 /// `qwen3_next`/`qwen3_5`/`qwen3_6`/`qwen3_5_moe`/`minicpmv4_7` → гибрид
@@ -135,6 +136,7 @@ pub fn detect_llm_arch(path: &Path) -> Result<LlmArch, String> {
         "muse_glimmer" | "muse_glimmer_text" => LlmArch::MuseGlimmer,
         "qwen4_exp" | "qwen4_exp_text" => LlmArch::Qwen4Exp,
         "inkling2_loop" | "inkling2_loop_text" | "inkling2" => LlmArch::Inkling2,
+        "hy_v4_flash" | "hy_v4_flash_text" => LlmArch::Hy4Flash,
         _ if has_moe_experts(path) => {
             return Err(format!(
                 "{key}: MoE-вариант этой архитектуры движок пока не исполняет (плотный Qwen3-путь не знает экспертов)"
