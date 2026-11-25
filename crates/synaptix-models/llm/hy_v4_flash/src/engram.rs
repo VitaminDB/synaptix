@@ -187,18 +187,17 @@ impl EngramLookup {
         let width = heads * dim;
         let mut out = vec![0f32; rows.len() * width];
         let live: Vec<bool> = rows.iter().map(|r| r.is_some()).collect();
-        let chunks: Vec<(usize, &mut [f32])> = out.chunks_mut(width).enumerate().collect();
+        // Параллельно по (токен, голова): на декоде это 16 случайных чтений
+        // строк таблицы с диска разом, а не по очереди.
         use rayon::prelude::*;
-        chunks.into_par_iter().try_for_each(|(t, o)| -> Result<(), ModelError> {
+        out.par_chunks_mut(dim).enumerate().try_for_each(|(i, x)| -> Result<(), ModelError> {
+            let (t, h) = (i / heads, i % heads);
             let Some(r) = &rows[t] else { return Ok(()) };
-            for (h, &row) in r.iter().enumerate() {
-                let x = &mut o[h * dim..(h + 1) * dim];
-                self.table.gather(row, x)?;
-                let ms = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
-                let rs = 1.0 / (ms + f32::EPSILON).sqrt();
-                for (v, g) in x.iter_mut().zip(&self.head_norm[h * dim..(h + 1) * dim]) {
-                    *v *= rs * g;
-                }
+            self.table.gather(r[h], x)?;
+            let ms = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            let rs = 1.0 / (ms + f32::EPSILON).sqrt();
+            for (v, g) in x.iter_mut().zip(&self.head_norm[h * dim..(h + 1) * dim]) {
+                *v *= rs * g;
             }
             Ok(())
         })?;

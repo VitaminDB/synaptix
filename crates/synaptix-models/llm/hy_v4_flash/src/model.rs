@@ -452,9 +452,18 @@ impl Hy4Model {
         let all_ids = cache.ids.clone();
         // Профиль `SYN_MOE_PROFILE`: стадия ждёт карту, иначе время уходит в следующую.
         let prof = synaptix_llm_common::profile::profiling();
+        // Строки engram всех слоёв зависят только от id — читаются с диска
+        // разом в начале шага (параллельно по слоям и головам).
+        let mut engram_rows: Vec<Option<(Vec<f32>, Vec<bool>)>> = hy4_stage(prof, dev, "hy4:engram_rows", || -> R<_> {
+            use rayon::prelude::*;
+            self.layers
+                .par_iter()
+                .map(|layer| layer.engram.as_ref().map(|e| e.lookup.embed(&all_ids, p0)).transpose())
+                .collect::<R<Vec<_>>>()
+        })?;
         for (l, layer) in self.layers.iter().enumerate() {
-            if let Some(e) = &layer.engram {
-                hy4_stage(prof, dev, "hy4:engram", || self.engram(e, &x, &all_ids, p0))?;
+            if let (Some(e), Some(rows)) = (&layer.engram, engram_rows[l].take()) {
+                hy4_stage(prof, dev, "hy4:engram", || self.engram(e, &x, rows))?;
             }
             let (hin, post) = kern::hc_pre(&x, &layer.attn_hc.mixes(&x)?, &layer.attn_hc.base, &layer.attn_hc.scale, false, c.rms_norm_eps, c.hc_eps, c.hc_magnitude)?;
             let hn = kern::rms(&hin, Some(&layer.in_norm), c.rms_norm_eps, ACT)?;
@@ -484,8 +493,8 @@ impl Hy4Model {
         f32c(&fwd(&self.lm_head, hidden)?)
     }
 
-    fn engram(&self, e: &EngramLayer, x: &Tensor, all: &[u32], p0: usize) -> R<()> {
-        let (emb, live) = e.lookup.embed(all, p0)?;
+    fn engram(&self, e: &EngramLayer, x: &Tensor, rows: (Vec<f32>, Vec<bool>)) -> R<()> {
+        let (emb, live) = rows;
         let t = live.len();
         if !live.iter().any(|v| *v) {
             return Ok(());
