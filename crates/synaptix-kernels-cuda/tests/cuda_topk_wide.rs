@@ -28,8 +28,11 @@ fn ready() -> bool {
 }
 
 fn check(rows: usize, cols: usize, k: usize, valid_of: impl Fn(usize) -> usize) {
+    check_data(noise(11, rows * cols), rows, cols, k, valid_of);
+}
+
+fn check_data(data: Vec<f32>, rows: usize, cols: usize, k: usize, valid_of: impl Fn(usize) -> usize) {
     let device = Device::Cuda(0);
-    let data = noise(11, rows * cols);
     let valid: Vec<u32> = (0..rows).map(|r| valid_of(r) as u32).collect();
     let scores = Tensor::from_vec(data.clone(), vec![rows, cols], device).expect("скоры");
     let valid_t = Tensor::from_vec(valid.clone(), vec![rows], device).expect("valid");
@@ -66,6 +69,27 @@ fn check(rows: usize, cols: usize, k: usize, valid_of: impl Fn(usize) -> usize) 
             "строка {r}: взят элемент {chosen_min} ниже порога {threshold}"
         );
     }
+}
+
+/// Оценки любого знака (у Hy4 — `Σ w_h·relu(…)` с весами разного знака) и
+/// `-inf` маскированных столбцов: отрицательные не должны обгонять положительные.
+#[test]
+fn wide_topk_signed_scores() {
+    if !ready() {
+        eprintln!("CUDA-устройств нет — пропуск");
+        return;
+    }
+    let (rows, cols) = (32, 650);
+    let mut s = 7u64;
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|i| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let v = ((s >> 33) as f32 / (1u64 << 31) as f32) * 8.0 - 6.0;
+            if i % cols >= cols - 20 { f32::NEG_INFINITY } else { v }
+        })
+        .collect();
+    check_data(data.clone(), rows, cols, 511, |r| 560 + r);
+    check_data(data, rows, cols, 511, |_| cols);
 }
 
 #[test]

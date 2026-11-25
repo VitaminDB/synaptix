@@ -1,8 +1,10 @@
 // Top-k по широким строкам: выбор блоков индексатором QSA (512 из тысяч).
 //
 // Строка в shared уже не помещается, а k слишком велико для «k раз найти
-// максимум», поэтому порог ищется radix-select'ом по битам float: значения
-// неотрицательны (идут после relu), и их битовое представление монотонно.
+// максимум», поэтому порог ищется radix-select'ом по битам float, переведённым
+// в монотонный ключ (`tw_key`): оценки бывают любого знака (у Hy4 это
+// Σ w_h·relu(…) с весами разного знака), а сырые биты отрицательного float
+// как беззнаковое число больше любого положительного.
 // Три прохода по 8 бит дают порог с точностью до 24 старших бит, дальше
 // элементы выше порога забираются целиком, а равные добираются до k.
 //
@@ -21,6 +23,13 @@ __device__ __forceinline__ void tw_hist_add(unsigned int* hist, unsigned int bin
     unsigned int peers = __match_any_sync(0xFFFFFFFFu, bin);
     unsigned int lane = threadIdx.x & 31u;
     if (bin < TW_BINS && lane == (unsigned int)(__ffs(peers) - 1)) atomicAdd(&hist[bin], (unsigned int)__popc(peers));
+}
+
+// Порядок float → порядок беззнаковых ключей: отрицательным инвертируются все
+// биты, положительным ставится знаковый.
+__device__ __forceinline__ unsigned int tw_key(float v) {
+    unsigned int b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
 extern "C" __global__ void topk_wide_f32(
@@ -60,7 +69,7 @@ extern "C" __global__ void topk_wide_f32(
     for (unsigned int base = 0; base < n; base += bs) {
         unsigned int i = base + tid;
         unsigned int bin = TW_BINS;
-        if (i < n) bin = __float_as_uint(src[i]) >> 24;
+        if (i < n) bin = tw_key(src[i]) >> 24;
         tw_hist_add(hist, bin);
     }
     __syncthreads();
@@ -88,7 +97,7 @@ extern "C" __global__ void topk_wide_f32(
         unsigned int i = base + tid;
         unsigned int bin = TW_BINS;
         if (i < n) {
-            unsigned int bits = __float_as_uint(src[i]);
+            unsigned int bits = tw_key(src[i]);
             if ((bits >> 24) == hi_bin) bin = (bits >> 16) & 0xFFu;
         }
         tw_hist_add(hist, bin);
@@ -120,7 +129,7 @@ extern "C" __global__ void topk_wide_f32(
         unsigned int i = base + tid;
         unsigned int bin = TW_BINS;
         if (i < n) {
-            unsigned int bits = __float_as_uint(src[i]);
+            unsigned int bits = tw_key(src[i]);
             if ((bits >> 16) == hi16) bin = (bits >> 8) & 0xFFu;
         }
         tw_hist_add(hist, bin);
@@ -155,7 +164,7 @@ extern "C" __global__ void topk_wide_f32(
     unsigned int hi = lo + seg < n ? lo + seg : n;
     unsigned int ca = 0, ce = 0;
     for (unsigned int i = lo; i < hi; ++i) {
-        unsigned int bits = __float_as_uint(src[i]) >> 8;
+        unsigned int bits = tw_key(src[i]) >> 8;
         ca += bits > thresh;
         ce += bits == thresh;
     }
@@ -199,7 +208,7 @@ extern "C" __global__ void topk_wide_f32(
         unsigned int skip = cnt_skip[tid];
         unsigned int quota = cnt_equal[tid];
         for (unsigned int i = lo; i < hi; ++i) {
-            unsigned int bits = __float_as_uint(src[i]) >> 8;
+            unsigned int bits = tw_key(src[i]) >> 8;
             bool in = bits > thresh;
             if (bits == thresh) {
                 if (skip > 0u) --skip;
