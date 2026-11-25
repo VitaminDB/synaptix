@@ -1,4 +1,5 @@
 //! Прогон Hy4-flash: `cargo run --example hy4_run -- <бандл> (--ids файл | --text "…" | --chat "…") [--gen N]`.
+//! `--spec K` (с `SYN_HY4_DFLY=1`) — жадный спекулятивный декод драфтером DFly.
 //! `--wait-mirror` — дождаться заполнения зеркала экспертов перед замером.
 //! `HY4_DUMP=каталог` — потоки после каждого слоя (сверка с scripts/reference/hy4_ref.py).
 
@@ -47,7 +48,7 @@ fn main() {
     let mut s = p.new_session(ids.len() + gen + 16).unwrap();
     // `--spec K`: жадный спекулятивный декод драфтером DFly (K драфтов за шаг).
     if let Some(k) = opt("--spec").and_then(|v| v.parse::<usize>().ok()) {
-        let d = p.dfly.as_ref().expect("в бандле нет драфтера DFly");
+        let d = p.dfly.as_ref().expect("драфтер DFly не загружен: нужен SYN_HY4_DFLY=1 (и веса в бандле)");
         let t0 = Instant::now();
         let mut h = no_grad(|| p.model.forward(&ids, &mut s.cache, Some(1))).unwrap();
         let mut bonus = synaptix_llm_hy_v4_flash::dfly::argmax(&p.model.logits(&h).unwrap()).unwrap();

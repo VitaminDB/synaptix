@@ -52,7 +52,7 @@ pub struct Hy4Pipeline {
     pub config: Hy4Config,
     pub path: PathBuf,
     zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
-    /// Драфтер DFly (спекулятивный декод), если есть в бандле (`SYN_HY4_DFLY=0` — не грузить).
+    /// Драфтер DFly (спекулятивный декод), если есть в бандле и `SYN_HY4_DFLY=1`.
     pub dfly: Option<crate::dfly::Dfly>,
     max_seq: usize,
 }
@@ -190,7 +190,9 @@ impl Hy4Pipeline {
         let guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let mut model = no_grad(|| Hy4Model::build(&w, device, cache, source, prefill_chunk()))?;
         drop(guard);
-        let dfly = if std::env::var("SYN_HY4_DFLY").as_deref() != Ok("0") {
+        // Драфтер держит ~0,8 ГБ VRAM, а выигрыша на этой карте не даёт
+        // (верификация упирается в шину) — грузится по `SYN_HY4_DFLY=1`.
+        let dfly = if std::env::var("SYN_HY4_DFLY").as_deref() == Ok("1") {
             // `SYN_HY4_DFLY_FROM=путь` — веса драфтера из другого источника
             // (каталог HF с BF16-оригиналом или бандл) — сверка точности драфта.
             match std::env::var("SYN_HY4_DFLY_FROM") {
