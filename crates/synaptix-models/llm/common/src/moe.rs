@@ -88,6 +88,10 @@ pub struct MoeExt {
     pub routed_scale: f32,
     /// Shared-эксперт без гейта (`shared_expert_gate` в весах нет).
     pub shared_ungated: bool,
+    /// Ширина входа роутера, если она не `hidden_size` (латентный MoE Hy4:
+    /// эксперты работают в узкой ширине, роутер смотрит на полный вход —
+    /// его передают в [`MoeFfn::forward_routed`]).
+    pub router_hidden: Option<usize>,
 }
 
 impl MoeConfig {
@@ -1085,12 +1089,13 @@ impl MoeFfn {
         let router_key = cfg.router_key.as_deref().unwrap_or("gate.weight");
         let router = weights
             .tensor(&format!("{prefix}.{router_key}"), device, DType::F32)?;
-        if router.dims() != [cfg.num_experts, cfg.hidden_size] {
+        let router_width = cfg.ext.router_hidden.unwrap_or(cfg.hidden_size);
+        if router.dims() != [cfg.num_experts, router_width] {
             return Err(ModelError::Load(format!(
                 "{prefix}.{router_key}: форма {:?}, ожидалась [{}, {}]",
                 router.dims(),
                 cfg.num_experts,
-                cfg.hidden_size
+                router_width
             )));
         }
 
@@ -1748,6 +1753,15 @@ impl MoeFfn {
                 let glu = g.mul_scalar(Activation::SWIGLU_OAI_ALPHA).and_then(|a| a.sigmoid()).and_then(|sg| sg.mul(&g)).map_err(ferr)?;
                 up.clamp(-lim, lim).and_then(|u| u.add_scalar(1.0)).and_then(|u| u.mul(&glu)).map_err(ferr)
             }
+            Activation::SiluClamp(lim) => {
+                let lim = lim as f32;
+                let g = gate.clamp(-3.0e38, lim).map_err(ferr)?;
+                let u = up.clamp(-lim, lim).map_err(ferr)?;
+                match g.silu_and_mul(&u) {
+                    Ok(h) => Ok(h),
+                    Err(_) => g.silu().and_then(|g| g.mul(&u)).map_err(ferr),
+                }
+            }
         }
     }
 
@@ -2197,7 +2211,8 @@ impl MoeFfn {
             )));
         }
         if let Some(r) = router_in {
-            if r.dims() != x.dims() {
+            let want = [x.dims()[0], self.cfg.ext.router_hidden.unwrap_or(self.cfg.hidden_size)];
+            if r.dims() != want {
                 return Err(ModelError::Forward(format!(
                     "MoE: вход роутера {:?} не совпал с входом экспертов {:?}",
                     r.dims(),
@@ -2710,7 +2725,7 @@ impl MoeFfn {
                 let (ph, sh) = match self.cfg.activation {
                     Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
                     Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
-                    Activation::SwigluOai => self.swiglu(&gu).and_then(|h| if h.dtype() == DType::F16 { Ok(h) } else { to_f16(&h) })?.nvfp4_quantize_act(),
+                    Activation::SwigluOai | Activation::SiluClamp(_) => self.swiglu(&gu).and_then(|h| if h.dtype() == DType::F16 { Ok(h) } else { to_f16(&h) })?.nvfp4_quantize_act(),
                 }
                 .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
                 let part = QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, g_rows, self.compute)
@@ -2945,7 +2960,7 @@ impl MoeFfn {
         // слой, а не на эксперта.
         let quantized = match self.cfg.activation {
             Activation::Silu => gu.silu_mul_quant_nvfp4(1.0).ok(),
-            Activation::GeluTanh | Activation::SwigluOai => {
+            Activation::GeluTanh | Activation::SwigluOai | Activation::SiluClamp(_) => {
                 let h = self.swiglu(&gu)?;
                 let h = if h.dtype() == DType::F16 { h } else { to_f16(&h)? };
                 h.nvfp4_quantize_act().ok()
@@ -3147,7 +3162,7 @@ impl MoeFfn {
         gate_up: &Tensor,
         m: usize,
     ) -> Result<Tensor, ModelError> {
-        if down.quant_dtype() == Some(DType::NVFP4) && self.cfg.activation != Activation::SwigluOai {
+        if down.quant_dtype() == Some(DType::NVFP4) && matches!(self.cfg.activation, Activation::Silu | Activation::GeluTanh) {
             let fused = match self.cfg.activation {
                 Activation::Silu => gate_up.silu_mul_quant_nvfp4(1.0),
                 _ => gate_up.gelu_tanh_mul_quant_nvfp4(1.0),

@@ -943,6 +943,16 @@ impl Backend for CudaBackend {
         k.launch(&stream, kernel, a, grid, block)
     }
 
+    fn hy4_launch(&self, device: synaptix_core::device::Device, kernel: &str, a: &synaptix_core::backend::Ink2Launch, grid: (u32, u32, u32), block: u32) -> Result<()> {
+        let synaptix_core::device::Device::Cuda(ord) = device else {
+            return Err(SynaptixError::Unsupported("hy4_launch: не CUDA"));
+        };
+        let ctx = synaptix_core::device::cuda::get(ord)?;
+        let stream = synaptix_core::device::cuda::default_stream(ord)?;
+        let k = crate::kernels::hy4::Hy4Kernels::for_context(&ctx)?;
+        k.launch(&stream, kernel, a, grid, block)
+    }
+
     fn moe_shared_fused(&self, device: synaptix_core::device::Device, a: &synaptix_core::backend::SeLaunch) -> Result<()> {
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_shared_fused: не CUDA"));

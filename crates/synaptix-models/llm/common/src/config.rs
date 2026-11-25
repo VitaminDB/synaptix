@@ -10,6 +10,8 @@ pub enum Activation {
     GeluTanh,
     /// MiniMax M3 (`swigluoai`): `g = min(gate, 7)`, `g·σ(1,702·g)·(clamp(up, ±7) + 1)`.
     SwigluOai,
+    /// Hy4 (`swiglu_limit`): `silu(min(gate, L))·clamp(up, ±L)`, `L` — поле.
+    SiluClamp(u32),
 }
 
 impl Activation {

@@ -4306,6 +4306,11 @@ impl Mlp {
                 let glu = g.mul_scalar(Activation::SWIGLU_OAI_ALPHA).coerr()?.sigmoid().coerr()?.mul(&g).coerr()?;
                 Ok(up.clamp(-lim, lim).coerr()?.add_scalar(1.0).coerr()?.mul(&glu).coerr()?)
             }
+            Activation::SiluClamp(lim) => {
+                let lim = lim as f32;
+                let g = gate.clamp(-3.0e38, lim).coerr()?;
+                Ok(g.silu().coerr()?.mul(&up.clamp(-lim, lim).coerr()?).coerr()?)
+            }
         })?;
         if calib {
             let ferr = |e: SynaptixError| ModelError::Forward(format!("calib mlp: {e}"));

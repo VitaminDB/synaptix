@@ -43,6 +43,7 @@ members = [
     "crates/synaptix-models/llm/muse_glimmer",
     "crates/synaptix-models/llm/qwen4_exp",
     "crates/synaptix-models/llm/inkling2",
+    "crates/synaptix-models/llm/hy_v4_flash",
     "crates/synaptix-models/vlm/qwen3_vl",
     "crates/synaptix-models/vlm/minicpm_v",
     "crates/synaptix-models/asr/whisper",
@@ -221,6 +222,7 @@ synaptix-llm-qwen3-next-hybrid = { path = "crates/synaptix-models/llm/qwen3_next
 synaptix-llm-muse-glimmer = { path = "crates/synaptix-models/llm/muse_glimmer" }
 synaptix-llm-qwen4-exp = { path = "crates/synaptix-models/llm/qwen4_exp" }
 synaptix-llm-inkling2 = { path = "crates/synaptix-models/llm/inkling2" }
+synaptix-llm-hy-v4-flash = { path = "crates/synaptix-models/llm/hy_v4_flash" }
 synaptix-vlm-qwen3    = { path = "crates/synaptix-models/vlm/qwen3_vl" }
 synaptix-vlm-minicpm  = { path = "crates/synaptix-models/vlm/minicpm_v" }
 synaptix-llm-common   = { path = "crates/synaptix-models/llm/common" }

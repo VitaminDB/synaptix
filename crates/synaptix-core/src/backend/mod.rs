@@ -459,6 +459,11 @@ pub trait Backend: Send + Sync + 'static {
         Err(SynaptixError::Unsupported("inkling2_launch не поддержан этим backend"))
     }
 
+    /// Ядра Hy4-flash (`hy4.cu`) по имени; аргументы — та же [`Ink2Launch`].
+    fn hy4_launch(&self, _device: crate::device::Device, _kernel: &str, _a: &Ink2Launch, _grid: (u32, u32, u32), _block: u32) -> Result<()> {
+        Err(SynaptixError::Unsupported("hy4_launch не поддержан этим backend"))
+    }
+
     /// Слитый gated-residual Qwen4Exp на декоде (два ядра, см. `HcLaunch`).
     fn qwen4_hc_fused(&self, _device: crate::device::Device, _a: &HcLaunch) -> Result<()> {
         Err(SynaptixError::Unsupported("qwen4_hc_fused не поддержан этим backend"))
