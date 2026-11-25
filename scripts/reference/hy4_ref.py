@@ -66,7 +66,7 @@ STAGE_DIR = None
 
 def stage(l, name, x):
     """Промежуточные стадии слоя 0 (`l0_<name>.f32`) — для поиска расхождений."""
-    if STAGE_DIR and l == 0:
+    if STAGE_DIR and l == int(os.environ.get("HY4_STAGE_LAYER", "0")):
         x.detach().numpy().astype(np.float32).tofile(os.path.join(STAGE_DIR, f"l0_{name}.f32"))
 
 
@@ -194,7 +194,9 @@ def main():
             own = pos // G
             lg = lg.masked_fill(torch.arange(ng)[None, :] >= own[:, None], float("-inf"))
             kk = min(topk // G - 1, ng)
+            stage(l, "idx_scores", lg)
             sel = torch.cat((lg.topk(kk, -1).indices, own[:, None]), -1)
+            stage(l, "idx_sel", sel.float())
             tokens = (sel[:, :, None] * G + torch.arange(G)).flatten(1).clamp(max=T - 1)
             keep = torch.zeros(T, T, dtype=torch.bool)
             keep.scatter_(1, tokens, True)

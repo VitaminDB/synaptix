@@ -540,7 +540,7 @@ impl Hy4Model {
             AttnKind::Sliding => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(c.sliding_window), scale)?,
             AttnKind::Indexed => {
                 let idx = a.indexer.as_ref().expect("индексатор");
-                let groups = self.indexer(idx, hn, &qr, pos, p0, t, lc)?;
+                let groups = self.indexer(_l, idx, hn, &qr, pos, p0, t, lc)?;
                 match &groups {
                     Some(g) => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Groups(g, c.index_kpool), scale)?,
                     None => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(usize::MAX), scale)?,
@@ -559,7 +559,7 @@ impl Hy4Model {
     /// Ключи индексатора в кэш, свёртка закрытых групп и, если хоть одному
     /// запросу мало плотного окна, выбор групп `[T, k]`.
     #[allow(clippy::too_many_arguments)]
-    fn indexer(&self, idx: &Indexer, hn: &Tensor, qr: &Tensor, pos: &Tensor, p0: usize, t: usize, lc: &mut LayerCache) -> R<Option<Tensor>> {
+    fn indexer(&self, l: usize, idx: &Indexer, hn: &Tensor, qr: &Tensor, pos: &Tensor, p0: usize, t: usize, lc: &mut LayerCache) -> R<Option<Tensor>> {
         let c = &self.config;
         let (g, ch) = (c.index_kpool, c.index_head_dim);
         let rope_w = c.indexed.qk_rope;
@@ -586,13 +586,24 @@ impl Hy4Model {
         let valid: Vec<u32> = (p0..p0 + t).map(|p| ((p / g) as u32).min(ng as u32)).collect();
         let valid = Tensor::from_vec(valid, vec![t], self.device).map_err(fe)?;
         let k = c.index_groups().min(ng);
-        Ok(Some(scores.topk_wide(&valid, k).map_err(fe)?))
+        let sel = scores.topk_wide(&valid, k).map_err(fe)?;
+        if std::env::var_os("HY4_DUMP").is_some() {
+            stage(l, "idx_scores", &scores);
+            if let Ok(v) = sel.to_vec2::<u32>() {
+                let f: Vec<f32> = v.into_iter().flatten().map(|x| x as f32).collect();
+                if let Ok(t) = Tensor::from_vec(f, vec![t, k], Device::Cpu) {
+                    stage(l, "idx_sel", &t);
+                }
+            }
+        }
+        Ok(Some(sel))
     }
 }
 
-/// `HY4_DUMP=каталог`: промежуточные стадии слоя 0 (`l0_<имя>.f32`).
+/// `HY4_DUMP=каталог`: промежуточные стадии слоя `HY4_STAGE_LAYER` (0) — `l0_<имя>.f32`.
 fn stage(l: usize, name: &str, x: &Tensor) {
-    if l != 0 {
+    let want = std::env::var("HY4_STAGE_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    if l != want {
         return;
     }
     let Ok(dir) = std::env::var("HY4_DUMP") else { return };
