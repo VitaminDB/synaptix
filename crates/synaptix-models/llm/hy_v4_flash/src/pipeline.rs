@@ -113,16 +113,33 @@ impl Hy4Session {
     }
 }
 
-/// Кэш экспертов на карте: `SYN_HY4_EXPERT_CACHE_GB` (по умолчанию 8; 0 — все на карту).
+/// Кэш экспертов на карте: `SYN_HY4_EXPERT_CACHE_GB` (0 — все на карту).
+/// Без переменной — вся свободная VRAM за вычетом запаса [`vram_reserve`]
+/// (ёмкость подгоняется после загрузки и перед каждым ходом).
 fn expert_cache(device: Device) -> Option<Arc<ExpertCache>> {
-    if !device.is_cuda() {
-        return None;
+    let Device::Cuda(ord) = device else { return None };
+    let bytes = match std::env::var("SYN_HY4_EXPERT_CACHE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(gb) if gb <= 0.0 => return None,
+        Some(gb) => (gb * (1u64 << 30) as f64) as usize,
+        None => synaptix_core::device::cuda::mem_info(ord).map(|(_, total)| total).unwrap_or(8 << 30),
+    };
+    Some(ExpertCache::new(device, bytes))
+}
+
+/// Запас VRAM под KV и активации хода: `SYN_HY4_VRAM_RESERVE_GB` (3).
+fn vram_reserve() -> usize {
+    let gb = std::env::var("SYN_HY4_VRAM_RESERVE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(3.0);
+    (gb * (1u64 << 30) as f64) as usize
+}
+
+/// Ёмкость кэша экспертов под свободную VRAM (только в авто-режиме).
+fn fit_cache(model: &Hy4Model) {
+    if std::env::var_os("SYN_HY4_EXPERT_CACHE_GB").is_some() {
+        return;
     }
-    let gb = std::env::var("SYN_HY4_EXPERT_CACHE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(8.0);
-    if gb <= 0.0 {
-        return None;
+    if let Some(c) = model.expert_cache() {
+        c.fit_to_vram(vram_reserve());
     }
-    Some(ExpertCache::new(device, (gb * (1u64 << 30) as f64) as usize))
 }
 
 impl Hy4Pipeline {
@@ -149,13 +166,27 @@ impl Hy4Pipeline {
         if let Some(m) = &mirror {
             m.resume();
         }
+        fit_cache(&model);
         eprintln!(
             "[hy4] модель поднята за {:.1} с; эксперты {}",
             t0.elapsed().as_secs_f64(),
             if lazy { "читаются из бандла (кэш на карте)" } else { "на карте" }
         );
+        if let Some(c) = model.expert_cache() {
+            eprintln!("[hy4] кэш экспертов на карте: {:.1} ГБ", c.capacity_bytes() as f64 / (1u64 << 30) as f64);
+        }
         let max_seq = max_seq.unwrap_or(32768).min(w.config.max_position_embeddings);
         Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, max_seq })
+    }
+
+    /// Готовность зеркала экспертов в RAM: (готово байт, всего), `None` — зеркала нет.
+    pub fn mirror_progress(&self) -> Option<(usize, usize)> {
+        self._mirror.as_ref().map(|m| m.progress())
+    }
+
+    /// Копировщики зеркала закончили (или зеркала нет).
+    pub fn mirror_finished(&self) -> bool {
+        self._mirror.as_ref().is_none_or(|m| m.finished())
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
@@ -239,6 +270,7 @@ impl Hy4Pipeline {
         if need > s.cache.max_seq {
             self.grow_session(s, need.min(self.max_seq.max(need)))?;
         }
+        fit_cache(&self.model);
         let eos = eos_set(cfg);
         let mut sampler = TokenSampler::new(cfg, prompt_ids);
         let t0 = Instant::now();

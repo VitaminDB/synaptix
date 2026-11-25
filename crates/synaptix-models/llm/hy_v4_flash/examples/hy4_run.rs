@@ -1,4 +1,5 @@
 //! Прогон Hy4-flash: `cargo run --example hy4_run -- <бандл> (--ids файл | --text "…" | --chat "…") [--gen N]`.
+//! `--wait-mirror` — дождаться заполнения зеркала экспертов перед замером.
 //! `HY4_DUMP=каталог` — потоки после каждого слоя (сверка с scripts/reference/hy4_ref.py).
 
 use std::time::Instant;
@@ -15,6 +16,17 @@ fn main() {
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let gen: usize = opt("--gen").and_then(|v| v.parse().ok()).unwrap_or(0);
     let p = Hy4Pipeline::load(path, Device::Cuda(0), Some(8192)).expect("загрузка");
+    // `--wait-mirror`: замер в установившемся режиме — дождаться, пока зеркало
+    // экспертов в RAM заполнится (иначе промахи делят диск с копировщиками).
+    if args.iter().any(|a| a == "--wait-mirror") {
+        let t0 = Instant::now();
+        while !p.mirror_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if let Some((r, t)) = p.mirror_progress() {
+            eprintln!("зеркало заполнено за {:.0} с: {:.1} из {:.1} ГБ", t0.elapsed().as_secs_f64(), r as f64 / 1e9, t as f64 / 1e9);
+        }
+    }
     let ids: Vec<u32> = if let Some(f) = opt("--ids") {
         std::fs::read_to_string(f).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect()
     } else if let Some(t) = opt("--chat") {
