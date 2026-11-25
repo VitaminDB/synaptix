@@ -182,7 +182,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
         }
         let n = name(f);
         let plan = match f.arch.as_str() {
-            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "wemm_qwen3_5_moe" | "moss_audio" | "musicflamingo" | "qwen3_omni_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" | "lfm3" | "inkling2_loop" | "inkling2" if !n.contains("embedding") => {
+            "gemma4" | "gemma3" | "qwen3_5" | "qwen3_5_moe" | "wemm_qwen3_5_moe" | "moss_audio" | "musicflamingo" | "qwen3_omni_moe" | "minicpmv4_7" | "qwen4_exp" | "muse_glimmer" | "llama" | "qwen3_next" | "lfm3" | "inkling2_loop" | "inkling2" | "hy_v4_flash" | "hy_v4_flash_text" if !n.contains("embedding") => {
                 Some(single(f, Task::Llm, &f.arch, "Языковая модель"))
             }
             "qwen3" if n.contains("embedding") => Some(single(f, Task::Embed, "qwen3_embedding", "Эмбеддинги для поиска по смыслу")),
@@ -272,11 +272,12 @@ mod tests {
             f("acestep_vae", "ace-step-vae"),
             f("bge-reranker-v2-m3", "xlm-roberta"),
             f("gemma-4-26b-a4b-it", "gemma4"),
+            f("hy4-flash", "hy_v4_flash"),
         ];
         let p = plan_parsed(&files);
         let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
         // Реранкер — своя модель (Task::Rerank), а не пропуск.
-        assert_eq!(ids, ["ltx-2-3-22b-dev", "ltx-2-3-22b-distilled-1-1", "acestep-v15-xl-turbo", "bge-reranker-v2-m3", "gemma-4-26b-a4b-it"]);
+        assert_eq!(ids, ["ltx-2-3-22b-dev", "ltx-2-3-22b-distilled-1-1", "acestep-v15-xl-turbo", "bge-reranker-v2-m3", "gemma-4-26b-a4b-it", "hy4-flash"]);
         let dev = &p.models[0];
         assert!(dev.components.iter().any(|(r, _)| r == "text_encoder"));
         assert!(dev.components.iter().any(|(r, _)| r == "distilled_lora"));
