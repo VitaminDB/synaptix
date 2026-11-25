@@ -51,6 +51,7 @@ pub struct Hy4Pipeline {
     pub chat_template: Option<String>,
     pub config: Hy4Config,
     pub path: PathBuf,
+    zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
     max_seq: usize,
 }
 
@@ -126,6 +127,18 @@ fn expert_cache(device: Device) -> Option<Arc<ExpertCache>> {
     Some(ExpertCache::new(device, bytes))
 }
 
+/// Zero-copy декод MoE: `SYN_HY4_ZC` (по умолчанию вкл).
+fn zc_on() -> bool {
+    std::env::var("SYN_HY4_ZC").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+/// Потолок старого кэша экспертов при zero-copy (только префилл):
+/// `SYN_HY4_ZC_PREFILL_GB` (2,5).
+fn zc_prefill_cache_bytes() -> usize {
+    let gb = std::env::var("SYN_HY4_ZC_PREFILL_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(2.5);
+    (gb * (1u64 << 30) as f64) as usize
+}
+
 /// Запас VRAM под KV и активации хода: `SYN_HY4_VRAM_RESERVE_GB` (3).
 fn vram_reserve() -> usize {
     let gb = std::env::var("SYN_HY4_VRAM_RESERVE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(3.0);
@@ -133,8 +146,8 @@ fn vram_reserve() -> usize {
 }
 
 /// Ёмкость кэша экспертов под свободную VRAM (только в авто-режиме).
-fn fit_cache(model: &Hy4Model) {
-    if std::env::var_os("SYN_HY4_EXPERT_CACHE_GB").is_some() {
+fn fit_cache(model: &Hy4Model, zc: bool) {
+    if zc || std::env::var_os("SYN_HY4_EXPERT_CACHE_GB").is_some() {
         return;
     }
     if let Some(c) = model.expert_cache() {
@@ -153,20 +166,41 @@ impl Hy4Pipeline {
         let first_sparse = w.config.dense.iter().position(|d| !d).unwrap_or(0);
         let lazy = cache.is_some() && stacks.as_deref().is_some_and(|s| em::has_lazy_stacks(s, first_sparse));
         let source: Option<Arc<dyn ExpertSource>> = lazy.then(|| Arc::new(em::BundleExperts::new(stacks.clone().expect("lazy"))) as Arc<dyn ExpertSource>);
+        // Zero-copy декод MoE (`SYN_HY4_ZC=0` — выкл): ядра читают NVFP4
+        // экспертов прямо из закреплённой RAM, поэтому зеркало — в натуральной
+        // раскладке.
+        let zc = zc_on() && lazy && stacks.as_deref().is_some_and(|s| em::experts_zc_capable(s));
         let mirror = if lazy && std::env::var("SYN_HY4_MIRROR").as_deref() != Ok("0") {
             let s = &**stacks.as_ref().expect("lazy");
-            em::host_mirror(&em::mirror_ranges(s, device), "hy4").map(|(g, _)| g)
+            let ranges = if zc { em::mirror_ranges_natural(s, device) } else { em::mirror_ranges(s, device) };
+            em::host_mirror(&ranges, "hy4").map(|(g, _)| g)
         } else {
             None
         };
         let t0 = Instant::now();
         let guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
-        let model = no_grad(|| Hy4Model::build(&w, device, cache, source, prefill_chunk()))?;
+        let mut model = no_grad(|| Hy4Model::build(&w, device, cache, source, prefill_chunk()))?;
         drop(guard);
+        let zc_pool = if zc && mirror.is_some() {
+            let pool = synaptix_llm_common::moe_zc::ZcPool::new(device);
+            // 512 экспертов, top-16: слоя хватает и ~16 слотов — промахи
+            // читаются прямо из RAM, а не ждут копии. `SYN_HY4_ZC_MIN_SLOTS`.
+            pool.set_min_slots(std::env::var("SYN_HY4_ZC_MIN_SLOTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16));
+            model.attach_zc(&pool);
+            // Старый кэш нужен лишь префиллу: потолок ужимается, VRAM отходит
+            // слотам zero-copy на первом декоде.
+            if let Some(cache) = model.expert_cache() {
+                cache.set_ceiling(zc_prefill_cache_bytes());
+            }
+            eprintln!("[hy4] декод MoE без синхронизации (zero-copy): эксперты из закреплённой RAM + слоты VRAM");
+            Some(pool)
+        } else {
+            None
+        };
         if let Some(m) = &mirror {
             m.resume();
         }
-        fit_cache(&model);
+        fit_cache(&model, zc_pool.is_some());
         eprintln!(
             "[hy4] модель поднята за {:.1} с; эксперты {}",
             t0.elapsed().as_secs_f64(),
@@ -176,7 +210,7 @@ impl Hy4Pipeline {
             eprintln!("[hy4] кэш экспертов на карте: {:.1} ГБ", c.capacity_bytes() as f64 / (1u64 << 30) as f64);
         }
         let max_seq = max_seq.unwrap_or(32768).min(w.config.max_position_embeddings);
-        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, max_seq })
+        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, zc_pool, max_seq })
     }
 
     /// Готовность зеркала экспертов в RAM: (готово байт, всего), `None` — зеркала нет.
@@ -187,6 +221,36 @@ impl Hy4Pipeline {
     /// Копировщики зеркала закончили (или зеркала нет).
     pub fn mirror_finished(&self) -> bool {
         self._mirror.as_ref().is_none_or(|m| m.finished())
+    }
+
+    /// Назначить слоты zero-copy (на первом декоде после загрузки или
+    /// длинного префилла): свободная VRAM за вычетом запаса, поровну на MoE-слои.
+    /// Запас `SYN_HY4_ZC_HEADROOM_MB` (2048) — соседям службы по карте и KV.
+    pub fn size_zc_pool(&self) {
+        let Some(pool) = &self.zc_pool else { return };
+        if pool.slots_per_layer() != 0 {
+            return;
+        }
+        let Device::Cuda(ord) = self.model.device else { return };
+        if let Some(cache) = self.model.expert_cache() {
+            cache.set_capacity(zc_prefill_cache_bytes().min(cache.ceiling_bytes()));
+        }
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
+        let Ok((free, _)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        let headroom = std::env::var("SYN_HY4_ZC_HEADROOM_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20;
+        let reserve = headroom + (768usize << 20);
+        let c = &self.config;
+        let layers = c.dense.iter().filter(|d| !**d).count().max(1);
+        // gate_up [2I, H] + down [H, I] в NVFP4: 4,5 бита на вес с масштабами.
+        let (h, i) = (c.moe_hidden, c.moe_intermediate);
+        let per_expert = (3 * h * i) * 9 / 16;
+        let slots = (free.saturating_sub(reserve) / layers / per_expert.max(1)).min(c.n_experts);
+        pool.set_slots_per_layer(slots);
+        eprintln!(
+            "[hy4] zero-copy: слотов VRAM {slots} на слой ({:.1} ГБ), свободно было {:.1} ГБ",
+            (slots * layers * per_expert) as f64 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64
+        );
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
@@ -236,6 +300,17 @@ impl Hy4Pipeline {
         }
         let reuse = s.reusable(prompt_ids);
         s.cache.truncate(reuse);
+        // Длинный префилл: слоты zero-copy отдать под активации (частоты
+        // выбора остаются затравкой следующего декода).
+        let zc_release = std::env::var("SYN_HY4_ZC_RELEASE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024usize);
+        if let Some(pool) = self.zc_pool.as_ref().filter(|_| prompt_ids.len() - reuse > zc_release) {
+            self.model.zc_release();
+            pool.set_slots_per_layer(0);
+            if let Device::Cuda(ord) = self.model.device {
+                let _ = synaptix_core::device::cuda::synchronize_all(ord);
+                let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+            }
+        }
         let chunk = prefill_chunk();
         let mut hidden = None;
         let mut at = reuse;
@@ -270,7 +345,7 @@ impl Hy4Pipeline {
         if need > s.cache.max_seq {
             self.grow_session(s, need.min(self.max_seq.max(need)))?;
         }
-        fit_cache(&self.model);
+        fit_cache(&self.model, self.zc_pool.is_some());
         let eos = eos_set(cfg);
         let mut sampler = TokenSampler::new(cfg, prompt_ids);
         let t0 = Instant::now();
@@ -280,6 +355,7 @@ impl Hy4Pipeline {
         if cfg.max_new_tokens == 0 {
             return Ok((out, GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: 0, prefill_ms, decode_ms: 0 }, reuse));
         }
+        self.size_zc_pool();
         let t1 = Instant::now();
         let mut tok = sampler.sample(&logits)?;
         loop {

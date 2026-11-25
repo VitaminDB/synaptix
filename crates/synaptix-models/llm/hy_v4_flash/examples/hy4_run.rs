@@ -46,7 +46,16 @@ fn main() {
     eprintln!("токенов: {} {:?}", ids.len(), &ids[..ids.len().min(32)]);
     let mut s = p.new_session(ids.len() + gen + 8).unwrap();
     let t0 = Instant::now();
-    let (logits, _) = p.prefill(&mut s, &ids, &mut |_: u32| true).expect("префилл");
+    // `--last-decode`: последний токен — шагом декода (путь MoE на 1 токен),
+    // остальное префиллом; логиты сравнимы с полным префиллом той же позиции.
+    let (logits, _) = if args.iter().any(|a| a == "--last-decode") {
+        p.prefill(&mut s, &ids[..ids.len() - 1], &mut |_: u32| true).expect("префилл");
+        p.size_zc_pool();
+        let h = no_grad(|| p.model.forward(&ids[ids.len() - 1..], &mut s.cache, Some(1))).unwrap();
+        (p.model.logits(&h).unwrap(), 0)
+    } else {
+        p.prefill(&mut s, &ids, &mut |_: u32| true).expect("префилл")
+    };
     let dt = t0.elapsed().as_secs_f64();
     let v = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     if let Some(f) = opt("--logits") {
@@ -60,6 +69,7 @@ fn main() {
         eprintln!("профиль префилла:\n{}", synaptix_llm_common::profile::report());
     }
     if gen > 0 {
+        p.size_zc_pool();
         let mut tok = idx[0] as u32;
         let mut out = vec![tok];
         let t1 = Instant::now();
@@ -74,6 +84,9 @@ fn main() {
         }
         let dd = t1.elapsed().as_secs_f64();
         eprintln!("декод {:.2} ток/с", (out.len() - 1) as f64 / dd);
+        if let Some((hit, picks, res)) = p.model.zc_stats() {
+            eprintln!("zero-copy: попаданий в слоты {:.1} % ({hit} из {picks}), резидентов {res}", 100.0 * hit as f64 / picks.max(1) as f64);
+        }
         if synaptix_llm_common::profile::profiling() {
             eprintln!("профиль декода ({} шагов, {:.1} мс/шаг):\n{}", out.len() - 1, dd * 1e3 / (out.len() - 1) as f64, synaptix_llm_common::profile::report());
         }

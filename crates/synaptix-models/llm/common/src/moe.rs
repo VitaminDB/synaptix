@@ -1001,6 +1001,9 @@ pub struct MoeFfn {
     zc_seed: Mutex<Vec<f32>>,
     /// Сколько вызовов подряд слой не собрался (зеркало не готово) — пауза.
     zc_retry: AtomicUsize,
+    /// Поправка выбора sigmoid-роутера на карте (`ext.select_bias`) — для
+    /// роутинга zero-copy без хоста.
+    zc_select_bias: std::sync::OnceLock<Tensor>,
 }
 
 impl MoeFfn {
@@ -1139,6 +1142,7 @@ impl MoeFfn {
             zc: Mutex::new(None),
             zc_seed: Mutex::new(Vec::new()),
             zc_retry: AtomicUsize::new(0),
+            zc_select_bias: std::sync::OnceLock::new(),
             offload_tables: Mutex::new(None),
             cfg,
             cache: None,
@@ -1972,10 +1976,17 @@ impl MoeFfn {
     /// индексные GEMV по таблице (слот VRAM или блоб в закреплённой RAM).
     /// `None` — путь неприменим (нет пула, формат не одноблобный, зеркало
     /// не готово) — считать прежним.
-    fn forward_zc(&self, x: &Tensor) -> Result<Option<Tensor>, ModelError> {
+    fn forward_zc(&self, x: &Tensor, router_in: Option<&Tensor>) -> Result<Option<Tensor>, ModelError> {
         let Some(pool) = &self.zc_pool else { return Ok(None) };
         let ExpertStore::Lazy { source, count } = &self.experts else { return Ok(None) };
-        if !self.cfg.norm_topk_prob || self.cfg.per_expert_scale.is_some() || self.cfg.activation != Activation::Silu {
+        // Sigmoid-роутер (Hy4: σ, поправка выбора, нормировка, масштаб) — свой
+        // выбор на карте ниже; softmax — прежний. Активация — SiLU или SiLU с
+        // ограничением (`act_mul`).
+        let sigmoid = self.cfg.ext.sigmoid_scoring;
+        if (!self.cfg.norm_topk_prob && !sigmoid)
+            || self.cfg.per_expert_scale.is_some()
+            || !matches!(self.cfg.activation, Activation::Silu | Activation::SiluClamp(_))
+        {
             return Ok(None);
         }
         let mut guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
@@ -2022,11 +2033,50 @@ impl MoeFfn {
         let xa = if xa.is_contiguous() { xa } else { xa.contiguous().map_err(ferr)? };
         // Роутер, top-k, softmax и кэш экспертов — одной пачкой ядер (F16-вход);
         // иначе выбор считается тензорными операциями.
-        let routed_on_dev = xa.dtype() == DType::F16 && self.router.dtype() == DType::F32 && self.router.is_contiguous() && self.cfg.num_experts <= 1024 && k <= 64 && h % 4 == 0;
+        let routed_on_dev = !sigmoid && router_in.is_none() && xa.dtype() == DType::F16 && self.router.dtype() == DType::F32 && self.router.is_contiguous() && self.cfg.num_experts <= 1024 && k <= 64 && h % 4 == 0;
         let (idx, w, gu_t, dn_t, iota) = if routed_on_dev {
             let idx = Tensor::empty_uninit(vec![t * k], DType::U32, self.device).map_err(ferr)?;
             let w = Tensor::empty_uninit(vec![t * k], DType::F32, self.device).map_err(ferr)?;
             let (gu_t, dn_t, iota) = layer.stage_routed(pool, &idx, Some((&self.router, &xa, &w)))?;
+            (idx, w, gu_t, dn_t, iota)
+        } else if sigmoid {
+            // Как `route_sigmoid`, но на карте: выбор по σ + поправка, веса —
+            // σ выбранных, нормированные, × масштаб.
+            let r = router_in.unwrap_or(x);
+            let s = r.to_dtype(DType::F32).and_then(|rf| rf.linear(&self.router)).and_then(|l| l.sigmoid()).map_err(ferr)?;
+            // σ выбранных = (σ + поправка) − поправка[idx]: gather на карте
+            // нет, index_select по вектору поправки есть.
+            let (sel, idx) = match &self.cfg.ext.select_bias {
+                Some(b) => {
+                    let bias = match self.zc_select_bias.get() {
+                        Some(t) => t.clone(),
+                        None => {
+                            let t = Tensor::from_vec(b.clone(), vec![b.len()], self.device).map_err(ferr)?;
+                            let _ = self.zc_select_bias.set(t.clone());
+                            t
+                        }
+                    };
+                    let choice = s.broadcast_add(&bias.reshape(vec![1, b.len()]).map_err(ferr)?).map_err(ferr)?;
+                    let (vals, idx) = choice.topk_rows(k).map_err(ferr)?;
+                    let flat = idx.flatten_all().and_then(|i| i.contiguous()).map_err(ferr)?;
+                    let picked = bias.index_select(0, &flat).and_then(|p| p.reshape(vec![t, k])).map_err(ferr)?;
+                    (vals.sub(&picked).map_err(ferr)?, idx)
+                }
+                None => {
+                    let (vals, idx) = s.topk_rows(k).map_err(ferr)?;
+                    (vals, idx)
+                }
+            };
+            let scale = if self.cfg.ext.routed_scale > 0.0 { self.cfg.ext.routed_scale } else { 1.0 };
+            let w = sel
+                .sum_keepdim(1)
+                .and_then(|d| d.add_scalar(1e-20))
+                .and_then(|d| sel.broadcast_div(&d))
+                .and_then(|w| w.mul_scalar(scale))
+                .map_err(ferr)?;
+            let idx = idx.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+            let w = w.flatten_all().and_then(|t| t.contiguous()).map_err(ferr)?;
+            let (gu_t, dn_t, iota) = layer.stage(pool, &idx)?;
             (idx, w, gu_t, dn_t, iota)
         } else {
             let logits = x.to_dtype(DType::F32).and_then(|xf| xf.linear(&self.router)).map_err(ferr)?;
@@ -2270,8 +2320,8 @@ impl MoeFfn {
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
         let routed = router_in.unwrap_or(x);
-        if t <= 4 && router_in.is_none() {
-            if let Some(out) = stage("moe:zc", || self.forward_zc(x))? {
+        if t <= 4 {
+            if let Some(out) = stage("moe:zc", || self.forward_zc(x, router_in))? {
                 if std::env::var("SYN_ZC_SYNC").as_deref() == Ok("1") {
                     if let Device::Cuda(o) = self.device {
                         let _ = synaptix_core::device::cuda::synchronize_all(o);
@@ -2279,7 +2329,7 @@ impl MoeFfn {
                 }
                 if zc_check() {
                     // Сверка с прежним путём (отладка): тот же вход, батч GEMV.
-                    let (experts, weights) = self.route(x)?;
+                    let (experts, weights) = self.route(routed)?;
                     self.prefetch(&experts, &weights, true);
                     if let Some(want) = self.forward_pairs_batched(x, &experts, &weights)? {
                         let d = out.to_dtype(DType::F32).and_then(|a| want.to_dtype(DType::F32).and_then(|b| a.sub(&b)))
