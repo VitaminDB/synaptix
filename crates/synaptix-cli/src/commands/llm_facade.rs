@@ -142,6 +142,7 @@ pub struct Splitter {
     state: State,
     header: String,
     thinking: bool,
+    tags: synaptix::facade::chat::think::ThinkTags,
 }
 
 impl Splitter {
@@ -159,9 +160,10 @@ impl Splitter {
             })
         })();
         let inkling = InklingIds::detect(tok).map(InklingParser::new);
-        let thinking = prompt.trim_end().ends_with("<think>");
+        let tags = synaptix::facade::chat::think_tags(tok);
+        let thinking = prompt.trim_end().ends_with(tags.open);
         let state = if channels.is_some() { State::Header } else { State::Body(Part::Answer) };
-        Self { channels, inkling, state, header: String::new(), thinking }
+        Self { channels, inkling, state, header: String::new(), thinking, tags }
     }
 
     pub fn push(&mut self, id: u32, delta: &str, emit: &mut dyn FnMut(Part, &str)) {
@@ -210,7 +212,7 @@ impl Splitter {
         }
         let mut rest = delta;
         while !rest.is_empty() {
-            let tag = if self.thinking { "</think>" } else { "<think>" };
+            let tag = if self.thinking { self.tags.close } else { self.tags.open };
             match rest.find(tag) {
                 Some(i) => {
                     if i > 0 {

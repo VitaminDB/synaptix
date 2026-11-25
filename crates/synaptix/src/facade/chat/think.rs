@@ -1,8 +1,35 @@
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
+/// Теги блока размышлений модели. Обычно `<think>`/`</think>`; у Hy4-flash —
+/// `<think:opensource>`/`</think:opensource>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkTags {
+    pub open: &'static str,
+    pub close: &'static str,
+    /// Что дописать, закрывая размышления принудительно (бюджет).
+    pub forced: &'static str,
+}
+
+pub const DEFAULT_TAGS: ThinkTags = ThinkTags { open: OPEN, close: CLOSE, forced: "\n</think>\n\n" };
+pub const HY4_TAGS: ThinkTags = ThinkTags { open: "<think:opensource>", close: "</think:opensource>", forced: "\n</think:opensource>" };
+
+impl ThinkTags {
+    /// Теги по словарю: чей закрывающий тег — один токен (`single`).
+    pub fn detect(single: impl Fn(&str) -> bool) -> Self {
+        if single(HY4_TAGS.close) { HY4_TAGS } else { DEFAULT_TAGS }
+    }
+}
+
+impl Default for ThinkTags {
+    fn default() -> Self {
+        DEFAULT_TAGS
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct ThinkParser {
+    tags: ThinkTags,
     inside: bool,
     pending: String,
     eat_extraneous_close: bool,
@@ -24,6 +51,7 @@ impl ThinkParser {
 
     pub fn new_implicit_open() -> Self {
         Self {
+            tags: DEFAULT_TAGS,
             inside: true,
             pending: String::new(),
             eat_extraneous_close: true,
@@ -31,19 +59,30 @@ impl ThinkParser {
         }
     }
 
+    /// Другие теги блока (см. [`ThinkTags::detect`]).
+    pub fn with_tags(mut self, tags: ThinkTags) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    pub fn tags(&self) -> ThinkTags {
+        self.tags
+    }
+
     pub fn feed(&mut self, chunk: &str) -> ThinkSplit {
+        let (open, close) = (self.tags.open, self.tags.close);
         let mut buf = std::mem::take(&mut self.pending);
         buf.push_str(chunk);
         if self.skip_open {
             let t = buf.trim_start();
             let lower = t.to_ascii_lowercase();
-            if OPEN.starts_with(lower.as_str()) && lower.len() < OPEN.len() {
+            if open.starts_with(lower.as_str()) && lower.len() < open.len() {
                 // Пусто или начало тега — ждём следующий кусок.
                 self.pending = buf;
                 return ThinkSplit::default();
             }
-            if lower.starts_with(OPEN) {
-                buf = t[OPEN.len()..].to_string();
+            if lower.starts_with(open) {
+                buf = t[open.len()..].to_string();
             }
             self.skip_open = false;
         }
@@ -53,14 +92,14 @@ impl ThinkParser {
 
         loop {
             if self.inside {
-                match find_ci(&buf, CLOSE, cursor) {
+                match find_ci(&buf, close, cursor) {
                     Some(pos) => {
                         push_segment(&mut out, true, &buf[cursor..pos]);
-                        cursor = pos + CLOSE.len();
+                        cursor = pos + close.len();
                         self.inside = false;
                     }
                     None => {
-                        let split = trailing_tag_prefix(&buf[cursor..], CLOSE);
+                        let split = trailing_tag_prefix(&buf[cursor..], close);
                         let safe_end = cursor + split;
                         push_segment(&mut out, true, &buf[cursor..safe_end]);
                         self.pending = buf[safe_end..].to_string();
@@ -68,18 +107,18 @@ impl ThinkParser {
                     }
                 }
             } else {
-                let open_pos = find_ci(&buf, OPEN, cursor);
+                let open_pos = find_ci(&buf, open, cursor);
                 let close_pos = if self.eat_extraneous_close {
-                    find_ci(&buf, CLOSE, cursor)
+                    find_ci(&buf, close, cursor)
                 } else {
                     None
                 };
 
                 let (next_pos, tag_len, opens) = match (open_pos, close_pos) {
                     (None, None) => {
-                        let split_open = trailing_tag_prefix(&buf[cursor..], OPEN);
+                        let split_open = trailing_tag_prefix(&buf[cursor..], open);
                         let split = if self.eat_extraneous_close {
-                            let split_close = trailing_tag_prefix(&buf[cursor..], CLOSE);
+                            let split_close = trailing_tag_prefix(&buf[cursor..], close);
                             split_open.min(split_close)
                         } else {
                             split_open
@@ -89,13 +128,13 @@ impl ThinkParser {
                         self.pending = buf[safe_end..].to_string();
                         return out;
                     }
-                    (Some(o), None) => (o, OPEN.len(), true),
-                    (None, Some(c)) => (c, CLOSE.len(), false),
+                    (Some(o), None) => (o, open.len(), true),
+                    (None, Some(c)) => (c, close.len(), false),
                     (Some(o), Some(c)) => {
                         if o <= c {
-                            (o, OPEN.len(), true)
+                            (o, open.len(), true)
                         } else {
-                            (c, CLOSE.len(), false)
+                            (c, close.len(), false)
                         }
                     }
                 };
@@ -191,6 +230,16 @@ mod tests {
         let mut p = ThinkParser::new_implicit_open();
         let r = split(&mut p, &["думаю</think>ответ"]);
         assert_eq!(r.thinking, "думаю");
+    }
+
+    #[test]
+    fn hy4_tags() {
+        let mut p = ThinkParser::new_implicit_open().with_tags(HY4_TAGS);
+        let r = split(&mut p, &["думаю</think:open", "source>ответ"]);
+        assert_eq!(r.thinking, "думаю");
+        assert_eq!(r.body, "ответ");
+        assert_eq!(ThinkTags::detect(|s| s == "</think:opensource>"), HY4_TAGS);
+        assert_eq!(ThinkTags::detect(|_| false), DEFAULT_TAGS);
     }
 
     #[test]

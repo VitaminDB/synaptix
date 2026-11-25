@@ -2625,17 +2625,20 @@ impl<'a> LlmGeneration<'a> {
                     _ => None,
                 }
             }
-            Some(_) => single("</think>")
-                // Шаблон мог сам закрыть блок размышлений (`<think>\n\n</think>`):
-                // режим без размышлений, выбранный в чате меткой (`{REASON:ilow}` у
-                // моделей DavidAU), хотя ход просили с размышлениями. Тогда ждать
-                // `</think>` от модели нечего.
-                .filter(|&c| {
-                    let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
-                    let open = single("<think>").and_then(last);
-                    !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
-                })
-                .map(|close| ThinkMarkup { open: None, close, forced: "\n</think>\n\n" }),
+            Some(_) => {
+                let tags = crate::facade::chat::think_tags(tokenizer);
+                single(tags.close)
+                    // Шаблон мог сам закрыть блок размышлений (`<think>\n\n</think>`):
+                    // режим без размышлений, выбранный в чате меткой (`{REASON:ilow}` у
+                    // моделей DavidAU), хотя ход просили с размышлениями. Тогда ждать
+                    // `</think>` от модели нечего.
+                    .filter(|&c| {
+                        let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
+                        let open = single(tags.open).and_then(last);
+                        !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
+                    })
+                    .map(|close| ThinkMarkup { open: None, close, forced: tags.forced })
+            }
         };
         let budget = match (&markup, self.thinking) {
             (Some(_), Some(b)) if b > 0 && b < max_new => b,
@@ -3484,9 +3487,10 @@ impl<'a> LlmGeneration<'a> {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),
             _ => None,
         };
-        let close = self.thinking.and_then(|_| single("</think>")).filter(|&c| {
+        let tags = crate::facade::chat::think_tags(tokenizer);
+        let close = self.thinking.and_then(|_| single(tags.close)).filter(|&c| {
             let last = |t: u32| prompt_ids.iter().rposition(|&x| x == t);
-            let open = single("<think>").and_then(last);
+            let open = single(tags.open).and_then(last);
             !matches!((open, last(c)), (Some(o), Some(cl)) if cl > o)
         });
         let max_new = self.opts.max_new_tokens;
@@ -3527,7 +3531,7 @@ impl<'a> LlmGeneration<'a> {
         };
         let mut r = run(self, prompt_ids, false, &mut |id, s| feed(&mut t, id, s, budget, on_token));
         if r.is_ok() && t.over && !t.cb_stop {
-            let forced = tokenizer.encode("\n</think>\n\n").map_err(|e| LlmError(e.to_string()))?;
+            let forced = tokenizer.encode(tags.forced).map_err(|e| LlmError(e.to_string()))?;
             let mut prompt2 = Vec::with_capacity(prompt_ids.len() + t.seq.len() + forced.len());
             prompt2.extend_from_slice(prompt_ids);
             prompt2.extend_from_slice(&t.seq);

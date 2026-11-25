@@ -66,6 +66,15 @@ MXFP8; индексатор (F32-проекции, позиционная таб
   Кэш индексированных слоёв — F32 (`HY4_KV=bf16`), у SWA — кольцо окно + чанк префилла.
 - Engram: хэш и строки таблицы — на хосте (строки MXFP8 читаются из блобов бандла), гейт — на карте.
 
+Фасад: `synaptix run llm/hy4-flash.syn "…" --chat` — шаблон по умолчанию с рассуждениями
+(`reasoning_effort:high`, ход начинается внутри `<think:opensource>`); теги фасад берёт по словарю
+(`facade::chat::think_tags`: `</think:opensource>` — один токен → теги Hy4). Шаблон использует
+Python `str.format` — поддержан в `pycompat`.
+
+Замеры (RTX 24 ГБ, кэш экспертов 8 ГБ, зеркало ~65–73 ГБ RAM): декод 5,1–5,9 ток/с; префилл
+2600 токенов — 32 с. Сверка с BF16-эталоном: top-1 совпадает, cos по слоям 0,996 → 0,80 (шум
+MXFP8/NVFP4); выбор групп индексатора на 2600 токенах совпадает на 98–99,6 %.
+
 Проверка: `cargo run --example hy4_run -- llm/hy4-flash.syn --chat "…" --gen 64`;
 сверка: `HY4_DUMP=dir … --save-ids ids.txt`, затем `scripts/reference/hy4_ref.py --ids ids.txt --out ref/`
 и `hy4_cmp.py ref/ dir/`.

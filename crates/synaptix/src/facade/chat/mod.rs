@@ -9,7 +9,7 @@ use synaptix_tokenizer::{Gemma4Ids, Gemma4StreamParser};
 use crate::facade::llm::LlmTokenizer;
 use channel::{ChannelIds, ChannelParser};
 use inkling::{InklingIds, InklingParser};
-use think::ThinkParser;
+use think::{ThinkParser, ThinkTags};
 pub use tool_parser::{LlamaJsonParser, RawToolCall, ToolCallParser};
 
 pub enum StreamParser {
@@ -41,7 +41,8 @@ impl StreamParser {
                     ThinkParser::new_implicit_open()
                 } else {
                     ThinkParser::new()
-                },
+                }
+                .with_tags(think_tags(tokenizer)),
                 tools: ToolCallParser::new(),
             },
         }
@@ -53,7 +54,7 @@ impl StreamParser {
     pub fn grammar_trigger(&self, thinking: bool) -> Option<&'static str> {
         match self {
             Self::Gemma(_) if thinking => Some("<channel|>"),
-            Self::ChatML { .. } if thinking => Some("</think>"),
+            Self::ChatML { think, .. } if thinking => Some(think.tags().close),
             _ => None,
         }
     }
@@ -141,7 +142,12 @@ fn single_token(tokenizer: &LlmTokenizer, s: &str) -> Option<u32> {
 }
 
 fn knows_think_tokens(tokenizer: &LlmTokenizer) -> bool {
-    matches!(tokenizer.encode("</think>"), Ok(ids) if ids.len() == 1)
+    single_token(tokenizer, think_tags(tokenizer).close).is_some()
+}
+
+/// Теги размышлений модели по её словарю (`<think>` или `<think:opensource>` у Hy4).
+pub fn think_tags(tokenizer: &LlmTokenizer) -> ThinkTags {
+    ThinkTags::detect(|s| single_token(tokenizer, s).is_some())
 }
 
 fn gemma4_ids(tokenizer: &LlmTokenizer) -> Option<Gemma4Ids> {
