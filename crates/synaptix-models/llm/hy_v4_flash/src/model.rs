@@ -23,7 +23,7 @@ use crate::loader::Hy4Weights;
 /// Проекции — в BF16 (диапазон шире F16; квант-ядра читают его напрямую).
 const ACT: DType = DType::BF16;
 
-fn lin(w: &dyn WeightSource, key: &str, dev: Device) -> R<QLinear> {
+pub(crate) fn lin(w: &dyn WeightSource, key: &str, dev: Device) -> R<QLinear> {
     let verbose = std::env::var_os("HY4_VERBOSE").is_some();
     if let Some(q) = w.quant(key, dev) {
         let q = q?;
@@ -39,7 +39,7 @@ fn lin(w: &dyn WeightSource, key: &str, dev: Device) -> R<QLinear> {
     QLinear::build(t, ACT, ACT)
 }
 
-fn f32t(w: &dyn WeightSource, key: &str, dev: Device) -> R<Tensor> {
+pub(crate) fn f32t(w: &dyn WeightSource, key: &str, dev: Device) -> R<Tensor> {
     let t = w.tensor(key, dev, DType::F32)?;
     kern::contig(&t)
 }
@@ -53,7 +53,50 @@ fn dense_f32(w: &dyn WeightSource, key: &str, dev: Device) -> R<Tensor> {
     f32t(w, key, dev)
 }
 
-fn fwd(l: &QLinear, x: &Tensor) -> R<Tensor> {
+/// Внимание MLA по префиксу весов (`…self_attn`): слой цели или драфтера DFly
+/// (у драфтера индексатора нет, `with_indexer = false`).
+pub(crate) fn load_attn(w: &dyn WeightSource, a: &str, dims: MlaDims, kind: AttnKind, kv_lora: usize, dev: Device, with_indexer: bool) -> R<Attn> {
+    // W_uk / W_uv из kv_b_proj [NH·(nope+v), L].
+    let kvb = dense_f32(w, &format!("{a}.kv_b_proj.weight"), dev)?;
+    let (nh, nope, vd, lat) = (dims.heads, dims.qk_nope, dims.v, kv_lora);
+    let kvb = kvb.reshape(vec![nh, nope + vd, lat]).map_err(fe)?;
+    let w_uk = kern::to(&kvb.narrow(1, 0, nope).map_err(fe)?, ACT)?;
+    let w_uv_t = kern::to(&kvb.narrow(1, nope, vd).and_then(|t| t.transpose(1, 2)).map_err(fe)?, ACT)?;
+    drop(kvb);
+    let indexer = if with_indexer {
+        let i = format!("{a}.compressed_indexer");
+        Some(Indexer {
+            q_proj: lin(w, &format!("{i}.query_projection.weight"), dev)?,
+            w_proj: lin(w, &format!("{i}.head_weight_projection.weight"), dev)?,
+            k_proj: lin(w, &format!("{i}.token_key_projection.weight"), dev)?,
+            k_norm: f32t(w, &format!("{i}.token_key_norm.weight"), dev)?,
+            wv: f32t(w, &format!("{i}.key_value_projection.weight"), dev)?,
+            wg: f32t(w, &format!("{i}.key_gate_projection.weight"), dev)?,
+            ape: f32t(w, &format!("{i}.intra_group_ape"), dev)?,
+            key_norm: f32t(w, &format!("{i}.key_norm.weight"), dev)?,
+        })
+    } else {
+        None
+    };
+    Ok(Attn {
+        dims,
+        kind,
+        q_a: lin(w, &format!("{a}.q_a_proj.weight"), dev)?,
+        q_a_norm: f32t(w, &format!("{a}.q_a_layernorm.weight"), dev)?,
+        q_b: lin(w, &format!("{a}.q_b_proj.weight"), dev)?,
+        kv_a: lin(w, &format!("{a}.kv_a_proj_with_mqa.weight"), dev)?,
+        kv_a_norm: f32t(w, &format!("{a}.kv_a_layernorm.weight"), dev)?,
+        w_uk,
+        w_uv_t,
+        gate: lin(w, &format!("{a}.linear_gate.weight"), dev)?,
+        o_proj: lin(w, &format!("{a}.o_proj.weight"), dev)?,
+        sinks: f32t(w, &format!("{a}.learnable_sink_param"), dev)?,
+        post_norm: f32t(w, &format!("{a}.post_proj_norm.weight"), dev)?,
+        indexer,
+    })
+}
+
+pub(crate) fn fwd(l: &QLinear, x: &Tensor) -> R<Tensor> {
     l.forward(x)
 }
 
@@ -74,6 +117,15 @@ impl Hc {
         let flat = x.reshape(vec![t, m * h]).map_err(fe)?;
         kern::contig(&flat.linear(&self.fn_w).map_err(fe)?)
     }
+}
+
+/// Ключи внимания, заданные снаружи (блок драфтера DFly по кэшу целевого слоя).
+pub(crate) enum ExtKeys {
+    /// Цель считала слой плотно: все позиции до запроса.
+    Dense,
+    /// Группы целевого слоя `[1, k]` для последнего принятого токена, целиком
+    /// ниже `lo`, и сплошной отрезок `lo … pos`.
+    Groups { row: Tensor, lo: usize },
 }
 
 /// Сжатый индексатор слоя с разреженным вниманием.
@@ -105,6 +157,13 @@ pub struct Attn {
     sinks: Tensor,
     post_norm: Tensor,
     indexer: Option<Indexer>,
+}
+
+impl Attn {
+    /// Норма выхода `o_proj` (`post_proj_norm`).
+    pub(crate) fn post_norm(&self) -> &Tensor {
+        &self.post_norm
+    }
 }
 
 pub enum Mlp {
@@ -141,6 +200,9 @@ pub struct LayerCache {
     pub grp: Option<Tensor>,
     /// Сколько групп уже свёрнуто.
     pub pooled: usize,
+    /// Выбор групп последнего прохода (целевые слои драфтера DFly): `(группы
+    /// [T, k] или None — внимание было плотным, позиция первой строки)`.
+    pub snap: Option<(Option<Tensor>, usize)>,
 }
 
 pub struct ModelCache {
@@ -176,6 +238,7 @@ impl ModelCache {
             if let Some(t) = &l.grp {
                 l.grp = Some(t.to_device(dev).map_err(fe)?);
             }
+            l.snap = None;
         }
         Ok(prev)
     }
@@ -200,6 +263,8 @@ pub struct Hy4Model {
     kv_dtype: DType,
     /// Ёмкость кольца SWA сверх окна (чанк префилла).
     swa_extra: usize,
+    /// Слои, чей выбор групп нужен драфтеру DFly (снимок в `LayerCache::snap`).
+    snap_layers: Vec<bool>,
 }
 
 fn moe_config(cfg: &Hy4Config, bias: Vec<f32>, chunk: usize) -> MoeConfig {
@@ -246,45 +311,7 @@ impl Hy4Model {
             let p = format!("model.layers.{l}");
             let dims = *cfg.dims(l);
             let kind = cfg.attn[l];
-            let a = format!("{p}.self_attn");
-            // W_uk / W_uv из kv_b_proj [NH·(nope+v), L].
-            let kvb = dense_f32(w, &format!("{a}.kv_b_proj.weight"), dev)?;
-            let (nh, nope, vd, lat) = (dims.heads, dims.qk_nope, dims.v, cfg.kv_lora_rank);
-            let kvb = kvb.reshape(vec![nh, nope + vd, lat]).map_err(fe)?;
-            let w_uk = kern::to(&kvb.narrow(1, 0, nope).map_err(fe)?, ACT)?;
-            let w_uv_t = kern::to(&kvb.narrow(1, nope, vd).and_then(|t| t.transpose(1, 2)).map_err(fe)?, ACT)?;
-            drop(kvb);
-            let indexer = if kind == AttnKind::Indexed {
-                let i = format!("{a}.compressed_indexer");
-                Some(Indexer {
-                    q_proj: lin(w, &format!("{i}.query_projection.weight"), dev)?,
-                    w_proj: lin(w, &format!("{i}.head_weight_projection.weight"), dev)?,
-                    k_proj: lin(w, &format!("{i}.token_key_projection.weight"), dev)?,
-                    k_norm: f32t(w, &format!("{i}.token_key_norm.weight"), dev)?,
-                    wv: f32t(w, &format!("{i}.key_value_projection.weight"), dev)?,
-                    wg: f32t(w, &format!("{i}.key_gate_projection.weight"), dev)?,
-                    ape: f32t(w, &format!("{i}.intra_group_ape"), dev)?,
-                    key_norm: f32t(w, &format!("{i}.key_norm.weight"), dev)?,
-                })
-            } else {
-                None
-            };
-            let attn = Attn {
-                dims,
-                kind,
-                q_a: lin(w, &format!("{a}.q_a_proj.weight"), dev)?,
-                q_a_norm: f32t(w, &format!("{a}.q_a_layernorm.weight"), dev)?,
-                q_b: lin(w, &format!("{a}.q_b_proj.weight"), dev)?,
-                kv_a: lin(w, &format!("{a}.kv_a_proj_with_mqa.weight"), dev)?,
-                kv_a_norm: f32t(w, &format!("{a}.kv_a_layernorm.weight"), dev)?,
-                w_uk,
-                w_uv_t,
-                gate: lin(w, &format!("{a}.linear_gate.weight"), dev)?,
-                o_proj: lin(w, &format!("{a}.o_proj.weight"), dev)?,
-                sinks: f32t(w, &format!("{a}.learnable_sink_param"), dev)?,
-                post_norm: f32t(w, &format!("{a}.post_proj_norm.weight"), dev)?,
-                indexer,
-            };
+            let attn = load_attn(w, &format!("{p}.self_attn"), dims, kind, cfg.kv_lora_rank, dev, kind == AttnKind::Indexed)?;
             let m = format!("{p}.mlp");
             let mlp = if cfg.dense[l] {
                 Mlp::Dense {
@@ -362,6 +389,7 @@ impl Hy4Model {
         }
         let head_hc = Hc { fn_w: f32t(w, "model.hc_head.hc_head_fn", dev)?, base: f32t(w, "model.hc_head.hc_head_base", dev)?, scale: f32t(w, "model.hc_head.hc_head_scale", dev)? };
         let kv_dtype = if std::env::var("HY4_KV").as_deref() == Ok("bf16") { DType::BF16 } else { DType::F32 };
+        let snap_layers = (0..cfg.num_hidden_layers).map(|l| cfg.dfly.as_ref().is_some_and(|d| d.target_layers.contains(&l))).collect();
         Ok(Self {
             embed: load_embed(w, &cfg)?,
             norm: f32t(w, "model.norm.weight", dev)?,
@@ -373,6 +401,7 @@ impl Hy4Model {
             expert_cache,
             kv_dtype,
             swa_extra: chunk,
+            snap_layers,
         })
     }
 
@@ -432,7 +461,7 @@ impl Hy4Model {
             } else {
                 (None, None)
             };
-            layers.push(LayerCache { lat, tok, grp, pooled: 0 });
+            layers.push(LayerCache { lat, tok, grp, pooled: 0, snap: None });
         }
         Ok(ModelCache { layers, ids: Vec::new(), max_seq })
     }
@@ -444,7 +473,7 @@ impl Hy4Model {
         n * ((c.kv_lora_rank + c.indexed.qk_rope) * self.kv_dtype.bytes_for_numel(1) + c.index_head_dim * 4 + c.index_head_dim)
     }
 
-    fn embed_rows(&self, ids: &[u32]) -> R<Tensor> {
+    pub(crate) fn embed_rows(&self, ids: &[u32]) -> R<Tensor> {
         let h = self.config.hidden_size;
         let mut v = vec![0f32; ids.len() * h];
         for (i, id) in ids.iter().enumerate() {
@@ -503,7 +532,7 @@ impl Hy4Model {
             let hn = kern::rms(&hin, Some(&layer.in_norm), c.rms_norm_eps, ACT)?;
             stage(l, "x", &x);
             stage(l, "attn_hn", &hn);
-            let y = hy4_stage(prof, dev, "hy4:attn", || self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l]))?;
+            let y = hy4_stage(prof, dev, "hy4:attn", || self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l], None))?;
             let y = kern::rms(&y, Some(&layer.attn.post_norm), c.rms_norm_eps, DType::F32)?;
             stage(l, "attn_y", &y);
             kern::hc_post(&x, post.as_ref().expect("post"), &y)?;
@@ -572,7 +601,7 @@ impl Hy4Model {
         }
     }
 
-    fn attention(&self, _l: usize, a: &Attn, hn: &Tensor, pos: &Tensor, p0: usize, lc: &mut LayerCache) -> R<Tensor> {
+    pub(crate) fn attention(&self, _l: usize, a: &Attn, hn: &Tensor, pos: &Tensor, p0: usize, lc: &mut LayerCache, ext: Option<&ExtKeys>) -> R<Tensor> {
         let c = &self.config;
         let d = &a.dims;
         let (t, nh, lat) = (hn.dims()[0], d.heads, c.kv_lora_rank);
@@ -613,6 +642,10 @@ impl Hy4Model {
         let scale = 1.0 / (d.qk() as f32).sqrt();
         let o_lat = hy4_stage(prof, dev, "a:core", || -> R<Tensor> { Ok(match a.kind {
             AttnKind::Sliding => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(c.sliding_window), scale)?,
+            AttnKind::Indexed if ext.is_some() => match ext.expect("ext") {
+                ExtKeys::Dense => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(usize::MAX), scale)?,
+                ExtKeys::Groups { row, lo } => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Draft { groups: row, size: c.index_kpool, lo: *lo }, scale)?,
+            },
             AttnKind::Indexed => {
                 let idx = a.indexer.as_ref().expect("индексатор");
                 let groups = self.indexer(_l, idx, hn, &qr, pos, p0, t, lc)?;
@@ -653,6 +686,9 @@ impl Hy4Model {
         lc.pooled = complete;
         let last_own = (p0 + t - 1) / g;
         if last_own <= c.index_groups() {
+            if self.snap_layers[l] {
+                lc.snap = Some((None, p0));
+            }
             return Ok(None);
         }
         let q = f32c(&fwd(&idx.q_proj, qr)?)?;
@@ -675,6 +711,9 @@ impl Hy4Model {
                     stage(l, "idx_sel", &t);
                 }
             }
+        }
+        if self.snap_layers[l] {
+            lc.snap = Some((Some(sel.clone()), p0));
         }
         Ok(Some(sel))
     }

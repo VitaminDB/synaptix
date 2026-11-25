@@ -2320,7 +2320,8 @@ impl MoeFfn {
         let t = x.dims()[0];
         let k = self.cfg.num_experts_per_tok;
         let routed = router_in.unwrap_or(x);
-        if t <= 4 {
+        let zc_rows = zc_decode_rows();
+        if t <= zc_rows {
             if let Some(out) = stage("moe:zc", || self.forward_zc(x, router_in))? {
                 if std::env::var("SYN_ZC_SYNC").as_deref() == Ok("1") {
                     if let Device::Cuda(o) = self.device {
@@ -2345,7 +2346,7 @@ impl MoeFfn {
             }
         }
         let (experts, weights) = stage("moe:route", || self.route(routed))?;
-        if self.zc_pool.is_some() && t > 4 {
+        if self.zc_pool.is_some() && t > zc_rows {
             if let Ok(mut seed) = self.zc_seed.lock() {
                 if seed.len() != self.cfg.num_experts {
                     *seed = vec![0.0; self.cfg.num_experts];
@@ -2359,7 +2360,7 @@ impl MoeFfn {
             route_trace::record(self.layer_id, &experts);
             LAST_ROUTE.with(|c| *c.borrow_mut() = experts.clone());
         }
-        if t > 4 {
+        if t > zc_rows {
             if let Some(out) = stage("moe:zc_prefill", || self.forward_zc_prefill(x, &experts, &weights))? {
                 return Ok(out);
             }
@@ -3639,6 +3640,14 @@ pub mod route_trace {
 }
 
 /// Сверка zero-copy с прежним путём (`SYN_ZC_CHECK=1`, отладка).
+/// До скольких строк MoE считает пары «токен × эксперт» без синхронизации
+/// (`forward_zc`); больше — группами по экспертам (`forward_zc_prefill`),
+/// где каждый эксперт читается один раз. `SYN_ZC_DECODE_ROWS` (4).
+fn zc_decode_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SYN_ZC_DECODE_ROWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
 fn zc_check() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SYN_ZC_CHECK").as_deref() == Ok("1"))

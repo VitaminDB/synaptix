@@ -59,6 +59,17 @@ impl EngramConfig {
     }
 }
 
+/// Спекулятивный драфтер DFly: слой драфтера `i` читает латентный кэш и выбор
+/// групп индексатора целевого слоя `target_layers[i]` (разреженного).
+#[derive(Debug, Clone)]
+pub struct DflyConfig {
+    pub layers: usize,
+    pub target_layers: Vec<usize>,
+    pub mask_token: u32,
+    /// Драфтов за проход (`speculative_config.num_speculative_tokens`).
+    pub draft_tokens: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Hy4Config {
     pub hidden_size: usize,
@@ -92,6 +103,8 @@ pub struct Hy4Config {
     pub hc_magnitude: f32,
     pub hc_eps: f32,
     pub engram: Option<EngramConfig>,
+    /// Драфтер DFly (`dfly_*` верхнего уровня config.json), если есть.
+    pub dfly: Option<DflyConfig>,
     pub bos: u32,
     pub eos: Vec<u32>,
     pub pad: u32,
@@ -109,6 +122,16 @@ fn f(v: &Value, k: &str) -> Result<f64, String> {
 
 fn u_or(v: &Value, k: &str, d: usize) -> usize {
     v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(d)
+}
+
+fn layers_n(t: &Value) -> usize {
+    t.get("num_hidden_layers").and_then(|x| x.as_u64()).unwrap_or(0) as usize
+}
+
+/// Разреженный ли слой `l` по `layer_types`.
+fn attn_at(t: &Value, l: usize) -> Option<bool> {
+    let kind = t.get("layer_types")?.as_array()?.get(l)?.as_str()?;
+    Some(matches!(kind, "deepseek_sparse_attention" | "indexed_attention"))
 }
 
 impl Hy4Config {
@@ -191,7 +214,20 @@ impl Hy4Config {
             Some(x) => x.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
             None => Vec::new(),
         };
+        let dfly = (|| {
+            let layers = root.get("dfly_num_hidden_layers")?.as_u64()? as usize;
+            let target_layers: Vec<usize> = root.get("dfly_target_kv_layers")?.as_array()?.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect();
+            let index: Vec<usize> = root.get("dfly_target_index_layer")?.as_array()?.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect();
+            // Движок держит одну пару: KV и индексы — из одного целевого слоя.
+            if target_layers.len() != layers || index != target_layers || target_layers.iter().any(|&l| l >= layers_n(t) || attn_at(t, l) != Some(true)) {
+                return None;
+            }
+            let mask_token = root.get("dfly_mask_token_id")?.as_u64()? as u32;
+            let draft_tokens = root.get("speculative_config").and_then(|s| s.get("num_speculative_tokens")).and_then(|x| x.as_u64()).unwrap_or(5) as usize;
+            Some(DflyConfig { layers, target_layers, mask_token, draft_tokens })
+        })();
         Ok(Self {
+            dfly,
             hidden_size: u(t, "hidden_size")?,
             num_hidden_layers: layers,
             vocab_size: u(t, "vocab_size")?,
@@ -257,6 +293,9 @@ mod tests {
         assert_eq!(c.indexed.heads, 32);
         assert_eq!(c.sliding.rope_theta, 1e4);
         assert_eq!(c.indexed.rope_theta, 1e7);
+        let d = c.dfly.clone().expect("dfly");
+        assert_eq!(d.target_layers, vec![25, 29, 33, 37, 41]);
+        assert_eq!((d.layers, d.mask_token, d.draft_tokens), (5, 120009, 5));
         let e = c.engram.clone().unwrap();
         assert_eq!(e.layers, vec![1, 11, 21, 31]);
         assert_eq!(e.heads(), 16);

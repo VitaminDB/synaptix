@@ -44,7 +44,58 @@ fn main() {
         std::fs::write(f, ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap();
     }
     eprintln!("токенов: {} {:?}", ids.len(), &ids[..ids.len().min(32)]);
-    let mut s = p.new_session(ids.len() + gen + 8).unwrap();
+    let mut s = p.new_session(ids.len() + gen + 16).unwrap();
+    // `--spec K`: жадный спекулятивный декод драфтером DFly (K драфтов за шаг).
+    if let Some(k) = opt("--spec").and_then(|v| v.parse::<usize>().ok()) {
+        let d = p.dfly.as_ref().expect("в бандле нет драфтера DFly");
+        let t0 = Instant::now();
+        let mut h = no_grad(|| p.model.forward(&ids, &mut s.cache, Some(1))).unwrap();
+        let mut bonus = synaptix_llm_hy_v4_flash::dfly::argmax(&p.model.logits(&h).unwrap()).unwrap();
+        eprintln!("префилл {:.2} с", t0.elapsed().as_secs_f64());
+        p.size_zc_pool();
+        let _ = synaptix_llm_common::profile::report();
+        let mut out = vec![bonus];
+        let (mut steps, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+        let mut depth = vec![0usize; k + 1];
+        let (mut t_draft, mut t_verify) = (0f64, 0f64);
+        let sync = || synaptix_core::device::cuda::synchronize(0).unwrap();
+        let t1 = Instant::now();
+        while out.len() < gen && !p.eos_ids().contains(&bonus) {
+            let a = s.cache.seq_len();
+            let td = Instant::now();
+            let drafts = no_grad(|| d.draft(&p.model, &mut s.cache, a, bonus, &h, k)).unwrap().unwrap_or_default();
+            sync();
+            t_draft += td.elapsed().as_secs_f64();
+            let tv = Instant::now();
+            let mut block = vec![bonus];
+            block.extend_from_slice(&drafts);
+            let hb = no_grad(|| p.model.forward(&block, &mut s.cache, None)).unwrap();
+            let lg = p.model.logits(&hb).unwrap();
+            let tgt = synaptix_llm_hy_v4_flash::dfly::argmax_rows(&lg).unwrap();
+            t_verify += tv.elapsed().as_secs_f64();
+            let n = drafts.iter().zip(&tgt).take_while(|(x, y)| x == y).count();
+            steps += 1;
+            depth[n] += 1;
+            drafted += drafts.len();
+            accepted += n;
+            out.extend_from_slice(&drafts[..n]);
+            bonus = tgt[n];
+            out.push(bonus);
+            s.cache.truncate(a + n + 1);
+            h = synaptix_llm_hy_v4_flash::kern::contig(&hb.narrow(0, n, 1).unwrap()).unwrap();
+        }
+        let dd = t1.elapsed().as_secs_f64();
+        eprintln!(
+            "спекуляция K={k}: {} токенов за {:.2} с = {:.2} ток/с; шагов {steps}, принято {accepted} из {drafted} драфтов ({:.0} %), {:.2} токена на шаг",
+            out.len() - 1, dd, (out.len() - 1) as f64 / dd, 100.0 * accepted as f64 / drafted.max(1) as f64, (out.len() - 1) as f64 / steps.max(1) as f64
+        );
+        eprintln!("принято драфтов за шаг (0…K): {depth:?}; драфт {:.1} мс/шаг, верификация {:.1} мс/шаг", t_draft * 1e3 / steps.max(1) as f64, t_verify * 1e3 / steps.max(1) as f64);
+        if synaptix_llm_common::profile::profiling() {
+            eprintln!("профиль спекуляции ({steps} шагов):\n{}", synaptix_llm_common::profile::report());
+        }
+        println!("{}", p.decode(&out).unwrap());
+        return;
+    }
     let t0 = Instant::now();
     // `--last-decode`: последний токен — шагом декода (путь MoE на 1 токен),
     // остальное префиллом; логиты сравнимы с полным префиллом той же позиции.

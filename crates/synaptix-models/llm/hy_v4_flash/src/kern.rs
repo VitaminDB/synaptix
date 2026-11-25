@@ -175,6 +175,10 @@ pub enum Keys<'a> {
     Window(usize),
     /// Группы `[T, NG]` (u32::MAX — пусто) плюс своя группа запроса; `G` токенов в группе.
     Groups(&'a Tensor, usize),
+    /// Блок драфтера DFly: одна строка групп `[1, NG]` на все запросы (выбор
+    /// целевого слоя для последнего принятого токена) — группы целиком ниже
+    /// `lo`, плюс сплошной отрезок `lo … pos`.
+    Draft { groups: &'a Tensor, size: usize, lo: usize },
 }
 
 /// MLA по латентному кэшу с синками. `qa` `[T, NH, L+R]` F32 → `o [T, NH, L]` F32.
@@ -203,6 +207,15 @@ pub fn mla_attn(qa: &Tensor, cache: &Tensor, sinks: &Tensor, pos: &Tensor, laten
             a.a[5] = addr(g)?;
             a.u[8] = g.dims()[1] as u32;
             a.u[9] = size as u32;
+            a.u[10] = u32::MAX;
+        }
+        Keys::Draft { groups, size, lo } => {
+            a.u[5] = 1;
+            a.a[5] = addr(groups)?;
+            a.u[8] = groups.dims()[1] as u32;
+            a.u[9] = size as u32;
+            a.u[10] = lo as u32;
+            a.u[11] = 1;
         }
     }
     a.f[0] = scale;

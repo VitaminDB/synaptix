@@ -52,6 +52,8 @@ pub struct Hy4Pipeline {
     pub config: Hy4Config,
     pub path: PathBuf,
     zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
+    /// Драфтер DFly (спекулятивный декод), если есть в бандле (`SYN_HY4_DFLY=0` — не грузить).
+    pub dfly: Option<crate::dfly::Dfly>,
     max_seq: usize,
 }
 
@@ -188,6 +190,22 @@ impl Hy4Pipeline {
         let guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(device);
         let mut model = no_grad(|| Hy4Model::build(&w, device, cache, source, prefill_chunk()))?;
         drop(guard);
+        let dfly = if std::env::var("SYN_HY4_DFLY").as_deref() != Ok("0") {
+            // `SYN_HY4_DFLY_FROM=путь` — веса драфтера из другого источника
+            // (каталог HF с BF16-оригиналом или бандл) — сверка точности драфта.
+            match std::env::var("SYN_HY4_DFLY_FROM") {
+                Ok(from) => {
+                    let src = Hy4Weights::open(&from).map_err(le)?;
+                    no_grad(|| crate::dfly::Dfly::load(&src, &w.config, device))?
+                }
+                Err(_) => no_grad(|| crate::dfly::Dfly::load(&w, &w.config, device))?,
+            }
+        } else {
+            None
+        };
+        if let Some(d) = &dfly {
+            eprintln!("[hy4] драфтер DFly: {} слоёв, цели {:?}", d.cfg.layers, d.cfg.target_layers);
+        }
         let zc_pool = if zc && mirror.is_some() {
             let pool = synaptix_llm_common::moe_zc::ZcPool::new(device);
             // 512 экспертов, top-16: слоя хватает и ~16 слотов — промахи
@@ -217,7 +235,7 @@ impl Hy4Pipeline {
             eprintln!("[hy4] кэш экспертов на карте: {:.1} ГБ", c.capacity_bytes() as f64 / (1u64 << 30) as f64);
         }
         let max_seq = max_seq.unwrap_or(32768).min(w.config.max_position_embeddings);
-        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, zc_pool, max_seq })
+        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, zc_pool, dfly, max_seq })
     }
 
     /// Готовность зеркала экспертов в RAM: (готово байт, всего), `None` — зеркала нет.

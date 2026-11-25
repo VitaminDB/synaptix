@@ -167,7 +167,7 @@ extern "C" __global__ void hy4_rope(Hy4Args args) {
 // u0 T, u1 NH, u2 L, u3 R, u4 CAP (слот = pos mod CAP), u5 режим (0 окно, 1 группы),
 // u6 окно (режим 0: ключи pos−окно+1 … pos), u8 NG, u9 токенов в группе.
 // f0 масштаб.
-#define HY4_MAXK 2048
+#define HY4_MAXK 2304
 extern "C" __global__ void hy4_mla_attn(Hy4Args args) {
     __shared__ float q[640];
     __shared__ float sc[HY4_MAXK];
@@ -188,20 +188,22 @@ extern "C" __global__ void hy4_mla_attn(Hy4Args args) {
         for (int j = threadIdx.x; j < n; j += blockDim.x) kp[j] = lo2 + j;
         if (threadIdx.x == 0) nk_s = n;
     } else {
+        // u10 — нижняя граница сплошного отрезка [lo, pos] (0xffffffff — начало
+        // своей группы); группы списка берутся только целиком ниже lo. u11 = 1 —
+        // одна строка групп на все запросы (блок драфтера DFly: история — выбор
+        // целевого слоя для последнего принятого токена).
         const unsigned NG = args.u[8], G = args.u[9];
-        const unsigned* gl = (const unsigned*)args.a[5] + (size_t)t * NG;
+        const unsigned* gl = (const unsigned*)args.a[5] + (args.u[11] ? (size_t)0 : (size_t)t * NG);
         if (threadIdx.x == 0) {
             int n = 0;
-            const int own = pos / (int)G;
-            for (unsigned i = 0; i <= NG && n + (int)G <= HY4_MAXK; ++i) {
-                const unsigned g = i < NG ? gl[i] : (unsigned)own;
+            const int lo = args.u[10] == 0xffffffffu ? (pos / (int)G) * (int)G : (int)args.u[10];
+            for (unsigned i = 0; i < NG && n + (int)G <= HY4_MAXK; ++i) {
+                const unsigned g = gl[i];
                 if (g == 0xffffffffu) continue;
-                if (i < NG && (int)g == own) continue;
-                for (unsigned o = 0; o < G; ++o) {
-                    const int p = (int)(g * G + o);
-                    if (p <= pos) kp[n++] = p;
-                }
+                if ((int)(g * G) + (int)G > lo) continue;
+                for (unsigned o = 0; o < G; ++o) kp[n++] = (int)(g * G + o);
             }
+            for (int p = lo; p <= pos && n < HY4_MAXK; ++p) kp[n++] = p;
             nk_s = n;
         }
     }

@@ -164,6 +164,18 @@ fn mla_attn_window_and_groups() {
         ks
     });
     close(&down(&o), &want, 1e-4, "группы");
+    // Блок драфтера: общая строка групп, группы целиком ниже lo и отрезок lo..pos.
+    let dpos = vec![20i32, 21, 22];
+    let dpt = Tensor::from_vec(dpos.clone(), vec![t], d).unwrap();
+    let drow = vec![0u32, 2, 4, u32::MAX];
+    let drt = Tensor::from_vec(drow.clone(), vec![1, 4], d).unwrap();
+    let o = kern::mla_attn(&qt, &ct, &st, &dpt, l, Keys::Draft { groups: &drt, size: 4, lo: 16 }, scale).unwrap();
+    let want = reference(&|ti| {
+        let mut ks: Vec<usize> = (0..4).chain(8..12).collect();
+        ks.extend(16..=dpos[ti] as usize);
+        ks
+    });
+    close(&down(&o), &want, 1e-4, "блок драфтера");
     // BF16-кэш читается так же.
     let cb = ct.to_dtype(DType::BF16).unwrap();
     let o = kern::mla_attn(&qt, &cb, &st, &pos, l, Keys::Window(8), scale).unwrap();

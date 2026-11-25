@@ -1,6 +1,7 @@
 //! Hy4-flash (tencent, `hy_v4_flash`). Схема, эталон и сверка — `docs/hy4_flash.md`.
 
 pub mod config;
+pub mod dfly;
 pub mod engram;
 pub mod kern;
 pub mod loader;
