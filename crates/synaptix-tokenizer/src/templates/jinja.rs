@@ -89,6 +89,13 @@ mod tests {
     }
 
     #[test]
+    fn pycompat_str_format() {
+        let src = "{%- set HYTK = ':opensource' %}{%- set t = '<｜hy_start{}｜>'.format(HYTK) %}{{ t }}|{{ '{1}-{0}-{{x}}'.format('a', 'b') }}";
+        let out = JinjaEnv::new().render(src, context! {}).unwrap();
+        assert_eq!(out, "<｜hy_start:opensource｜>|b-a-{x}");
+    }
+
+    #[test]
     fn pycompat_startswith() {
         let env = JinjaEnv::new();
         let src = "{% if name.startswith('A') %}A!{% else %}other{% endif %}";

@@ -17,6 +17,7 @@ pub fn register_all(env: &mut Environment<'_>) {
     env.add_function("values", fn_values);
     env.add_function("len", fn_len);
     env.add_function("get", fn_get);
+    env.add_function("format", fn_format);
 
     env.add_filter("startswith", filt_startswith);
     env.add_filter("endswith", filt_endswith);
@@ -108,6 +109,48 @@ fn fn_rstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
 
 fn filt_rstrip(s: Value, chars: Option<Value>) -> Result<String, MjError> {
     fn_rstrip(s, chars)
+}
+
+/// Python `str.format` с позиционными полями: `{}` по порядку, `{N}` по
+/// номеру, `{{`/`}}` — литеральные скобки (шаблон Hy4: `'<｜hy_start{}｜>'.format(HYTK)`).
+fn fn_format(s: Value, args: minijinja::value::Rest<Value>) -> Result<String, MjError> {
+    let s = as_str_required(&s, "format")?;
+    let mut out = String::with_capacity(s.len());
+    let mut next = 0usize;
+    let mut it = s.chars().peekable();
+    let arg = |i: usize| -> Result<String, MjError> {
+        args.get(i).map(|v| v.to_string()).ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, format!("format: нет аргумента {i}")))
+    };
+    while let Some(c) = it.next() {
+        match c {
+            '{' if it.peek() == Some(&'{') => {
+                it.next();
+                out.push('{');
+            }
+            '}' if it.peek() == Some(&'}') => {
+                it.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut field = String::new();
+                for c in it.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    field.push(c);
+                }
+                let idx = if field.trim().is_empty() {
+                    next += 1;
+                    next - 1
+                } else {
+                    field.trim().parse::<usize>().map_err(|_| MjError::new(ErrorKind::InvalidOperation, format!("format: поле {{{field}}} не поддержано")))?
+                };
+                out.push_str(&arg(idx)?);
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
 }
 
 fn fn_lower(s: Value) -> Result<String, MjError> {
@@ -413,6 +456,7 @@ pub fn preprocess(template: &str) -> String {
         "keys",
         "values",
         "get",
+        "format",
     ];
     let mut s = template.to_string();
     let mut changed = true;
@@ -463,6 +507,7 @@ pub fn preprocess(template: &str) -> String {
     s = s.replace("__pyc_skip_keys_", ".keys(");
     s = s.replace("__pyc_skip_values_", ".values(");
     s = s.replace("__pyc_skip_get_", ".get(");
+    s = s.replace("__pyc_skip_format_", ".format(");
     parenthesize_kwarg_ternaries(&s)
 }
 

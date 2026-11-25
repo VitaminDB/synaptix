@@ -42,13 +42,15 @@ pub fn prefill_chunk() -> usize {
 }
 
 pub struct Hy4Pipeline {
+    /// Закреплённое зеркало стопок экспертов в RAM (сколько влезло). Первое
+    /// поле: поля роняются по порядку, и копировщики зеркала должны встать
+    /// раньше, чем модель отпустит mmap бандла, из которого они читают.
+    _mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     pub model: Hy4Model,
     pub tokenizer: HfTokenizer,
     pub chat_template: Option<String>,
     pub config: Hy4Config,
     pub path: PathBuf,
-    /// Закреплённое зеркало стопок экспертов в RAM (сколько влезло).
-    _mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     max_seq: usize,
 }
 
@@ -153,7 +155,7 @@ impl Hy4Pipeline {
             if lazy { "читаются из бандла (кэш на карте)" } else { "на карте" }
         );
         let max_seq = max_seq.unwrap_or(32768).min(w.config.max_position_embeddings);
-        Ok(Self { model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, _mirror: mirror, max_seq })
+        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, max_seq })
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
