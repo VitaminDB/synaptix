@@ -320,10 +320,13 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
         spec("frequency_penalty", "Штраф за частоту", "Сильнее против слов, повторённых много раз; 0 — без штрафа", float(-2.0, 2.0, 0.1, 2), f(0.0)),
         spec("repeat_last_n", "Окно штрафа за повторы, токенов", "Сколько последних токенов учитывают штрафы за повторы", int(0, 4096, 16), i(64)),
     ];
-    if template.contains("enable_thinking") {
+    // Переключатель размышлений: шаблон знает `enable_thinking` или уровень
+    // «без размышлений» `no_think` (Hy4-flash).
+    let thinking_switch = template.contains("enable_thinking") || profile.reasoning.as_ref().is_some_and(|r| r.levels.iter().any(|l| l == "no_think"));
+    if thinking_switch {
         out.push(spec("thinking", "Размышления", "Модель сначала рассуждает, потом отвечает — точнее и дольше", ParamKind::Bool, Some(ParamValue::Bool(false))));
     }
-    if template.contains("enable_thinking") {
+    if thinking_switch {
         out.push(spec(
             "thinking_budget",
             "Бюджет размышлений, токенов",

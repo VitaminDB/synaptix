@@ -244,6 +244,14 @@ fn generation_config_preset(bytes: &[u8]) -> Option<SamplingPreset> {
 /// модель с другим набором не требовала правки движка. `reasoning_strength`
 /// (Muse Glimmer) шаблон не проверяет, уровни есть только в карточке модели.
 pub fn reasoning_levels(arch: Option<LlmArch>, template: &str) -> Option<ReasoningLevels> {
+    // Hy4-flash: `reasoning_effort not in ['no_think', 'high']`, умолчание —
+    // `{%- set reasoning_effort = 'high' %}`; `no_think` — ход без размышлений.
+    if let Some(levels) = quoted_list_between(template, "reasoning_effort not in [", ']') {
+        let default = quoted_after(template, "set reasoning_effort = '")
+            .filter(|d| levels.contains(d))
+            .unwrap_or_else(|| levels.last().cloned().unwrap_or_default());
+        return Some(ReasoningLevels { var: ReasoningVar::Effort, levels: by_depth(levels), default, instruct_default: None });
+    }
     if template.contains("reasoning_effort") && !template.contains("reasoning_effort not in (") {
         // Inkling-2: уровни — ключи `effort_map` (строка → число в системной
         // реплике), по умолчанию число `… is not none else 0.9`.
@@ -317,8 +325,12 @@ fn effort_map_levels(template: &str) -> Option<(Vec<String>, String)> {
 
 /// `'a', 'b', 'c'` сразу после `marker` до закрывающей скобки.
 fn quoted_list_after(src: &str, marker: &str) -> Option<Vec<String>> {
+    quoted_list_between(src, marker, ')')
+}
+
+fn quoted_list_between(src: &str, marker: &str, close: char) -> Option<Vec<String>> {
     let start = src.find(marker)? + marker.len();
-    let end = start + src[start..].find(')')?;
+    let end = start + src[start..].find(close)?;
     let items: Vec<String> = src[start..end]
         .split(',')
         .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
@@ -337,7 +349,7 @@ fn quoted_after(src: &str, marker: &str) -> Option<String> {
 fn by_depth(mut levels: Vec<String>) -> Vec<String> {
     // `einstein` и `spoon` — режимы DavidAU глубже `xhigh`: «20 виртуальных
     // агентов» и «исследование» с размышлениями от 5000 слов.
-    const ORDER: [&str; 9] = ["none", "minimal", "low", "medium", "high", "xhigh", "einstein", "spoon", "max"];
+    const ORDER: [&str; 10] = ["none", "no_think", "minimal", "low", "medium", "high", "xhigh", "einstein", "spoon", "max"];
     let rank = |s: &String| ORDER.iter().position(|o| o.eq_ignore_ascii_case(s)).unwrap_or(ORDER.len());
     levels.sort_by_key(rank);
     levels
@@ -365,7 +377,7 @@ pub(crate) fn with_thinking_vars(
         .or_else(|| {
             levels
                 .filter(|l| !enable_thinking && l.var == ReasoningVar::Effort && l.instruct_default.is_none())
-                .and_then(|l| l.resolve(Some("none")))
+                .and_then(|l| l.resolve(Some("none")).or_else(|| l.resolve(Some("no_think"))))
         });
     let strength = match levels {
         _ if !enable_thinking => "low",
@@ -423,6 +435,18 @@ mod tests {
         // Без размышлений — минимальный уровень `none`.
         assert!(render(INKLING2, a, false, None).contains("Thinking effort level: 0<"));
         assert!(render(INKLING2, a, false, Some("max")).contains("Thinking effort level: 0<"));
+    }
+
+    #[test]
+    fn hy4_no_think_levels() {
+        const HY4: &str = "{%- if not reasoning_effort is defined %}{%- set reasoning_effort = 'high' %}{%- elif reasoning_effort not in ['no_think', 'high'] %}{{ raise_exception('bad') }}{%- endif %}effort:{{ reasoning_effort }}<";
+        let l = reasoning_levels(Some(LlmArch::Hy4Flash), HY4).expect("levels");
+        assert_eq!(l.levels, ["no_think", "high"]);
+        assert_eq!(l.default, "high");
+        let a = LlmArch::Hy4Flash;
+        assert!(render(HY4, a, true, None).contains("effort:high<"));
+        assert!(render(HY4, a, false, None).contains("effort:no_think<"));
+        assert!(render(HY4, a, false, Some("high")).contains("effort:no_think<"));
     }
 
     #[test]
