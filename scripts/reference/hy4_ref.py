@@ -61,7 +61,17 @@ def rope_inter(x, pos, theta, width):
     return torch.stack((a * c - b * s, b * c + a * s), dim=-1).flatten(-2)
 
 
+STAGE_DIR = None
+
+
+def stage(l, name, x):
+    """Промежуточные стадии слоя 0 (`l0_<name>.f32`) — для поиска расхождений."""
+    if STAGE_DIR and l == 0:
+        x.detach().numpy().astype(np.float32).tofile(os.path.join(STAGE_DIR, f"l0_{name}.f32"))
+
+
 def main():
+    global STAGE_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--ids", required=True)
@@ -69,6 +79,7 @@ def main():
     ap.add_argument("--layers", type=int, default=None)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    STAGE_DIR = a.out
     cfg = json.load(open(os.path.join(a.model, "config.json")))["text_config"]
     eng = json.load(open(os.path.join(a.model, "hy4_engram.json")))
     w = W(a.model)
@@ -142,6 +153,8 @@ def main():
         # ---- внимание ----
         h, post = hc(f"{p}.hc_attn_layer.hc_pre")
         hn = rms(h, w.t(f"{p}.input_layernorm.weight"), eps)
+        stage(l, "x", X)
+        stage(l, "attn_hn", hn)
         A = f"{p}.self_attn"
         sliding = types[l] == "sliding_attention"
         nhd = cfg["swa_num_attention_heads"] if sliding else cfg["num_attention_heads"]
@@ -192,12 +205,15 @@ def main():
         pr = sc.softmax(-1)[..., :-1]
         o = torch.einsum("hts,shd->thd", pr, v).reshape(T, nhd * vd)
         o = o * torch.sigmoid(gate)
+        stage(l, "attn_o", o)
         y = rms(o @ w.t(f"{A}.o_proj.weight").T, w.t(f"{A}.post_proj_norm.weight"), eps)
+        stage(l, "attn_y", y)
         X = X + post[:, :, None] * y[:, None, :]
 
         # ---- MLP ----
         h, post = hc(f"{p}.hc_mlp_layer.hc_pre")
         hn = rms(h, w.t(f"{p}.post_attention_layernorm.weight"), eps)
+        stage(l, "mlp_hn", hn)
         Mp = f"{p}.mlp"
         if cfg["mlp_layer_types"][l] == "dense":
             z = (F.silu(hn @ w.t(f"{Mp}.gate_proj.weight").T) * (hn @ w.t(f"{Mp}.up_proj.weight").T)) @ w.t(f"{Mp}.down_proj.weight").T
@@ -221,6 +237,7 @@ def main():
             routed = out @ w.t(f"{Mp}.routed_expert_up_proj.weight").T
             sh = (F.silu(hn @ w.t(f"{Mp}.shared_experts.gate_proj.weight").T) * (hn @ w.t(f"{Mp}.shared_experts.up_proj.weight").T)) @ w.t(f"{Mp}.shared_experts.down_proj.weight").T
             z = rms(routed + sh, w.t(f"{Mp}.combine_output_norm.weight"), eps)
+        stage(l, "mlp_z", z)
         X = X + post[:, :, None] * z[:, None, :]
         X.numpy().astype(np.float32).tofile(os.path.join(a.out, f"layer{l:02d}.f32"))
         print(f"слой {l}: |X| {X.norm().item():.4e}", flush=True)

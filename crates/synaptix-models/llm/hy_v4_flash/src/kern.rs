@@ -49,8 +49,8 @@ pub fn contig(t: &Tensor) -> R<Tensor> {
 }
 
 pub fn to(t: &Tensor, dt: DType) -> R<Tensor> {
-    let t = if t.dtype() == dt { t.clone() } else { t.to_dtype(dt).map_err(fe)? };
-    contig(&t)
+    let t = contig(t)?;
+    if t.dtype() == dt { Ok(t) } else { contig(&t.to_dtype(dt).map_err(fe)?) }
 }
 
 pub fn f32c(t: &Tensor) -> R<Tensor> {
@@ -196,7 +196,7 @@ pub fn mla_attn(qa: &Tensor, cache: &Tensor, sinks: &Tensor, pos: &Tensor, laten
     match keys {
         Keys::Window(w) => {
             a.u[5] = 0;
-            a.u[6] = w.min(u32::MAX as usize) as u32;
+            a.u[6] = w.min(i32::MAX as usize) as u32; // ядро читает окно как int
         }
         Keys::Groups(g, size) => {
             a.u[5] = 1;

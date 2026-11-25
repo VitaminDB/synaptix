@@ -40,7 +40,7 @@ fn f32t(w: &dyn WeightSource, key: &str, dev: Device) -> R<Tensor> {
 fn dense_f32(w: &dyn WeightSource, key: &str, dev: Device) -> R<Tensor> {
     if let Some(q) = w.quant(key, dev) {
         let q = q?;
-        return q.dequantize(DType::F32).and_then(|t| t.contiguous()).map_err(fe);
+        return q.dequantize(DType::BF16).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.contiguous()).map_err(fe);
     }
     f32t(w, key, dev)
 }
@@ -215,7 +215,7 @@ fn moe_config(cfg: &Hy4Config, bias: Vec<f32>, chunk: usize) -> MoeConfig {
 fn load_embed(w: &Hy4Weights, cfg: &Hy4Config) -> R<Vec<u16>> {
     let key = "model.embed_tokens.weight";
     let t = match w.quant(key, Device::Cpu) {
-        Some(q) => q?.dequantize(DType::F32).map_err(fe)?,
+        Some(q) => q?.dequantize(DType::BF16).and_then(|t| t.to_dtype(DType::F32)).map_err(fe)?,
         None => w.tensor(key, Device::Cpu, DType::F32)?,
     };
     let v = t.flatten_all().and_then(|t| t.to_vec1::<f32>()).map_err(fe)?;
@@ -448,12 +448,17 @@ impl Hy4Model {
             }
             let (hin, post) = kern::hc_pre(&x, &layer.attn_hc.mixes(&x)?, &layer.attn_hc.base, &layer.attn_hc.scale, false, c.rms_norm_eps, c.hc_eps, c.hc_magnitude)?;
             let hn = kern::rms(&hin, Some(&layer.in_norm), c.rms_norm_eps, ACT)?;
+            stage(l, "x", &x);
+            stage(l, "attn_hn", &hn);
             let y = self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l])?;
             let y = kern::rms(&y, Some(&layer.attn.post_norm), c.rms_norm_eps, DType::F32)?;
+            stage(l, "attn_y", &y);
             kern::hc_post(&x, post.as_ref().expect("post"), &y)?;
             let (hin, post) = kern::hc_pre(&x, &layer.ffn_hc.mixes(&x)?, &layer.ffn_hc.base, &layer.ffn_hc.scale, false, c.rms_norm_eps, c.hc_eps, c.hc_magnitude)?;
             let hn = kern::rms(&hin, Some(&layer.ffn_norm), c.rms_norm_eps, ACT)?;
+            stage(l, "mlp_hn", &hn);
             let z = self.mlp(&layer.mlp, &hn)?;
+            stage(l, "mlp_z", &z);
             kern::hc_post(&x, post.as_ref().expect("post"), &z)?;
             trace(l, &x);
         }
@@ -527,8 +532,8 @@ impl Hy4Model {
         let q3 = q.reshape(vec![t, nh, d.qk()]).map_err(fe)?;
         let q_nope = kern::to(&q3.narrow(2, 0, d.qk_nope).and_then(|x| x.transpose(0, 1)).map_err(fe)?, ACT)?;
         let q_lat = f32c(&q_nope.matmul(&a.w_uk).map_err(fe)?)?; // [NH, T, L]
-        let q_lat = q_lat.transpose(0, 1).map_err(fe)?; // [T, NH, L]
-        let q_rot = q3.narrow(2, d.qk_nope, d.qk_rope).map_err(fe)?;
+        let q_lat = kern::contig(&q_lat.transpose(0, 1).map_err(fe)?)?; // [T, NH, L]
+        let q_rot = kern::contig(&q3.narrow(2, d.qk_nope, d.qk_rope).map_err(fe)?)?;
         let qa = kern::contig(&Tensor::cat(&[&q_lat, &q_rot], 2).map_err(fe)?)?;
         let scale = 1.0 / (d.qk() as f32).sqrt();
         let o_lat = match a.kind {
@@ -546,6 +551,7 @@ impl Hy4Model {
         let o = kern::to(&o_lat.transpose(0, 1).map_err(fe)?, ACT)?; // [NH, T, L]
         let v = f32c(&o.matmul(&a.w_uv_t).map_err(fe)?)?; // [NH, T, V]
         let v = kern::contig(&v.transpose(0, 1).map_err(fe)?)?.reshape(vec![t, nh * d.v]).map_err(fe)?;
+        stage(_l, "attn_o", &v);
         let og = kern::gate_mul(&v, &gate, ACT)?;
         fwd(&a.o_proj, &og)
     }
@@ -581,6 +587,18 @@ impl Hy4Model {
         let valid = Tensor::from_vec(valid, vec![t], self.device).map_err(fe)?;
         let k = c.index_groups().min(ng);
         Ok(Some(scores.topk_wide(&valid, k).map_err(fe)?))
+    }
+}
+
+/// `HY4_DUMP=каталог`: промежуточные стадии слоя 0 (`l0_<имя>.f32`).
+fn stage(l: usize, name: &str, x: &Tensor) {
+    if l != 0 {
+        return;
+    }
+    let Ok(dir) = std::env::var("HY4_DUMP") else { return };
+    if let Ok(v) = x.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()) {
+        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/l0_{name}.f32"), bytes);
     }
 }
 
