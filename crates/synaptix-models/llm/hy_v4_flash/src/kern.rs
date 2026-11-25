@@ -291,3 +291,31 @@ pub fn gate_mul(o: &Tensor, gate: &Tensor, out_dt: DType) -> R<Tensor> {
     launch(o.device(), "hy4_gate_mul", &a, (t as u32, 1, 1), 256)?;
     Ok(out)
 }
+
+/// Строк декода, до которых поглощённые проекции идут ядром [`head_gemv`].
+pub const HEAD_GEMV_MAX_T: usize = 8;
+
+/// По головам `out[t,h,:] = x[t,h,:] · W[h]`: `x` F32 (шаги `x_t`, `x_h` в
+/// элементах от начала тензора), `w` BF16 `[NH, Din, Dout]`, выход F32
+/// `[T, NH, Dout]`. Для `T ≤ HEAD_GEMV_MAX_T`.
+pub fn head_gemv(x: &Tensor, x_t: usize, x_h: usize, w: &Tensor, t: usize) -> R<Tensor> {
+    let (nh, din, dout) = (w.dims()[0], w.dims()[1], w.dims()[2]);
+    if t > HEAD_GEMV_MAX_T || din > 512 || dout % 64 != 0 || x.dtype() != DType::F32 || w.dtype() != DType::BF16 {
+        return Err(ModelError::Forward(format!("hy4_head_gemv: вне формы (T {t}, Din {din}, Dout {dout})")));
+    }
+    let out = empty(vec![t, nh, dout], DType::F32, x.device())?;
+    let mut a = Ink2Launch::default();
+    a.a[0] = addr(x)?;
+    a.a[1] = addr(w)?;
+    a.a[2] = addr(&out)?;
+    a.u[0] = t as u32;
+    a.u[1] = nh as u32;
+    a.u[2] = din as u32;
+    a.u[3] = dout as u32;
+    a.u[4] = x_t as u32;
+    a.u[5] = x_h as u32;
+    a.u[6] = (nh * dout) as u32;
+    a.u[7] = dout as u32;
+    launch(x.device(), "hy4_head_gemv", &a, (nh as u32, (dout / 64) as u32, 1), 256)?;
+    Ok(out)
+}

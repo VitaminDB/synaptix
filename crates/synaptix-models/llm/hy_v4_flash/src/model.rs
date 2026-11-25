@@ -24,10 +24,18 @@ use crate::loader::Hy4Weights;
 const ACT: DType = DType::BF16;
 
 fn lin(w: &dyn WeightSource, key: &str, dev: Device) -> R<QLinear> {
+    let verbose = std::env::var_os("HY4_VERBOSE").is_some();
     if let Some(q) = w.quant(key, dev) {
-        return Ok(QLinear::Quant(q?));
+        let q = q?;
+        if verbose {
+            eprintln!("[hy4] {key}: {:?} [{}, {}]", q.dtype(), q.n(), q.k());
+        }
+        return Ok(QLinear::Quant(q));
     }
     let t = w.tensor(key, dev, ACT)?;
+    if verbose {
+        eprintln!("[hy4] {key}: плотный {:?} {:?}", t.dtype(), t.dims());
+    }
     QLinear::build(t, ACT, ACT)
 }
 
@@ -442,22 +450,24 @@ impl Hy4Model {
         let emb = self.embed_rows(ids)?;
         let x = kern::contig(&emb.unsqueeze(1).and_then(|e| e.expand(vec![t, m, h])).map_err(fe)?)?;
         let all_ids = cache.ids.clone();
+        // Профиль `SYN_MOE_PROFILE`: стадия ждёт карту, иначе время уходит в следующую.
+        let prof = synaptix_llm_common::profile::profiling();
         for (l, layer) in self.layers.iter().enumerate() {
             if let Some(e) = &layer.engram {
-                self.engram(e, &x, &all_ids, p0)?;
+                hy4_stage(prof, dev, "hy4:engram", || self.engram(e, &x, &all_ids, p0))?;
             }
             let (hin, post) = kern::hc_pre(&x, &layer.attn_hc.mixes(&x)?, &layer.attn_hc.base, &layer.attn_hc.scale, false, c.rms_norm_eps, c.hc_eps, c.hc_magnitude)?;
             let hn = kern::rms(&hin, Some(&layer.in_norm), c.rms_norm_eps, ACT)?;
             stage(l, "x", &x);
             stage(l, "attn_hn", &hn);
-            let y = self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l])?;
+            let y = hy4_stage(prof, dev, "hy4:attn", || self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l]))?;
             let y = kern::rms(&y, Some(&layer.attn.post_norm), c.rms_norm_eps, DType::F32)?;
             stage(l, "attn_y", &y);
             kern::hc_post(&x, post.as_ref().expect("post"), &y)?;
             let (hin, post) = kern::hc_pre(&x, &layer.ffn_hc.mixes(&x)?, &layer.ffn_hc.base, &layer.ffn_hc.scale, false, c.rms_norm_eps, c.hc_eps, c.hc_magnitude)?;
             let hn = kern::rms(&hin, Some(&layer.ffn_norm), c.rms_norm_eps, ACT)?;
             stage(l, "mlp_hn", &hn);
-            let z = self.mlp(&layer.mlp, &hn)?;
+            let z = hy4_stage(prof, dev, "hy4:mlp", || self.mlp(&layer.mlp, &hn))?;
             stage(l, "mlp_z", &z);
             kern::hc_post(&x, post.as_ref().expect("post"), &z)?;
             trace(l, &x);
@@ -518,25 +528,41 @@ impl Hy4Model {
         let d = &a.dims;
         let (t, nh, lat) = (hn.dims()[0], d.heads, c.kv_lora_rank);
         let eps = c.rms_norm_eps;
-        let gate = fwd(&a.gate, hn)?;
-        let qr = kern::rms(&fwd(&a.q_a, hn)?, Some(&a.q_a_norm), eps, ACT)?;
-        let q = f32c(&fwd(&a.q_b, &qr)?)?;
+        let prof = synaptix_llm_common::profile::profiling();
+        let dev = self.device;
+        let (gate, qr, q) = hy4_stage(prof, dev, "a:q", || -> R<_> {
+            let gate = fwd(&a.gate, hn)?;
+            let qr = kern::rms(&fwd(&a.q_a, hn)?, Some(&a.q_a_norm), eps, ACT)?;
+            let q = f32c(&fwd(&a.q_b, &qr)?)?;
+            Ok((gate, qr, q))
+        })?;
         kern::rope(&q, pos, nh * d.qk(), nh, d.qk(), d.qk_nope, d.qk_rope, d.rope_theta)?;
-        let ckv = f32c(&fwd(&a.kv_a, hn)?)?;
+        let ckv = hy4_stage(prof, dev, "a:kv", || f32c(&fwd(&a.kv_a, hn)?))?;
         let latent = kern::rms_cols(&ckv, lat, Some(&a.kv_a_norm), eps, DType::F32)?;
         let krot = kern::contig(&ckv.narrow(1, lat, d.qk_rope).map_err(fe)?)?;
         kern::rope(&krot, pos, d.qk_rope, 1, d.qk_rope, 0, d.qk_rope, d.rope_theta)?;
         let row = kern::contig(&Tensor::cat(&[&latent, &krot], 1).map_err(fe)?)?;
         kern::cache_put(&row, &lc.lat, pos)?;
         // Поглощённый запрос: q_lat = q_nope · W_uk по головам.
+        if prof {
+            if let Device::Cuda(o) = dev {
+                let _ = synaptix_core::device::cuda::synchronize(o);
+            }
+        }
         let q3 = q.reshape(vec![t, nh, d.qk()]).map_err(fe)?;
-        let q_nope = kern::to(&q3.narrow(2, 0, d.qk_nope).and_then(|x| x.transpose(0, 1)).map_err(fe)?, ACT)?;
-        let q_lat = f32c(&q_nope.matmul(&a.w_uk).map_err(fe)?)?; // [NH, T, L]
-        let q_lat = kern::contig(&q_lat.transpose(0, 1).map_err(fe)?)?; // [T, NH, L]
+        let q_lat = hy4_stage(prof, dev, "a:qlat", || -> R<Tensor> {
+            if t <= kern::HEAD_GEMV_MAX_T && !gemv_off() {
+                // Декод: ядро по головам прямо из q [T, NH·qk] в [T, NH, L].
+                return kern::head_gemv(&q, nh * d.qk(), d.qk(), &a.w_uk, t);
+            }
+            let q_nope = kern::to(&q3.narrow(2, 0, d.qk_nope).and_then(|x| x.transpose(0, 1)).map_err(fe)?, ACT)?;
+            let q_lat = f32c(&q_nope.matmul(&a.w_uk).map_err(fe)?)?; // [NH, T, L]
+            kern::contig(&q_lat.transpose(0, 1).map_err(fe)?) // [T, NH, L]
+        })?;
         let q_rot = kern::contig(&q3.narrow(2, d.qk_nope, d.qk_rope).map_err(fe)?)?;
         let qa = kern::contig(&Tensor::cat(&[&q_lat, &q_rot], 2).map_err(fe)?)?;
         let scale = 1.0 / (d.qk() as f32).sqrt();
-        let o_lat = match a.kind {
+        let o_lat = hy4_stage(prof, dev, "a:core", || -> R<Tensor> { Ok(match a.kind {
             AttnKind::Sliding => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(c.sliding_window), scale)?,
             AttnKind::Indexed => {
                 let idx = a.indexer.as_ref().expect("индексатор");
@@ -546,14 +572,19 @@ impl Hy4Model {
                     None => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(usize::MAX), scale)?,
                 }
             }
-        };
+        }) })?;
         // v = o_lat · W_uvᵀ по головам.
-        let o = kern::to(&o_lat.transpose(0, 1).map_err(fe)?, ACT)?; // [NH, T, L]
-        let v = f32c(&o.matmul(&a.w_uv_t).map_err(fe)?)?; // [NH, T, V]
-        let v = kern::contig(&v.transpose(0, 1).map_err(fe)?)?.reshape(vec![t, nh * d.v]).map_err(fe)?;
+        let v = hy4_stage(prof, dev, "a:v", || -> R<Tensor> {
+            if t <= kern::HEAD_GEMV_MAX_T && !gemv_off() {
+                return kern::head_gemv(&o_lat, nh * lat, lat, &a.w_uv_t, t)?.reshape(vec![t, nh * d.v]).map_err(fe);
+            }
+            let o = kern::to(&o_lat.transpose(0, 1).map_err(fe)?, ACT)?; // [NH, T, L]
+            let v = f32c(&o.matmul(&a.w_uv_t).map_err(fe)?)?; // [NH, T, V]
+            kern::contig(&v.transpose(0, 1).map_err(fe)?)?.reshape(vec![t, nh * d.v]).map_err(fe)
+        })?;
         stage(_l, "attn_o", &v);
         let og = kern::gate_mul(&v, &gate, ACT)?;
-        fwd(&a.o_proj, &og)
+        hy4_stage(prof, dev, "a:o", || fwd(&a.o_proj, &og))
     }
 
     /// Ключи индексатора в кэш, свёртка закрытых групп и, если хоть одному
@@ -598,6 +629,26 @@ impl Hy4Model {
         }
         Ok(Some(sel))
     }
+}
+
+/// `HY4_HEAD_GEMV=0` — поглощённые проекции декода общим matmul (сверка).
+fn gemv_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("HY4_HEAD_GEMV").as_deref() == Ok("0"))
+}
+
+/// Стадия под профилем `SYN_MOE_PROFILE`: время до готовности карты.
+fn hy4_stage<T>(prof: bool, dev: Device, name: &'static str, f: impl FnOnce() -> T) -> T {
+    if !prof {
+        return f();
+    }
+    synaptix_llm_common::profile::stage(name, || {
+        let out = f();
+        if let Device::Cuda(o) = dev {
+            let _ = synaptix_core::device::cuda::synchronize(o);
+        }
+        out
+    })
 }
 
 /// `HY4_DUMP=каталог`: промежуточные стадии слоя `HY4_STAGE_LAYER` (0) — `l0_<имя>.f32`.

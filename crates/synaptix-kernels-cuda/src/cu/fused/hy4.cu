@@ -384,3 +384,55 @@ extern "C" __global__ void hy4_gate_mul(Hy4Args args) {
         st_any(args.a[2], k, args.u[3], CPF(0)[k] * sigm(ld_any(args.a[1], k, args.u[2])));
     }
 }
+
+// Поглощённые проекции MLA на декоде: по головам out[t,h,:] = x[t,h,:] · W[h]
+// (W BF16 [NH, Din, Dout]; x, out — F32 со своими шагами по t и h). Общий
+// батч-matmul на одну строку медленный; здесь вес читается один раз на все
+// T ≤ 8 строк. Блок 32×8: варп — 64 соседних столбца (пары bf16), 8 варпов
+// делят Din и сводятся в shared. Сетка (NH, Dout/64).
+//   a0 x, a1 W, a2 out; u0 T, u1 NH, u2 Din, u3 Dout, u4 x_t, u5 x_h, u6 o_t, u7 o_h
+#define HY4_HG_T 8
+extern "C" __global__ void hy4_head_gemv(Hy4Args args) {
+    __shared__ float xs[HY4_HG_T][512];
+    __shared__ float red[8][HY4_HG_T][64];
+    const unsigned h = blockIdx.x, T = args.u[0], Din = args.u[2], Dout = args.u[3];
+    const unsigned lx = threadIdx.x & 31, ly = threadIdx.x >> 5;
+    const float* x = CPF(0);
+    for (unsigned i = threadIdx.x; i < T * Din; i += blockDim.x) {
+        const unsigned t = i / Din, d = i % Din;
+        xs[t][d] = x[(size_t)t * args.u[4] + (size_t)h * args.u[5] + d];
+    }
+    __syncthreads();
+    const unsigned c = blockIdx.y * 64 + 2 * lx;
+    float acc[HY4_HG_T][2];
+#pragma unroll
+    for (int t = 0; t < HY4_HG_T; ++t) acc[t][0] = acc[t][1] = 0.0f;
+    if (c < Dout) {
+        const __nv_bfloat162* w = (const __nv_bfloat162*)((const __nv_bfloat16*)args.a[1] + (size_t)h * Din * Dout + c);
+        for (unsigned d = ly; d < Din; d += 8) {
+            const float2 wf = __bfloat1622float2(w[(size_t)d * (Dout / 2)]);
+#pragma unroll
+            for (int t = 0; t < HY4_HG_T; ++t) {
+                if (t < (int)T) {
+                    acc[t][0] += xs[t][d] * wf.x;
+                    acc[t][1] += xs[t][d] * wf.y;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < HY4_HG_T; ++t) {
+        red[ly][t][2 * lx] = acc[t][0];
+        red[ly][t][2 * lx + 1] = acc[t][1];
+    }
+    __syncthreads();
+    float* out = PF(2);
+    for (unsigned i = threadIdx.x; i < T * 64; i += blockDim.x) {
+        const unsigned t = i / 64, j = i % 64, col = blockIdx.y * 64 + j;
+        if (col >= Dout) continue;
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) s += red[k][t][j];
+        out[(size_t)t * args.u[6] + (size_t)h * args.u[7] + col] = s;
+    }
+}

@@ -261,3 +261,31 @@ fn engram_gate_update() {
     }
     close(&down(&xt), &want, 1e-4, "гейт engram (вторая строка не тронута)");
 }
+
+/// Поглощённые проекции декода: x — срез строки q (шаги как у q [T, NH·qk]),
+/// W BF16 [NH, Din, Dout]; T от 1 до 8.
+#[test]
+fn head_gemv_matches_cpu() {
+    let Some(d) = dev() else { return };
+    for &(t, nh, qk, din, dout) in &[(1usize, 4usize, 256usize, 192usize, 512usize), (3, 2, 512, 512, 256), (8, 3, 192, 192, 128)] {
+        let x = rnd(11, t * nh * qk, 1.0);
+        let w = rnd(12, nh * din * dout, 0.1);
+        // Вес в BF16 и обратно — эталон считает с теми же округлёнными весами.
+        let wb: Vec<f32> = w.iter().map(|v| half::bf16::from_f32(*v).to_f32()).collect();
+        let wt = up(&wb, vec![nh, din, dout], d).to_dtype(DType::BF16).unwrap();
+        let got = down(&kern::head_gemv(&up(&x, vec![t, nh * qk], d), nh * qk, qk, &wt, t).unwrap());
+        let mut want = vec![0f32; t * nh * dout];
+        for ti in 0..t {
+            for h in 0..nh {
+                for c in 0..dout {
+                    let mut s = 0f32;
+                    for k in 0..din {
+                        s += x[ti * nh * qk + h * qk + k] * wb[(h * din + k) * dout + c];
+                    }
+                    want[(ti * nh + h) * dout + c] = s;
+                }
+            }
+        }
+        close(&got, &want, 1e-4, &format!("head_gemv t={t} din={din} dout={dout}"));
+    }
+}

@@ -44,6 +44,9 @@ fn main() {
     idx.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap());
     let top: Vec<(usize, f32, String)> = idx[..10].iter().map(|&i| (i, v[i], p.decode(&[i as u32]).unwrap_or_default())).collect();
     eprintln!("префилл {:.2} с ({:.1} ток/с); top-10: {top:?}", dt, ids.len() as f64 / dt);
+    if synaptix_llm_common::profile::profiling() {
+        eprintln!("профиль префилла:\n{}", synaptix_llm_common::profile::report());
+    }
     if gen > 0 {
         let mut tok = idx[0] as u32;
         let mut out = vec![tok];
@@ -59,6 +62,9 @@ fn main() {
         }
         let dd = t1.elapsed().as_secs_f64();
         eprintln!("декод {:.2} ток/с", (out.len() - 1) as f64 / dd);
+        if synaptix_llm_common::profile::profiling() {
+            eprintln!("профиль декода ({} шагов, {:.1} мс/шаг):\n{}", out.len() - 1, dd * 1e3 / (out.len() - 1) as f64, synaptix_llm_common::profile::report());
+        }
         println!("{}", p.decode(&out).unwrap());
     }
 }
