@@ -1588,6 +1588,25 @@ impl TensorStream for HfStream {
                     p(self.done, self.items.len(), &item.name);
                 }
                 let mut scales_all = Vec::new();
+                if let Some(rows) = mxfp8_row_chunk(&self.hf, item) {
+                    // Огромная таблица: кусками строк (MXFP8 построчный —
+                    // байты и масштабы кусков подряд = кодировка целиком).
+                    let (_, n, k) = item.dims;
+                    for r0 in (0..n).step_by(rows) {
+                        let r1 = (r0 + rows).min(n);
+                        let v = self.hf.matrix_rows(&item.name, r0, r1).expect("проверено в mxfp8_row_chunk").map_err(err)?;
+                        let (packed, scales) = mxfp8_rows(v, r1 - r0, k, self.device)
+                            .map_err(|e| err(IoError::Bundle(format!("{}: MXFP8 строк {r0}..{r1}: {e}", item.name))))?;
+                        w.write_all(&packed).map_err(synaptix_bundle::Error::Io)?;
+                        scales_all.extend_from_slice(&scales);
+                        if let Some(p) = &self.progress {
+                            p(self.done, self.items.len(), &format!("{} [{r1}/{n}]", item.name));
+                        }
+                    }
+                    self.done += 1;
+                    self.pending_scales = Some((ii, scales_all));
+                    return Ok(());
+                }
                 for s in 0..item.dims.0 {
                     let (packed, scales) = transcode_slice(None, item, s, self.device).map_err(err)?;
                     w.write_all(&packed).map_err(synaptix_bundle::Error::Io)?;
@@ -1601,6 +1620,31 @@ impl TensorStream for HfStream {
             }
         }
     }
+}
+
+/// Двумерная плотная матрица в MXFP8 больше `SYN_QUANT_ROW_CHUNK` элементов
+/// (по умолчанию 2^28 — 1 ГиБ f32) кодируется кусками строк: целиком она не
+/// влезла бы ни в RAM в f32, ни на карту (engram Hy4-flash — 31,7 ГБ BF16).
+/// Возвращает строк в куске.
+fn mxfp8_row_chunk(hf: &super::hf_origin::HfOrigin, item: &Item) -> Option<usize> {
+    let (slices, n, k) = item.dims;
+    let limit = std::env::var("SYN_QUANT_ROW_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1 << 28).max(k);
+    if slices != 1 || item.target != DType::MXFP8 || item.delta.is_some() || n * k <= limit {
+        return None;
+    }
+    hf.matrix_rows(&item.name, 0, 0)?.ok()?;
+    Some((limit / k).max(1))
+}
+
+/// Кусок строк в MXFP8 тем же путём, что и обычные матрицы (F16 →
+/// `quantize_to`): на карте округление к чётному, как у прочих тензоров бандла.
+fn mxfp8_rows(v: Vec<f32>, n: usize, k: usize, device: Device) -> synaptix_core::error::Result<(Vec<u8>, Vec<u8>)> {
+    let q = Tensor::from_vec(v, vec![n, k], device)?.to_dtype(DType::F16)?.quantize_to(DType::MXFP8)?;
+    let (p, s) = host_packed(&q)?;
+    if let Device::Cuda(o) = device {
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+    }
+    Ok((p, s.unwrap_or_default()))
 }
 
 /// Компоненты плана, к которым применяется `spec` (остальные — как есть).
@@ -1669,6 +1713,47 @@ pub fn write_bundle_hf(src: &synaptix_bundle::PackPlan, out: &Path, spec: &Trans
     builder = builder.add_file_bytes(MANIFEST_NAME, mbytes, FileTag::Inference).map_err(|e| IoError::Bundle(e.to_string()))?;
     builder.write(out).map_err(|e| IoError::Bundle(format!("{}: {e}", out.display())))?;
     Ok(TranscodeReport { tensors, bytes_before: before, bytes_after: after, placement: "file", cache_path: Some(out.to_path_buf()), seconds: t0.elapsed().as_secs_f64() })
+}
+
+#[cfg(test)]
+mod row_chunk_tests {
+    use super::*;
+
+    /// Таблица MXFP8 кусками строк из оригинала = та же таблица целиком,
+    /// и совпадает с обычным путём `quantize_to(MXFP8)` (раскладка масштабов
+    /// построчная, без свизла).
+    #[test]
+    fn mxfp8_row_chunks_match_whole() {
+        synaptix_kernels_cpu::ensure_registered();
+        let (n, k) = (97usize, 96usize);
+        let w: Vec<f32> = (0..n * k).map(|i| half::bf16::from_f32(((i * 7919 % 1013) as f32 - 506.0) * 1e-3 * if i % 41 == 0 { 30.0 } else { 1.0 }).to_f32()).collect();
+        let bytes: Vec<u8> = w.iter().flat_map(|v| half::bf16::from_f32(*v).to_le_bytes()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let view = safetensors::tensor::TensorView::new(safetensors::tensor::Dtype::BF16, vec![n, k], &bytes).unwrap();
+        safetensors::serialize_to_file(vec![("engram.embedding.weight".to_string(), view)], None, &path).unwrap();
+        let hf = super::super::hf_origin::HfOrigin::from_files(&[path], None).unwrap();
+        let item = Item { name: "engram.embedding.weight".into(), dims: (1, n, k), shape: vec![n, k], current: None, target: DType::MXFP8, delta: None, origin: None };
+        std::env::set_var("SYN_QUANT_ROW_CHUNK", (40 * k).to_string());
+        let rows = mxfp8_row_chunk(&hf, &item).expect("таблица больше порога");
+        std::env::remove_var("SYN_QUANT_ROW_CHUNK");
+        assert_eq!(rows, 40);
+        // Значения BF16 этого диапазона в F16 точны — куски = обычный путь целиком.
+        synaptix_kernels_cuda::ensure_registered();
+        for dev in [Device::Cpu, Device::Cuda(0)] {
+            let (mut p, mut s) = (Vec::new(), Vec::new());
+            for r0 in (0..n).step_by(rows) {
+                let r1 = (r0 + rows).min(n);
+                let (pc, sc) = mxfp8_rows(hf.matrix_rows(&item.name, r0, r1).unwrap().unwrap(), r1 - r0, k, dev).unwrap();
+                p.extend(pc);
+                s.extend(sc);
+            }
+            let q = Tensor::from_vec(w.clone(), vec![n, k], dev).and_then(|t| t.to_dtype(DType::F16)).and_then(|t| t.quantize_to(DType::MXFP8)).unwrap();
+            let (pq, sq) = host_packed(&q).unwrap();
+            assert_eq!(p, pq, "байты кусков ≠ целиком ({dev:?})");
+            assert_eq!(s, sq.unwrap_or_default(), "масштабы кусков ≠ целиком ({dev:?})");
+        }
+    }
 }
 
 #[cfg(test)]

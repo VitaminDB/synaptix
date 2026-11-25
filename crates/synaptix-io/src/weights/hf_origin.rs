@@ -222,6 +222,24 @@ impl HfOrigin {
         })
     }
 
+    /// Строки `r0..r1` двумерного плотного тензора (BF16/F16/F32) в f32 —
+    /// без чтения остального: таблицы в десятки ГБ (engram Hy4) кодируются
+    /// кусками. `None` — тензор не двумерный или не плотный.
+    pub fn matrix_rows(&self, name: &str, r0: usize, r1: usize) -> Option<Result<Vec<f32>>> {
+        let (dt, shape, sh, a, b) = self.raw(name).ok()?;
+        let [n, k] = shape.as_slice() else { return None };
+        let (n, k) = (*n, *k);
+        let es = match dt.as_str() {
+            "F32" => 4,
+            "BF16" | "F16" => 2,
+            _ => return None,
+        };
+        if r0 > r1 || r1 > n || b - a != n * k * es {
+            return Some(Err(IoError::Bundle(format!("{name}: строки {r0}..{r1} при форме [{n}, {k}] и {} байт", b - a))));
+        }
+        Some(Self::floats(&dt, &sh.map[a + r0 * k * es..a + r1 * k * es]))
+    }
+
     /// Матрица HF `[n, k]` (`….weight`) в f32, FP8 — с блочными масштабами.
     pub fn matrix(&self, name: &str) -> Result<(Vec<f32>, usize, usize)> {
         self.matrix_slice(name, 0)
