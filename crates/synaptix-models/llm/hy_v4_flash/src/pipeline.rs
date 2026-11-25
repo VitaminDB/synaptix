@@ -139,6 +139,13 @@ fn zc_prefill_cache_bytes() -> usize {
     (gb * (1u64 << 30) as f64) as usize
 }
 
+/// Ёмкость старого кэша на декоде с zero-copy: `SYN_HY4_ZC_DECODE_CACHE_MB` (2560).
+/// Меньше — больше слотов (выше попадания), но на загруженной машине замеры
+/// выигрыша не показали.
+fn zc_decode_cache_bytes() -> usize {
+    std::env::var("SYN_HY4_ZC_DECODE_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2560) << 20
+}
+
 /// Запас VRAM под KV и активации хода: `SYN_HY4_VRAM_RESERVE_GB` (3).
 fn vram_reserve() -> usize {
     let gb = std::env::var("SYN_HY4_VRAM_RESERVE_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(3.0);
@@ -232,11 +239,26 @@ impl Hy4Pipeline {
             return;
         }
         let Device::Cuda(ord) = self.model.device else { return };
+        // Старый кэш на декоде не нужен (короткий префилл идёт через слоты),
+        // его память — слотам; вернётся перед длинным префиллом.
+        // Не ноль: при нулевой ёмкости кэш ужимался бы (синхронизация и трим
+        // пула) на каждом вызове слоя.
         if let Some(cache) = self.model.expert_cache() {
-            cache.set_capacity(zc_prefill_cache_bytes().min(cache.ceiling_bytes()));
+            cache.set_capacity(zc_decode_cache_bytes().min(cache.ceiling_bytes()));
         }
         let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(ord);
-        let Ok((free, _)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        let Ok((free, total)) = synaptix_core::device::cuda::mem_info(ord) else { return };
+        if std::env::var_os("SYN_HY4_TRACE_MEM").is_some() {
+            let gb = |x: u64| x as f64 / (1u64 << 30) as f64;
+            let (ar, au) = synaptix_core::device::cuda::activations_pool_stats(ord).unwrap_or((0, 0));
+            let (wr, wu) = synaptix_core::device::cuda::weights_pool_stats(ord).unwrap_or((0, 0));
+            let (er, eu) = synaptix_core::device::cuda::experts_pool_stats(ord).unwrap_or((0, 0));
+            let (dr, du) = synaptix_core::memory::cuda_pool::cuda_mempool_stats(ord).unwrap_or((0, 0));
+            eprintln!(
+                "[hy4] VRAM перед слотами: свободно {:.2} из {:.2} ГБ; активации {:.2}/{:.2}, веса {:.2}/{:.2}, эксперты {:.2}/{:.2}, общий {:.2}/{:.2} ГБ; KV {:.2} ГБ",
+                gb(free as u64), gb(total as u64), gb(au), gb(ar), gb(wu), gb(wr), gb(eu), gb(er), gb(du), gb(dr), gb(self.model.kv_bytes_per_token() as u64 * 8192)
+            );
+        }
         let headroom = std::env::var("SYN_HY4_ZC_HEADROOM_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20;
         let reserve = headroom + (768usize << 20);
         let c = &self.config;
@@ -306,6 +328,9 @@ impl Hy4Pipeline {
         if let Some(pool) = self.zc_pool.as_ref().filter(|_| prompt_ids.len() - reuse > zc_release) {
             self.model.zc_release();
             pool.set_slots_per_layer(0);
+            if let Some(cache) = self.model.expert_cache() {
+                cache.set_capacity(zc_prefill_cache_bytes().min(cache.ceiling_bytes()));
+            }
             if let Device::Cuda(ord) = self.model.device {
                 let _ = synaptix_core::device::cuda::synchronize_all(ord);
                 let _ = synaptix_core::device::cuda::trim_activations_pool(ord);

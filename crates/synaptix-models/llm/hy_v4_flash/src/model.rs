@@ -553,15 +553,21 @@ impl Hy4Model {
                 kern::rms(&z, Some(post_norm), eps, DType::F32)
             }
             Mlp::Moe { moe, pre, post, sh_gate, sh_up, sh_down, combine_norm } => {
-                let lat = kern::to(&fwd(pre, hn)?, DType::F16)?;
-                let routed = moe.forward_routed(&lat, Some(hn))?;
-                let routed = fwd(post, &kern::to(&routed, ACT)?)?;
-                let g = fwd(sh_gate, hn)?;
-                let u = fwd(sh_up, hn)?;
-                let a = g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|g| g.mul(&u))).map_err(fe)?;
-                let s = fwd(sh_down, &a)?;
-                let sum = f32c(&routed)?.add(&f32c(&s)?).map_err(fe)?;
-                kern::rms(&sum, Some(combine_norm), eps, DType::F32)
+                let prof = synaptix_llm_common::profile::profiling();
+                let dev = self.device;
+                let lat = hy4_stage(prof, dev, "m:pre", || kern::to(&fwd(pre, hn)?, DType::F16))?;
+                let routed = hy4_stage(prof, dev, "m:moe", || moe.forward_routed(&lat, Some(hn)))?;
+                let routed = hy4_stage(prof, dev, "m:post", || fwd(post, &kern::to(&routed, ACT)?))?;
+                let s = hy4_stage(prof, dev, "m:shared", || -> R<Tensor> {
+                    let g = fwd(sh_gate, hn)?;
+                    let u = fwd(sh_up, hn)?;
+                    let a = g.silu_and_mul(&u).or_else(|_| g.silu().and_then(|g| g.mul(&u))).map_err(fe)?;
+                    fwd(sh_down, &a)
+                })?;
+                hy4_stage(prof, dev, "m:norm", || {
+                    let sum = f32c(&routed)?.add(&f32c(&s)?).map_err(fe)?;
+                    kern::rms(&sum, Some(combine_norm), eps, DType::F32)
+                })
             }
         }
     }
