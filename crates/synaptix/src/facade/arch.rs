@@ -217,7 +217,7 @@ mod tests {
 
 /// Принимает ли языковая модель картинки — без загрузки, по `config.json` и
 /// бандлу; правила те же, что у [`crate::facade::llm::Llm::supports_media`]:
-/// Gemma4 — `image_token_id` и `vision_config`; Qwen-гибрид и Qwen4Exp —
+/// Gemma4 и Hy4-flash — `image_token_id` и `vision_config`; Qwen-гибрид и Qwen4Exp —
 /// `image_token_id` и башня в бандле; Muse Glimmer и Inkling-2 — `vision_config`.
 /// Для каталога службы: найти модель со зрением, не поднимая все подряд.
 pub fn config_supports_media(path: &Path) -> bool {
@@ -228,6 +228,7 @@ pub fn config_supports_media(path: &Path) -> bool {
     match detect_llm_arch(path) {
         Ok(LlmArch::Gemma4) => image_token && vision_config,
         Ok(LlmArch::MuseGlimmer | LlmArch::Inkling2) => vision_config,
+        Ok(LlmArch::Hy4Flash) => image_token && vision_config,
         Ok(LlmArch::Hybrid) => image_token && bundle_has_vision_hybrid(path),
         Ok(LlmArch::Qwen4Exp) => image_token && bundle_has_vision_qwen4(path),
         _ => false,
@@ -253,8 +254,8 @@ fn bundle_has_vision_qwen4(_path: &Path) -> bool {
 
 #[cfg(test)]
 mod media_tests {
-    /// На реальных бандлах библиотеки (если они есть): у Gemma-4 E4B зрение есть,
-    /// у Hy4-flash (башня в бандле, движок её пока не исполняет) — нет.
+    /// На реальных бандлах библиотеки (если они есть): у Gemma-4 E4B и Hy4-flash
+    /// зрение есть, у Qwen3-1.7B — нет.
     #[test]
     fn media_from_config() {
         let lib = std::path::Path::new(concat!(env!("HOME"), "/Storage/Нейросети/Модели/llm"));
@@ -264,7 +265,7 @@ mod media_tests {
         }
         let hy4 = lib.join("hy4-flash.syn");
         if hy4.exists() {
-            assert!(!super::config_supports_media(&hy4));
+            assert!(super::config_supports_media(&hy4));
         }
         let qwen3 = lib.join("qwen3-1.7b.syn");
         if qwen3.exists() {
