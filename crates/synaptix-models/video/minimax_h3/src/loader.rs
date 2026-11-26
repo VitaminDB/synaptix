@@ -116,20 +116,26 @@ impl LoraWeights {
         }
         let diffusers = names.iter().any(|n| n.contains("transformer_blocks.") || n.contains(".attn.to_q."));
         let md = loader.metadata();
-        let alpha = ["alpha", "training_alpha", "lora_alpha"]
+        let qkv_fused = md.contains_key("qkv_fusion");
+        let alpha = ["alpha", "training_alpha", "lora_alpha", "default_training_alpha"]
             .iter()
             .find_map(|k| md.get(*k).and_then(|v| v.trim().parse::<f32>().ok()))
             .filter(|a| *a > 0.0);
         // ComfyUI-сборка qkv (блочно-диагональная B, rank·3) хранит alpha·3 и
-        // `training_scale` — масштаб берётся прямо из него.
+        // `training_scale` — масштаб берётся прямо из него (если нет per-module `.alpha`).
         let alpha = match md.get("training_scale").and_then(|v| v.trim().parse::<f32>().ok()) {
-            Some(sc) if sc > 0.0 && md.contains_key("qkv_fusion") => Some(-sc),
+            Some(sc) if sc > 0.0 && qkv_fused => Some(-sc),
             _ => alpha,
         };
-        // Turbo LoRA для 768p (lightx2v v1.x) учены со сдвигом сигмы 6/3, а не
-        // 12/3 модели; без явного --sigma-shift-* — их сдвиг.
+        let has_per_module_alpha = names.iter().any(|n| n.ends_with(".alpha"));
+        // Turbo LoRA для 768p FL2V (lightx2v 4-step v1.x и 8-step v1.0/v1.1) учены
+        // со сдвигом сигмы 6/3; 8-step v1.2 и Ref2V используют базовый сдвиг 12/3.
         let fname = path.as_ref().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if fname.contains("turbo") && fname.contains("768p") {
+        let needs_shift6 = fname.contains("turbo")
+            && fname.contains("768p")
+            && !fname.contains("ref2v")
+            && !(fname.contains("8step") && fname.contains("v1.2"));
+        if needs_shift6 {
             let (v, a) = crate::runtime::sigma_shift();
             if v.is_none() {
                 crate::runtime::set_sigma_shift(Some(6.0), a.or(Some(3.0)));
@@ -137,15 +143,49 @@ impl LoraWeights {
             }
         }
         eprintln!(
-            "[h3] LoRA: {} имена, alpha {}",
+            "[h3] LoRA: {} имена, alpha {}{}",
             if diffusers { "Diffusers" } else { "ComfyUI/H3" },
             match alpha {
                 Some(a) if a < 0.0 => format!("— training_scale {}", -a),
                 Some(a) => format!("{a} (масштаб alpha/rank)"),
                 None => "нет (масштаб 1)".into(),
-            }
+            },
+            if has_per_module_alpha { " + per-module .alpha" } else { "" },
         );
         Ok(Self { loader, strength, device, prefixes, diffusers, alpha })
+    }
+
+    /// Скалярный тензор `<prefix><key>.alpha` (если есть — имеет приоритет над глобальной alpha
+    /// в метаданных, например у Turbo v1.2 с разными рангами adaln=16 и attn/mlp=128).
+    fn module_alpha(&self, key: &str) -> Result<Option<f32>, H3Error> {
+        let names = self.loader.names();
+        for p in &self.prefixes {
+            let k = format!("{p}{key}.alpha");
+            if names.iter().any(|n| *n == k.as_str()) {
+                let t = self
+                    .loader
+                    .load_to(&k, Device::Cpu, DType::F32)
+                    .map_err(|e| H3Error::Load(format!("lora {k}: {e}")))?;
+                let v = t.flatten_all()?.to_vec1::<f32>()?;
+                if let Some(&val) = v.first() {
+                    if val > 0.0 && val.is_finite() {
+                        return Ok(Some(val));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn effective_scale(&self, key: &str, rank: f32) -> Result<f32, H3Error> {
+        if let Some(ma) = self.module_alpha(key)? {
+            return Ok(ma / rank);
+        }
+        Ok(match self.alpha {
+            Some(a) if a < 0.0 => -a, // готовый training_scale
+            Some(a) => a / rank,
+            None => 1.0,
+        })
     }
 
     fn pair_delta(&self, key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {
@@ -161,11 +201,7 @@ impl LoraWeights {
             .load_to(&kb, self.device, dtype)
             .map_err(|e| H3Error::Load(format!("lora {kb}: {e}")))?;
         let rank = a.dims()[0] as f32;
-        let scale = match self.alpha {
-            Some(a) if a < 0.0 => -a, // готовый training_scale
-            Some(a) => a / rank,
-            None => 1.0,
-        };
+        let scale = self.effective_scale(key, rank)?;
         let bs = b.mul_scalar(self.strength * scale)?;
         Ok(Some(bs.matmul(&a)?))
     }
@@ -249,11 +285,7 @@ impl LoraWeights {
         let a = self.loader.load_to(&ka, self.device, dtype).map_err(|e| H3Error::Load(format!("lora {ka}: {e}")))?;
         let b = self.loader.load_to(&kb, self.device, dtype).map_err(|e| H3Error::Load(format!("lora {kb}: {e}")))?;
         let rank = a.dims()[0] as f32;
-        let scale = match self.alpha {
-            Some(al) if al < 0.0 => -al,
-            Some(al) => al / rank,
-            None => 1.0,
-        };
+        let scale = self.effective_scale(key, rank)?;
         Ok(Some((a, b.mul_scalar(self.strength * scale)?)))
     }
 
@@ -287,18 +319,36 @@ impl LoraWeights {
                 _ => None,
             });
         }
-        // ComfyUI: B — [q; k; v] (блочно-диагональная), A общая.
+        // ComfyUI: при `qkv_fusion` B — блочно-диагональная `[3N, 3r]`, A — `[3r, K]`
+        // (режем на 3 независимые пары ранга r, в 3× меньше вычислений); иначе общая A.
         let Some((a, b)) = self.raw_pair(model_key, dtype)? else {
             return Ok(None);
         };
         let inner = b.dims()[0] / 3;
-        let part = |i: usize| -> Result<(Tensor, Tensor), H3Error> { Ok((a.clone(), b.narrow(0, i * inner, inner)?.contiguous()?)) };
+        let r_total = a.dims()[0];
+        let block_diag = self.loader.metadata().contains_key("qkv_fusion") && r_total % 3 == 0 && b.dims()[1] == r_total;
+        let part = |i: usize| -> Result<(Tensor, Tensor), H3Error> {
+            if block_diag {
+                let r = r_total / 3;
+                Ok((
+                    a.narrow(0, i * r, r)?.contiguous()?,
+                    b.narrow(0, i * inner, inner)?.narrow(1, i * r, r)?.contiguous()?,
+                ))
+            } else {
+                Ok((a.clone(), b.narrow(0, i * inner, inner)?.contiguous()?))
+            }
+        };
         Ok(Some([part(0)?, part(1)?, part(2)?]))
     }
 
     /// Сколько модулей H3 эта LoRA задевает (для журнала: 0 — имена не сошлись).
     pub fn modules(&self) -> usize {
         self.loader.names().iter().filter(|n| n.contains("lora_A") || n.contains("lora_down")).count()
+    }
+
+    /// Задевает ли LoRA проекции adaLN (если нет — дисковый кэш adaLN валиден).
+    pub fn touches_adaln(&self) -> bool {
+        self.loader.names().iter().any(|n| n.contains("adaln") || n.contains("norm_out.linear"))
     }
 
     pub fn diff(&self, model_key: &str, dtype: DType) -> Result<Option<Tensor>, H3Error> {
@@ -354,6 +404,10 @@ impl H3Checkpoint {
 
     pub fn has_lora(&self) -> bool {
         self.lora.is_some()
+    }
+
+    pub fn lora_touches_adaln(&self) -> bool {
+        self.lora.as_ref().is_some_and(|l| l.touches_adaln())
     }
 
     pub fn lora_pair(&self, key: &str, dtype: DType) -> Result<Option<(Tensor, Tensor)>, H3Error> {
@@ -554,6 +608,10 @@ impl ComponentLoader {
 
     pub fn names(&self) -> Vec<&str> {
         self.loader.names()
+    }
+
+    pub fn raw_bytes(&self, name: &str) -> Option<(&[u8], DType, &[usize])> {
+        self.loader.raw_bytes(name)
     }
 
     pub fn infos(&self) -> impl Iterator<Item = (&str, DType, &[usize])> {

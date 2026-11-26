@@ -191,9 +191,9 @@ pub fn load_reserve_for(
     const LEGACY: usize = 13 << 29;
     // + текст и служебные строки
     let seq = g.video_tokens(cfg.patch_size) + g.audio_t + 1024;
-    // LoRA при счёте: BF16-входы проекций внимания и MLP (два [seq, hidden])
-    // и промежуточные (x·Aᵀ) — сверх обычных активаций.
-    let lora_b = if lora { 2 * seq * cfg.hidden_size * compute.bytes_for_numel(1).max(1) + (1usize << 30) } else { 0 };
+    // LoRA при счёте: один BF16-буфер входа [seq, hidden] (h1 и h2 не живут
+    // одновременно) + промежуточный (x·Aᵀ) ранга 128.
+    let lora_b = if lora { seq * cfg.hidden_size * compute.bytes_for_numel(1).max(1) + (512usize << 20) } else { 0 };
     // Стартовый запас — с избытком: после первого шага денойза раскладка
     // подстраивается по замеренному пику (H3Dit::adapt_resident) — лишнее
     // занимают блоки с хоста, при нехватке они возвращаются.

@@ -302,7 +302,11 @@ pub fn prepare(
                 .join(",")
         ),
     );
-    let plan = AdalnPlan::build(&layout, sched, req.visual_cond_aug, req.audio_cond_aug);
+    let adaln_sched = match speed_plan(req, sched.steps()) {
+        Some((coarse_geo, coarse_steps)) => speed_stage2_sched(sched, coarse_geo, g, coarse_steps),
+        None => sched.clone(),
+    };
+    let plan = AdalnPlan::build(&layout, &adaln_sched, req.visual_cond_aug, req.audio_cond_aug);
     let segments = mod_segments(&layout, &plan.roles, Some(&req.cond.text_tags));
     let rope = dit.rope_tables(&layout.positions)?;
 
@@ -514,6 +518,341 @@ pub fn denoise_one(
     Ok((v_vel, a_vel))
 }
 
+/// Настройки блочно-разреженного FP8-внимания (Sol-стиль) для шага денойза:
+/// - `SYN_H3_SPARSE_ATTN=0` — выключить (по умолчанию включено при `seq_len ≥ 8192`);
+/// - `SYN_H3_SPARSE_DENSE_STEPS` — число первых плотных шагов (по умолчанию `ceil(25%)`, т.е. 2 из 8, 5 из 20);
+/// - `SYN_H3_SPARSE_KEEP` — доля дальних видео-блоков по top-k (по умолчанию `0.40`).
+/// Префикс `[0..video_start)` (Text/Cond/Refs/Audio) и локальное окно ±1 кадр всегда плотные.
+fn sparse_cfg_for_step(
+    step: usize,
+    total_steps: usize,
+    prep: &PreparedRun,
+) -> Option<synaptix_core::precision::AttentionSparseConfig> {
+    if matches!(std::env::var("SYN_H3_SPARSE_ATTN").as_deref(), Ok("0") | Ok("false") | Ok("off")) {
+        return None;
+    }
+    if prep.layout.seq_len < 8192 || total_steps < 2 {
+        return None;
+    }
+    let dense_steps = std::env::var("SYN_H3_SPARSE_DENSE_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| ((total_steps as f32 * 0.25).ceil() as usize).max(1));
+    if step < dense_steps {
+        return None;
+    }
+    let keep_ratio = std::env::var("SYN_H3_SPARSE_KEEP")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.40)
+        .clamp(0.15, 1.0);
+    if keep_ratio >= 0.999 {
+        return None;
+    }
+    Some(synaptix_core::precision::AttentionSparseConfig {
+        protected_prefix: prep.video_seg.0,
+        q_offset: 0,
+        keep_ratio,
+        frame_tokens: prep.layout.frame_rows,
+    })
+}
+
+/// Параметры 2-стадийного coarse-to-fine семплинга (SPEED):
+/// - `SYN_H3_SPEED=0` — выключить (по умолчанию включено для `steps ≥ 4` и
+///   кадра выше порога сетки);
+/// - `SYN_H3_SPEED_STEPS=N` — число грубых шагов (по умолчанию `round(35%)`,
+///   т.е. 1/4, 3/8, 7/20).
+/// Порог грубой сетки — минимум `34×60` латентов (`544×960`, кратно 32):
+/// ниже этого порога на 768p H3 теряет кадрирование (крупный план уходит в общий).
+fn speed_plan(req: &DenoiseRequest<'_>, steps: usize) -> Option<(Geometry, usize)> {
+    if matches!(std::env::var("SYN_H3_SPEED").as_deref(), Ok("0") | Ok("false") | Ok("off")) {
+        return None;
+    }
+    if !req.refs.is_empty() || req.init_video.is_some() {
+        return None;
+    }
+    let force_steps = std::env::var("SYN_H3_SPEED_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let coarse_steps = match force_steps {
+        Some(0) => return None,
+        Some(n) => n.min(steps.saturating_sub(1)),
+        None => {
+            if steps < 4 {
+                return None;
+            }
+            ((steps as f64 * 0.35).round() as usize).clamp(1, steps / 2)
+        }
+    };
+    if coarse_steps == 0 || coarse_steps >= steps {
+        return None;
+    }
+    let g = req.geometry;
+    let cw_ch = speed_coarse_dims(g.width, g.height)?;
+    Some((Geometry::new(cw_ch.0, cw_ch.1, g.frame_count), coarse_steps))
+}
+
+/// Вычислить грубое разрешение `(w, h)` с сохранением пропорций, кратностью 32
+/// и порогом латентной сетки `≥ 34×60` (`544×960` px). `None`, если выигрыш < 30%.
+fn speed_coarse_dims(width: usize, height: usize) -> Option<(usize, usize)> {
+    let short = width.min(height) as f64;
+    let long = width.max(height) as f64;
+    let scale = 0.5f64.max(544.0 / short).max(960.0 / long);
+    if scale >= 0.85 {
+        return None;
+    }
+    let snap32 = |v: f64| ((v / 32.0).round().max(1.0) as usize) * 32;
+    let cw = snap32(width as f64 * scale).min(width);
+    let ch = snap32(height as f64 * scale).min(height);
+    if cw * ch * 10 > width * height * 7 {
+        return None;
+    }
+    Some((cw, ch))
+}
+
+/// Ортонормированный базис 1D DCT-II размера `n × n` (row-major).
+fn dct2_basis(n: usize) -> Vec<f32> {
+    let mut b = vec![0f32; n * n];
+    let s0 = (1.0 / n as f64).sqrt();
+    let s1 = (2.0 / n as f64).sqrt();
+    let scale = std::f64::consts::PI / n as f64;
+    for k in 0..n {
+        let c = if k == 0 { s0 } else { s1 };
+        let kf = k as f64;
+        for j in 0..n {
+            b[k * n + j] = (c * (scale * kf * (j as f64 + 0.5)).cos()) as f32;
+        }
+    }
+    b
+}
+
+/// 2D ортонормированное DCT-II над плоскостями `[planes, H, W]`: `B_H · X · B_Wᵀ`.
+fn dct2_planes(src: &[f32], planes: usize, h: usize, w: usize) -> Vec<f32> {
+    let bh = dct2_basis(h);
+    let bw = dct2_basis(w);
+    let hw = h * w;
+    let mut dst = vec![0f32; planes * hw];
+    let mut tmp = vec![0f32; hw];
+    for p in 0..planes {
+        let sp = &src[p * hw..(p + 1) * hw];
+        let dp = &mut dst[p * hw..(p + 1) * hw];
+        for i in 0..h {
+            let bi = &bh[i * h..(i + 1) * h];
+            let tr = &mut tmp[i * w..(i + 1) * w];
+            tr.fill(0.0);
+            for k in 0..h {
+                let bval = bi[k];
+                let sr = &sp[k * w..(k + 1) * w];
+                for j in 0..w {
+                    tr[j] += bval * sr[j];
+                }
+            }
+        }
+        for i in 0..h {
+            let tr = &tmp[i * w..(i + 1) * w];
+            let dr = &mut dp[i * w..(i + 1) * w];
+            for j in 0..w {
+                let bj = &bw[j * w..(j + 1) * w];
+                let mut acc = 0.0f32;
+                for k in 0..w {
+                    acc += tr[k] * bj[k];
+                }
+                dr[j] = acc;
+            }
+        }
+    }
+    dst
+}
+
+/// Обратное 2D ортонормированное DCT-II над плоскостями `[planes, H, W]`: `B_Hᵀ · C · B_W`.
+fn idct2_planes(src: &[f32], planes: usize, h: usize, w: usize) -> Vec<f32> {
+    let bh = dct2_basis(h);
+    let bw = dct2_basis(w);
+    let hw = h * w;
+    let mut dst = vec![0f32; planes * hw];
+    let mut tmp = vec![0f32; hw];
+    for p in 0..planes {
+        let sp = &src[p * hw..(p + 1) * hw];
+        let dp = &mut dst[p * hw..(p + 1) * hw];
+        tmp.fill(0.0);
+        for k in 0..h {
+            let bk = &bh[k * h..(k + 1) * h];
+            let sr = &sp[k * w..(k + 1) * w];
+            for i in 0..h {
+                let bval = bk[i];
+                let tr = &mut tmp[i * w..(i + 1) * w];
+                for j in 0..w {
+                    tr[j] += bval * sr[j];
+                }
+            }
+        }
+        for i in 0..h {
+            let tr = &tmp[i * w..(i + 1) * w];
+            let dr = &mut dp[i * w..(i + 1) * w];
+            dr.fill(0.0);
+            for k in 0..w {
+                let tval = tr[k];
+                let bk = &bw[k * w..(k + 1) * w];
+                for j in 0..w {
+                    dr[j] += tval * bk[j];
+                }
+            }
+        }
+    }
+    dst
+}
+
+/// Понижение разрешения 5D-латента через 2D DCT low-pass (SPEED `_downsample_source`
+/// с сохранением среднего уровня `sqrt(H_out·W_out / H_in·W_in)`).
+fn lowpass_dct_5d(x: &Tensor, h_out: usize, w_out: usize) -> R<Tensor> {
+    let d = x.dims().to_vec();
+    let (b, c, t, h_in, w_in) = (d[0], d[1], d[2], d[3], d[4]);
+    if h_in == h_out && w_in == w_out {
+        return Ok(x.clone());
+    }
+    let dev = x.device();
+    let dt = x.dtype();
+    let src = x.to_device(Device::Cpu)?.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let planes = b * c * t;
+    let coeff = dct2_planes(&src, planes, h_in, w_in);
+    let in_hw = h_in * w_in;
+    let out_hw = h_out * w_out;
+    let mut cropped = vec![0f32; planes * out_hw];
+    for p in 0..planes {
+        let sp = &coeff[p * in_hw..(p + 1) * in_hw];
+        let dp = &mut cropped[p * out_hw..(p + 1) * out_hw];
+        for y in 0..h_out {
+            dp[y * w_out..(y + 1) * w_out].copy_from_slice(&sp[y * w_in..y * w_in + w_out]);
+        }
+    }
+    let mut restored = idct2_planes(&cropped, planes, h_out, w_out);
+    let gain = ((out_hw as f64) / (in_hw as f64)).sqrt() as f32;
+    for v in &mut restored {
+        *v *= gain;
+    }
+    Tensor::from_vec(restored, vec![b, c, t, h_out, w_out], dev)?.to_dtype(dt)
+}
+
+/// Спектральное расширение состояния 5D-латента (SPEED `spectral_expand`):
+/// переносит НЧ-коэффициенты DCT-II грубого состояния в полный спектр, а новые
+/// ВЧ-частоты заполняет гауссовым шумом амплитуды `sigma`, затем делает обратное
+/// 2D DCT-II. Без размытия и потери дисперсии билинейного апскейла.
+fn spectral_expand_5d(x: &Tensor, h_out: usize, w_out: usize, sigma: f32, seed: u64) -> R<Tensor> {
+    let d = x.dims().to_vec();
+    let (b, c, t, h_in, w_in) = (d[0], d[1], d[2], d[3], d[4]);
+    if h_in == h_out && w_in == w_out {
+        return Ok(x.clone());
+    }
+    let dev = x.device();
+    let dt = x.dtype();
+    let src = x.to_device(Device::Cpu)?.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let planes = b * c * t;
+    let low_coeff = dct2_planes(&src, planes, h_in, w_in);
+    let in_hw = h_in * w_in;
+    let out_hw = h_out * w_out;
+
+    let mut rng = synaptix_ops::rng::Philox4x32::new(seed);
+    let mut full_coeff = vec![0f32; planes * out_hw];
+    synaptix_ops::rng::fill_normal_f32(&mut rng, &mut full_coeff);
+    for v in &mut full_coeff {
+        *v *= sigma;
+    }
+    for p in 0..planes {
+        let sp = &low_coeff[p * in_hw..(p + 1) * in_hw];
+        let dp = &mut full_coeff[p * out_hw..(p + 1) * out_hw];
+        for y in 0..h_in {
+            dp[y * w_out..y * w_out + w_in].copy_from_slice(&sp[y * w_in..(y + 1) * w_in]);
+        }
+    }
+    let expanded = idct2_planes(&full_coeff, planes, h_out, w_out);
+    Tensor::from_vec(expanded, vec![b, c, t, h_out, w_out], dev)?.to_dtype(dt)
+}
+
+/// Выравнивание сигмы при переходе разрешения (SPEED `aligned_sigma`):
+/// возвращает `(kappa, next_sigma)` так, что `expanded * kappa` имеет точный
+/// баланс `(1 - next_sigma) · x0 + next_sigma · eps`.
+fn speed_aligned_sigma(sigma: f64, ratio: f64) -> (f64, f64) {
+    let kappa = ratio / (1.0 + (ratio - 1.0) * sigma);
+    (kappa, sigma * kappa)
+}
+
+fn speed_stage2_sched(
+    sched: &H3Scheduler,
+    coarse_geo: Geometry,
+    full_geo: Geometry,
+    coarse_steps: usize,
+) -> H3Scheduler {
+    let mut out = sched.clone();
+    if coarse_steps > 0 && coarse_steps < out.steps() {
+        let q = out.video_sigma(coarse_steps);
+        let ratio = ((full_geo.latent_h * full_geo.latent_w) as f64
+            / (coarse_geo.latent_h * coarse_geo.latent_w) as f64)
+            .sqrt();
+        if q > 0.0 && q < 1.0 && ratio > 1.0 {
+            let (_, next_sigma) = speed_aligned_sigma(q, ratio);
+            out.sigmas[coarse_steps] = next_sigma;
+        }
+    }
+    out
+}
+
+/// Подготовить `PreparedRun` под грубую геометрию SPEED без пересчёта `TokenRefiner`.
+fn prepare_coarse(
+    dit: &H3Dit,
+    full_prep: &PreparedRun,
+    req: &DenoiseRequest<'_>,
+    coarse_geo: Geometry,
+    sched: &H3Scheduler,
+) -> Result<PreparedRun, H3Error> {
+    let text_len = req.cond.context.dims()[1];
+    let prefix_vt = req.prefix_video.as_ref().map(|t| t.dims().get(2).copied().unwrap_or(0)).unwrap_or(0);
+    let prefix_at = req.prefix_audio.as_ref().map(|t| t.dims().get(3).copied().unwrap_or(0)).unwrap_or(0);
+    let layout = PackedLayout::build(
+        &LayoutRequest::new(text_len, coarse_geo.latent_t, coarse_geo.latent_h, coarse_geo.latent_w, coarse_geo.audio_t)
+            .with_frame_count(coarse_geo.frame_count)
+            .with_keyframes(req.keyframes.clone())
+            .with_prefix(prefix_vt, prefix_at),
+    )?;
+    let plan = AdalnPlan::build(&layout, sched, req.visual_cond_aug, req.audio_cond_aug);
+    let segments = mod_segments(&layout, &plan.roles, Some(&req.cond.text_tags));
+    let rope = dit.rope_tables(&layout.positions)?;
+    let vseg = layout.segment(SegmentKind::Video).ok_or_else(|| H3Error::Layout("нет video-сегмента".into()))?;
+    let aseg = layout.segment(SegmentKind::Audio).ok_or_else(|| H3Error::Layout("нет audio-сегмента".into()))?;
+    let vrow = plan.roles.index(plan.roles.role_for(SegmentKind::Video)) * crate::config::ADALN_MODALITIES;
+    let arow = plan.roles.index(plan.roles.role_for(SegmentKind::Audio)) * crate::config::ADALN_MODALITIES;
+    Ok(PreparedRun {
+        layout,
+        plan,
+        segments,
+        rope,
+        video_seg: (vseg.start, vseg.stop, vrow / crate::config::ADALN_MODALITIES),
+        audio_seg: (aseg.start, aseg.stop, arow / crate::config::ADALN_MODALITIES),
+        refined_cond: full_prep.refined_cond.clone(),
+        refined_negative: full_prep.refined_negative.clone(),
+    })
+}
+
+/// Уменьшить патч-строки ключевых кадров (`cond_rows.video`) до грубой сетки SPEED.
+fn resize_keyframe_cond_rows(
+    rows: &Tensor,
+    full_g: Geometry,
+    coarse_g: Geometry,
+    latents_dim: usize,
+    patch: [usize; 3],
+) -> R<Tensor> {
+    let full_fr = (full_g.latent_h / patch[1]) * (full_g.latent_w / patch[2]);
+    let n_kf = rows.dims()[0] / full_fr.max(1);
+    let mut parts = Vec::with_capacity(n_kf);
+    for i in 0..n_kf {
+        let r = rows.narrow(0, i * full_fr, full_fr)?.contiguous()?;
+        let lat = unpatchify_video(&r, 1, full_g.latent_h / patch[1], full_g.latent_w / patch[2], latents_dim, patch)?;
+        let small = lowpass_dct_5d(&lat, coarse_g.latent_h, coarse_g.latent_w)?;
+        parts.push(patchify_video(&small, patch)?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn is_oom(e: &impl std::fmt::Display) -> bool {
     let s = e.to_string();
@@ -632,26 +971,240 @@ pub fn denoise_av(
 
     let steps = sched.steps();
     let patch = cfg.patch_size;
+
+    // 2-стадийный спектральный coarse-to-fine семплинг (SPEED): первые шаги идут на
+    // уменьшенной сетке (не ниже 34×60 латентов, чтобы держать кадрирование), затем
+    // состояние расширяется в спектре 2D DCT-II с выравниванием сигмы `aligned_sigma`.
+    if let Some((coarse_geo, coarse_steps)) = speed_plan(req, steps) {
+        let q = sched.video_sigma(coarse_steps);
+        let ratio = ((g.latent_h * g.latent_w) as f64
+            / (coarse_geo.latent_h * coarse_geo.latent_w) as f64)
+            .sqrt();
+        let (kappa, next_sigma) = speed_aligned_sigma(q, ratio);
+        let stage2_sched = speed_stage2_sched(sched, coarse_geo, g, coarse_steps);
+        eprintln!(
+            "[h3] SPEED (DCT coarse-to-fine): шаги 0..{coarse_steps} на {}×{} ({}×{} лат.) → шаги {coarse_steps}..{steps} на {}×{} ({}×{} лат., σ {q:.4} → {next_sigma:.4})",
+            coarse_geo.width, coarse_geo.height, coarse_geo.latent_h, coarse_geo.latent_w,
+            g.width, g.height, g.latent_h, g.latent_w
+        );
+        let coarse_prep = prepare_coarse(dit, prep, req, coarse_geo, sched)?;
+        let (mut cv_lat, mut ca_lat) = init_latents(
+            coarse_geo,
+            cfg.latents_dim,
+            cfg.audio_latents_dim,
+            device,
+            compute,
+            req.seed,
+        )?;
+        let coarse_cond_v = match &cond_video {
+            Some(cv) => Some(resize_keyframe_cond_rows(cv, g, coarse_geo, cfg.latents_dim, patch)?),
+            None => None,
+        };
+        let coarse_v_prefix: Option<(Tensor, Tensor, usize)> = match &v_prefix {
+            Some((exact, noisy, pt)) => Some((
+                lowpass_dct_5d(exact, coarse_geo.latent_h, coarse_geo.latent_w)?,
+                lowpass_dct_5d(noisy, coarse_geo.latent_h, coarse_geo.latent_w)?,
+                *pt,
+            )),
+            None => None,
+        };
+        if let Some((_, ref p_in, pt)) = coarse_v_prefix {
+            let rest = cv_lat.narrow(2, pt, coarse_geo.latent_t - pt)?.contiguous()?;
+            cv_lat = Tensor::cat(&[p_in, &rest], 2)?;
+        }
+        if let Some((_, ref p_in, pt)) = a_prefix {
+            ca_lat = splice_a(&ca_lat, p_in, pt)?;
+        }
+        let mut old_cv: Option<Tensor> = None;
+        let mut old_ca: Option<Tensor> = None;
+        dit.set_adapt_resident(false);
+        run_denoise_range(
+            dit,
+            cache,
+            &coarse_prep,
+            req,
+            sched,
+            hooks,
+            coarse_geo,
+            0..coarse_steps,
+            steps,
+            coarse_cond_v.as_ref(),
+            cond_audio.as_ref(),
+            coarse_v_prefix.as_ref(),
+            a_prefix.as_ref(),
+            &mut cv_lat,
+            &mut ca_lat,
+            &mut old_cv,
+            &mut old_ca,
+            None,
+        )?;
+        drop(coarse_prep);
+        drop(coarse_cond_v);
+        drop(coarse_v_prefix);
+        drop(old_cv);
+
+        // Переход Stage 1 → Stage 2 (Spectral Progressive Diffusion):
+        // переносим НЧ-спектр состояния `cv_lat` в 2D DCT-II полного разрешения,
+        // ВЧ-полосу заполняем шумом `q · N(0, 1)`, затем умножаем на `kappa` —
+        // баланс `(1 - next_sigma) · x0 + next_sigma · eps` сохраняется точно.
+        let expanded_v = spectral_expand_5d(
+            &cv_lat,
+            g.latent_h,
+            g.latent_w,
+            q as f32,
+            req.seed.unwrap_or(0).wrapping_add(10_000),
+        )?;
+        drop(cv_lat);
+        v_lat = expanded_v.mul_scalar(kappa as f32)?;
+        if let Some((_, ref p_in, pt)) = v_prefix {
+            v_lat = splice_v(&v_lat, p_in, pt)?;
+        }
+
+        // Аудио `clock_reindex`: сдвигаем нативное состояние `ca_lat` с `old_sa` на `new_sa`.
+        a_lat = if let Some(ref clean_a) = old_ca {
+            let old_sa = sched.audio_sigma(coarse_steps);
+            let new_sa = stage2_sched.audio_sigma(coarse_steps);
+            if old_sa > 1e-6 && (new_sa - old_sa).abs() > 1e-6 {
+                let noise_a = ca_lat
+                    .sub(&clean_a.mul_scalar((1.0 - old_sa) as f32)?)?
+                    .mul_scalar((1.0 / old_sa) as f32)?;
+                clean_a
+                    .mul_scalar((1.0 - new_sa) as f32)?
+                    .add(&noise_a.mul_scalar(new_sa as f32)?)?
+            } else {
+                ca_lat
+            }
+        } else {
+            ca_lat
+        };
+        if let Some((_, ref p_in, pt)) = a_prefix {
+            a_lat = splice_a(&a_lat, p_in, pt)?;
+        }
+        let mut old_denoised_v: Option<Tensor> = None;
+        let mut old_denoised_a: Option<Tensor> = old_ca;
+
+        // Замер пика VRAM начинаем заново уже на полном разрешении.
+        dit.set_adapt_resident(true);
+        dit.reset_free_watch();
+        run_denoise_range(
+            dit,
+            cache,
+            prep,
+            req,
+            &stage2_sched,
+            hooks,
+            g,
+            coarse_steps..steps,
+            steps,
+            cond_video.as_ref(),
+            cond_audio.as_ref(),
+            v_prefix.as_ref(),
+            a_prefix.as_ref(),
+            &mut v_lat,
+            &mut a_lat,
+            &mut old_denoised_v,
+            &mut old_denoised_a,
+            None,
+        )?;
+        if let Some((ref exact, _, pt)) = v_prefix {
+            v_lat = splice_v(&v_lat, exact, pt)?;
+        }
+        if let Some((ref exact, _, pt)) = a_prefix {
+            a_lat = splice_a(&a_lat, exact, pt)?;
+        }
+        hooks.report(steps, steps, stage2_sched.video_sigma(steps));
+        return Ok(DenoiseOutput { video_latent: v_lat, audio_latent: a_lat });
+    }
+
     let mut old_denoised_v: Option<Tensor> = None;
     let mut old_denoised_a: Option<Tensor> = None;
 
     // Раскладка блоков подстраивается по факту (H3Dit::adapt_resident).
     dit.reset_free_watch();
-    for step in 0..steps {
+    run_denoise_range(
+        dit,
+        cache,
+        prep,
+        req,
+        sched,
+        hooks,
+        g,
+        0..steps,
+        steps,
+        cond_video.as_ref(),
+        cond_audio.as_ref(),
+        v_prefix.as_ref(),
+        a_prefix.as_ref(),
+        &mut v_lat,
+        &mut a_lat,
+        &mut old_denoised_v,
+        &mut old_denoised_a,
+        None,
+    )?;
+    if let Some((ref exact, _, pt)) = v_prefix {
+        v_lat = splice_v(&v_lat, exact, pt)?;
+    }
+    if let Some((ref exact, _, pt)) = a_prefix {
+        a_lat = splice_a(&a_lat, exact, pt)?;
+    }
+    hooks.report(steps, steps, sched.video_sigma(steps));
+
+    Ok(DenoiseOutput { video_latent: v_lat, audio_latent: a_lat })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_denoise_range(
+    dit: &H3Dit,
+    cache: &AdalnCache,
+    prep: &PreparedRun,
+    req: &DenoiseRequest<'_>,
+    sched: &H3Scheduler,
+    hooks: &DenoiseHooks<'_>,
+    g: Geometry,
+    range: std::ops::Range<usize>,
+    total_steps: usize,
+    cond_video: Option<&Tensor>,
+    cond_audio: Option<&Tensor>,
+    v_prefix: Option<&(Tensor, Tensor, usize)>,
+    a_prefix: Option<&(Tensor, Tensor, usize)>,
+    v_lat: &mut Tensor,
+    a_lat: &mut Tensor,
+    old_denoised_v: &mut Option<Tensor>,
+    old_denoised_a: &mut Option<Tensor>,
+    mut last_denoised_v: Option<&mut Tensor>,
+) -> Result<(), H3Error> {
+    let cfg = &dit.cfg;
+    let patch = cfg.patch_size;
+    let splice_v = |cur: &Tensor, pref: &Tensor, pt: usize| -> R<Tensor> {
+        let rest = cur.narrow(2, pt, g.latent_t - pt)?.contiguous()?;
+        Tensor::cat(&[pref, &rest], 2)
+    };
+    let splice_a = |cur: &Tensor, pref: &Tensor, pt: usize| -> R<Tensor> {
+        let rest = cur.narrow(3, pt, g.audio_t - pt)?.contiguous()?;
+        Tensor::cat(&[pref, &rest], 3)
+    };
+    if let Some(sp) = sparse_cfg_for_step(range.end.saturating_sub(1), total_steps, prep) {
+        let dense_n = range.clone().take_while(|&s| sparse_cfg_for_step(s, total_steps, prep).is_none()).count();
+        eprintln!(
+            "[h3] разреженное FP8-внимание (Sol): плотных шагов {dense_n}, далее keep={:.2}, защита 0..{} + ±{} ток.",
+            sp.keep_ratio, sp.protected_prefix, sp.frame_tokens
+        );
+    }
+    for step in range {
         if hooks.cancelled() {
             return Err(H3Error::Cancelled);
         }
-        hooks.report(step, steps, sched.video_sigma(step));
+        hooks.report(step, total_steps, sched.video_sigma(step));
 
         if step == dump_step() {
-            dump_tensor("step_v_lat", &v_lat);
-            dump_tensor("step_a_lat", &a_lat);
+            dump_tensor("step_v_lat", v_lat);
+            dump_tensor("step_a_lat", a_lat);
             dump_text("step_sigma", &format!("{}", sched.video_sigma(step)));
         }
-        let v_rows_t = patchify_video(&v_lat, patch)?;
-        let a_rows_t = pack_audio(&a_lat)?;
-        let v_rows = merge_stream_rows(&v_rows_t, cond_video.as_ref(), &prep.layout.img_update)?;
-        let a_rows = merge_stream_rows(&a_rows_t, cond_audio.as_ref(), &prep.layout.audio_update)?;
+        let v_rows_t = patchify_video(v_lat, patch)?;
+        let a_rows_t = pack_audio(a_lat)?;
+        let v_rows = merge_stream_rows(&v_rows_t, cond_video, &prep.layout.img_update)?;
+        let a_rows = merge_stream_rows(&a_rows_t, cond_audio, &prep.layout.audio_update)?;
 
         let v_emb = dit.embed_video(&v_rows)?;
         let a_emb = dit.embed_audio(&a_rows)?;
@@ -675,6 +1228,7 @@ pub fn denoise_av(
             }
         }
         // Нехватка видеопамяти — поднятые по ходу блоки обратно на хост и шаг заново.
+        let _sparse = synaptix_core::precision::AttentionSparseGuard::new(sparse_cfg_for_step(step, total_steps, prep));
         let fwd = |h: &Tensor| loop {
             match dit.forward(h, cache, step, &prep.segments, &prep.rope, prep.video_seg, prep.audio_seg) {
                 Err(e) if is_oom(&e) && dit.shed_promoted() => continue,
@@ -695,6 +1249,7 @@ pub fn denoise_av(
             }
             _ => (v_out, a_out),
         };
+        drop(_sparse);
 
         let v_vel = unpatchify_video(
             &v_out.mul_scalar(-1.0)?,
@@ -713,12 +1268,12 @@ pub fn denoise_av(
 
         match req.sampler {
             SamplerKind::Euler => {
-                v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(sched.video_dt(step) as f32)?)?;
-                a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(sched.audio_dt(step) as f32)?)?;
+                *v_lat = v_lat.add(&v_vel.to_dtype(v_lat.dtype())?.mul_scalar(sched.video_dt(step) as f32)?)?;
+                *a_lat = a_lat.add(&a_vel.to_dtype(a_lat.dtype())?.mul_scalar(sched.audio_dt(step) as f32)?)?;
             }
             SamplerKind::ResMultistep => {
-                v_lat = res_multistep_update(
-                    &v_lat,
+                *v_lat = res_multistep_update(
+                    v_lat,
                     &v_vel,
                     &denoised_v,
                     old_denoised_v.as_ref(),
@@ -726,8 +1281,8 @@ pub fn denoise_av(
                     sv,
                     sched.video_sigma(step + 1),
                 )?;
-                a_lat = res_multistep_update(
-                    &a_lat,
+                *a_lat = res_multistep_update(
+                    a_lat,
                     &a_vel,
                     &denoised_a,
                     old_denoised_a.as_ref(),
@@ -738,45 +1293,40 @@ pub fn denoise_av(
             }
         }
         if let Some((_, ref p_in, pt)) = v_prefix {
-            v_lat = splice_v(&v_lat, p_in, pt)?;
+            *v_lat = splice_v(v_lat, p_in, *pt)?;
         }
         if let Some((_, ref p_in, pt)) = a_prefix {
-            a_lat = splice_a(&a_lat, p_in, pt)?;
+            *a_lat = splice_a(a_lat, p_in, *pt)?;
         }
-        let denoised_v = match &v_prefix {
+        let denoised_v = match v_prefix {
             Some((exact, _, pt)) => splice_v(&denoised_v, exact, *pt)?,
             None => denoised_v,
         };
-        let denoised_a = match &a_prefix {
+        let denoised_a = match a_prefix {
             Some((exact, _, pt)) => splice_a(&denoised_a, exact, *pt)?,
             None => denoised_a,
         };
-        old_denoised_v = Some(denoised_v.clone());
-        old_denoised_a = Some(denoised_a);
+        if let Some(dst) = last_denoised_v.as_deref_mut() {
+            *dst = denoised_v.clone();
+        }
+        *old_denoised_v = Some(denoised_v.clone());
+        *old_denoised_a = Some(denoised_a);
 
         if runtime::h3_prof() {
             eprintln!(
                 "[h3-prof] шаг {step}: σv {sv:.4} · {} · {} · {}",
                 tensor_stats("v_vel", &v_vel),
-                tensor_stats("v_lat", &v_lat),
+                tensor_stats("v_lat", v_lat),
                 tensor_stats("x0_video", &denoised_v)
             );
             eprintln!(
                 "[h3-prof] шаг {step}: σa {sa:.4} · {} · {}",
                 tensor_stats("a_vel", &a_vel),
-                tensor_stats("a_lat", &a_lat)
+                tensor_stats("a_lat", a_lat)
             );
         }
     }
-    if let Some((ref exact, _, pt)) = v_prefix {
-        v_lat = splice_v(&v_lat, exact, pt)?;
-    }
-    if let Some((ref exact, _, pt)) = a_prefix {
-        a_lat = splice_a(&a_lat, exact, pt)?;
-    }
-    hooks.report(steps, steps, sched.video_sigma(steps));
-
-    Ok(DenoiseOutput { video_latent: v_lat, audio_latent: a_lat })
+    Ok(())
 }
 
 fn res_multistep_update(
@@ -851,4 +1401,41 @@ pub(crate) fn apply_noise_aug(rows: &Tensor, aug: f32, seed: u64) -> Result<Tens
     let mut rng = synaptix_ops::rng::Philox4x32::new(seed);
     let noise = randn(rows.dims(), rows.device(), rows.dtype(), &mut rng)?;
     Ok(rows.mul_scalar(aug)?.add(&noise.mul_scalar(1.0 - aug)?)?)
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    #[test]
+    fn speed_coarse_dims_respects_floor() {
+        assert_eq!(speed_coarse_dims(1344, 768), Some((960, 544)));
+        assert_eq!(speed_coarse_dims(1920, 1088), Some((960, 544)));
+        assert_eq!(speed_coarse_dims(640, 384), None);
+    }
+
+    #[test]
+    fn dct2_idct2_roundtrip_and_spectral_expand() {
+        let data: Vec<f32> = (0..2 * 4 * 6).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let c = dct2_planes(&data, 2, 4, 6);
+        let rec = idct2_planes(&c, 2, 4, 6);
+        let max_err = data.iter().zip(&rec).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "dct2/idct2 roundtrip max_err={max_err}");
+
+        // Константный x0 при q=0.5, ratio=2.0: после spectral_expand(sigma=0) * kappa
+        // сигнал должен иметь вес (1 - next_sigma) точно.
+        let q = 0.5f64;
+        let ratio = 2.0f64;
+        let (kappa, next_sigma) = speed_aligned_sigma(q, ratio);
+        let x = Tensor::from_vec(vec![(1.0 - q) as f32; 2 * 4 * 6], vec![1, 1, 2, 4, 6], Device::Cpu).unwrap();
+        let y = spectral_expand_5d(&x, 8, 12, 0.0, 42).unwrap();
+        assert_eq!(y.dims(), &[1, 1, 2, 8, 12]);
+        let v: Vec<f32> = y.flatten_all().unwrap().to_vec1::<f32>().unwrap().into_iter().map(|a| a * kappa as f32).collect();
+        let want = (1.0 - next_sigma) as f32;
+        assert!(v.iter().all(|&a| (a - want).abs() < 1e-4), "want {want}, got {}", v[0]);
+
+        let down = lowpass_dct_5d(&y, 4, 6).unwrap();
+        let dv: Vec<f32> = down.flatten_all().unwrap().to_vec1::<f32>().unwrap().into_iter().map(|a| a * kappa as f32).collect();
+        assert!(dv.iter().all(|&a| (a - want).abs() < 1e-4));
+    }
 }

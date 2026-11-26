@@ -340,6 +340,13 @@ impl H3Model {
         let mut sched = h3::H3Scheduler::new(steps, ckpt.config.sigma_shift_video as f64, ckpt.config.sigma_shift_audio as f64);
         let conditioning = h3::pipeline::Conditioning { context: c.cond.hidden.clone(), text_tags: c.cond.tags.clone() };
         let mut dreq = h3::pipeline::DenoiseRequest::new(geometry, &conditioning);
+        if let Some((p, _)) = &self.lora {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if fname.contains("turbo") && std::env::var("H3_SAMPLER").is_err() {
+                dreq.sampler = h3::pipeline::SamplerKind::Euler;
+                eprintln!("[h3] Turbo LoRA: сэмплер Euler");
+            }
+        }
         let neg_cond;
         if let (Some(n), true) = (&c.negative, cfg_scale > 1.0) {
             neg_cond = h3::pipeline::Conditioning { context: n.hidden.clone(), text_tags: n.tags.clone() };

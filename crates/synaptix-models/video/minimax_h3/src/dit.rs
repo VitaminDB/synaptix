@@ -144,14 +144,20 @@ impl Lin {
         self.1.is_some()
     }
 
-    /// `y` (строки `off..off+n` выхода) + LoRA от BF16-входа `x` (все строки).
-    fn lora_add(&self, y: Tensor, x: Option<&Tensor>, off: usize, n: usize) -> R<Tensor> {
-        let (Some(p), Some(x)) = (&self.1, x) else { return Ok(y) };
-        let xc = x.narrow(0, off, n)?.contiguous()?;
-        let xc = if xc.dtype() == p.0.dtype() { xc } else { xc.to_dtype(p.0.dtype())? };
+    /// `y` (строки `off..off+n` выхода) + LoRA от уже вырезанного BF16-чанка `xc`.
+    fn lora_add_chunk(&self, y: Tensor, xc: Option<&Tensor>) -> R<Tensor> {
+        let (Some(p), Some(xc)) = (&self.1, xc) else { return Ok(y) };
+        let xc = if xc.dtype() == p.0.dtype() { xc.clone() } else { xc.to_dtype(p.0.dtype())? };
         let lo = xc.linear(&p.0)?.linear(&p.1)?;
         let lo = if lo.dtype() == y.dtype() { lo } else { lo.to_dtype(y.dtype())? };
         y.add(&lo)
+    }
+
+    /// `y` (строки `off..off+n` выхода) + LoRA от BF16-входа `x` (все строки).
+    fn lora_add(&self, y: Tensor, x: Option<&Tensor>, off: usize, n: usize) -> R<Tensor> {
+        let (Some(_), Some(x)) = (&self.1, x) else { return Ok(y) };
+        let xc = x.narrow(0, off, n)?.contiguous()?;
+        self.lora_add_chunk(y, Some(&xc))
     }
 
     pub fn forward(&self, x: &Tensor) -> R<Tensor> {
@@ -178,7 +184,7 @@ impl Lin {
             drop(chunk);
             cols = y.dims()[1];
             if out.is_none() {
-                out = Some(Tensor::zeros(vec![1, rows, cols], y.dtype(), y.device())?);
+                out = Some(Tensor::empty_uninit(vec![1, rows, cols], y.dtype(), y.device())?);
             }
             out.as_mut()
                 .unwrap()
@@ -288,7 +294,7 @@ impl Attention {
                 p = p.to_dtype(x.dtype())?;
             }
             if out.is_none() {
-                out = Some(Tensor::zeros(
+                out = Some(Tensor::empty_uninit(
                     vec![1, s, self.heads, self.head_dim],
                     p.dtype(),
                     p.device(),
@@ -308,6 +314,7 @@ impl Attention {
         let k = self.stream_bshd(x, &self.k_proj, Some(&k_norm), Some(rt))?;
         let v = self.stream_bshd(x, &self.v_proj, None, None)?;
 
+        let _kv_cache = synaptix_core::precision::FlashFp8KvGuard::new();
         let mut res: Option<Tensor> = None;
         let mut cols = 0;
         let mut off = 0;
@@ -318,13 +325,18 @@ impl Attention {
             drop(xq);
             let q = self.norm_rope(q, &q_norm, rt, off)?;
             let q = q.to_dtype(x.dtype())?;
+            let _sp_off = synaptix_core::precision::attention_sparse().map(|mut sp| {
+                sp.q_offset = off;
+                synaptix_core::precision::AttentionSparseGuard::new(Some(sp))
+            });
             let a = q.flash_attention_bshd(&k, &v, self.scale, false)?;
+            drop(_sp_off);
             drop(q);
             let y = self.out.forward(&a.reshape(vec![n, inner])?)?;
             drop(a);
             cols = y.dims()[1];
             if res.is_none() {
-                res = Some(Tensor::zeros(vec![1, s, cols], y.dtype(), y.device())?);
+                res = Some(Tensor::empty_uninit(vec![1, s, cols], y.dtype(), y.device())?);
             }
             res.as_mut()
                 .unwrap()
@@ -352,21 +364,27 @@ impl Attention {
         let mut v_full: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
+            // Вырезаем чанк входа LoRA один раз на обе проекции K и V.
+            let xc = match lin {
+                Some(l) if self.k_proj.has_lora() || self.v_proj.has_lora() => Some(l.narrow(0, *off, *n)?.contiguous()?),
+                _ => None,
+            };
             let k = self.k_proj.0.forward_prequant(packed, scales, *n, attn_dt)?;
-            let k = self.k_proj.lora_add(k, lin, *off, *n)?.reshape(shape.clone())?;
+            let k = self.k_proj.lora_add_chunk(k, xc.as_ref())?.reshape(shape.clone())?;
             let k = self.norm_rope(k, &k_norm, rt, *off)?;
             let v = if attn_dt == DType::F16 && out_dt != DType::F16 {
-                self.v_proj.lora_add(self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?, lin, *off, *n)?
+                self.v_proj.lora_add_chunk(self.v_proj.0.forward_prequant(packed, scales, *n, out_dt)?, xc.as_ref())?
                     .mul_scalar(1.0 / 16.0)?
                     .clamp(-60000.0, 60000.0)?
                     .to_dtype(DType::F16)?
                     .reshape(shape)?
             } else {
-                self.v_proj.lora_add(self.v_proj.0.forward_prequant(packed, scales, *n, attn_dt)?, lin, *off, *n)?.reshape(shape)?
+                self.v_proj.lora_add_chunk(self.v_proj.0.forward_prequant(packed, scales, *n, attn_dt)?, xc.as_ref())?.reshape(shape)?
             };
+            drop(xc);
             if k_full.is_none() {
-                k_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], attn_dt, k.device())?);
-                v_full = Some(Tensor::zeros(vec![1, s, self.heads, self.head_dim], attn_dt, v.device())?);
+                k_full = Some(Tensor::empty_uninit(vec![1, s, self.heads, self.head_dim], attn_dt, k.device())?);
+                v_full = Some(Tensor::empty_uninit(vec![1, s, self.heads, self.head_dim], attn_dt, v.device())?);
             }
             k_full.as_mut().unwrap().copy_rows_from(*off, &k)?;
             v_full.as_mut().unwrap().copy_rows_from(*off, &v)?;
@@ -374,13 +392,19 @@ impl Attention {
         let k_full = k_full.ok_or_else(|| SynaptixError::Other("prequant: пустые чанки".into()))?;
         let v_full = v_full.unwrap();
 
+        let _kv_cache = synaptix_core::precision::FlashFp8KvGuard::new();
         let mut res: Option<Tensor> = None;
         for (packed, scales, off, n) in chunks {
             let shape = vec![1, *n, self.heads, self.head_dim];
             let q = self.q_proj.0.forward_prequant(packed, scales, *n, attn_dt)?;
             let q = self.q_proj.lora_add(q, lin, *off, *n)?.reshape(shape)?;
             let q = self.norm_rope(q, &q_norm, rt, *off)?;
+            let _sp_off = synaptix_core::precision::attention_sparse().map(|mut sp| {
+                sp.q_offset = *off;
+                synaptix_core::precision::AttentionSparseGuard::new(Some(sp))
+            });
             let a = q.flash_attention_bshd(&k_full, &v_full, self.scale, false)?;
+            drop(_sp_off);
             drop(q);
             let y = self.out.forward(&a.reshape(vec![*n, inner])?)?;
             drop(a);
@@ -391,7 +415,7 @@ impl Attention {
                 y
             };
             if res.is_none() {
-                res = Some(Tensor::zeros(vec![1, s, y.dims()[1]], y.dtype(), y.device())?);
+                res = Some(Tensor::empty_uninit(vec![1, s, y.dims()[1]], y.dtype(), y.device())?);
             }
             let cols = y.dims()[1];
             res.as_mut().unwrap().copy_rows_from(*off, &y.reshape(vec![1, *n, cols])?)?;
@@ -547,7 +571,7 @@ impl Mlp {
                 self.fc2.forward(&act)?
             };
             if res.is_none() {
-                res = Some(Tensor::zeros(vec![1, rows, y.dims()[1]], y.dtype(), y.device())?);
+                res = Some(Tensor::empty_uninit(vec![1, rows, y.dims()[1]], y.dtype(), y.device())?);
             }
             let cols = y.dims()[1];
             res.as_mut().unwrap().copy_rows_from(*off, &y.reshape(vec![1, *n, cols])?)?;
@@ -746,9 +770,10 @@ impl DiTBlock {
         let Some(chunks) = self.quant_chunks(x, &mods.scale_msa, &mods.shift_msa, &self.norm1, segments, fmt)? else {
             return Ok(None);
         };
-        // LoRA при счёте: BF16-вход проекций (норма + модуляция) рядом с квантом.
-        let lora = self.attn.q_proj.has_lora() || self.mlp.fc1.has_lora() || self.mlp.fc2.has_lora();
-        let h1 = if lora {
+        // LoRA при счёте: BF16-вход проекций (норма + модуляция) только если
+        // соответствующий подблок реально имеет LoRA.
+        let attn_lora = self.attn.q_proj.has_lora() || self.attn.k_proj.has_lora() || self.attn.v_proj.has_lora();
+        let h1 = if attn_lora {
             Some(mod_scale_shift(&rms_norm(x, &self.norm1, self.eps)?, &mods.shift_msa, &mods.scale_msa, segments)?)
         } else {
             None
@@ -765,7 +790,7 @@ impl DiTBlock {
             let m = self.mlp.forward(&h)?;
             return Ok(Some(mod_gate(&x, &m, &mods.gate_mlp, segments)?));
         };
-        let h2 = if lora {
+        let h2 = if self.mlp.fc1.has_lora() {
             Some(mod_scale_shift(&rms_norm(&x, &self.norm2, self.eps)?, &mods.shift_mlp, &mods.scale_mlp, segments)?)
         } else {
             None
@@ -1075,6 +1100,9 @@ pub struct H3Dit {
     /// Потолок поднятых блоков после нехватки памяти на шаге (иначе повтор
     /// шага поднял бы их снова).
     promote_cap: std::sync::atomic::AtomicUsize,
+    /// Разрешён ли автоподъём блоков (приостанавливается на грубой стадии SPEED,
+    /// чтобы не поднять лишнего под меньшее разрешение).
+    adapt_enabled: std::sync::atomic::AtomicBool,
     /// Минимум свободной видеопамяти у драйвера с прошлого замера (поток
     /// [`FreeWatch`]): пик шага по факту, вместе с буферами вне пула
     /// (FP8-внимание берёт их у драйвера напрямую).
@@ -1124,8 +1152,9 @@ impl Drop for FreeWatch {
     }
 }
 
-/// Запас сверх замеренного пика, когда блоки поднимаются на карту.
-const ADAPT_MARGIN: usize = 1 << 30;
+/// Запас сверх замеренного пика, когда блоки поднимаются на карту (покрывает
+/// два буфера стриминга блоков + кэш FP8 KV и буферы sparse-роутинга).
+const ADAPT_MARGIN: usize = 2 << 30;
 
 impl H3Dit {
     pub fn load(
@@ -1161,8 +1190,8 @@ impl H3Dit {
         // Место, которое должно остаться после резидентных блоков: два
         // стримящихся блока (текущий + префетч), сырой вес под квантование
         // и запас на хвост модели.
-        // LoRA при счёте: её A/B (~27 МБ на блок у Turbo) и BF16-входы проекций.
-        let lora = if ckpt.has_lora() { 2usize << 30 } else { 0 };
+        // LoRA при счёте: её веса A/B (~1.3 ГБ на все 50 блоков у Turbo).
+        let lora = if ckpt.has_lora() { 1400usize << 20 } else { 0 };
         let reserve = 2 * blk_q + blk_dense / 2 + (1usize << 30) + runtime::load_reserve_bytes() + lora;
         let mut host_from = match mode {
             crate::memory::H3MemoryMode::BlockOffload if cuda => 0,
@@ -1282,6 +1311,7 @@ impl H3Dit {
             promoted: std::sync::RwLock::new(Vec::new()),
             blk_bytes: blk_q,
             promote_cap: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            adapt_enabled: std::sync::atomic::AtomicBool::new(true),
             free_watch: if host_from < nblocks { FreeWatch::start(device) } else { None },
         })
     }
@@ -1299,6 +1329,9 @@ impl H3Dit {
     /// подкачка на всех следующих шагах). Сбрасывает счётчик пика под
     /// следующий шаг. Возвращает, сколько блоков поднято.
     pub fn adapt_resident(&self, margin: usize) -> R<usize> {
+        if !self.adapt_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(0);
+        }
         let Device::Cuda(_) = self.device else { return Ok(0) };
         let Some(watch) = &self.free_watch else { return Ok(0) };
         let n = self.blocks.len();
@@ -1347,6 +1380,11 @@ impl H3Dit {
         if let Some(w) = &self.free_watch {
             w.take();
         }
+    }
+
+    /// Включить/приостановить автоподъём блоков с хоста.
+    pub fn set_adapt_resident(&self, on: bool) {
+        self.adapt_enabled.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Нехватка видеопамяти на шаге: вернуть на хост половину поднятых по

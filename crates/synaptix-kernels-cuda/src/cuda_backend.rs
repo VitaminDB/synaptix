@@ -290,22 +290,29 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         let src_lo = src.1;
         let dst_lo = dst.1;
-        // Быстрый путь: contiguous src без offset + contiguous dst → raw dtod memcpy.
-        // Только когда буферы совпадают по длине: memcpy_dtod копирует слайсы
-        // ЦЕЛИКОМ, а contiguous-вью может смотреть в буфер большего размера
-        // (narrow по ведущей оси даёт offset 0 и contiguous strides).
-        if src_lo.is_contiguous() && src_lo.offset() == 0 && dst_lo.is_contiguous() {
+        // Быстрый путь: плотные шаги src (включая `narrow(0, off, n)` с ненулевым
+        // offset и любые типы вроде I32/U8) + contiguous dst → raw dtod memcpy по
+        // точному байтовому диапазону без запуска `unary_rows_*`.
+        if src_lo.strides().is_contiguous(src_lo.shape())
+            && dst_lo.is_contiguous()
+            && src_lo.dtype() == dst_lo.dtype()
+        {
+            let nbytes = src_lo.dtype().bytes_for_numel(src_lo.numel());
+            let src_off = src_lo.byte_offset();
+            let dst_off = dst_lo.byte_offset();
             let src_buf = src
                 .0
                 .as_cuda()
                 .ok_or(SynaptixError::Unsupported("cuda copy: src non-cuda"))?;
-            let same_len = src_buf.slice().len()
-                == dst
-                    .0
-                    .as_cuda()
-                    .map(|b| b.slice().len())
-                    .unwrap_or(usize::MAX);
-            if same_len {
+            let dst_len = dst
+                .0
+                .as_cuda()
+                .map(|b| b.slice().len())
+                .unwrap_or(0);
+            if nbytes == 0 {
+                return Ok(());
+            }
+            if src_off + nbytes <= src_buf.slice().len() && dst_off + nbytes <= dst_len {
                 let ord = src_buf.ordinal();
                 let src_stream = src_buf.stream().clone();
                 let dst_buf = dst
@@ -313,8 +320,10 @@ impl Backend for CudaBackend {
                     .as_cuda_mut()
                     .ok_or(SynaptixError::Unsupported("cuda copy: dst non-cuda"))?;
                 let stream = synaptix_core::device::cuda::compute_stream_for(&src_stream, ord)?;
+                let src_view = src_buf.slice().slice(src_off..src_off + nbytes);
+                let mut dst_view = dst_buf.slice_mut().slice_mut(dst_off..dst_off + nbytes);
                 stream
-                    .memcpy_dtod(src_buf.slice(), dst_buf.slice_mut())
+                    .memcpy_dtod(&src_view, &mut dst_view)
                     .map_err(|e| SynaptixError::Cuda(format!("memcpy_dtod: {e:?}")))?;
                 return Ok(());
             }
@@ -1621,7 +1630,7 @@ impl Backend for CudaBackend {
         let fmt = if mxfp8 { DType::MXFP8 } else { DType::NVFP4 };
         require_quant_native(x.0, fmt, "rms_segmod_quant: карта без block-scale MMA")?;
         for lo in [x.1, scale.1, shift.1, ridx.1] {
-            if !lo.is_contiguous() {
+            if !lo.strides().is_contiguous(lo.shape()) {
                 return Err(SynaptixError::NonContiguous);
             }
         }

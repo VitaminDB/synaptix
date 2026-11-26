@@ -490,8 +490,36 @@ fn vae_quant() -> Option<DType> {
     })
 }
 
-/// Квантованные проекции блока (в порядке qkv, out / w1, w2).
+/// Сколько пространственных тайлов (256×256) ViT-декодер считает за один
+/// проход по 36 блокам (`SYN_H3_VAE_TILE_BATCH`, по умолчанию 8).
+fn vae_tile_batch() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SYN_H3_VAE_TILE_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    })
+}
+
+/// Прогреть в page cache страницы mmap весов одного ViT-блока декодера VAE.
+fn prefetch_vit_block(w: &ComponentLoader, idx: usize) {
+    let p = format!("decoder.transformer_blocks.{idx}.");
+    let names = w.names();
+    let ranges: Vec<&[u8]> = names
+        .iter()
+        .filter(|n| n.starts_with(&p))
+        .filter_map(|n| w.raw_bytes(n).map(|r| r.0))
+        .collect();
+    crate::prefetch::populate(&ranges);
+}
+
+/// Квантованные проекции блока FFN (w1, w2).
 type QPair = Option<Box<[synaptix_nn::quant_linear::QuantLinear; 2]>>;
+/// Квантованные проекции внимания (q, k, v, out) — разделённые по головам,
+/// чтобы Q/K/V выходили плотными `[B·S, H·D]` без strided-копий `unary_rows`.
+type QAttn = Option<Box<[synaptix_nn::quant_linear::QuantLinear; 4]>>;
 
 fn quant_pair(w0: &Tensor, b0: &Tensor, w1: &Tensor, b1: &Tensor, q: DType) -> R<QPair> {
     use synaptix_nn::quant_linear::QuantLinear;
@@ -499,6 +527,35 @@ fn quant_pair(w0: &Tensor, b0: &Tensor, w1: &Tensor, b1: &Tensor, q: DType) -> R
     let a = QuantLinear::build(w0.clone(), Some(b0.clone()), q, dt)?;
     let b = QuantLinear::build(w1.clone(), Some(b1.clone()), q, dt)?;
     Ok((a.is_quant() && b.is_quant()).then(|| Box::new([a, b])))
+}
+
+fn quant_attn(
+    qkv_w: &Tensor,
+    qkv_b: &Tensor,
+    out_w: &Tensor,
+    out_b: &Tensor,
+    heads: usize,
+    dim_head: usize,
+    q: DType,
+) -> R<QAttn> {
+    use synaptix_nn::quant_linear::QuantLinear;
+    let dt = out_b.dtype();
+    let k_dim = qkv_w.dims()[1];
+    let w3 = qkv_w.reshape(vec![heads, 3, dim_head, k_dim])?;
+    let b3 = qkv_b.reshape(vec![heads, 3, dim_head])?;
+    let mut parts = Vec::with_capacity(4);
+    for s in 0..3 {
+        let ws = w3.narrow(1, s, 1)?.contiguous()?.reshape(vec![heads * dim_head, k_dim])?;
+        let bs = b3.narrow(1, s, 1)?.contiguous()?.reshape(vec![heads * dim_head])?;
+        parts.push(QuantLinear::build(ws, Some(bs), q, dt)?);
+    }
+    parts.push(QuantLinear::build(out_w.clone(), Some(out_b.clone()), q, dt)?);
+    if parts.iter().all(|l| l.is_quant()) {
+        let arr: [QuantLinear; 4] = parts.try_into().map_err(|_| SynaptixError::Other("quant_attn".into()))?;
+        Ok(Some(Box::new(arr)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn qfwd(l: &synaptix_nn::quant_linear::QuantLinear, x: &Tensor) -> R<Tensor> {
@@ -511,7 +568,7 @@ struct VitAttention {
     qkv_b: Tensor,
     out_w: Tensor,
     out_b: Tensor,
-    q: QPair,
+    q: QAttn,
     heads: usize,
     dim_head: usize,
     eps: f32,
@@ -552,10 +609,25 @@ impl VitAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, rope: &RopeTables) -> R<Tensor> {
-        if let Some(y) = self.forward_bshd(x, rope)? {
+    fn forward_batch(&self, x: &Tensor, batch: usize, s: usize, rope: &RopeTables, ones_d: &Tensor) -> R<Tensor> {
+        if let Some(y) = self.forward_bshd_batch(x, batch, s, rope, ones_d)? {
             return Ok(y);
         }
+        // Fallback: по одному тайлу из батча (CPU / F32 путь).
+        if batch == 1 {
+            return self.forward_fallback(x, rope);
+        }
+        let dim = x.dims()[1];
+        let mut outs = Vec::with_capacity(batch);
+        for bi in 0..batch {
+            let xi = x.narrow(0, bi * s, s)?.contiguous()?;
+            outs.push(self.forward_fallback(&xi, rope)?);
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        Tensor::cat(&refs, 0)?.reshape(vec![batch * s, dim])
+    }
+
+    fn forward_fallback(&self, x: &Tensor, rope: &RopeTables) -> R<Tensor> {
         let s = x.dims()[0];
         let qkv = x
             .linear(&self.qkv_w)?
@@ -594,33 +666,50 @@ impl VitAttention {
             .broadcast_add(&self.out_b)
     }
 
-    /// CUDA-путь без транспонирований: bias в эпилоге GEMM, qk-норма и RoPE
-    /// одним ядром прямо в BSHD (f32 внутри, без промежуточного округления
-    /// bf16), flash-внимание BSHD, выход сразу `[S, H·D]`. `None` — не умеет.
-    fn forward_bshd(&self, x: &Tensor, rope: &RopeTables) -> R<Option<Tensor>> {
+    /// CUDA-путь без транспонирований и без strided-копий QKV: раздельные
+    /// Q/K/V с общим квантом входа (`forward_many`), qk-норма + RoPE одним
+    /// ядром прямо в BSHD по всему батчу тайлов `[B, S, H, D]`, flash-внимание
+    /// BSHD, выход `[B·S, H·D]`.
+    fn forward_bshd_batch(
+        &self,
+        x: &Tensor,
+        batch: usize,
+        s: usize,
+        rope: &RopeTables,
+        ones_d: &Tensor,
+    ) -> R<Option<Tensor>> {
         if !matches!(x.dtype(), DType::BF16 | DType::F16)
             || !matches!(x.device(), Device::Cuda(_))
             || rope.cos.dtype() != DType::F32
         {
             return Ok(None);
         }
-        let s = x.dims()[0];
         let (h, d) = (self.heads, self.dim_head);
-        let qkv = match &self.q {
-            Some(q) => qfwd(&q[0], x)?,
-            None => x.linear_bias_residual(&self.qkv_w, Some(&self.qkv_b), None)?,
-        }
-        .reshape(vec![1, s, h, 3 * d])?;
-        let ones = Tensor::ones(vec![d], DType::F32, x.device())?;
-        let nr = |t: Tensor| t.qk_norm_rope(&ones, &rope.cos, &rope.sin, 0, rope.rot_dim, self.eps);
-        let Ok(q) = nr(qkv.narrow(3, 0, d)?.contiguous()?) else { return Ok(None) };
-        let k = nr(qkv.narrow(3, d, d)?.contiguous()?)?;
-        let v = qkv.narrow(3, 2 * d, d)?.contiguous()?;
-        drop(qkv);
+        let nr = |t: Tensor| t.qk_norm_rope(ones_d, &rope.cos, &rope.sin, 0, rope.rot_dim, self.eps);
+        let (q, k, v) = if let Some(ql) = &self.q {
+            let mut qkv = synaptix_nn::quant_linear::QuantLinear::forward_many(x, &[&ql[0], &ql[1], &ql[2]])?;
+            let v = qkv.pop().unwrap().reshape(vec![batch, s, h, d])?;
+            let k = qkv.pop().unwrap().reshape(vec![batch, s, h, d])?;
+            let q = qkv.pop().unwrap().reshape(vec![batch, s, h, d])?;
+            let Ok(q) = nr(q) else { return Ok(None) };
+            let k = nr(k)?;
+            (q, k, v)
+        } else {
+            let qkv = x
+                .linear_bias_residual(&self.qkv_w, Some(&self.qkv_b), None)?
+                .reshape(vec![batch, s, h, 3 * d])?;
+            let Ok(q) = nr(qkv.narrow(3, 0, d)?.contiguous()?) else { return Ok(None) };
+            let k = nr(qkv.narrow(3, d, d)?.contiguous()?)?;
+            let v = qkv.narrow(3, 2 * d, d)?.contiguous()?;
+            (q, k, v)
+        };
         let Ok(attn) = q.flash_attention_bshd(&k, &v, self.scale, false) else { return Ok(None) };
-        let attn = attn.reshape(vec![s, h * d])?;
+        drop(q);
+        drop(k);
+        drop(v);
+        let attn = attn.reshape(vec![batch * s, h * d])?;
         Ok(Some(match &self.q {
-            Some(q) => qfwd(&q[1], &attn)?,
+            Some(ql) => qfwd(&ql[3], &attn)?,
             None => attn.linear_bias_residual(&self.out_w, Some(&self.out_b), None)?,
         }))
     }
@@ -677,10 +766,20 @@ impl VitFeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> R<Tensor> {
+        let rows = x.dims()[0];
+        let out_dt = x.dtype();
         let h = match &self.q {
             Some(q) => qfwd(&q[0], x)?,
             None => x.linear_bias_residual(&self.w1, Some(&self.b1), None)?,
         };
+        if let Some(q) = &self.q {
+            if q[1].is_mxfp8() {
+                if let Ok((p2, s2)) = h.silu_mul_quant_mxfp8() {
+                    drop(h);
+                    return q[1].forward_prequant(&p2, &s2, rows, out_dt);
+                }
+            }
+        }
         let gate = h.narrow(1, 0, self.inner)?.contiguous()?;
         let up = h.narrow(1, self.inner, self.inner)?.contiguous()?;
         drop(h);
@@ -733,9 +832,9 @@ impl VitBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor, rope: &RopeTables) -> R<Tensor> {
+    fn forward_batch(&self, x: &Tensor, batch: usize, s: usize, rope: &RopeTables, ones_d: &Tensor) -> R<Tensor> {
         let h = rms_gain(x, &self.norm1, self.eps)?;
-        let a = self.attn.forward(&h, rope)?;
+        let a = self.attn.forward_batch(&h, batch, s, rope, ones_d)?;
         let x = match x.fused_gate_residual(&a, &self.scale1) {
             Ok(y) => y,
             Err(_) => x.add(&a.broadcast_mul(&self.scale1)?)?,
@@ -770,6 +869,7 @@ pub struct VaeDecoder {
     norm_out_b: Tensor,
     proj_out_w: Tensor,
     proj_out_b: Tensor,
+    ones_d: Tensor,
     pub cfg: VaeConfig,
     vit: VitDecoderConfig,
     device: Device,
@@ -785,8 +885,9 @@ impl VaeDecoder {
     ) -> Result<Self, H3Error> {
         let vit = cfg.vit_decoder_kwargs.clone();
         // Блоки на карту, пока свободной VRAM хватает на запас (активации
-        // тайла, два стримящихся блока, рабочий стол); остальные — из
-        // источника в проходе. На большой карте всё резидентно, как раньше.
+        // батча тайлов, два стримящихся блока, рабочий стол); остальные — из
+        // источника в проходе. Загрузка через pinned-конвейер + прогрев page
+        // cache следующего блока (было 1.9 ГБ/с pageable → ~25 ГБ/с).
         let blk = {
             let d = vit.dim();
             let el = dtype.bytes_for_numel(1).max(1);
@@ -807,10 +908,15 @@ impl VaeDecoder {
                     break;
                 }
             }
-            let mut b = VitBlock::load(w, i, &vit, dtype)?;
+            let mut b = std::thread::scope(|sc| {
+                if i + 1 < vit.num_layers {
+                    sc.spawn(|| prefetch_vit_block(w, i + 1));
+                }
+                VitBlock::load(w, i, &vit, dtype)
+            })?;
             if let Some(q) = vae_quant().filter(|_| device.is_cuda()) {
                 let a = &mut b.attn;
-                a.q = quant_pair(&a.qkv_w, &a.qkv_b, &a.out_w, &a.out_b, q)?;
+                a.q = quant_attn(&a.qkv_w, &a.qkv_b, &a.out_w, &a.out_b, a.heads, a.dim_head, q)?;
                 let f = &mut b.ff;
                 f.q = quant_pair(&f.w1, &f.b1, &f.w2, &f.b2, q)?;
                 if a.q.is_some() && f.q.is_some() {
@@ -822,6 +928,7 @@ impl VaeDecoder {
             }
             blocks.push(b);
         }
+        let ones_d = Tensor::ones(vec![vit.dim_head], DType::F32, device)?;
         Ok(Self {
             post_quant: CausalConv3d::load(w, "post_quant_conv", (0, 0, 0), (1, 1, 1), dtype)?,
             x_embed_w: w.get_as("decoder.x_embedder.weight", dtype)?,
@@ -833,6 +940,7 @@ impl VaeDecoder {
             norm_out_b: w.get_as("decoder.norm_out.bias", dtype)?,
             proj_out_w: w.get_as("decoder.proj_out.weight", dtype)?,
             proj_out_b: w.get_as("decoder.proj_out.bias", dtype)?,
+            ones_d,
             cfg,
             vit,
             device,
@@ -915,74 +1023,127 @@ impl VaeDecoder {
         Ok(())
     }
 
-    fn vit_forward(&self, z: &Tensor) -> R<Tensor> {
-        let d = z.dims().to_vec();
+    fn vit_forward_batch(&self, zs: &[Tensor], base_rope: &RopeTables) -> R<Vec<Tensor>> {
+        let batch = zs.len();
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let d = zs[0].dims().to_vec();
         let (_, c, t, h, w) = (d[0], d[1], d[2], d[3], d[4]);
         let s = t * h * w;
-        let tokens = z
-            .reshape(vec![c, s])?
-            .transpose(0, 1)?
-            .contiguous()?;
-        let mut x = tokens
-            .linear(&self.x_embed_w)?
-            .broadcast_add(&self.x_embed_b)?;
-        crate::pipeline::dump_tensor("vit_embed", &x);
-
         let nreg = self.vit.num_register_tokens;
+        let s_tot = s + nreg + 1;
         let dim = self.vit.dim();
         let reg = self.register_tokens.reshape(vec![nreg, dim])?;
-        let zero = Tensor::zeros(vec![1, dim], x.dtype(), x.device())?;
-        x = Tensor::cat(&[&x, &reg, &zero], 0)?;
+        let zero = Tensor::zeros(vec![1, dim], self.dtype, self.device)?;
 
-        let ids = token_ids([t, h, w]);
-        let (angles, half) =
-            vit_rope_angles(&ids, self.vit.rope_dim(), self.vit.rope_theta, nreg + 1);
-        let rope = RopeTables::from_angles(angles, s + nreg + 1, half, x.device())
-            .map_err(err_tensor)?;
+        let mut tile_xs = Vec::with_capacity(batch);
+        for (bi, z) in zs.iter().enumerate() {
+            let tokens = z.reshape(vec![c, s])?.transpose(0, 1)?.contiguous()?;
+            let x = tokens.linear(&self.x_embed_w)?.broadcast_add(&self.x_embed_b)?;
+            if bi == 0 {
+                crate::pipeline::dump_tensor("vit_embed", &x);
+            }
+            tile_xs.push(Tensor::cat(&[&x, &reg, &zero], 0)?);
+        }
+        let mut x = if batch == 1 {
+            tile_xs.pop().unwrap()
+        } else {
+            let refs: Vec<&Tensor> = tile_xs.iter().collect();
+            Tensor::cat(&refs, 0)?
+        };
+
+        let rope = if batch == 1 {
+            RopeTables { cos: base_rope.cos.clone(), sin: base_rope.sin.clone(), seq_len: base_rope.seq_len, rot_dim: base_rope.rot_dim }
+        } else {
+            let cs: Vec<&Tensor> = std::iter::repeat_n(&base_rope.cos, batch).collect();
+            let ss: Vec<&Tensor> = std::iter::repeat_n(&base_rope.sin, batch).collect();
+            RopeTables { cos: Tensor::cat(&cs, 0)?, sin: Tensor::cat(&ss, 0)?, seq_len: base_rope.seq_len * batch, rot_dim: base_rope.rot_dim }
+        };
 
         self.for_each_block(|bi, b| {
-            x = b.forward(&x, &rope)?;
-            if bi == 0 {
+            x = b.forward_batch(&x, batch, s_tot, &rope, &self.ones_d)?;
+            if bi == 0 && batch == 1 {
                 crate::pipeline::dump_tensor("vit_blk0", &x);
             }
             Ok(())
         })?;
-        crate::pipeline::dump_tensor("vit_last", &x);
+        if batch == 1 {
+            crate::pipeline::dump_tensor("vit_last", &x);
+        }
 
-        let x = x.narrow(0, 0, s)?.contiguous()?;
+        let x = x
+            .reshape(vec![batch, s_tot, dim])?
+            .narrow(1, 0, s)?
+            .contiguous()?
+            .reshape(vec![batch * s, dim])?;
         let x = x.layer_norm_fused(&self.norm_out_w, Some(&self.norm_out_b), self.vit.eps)?;
-        let out = x
-            .linear(&self.proj_out_w)?
-            .broadcast_add(&self.proj_out_b)?;
+        let out = x.linear(&self.proj_out_w)?.broadcast_add(&self.proj_out_b)?;
 
         let oc = self.cfg.out_ch;
         let pt = self.vit.patch_size_t;
         let ps = self.vit.patch_size;
-        out.reshape(vec![1, t, h, w, oc, pt, ps, ps])?
+        let pix = out
+            .reshape(vec![batch, t, h, w, oc, pt, ps, ps])?
             .permute([0, 4, 1, 5, 2, 6, 3, 7])?
             .contiguous()?
-            .reshape(vec![1, oc, t * pt, h * ps, w * ps])
+            .reshape(vec![batch, oc, t * pt, h * ps, w * ps])?;
+        if batch == 1 {
+            return Ok(vec![pix]);
+        }
+        let mut res = Vec::with_capacity(batch);
+        for bi in 0..batch {
+            res.push(pix.narrow(0, bi, 1)?.contiguous()?);
+        }
+        Ok(res)
+    }
+
+    fn build_vit_rope(&self, t: usize, h: usize, w: usize) -> R<RopeTables> {
+        let s = t * h * w;
+        let nreg = self.vit.num_register_tokens;
+        let ids = token_ids([t, h, w]);
+        let (angles, half) = vit_rope_angles(&ids, self.vit.rope_dim(), self.vit.rope_theta, nreg + 1);
+        RopeTables::from_angles(angles, s + nreg + 1, half, self.device).map_err(err_tensor)
     }
 
     fn decode_pixels(&self, z: &Tensor) -> R<Tensor> {
         let ratio = self.vit.patch_size;
         let dims = z.dims();
-        let (lat_h, lat_w) = (dims[3], dims[4]);
+        let (lat_t, lat_h, lat_w) = (dims[2], dims[3], dims[4]);
         let tile_lat = VAE_TILE_SIZE / ratio;
         if lat_h <= tile_lat && lat_w <= tile_lat {
-            return self.vit_forward(&self.post_quant.forward(z)?);
+            let rope = self.build_vit_rope(lat_t, lat_h, lat_w)?;
+            let mut out = self.vit_forward_batch(&[self.post_quant.forward(z)?], &rope)?;
+            return Ok(out.pop().unwrap());
         }
         let (ys, yl, yo) = split_tiles(lat_h * ratio, VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
         let (xs, xl, xo) = split_tiles(lat_w * ratio, VAE_TILE_SIZE, VAE_TILE_OVERLAP_MIN, ratio);
-        let mut rows: Vec<Vec<Tensor>> = Vec::with_capacity(ys.len());
+        let nrows = ys.len();
+        let ncols = xs.len();
+        let tile_h = yl[0] / ratio;
+        let tile_w = xl[0] / ratio;
+        let rope = self.build_vit_rope(lat_t, tile_h, tile_w)?;
+        let mut tiles_in: Vec<Tensor> = Vec::with_capacity(nrows * ncols);
         for (&y0, &ylen) in ys.iter().zip(&yl) {
-            let mut row = Vec::with_capacity(xs.len());
             for (&x0, &xlen) in xs.iter().zip(&xl) {
                 let zt = z
                     .narrow(3, y0 / ratio, ylen / ratio)?
                     .narrow(4, x0 / ratio, xlen / ratio)?
                     .contiguous()?;
-                row.push(self.vit_forward(&self.post_quant.forward(&zt)?)?);
+                tiles_in.push(self.post_quant.forward(&zt)?);
+            }
+        }
+        let bs = vae_tile_batch().min(tiles_in.len()).max(1);
+        let mut tiles_out: Vec<Tensor> = Vec::with_capacity(tiles_in.len());
+        for chunk in tiles_in.chunks(bs) {
+            tiles_out.extend(self.vit_forward_batch(chunk, &rope)?);
+        }
+        let mut iter = tiles_out.into_iter();
+        let mut rows: Vec<Vec<Tensor>> = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                row.push(iter.next().unwrap());
             }
             rows.push(row);
         }

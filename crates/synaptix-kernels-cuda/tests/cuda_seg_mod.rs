@@ -104,6 +104,29 @@ fn segmod_quant_bitexact() {
     }
 }
 
+/// Чанки с ненулевым `offset` (`narrow(0, off, n)` по `x` и `ridx: I32`)
+/// обязаны идти по тому же слитому пути и совпадать бит-в-бит с полным проходом.
+#[test]
+fn segmod_quant_narrow_offset_bitexact() {
+    synaptix_kernels_cuda::ensure_registered();
+    let dev = Device::Cuda(0);
+    let (m, k, rows) = (512usize, 5376usize, 6usize);
+    let x = Tensor::from_vec(det(21, m * k, 2.0), vec![m, k], dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let sc = Tensor::from_vec(det(22, rows * k, 0.5), vec![rows, k], dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let sh = Tensor::from_vec(det(23, rows * k, 0.3), vec![rows, k], dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let idx = ridx(m, rows);
+    let ri = Tensor::from_vec(idx.clone(), vec![m], dev).unwrap();
+    for fmt in [DType::MXFP8, DType::NVFP4] {
+        let (pk_all, sc_all) = x.rms_segmod_quant(&sc, &sh, &ri, 1e-6, fmt).unwrap();
+        let (pk_c0, _) = x.narrow(0, 0, 256).unwrap().rms_segmod_quant(&sc, &sh, &ri.narrow(0, 0, 256).unwrap(), 1e-6, fmt).unwrap();
+        let (pk_c1, _) = x.narrow(0, 256, 256).unwrap().rms_segmod_quant(&sc, &sh, &ri.narrow(0, 256, 256).unwrap(), 1e-6, fmt).unwrap();
+        let mut combined = bytes(&pk_c0);
+        combined.extend_from_slice(&bytes(&pk_c1));
+        assert_eq!(combined, bytes(&pk_all), "narrow offset packed mismatch ({fmt:?})");
+        let _ = sc_all;
+    }
+}
+
 #[test]
 fn gate_residual_seg_bitexact() {
     synaptix_kernels_cuda::ensure_registered();

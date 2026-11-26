@@ -314,7 +314,16 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
             skip_steps: args.guider_skip_steps,
         };
     }
-    req.sampler = sampler;
+    req.sampler = match (&args.lora, sampler) {
+        (Some(lp), h3::pipeline::SamplerKind::ResMultistep)
+            if lp.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default().contains("turbo")
+                && std::env::var("H3_SAMPLER").is_err() =>
+        {
+            eprintln!("[h3 {}] Turbo LoRA: сэмплер Euler", ts());
+            h3::pipeline::SamplerKind::Euler
+        }
+        _ => sampler,
+    };
     req.seed = Some(seed);
     eprintln!("[h3 {}] seed {seed}", ts());
     req.keyframes = keyframe_paths
@@ -431,8 +440,9 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let cache = h3::pipeline::build_adaln_cache(&dit, &ckpt, &prep, compute)?;
 
     eprintln!(
-        "[h3] денойзинг: {steps} шагов, {}, сэмплер {sampler:?}",
-        if req.negative.is_some() { format!("cfg {cfg_scale}") } else { "без CFG".into() }
+        "[h3] денойзинг: {steps} шагов, {}, сэмплер {:?}",
+        if req.negative.is_some() { format!("cfg {cfg_scale}") } else { "без CFG".into() },
+        req.sampler
     );
     let progress = |p: h3::pipeline::DenoiseProgress| {
         eprint!("\r[h3 {}] шаг {}/{} sigma {:.4}   ", ts(), p.step, p.total, p.sigma);

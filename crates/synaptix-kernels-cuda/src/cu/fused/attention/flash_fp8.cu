@@ -213,17 +213,191 @@ extern "C" __global__ void fa8_quant_vt(const fa8_t* v, const float* amax, unsig
   for (int k = 0; k < 4; k++) dst[k] = make_uint4(w[4 * k], w[4 * k + 1], w[4 * k + 2], w[4 * k + 3]);
 }
 
+// ── Блочный роутинг для разреженного внимания (Sol-стиль, блоки 64×64) ───
+
+// Средний вектор 64-токенного блока: [B, S, H, 128] → [B·H, n_blk, 128] f32.
+// Грид (n_blk, B·H), блок 128 (по d).
+extern "C" __global__ void fa8_pool_blocks(const fa8_t* x, float* pooled, int S, int H, int n_blk) {
+  int blk = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
+  int b = bh / H, h = bh % H;
+  int s0 = blk * FA8_BN;
+  int s1 = min(S, s0 + FA8_BN);
+  int cnt = s1 - s0;
+  float acc = 0.f;
+  const fa8_t* p = x + (((size_t)b * S + s0) * H + h) * FA8_D + d;
+  for (int i = 0; i < cnt; i++) {
+    acc += fa8_tof(p[(size_t)i * H * FA8_D]);
+  }
+  pooled[((size_t)bh * n_blk + blk) * FA8_D + d] = cnt > 0 ? acc / (float)cnt : 0.f;
+}
+
+// Выбор KV-блоков для каждого Q-блока и головы:
+//  - Q в [0..prot_prefix) → плотно (все KV-блоки);
+//  - KV в [0..prot_prefix) (Text/Cond/Refs/Audio) → всегда;
+//  - локальное окно |k_center - q_center| ≤ local_win → всегда;
+//  - остальные дальние видео-блоки → top-k по dot(q_pool, k_pool) с долей keep_ratio.
+// Грид (n_qblk, B·H), блок 256, дин. smem = n_kblk*4 + n_kblk + 2048 Б.
+extern "C" __global__ void fa8_sparse_route(
+    const float* __restrict__ q_pool, const float* __restrict__ k_pool,
+    unsigned short* __restrict__ blk_idx, int* __restrict__ blk_cnt,
+    int n_qblk, int n_kblk, int q_offset, int prot_prefix, int local_win, float keep_ratio) {
+  extern __shared__ unsigned char rsmem[];
+  float* s_q = reinterpret_cast<float*>(rsmem);                    // 128 floats = 512 B
+  float* s_red = reinterpret_cast<float*>(rsmem + 512);            // 16 floats (8 min + 8 max) = 64 B
+  int* s_ired = reinterpret_cast<int*>(rsmem + 576);               // 8 ints = 32 B
+  float* scores = reinterpret_cast<float*>(rsmem + 640);           // n_kblk floats
+  unsigned char* flags = rsmem + 640 + n_kblk * 4;                 // n_kblk bytes
+
+  int qb = blockIdx.x, bh = blockIdx.y, tid = threadIdx.x;
+  int warp = tid >> 5, lane = tid & 31;
+  unsigned short* out_idx = blk_idx + ((size_t)bh * n_qblk + qb) * n_kblk;
+  int q_start = q_offset + qb * FA8_BM;
+  int q_center = q_start + FA8_BM / 2;
+
+  // Защищённый префикс (Text/Cond/Refs/Audio): запрос смотрит на все KV-блоки.
+  if (q_start < prot_prefix || keep_ratio >= 0.999f) {
+    for (int kb = tid; kb < n_kblk; kb += 256) out_idx[kb] = (unsigned short)kb;
+    if (tid == 0) blk_cnt[(size_t)bh * n_qblk + qb] = n_kblk;
+    return;
+  }
+
+  if (tid < FA8_D) s_q[tid] = q_pool[((size_t)bh * n_qblk + qb) * FA8_D + tid];
+  __syncthreads();
+
+  int prot_kblks = (prot_prefix + FA8_BN - 1) / FA8_BN;
+  const float* kp_base = k_pool + (size_t)bh * n_kblk * FA8_D;
+
+  // Коалесцированный расчёт dot(q_pool, k_pool[kb]): один варп (32 нити × float4 = 128)
+  // обрабатывает один kb за один 128-байтный проход по глобальной памяти.
+  const float4 q4 = *reinterpret_cast<const float4*>(s_q + lane * 4);
+  float lmin = 1e30f, lmax = -1e30f;
+  int lrem = 0;
+  for (int kb = warp; kb < n_kblk; kb += 8) {
+    int k_center = kb * FA8_BN + FA8_BN / 2;
+    bool mand = (kb < prot_kblks) || (abs(k_center - q_center) <= local_win);
+    if (!mand) {
+      float4 k4 = *reinterpret_cast<const float4*>(kp_base + (size_t)kb * FA8_D + lane * 4);
+      float dot = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+      for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+      if (lane == 0) {
+        flags[kb] = 0;
+        scores[kb] = dot;
+        lmin = fminf(lmin, dot);
+        lmax = fmaxf(lmax, dot);
+        lrem++;
+      }
+    } else if (lane == 0) {
+      flags[kb] = 1;
+      scores[kb] = -1e30f;
+    }
+  }
+  // Редукция min, max, count по 8 варпам (значения у lane 0 каждого варпа).
+  if (lane == 0) {
+    s_red[warp] = lmin;
+    s_red[8 + warp] = lmax;
+    s_ired[warp] = lrem;
+  }
+  __syncthreads();
+  float gmin = s_red[0], gmax = s_red[8];
+  int total_rem = 0;
+  if (warp == 0) {
+    float vmin = (lane < 8) ? s_red[lane] : 1e30f;
+    float vmax = (lane < 8) ? s_red[8 + lane] : -1e30f;
+    int vrem = (lane < 8) ? s_ired[lane] : 0;
+    for (int o = 4; o > 0; o >>= 1) {
+      vmin = fminf(vmin, __shfl_xor_sync(0xffffffffu, vmin, o));
+      vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+      vrem += __shfl_xor_sync(0xffffffffu, vrem, o);
+    }
+    if (lane == 0) {
+      s_red[0] = vmin;
+      s_red[1] = vmax;
+      s_ired[0] = vrem;
+    }
+  }
+  __syncthreads();
+  gmin = s_red[0];
+  gmax = s_red[1];
+  total_rem = s_ired[0];
+
+  int target_rem = max(1, (int)ceilf((float)total_rem * keep_ratio));
+  if (total_rem == 0 || target_rem >= total_rem) {
+    for (int kb = tid; kb < n_kblk; kb += 256) out_idx[kb] = (unsigned short)kb;
+    if (tid == 0) blk_cnt[(size_t)bh * n_qblk + qb] = n_kblk;
+    return;
+  }
+
+  // 10 шагов бинарного поиска порога tau по [gmin, gmax].
+  float lo = gmin, hi = gmax;
+  for (int it = 0; it < 10; it++) {
+    float mid = 0.5f * (lo + hi);
+    int c = 0;
+    for (int kb = tid; kb < n_kblk; kb += 256) {
+      if (flags[kb] == 0 && scores[kb] >= mid) c++;
+    }
+    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+    if (lane == 0) s_ired[warp] = c;
+    __syncthreads();
+    if (warp == 0) {
+      int vc = (lane < 8) ? s_ired[lane] : 0;
+      for (int o = 4; o > 0; o >>= 1) vc += __shfl_xor_sync(0xffffffffu, vc, o);
+      if (lane == 0) s_ired[0] = vc;
+    }
+    __syncthreads();
+    int ge = s_ired[0];
+    if (ge > target_rem) lo = mid; else hi = mid;
+  }
+  float tau = 0.5f * (lo + hi);
+  // Разметка: 1 — обязательный, 2 — строго выше порога, 3 — на границе.
+  int strict_cnt = 0;
+  for (int kb = tid; kb < n_kblk; kb += 256) {
+    if (flags[kb] == 0) {
+      if (scores[kb] > tau) {
+        flags[kb] = 2;
+        strict_cnt++;
+      } else if (scores[kb] >= lo) {
+        flags[kb] = 3;
+      }
+    }
+  }
+  for (int o = 16; o > 0; o >>= 1) strict_cnt += __shfl_xor_sync(0xffffffffu, strict_cnt, o);
+  if (lane == 0) s_ired[warp] = strict_cnt;
+  __syncthreads();
+  if (warp == 0) {
+    int vc = (lane < 8) ? s_ired[lane] : 0;
+    for (int o = 4; o > 0; o >>= 1) vc += __shfl_xor_sync(0xffffffffu, vc, o);
+    if (lane == 0) s_ired[0] = vc;
+  }
+  __syncthreads();
+  // Детерминированный проход в порядке возрастания kb (n_kblk ≤ 4096 → ~1.5 мкс).
+  if (tid == 0) {
+    int tie_budget = max(0, target_rem - s_ired[0]);
+    int out_n = 0;
+    for (int kb = 0; kb < n_kblk; kb++) {
+      unsigned char f = flags[kb];
+      if (f == 1 || f == 2) {
+        out_idx[out_n++] = (unsigned short)kb;
+      } else if (f == 3 && tie_budget > 0) {
+        out_idx[out_n++] = (unsigned short)kb;
+        tie_budget--;
+      }
+    }
+    blk_cnt[(size_t)bh * n_qblk + qb] = out_n;
+  }
+}
+
 // ── Главное ядро ──────────────────────────────────────────────────────────
 // ACC16: обе свёртки — e4m3 с f16-накоплением. Чтобы f16 (≤ 65504) не
 // переполнился: Q и K квантуются в |x| ≤ 16 (128 произведений ≤ 32768), P —
 // ·256, V — в |x| ≤ 3.9 (64 ключа плитки ≤ 63898); вклад плитки P·V копится в
-// f32, как и прежде.
-template <int PV8, int ACC16>
+// f32, как и прежде. SPARSE=1: цикл идёт только по списку индексов blk_idx.
+template <int PV8, int ACC16, int SPARSE>
 __device__ __forceinline__ void fa8_main_impl(
     const unsigned char* __restrict__ qq, const float* __restrict__ qs,
     const unsigned char* __restrict__ kq, const float* __restrict__ ks,
     const void* __restrict__ vptr, const float* __restrict__ vsc,
-    fa8_t* __restrict__ out, int B, int H, int Sq, int Skv, int Spad) {
+    fa8_t* __restrict__ out, int B, int H, int Sq, int Skv, int Spad,
+    const unsigned short* __restrict__ blk_idx, const int* __restrict__ blk_cnt, int n_kblk_stride) {
   extern __shared__ __align__(128) unsigned char smem[];
   // PV8: K 2×8К | V 2×8К | шкалы K 2×256 Б; Q (8К) живёт во втором буфере V
   // до первой подкачки — 33 КБ на блок, три блока на SM (было 41 КБ и два).
@@ -243,12 +417,17 @@ __device__ __forceinline__ void fa8_main_impl(
   const unsigned char* qbase = qq + ((size_t)b * Sq * H + h) * FA8_D;
   const unsigned char* kbase = kq + ((size_t)b * Skv * H + h) * FA8_D;
 
+  int n_qblk = (Sq + FA8_BM - 1) / FA8_BM;
+  const unsigned short* idx_row = SPARSE ? (blk_idx + ((size_t)bh * n_qblk + blockIdx.x) * n_kblk_stride) : nullptr;
+  int nblk = SPARSE ? blk_cnt[(size_t)bh * n_qblk + blockIdx.x] : ((Skv + FA8_BN - 1) / FA8_BN);
+  if (nblk <= 0) return;
+
   for (int c = tid; c < 512; c += 128) {
     int r = c >> 3, ch = c & 7, s = q0 + r;
     fa8_cp16(fa8_smem(sQ + r * 128 + ((ch ^ (r & 7)) << 4)), qbase + (size_t)min(s, Sq - 1) * rs + ch * 16, s < Sq);
   }
-  auto load_kv = [&](int j, int buf) {
-    int k0 = j * FA8_BN;
+  auto load_kv = [&](int kblk_id, int buf) {
+    int k0 = kblk_id * FA8_BN;
     unsigned char* dk = sK + buf * 8192;
     for (int c = tid; c < 512; c += 128) {
       int r = c >> 3, ch = c & 7, s = k0 + r;
@@ -277,7 +456,8 @@ __device__ __forceinline__ void fa8_main_impl(
       }
     }
   };
-  load_kv(0, 0);
+  int cur_kblk = SPARSE ? (int)idx_row[0] : 0;
+  load_kv(cur_kblk, 0);
   fa8_commit();
 
   int row0 = q0 + warp * 16 + g, row1 = row0 + 8;
@@ -290,8 +470,8 @@ __device__ __forceinline__ void fa8_main_impl(
   for (int i = 0; i < 16; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float m0 = FA8_NEG_INF, m1 = FA8_NEG_INF, l0 = 0.f, l1 = 0.f;
 
-  int nblk = (Skv + FA8_BN - 1) / FA8_BN;
   for (int j = 0; j < nblk; j++) {
+    int kblk_id = cur_kblk;
     fa8_wait0();
     __syncthreads();
     if (j == 0) {
@@ -305,7 +485,8 @@ __device__ __forceinline__ void fa8_main_impl(
       if (PV8) __syncthreads();
     }
     if (j + 1 < nblk) {
-      load_kv(j + 1, (j + 1) & 1);
+      cur_kblk = SPARSE ? (int)idx_row[j + 1] : (j + 1);
+      load_kv(cur_kblk, (j + 1) & 1);
       fa8_commit();
     }
     int buf = j & 1;
@@ -338,7 +519,7 @@ __device__ __forceinline__ void fa8_main_impl(
     }
     // Шкалы ключей и маска хвоста.
     float mx0 = FA8_NEG_INF, mx1 = FA8_NEG_INF;
-    int kb = j * FA8_BN;
+    int kb = kblk_id * FA8_BN;
     if (ACC16) {
       // s = acc·k̂ (шкала Q > 0 выносится: max(s·q̂) = q̂·max(s)); q̂ входит в
       // FFMA показателя, множитель P (·256) — в его сдвиг (+8 в log2).
@@ -506,15 +687,27 @@ __device__ __forceinline__ void fa8_main_impl(
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_qk_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
     const fa8_t* v, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
-  fa8_main_impl<0, 0>(qq, qs, kq, ks, v, vsc, out, B, H, Sq, Skv, Spad);
+  fa8_main_impl<0, 0, 0>(qq, qs, kq, ks, v, vsc, out, B, H, Sq, Skv, Spad, nullptr, nullptr, 0);
 }
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_full_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
     const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
-  fa8_main_impl<1, 0>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
+  fa8_main_impl<1, 0, 0>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad, nullptr, nullptr, 0);
 }
 extern "C" __global__ void __launch_bounds__(128) flash_fp8_a16_hd128_bshd(
     const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
     const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad) {
-  fa8_main_impl<1, 1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad);
+  fa8_main_impl<1, 1, 0>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad, nullptr, nullptr, 0);
+}
+extern "C" __global__ void __launch_bounds__(128) flash_fp8_full_sparse_hd128_bshd(
+    const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
+    const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad,
+    const unsigned short* blk_idx, const int* blk_cnt, int n_kblk_stride) {
+  fa8_main_impl<1, 0, 1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad, blk_idx, blk_cnt, n_kblk_stride);
+}
+extern "C" __global__ void __launch_bounds__(128) flash_fp8_a16_sparse_hd128_bshd(
+    const unsigned char* qq, const float* qs, const unsigned char* kq, const float* ks,
+    const unsigned char* vt, const float* vsc, fa8_t* out, int B, int H, int Sq, int Skv, int Spad,
+    const unsigned short* blk_idx, const int* blk_cnt, int n_kblk_stride) {
+  fa8_main_impl<1, 1, 1>(qq, qs, kq, ks, vt, vsc, out, B, H, Sq, Skv, Spad, blk_idx, blk_cnt, n_kblk_stride);
 }

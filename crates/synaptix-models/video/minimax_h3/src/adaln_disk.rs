@@ -53,7 +53,7 @@ fn fnv(bytes: impl IntoIterator<Item = u8>) -> u64 {
 
 impl DiskCache {
     pub fn open(ckpt: &H3Checkpoint, dtype: DType) -> Option<Self> {
-        if matches!(std::env::var("SYN_H3_ADALN_CACHE").as_deref(), Ok("0")) || ckpt.has_lora() {
+        if matches!(std::env::var("SYN_H3_ADALN_CACHE").as_deref(), Ok("0")) || ckpt.lora_touches_adaln() {
             return None;
         }
         let path = ckpt.source.path();

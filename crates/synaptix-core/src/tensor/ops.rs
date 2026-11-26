@@ -1132,10 +1132,19 @@ impl Tensor {
             _ => return Err(SynaptixError::Unsupported("rms_segmod_quant: формат")),
         };
         let (packed_bytes, scales_bytes) = if mxfp8 { (m * k, m * k / 32) } else { (m * k / 2, (k.div_ceil(64) * 4) * (m.div_ceil(128) * 128)) };
-        let x = self.contiguous_view()?;
-        let sc = scale.contiguous_view()?;
-        let sh = shift.contiguous_view()?;
-        let ri = ridx.contiguous_view()?;
+        // Ядро принимает `byte_offset()`: срез по ведущей оси (`narrow(0, off, n)`)
+        // имеет плотные шаги при ненулевом offset и идёт без копии (zero-copy).
+        let stride_contig = |t: &Tensor| -> Result<Tensor> {
+            if t.layout.strides().is_contiguous(t.layout.shape()) {
+                Ok(t.clone())
+            } else {
+                t.contiguous()
+            }
+        };
+        let x = stride_contig(self)?;
+        let sc = stride_contig(scale)?;
+        let sh = stride_contig(shift)?;
+        let ri = stride_contig(ridx)?;
         let backend = registry::backend_for(self.device())?;
         let mut packed_st = backend.alloc_uninit(packed_bytes, self.device())?;
         let mut scales_st = backend.alloc_uninit(scales_bytes, self.device())?;

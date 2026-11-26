@@ -105,3 +105,76 @@ fn fp8_attention_acc16_close() {
         }
     }
 }
+
+#[test]
+fn fp8_attention_kv_cache_and_sparse() {
+    synaptix_kernels_cuda::ensure_registered();
+    let ctx = synaptix_core::device::cuda::get(0).unwrap();
+    let stream = synaptix_core::device::cuda::default_stream(0).unwrap();
+    let (h, sq, skv, d) = (4usize, 512usize, 2048usize, 128usize);
+    let mk = |seed: u64, s: usize, amp: f32| -> CudaSlice<u8> {
+        let r = det(seed, s * h * d);
+        let v: Vec<u8> = r.iter().flat_map(|x| bf16::from_f32(x * amp).to_le_bytes()).collect();
+        stream.clone_htod(&v).unwrap()
+    };
+    let (q, k, v) = (mk(11, sq, 1.5), mk(12, skv, 1.5), mk(13, skv, 1.0));
+    let scale = 1.0 / (d as f32).sqrt();
+    let k8 = FlashFp8Kernels::for_dtype(&ctx, DType::BF16).unwrap();
+    let bytes = sq * h * d * 2;
+    let mut o_dense: CudaSlice<u8> = stream.alloc_zeros(bytes).unwrap();
+    let mut o_cached: CudaSlice<u8> = stream.alloc_zeros(bytes).unwrap();
+    let mut o_sp_full: CudaSlice<u8> = stream.alloc_zeros(bytes).unwrap();
+    let mut o_sp_prot: CudaSlice<u8> = stream.alloc_zeros(bytes).unwrap();
+
+    // 1. Dense uncached
+    flash_fp8_bshd_mode(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o_dense, 1, h, sq, skv, scale, Fa8Mode::Acc16).unwrap();
+
+    // 2. Cached K/V across two calls must be bit-exact with uncached
+    {
+        let _kv = synaptix_core::precision::FlashFp8KvGuard::new();
+        flash_fp8_bshd_mode(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o_cached, 1, h, sq, skv, scale, Fa8Mode::Acc16).unwrap();
+        flash_fp8_bshd_mode(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o_cached, 1, h, sq, skv, scale, Fa8Mode::Acc16).unwrap();
+    }
+
+    // 3. Sparse with q_offset=0 and protected_prefix=sq -> ALL queries protected -> bit-exact with dense!
+    {
+        let _sp = synaptix_core::precision::AttentionSparseGuard::new(Some(synaptix_core::precision::AttentionSparseConfig {
+            protected_prefix: sq,
+            q_offset: 0,
+            keep_ratio: 0.35,
+            frame_tokens: 256,
+        }));
+        flash_fp8_bshd_mode(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o_sp_prot, 1, h, sq, skv, scale, Fa8Mode::Acc16).unwrap();
+    }
+
+    // 4. Sparse on video region (q_offset=256, prot=128, keep=0.5) must stay finite & close
+    {
+        let _sp = synaptix_core::precision::AttentionSparseGuard::new(Some(synaptix_core::precision::AttentionSparseConfig {
+            protected_prefix: 128,
+            q_offset: 256,
+            keep_ratio: 0.50,
+            frame_tokens: 256,
+        }));
+        flash_fp8_bshd_mode(&k8, &stream, (&q, 0), (&k, 0), (&v, 0), &mut o_sp_full, 1, h, sq, skv, scale, Fa8Mode::Acc16).unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let b_dense = stream.clone_dtoh(&o_dense).unwrap();
+    let b_cached = stream.clone_dtoh(&o_cached).unwrap();
+    let b_prot = stream.clone_dtoh(&o_sp_prot).unwrap();
+    let b_sp = stream.clone_dtoh(&o_sp_full).unwrap();
+    assert_eq!(b_dense, b_cached, "KV cache must be bit-exact with uncached");
+    assert_eq!(b_dense, b_prot, "Protected prefix queries must be bit-exact with dense");
+
+    let to_f = |buf: &[u8]| -> Vec<f32> { buf.chunks(2).map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect() };
+    let (fd, fs) = (to_f(&b_dense), to_f(&b_sp));
+    assert!(fs.iter().all(|x| x.is_finite()), "sparse output contains NaN/Inf");
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in fs.iter().zip(&fd) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y; na += x * x; nb += y * y;
+    }
+    let cos = (dot / (na.sqrt() * nb.sqrt())) as f32;
+    eprintln!("[fp8 sparse keep=0.50] cos vs dense = {cos:.6}");
+    assert!(cos > 0.85, "sparse cos too low: {cos}");
+}

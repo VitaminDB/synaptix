@@ -184,6 +184,9 @@ mod tests {
 
 thread_local! {
     static ATTN_FP8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ATTN_FP8_KV_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ATTN_FP8_KV_SLOT: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+    static ATTN_SPARSE: std::cell::Cell<Option<AttentionSparseConfig>> = const { std::cell::Cell::new(None) };
 }
 
 /// FP8-внимание (e4m3 QKᵀ и P·V) для текущего потока: длинные
@@ -216,5 +219,79 @@ impl AttentionFp8Guard {
 impl Drop for AttentionFp8Guard {
     fn drop(&mut self) {
         ATTN_FP8.with(|c| c.set(self.0));
+    }
+}
+
+/// Охранник кэша квантованных K/V в FP8-внимании (для чанкования Q по одним
+/// и тем же неизменным K/V внутри одного блока DiT). При выходе из области
+/// видимости буферы немедленно освобождаются.
+pub struct FlashFp8KvGuard {
+    prev_active: bool,
+    prev_slot: Option<Box<dyn std::any::Any>>,
+}
+
+impl FlashFp8KvGuard {
+    pub fn new() -> Self {
+        let prev_active = ATTN_FP8_KV_ACTIVE.with(|c| c.replace(true));
+        let prev_slot = ATTN_FP8_KV_SLOT.with(|s| s.borrow_mut().take());
+        Self { prev_active, prev_slot }
+    }
+}
+
+impl Default for FlashFp8KvGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for FlashFp8KvGuard {
+    fn drop(&mut self) {
+        ATTN_FP8_KV_ACTIVE.with(|c| c.set(self.prev_active));
+        ATTN_FP8_KV_SLOT.with(|s| *s.borrow_mut() = self.prev_slot.take());
+    }
+}
+
+pub fn fp8_kv_cache_active() -> bool {
+    ATTN_FP8_KV_ACTIVE.with(|c| c.get())
+}
+
+pub fn fp8_kv_cache_with<R>(f: impl FnOnce(&mut Option<Box<dyn std::any::Any>>) -> R) -> R {
+    ATTN_FP8_KV_SLOT.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Настройки блочно-разреженного FP8-внимания (Sol-подобный роутинг по блокам 64×64).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttentionSparseConfig {
+    /// Число первых токенов (Text + Cond + Ref* + Audio), которые всегда
+    /// участвуют во внимании целиком (как ключи для всех Q и как запросы ко всем KV).
+    pub protected_prefix: usize,
+    /// Смещение текущего чанка Q в полной последовательности.
+    pub q_offset: usize,
+    /// Доля дальних KV-блоков видео, оставляемых по top-k скору (0.1..1.0).
+    pub keep_ratio: f32,
+    /// Число токенов одного латентного кадра видео (для защиты локального окна ±1 кадр).
+    pub frame_tokens: usize,
+}
+
+pub fn attention_sparse() -> Option<AttentionSparseConfig> {
+    ATTN_SPARSE.with(|c| c.get())
+}
+
+pub fn set_attention_sparse(cfg: Option<AttentionSparseConfig>) {
+    ATTN_SPARSE.with(|c| c.set(cfg));
+}
+
+pub struct AttentionSparseGuard(Option<AttentionSparseConfig>);
+
+impl AttentionSparseGuard {
+    pub fn new(cfg: Option<AttentionSparseConfig>) -> Self {
+        let prev = ATTN_SPARSE.with(|c| c.replace(cfg));
+        Self(prev)
+    }
+}
+
+impl Drop for AttentionSparseGuard {
+    fn drop(&mut self) {
+        ATTN_SPARSE.with(|c| c.set(self.0));
     }
 }
