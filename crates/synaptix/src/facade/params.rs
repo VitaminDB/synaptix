@@ -303,7 +303,7 @@ fn llm(path: Option<&Path>) -> Vec<ParamSpec> {
     let system_default = if is_omni {
         Some(ParamValue::Text(String::new()))
     } else if is_af {
-        Some(ParamValue::Text(synaptix_llm_qwen3_next_hybrid::pipeline::AF_NEXT_SYSTEM.into()))
+        af_next_system().map(|s| ParamValue::Text(s.into()))
     } else {
         (is_wemm || is_moss).then(|| ParamValue::Text("You are a helpful assistant.".into()))
     };
@@ -433,4 +433,16 @@ mod tests {
         assert!(s.iter().any(|p| p.key == "temperature"));
         assert!(!s.iter().any(|p| p.key == "reasoning"));
     }
+}
+
+/// Стартовый промпт Audio Flamingo-Next — из крейта модели; без движка
+/// (клиенты службы: Synthos, «Модели») крейт не линкуется, умолчание даёт служба.
+#[cfg(feature = "engine")]
+fn af_next_system() -> Option<&'static str> {
+    Some(synaptix_llm_qwen3_next_hybrid::pipeline::AF_NEXT_SYSTEM)
+}
+
+#[cfg(not(feature = "engine"))]
+fn af_next_system() -> Option<&'static str> {
+    None
 }
