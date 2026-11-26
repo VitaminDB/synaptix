@@ -93,3 +93,16 @@ pub fn vae_grid() -> Option<(usize, usize)> {
         p => Some(((p >> 32) & 0xffff_ffff, p & 0xffff_ffff)),
     }
 }
+
+/// Сэмплер LTX-2.5 (Euler-ancestral, eta = 1) вместо Euler: `Some(seed)` —
+/// сид шума ancestral-шагов этапа (эталон: seed + 10000 на этапе 1,
+/// seed + 20000 на этапе 2). `None` — Euler (LTX-2.3).
+static ANCESTRAL: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+pub fn set_ancestral(seed: Option<u64>) {
+    *ANCESTRAL.lock().unwrap_or_else(|e| e.into_inner()) = seed;
+}
+
+pub fn ancestral() -> Option<u64> {
+    *ANCESTRAL.lock().unwrap_or_else(|e| e.into_inner())
+}

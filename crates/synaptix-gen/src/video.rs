@@ -80,6 +80,13 @@ pub fn lora_steps(p: &Path) -> Option<usize> {
 /// квантованного файла DiT берёт его же формат — перекодировка в другой
 /// квант (MXFP8 → NVFP4) теряет качество, а плотное чтение деквантует
 /// и стримит вдвое больший вес.
+/// Версия LTX из метаданных (`"2.5.0"`) не ниже `major.minor`.
+fn ltx_version_at_least(v: &str, major: u32, minor: u32) -> bool {
+    let mut it = v.split('.').map(|x| x.trim().parse::<u32>().unwrap_or(0));
+    let (a, b) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+    (a, b) >= (major, minor)
+}
+
 pub(crate) fn stored_format(model: &Path) -> Option<DType> {
     let b = synaptix_bundle::Bundle::open(model).ok()?;
     let raw = b.read_file("quant_manifest.json").ok()?;
@@ -724,6 +731,17 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                 }
             })
         };
+        // LTX-2.5: Euler-ancestral на обоих этапах, шум — seed+10000 / seed+20000.
+        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5);
+        let base = seed.unwrap_or(1);
+        struct AncReset;
+        impl Drop for AncReset {
+            fn drop(&mut self) {
+                synaptix_video_ltx23::runtime::set_ancestral(None);
+            }
+        }
+        let _anc = AncReset;
+        synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(10_000)));
         let (mut l, mut a, mut wave) = stage((hp1, wp1), &lp::DISTILLED_SIGMAS, None)?;
         let stage1_saved = if two_stage { Some(l.clone()) } else { None };
         if two_stage {
@@ -734,6 +752,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let l2 = up.upsample(&l).map_err(err)?.to_dtype(compute).map_err(err)?;
             drop(up);
             synaptix_core::tensor::ops::conv_filter_cache_clear();
+            synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(20_000)));
             let (l3, a3, w3) = stage((hp2, wp2), &lp::STAGE2_SIGMAS, Some((&l2, &a)))?;
             l = l3;
             a = a3;

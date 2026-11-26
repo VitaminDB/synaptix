@@ -107,6 +107,27 @@ impl<'a> DenoiseHooks<'a> {
     }
 }
 
+/// Шаг Euler-ancestral (eta = 1, s_noise = 1) по скорости `v`: x0 = x − σ·v,
+/// σ↓ = σₙ²/σ, x = (σ↓/σ)·x + (1 − σ↓/σ)·x0, затем повторное зашумление до σₙ
+/// по схеме RF (эталон LTX-2 `diffusion_steps.py`). На последнем шаге — x0.
+fn ancestral_step(x: &Tensor, v: &Tensor, sigma: f64, sigma_next: f64, seed: u64) -> Result<Tensor, LtxError> {
+    let x0 = x.sub(&v.to_dtype(x.dtype())?.mul_scalar(sigma as f32)?)?;
+    if sigma_next <= 0.0 {
+        return Ok(x0);
+    }
+    let sd = sigma_next * sigma_next / sigma;
+    let r = sd / sigma;
+    let x = x.mul_scalar(r as f32)?.add(&x0.mul_scalar((1.0 - r) as f32)?)?;
+    let scale = (1.0 - sigma_next) / (1.0 - sd);
+    let var = sigma_next * sigma_next - sd * sd * scale * scale;
+    let x = x.mul_scalar(scale as f32)?;
+    if var <= 0.0 {
+        return Ok(x);
+    }
+    let eps = noise_tensor(x.dims().to_vec(), Some(seed))?.to_device(x.device())?.to_dtype(x.dtype())?;
+    Ok(x.add(&eps.mul_scalar(var.sqrt() as f32)?)?)
+}
+
 fn noise_tensor(shape: Vec<usize>, seed: Option<u64>) -> Result<Tensor, LtxError> {
     match seed {
         Some(s) => Tensor::randn_seeded(shape, s, Device::Cpu).map_err(LtxError::from),
@@ -1159,6 +1180,7 @@ pub fn denoise_av_cond(
     if long_t {
         synaptix_core::memory::cuda_pool::set_trim_threshold(22 << 30);
     }
+    let anc = crate::runtime::ancestral();
     for i in 0..max_steps {
         if hooks.cancelled() {
             if long_t {
@@ -1190,6 +1212,21 @@ pub fn denoise_av_cond(
             v_nag,
         )?;
         let dt = (sigma_next - sigma) as f32;
+        if let Some(base) = anc {
+            // LTX-2.5: Euler-ancestral (eta = 1) по x0 = x − σ·v, затем
+            // замороженные позиции — к чистым, как и у Euler.
+            let s = i as u64 * 2;
+            v_tok = ancestral_step(&v_tok, &v_vel, sigma, sigma_next, base.wrapping_add(s))?;
+            a_tok = ancestral_step(&a_tok, &a_vel, sigma, sigma_next, base.wrapping_add(s + 1))?;
+            if cond {
+                let (m, inv, clean) = (v_mask.as_ref().unwrap(), v_inv_mask.as_ref().unwrap(), v_clean.as_ref().unwrap());
+                v_tok = v_tok.broadcast_mul(m)?.add(&clean.broadcast_mul(inv)?)?;
+            }
+            if a_cond {
+                let (m, inv, clean) = (a_mask.as_ref().unwrap(), a_inv_mask.as_ref().unwrap(), a_clean.as_ref().unwrap());
+                a_tok = a_tok.broadcast_mul(m)?.add(&clean.broadcast_mul(inv)?)?;
+            }
+        } else {
         if cond {
             // per-token euler видео + blend conditioned-позиций к clean (frozen).
             let m = v_mask.as_ref().unwrap();
@@ -1210,6 +1247,7 @@ pub fn denoise_av_cond(
             a_tok = a_tok.broadcast_mul(m)?.add(&clean.broadcast_mul(inv)?)?;
         } else {
             a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        }
         }
         if prof { sync(); eprintln!("[LTX_PROF] av step {i} (Tv {tv} Ta {fa}): {:.2}s", t_step.elapsed().as_secs_f32()); }
         hooks.emit(i + 1, max_steps, sigma_next);

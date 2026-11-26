@@ -188,7 +188,9 @@ impl Lin {
         compute: DType,
     ) -> Result<Self, LtxError> {
         let name = format!("{prefix}.{key}.weight");
-        let b = if bias { Some(ckpt.get_raw(&format!("{prefix}.{key}.bias"))?) } else { None };
+        // LTX-2.5: у видео-FFN нет смещения (`ff_bias: false`) — смещение берётся, если есть.
+        let bname = format!("{prefix}.{key}.bias");
+        let b = if bias && ckpt.contains(&bname) { Some(ckpt.get_raw(&bname)?) } else { None };
         // Квантованный бандл: формат веса — как в файле. Без LoRA вес берётся
         // готовым; с LoRA — деквант + ΔW + квант тем же форматом.
         let stored = ckpt.quant_dtype(&name);
@@ -1359,7 +1361,7 @@ impl AvBlock {
         let bprof = crate::runtime::ltx_blk_prof();
         let mut bm: Vec<(&'static str, f64)> = Vec::new();
         let mut bt = std::time::Instant::now();
-        let mut bmark = |name: &'static str, bt: &mut std::time::Instant, bm: &mut Vec<(&'static str, f64)>| {
+        let bmark = |name: &'static str, bt: &mut std::time::Instant, bm: &mut Vec<(&'static str, f64)>| {
             if bprof {
                 let _ = synaptix_core::device::cuda::synchronize(ord);
                 bm.push((name, bt.elapsed().as_secs_f64()));
@@ -1590,6 +1592,29 @@ fn av_weight_suffixes() -> Vec<String> {
     v
 }
 
+/// LTX-2.5: эмбеддинг первого латентного кадра `e [1,dim]` — к ведущим
+/// токенам с той же временной координатой, что у токена 0 (первый кадр
+/// генерируемого видео; токены ключевых кадров идут после и не помечаются).
+/// `positions` — `[3,T,2]` flat (ось времени — первая).
+fn add_first_frame_emb(vx: &Tensor, e: &Tensor, positions: &[f64]) -> R<Tensor> {
+    let t = vx.dims()[1];
+    let t0 = positions.first().copied().unwrap_or(0.0);
+    let n = (0..t).take_while(|&i| positions.get(i * 2).is_some_and(|&p| p == t0)).count();
+    if n == 0 {
+        return Ok(vx.clone());
+    }
+    let head = vx.narrow(1, 0, n)?.broadcast_add(&e.reshape(vec![1, 1, e.dims().iter().product::<usize>()])?.to_dtype(vx.dtype())?)?;
+    if n == t {
+        return Ok(head);
+    }
+    Tensor::cat(&[&head, &vx.narrow(1, n, t - n)?], 1)
+}
+
+/// Есть ли у блоков смещение тензора `suffix` (LTX-2.5: видео-FFN без смещения).
+fn block_has(ckpt: &LtxCheckpoint, suffix: &str) -> bool {
+    ckpt.contains(&format!("{}.{suffix}", block_prefix(0)))
+}
+
 fn block_prefix(idx: usize) -> String {
     format!("{DIT_PREFIX}.transformer_blocks.{idx}")
 }
@@ -1644,8 +1669,9 @@ impl<'a> SlotAlloc<'a> {
 
     fn lin(&mut self, prefix: &str, l: &str) -> Result<Lin, LtxError> {
         let w = self.w(&format!("{prefix}.{l}.weight"))?;
-        let b = self.w(&format!("{prefix}.{l}.bias"))?;
-        Ok(Lin(QuantLinear::dense(w, Some(b)).map_err(LtxError::from)?))
+        let bs = format!("{prefix}.{l}.bias");
+        let b = if block_has(self.ckpt, &bs) { Some(self.w(&bs)?) } else { None };
+        Ok(Lin(QuantLinear::dense(w, b).map_err(LtxError::from)?))
     }
 
     fn attn(&mut self, ap: &str, heads: usize, dim_head: usize) -> Result<Attn, LtxError> {
@@ -1711,7 +1737,8 @@ impl SlotState {
         if ckpt.has_lora() || !matches!(device, Device::Cuda(_)) {
             return None;
         }
-        let suffixes = av_weight_suffixes();
+        // Смещения, которых у чекпойнта нет (LTX-2.5: видео-FFN), не в слотах.
+        let suffixes: Vec<String> = av_weight_suffixes().into_iter().filter(|s| !s.ends_with(".bias") || block_has(ckpt, s)).collect();
         let mut shapes0: Vec<Vec<usize>> = Vec::with_capacity(suffixes.len());
         for s in &suffixes {
             let (_, fdt, shape) = ckpt.raw_bytes(&format!("{}.{s}", block_prefix(0)))?;
@@ -1738,7 +1765,7 @@ impl SlotState {
                 v_attn1: sa.attn("attn1", 32, 128)?,
                 v_attn2: sa.attn("attn2", 32, 128)?,
                 v_ff0: sa.lin("ff.net.0", "proj")?,
-                v_ff2: Lin(QuantLinear::dense(sa.w("ff.net.2.weight")?, Some(sa.w("ff.net.2.bias")?)).map_err(LtxError::from)?),
+                v_ff2: sa.lin("ff", "net.2")?,
                 a_sst: sa.table(2)?,
                 a_prompt_sst: sa.table(3)?,
                 a_attn1: sa.attn("audio_attn1", 32, 64)?,
@@ -2075,6 +2102,9 @@ impl GraphCtx {
 pub struct AvDit {
     // video module-level
     v_patchify: Lin,
+    /// LTX-2.5 (`use_keyframes_abs_pos_embedding`): `[1,4096]`, прибавляется
+    /// к токенам первого латентного кадра сразу после patchify.
+    v_kf_emb: Option<Tensor>,
     v_ada: AdaLN,
     v_pada: AdaLN,
     v_sst_out: Tensor,
@@ -2204,8 +2234,15 @@ impl AvDit {
         let a_max_pos = t.audio_positional_embedding_max_pos.iter().map(|&x| x as f64).collect::<Vec<_>>();
         let cross_max_pos = t.positional_embedding_max_pos[0]
             .max(t.audio_positional_embedding_max_pos[0]) as f64;
+        let kf_name = format!("{DIT_PREFIX}.keyframes_abs_pos_embedding");
+        let v_kf_emb = if wckpt.contains(&kf_name) {
+            Some(wckpt.get_raw(&kf_name)?.to_dtype(dtype)?.to_device(device)?)
+        } else {
+            None
+        };
         Ok(Self {
             v_patchify: g("patchify_proj")?,
+            v_kf_emb,
             v_ada: ga("adaln_single")?,
             v_pada: ga("prompt_adaln_single")?,
             v_sst_out: raw("scale_shift_table")?,
@@ -2327,6 +2364,9 @@ impl AvDit {
             }
         }
         let mut vx = self.v_patchify.fwd(v_latent)?; // [1,Tv,4096]
+        if let Some(e) = &self.v_kf_emb {
+            vx = add_first_frame_emb(&vx, e, v_positions)?;
+        }
         let mut ax = self.a_patchify.fwd(a_latent)?; // [1,Ta,2048]
 
         // within-stream adaln (per-token). split СРАЗУ после modulate и drop
