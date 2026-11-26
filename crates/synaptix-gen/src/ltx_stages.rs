@@ -67,6 +67,24 @@ pub struct LtxModel {
     depth: Option<PathBuf>,
     ckpt: Mutex<Option<Arc<LtxCheckpoint>>>,
     held: Mutex<Held>,
+    /// LTX-2.5 и новее: сэмплер Euler-ancestral (seed+10000 / +20000).
+    ltx25: bool,
+}
+
+/// Сэмплер этапа LTX-2.5 на время вызова (Euler-ancestral с сидом этапа).
+struct Ancestral;
+
+impl Ancestral {
+    fn on(enabled: bool, seed: u64) -> Self {
+        synaptix_video_ltx23::runtime::set_ancestral(enabled.then_some(seed));
+        Ancestral
+    }
+}
+
+impl Drop for Ancestral {
+    fn drop(&mut self) {
+        synaptix_video_ltx23::runtime::set_ancestral(None);
+    }
 }
 
 /// Закодированное описание: контексты видео и звука.
@@ -246,7 +264,8 @@ pub fn open(paths: LtxPaths, device: Device, quant: Option<&str>, lora: Option<(
     synaptix_kernels_cuda::ensure_registered();
     let quant_dit = crate::video::quant_setting(quant).or_else(|| crate::video::stored_format(&paths.model)).unwrap_or(COMPUTE);
     let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
-    Ok(LtxModel { paths, device, quant_dit, quant_enc, lora: lora.filter(|(_, s)| *s > 0.0), depth, ckpt: Mutex::new(None), held: Mutex::new(Held::default()) })
+    let ltx25 = crate::video::is_ltx25(&paths.model);
+    Ok(LtxModel { paths, device, quant_dit, quant_enc, lora: lora.filter(|(_, s)| *s > 0.0), depth, ckpt: Mutex::new(None), held: Mutex::new(Held::default()), ltx25 })
 }
 
 impl LtxModel {
@@ -486,6 +505,7 @@ impl LtxModel {
         h: &Hooks,
     ) -> R<LtxLatent> {
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
+        let _anc = Ancestral::on(self.ltx25, seed.wrapping_add(10_000));
         let dev = self.device;
         let (fps, hp, wp, fp, overlap_frames) = if let Some(ctx) = context {
             let req_w = (shape.width > 0).then_some(shape.width);
@@ -606,6 +626,7 @@ impl LtxModel {
         h: &Hooks,
     ) -> R<LtxLatent> {
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
+        let _anc = Ancestral::on(self.ltx25, seed.wrapping_add(20_000));
         let dev = self.device;
         let dit = self.dit(lat.fp * lat.hp * lat.wp)?;
         let on_step = |p: lp::DenoiseProgress| (h.progress)(p.step, p.total);

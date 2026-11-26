@@ -1603,11 +1603,11 @@ fn add_first_frame_emb(vx: &Tensor, e: &Tensor, positions: &[f64]) -> R<Tensor> 
     if n == 0 {
         return Ok(vx.clone());
     }
-    let head = vx.narrow(1, 0, n)?.broadcast_add(&e.reshape(vec![1, 1, e.dims().iter().product::<usize>()])?.to_dtype(vx.dtype())?)?;
+    let head = vx.narrow(1, 0, n)?.contiguous()?.broadcast_add(&e.reshape(vec![1, 1, e.dims().iter().product::<usize>()])?.to_dtype(vx.dtype())?)?;
     if n == t {
         return Ok(head);
     }
-    Tensor::cat(&[&head, &vx.narrow(1, n, t - n)?], 1)
+    Tensor::cat(&[&head, &vx.narrow(1, n, t - n)?.contiguous()?], 1)
 }
 
 /// Есть ли у блоков смещение тензора `suffix` (LTX-2.5: видео-FFN без смещения).

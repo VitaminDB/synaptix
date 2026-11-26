@@ -80,6 +80,14 @@ pub fn lora_steps(p: &Path) -> Option<usize> {
 /// квантованного файла DiT берёт его же формат — перекодировка в другой
 /// квант (MXFP8 → NVFP4) теряет качество, а плотное чтение деквантует
 /// и стримит вдвое больший вес.
+/// Чекпойнт LTX-2.5 и новее (сэмплер Euler-ancestral, подпись «LTX-2.5»);
+/// `SYN_LTX_SAMPLER=euler` — прежний Euler.
+pub(crate) fn is_ltx25(model: &Path) -> bool {
+    std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler")
+        && synaptix_video_ltx23::loader::LtxCheckpoint::open(model, Device::Cpu, DType::BF16)
+            .is_ok_and(|c| ltx_version_at_least(&c.config.model_version, 2, 5))
+}
+
 /// Версия LTX из метаданных (`"2.5.0"`) не ниже `major.minor`.
 fn ltx_version_at_least(v: &str, major: u32, minor: u32) -> bool {
     let mut it = v.split('.').map(|x| x.trim().parse::<u32>().unwrap_or(0));
@@ -731,7 +739,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             })
         };
         // LTX-2.5: Euler-ancestral на обоих этапах, шум — seed+10000 / seed+20000.
-        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5);
+        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5) && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler");
         let base = seed.unwrap_or(1);
         struct AncReset;
         impl Drop for AncReset {
@@ -870,7 +878,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
         _ => write_mp4(&frames, Some((&pcm, 48_000, 2)), fps, out)?,
     }
-    let label = format!("LTX-2.3 {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / fps, if two_stage { ", две стадии" } else { "" });
+    let name = if ltx_version_at_least(&ckpt.config.model_version, 2, 5) { "LTX-2.5" } else { "LTX-2.3" };
+    let label = format!("{name} {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / fps, if two_stage { ", две стадии" } else { "" });
     Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label, tail: tail_path, continued_from_latent: continued })
 }
 
