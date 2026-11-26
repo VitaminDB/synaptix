@@ -388,6 +388,8 @@ impl QwenImageModel {
             r.host,
             r.source
         );
+        synaptix_core::gen_status::phase("денойз");
+        synaptix_core::gen_status::blocks(r.device, r.device + r.host + r.source);
         memory::release_pools(self.device);
         Ok(t)
     }

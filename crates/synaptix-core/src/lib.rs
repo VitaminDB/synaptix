@@ -4,6 +4,7 @@ pub mod backend;
 pub mod device;
 pub mod dtype;
 pub mod error;
+pub mod gen_status;
 pub mod grad;
 pub mod memory;
 pub mod precision;

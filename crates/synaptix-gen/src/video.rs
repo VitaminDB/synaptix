@@ -123,8 +123,10 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     // Негатив — только при CFG > 1 (без CFG его не кодировать).
     let negative = req.negative.as_deref().filter(|_| cfg_scale > 1.0);
     let first = if continued { None } else { req.first_frame.as_deref() };
+    let _status = synaptix_core::gen_status::Scope::new("кодирование текста и кадров");
     let cond = m.encode_with_context(size, &req.prompt, negative, first, req.last_frame.as_deref(), &req.refs, st::RefSize::Match, context, req.model_id.as_deref())?;
     let keyframes = first.is_some() as usize + req.last_frame.is_some() as usize;
+    synaptix_core::gen_status::phase("загрузка DiT");
     let lat = m.sample(&cond, steps, cfg_scale, req.seed, req.source_video.as_deref(), req.strength, cancel, progress)?;
     drop(cond);
     let tail_path = if let Some(tp) = &req.tail_out {
@@ -135,8 +137,11 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     } else {
         None
     };
+    synaptix_core::gen_status::phase("декодер VAE: видео");
     let frames = m.decode_video(&lat)?;
+    synaptix_core::gen_status::phase("декодер VAE: звук");
     let (pcm, sample_rate, channels) = m.decode_audio(&lat)?;
+    synaptix_core::gen_status::phase("запись mp4");
     write_mp4(&frames, Some((&pcm, sample_rate, channels)), st::FPS, out)?;
     let (width, height) = (lat.width, lat.height);
     let n_frames = frames.len();
@@ -451,6 +456,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let lora_path = adapter.clone().or_else(|| if distilled_ckpt { None } else { paths.distilled_lora.clone() });
 
     // Текст: Gemma (выгружается) → коннекторы.
+    let _status = synaptix_core::gen_status::Scope::new("кодирование текста (Gemma)");
     synaptix_core::device::cuda::set_offload_pinned(true);
     let (states, mask, nag_states) = {
         let prec = PrecisionConfig { compute, attn_w: quant_enc, mlp_w: quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
@@ -490,7 +496,9 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             None => None,
         };
         let lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
+        synaptix_core::gen_status::phase("загрузка DiT");
         let dit = AvDit::load_with(lora_ckpt.as_ref().unwrap_or(&ckpt), device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
+        synaptix_core::gen_status::phase(if offload { "денойз (DiT стримится с хоста)" } else { "денойз" });
         let (hp1, wp1) = if two_stage { lp::stage1_grid(hp, wp) } else { (hp, wp) };
         let (hp2, wp2) = (hp1 * 2, wp1 * 2);
         let venc = if matches!(mode, LtxMode::Text | LtxMode::Continue { .. } | LtxMode::A2v { image: None, .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
@@ -735,6 +743,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         None
     };
     release();
+    synaptix_core::gen_status::phase("декодер VAE: видео");
     let rgb = synaptix_core::grad::no_grad(|| -> R<Tensor> {
         let vae = VaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
         vae.decode(&latent).map_err(|e| format!("VAE: {e}"))
@@ -744,6 +753,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let pcm: Vec<f32> = match input_wave {
         Some(w) => w,
         None => {
+            synaptix_core::gen_status::phase("декодер VAE: звук");
             let wave = synaptix_core::grad::no_grad(|| -> R<Tensor> {
                 let avae = AudioVaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
                 let voc = VocoderWithBwe::load(&paths.model, device).map_err(|e| format!("вокодер: {e}"))?;

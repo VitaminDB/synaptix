@@ -119,8 +119,10 @@ pub fn generate(model: &Path, device: Device, req: &ImageRequest, progress: &mut
             return Err(format!("strength вне [0, 1]: {s}"));
         }
     }
+    let _status = synaptix_core::gen_status::Scope::new("подготовка модели");
     let m = crate::image_stages::open(model, device, req.quant.as_deref())?;
     let family = m.family;
+    synaptix_core::gen_status::phase("кодирование текста");
     // Картинки запроса: у FLUX.2 и Qwen-Image — референсы (Qwen видит их и в описании).
     let qwen = matches!(family, Family::QwenImage | Family::QwenImage21);
     let cond_images: &[PathBuf] = if qwen { &req.images } else { &[] };
@@ -136,8 +138,10 @@ pub fn generate(model: &Path, device: Device, req: &ImageRequest, progress: &mut
         None => crate::image_stages::Latent::Size(size.0, size.1),
     };
     let opts = crate::image_stages::SampleOpts { steps: req.steps, guidance: req.guidance, seed: req.seed, denoise: req.strength };
+    synaptix_core::gen_status::phase("загрузка DiT и денойз");
     let lat = m.sample(&cond, Some(&latent), refs.as_ref(), &opts, progress)?;
     drop((cond, refs, latent));
+    synaptix_core::gen_status::phase("декодер VAE");
     let image = m.decode(&lat)?;
     let crate::image_stages::Latent::Sampled { width, height, steps, label, .. } = lat else { unreachable!() };
     Ok(ImageOutput { image, width, height, steps, label })

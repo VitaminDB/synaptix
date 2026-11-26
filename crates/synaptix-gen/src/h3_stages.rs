@@ -403,6 +403,8 @@ impl H3Model {
         h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0 || c.context.is_some(), self.lora.is_some()));
         let dit = h3::dit::H3Dit::load(&ckpt, device, COMPUTE, quant_dit).map_err(err)?;
         let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
+        synaptix_core::gen_status::phase("денойз");
+        synaptix_core::gen_status::blocks(dit.resident_blocks(), ckpt.config.num_layers);
         if !c.keyframes.is_empty() {
             let vw = h3::loader::ComponentLoader::open_component(source, h3::H3Component::VideoVae, device).map_err(err)?;
             let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, COMPUTE).map_err(err)?;

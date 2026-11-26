@@ -1112,6 +1112,8 @@ impl H3Dit {
         let mut blocks = Vec::with_capacity(nblocks);
         let mut mirror: Option<synaptix_core::device::cuda::PinMirrorGuard> = None;
         for i in 0..nblocks {
+            synaptix_core::gen_status::phase(format!("загрузка DiT: блок {}/{nblocks}", i + 1));
+            synaptix_core::gen_status::blocks(host_from.min(i), nblocks);
             if cuda
                 && host_from == nblocks
                 && mode == crate::memory::H3MemoryMode::Auto
