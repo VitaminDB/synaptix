@@ -70,6 +70,10 @@ pub struct LayoutRequest {
     pub frame_count: Option<usize>,
     pub keyframes: Vec<Keyframe>,
     pub refs: Vec<RefBlock>,
+    /// Число первых латентных кадров видео, замороженных как условие (хвост предыдущего ролика).
+    pub prefix_video_t: usize,
+    /// Число первых латентных кадров аудио (на канал), замороженных как условие.
+    pub prefix_audio_t: usize,
 }
 
 impl LayoutRequest {
@@ -89,6 +93,8 @@ impl LayoutRequest {
             frame_count: None,
             keyframes: Vec::new(),
             refs: Vec::new(),
+            prefix_video_t: 0,
+            prefix_audio_t: 0,
         }
     }
 
@@ -106,6 +112,12 @@ impl LayoutRequest {
         self.refs = refs;
         self
     }
+
+    pub fn with_prefix(mut self, video_t: usize, audio_t: usize) -> Self {
+        self.prefix_video_t = video_t;
+        self.prefix_audio_t = audio_t;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -117,6 +129,8 @@ pub struct LayoutSignature {
     pub audio_t: usize,
     pub keyframes: Vec<usize>,
     pub refs: Vec<(u8, usize, usize, usize)>,
+    pub prefix_video_t: usize,
+    pub prefix_audio_t: usize,
 }
 
 pub struct PackedLayout {
@@ -128,6 +142,9 @@ pub struct PackedLayout {
     pub audio_rows: Vec<usize>,
     pub audio_update: Vec<bool>,
     pub frame_rows: usize,
+    pub audio_t: usize,
+    pub prefix_video_t: usize,
+    pub prefix_audio_t: usize,
     pub signature: LayoutSignature,
 }
 
@@ -273,6 +290,8 @@ impl PackedLayout {
                     }
                 })
                 .collect(),
+            prefix_video_t: req.prefix_video_t,
+            prefix_audio_t: req.prefix_audio_t,
         };
 
         Ok(Self {
@@ -284,6 +303,9 @@ impl PackedLayout {
             audio_rows,
             audio_update,
             frame_rows,
+            audio_t: req.audio_t,
+            prefix_video_t: req.prefix_video_t,
+            prefix_audio_t: req.prefix_audio_t,
             signature,
         })
     }
@@ -293,13 +315,16 @@ impl PackedLayout {
     }
 
     pub fn has_visual_cond(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|s| matches!(s.kind, SegmentKind::Cond | SegmentKind::RefImg))
+        self.prefix_video_t > 0
+            || self
+                .segments
+                .iter()
+                .any(|s| matches!(s.kind, SegmentKind::Cond | SegmentKind::RefImg))
     }
 
     pub fn has_audio_cond(&self) -> bool {
-        self.segments.iter().any(|s| s.kind == SegmentKind::RefAudio)
+        self.prefix_audio_t > 0
+            || self.segments.iter().any(|s| s.kind == SegmentKind::RefAudio)
     }
 
     pub fn video_rows(&self) -> usize {

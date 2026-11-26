@@ -13,7 +13,40 @@ use synaptix_core::dtype::DType;
 use synaptix_core::tensor::Tensor;
 use synaptix_video_minimax_h3 as h3;
 
+use crate::tail::{TailLatent, TailMeta};
 use crate::video::{media_seconds, quant_setting};
+
+/// Число латентных кадров хвоста по умолчанию для H3 (7 лат. кадров = 22 пикс. ≈ 0.92 с,
+/// кратно 5-токенной фазе ViT VAE: 5n + 2).
+pub const DEFAULT_CONTEXT_FRAMES: usize = 7;
+
+/// Подогнать запрошенное число латентных кадров хвоста к фазово-выровненной
+/// сетке H3 (`5m + 2`: 2 → 5 пикс. к., 7 → 22 пикс. к., 12 → 39 пикс. к.)
+/// и гарантировать запас хотя бы в один новый блок до `max_latent_t`.
+pub fn snap_context_frames(requested: usize, max_latent_t: usize) -> usize {
+    let want = if requested == 0 { DEFAULT_CONTEXT_FRAMES } else { requested };
+    let mut snapped = ((want + 2) / 5) * 5 + 2;
+    let limit = max_latent_t.saturating_sub(5).max(2);
+    while snapped > limit && snapped > 2 {
+        snapped -= 5;
+    }
+    snapped.min(max_latent_t.saturating_sub(1).max(1))
+}
+
+/// Число пиксельных кадров, соответствующее `t_ctx` латентным кадрам хвоста H3 (`5m + 2` → `17m + 5`).
+pub fn overlap_frames_for_context(t_ctx: usize) -> usize {
+    if t_ctx <= 2 {
+        h3::config::FRAME_GRID_BASE
+    } else {
+        (t_ctx.saturating_sub(2) / 5) * h3::config::FRAME_GRID_STEP + h3::config::FRAME_GRID_BASE
+    }
+}
+
+/// Число аудио-латентных кадров (40 Гц), соответствующее `t_ctx` видеолатентам хвоста H3.
+pub fn audio_frames_for_context(t_ctx: usize) -> usize {
+    let px = overlap_frames_for_context(t_ctx);
+    ((px as f64 / FPS) * h3::config::AUDIO_LATENTS_PER_SECOND as f64).round() as usize
+}
 
 type R<T> = Result<T, String>;
 
@@ -58,13 +91,17 @@ pub struct H3Cond {
     keyframes: Vec<(usize, Tensor)>,
     ref_media: Vec<h3::refs::RefMedia>,
     refs: usize,
+    context: Option<TailLatent>,
 }
 
 impl H3Cond {
     pub fn label(&self) -> String {
         let g = &self.geometry;
-        let mut s = format!("{}×{}, {:.1} с", g.width, g.height, g.frame_count as f64 / h3::config::FPS);
-        if !self.keyframes.is_empty() {
+        let out_frames = g.frame_count.saturating_sub(self.context.as_ref().map(|t| t.meta.overlap_frames).unwrap_or(0));
+        let mut s = format!("{}×{}, {:.1} с", g.width, g.height, out_frames as f64 / h3::config::FPS);
+        if let Some(ctx) = &self.context {
+            s += &format!(", с хвоста ({} лат.)", ctx.meta.context_frames);
+        } else if !self.keyframes.is_empty() {
             s += &format!(", ключевых кадров {}", self.keyframes.len());
         }
         if self.refs > 0 {
@@ -81,8 +118,57 @@ pub struct H3Latent {
     audio: Tensor,
     pub width: usize,
     pub height: usize,
+    /// Число выходных кадров (уже без перекрытия хвоста).
     pub frames: usize,
+    /// Сколько первых пиксельных кадров — повтор хвоста предыдущего ролика (выбрасываются при декоде).
+    pub overlap_frames: usize,
     pub label: String,
+}
+
+impl H3Latent {
+    /// Извлечь латент хвоста (видео + звук) прямо из выхода денойзера до декодирования VAE.
+    pub fn tail(&self, context_frames: usize, model: &str) -> R<TailLatent> {
+        let vt_total = self.video.dims()[2];
+        let at_total = self.audio.dims()[3];
+        let t_ctx = snap_context_frames(context_frames, vt_total);
+        let overlap_frames = overlap_frames_for_context(t_ctx);
+        let a_ctx = audio_frames_for_context(t_ctx).min(at_total.saturating_sub(1).max(1));
+        let v_tail = self
+            .video
+            .narrow(2, vt_total - t_ctx, t_ctx)
+            .map_err(err)?
+            .contiguous()
+            .map_err(err)?
+            .to_device(Device::Cpu)
+            .map_err(err)?
+            .to_dtype(DType::F32)
+            .map_err(err)?;
+        let a_tail = self
+            .audio
+            .narrow(3, at_total - a_ctx, a_ctx)
+            .map_err(err)?
+            .contiguous()
+            .map_err(err)?
+            .to_device(Device::Cpu)
+            .map_err(err)?
+            .to_dtype(DType::F32)
+            .map_err(err)?;
+        Ok(TailLatent {
+            meta: TailMeta {
+                family: "h3".into(),
+                model: model.to_string(),
+                width: self.width,
+                height: self.height,
+                fps: FPS,
+                context_frames: t_ctx,
+                overlap_frames,
+                audio_frames: a_ctx,
+            },
+            video: v_tail,
+            audio: Some(a_tail),
+            video_stage1: None,
+        })
+    }
 }
 
 /// Режим памяти и настройки рантайма H3 — перед каждой стадией (как у `synaptix h3`).
@@ -130,12 +216,42 @@ impl H3Model {
     /// референсах задаёт длительность ролика.
     #[allow(clippy::too_many_arguments)]
     pub fn encode(&self, size: Size, prompt: &str, negative: Option<&str>, first: Option<&Path>, last: Option<&Path>, refs: &[PathBuf], ref_size: RefSize) -> R<H3Cond> {
+        self.encode_with_context(size, prompt, negative, first, last, refs, ref_size, None, None)
+    }
+
+    /// То же с опциональным латентом хвоста `context` (продолжение ролика без PNG).
+    /// Если подан `context`: `first` игнорируется, размер берётся из хвоста (несовпадение
+    /// модели/размера — явная ошибка), а длина `size.seconds` считается без перекрытия.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_with_context(
+        &self,
+        size: Size,
+        prompt: &str,
+        negative: Option<&str>,
+        first: Option<&Path>,
+        last: Option<&Path>,
+        refs: &[PathBuf],
+        ref_size: RefSize,
+        context: Option<TailLatent>,
+        model_id: Option<&str>,
+    ) -> R<H3Cond> {
         setup()?;
         let device = self.device;
         // Кратно 32: VAE ×16 и патч DiT 2×2 (720 → 704; при 16 падало на reshape).
         let snap = |v: usize| (v / 32).max(1) * 32;
-        let width = snap(if size.width > 0 { size.width } else { 1344 });
-        let height = snap(if size.height > 0 { size.height } else { 768 });
+        let (width, height, overlap_frames) = if let Some(ref ctx) = context {
+            let req_w = (size.width > 0).then(|| snap(size.width));
+            let req_h = (size.height > 0).then(|| snap(size.height));
+            ctx.meta.check_compat("h3", model_id, req_w, req_h, Some(FPS))?;
+            (ctx.meta.width, ctx.meta.height, ctx.meta.overlap_frames)
+        } else {
+            (
+                snap(if size.width > 0 { size.width } else { 1344 }),
+                snap(if size.height > 0 { size.height } else { 768 }),
+                0,
+            )
+        };
+        let first = if context.is_some() { None } else { first };
         let ref_sources = refs.iter().map(|p| h3::refs::RefSource::from_path(p, true)).collect::<Result<Vec<_>, _>>().map_err(err)?;
         h3::refs::validate(&ref_sources).map_err(err)?;
         if !ref_sources.is_empty() && (first.is_some() || last.is_some()) {
@@ -144,7 +260,13 @@ impl H3Model {
         let variant = if ref_sources.is_empty() { h3::config::H3Variant::Fl2va } else { h3::config::H3Variant::Ref2va };
         let source = h3::H3Source::open(&self.model, variant).map_err(err)?;
         let audio_secs = refs.iter().filter(|p| is_audio(p)).filter_map(|p| media_seconds(p)).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
-        let frame_count = h3::config::frames_for_duration(audio_secs.or((size.seconds > 0.0).then_some(size.seconds)).unwrap_or(5.0).clamp(1.0, 15.0));
+        let want_secs = audio_secs.or((size.seconds > 0.0).then_some(size.seconds)).unwrap_or(5.0).clamp(1.0, 15.0);
+        let frame_count = if overlap_frames > 0 {
+            let want_new = (want_secs * FPS).round() as usize;
+            h3::config::snap_frame_count(overlap_frames + want_new)
+        } else {
+            h3::config::frames_for_duration(want_secs)
+        };
         let geometry = h3::pipeline::Geometry::new(width, height, frame_count);
 
         let encoder_source = match &self.encoder {
@@ -195,7 +317,7 @@ impl H3Model {
         };
         drop(encoder);
         h3::memory::trim_pool(device);
-        Ok(H3Cond { source, geometry, cond, negative, keyframes, ref_media, refs: refs.len() })
+        Ok(H3Cond { source, geometry, cond, negative, keyframes, ref_media, refs: refs.len(), context })
     }
 
     /// Денойз видео и звука. `source_video` — перерисовка ролика с силой
@@ -226,6 +348,13 @@ impl H3Model {
         }
         dreq.seed = Some(seed);
         dreq.keyframes = c.keyframes.iter().map(|(i, _)| h3::layout::Keyframe { resolved_frame_index: *i }).collect();
+        let overlap_frames = if let Some(ref ctx) = c.context {
+            dreq.prefix_video = Some(ctx.video.clone());
+            dreq.prefix_audio = ctx.audio.clone();
+            ctx.meta.overlap_frames
+        } else {
+            0
+        };
 
         let ref_media = &c.ref_media;
         if !ref_media.is_empty() {
@@ -271,7 +400,7 @@ impl H3Model {
             dreq.init_video = Some(v0);
             dreq.init_audio = Some(a0);
         }
-        h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0, self.lora.is_some()));
+        h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0 || c.context.is_some(), self.lora.is_some()));
         let dit = h3::dit::H3Dit::load(&ckpt, device, COMPUTE, quant_dit).map_err(err)?;
         let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
         if !c.keyframes.is_empty() {
@@ -297,10 +426,12 @@ impl H3Model {
         drop(dit);
         h3::memory::trim_pool(device);
         let label = format!("MiniMax-H3 {}, {steps} шагов", c.label());
-        Ok(H3Latent { source: source.clone(), video: lat.video_latent, audio: lat.audio_latent, width: geometry.width, height: geometry.height, frames: geometry.frame_count, label })
+        let out_frames = geometry.frame_count.saturating_sub(overlap_frames);
+        Ok(H3Latent { source: source.clone(), video: lat.video_latent, audio: lat.audio_latent, width: geometry.width, height: geometry.height, frames: out_frames, overlap_frames, label })
     }
 
-    /// Латент видео → кадры `[3,H,W]` 0..1 (24 к/с).
+    /// Латент видео → кадры `[3,H,W]` 0..1 (24 к/с). При продолжении с хвоста
+    /// декодируется полный латент (для прогрева ViT VAE), затем перекрытие отрезается.
     pub fn decode_video(&self, lat: &H3Latent) -> R<Vec<Tensor>> {
         setup()?;
         let device = self.device;
@@ -311,10 +442,14 @@ impl H3Model {
         drop(vdec);
         drop(vw);
         h3::memory::trim_pool(device);
-        h3::vae::rgb_to_frames(&rgb).map_err(err)
+        let mut frames = h3::vae::rgb_to_frames(&rgb).map_err(err)?;
+        if lat.overlap_frames > 0 && frames.len() > lat.overlap_frames {
+            frames.drain(0..lat.overlap_frames);
+        }
+        Ok(frames)
     }
 
-    /// Латент звука → перемежённые отсчёты, частота, каналы.
+    /// Латент звука → перемежённые отсчёты, частота, каналы (с обрезкой перекрытия хвоста).
     pub fn decode_audio(&self, lat: &H3Latent) -> R<(Vec<f32>, u32, u16)> {
         setup()?;
         let device = self.device;
@@ -322,12 +457,19 @@ impl H3Model {
         let aw = h3::loader::ComponentLoader::open_component(&lat.source, h3::H3Component::AudioVae, device).map_err(err)?;
         let adec = h3::audio_vae::AudioVae::load_decoder(&aw, ckpt.audio_vae_config().map_err(err)?, device, COMPUTE).map_err(err)?;
         let wave = adec.decode(&lat.audio).map_err(err)?;
-        let sample_rate = adec.sample_rate();
+        let sample_rate = adec.sample_rate() as u32;
         drop(adec);
         h3::memory::trim_pool(device);
-        let pcm = h3::audio_vae::interleave_stereo(&wave).map_err(err)?;
+        let mut pcm = h3::audio_vae::interleave_stereo(&wave).map_err(err)?;
         let channels = wave.dims()[1] as u16;
-        Ok((pcm, sample_rate as u32, channels))
+        if lat.overlap_frames > 0 {
+            let cut_frames = ((lat.overlap_frames as f64 / FPS) * sample_rate as f64).round() as usize;
+            let cut_samples = (cut_frames * channels as usize).min(pcm.len());
+            if cut_samples > 0 && cut_samples < pcm.len() {
+                pcm.drain(0..cut_samples);
+            }
+        }
+        Ok((pcm, sample_rate, channels))
     }
 }
 

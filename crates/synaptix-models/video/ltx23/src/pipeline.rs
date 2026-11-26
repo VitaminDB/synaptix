@@ -996,6 +996,48 @@ pub fn denoise_av(
     seed: Option<u64>,
     hooks: &DenoiseHooks,
 ) -> Result<(Tensor, Tensor), LtxError> {
+    denoise_av_cond(
+        dit,
+        video_encoding,
+        audio_encoding,
+        fp,
+        hp,
+        wp,
+        sigmas,
+        v_init,
+        a_init,
+        fps,
+        device,
+        v_nag,
+        v_conds,
+        &[],
+        seed,
+        hooks,
+    )
+}
+
+/// Joint A/V денойз-петля с replace-conditioning и на видео (`v_conds`), и на
+/// звуке (`a_conds`: `(start_token, tokens [1,n,128], strength)`). Используется
+/// для продолжения ролика по латенту хвоста (видео + звук заморожены в начале).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_cond(
+    dit: &AvDit,
+    video_encoding: &Tensor,
+    audio_encoding: &Tensor,
+    fp: usize,
+    hp: usize,
+    wp: usize,
+    sigmas: &[f64],
+    v_init: Option<&Tensor>,
+    a_init: Option<&Tensor>,
+    fps: f64,
+    device: Device,
+    v_nag: Option<(&Tensor, f32, f32, f32)>,
+    v_conds: &[(usize, Tensor, f32)],
+    a_conds: &[(usize, Tensor, f32)],
+    seed: Option<u64>,
+    hooks: &DenoiseHooks,
+) -> Result<(Tensor, Tensor), LtxError> {
     let tv = fp * hp * wp;
     let v_pos = pixel_coords(fp, hp, wp, fps);
     let ddt = dit.compute_dtype();
@@ -1057,6 +1099,42 @@ pub fn denoise_av(
         v_mask = Some(m);
     }
 
+    // replace-conditioning аудио-потока (хвост предыдущего ролика в начале)
+    let a_cond = !a_conds.is_empty();
+    let mut a_mask_v = vec![1f32; fa];
+    let (mut a_mask, mut a_inv_mask, mut a_clean) = (None, None, None);
+    if a_cond {
+        for (start, toks, strength) in a_conds {
+            let n = toks.dims()[1].min(fa.saturating_sub(*start));
+            for k in *start..(*start + n) {
+                a_mask_v[k] = 1.0 - *strength;
+            }
+        }
+        for (start, toks, _) in a_conds {
+            let n = toks.dims()[1].min(fa.saturating_sub(*start));
+            if n == 0 {
+                continue;
+            }
+            let toks = toks.narrow(1, 0, n)?.contiguous()?.to_device(device)?.to_dtype(ddt)?;
+            let pre = if *start > 0 { Some(a_tok.narrow(1, 0, *start)?.contiguous()?) } else { None };
+            let post = if start + n < fa {
+                Some(a_tok.narrow(1, start + n, fa - start - n)?.contiguous()?)
+            } else {
+                None
+            };
+            let mut parts: Vec<Tensor> = Vec::new();
+            if let Some(p) = &pre { parts.push(p.clone()); }
+            parts.push(toks);
+            if let Some(p) = &post { parts.push(p.clone()); }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            a_tok = Tensor::cat(&refs, 1)?.contiguous()?;
+        }
+        let m = Tensor::from_vec(a_mask_v.clone(), vec![1, fa, 1], device)?.to_dtype(ddt)?;
+        a_inv_mask = Some(m.affine(-1.0, 1.0)?);
+        a_clean = Some(a_tok.clone());
+        a_mask = Some(m);
+    }
+
     let prof = crate::runtime::ltx_prof();
     let ord = if let Device::Cuda(o) = device { o } else { 0 };
     let sync = || { let _ = synaptix_core::device::cuda::synchronize(ord); };
@@ -1097,7 +1175,11 @@ pub fn denoise_av(
         } else {
             vec![sigma as f32; tv]
         };
-        let a_ts = vec![sigma as f32; fa];
+        let a_ts: Vec<f32> = if a_cond {
+            a_mask_v.iter().map(|&m| m * sigma as f32).collect()
+        } else {
+            vec![sigma as f32; fa]
+        };
         let t_step = std::time::Instant::now();
         // компакт только перед ПЕРВЫМ шагом (после upsample-каши); на остальных
         // границах weights-пул держит карусель, а sync+trim стоит ~1s/шаг
@@ -1119,7 +1201,16 @@ pub fn denoise_av(
         } else {
             v_tok = v_tok.add(&v_vel.mul_scalar(dt)?)?;
         }
-        a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        if a_cond {
+            let m = a_mask.as_ref().unwrap();
+            let inv = a_inv_mask.as_ref().unwrap();
+            let clean = a_clean.as_ref().unwrap();
+            let adt = m.mul_scalar(dt)?;
+            a_tok = a_tok.add(&a_vel.broadcast_mul(&adt)?)?;
+            a_tok = a_tok.broadcast_mul(m)?.add(&clean.broadcast_mul(inv)?)?;
+        } else {
+            a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        }
         if prof { sync(); eprintln!("[LTX_PROF] av step {i} (Tv {tv} Ta {fa}): {:.2}s", t_step.elapsed().as_secs_f32()); }
         hooks.emit(i + 1, max_steps, sigma_next);
     }

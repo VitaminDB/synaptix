@@ -226,6 +226,12 @@ pub struct DenoiseRequest<'a> {
     pub init_audio: Option<Tensor>,
     pub visual_cond_aug: Option<f32>,
     pub audio_cond_aug: Option<f32>,
+    /// Хвост видео-латента предыдущего ролика `[1, 24, T_ctx, H, W]`: ставится
+    /// в начало целевого видео и замораживается с ролью `VisualCond`.
+    pub prefix_video: Option<Tensor>,
+    /// Хвост аудио-латента предыдущего ролика `[1, 32, 2, A_ctx]`: ставится в
+    /// начало целевого аудио и замораживается с ролью `AudioCond`.
+    pub prefix_audio: Option<Tensor>,
 }
 
 impl<'a> DenoiseRequest<'a> {
@@ -244,6 +250,8 @@ impl<'a> DenoiseRequest<'a> {
             init_audio: None,
             visual_cond_aug: None,
             audio_cond_aug: None,
+            prefix_video: None,
+            prefix_audio: None,
         }
     }
 }
@@ -273,11 +281,14 @@ pub fn prepare(
     dump_tensor("cond_hidden", &req.cond.context);
     dump_text("cond_tags", &format!("{:?}", req.cond.text_tags));
     let text_len = req.cond.context.dims()[1];
+    let prefix_vt = req.prefix_video.as_ref().map(|t| t.dims().get(2).copied().unwrap_or(0)).unwrap_or(0);
+    let prefix_at = req.prefix_audio.as_ref().map(|t| t.dims().get(3).copied().unwrap_or(0)).unwrap_or(0);
     let layout = PackedLayout::build(
         &LayoutRequest::new(text_len, g.latent_t, g.latent_h, g.latent_w, g.audio_t)
             .with_frame_count(g.frame_count)
             .with_keyframes(req.keyframes.clone())
-            .with_refs(req.refs.clone()),
+            .with_refs(req.refs.clone())
+            .with_prefix(prefix_vt, prefix_at),
     )?;
     dump_text(
         "positions",
@@ -542,6 +553,78 @@ pub fn denoise_av(
     let cond_video = cast(&req.cond_rows.video)?;
     let cond_audio = cast(&req.cond_rows.audio)?;
 
+    // Префикс-контекст (продолжение с хвоста): замороженные первые кадры видео и звука.
+    let v_prefix: Option<(Tensor, Tensor, usize)> = match &req.prefix_video {
+        Some(pv) => {
+            let d = pv.dims();
+            if d.len() != 5 || d[0] != 1 || d[1] != cfg.latents_dim || d[3] != g.latent_h || d[4] != g.latent_w {
+                return Err(H3Error::Layout(format!(
+                    "prefix_video {:?} не совпадает с целевой сеткой [1, {}, *, {}, {}]",
+                    d, cfg.latents_dim, g.latent_h, g.latent_w
+                )));
+            }
+            let pt = d[2];
+            if pt == 0 || pt >= g.latent_t {
+                return Err(H3Error::Layout(format!(
+                    "prefix_video T={pt} вне допустимого диапазона 1..{}",
+                    g.latent_t
+                )));
+            }
+            let exact = pv.to_device(device)?.to_dtype(compute)?;
+            let aug = req.visual_cond_aug.unwrap_or(VISUAL_COND_TIMESTEP);
+            let noisy = if aug < 1.0 {
+                let p32 = pv.to_device(device)?.to_dtype(DType::F32)?;
+                apply_noise_aug(&p32, aug, req.seed.unwrap_or(0))?.to_dtype(compute)?
+            } else {
+                exact.clone()
+            };
+            Some((exact, noisy, pt))
+        }
+        None => None,
+    };
+    let a_prefix: Option<(Tensor, Tensor, usize)> = match &req.prefix_audio {
+        Some(pa) => {
+            let d = pa.dims();
+            if d.len() != 4 || d[0] != 1 || d[1] != cfg.audio_latents_dim || d[2] != 2 {
+                return Err(H3Error::Layout(format!(
+                    "prefix_audio {:?} не совпадает с целевым форматом [1, {}, 2, *]",
+                    d, cfg.audio_latents_dim
+                )));
+            }
+            let pt = d[3];
+            if pt == 0 || pt >= g.audio_t {
+                return Err(H3Error::Layout(format!(
+                    "prefix_audio T={pt} вне допустимого диапазона 1..{}",
+                    g.audio_t
+                )));
+            }
+            let exact = pa.to_device(device)?.to_dtype(compute)?;
+            let aug = req.audio_cond_aug.unwrap_or(AUDIO_COND_TIMESTEP);
+            let noisy = if aug < 1.0 {
+                let p32 = pa.to_device(device)?.to_dtype(DType::F32)?;
+                apply_noise_aug(&p32, aug, req.seed.unwrap_or(0).wrapping_add(1))?.to_dtype(compute)?
+            } else {
+                exact.clone()
+            };
+            Some((exact, noisy, pt))
+        }
+        None => None,
+    };
+    let splice_v = |cur: &Tensor, pref: &Tensor, pt: usize| -> R<Tensor> {
+        let rest = cur.narrow(2, pt, g.latent_t - pt)?.contiguous()?;
+        Tensor::cat(&[pref, &rest], 2)
+    };
+    let splice_a = |cur: &Tensor, pref: &Tensor, pt: usize| -> R<Tensor> {
+        let rest = cur.narrow(3, pt, g.audio_t - pt)?.contiguous()?;
+        Tensor::cat(&[pref, &rest], 3)
+    };
+    if let Some((_, ref p_in, pt)) = v_prefix {
+        v_lat = splice_v(&v_lat, p_in, pt)?;
+    }
+    if let Some((_, ref p_in, pt)) = a_prefix {
+        a_lat = splice_a(&a_lat, p_in, pt)?;
+    }
+
     let steps = sched.steps();
     let patch = cfg.patch_size;
     let mut old_denoised_v: Option<Tensor> = None;
@@ -656,6 +739,20 @@ pub fn denoise_av(
                 )?;
             }
         }
+        if let Some((_, ref p_in, pt)) = v_prefix {
+            v_lat = splice_v(&v_lat, p_in, pt)?;
+        }
+        if let Some((_, ref p_in, pt)) = a_prefix {
+            a_lat = splice_a(&a_lat, p_in, pt)?;
+        }
+        let denoised_v = match &v_prefix {
+            Some((exact, _, pt)) => splice_v(&denoised_v, exact, *pt)?,
+            None => denoised_v,
+        };
+        let denoised_a = match &a_prefix {
+            Some((exact, _, pt)) => splice_a(&denoised_a, exact, *pt)?,
+            None => denoised_a,
+        };
         old_denoised_v = Some(denoised_v.clone());
         old_denoised_a = Some(denoised_a);
 
@@ -672,6 +769,12 @@ pub fn denoise_av(
                 tensor_stats("a_lat", &a_lat)
             );
         }
+    }
+    if let Some((ref exact, _, pt)) = v_prefix {
+        v_lat = splice_v(&v_lat, exact, pt)?;
+    }
+    if let Some((ref exact, _, pt)) = a_prefix {
+        a_lat = splice_a(&a_lat, exact, pt)?;
     }
     hooks.report(steps, steps, sched.video_sigma(steps));
 

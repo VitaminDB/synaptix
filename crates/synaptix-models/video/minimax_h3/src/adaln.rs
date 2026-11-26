@@ -132,6 +132,50 @@ pub fn mod_segments(
                 continue;
             }
         }
+        if seg.kind == SegmentKind::Video && layout.prefix_video_t > 0 {
+            let pref_rows = (layout.prefix_video_t * layout.frame_rows).min(seg.len());
+            if pref_rows > 0 {
+                let cond_base = roles.index(TimeRole::VisualCond) * ADALN_MODALITIES;
+                out.push(ModSegment {
+                    start: seg.start,
+                    stop: seg.start + pref_rows,
+                    row: cond_base + crate::config::MODALITY_VIDEO,
+                });
+            }
+            if seg.start + pref_rows < seg.stop {
+                out.push(ModSegment {
+                    start: seg.start + pref_rows,
+                    stop: seg.stop,
+                    row: role_base + crate::config::MODALITY_VIDEO,
+                });
+            }
+            continue;
+        }
+        if seg.kind == SegmentKind::Audio && layout.prefix_audio_t > 0 && layout.audio_t > 0 {
+            // Аудио упаковано поканально: [ch0: 0..audio_t, ch1: audio_t..2*audio_t].
+            let at = layout.audio_t;
+            let pa = layout.prefix_audio_t.min(at);
+            let cond_base = roles.index(TimeRole::AudioCond) * ADALN_MODALITIES;
+            let channels = seg.len() / at;
+            for ch in 0..channels {
+                let ch_start = seg.start + ch * at;
+                if pa > 0 {
+                    out.push(ModSegment {
+                        start: ch_start,
+                        stop: ch_start + pa,
+                        row: cond_base + crate::config::MODALITY_AUDIO,
+                    });
+                }
+                if pa < at {
+                    out.push(ModSegment {
+                        start: ch_start + pa,
+                        stop: ch_start + at,
+                        row: role_base + crate::config::MODALITY_AUDIO,
+                    });
+                }
+            }
+            continue;
+        }
         out.push(ModSegment {
             start: seg.start,
             stop: seg.stop,
@@ -337,4 +381,44 @@ pub fn stack_steps(per_step: Vec<Tensor>, dtype: DType) -> Result<Tensor, H3Erro
     let refs: Vec<&Tensor> = per_step.iter().collect();
     let t = Tensor::stack(&refs, 0)?;
     Ok(if t.dtype() == dtype { t } else { t.to_dtype(dtype)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{MODALITY_AUDIO, MODALITY_VIDEO};
+    use crate::layout::{LayoutRequest, PackedLayout};
+
+    #[test]
+    fn prefix_splits_video_and_stereo_audio_segments() {
+        let req = LayoutRequest::new(16, 12, 6, 8, 40).with_prefix(7, 15);
+        let layout = PackedLayout::build(&req).unwrap();
+        assert!(layout.has_visual_cond());
+        assert!(layout.has_audio_cond());
+        let roles = RoleTable::for_layout(&layout);
+        assert_eq!(roles.roles, vec![TimeRole::Base, TimeRole::Audio, TimeRole::VisualCond, TimeRole::AudioCond]);
+
+        let segs = mod_segments(&layout, &roles, None);
+        let frame_rows = (6 / 2) * (8 / 2); // 12 tokens per latent video frame
+        let vis_row = roles.index(TimeRole::VisualCond) * ADALN_MODALITIES + MODALITY_VIDEO;
+        let base_vid_row = roles.index(TimeRole::Base) * ADALN_MODALITIES + MODALITY_VIDEO;
+        let aud_cond_row = roles.index(TimeRole::AudioCond) * ADALN_MODALITIES + MODALITY_AUDIO;
+        let aud_row = roles.index(TimeRole::Audio) * ADALN_MODALITIES + MODALITY_AUDIO;
+
+        let vid_seg = layout.segments.iter().find(|s| s.kind == SegmentKind::Video).unwrap();
+        let vid_mods: Vec<_> = segs.iter().filter(|m| m.start >= vid_seg.start && m.stop <= vid_seg.stop).collect();
+        assert_eq!(vid_mods.len(), 2);
+        assert_eq!(vid_mods[0].row, vis_row);
+        assert_eq!(vid_mods[0].stop - vid_mods[0].start, 7 * frame_rows);
+        assert_eq!(vid_mods[1].row, base_vid_row);
+        assert_eq!(vid_mods[1].stop - vid_mods[1].start, 5 * frame_rows);
+
+        let aud_seg = layout.segments.iter().find(|s| s.kind == SegmentKind::Audio).unwrap();
+        let aud_mods: Vec<_> = segs.iter().filter(|m| m.start >= aud_seg.start && m.stop <= aud_seg.stop).collect();
+        assert_eq!(aud_mods.len(), 4);
+        assert_eq!((aud_mods[0].row, aud_mods[0].stop - aud_mods[0].start), (aud_cond_row, 15));
+        assert_eq!((aud_mods[1].row, aud_mods[1].stop - aud_mods[1].start), (aud_row, 25));
+        assert_eq!((aud_mods[2].row, aud_mods[2].stop - aud_mods[2].start), (aud_cond_row, 15));
+        assert_eq!((aud_mods[3].row, aud_mods[3].stop - aud_mods[3].start), (aud_row, 25));
+    }
 }

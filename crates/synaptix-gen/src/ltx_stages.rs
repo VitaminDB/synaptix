@@ -26,7 +26,11 @@ use synaptix_video_ltx23::loader::LoraWeights;
 use synaptix_video_ltx23::pipeline as lp;
 use synaptix_video_ltx23::LtxCheckpoint;
 
+use crate::tail::{TailLatent, TailMeta};
 use crate::video::LtxPaths;
+
+/// Число латентных кадров хвоста по умолчанию для LTX-2.3 (3 лат. кадра = 17 пикс. ≈ 0.71 с).
+pub const DEFAULT_CONTEXT_FRAMES: usize = 3;
 
 type R<T> = Result<T, String>;
 
@@ -94,6 +98,10 @@ pub struct LtxLatent {
     pub hp: usize,
     pub wp: usize,
     pub fps: f64,
+    /// Сколько первых пиксельных кадров — повтор хвоста предыдущего ролика (выбрасываются при декоде).
+    pub overlap_frames: usize,
+    /// Опциональный латент Stage1 (половинной сетки) для бесшовного двухстадийного продолжения.
+    pub stage1_video: Option<Tensor>,
     pub label: String,
 }
 
@@ -105,7 +113,64 @@ impl LtxLatent {
         self.hp * 32
     }
     pub fn seconds(&self) -> f64 {
-        lp::out_frame_count(self.fp) as f64 / self.fps
+        lp::out_frame_count(self.fp).saturating_sub(self.overlap_frames) as f64 / self.fps
+    }
+
+    /// Извлечь латент хвоста (видео + звук) до декодирования VAE.
+    pub fn tail(&self, context_frames: usize, model: &str) -> R<TailLatent> {
+        let want = if context_frames == 0 { DEFAULT_CONTEXT_FRAMES } else { context_frames };
+        let t_ctx = want.clamp(1, self.fp.saturating_sub(1).max(1));
+        let overlap_frames = lp::out_frame_count(t_ctx);
+        let v_tail = self
+            .video
+            .narrow(2, self.fp - t_ctx, t_ctx)
+            .map_err(err)?
+            .contiguous()
+            .map_err(err)?
+            .to_device(Device::Cpu)
+            .map_err(err)?
+            .to_dtype(DType::F32)
+            .map_err(err)?;
+        let fa_total = self.audio.dims()[1];
+        let fa_ctx = lp::audio_token_count(t_ctx, self.fps).min(fa_total.saturating_sub(1).max(1));
+        let a_tail = self
+            .audio
+            .narrow(1, fa_total - fa_ctx, fa_ctx)
+            .map_err(err)?
+            .contiguous()
+            .map_err(err)?
+            .to_device(Device::Cpu)
+            .map_err(err)?
+            .to_dtype(DType::F32)
+            .map_err(err)?;
+        let s1_tail = match &self.stage1_video {
+            Some(s1) if s1.dims()[2] >= t_ctx => Some(
+                s1.narrow(2, s1.dims()[2] - t_ctx, t_ctx)
+                    .map_err(err)?
+                    .contiguous()
+                    .map_err(err)?
+                    .to_device(Device::Cpu)
+                    .map_err(err)?
+                    .to_dtype(DType::F32)
+                    .map_err(err)?,
+            ),
+            _ => None,
+        };
+        Ok(TailLatent {
+            meta: TailMeta {
+                family: "ltx".into(),
+                model: model.to_string(),
+                width: self.width(),
+                height: self.height(),
+                fps: self.fps,
+                context_frames: t_ctx,
+                overlap_frames,
+                audio_frames: fa_ctx,
+            },
+            video: v_tail,
+            audio: Some(a_tail),
+            video_stage1: s1_tail,
+        })
     }
 }
 
@@ -404,17 +469,91 @@ impl LtxModel {
 
     /// Stage1: денойз на половинной сетке (с NAG и картинкой-условием).
     pub fn stage1(&self, cond: &LtxCond, nag: Option<&LtxNag>, image: Option<&LtxImage>, shape: Shape, seed: u64, h: &Hooks) -> R<LtxLatent> {
+        self.stage1_with_context(cond, nag, image, None, None, shape, seed, h)
+    }
+
+    /// Stage1 с опциональным латентом хвоста `context` (продолжение ролика).
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage1_with_context(
+        &self,
+        cond: &LtxCond,
+        nag: Option<&LtxNag>,
+        image: Option<&LtxImage>,
+        context: Option<&TailLatent>,
+        model_id: Option<&str>,
+        shape: Shape,
+        seed: u64,
+        h: &Hooks,
+    ) -> R<LtxLatent> {
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
         let dev = self.device;
-        let fps = shape.fps;
-        let (hp, wp) = shape.grid();
-        let fp = shape.fp();
+        let (fps, hp, wp, fp, overlap_frames) = if let Some(ctx) = context {
+            let req_w = (shape.width > 0).then_some(shape.width);
+            let req_h = (shape.height > 0).then_some(shape.height);
+            ctx.meta.check_compat("ltx", model_id, req_w, req_h, (shape.fps > 0.0).then_some(shape.fps))?;
+            let (hp, wp) = lp::latent_grid(ctx.meta.width, ctx.meta.height);
+            let want_secs = if shape.seconds > 0.0 { shape.seconds } else { 5.0 };
+            let fp_new = ((want_secs * ctx.meta.fps) / 8.0).round().max(1.0) as usize;
+            (ctx.meta.fps, hp, wp, ctx.meta.context_frames + fp_new, ctx.meta.overlap_frames)
+        } else {
+            let (hp, wp) = shape.grid();
+            (shape.fps, hp, wp, shape.fp(), 0)
+        };
         let (hp1, wp1) = lp::stage1_grid(hp, wp);
-        let toks = image.map(|i| self.image_tokens(&i.image, hp1, wp1)).transpose()?;
         let dit = self.dit(fp * hp * wp)?;
         let on_step = |p: lp::DenoiseProgress| (h.progress)(p.step, p.total);
         let hooks = self.hooks(h, &on_step);
         let v_nag = nag.map(|n| (&n.enc, n.scale, n.alpha, n.tau));
+        if let Some(ctx) = context {
+            // Если хвост содержит половинную сетку (video_stage1) — используем её,
+            // иначе если video уже на сетке (hp1, wp1) — берём video, иначе работаем на полной сетке.
+            let (gh, gw, v_pref) = match &ctx.video_stage1 {
+                Some(s1) if s1.dims()[3] == hp1 && s1.dims()[4] == wp1 => (hp1, wp1, s1),
+                _ if ctx.video.dims()[3] == hp1 && ctx.video.dims()[4] == wp1 => (hp1, wp1, &ctx.video),
+                _ => (ctx.video.dims()[3], ctx.video.dims()[4], &ctx.video),
+            };
+            let t_ctx = v_pref.dims()[2];
+            let v_tok = v_pref
+                .reshape(vec![1, 128, t_ctx * gh * gw])
+                .and_then(|t| t.transpose(1, 2))
+                .and_then(|t| t.contiguous())
+                .map_err(err)?;
+            let a_conds: Vec<(usize, Tensor, f32)> = match &ctx.audio {
+                Some(a) => vec![(0, a.clone(), 1.0)],
+                None => Vec::new(),
+            };
+            let (v, a) = lp::denoise_av_cond(
+                &dit.dit,
+                &cond.video,
+                &cond.audio,
+                fp,
+                gh,
+                gw,
+                &lp::DISTILLED_SIGMAS,
+                None,
+                None,
+                fps,
+                dev,
+                v_nag,
+                &[(0, v_tok, 1.0)],
+                &a_conds,
+                Some(seed),
+                &hooks,
+            )
+            .map_err(ltx_err)?;
+            return Ok(LtxLatent {
+                video: v,
+                audio: a,
+                fp,
+                hp: gh,
+                wp: gw,
+                fps,
+                overlap_frames,
+                stage1_video: None,
+                label: format!("LTX-2.3 Stage1 {}×{}, с хвоста ({t_ctx} лат.)", gw * 32, gh * 32),
+            });
+        }
+        let toks = image.map(|i| self.image_tokens(&i.image, hp1, wp1)).transpose()?;
         let (v, a) = match (image, &toks) {
             (Some(i), Some(t)) if i.frame > 0 => {
                 let pos = lp::keyframe_positions(hp1, wp1, i.frame, fps);
@@ -423,7 +562,7 @@ impl LtxModel {
             (Some(i), Some(t)) => lp::denoise_av(&dit.dit, &cond.video, &cond.audio, fp, hp1, wp1, &lp::DISTILLED_SIGMAS, None, None, fps, dev, v_nag, &[(0, t.clone(), i.strength)], Some(seed), &hooks).map_err(ltx_err)?,
             _ => lp::denoise_av(&dit.dit, &cond.video, &cond.audio, fp, hp1, wp1, &lp::DISTILLED_SIGMAS, None, None, fps, dev, v_nag, &[], Some(seed), &hooks).map_err(ltx_err)?,
         };
-        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1, wp: wp1, fps, label: format!("LTX-2.3 Stage1 {}×{}", wp1 * 32, hp1 * 32) })
+        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1, wp: wp1, fps, overlap_frames: 0, stage1_video: None, label: format!("LTX-2.3 Stage1 {}×{}", wp1 * 32, hp1 * 32) })
     }
 
     /// Апскейл латента ×2 (звук — как был).
@@ -438,17 +577,85 @@ impl LtxModel {
         let v = up.upsample(&lat.video).map_err(err)?.to_dtype(COMPUTE).map_err(err)?;
         drop(up);
         synaptix_core::tensor::ops::conv_filter_cache_clear();
-        Ok(LtxLatent { video: v, audio: lat.audio.clone(), fp: lat.fp, hp: lat.hp * 2, wp: lat.wp * 2, fps: lat.fps, label: format!("{} → ×2", lat.label) })
+        Ok(LtxLatent {
+            video: v,
+            audio: lat.audio.clone(),
+            fp: lat.fp,
+            hp: lat.hp * 2,
+            wp: lat.wp * 2,
+            fps: lat.fps,
+            overlap_frames: lat.overlap_frames,
+            stage1_video: Some(lat.video.clone()),
+            label: format!("{} → ×2", lat.label),
+        })
     }
 
     /// Stage2: доводка латента (после апскейла) с тем же условием.
     pub fn stage2(&self, lat: &LtxLatent, cond: &LtxCond, image: Option<&LtxImage>, seed: u64, h: &Hooks) -> R<LtxLatent> {
+        self.stage2_with_context(lat, cond, image, None, seed, h)
+    }
+
+    /// Stage2 с опциональным латентом хвоста `context` (заморозка полного разрешения на доводке).
+    pub fn stage2_with_context(
+        &self,
+        lat: &LtxLatent,
+        cond: &LtxCond,
+        image: Option<&LtxImage>,
+        context: Option<&TailLatent>,
+        seed: u64,
+        h: &Hooks,
+    ) -> R<LtxLatent> {
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
         let dev = self.device;
-        let toks = image.map(|i| self.image_tokens(&i.image, lat.hp, lat.wp)).transpose()?;
         let dit = self.dit(lat.fp * lat.hp * lat.wp)?;
         let on_step = |p: lp::DenoiseProgress| (h.progress)(p.step, p.total);
         let hooks = self.hooks(h, &on_step);
+        if let Some(ctx) = context {
+            if ctx.video.dims()[3] == lat.hp && ctx.video.dims()[4] == lat.wp {
+                let t_ctx = ctx.video.dims()[2];
+                let v_tok = ctx
+                    .video
+                    .reshape(vec![1, 128, t_ctx * lat.hp * lat.wp])
+                    .and_then(|t| t.transpose(1, 2))
+                    .and_then(|t| t.contiguous())
+                    .map_err(err)?;
+                let a_conds: Vec<(usize, Tensor, f32)> = match &ctx.audio {
+                    Some(a) => vec![(0, a.clone(), 1.0)],
+                    None => Vec::new(),
+                };
+                let (v, a) = lp::denoise_av_cond(
+                    &dit.dit,
+                    &cond.video,
+                    &cond.audio,
+                    lat.fp,
+                    lat.hp,
+                    lat.wp,
+                    &lp::STAGE2_SIGMAS,
+                    Some(&lat.video),
+                    Some(&lat.audio),
+                    lat.fps,
+                    dev,
+                    None,
+                    &[(0, v_tok, 1.0)],
+                    &a_conds,
+                    Some(seed),
+                    &hooks,
+                )
+                .map_err(ltx_err)?;
+                return Ok(LtxLatent {
+                    video: v,
+                    audio: a,
+                    fp: lat.fp,
+                    hp: lat.hp,
+                    wp: lat.wp,
+                    fps: lat.fps,
+                    overlap_frames: lat.overlap_frames.max(ctx.meta.overlap_frames),
+                    stage1_video: lat.stage1_video.clone(),
+                    label: format!("LTX-2.3 {}×{}, с хвоста ({t_ctx} лат.)", lat.wp * 32, lat.hp * 32),
+                });
+            }
+        }
+        let toks = image.map(|i| self.image_tokens(&i.image, lat.hp, lat.wp)).transpose()?;
         let (v, a) = match (image, &toks) {
             (Some(i), Some(t)) if i.frame > 0 => {
                 let pos = lp::keyframe_positions(lat.hp, lat.wp, i.frame, lat.fps);
@@ -457,7 +664,17 @@ impl LtxModel {
             (Some(i), Some(t)) => lp::denoise_av(&dit.dit, &cond.video, &cond.audio, lat.fp, lat.hp, lat.wp, &lp::STAGE2_SIGMAS, Some(&lat.video), Some(&lat.audio), lat.fps, dev, None, &[(0, t.clone(), i.strength)], Some(seed), &hooks).map_err(ltx_err)?,
             _ => lp::denoise_av(&dit.dit, &cond.video, &cond.audio, lat.fp, lat.hp, lat.wp, &lp::STAGE2_SIGMAS, Some(&lat.video), Some(&lat.audio), lat.fps, dev, None, &[], Some(seed), &hooks).map_err(ltx_err)?,
         };
-        Ok(LtxLatent { video: v, audio: a, fp: lat.fp, hp: lat.hp, wp: lat.wp, fps: lat.fps, label: format!("LTX-2.3 {}×{}", lat.wp * 32, lat.hp * 32) })
+        Ok(LtxLatent {
+            video: v,
+            audio: a,
+            fp: lat.fp,
+            hp: lat.hp,
+            wp: lat.wp,
+            fps: lat.fps,
+            overlap_frames: lat.overlap_frames,
+            stage1_video: lat.stage1_video.clone(),
+            label: format!("LTX-2.3 {}×{}", lat.wp * 32, lat.hp * 32),
+        })
     }
 
     /// Retake: перегенерировать отрезок `start..end` (с) исходного ролика.
@@ -477,7 +694,7 @@ impl LtxModel {
         let on_step = |p: lp::DenoiseProgress| (h.progress)(p.step, p.total);
         let hooks = self.hooks(h, &on_step);
         let (v, a) = lp::denoise_av_retake(&dit.dit, &cond.video, &cond.audio, fp, hp, wp, &lp::DISTILLED_SIGMAS, &source, start, end, fps, dev, Some(seed), &hooks).map_err(ltx_err)?;
-        Ok(LtxLatent { video: v, audio: a, fp, hp, wp, fps, label: format!("LTX-2.3 retake {start:.1}–{end:.1} с") })
+        Ok(LtxLatent { video: v, audio: a, fp, hp, wp, fps, overlap_frames: 0, stage1_video: None, label: format!("LTX-2.3 retake {start:.1}–{end:.1} с") })
     }
 
     /// IC-LoRA: ролик по образцу (масштаб `downscale`, сила `strength`,
@@ -512,7 +729,7 @@ impl LtxModel {
             Control::Canny { .. } => "по контурам образца",
             Control::Depth => "по глубине образца",
         };
-        Ok(LtxLatent { video: v, audio: a, fp, hp, wp, fps, label: format!("LTX-2.3 IC-LoRA {what}") })
+        Ok(LtxLatent { video: v, audio: a, fp, hp, wp, fps, overlap_frames: 0, stage1_video: None, label: format!("LTX-2.3 IC-LoRA {what}") })
     }
 
     /// LipDub: исходный ролик переозвучен речью `audio` (две стадии сразу).
@@ -540,7 +757,7 @@ impl LtxModel {
         let up = synaptix_video_ltx23::upscaler::Upsampler::load(self.paths.upscaler.as_ref().ok_or("у модели нет апскейлера LTX-2.3 ×2")?, &mean, &std, dev).map_err(|e| format!("апскейлер: {e}"))?;
         let (v, a) = lp::generate_lipdub_latents(&dit.dit, &up, &cond.video, &cond.audio, &r1, &p1, &r2, &p2, &aref, fp, hp1, wp1, fps, dev).map_err(ltx_err)?;
         synaptix_core::tensor::ops::conv_filter_cache_clear();
-        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1 * 2, wp: wp1 * 2, fps, label: "LTX-2.3 LipDub".into() })
+        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1 * 2, wp: wp1 * 2, fps, overlap_frames: 0, stage1_video: None, label: "LTX-2.3 LipDub".into() })
     }
 
     /// Видео по звуку: звук заморожен на обеих стадиях (Stage1 → ×2 → Stage2).
@@ -562,9 +779,9 @@ impl LtxModel {
         };
         let hooks = self.hooks(h, &on_step);
         let (l1, _) = lp::denoise_av_append(&dit.dit, &cond.video, &cond.audio, fp, hp1, wp1, &lp::DISTILLED_SIGMAS, None, Some(&audio_lat), true, None, None, fps, dev, Some(seed), &hooks).map_err(ltx_err)?;
-        let up = self.upscale(&LtxLatent { video: l1, audio: audio_lat.clone(), fp, hp: hp1, wp: wp1, fps, label: String::new() })?;
+        let up = self.upscale(&LtxLatent { video: l1, audio: audio_lat.clone(), fp, hp: hp1, wp: wp1, fps, overlap_frames: 0, stage1_video: None, label: String::new() })?;
         let (v, a) = lp::denoise_av_append(&dit.dit, &cond.video, &cond.audio, fp, hp1 * 2, wp1 * 2, &lp::STAGE2_SIGMAS, Some(&up.video), Some(&audio_lat), true, None, None, fps, dev, Some(seed), &hooks).map_err(ltx_err)?;
-        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1 * 2, wp: wp1 * 2, fps, label: "LTX-2.3 по звуку".into() })
+        Ok(LtxLatent { video: v, audio: a, fp, hp: hp1 * 2, wp: wp1 * 2, fps, overlap_frames: 0, stage1_video: up.stage1_video, label: "LTX-2.3 по звуку".into() })
     }
 
     /// Латент видео → кадры `[3,H,W]` 0..1. DiT отпускается (VAE нужна память).
@@ -575,7 +792,11 @@ impl LtxModel {
             vae.decode(&lat.video).map_err(|e| format!("VAE: {e}"))
         })?;
         trim(self.device);
-        lp::rgb_to_frames(&rgb).map_err(err)
+        let mut frames = lp::rgb_to_frames(&rgb).map_err(err)?;
+        if lat.overlap_frames > 0 && frames.len() > lat.overlap_frames {
+            frames.drain(0..lat.overlap_frames);
+        }
+        Ok(frames)
     }
 
     /// Звуковые токены → стерео (перемежённые отсчёты, [`AUDIO_RATE`]).
@@ -590,7 +811,15 @@ impl LtxModel {
         trim(self.device);
         let (ch, l) = (wave.dims()[1], wave.dims()[2]);
         let planar: Vec<f32> = wave.reshape(vec![ch * l]).map_err(err)?.to_dtype(DType::F32).map_err(err)?.to_device(Device::Cpu).map_err(err)?.to_vec1::<f32>().map_err(err)?;
-        Ok((0..l).flat_map(|i| (0..ch).map(move |c| (c, i))).map(|(c, i)| planar[c * l + i]).collect())
+        let mut pcm: Vec<f32> = (0..l).flat_map(|i| (0..ch).map(move |c| (c, i))).map(|(c, i)| planar[c * l + i]).collect();
+        if lat.overlap_frames > 0 {
+            let cut_frames = ((lat.overlap_frames as f64 / lat.fps) * AUDIO_RATE as f64).round() as usize;
+            let cut_samples = (cut_frames * ch).min(pcm.len());
+            if cut_samples > 0 && cut_samples < pcm.len() {
+                pcm.drain(0..cut_samples);
+            }
+        }
+        Ok(pcm)
     }
 }
 
