@@ -134,6 +134,39 @@ impl Gemma4Pipeline {
             .map_err(|e| PipelineError::Tokenize(e.to_string()))
     }
 
+    /// Текстовый кодер LTX-2.5 (эталон LTX-2 `base_encoder.py`): промпт без
+    /// шаблона (strip), BOS ровно один (токенизатор Gemma 4 сам его не
+    /// ставит), обрезка до `max_seq`, left-pad токеном 0 до `max_seq`; все
+    /// скрытые состояния (эмбеддинг·√H, выходы слоёв, последний — после
+    /// final_norm) и маска `[pad×0, real×1]`.
+    pub fn encode_for_ltx(
+        &self,
+        prompt: &str,
+        max_seq: usize,
+        device: synaptix_core::device::Device,
+    ) -> Result<(Vec<synaptix_core::tensor::Tensor>, Vec<u32>), PipelineError> {
+        use synaptix_core::tensor::Tensor;
+        let bos = self.config.bos_token_id.unwrap_or(2);
+        let mut ids = self.encode(prompt.trim())?;
+        while ids.first() == Some(&bos) {
+            ids.remove(0);
+        }
+        ids.insert(0, bos);
+        ids.truncate(max_seq);
+        let real = ids.len();
+        let pad = max_seq - real;
+        let mut padded = vec![0u32; pad];
+        padded.extend_from_slice(&ids);
+        let mut mask = vec![0u32; pad];
+        mask.extend(std::iter::repeat_n(1u32, real));
+        let ids_t = Tensor::from_vec(padded, vec![1, max_seq], device).map_err(|e| PipelineError::Model(e.to_string()))?;
+        let mask_f: Vec<f32> = mask.iter().map(|&m| m as f32).collect();
+        let mask_t = Tensor::from_vec(mask_f, vec![1, max_seq], device).map_err(|e| PipelineError::Model(e.to_string()))?;
+        let states = synaptix_core::grad::no_grad(|| self.model.forward_hidden_states(&ids_t, Some(&mask_t)))
+            .map_err(|e| PipelineError::Model(e.to_string()))?;
+        Ok((states, mask))
+    }
+
     pub fn decode(&self, ids: &[u32]) -> Result<String, PipelineError> {
         self.tokenizer
             .decode(ids, true)

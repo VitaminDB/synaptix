@@ -139,6 +139,8 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
     let find = |pred: &dyn Fn(&File) -> bool| files.iter().find(|f| pred(f)).map(|f| f.path.clone());
 
     let ltx_encoder = find(&|f| f.arch == "gemma3" && name(f).contains("ltx"));
+    // LTX-2.5: Gemma 4 12B unified (свой кодер); апскейлер ×2 побайтно как у 2.3.
+    let ltx25_encoder = find(&|f| f.arch.starts_with("gemma4") && name(f).contains("ltx"));
     let ltx_upscaler = find(&|f| f.arch == "ltx-2.3" && name(f).contains("upscaler"));
     let ltx_distill_lora = find(&|f| f.arch == "ltx-2.3" && name(f).contains("distilled-lora"));
     let ltx_ic: Vec<(String, PathBuf)> = files
@@ -166,6 +168,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
 
     let is_component = |f: &File| {
         Some(&f.path) == ltx_encoder.as_ref()
+            || Some(&f.path) == ltx25_encoder.as_ref()
             || Some(&f.path) == ltx_upscaler.as_ref()
             || Some(&f.path) == ltx_distill_lora.as_ref()
             || ltx_ic.iter().any(|(_, p)| *p == f.path)
@@ -213,6 +216,12 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                     p.components.extend(ltx_distill_lora.iter().map(|x| ("distilled_lora".to_string(), x.clone())));
                 }
                 p.components.extend(ltx_ic.iter().cloned());
+                Some(p)
+            }
+            "ltx-2.5" => {
+                let mut p = single(f, Task::Video, "ltx23", "Видео со звуком по тексту и картинке (LTX-2.5)");
+                p.components.extend(ltx25_encoder.iter().map(|x| ("text_encoder".to_string(), x.clone())));
+                p.components.extend(ltx_upscaler.iter().map(|x| ("upscaler".to_string(), x.clone())));
                 Some(p)
             }
             // `syn-pack` по каталогу Diffusers пишет имя класса из `model_index.json`.
@@ -283,6 +292,25 @@ mod tests {
         assert!(dev.components.iter().any(|(r, _)| r == "distilled_lora"));
         assert!(!p.models[1].components.iter().any(|(r, _)| r == "distilled_lora"));
         assert_eq!(p.models[2].components.len(), 3);
+        assert!(p.skipped.is_empty(), "{:?}", p.skipped);
+    }
+
+    #[test]
+    fn groups_ltx25() {
+        let files = vec![
+            f("ltx-2.3-spatial-upscaler-x2-1.1", "ltx-2.3"),
+            f("ltx-gemma-3-12b-qat", "gemma3"),
+            f("ltx-2.3-22b-distilled-1.1", "ltx-2.3"),
+            f("ltx-2.5-22b-distilled", "ltx-2.5"),
+            f("ltx-gemma-4-12b-2.5", "gemma4_unified_text"),
+        ];
+        let p = plan_parsed(&files);
+        let m = p.models.iter().find(|m| m.id == "ltx-2-5-22b-distilled").expect("ltx-2.5");
+        let enc = m.components.iter().find(|(r, _)| r == "text_encoder").map(|(_, p)| p.clone());
+        assert_eq!(enc, Some(PathBuf::from("/m/ltx-gemma-4-12b-2.5.syn")));
+        assert!(m.components.iter().any(|(r, _)| r == "upscaler"));
+        let m23 = p.models.iter().find(|m| m.id == "ltx-2-3-22b-distilled-1-1").unwrap();
+        assert!(m23.components.iter().any(|(_, p)| p.ends_with("ltx-gemma-3-12b-qat.syn")));
         assert!(p.skipped.is_empty(), "{:?}", p.skipped);
     }
 }

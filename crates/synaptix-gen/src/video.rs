@@ -364,7 +364,6 @@ pub(crate) fn media_seconds(path: &Path) -> Option<f64> {
 /// LipDub; одна стадия или две (апскейлер ×2 и доводка).
 pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> R<VideoOutput> {
     use synaptix_core::precision::PrecisionConfig;
-    use synaptix_llm_gemma3::pipeline::GemmaPipeline;
     use synaptix_video_ltx23::audio_vae::{ltx_log_mel, AudioVaeDecoder, AudioVaeEncoder};
     use synaptix_video_ltx23::dit::AvDit;
     use synaptix_video_ltx23::loader::{LoraWeights, LtxCheckpoint};
@@ -491,7 +490,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     synaptix_core::device::cuda::set_offload_pinned(true);
     let (states, mask, nag_states) = {
         let prec = PrecisionConfig { compute, attn_w: quant_enc, mlp_w: quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
-        let gemma = GemmaPipeline::load_with_precision(&paths.gemma, device, prec, Some(1024)).map_err(|e| format!("Gemma: {e}"))?;
+        let gemma = crate::ltx_text::LtxTextEncoder::load(&paths.gemma, device, prec, Some(1024))?;
         if let Some(p) = &pin {
             p.resume();
         }

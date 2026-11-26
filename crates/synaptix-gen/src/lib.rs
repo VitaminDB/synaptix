@@ -6,6 +6,7 @@ pub mod h3_stages;
 pub mod image;
 pub mod image_stages;
 pub mod ltx_stages;
+pub mod ltx_text;
 pub mod music;
 pub mod music_stages;
 pub mod tail;

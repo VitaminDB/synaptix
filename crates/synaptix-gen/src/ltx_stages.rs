@@ -20,7 +20,7 @@ use synaptix_core::device::Device;
 use synaptix_core::dtype::DType;
 use synaptix_core::precision::PrecisionConfig;
 use synaptix_core::tensor::Tensor;
-use synaptix_llm_gemma3::pipeline::GemmaPipeline;
+use crate::ltx_text::LtxTextEncoder;
 use synaptix_video_ltx23::dit::{dit_resident_bytes, AvDit};
 use synaptix_video_ltx23::loader::LoraWeights;
 use synaptix_video_ltx23::pipeline as lp;
@@ -53,7 +53,7 @@ struct DitBox {
 #[derive(Default)]
 struct Held {
     dit: Option<Arc<DitBox>>,
-    gemma: Option<Arc<GemmaPipeline>>,
+    gemma: Option<Arc<LtxTextEncoder>>,
     used: Option<Instant>,
 }
 
@@ -288,7 +288,7 @@ impl LtxModel {
         self.held.lock().map(|h| h.dit.is_some() || h.gemma.is_some()).unwrap_or(false)
     }
 
-    fn gemma(&self) -> R<Arc<GemmaPipeline>> {
+    fn gemma(&self) -> R<Arc<LtxTextEncoder>> {
         if let Some(g) = self.held.lock().map_err(err)?.gemma.clone() {
             return Ok(g);
         }
@@ -298,7 +298,7 @@ impl LtxModel {
         }
         trim(self.device);
         let prec = PrecisionConfig { compute: COMPUTE, attn_w: self.quant_enc, mlp_w: self.quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
-        let g = Arc::new(GemmaPipeline::load_with_precision(&self.paths.gemma, self.device, prec, Some(GEMMA_CTX)).map_err(|e| format!("Gemma {}: {e}", self.paths.gemma.display()))?);
+        let g = Arc::new(LtxTextEncoder::load(&self.paths.gemma, self.device, prec, Some(GEMMA_CTX)).map_err(|e| format!("{} ({})", e, self.paths.gemma.display()))?);
         let mut h = self.held.lock().map_err(err)?;
         h.gemma = Some(g.clone());
         h.used = Some(Instant::now());

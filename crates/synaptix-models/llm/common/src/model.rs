@@ -3124,7 +3124,13 @@ impl DecoderModel {
                 ));
             }
             let mlp_out = apply_opt_norm(&mlp_out, blk.post_mlp_norm.as_ref(), blk.post_eps)?;
-            residual2.add(&mlp_out).coerr()
+            let out = residual2.add(&mlp_out).coerr()?;
+            // Gemma 4: множитель слоя — как в обычном forward (иначе скрытые
+            // состояния для текстовых кодеров видео-моделей расходятся).
+            match blk.layer_scalar {
+                Some(a) if a != 1.0 => out.mul_scalar(a).coerr(),
+                _ => Ok(out),
+            }
         };
         self.for_each_block(dev, s, |idx, blk| {
             hidden = step(idx, blk, &hidden, &mut kv)?;

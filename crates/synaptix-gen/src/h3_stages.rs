@@ -407,11 +407,8 @@ impl H3Model {
             dreq.init_video = Some(v0);
             dreq.init_audio = Some(a0);
         }
-        h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0 || c.context.is_some(), self.lora.is_some()));
-        let dit = h3::dit::H3Dit::load(&ckpt, device, COMPUTE, quant_dit).map_err(err)?;
-        let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
-        synaptix_core::gen_status::phase("денойз");
-        synaptix_core::gen_status::blocks(dit.resident_blocks(), ckpt.config.num_layers);
+        // Ключевые кадры кодируем через VAE до загрузки DiT (как refs и restyle),
+        // чтобы не держать лишний запас VRAM поверх загруженного DiT.
         if !c.keyframes.is_empty() {
             let vw = h3::loader::ComponentLoader::open_component(source, h3::H3Component::VideoVae, device).map_err(err)?;
             let enc = h3::vae::VaeEncoder::load(&vw, ckpt.vae_config().map_err(err)?, device, COMPUTE).map_err(err)?;
@@ -423,8 +420,13 @@ impl H3Model {
             }
             drop(enc);
             h3::memory::trim_pool(device);
-            dreq.cond_rows.video = h3::pipeline::cond_rows_from_keyframe_latents(&latents, dit.cfg.patch_size, None, seed).map_err(err)?;
+            dreq.cond_rows.video = h3::pipeline::cond_rows_from_keyframe_latents(&latents, ckpt.config.patch_size, None, seed).map_err(err)?;
         }
+        h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(&geometry, &ckpt.config, COMPUTE, !c.keyframes.is_empty() || c.refs > 0 || c.context.is_some(), self.lora.is_some()));
+        let dit = h3::dit::H3Dit::load(&ckpt, device, COMPUTE, quant_dit).map_err(err)?;
+        let prep = h3::pipeline::prepare(&dit, &dreq, &sched).map_err(err)?;
+        synaptix_core::gen_status::phase("денойз");
+        synaptix_core::gen_status::blocks(dit.resident_blocks(), ckpt.config.num_layers);
         let _plan = h3::memory::plan(&ckpt, &prep.plan, prep.layout.seq_len, quant_dit, COMPUTE, COMPUTE, mode, device).map_err(err)?;
         let cache = h3::pipeline::build_adaln_cache(&dit, &ckpt, &prep, COMPUTE).map_err(err)?;
         let on_step = |p: h3::pipeline::DenoiseProgress| progress(p.step, p.total);
