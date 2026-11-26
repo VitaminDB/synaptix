@@ -194,8 +194,33 @@ pub fn load_reserve_for(
     // LoRA при счёте: BF16-входы проекций внимания и MLP (два [seq, hidden])
     // и промежуточные (x·Aᵀ) — сверх обычных активаций.
     let lora_b = if lora { 2 * seq * cfg.hidden_size * compute.bytes_for_numel(1).max(1) + (1usize << 30) } else { 0 };
+    let est = activation_bytes(seq, cfg, compute) * 3 / 2 + (1usize << 29);
+    // Потолка нет: 1344×768 × 10 с — ≈ 13 ГБ активаций, при прежнем
+    // `min(LEGACY)` резидентных блоков грузилось до упора и денойз падал OOM.
+    // Лишние блоки уходят на хост (pinned-зеркало) — медленнее, но проходит.
     if keyframes_or_refs {
-        return LEGACY + lora_b;
+        return est.max(LEGACY) + lora_b;
     }
-    (activation_bytes(seq, cfg, compute) * 3 / 2 + (1usize << 29)).min(LEGACY) + lora_b
+    est + lora_b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Запас под денойз растёт с длиной без потолка 6.5 ГБ: 1344×768 × 10 с
+    /// с первым кадром падал OOM при запасе 6.5 ГБ (нужно ≈ 13 ГБ).
+    #[test]
+    fn reserve_scales_with_length() {
+        let cfg = crate::config::H3Config::default();
+        let g = |s: f64| crate::pipeline::Geometry::from_duration(1344, 768, s);
+        let gb = |b: usize| b as f64 / 1e9;
+        let r10 = load_reserve_for(&g(10.0), &cfg, DType::BF16, true, false);
+        let r5 = load_reserve_for(&g(5.0), &cfg, DType::BF16, true, false);
+        assert!(gb(r10) > 12.5, "10 с: {:.1} ГБ", gb(r10));
+        assert!(r5 >= 13 << 29 && r5 < r10);
+        // Без кадров — по оценке, малый кадр ниже прежних 6.5 ГБ.
+        let small = load_reserve_for(&crate::pipeline::Geometry::from_duration(640, 384, 5.0), &cfg, DType::BF16, false, false);
+        assert!(small < 13 << 29);
+    }
 }
