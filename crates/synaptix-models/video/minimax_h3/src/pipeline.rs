@@ -515,6 +515,11 @@ pub fn denoise_one(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn is_oom(e: &impl std::fmt::Display) -> bool {
+    let s = e.to_string();
+    s.contains("OUT_OF_MEMORY") || s.contains("OOM") || s.contains("out of memory")
+}
+
 pub fn denoise_av(
     dit: &H3Dit,
     cache: &AdalnCache,
@@ -630,6 +635,8 @@ pub fn denoise_av(
     let mut old_denoised_v: Option<Tensor> = None;
     let mut old_denoised_a: Option<Tensor> = None;
 
+    // Раскладка блоков подстраивается по факту (H3Dit::adapt_resident).
+    dit.reset_free_watch();
     for step in 0..steps {
         if hooks.cancelled() {
             return Err(H3Error::Cancelled);
@@ -667,29 +674,20 @@ pub fn denoise_av(
                 eprintln!("[pre-fwd] {bytes} B × {count}");
             }
         }
-        let (v_out, a_out) = dit.forward(
-            &hidden,
-            cache,
-            step,
-            &prep.segments,
-            &prep.rope,
-            prep.video_seg,
-            prep.audio_seg,
-        )?;
+        // Нехватка видеопамяти — поднятые по ходу блоки обратно на хост и шаг заново.
+        let fwd = |h: &Tensor| loop {
+            match dit.forward(h, cache, step, &prep.segments, &prep.rope, prep.video_seg, prep.audio_seg) {
+                Err(e) if is_oom(&e) && dit.shed_promoted() => continue,
+                r => break r,
+            }
+        };
+        let (v_out, a_out) = fwd(&hidden)?;
         drop(hidden);
 
         let (v_out, a_out) = match (&prep.refined_negative, &embs) {
             (Some(neg), Some((v_emb, a_emb))) => {
                 let n_hidden = assemble_hidden(prep, neg, v_emb, a_emb)?;
-                let (nv, na) = dit.forward(
-                    &n_hidden,
-                    cache,
-                    step,
-                    &prep.segments,
-                    &prep.rope,
-                    prep.video_seg,
-                    prep.audio_seg,
-                )?;
+                let (nv, na) = fwd(&n_hidden)?;
                 (
                     apply_cfg(&v_out, &nv, req.guider.cfg_scale)?,
                     apply_cfg(&a_out, &na, req.guider.cfg_scale)?,

@@ -1066,7 +1066,66 @@ pub struct H3Dit {
     /// Pinned-зеркало хостовых блоков: подкачка — DMA прямо из него, без
     /// копии через staging-буфер на каждом шаге (её делал процессор, ~5 ГБ/с).
     mirror: Option<synaptix_core::device::cuda::PinMirrorGuard>,
+    /// Копии хостовых блоков `host_from..host_from+len` на карте, поднятые
+    /// по ходу денойза ([`H3Dit::adapt_resident`]): запас под активации
+    /// меряется по факту шага, а не задаётся числом при загрузке.
+    promoted: std::sync::RwLock<Vec<DiTBlock>>,
+    /// Размер блока на карте (оценка), байт.
+    blk_bytes: usize,
+    /// Потолок поднятых блоков после нехватки памяти на шаге (иначе повтор
+    /// шага поднял бы их снова).
+    promote_cap: std::sync::atomic::AtomicUsize,
+    /// Минимум свободной видеопамяти у драйвера с прошлого замера (поток
+    /// [`FreeWatch`]): пик шага по факту, вместе с буферами вне пула
+    /// (FP8-внимание берёт их у драйвера напрямую).
+    free_watch: Option<FreeWatch>,
 }
+
+/// Фоновый замер минимума свободной видеопамяти (раз в 10 мс).
+struct FreeWatch {
+    min_free: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FreeWatch {
+    fn start(device: Device) -> Option<Self> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let Device::Cuda(_) = device else { return None };
+        let min_free = Arc::new(AtomicUsize::new(usize::MAX));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (m, st) = (min_free.clone(), stop.clone());
+        std::thread::Builder::new()
+            .name("h3-free-watch".into())
+            .spawn(move || {
+                while !st.load(Ordering::Relaxed) {
+                    let f = crate::memory::free_vram(device);
+                    if f > 0 {
+                        m.fetch_min(f, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+            .ok()?;
+        Some(Self { min_free, stop })
+    }
+
+    /// Минимум свободного с прошлого вызова; замер начинается заново.
+    fn take(&self) -> Option<usize> {
+        match self.min_free.swap(usize::MAX, std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => None,
+            v => Some(v),
+        }
+    }
+}
+
+impl Drop for FreeWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Запас сверх замеренного пика, когда блоки поднимаются на карту.
+const ADAPT_MARGIN: usize = 1 << 30;
 
 impl H3Dit {
     pub fn load(
@@ -1163,6 +1222,20 @@ impl H3Dit {
             }
             crate::memory::trim_pool(device);
         }
+        let fmt = ckpt
+            .infos()
+            .find(|(n, _, _)| n.starts_with("blocks.0.") && n.contains(".mlp.") && n.ends_with(".weight"))
+            .map(|(_, dt, _)| if dt.is_quantized() { dt } else { quant })
+            .unwrap_or(quant);
+        let resident = host_from.min(nblocks);
+        eprintln!(
+            "[h3] DiT {fmt:?}/{compute:?}: блоков на карте {resident}, на хосте {} (блок {:.2} ГБ), запас под денойз {:.1} ГБ, свободно {:.1} ГБ{}",
+            nblocks - resident,
+            blk_q as f64 / 1e9,
+            reserve as f64 / 1e9,
+            crate::memory::free_vram(device) as f64 / 1e9,
+            if mirror.is_some() { ", хост — pinned-зеркало" } else { "" }
+        );
         let final_layer = FinalLayer::load(ckpt, &cfg, compute)?;
 
         let time_embedder = TimeEmbedder::new(
@@ -1206,12 +1279,94 @@ impl H3Dit {
             stream: None,
             host_from,
             mirror,
+            promoted: std::sync::RwLock::new(Vec::new()),
+            blk_bytes: blk_q,
+            promote_cap: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            free_watch: if host_from < nblocks { FreeWatch::start(device) } else { None },
         })
     }
 
-    /// Сколько блоков лежит на устройстве; остальные стримятся с хоста.
+    /// Сколько блоков лежит на устройстве (с поднятыми по ходу); остальные
+    /// стримятся с хоста.
     pub fn resident_blocks(&self) -> usize {
-        self.host_from.min(self.blocks.len())
+        let extra = self.promoted.read().map(|p| p.len()).unwrap_or(0);
+        (self.host_from + extra).min(self.blocks.len())
+    }
+
+    /// Подстройка раскладки после шага денойза по факту: пик пула за шаг
+    /// минус живое сейчас — временные активации шага; свободное у драйвера
+    /// сверх них и запаса `margin` занимают блоки с хоста (каждый — минус
+    /// подкачка на всех следующих шагах). Сбрасывает счётчик пика под
+    /// следующий шаг. Возвращает, сколько блоков поднято.
+    pub fn adapt_resident(&self, margin: usize) -> R<usize> {
+        let Device::Cuda(_) = self.device else { return Ok(0) };
+        let Some(watch) = &self.free_watch else { return Ok(0) };
+        let n = self.blocks.len();
+        let Some(min_free) = watch.take() else { return Ok(0) };
+        crate::memory::trim_pool(self.device);
+        let mut promoted = self.promoted.write().map_err(|_| SynaptixError::Other("h3: promoted отравлен".into()))?;
+        let next = self.host_from + promoted.len();
+        let blk = self.blk_bytes.max(1);
+        // Пока на хосте что-то остаётся, двое буферов подкачки нужны; когда
+        // поднимается всё — они освобождаются, это запас сверху.
+        let room = min_free.saturating_sub(margin);
+        let cap = self.promote_cap.load(std::sync::atomic::Ordering::Relaxed);
+        let k = (room / blk).min(n.saturating_sub(next)).min(cap.saturating_sub(promoted.len()));
+        let mirror = self.mirror.is_some();
+        let mut up = 0;
+        for i in next..next + k {
+            synaptix_core::device::cuda::set_offload_pinned(true);
+            synaptix_core::device::cuda::set_pin_mirror(mirror);
+            let b = self.blocks[i].to_device(self.device);
+            synaptix_core::device::cuda::set_pin_mirror(false);
+            synaptix_core::device::cuda::set_offload_pinned(false);
+            match b {
+                Ok(b) => {
+                    promoted.push(b);
+                    up += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        drop(promoted);
+        if up > 0 {
+            eprintln!(
+                "[h3] по факту шага: минимум свободного {:.1} ГБ → ещё {up} блоков на карту, на карте {}/{n}",
+                min_free as f64 / 1e9,
+                self.resident_blocks()
+            );
+            // Замер — уже с новыми блоками.
+            watch.take();
+        }
+        synaptix_core::gen_status::blocks(self.resident_blocks(), n);
+        Ok(up)
+    }
+
+    /// Замер пика заново (перед денойзом: загрузка и adaLN не в счёт).
+    pub fn reset_free_watch(&self) {
+        if let Some(w) = &self.free_watch {
+            w.take();
+        }
+    }
+
+    /// Нехватка видеопамяти на шаге: вернуть на хост половину поднятых по
+    /// ходу блоков (не меньше одного). `false` — отдавать нечего.
+    pub fn shed_promoted(&self) -> bool {
+        let Ok(mut p) = self.promoted.write() else { return false };
+        if p.is_empty() {
+            return false;
+        }
+        let keep = p.len() / 2;
+        p.truncate(keep);
+        self.promote_cap.store(keep, std::sync::atomic::Ordering::Relaxed);
+        drop(p);
+        crate::memory::trim_pool(self.device);
+        if let Some(w) = &self.free_watch {
+            w.take();
+        }
+        eprintln!("[h3] видеопамять кончилась на шаге — часть поднятых блоков снова на хосте, на карте {}/{}", self.resident_blocks(), self.blocks.len());
+        synaptix_core::gen_status::blocks(self.resident_blocks(), self.blocks.len());
+        true
     }
 
     /// Проход по блокам: резидентные как есть, остальные приезжают с хоста,
@@ -1222,9 +1377,9 @@ impl H3Dit {
         F: FnMut(usize, &DiTBlock) -> R<()>,
     {
         let n = self.blocks.len();
-        let first = self.resident_blocks();
+        let base = self.host_from.min(n);
         let ord = match self.device {
-            Device::Cuda(o) if first < n => o,
+            Device::Cuda(o) if base < n => o,
             _ => {
                 for (i, b) in self.blocks.iter().enumerate() {
                     body(i, b)?;
@@ -1232,10 +1387,35 @@ impl H3Dit {
                 return Ok(());
             }
         };
-        let dev = self.device;
-        for (i, b) in self.blocks[..first].iter().enumerate() {
-            body(i, b)?;
+        let poisoned = || SynaptixError::Other("h3: promoted отравлен".into());
+        // Блоки на карте (свои и поднятые раньше) — подряд.
+        let done = {
+            let p = self.promoted.read().map_err(|_| poisoned())?;
+            for (i, b) in self.blocks[..base].iter().enumerate() {
+                body(i, b)?;
+            }
+            for (k, b) in p.iter().enumerate() {
+                body(base + k, b)?;
+            }
+            (base + p.len()).min(n)
+        };
+        // Пик шага уже виден по пройденным блокам (все блоки одной формы):
+        // свободное сверх него занимают блоки с хоста — с этого же прохода.
+        if done < n {
+            self.adapt_resident(ADAPT_MARGIN)?;
         }
+        let first = {
+            let p = self.promoted.read().map_err(|_| poisoned())?;
+            let upto = (base + p.len()).min(n);
+            for i in done..upto {
+                body(i, &p[i - base])?;
+            }
+            upto
+        };
+        if first >= n {
+            return Ok(());
+        }
+        let dev = self.device;
         let ls = synaptix_core::device::cuda::loader_stream(ord)?;
         let mirror = self.mirror.is_some();
         synaptix_core::device::cuda::set_offload_pinned(true);
