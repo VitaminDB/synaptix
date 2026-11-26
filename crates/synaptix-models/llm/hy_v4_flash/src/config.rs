@@ -110,6 +110,8 @@ pub struct Hy4Config {
     pub pad: u32,
     pub max_position_embeddings: usize,
     pub image_token_id: Option<u32>,
+    /// Заполнитель видео (`video_token_id`).
+    pub video_token_id: Option<u32>,
 }
 
 fn u(v: &Value, k: &str) -> Result<usize, String> {
@@ -261,6 +263,7 @@ impl Hy4Config {
             pad: u_or(t, "pad_token_id", 120002) as u32,
             max_position_embeddings: u_or(t, "max_position_embeddings", 1 << 20),
             image_token_id: root.get("image_token_id").and_then(|x| x.as_u64()).map(|x| x as u32),
+            video_token_id: root.get("video_token_id").and_then(|x| x.as_u64()).map(|x| x as u32),
         })
     }
 

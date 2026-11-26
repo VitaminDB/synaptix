@@ -29,12 +29,17 @@ const Q_CHUNK: usize = 1024;
 
 /// Размер после smart_resize `(h, w)`, кратный 32.
 pub fn smart_resize(h: usize, w: usize) -> (usize, usize) {
+    smart_resize_px(h, w, MAX_PIXELS)
+}
+
+/// smart_resize с верхней границей площади `max_px`.
+pub fn smart_resize_px(h: usize, w: usize, max_px: usize) -> (usize, usize) {
     let f = (PATCH * MERGE) as f64;
     let (hf, wf) = (h as f64, w as f64);
     let mut rh = (hf / f).round_ties_even() * f;
     let mut rw = (wf / f).round_ties_even() * f;
-    if rh * rw > MAX_PIXELS as f64 {
-        let beta = (hf * wf / MAX_PIXELS as f64).sqrt();
+    if rh * rw > max_px as f64 {
+        let beta = (hf * wf / max_px as f64).sqrt();
         rh = f.max((hf / beta / f).floor() * f);
         rw = f.max((wf / beta / f).floor() * f);
     } else if rh * rw < MIN_PIXELS as f64 {
@@ -50,6 +55,11 @@ pub fn image_tokens(h: usize, w: usize) -> usize {
     let (rh, rw) = smart_resize(h, w);
     (rh / 32) * (rw / 32 + 1)
 }
+
+/// Заполнители картинки в тексте (chat_template Hy4).
+pub const IMAGE_START: &str = "<｜hy_image▁start:opensource｜>";
+pub const IMAGE_PAD: &str = "<｜hy_image▁pad:opensource｜>";
+pub const IMAGE_END: &str = "<｜hy_image▁end:opensource｜>";
 
 /// Подготовленная картинка: патчи `[gh·gw, 768]` F32 (`[-1, 1]`) и сетка.
 pub struct Prepared {
@@ -77,9 +87,33 @@ pub fn prepare(path: &std::path::Path) -> R<Prepared> {
     Ok(prepare_chw(&src, d[1], d[2]))
 }
 
+/// [`prepare`] с потолком числа токенов: картинка уменьшается (по площади),
+/// пока `(H/32)·(W/32+1)` не влезет.
+pub fn prepare_limited(path: &std::path::Path, max_tokens: Option<usize>) -> R<Prepared> {
+    let img = synaptix_io::image::png::load_image(path, Device::Cpu).map_err(|e| synaptix_llm_common::ModelError::Load(format!("картинка: {e}")))?;
+    let d = img.dims().to_vec();
+    let src = img.flatten_all().and_then(|t| t.to_vec1::<f32>()).map_err(fe)?;
+    let (h, w) = (d[1], d[2]);
+    let mut max_px = MAX_PIXELS;
+    if let Some(cap) = max_tokens.filter(|c| *c > 0) {
+        while max_px > MIN_PIXELS {
+            let (rh, rw) = smart_resize_px(h, w, max_px);
+            if (rh / 32) * (rw / 32 + 1) <= cap {
+                break;
+            }
+            max_px = max_px * 9 / 10;
+        }
+    }
+    Ok(prepare_chw_px(&src, h, w, max_px))
+}
+
 /// `[3, H, W]` в `0…1` → патчи.
 pub fn prepare_chw(src: &[f32], h: usize, w: usize) -> Prepared {
-    let (rh, rw) = smart_resize(h, w);
+    prepare_chw_px(src, h, w, MAX_PIXELS)
+}
+
+fn prepare_chw_px(src: &[f32], h: usize, w: usize, max_px: usize) -> Prepared {
+    let (rh, rw) = smart_resize_px(h, w, max_px);
     // Ресайз по uint8 (как torchvision/PIL): вход — сетка 1/255, выход округлён к ней.
     let mut px = synaptix_vlm_minicpm::preprocess::resize_bicubic_aa(src, 3, h, w, rh, rw);
     if (rh, rw) == (h, w) {

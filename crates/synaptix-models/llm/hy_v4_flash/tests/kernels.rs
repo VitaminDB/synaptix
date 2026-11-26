@@ -195,7 +195,7 @@ fn indexer_pool_and_score() {
     let theta = 1e7f64;
     let tok = up(&toks, vec![ng * g, c], d);
     let out = kern::zeros(vec![ng, c], DType::F32, d).unwrap();
-    kern::idx_pool(&tok, &up(&wv, vec![c, c], d), &up(&wg, vec![c, c], d), &up(&ape, vec![g, c], d), &up(&kn, vec![c], d), &out, 0, ng, g, 64, 1e-5, theta).unwrap();
+    kern::idx_pool(&tok, &up(&wv, vec![c, c], d), &up(&wg, vec![c, c], d), &up(&ape, vec![g, c], d), &up(&kn, vec![c], d), &out, 0, ng, g, 64, 1e-5, theta, None).unwrap();
     let mut want = vec![0f32; ng * c];
     for gi in 0..ng {
         let mut pooled = vec![0f32; c];
@@ -300,4 +300,41 @@ fn head_gemv_matches_cpu() {
         }
         close(&got, &want, 1e-4, &format!("head_gemv t={t} din={din} dout={dout}"));
     }
+}
+
+/// M-RoPE: пара j (j < 30) берёт ось j % 3 (t, h, w), остальные — t; при
+/// равных осях — то же, что обычный RoPE.
+#[test]
+fn mrope_axes() {
+    let Some(d) = dev() else { return };
+    let (t, heads, w, theta) = (3usize, 2usize, 64usize, 1e7f64);
+    let x = rnd(21, t * heads * w, 1.0);
+    let p3: Vec<f32> = vec![5.0, 9.0, 13.0, 6.0, 6.0, 6.0, 40.0, 41.0, 77.0];
+    let pos = Tensor::from_vec(vec![5i32, 6, 40], vec![t], d).unwrap();
+    let xt = up(&x, vec![t, heads * w], d);
+    let p3t = up(&p3, vec![t, 3], d);
+    kern::rope_m(&xt, &pos, Some(&p3t), heads * w, heads, w, 0, w, theta).unwrap();
+    let got = down(&xt);
+    let mut want = x.clone();
+    for ti in 0..t {
+        for h in 0..heads {
+            for j in 0..w / 2 {
+                let ax = if j < kern::MROPE_SPLIT { j % 3 } else { 0 };
+                let inv = 1.0 / (theta as f32).powf(2.0 * j as f32 / w as f32);
+                let ang = p3[ti * 3 + ax] * inv;
+                let (s, c) = ang.sin_cos();
+                let o = ti * heads * w + h * w + 2 * j;
+                let (a, b) = (x[o], x[o + 1]);
+                want[o] = a * c - b * s;
+                want[o + 1] = b * c + a * s;
+            }
+        }
+    }
+    close(&got, &want, 2e-3, "M-RoPE");
+    // Строка 1 (6, 6, 6) — как обычный RoPE на позиции 6.
+    let x1 = up(&x, vec![t, heads * w], d);
+    kern::rope(&x1, &pos, heads * w, heads, w, 0, w, theta).unwrap();
+    let plain = down(&x1);
+    let r = heads * w;
+    close(&got[r..2 * r], &plain[r..2 * r], 1e-5, "равные оси = 1D");
 }

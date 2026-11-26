@@ -24,6 +24,9 @@ pub struct EngramHash {
     /// Первая строка головы в общей таблице.
     offsets: Vec<u64>,
     pad_token: u32,
+    /// Ещё id без памяти: заполнители картинок и видео (их id остаются в
+    /// истории n-грамм следующих токенов, как у эталона).
+    skip: Vec<u32>,
     max_ngram: usize,
     heads_per_ngram: usize,
 }
@@ -37,11 +40,17 @@ impl EngramHash {
             offsets.push(acc);
             acc += p;
         }
-        Self { token_map, multipliers, primes, offsets, pad_token: cfg.pad_id, max_ngram: cfg.max_ngram, heads_per_ngram: cfg.heads_per_ngram }
+        Self { token_map, multipliers, primes, offsets, pad_token: cfg.pad_id, skip: Vec::new(), max_ngram: cfg.max_ngram, heads_per_ngram: cfg.heads_per_ngram }
     }
 
     pub fn heads(&self) -> usize {
         self.primes.len()
+    }
+
+    /// Пропускать (без памяти) и эти id.
+    pub fn with_skip(mut self, ids: Vec<u32>) -> Self {
+        self.skip = ids;
+        self
     }
 
     fn map(&self, id: u32) -> u64 {
@@ -54,7 +63,7 @@ impl EngramHash {
     pub fn rows(&self, ids: &[u32], from: usize, out: &mut Vec<Option<Vec<u64>>>) {
         let pad = self.map(self.pad_token);
         for p in from..ids.len() {
-            if ids[p] == self.pad_token {
+            if ids[p] == self.pad_token || self.skip.contains(&ids[p]) {
                 out.push(None);
                 continue;
             }

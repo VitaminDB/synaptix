@@ -148,10 +148,14 @@ extern "C" __global__ void hy4_rope(Hy4Args args) {
     const unsigned t = blockIdx.x, h = blockIdx.y, W = args.u[5];
     const int pos = ((const int*)args.a[1])[t];
     float* x = PF(0) + (size_t)t * args.u[1] + (size_t)h * args.u[2] + args.u[3];
+    // M-RoPE (картинки): a2 — позиции [T, 3] (t, h, w) F32, u6 — граница секций
+    // h/w в парах (у Hy4 30): пара j%3==1 → h, j%3==2 → w, иначе t.
+    const float* p3 = args.a[2] ? (const float*)args.a[2] + (size_t)t * 3 : nullptr;
     for (unsigned j = threadIdx.x; j < W / 2; j += blockDim.x) {
         // Частота как в torch: 1/(theta^(2j/W)) в F32, угол pos·inv_freq в F32.
         const float inv = 1.0f / exp2f(args.f[0] * (float)(2 * j) / (float)W);
-        const float ang = (float)pos * inv;
+        const unsigned ax = (p3 && j < args.u[6]) ? (j % 3) : 0;
+        const float ang = (p3 ? p3[ax] : (float)pos) * inv;
         float s, c;
         sincosf(ang, &s, &c);
         const float a = x[2 * j], b = x[2 * j + 1];
@@ -294,14 +298,18 @@ extern "C" __global__ void hy4_idx_pool(Hy4Args args) {
     __syncthreads();
     const unsigned W = args.u[5], off = C - W;
     float* out = PF(5) + (size_t)(g % args.u[4]) * C;
+    // RoPE ключа группы — позиция её первого токена; с картинками (a6) — из
+    // таблицы RoPE-позиций по слотам [u7, 3] F32 (t, h, w), граница секций u8.
+    const float* p3 = args.a[6] ? (const float*)args.a[6] + (size_t)((g * G) % args.u[7]) * 3 : nullptr;
     const float pos = (float)(g * G);
     for (unsigned c = threadIdx.x; c < C; c += blockDim.x) {
         float v = pooled[c];
         if (c >= off) {
             const unsigned j = (c - off) / 2;
             const float inv = 1.0f / exp2f(args.f[1] * (float)(2 * j) / (float)W);
+            const unsigned ax = (p3 && j < args.u[8]) ? (j % 3) : 0;
             float s, co;
-            sincosf(pos * inv, &s, &co);
+            sincosf((p3 ? p3[ax] : pos) * inv, &s, &co);
             const float a = pooled[off + 2 * j], b = pooled[off + 2 * j + 1];
             v = ((c - off) & 1) ? (b * co + a * s) : (a * co - b * s);
         }

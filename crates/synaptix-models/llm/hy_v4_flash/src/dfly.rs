@@ -146,7 +146,7 @@ impl Dfly {
                 None => h.clone(),
             };
             let hn = self.rms(&x, &l.in_norm, ACT)?;
-            let y = m.attention(l.target, &l.attn, &hn, &pos, a, &mut cache.layers[l.target], Some(kk))?;
+            let y = m.attention(l.target, &l.attn, &hn, &pos, a, &mut cache.layers[l.target], Some(kk), &Default::default())?;
             let y = self.rms(&y, l.attn.post_norm(), DType::F32)?;
             let x = y.add(&x).map_err(fe)?;
             let hn = self.rms(&x, &l.post_norm, ACT)?;

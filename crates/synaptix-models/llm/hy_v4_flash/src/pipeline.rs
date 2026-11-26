@@ -20,7 +20,7 @@ use synaptix_tokenizer::Tokenizer;
 
 use crate::config::Hy4Config;
 use crate::loader::{Hy4Weights, LoadError};
-use crate::model::{Hy4Model, ModelCache};
+use crate::model::{Hy4Model, MediaChunk, ModelCache};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -54,6 +54,9 @@ pub struct Hy4Pipeline {
     zc_pool: Option<Arc<synaptix_llm_common::moe_zc::ZcPool>>,
     /// Драфтер DFly (спекулятивный декод), если есть в бандле и `SYN_HY4_DFLY=1`.
     pub dfly: Option<crate::dfly::Dfly>,
+    /// Башня зрения (грузится по требованию, `load_vision`).
+    vision: Option<crate::vision::Hy4Vision>,
+    has_vision_weights: bool,
     max_seq: usize,
 }
 
@@ -62,6 +65,8 @@ pub struct Hy4Session {
     resume_at: Option<usize>,
     parked: bool,
     device: Device,
+    /// Картинки в кэше: (первая строка заполнителей, длина, отпечаток).
+    images: Vec<(usize, usize, u64)>,
 }
 
 impl Hy4Session {
@@ -79,6 +84,7 @@ impl Hy4Session {
     }
     pub fn invalidate(&mut self) {
         self.cache.truncate(0);
+        self.images.clear();
     }
     pub fn device_bytes(&self) -> usize {
         if self.parked { 0 } else { self.cache.device_bytes() }
@@ -192,6 +198,7 @@ impl Hy4Pipeline {
         drop(guard);
         // Драфтер держит ~0,8 ГБ VRAM, а выигрыша на этой карте не даёт
         // (верификация упирается в шину) — грузится по `SYN_HY4_DFLY=1`.
+        let has_vision_weights = w.config.image_token_id.is_some() && synaptix_llm_common::WeightSource::contains(&w, "vit.embeddings.patch_embedding.weight");
         let dfly = if std::env::var("SYN_HY4_DFLY").as_deref() == Ok("1") {
             // `SYN_HY4_DFLY_FROM=путь` — веса драфтера из другого источника
             // (каталог HF с BF16-оригиналом или бандл) — сверка точности драфта.
@@ -237,7 +244,7 @@ impl Hy4Pipeline {
             eprintln!("[hy4] кэш экспертов на карте: {:.1} ГБ", c.capacity_bytes() as f64 / (1u64 << 30) as f64);
         }
         let max_seq = max_seq.unwrap_or(32768).min(w.config.max_position_embeddings);
-        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, zc_pool, dfly, max_seq })
+        Ok(Self { _mirror: mirror, model, tokenizer, chat_template: w.chat_template.clone(), config: w.config.clone(), path, zc_pool, dfly, vision: None, has_vision_weights, max_seq })
     }
 
     /// Готовность зеркала экспертов в RAM: (готово байт, всего), `None` — зеркала нет.
@@ -295,6 +302,142 @@ impl Hy4Pipeline {
         );
     }
 
+    /// Есть ли в бандле башня зрения.
+    pub fn has_vision_weights(&self) -> bool {
+        self.has_vision_weights
+    }
+
+    /// Башня зрения в памяти устройства.
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Догрузить башню зрения (`Ok(false)` — её нет в бандле).
+    pub fn load_vision(&mut self) -> Result<bool, PipelineError> {
+        if self.vision.is_some() {
+            return Ok(true);
+        }
+        if !self.has_vision_weights {
+            return Ok(false);
+        }
+        let w = Hy4Weights::open(&self.path).map_err(|e| PipelineError::Load(e.to_string()))?;
+        let guard = synaptix_core::device::cuda::WeightsAllocGuard::for_device(self.model.device);
+        self.vision = no_grad(|| crate::vision::Hy4Vision::load(&w, self.model.device, 27))?;
+        drop(guard);
+        Ok(self.vision.is_some())
+    }
+
+    /// Отпустить башню зрения.
+    pub fn release_vision(&mut self) {
+        if self.vision.take().is_some() {
+            if let Device::Cuda(o) = self.model.device {
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(o);
+            }
+        }
+    }
+
+    /// Признаки картинки `[N, 3072]` и её сетка `(строк, столбцов с newline)`.
+    /// `max_tokens` — потолок числа токенов (картинка уменьшается).
+    pub fn encode_image(&self, path: &Path, max_tokens: Option<usize>) -> Result<(Tensor, (usize, usize)), PipelineError> {
+        let v = self.vision.as_ref().ok_or_else(|| PipelineError::Load("башня зрения не загружена".into()))?;
+        let p = crate::vision::prepare_limited(path, max_tokens)?;
+        let grid = p.rows_cols();
+        let f = no_grad(|| v.encode(&p))?;
+        Ok((f, grid))
+    }
+
+    /// Блок промпта картинки на `tokens` заполнителей.
+    pub fn image_block(&self, tokens: usize) -> String {
+        format!("{}{}{}", crate::vision::IMAGE_START, crate::vision::IMAGE_PAD.repeat(tokens), crate::vision::IMAGE_END)
+    }
+
+    /// Ход с картинками в сессии. `images` — по порядку прогонов заполнителя
+    /// `image_token_id` в промпте: признаки `[N, H]`, отпечаток, сетка
+    /// `(строк, столбцов)`. Позиции RoPE — M-RoPE (t, h, w): заполнитель
+    /// `(s, s + r, s + c)`, токен после картинки — `s + max(строк, столбцов)`.
+    pub fn generate_cached_media_streaming(
+        &self,
+        s: &mut Hy4Session,
+        prompt_ids: &[u32],
+        images: &[(&Tensor, u64, (usize, usize))],
+        cfg: &GenerationConfig,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(Vec<u32>, GenerationStats, usize), PipelineError> {
+        if s.parked {
+            s.unpark_to(self.model.device)?;
+        }
+        let img_tok = self.config.image_token_id.ok_or_else(|| PipelineError::Tokenize("модель без картинок".into()))?;
+        let (rpos, inject, runs) = media_positions(prompt_ids, img_tok, images)?;
+        let need = prompt_ids.len() + cfg.max_new_tokens + 1;
+        if need > s.cache.max_seq {
+            self.grow_session(s, need.min(self.max_seq.max(need)))?;
+        }
+        // Префикс из кэша — только пока картинки в нём те же.
+        let mut reuse = s.reusable(prompt_ids);
+        for &(start, len, hash) in &s.images {
+            if start >= reuse {
+                continue;
+            }
+            let same = runs.iter().any(|&(st, l, i)| st == start && l == len && images[i].1 == hash);
+            if !same {
+                reuse = reuse.min(start);
+            }
+        }
+        let feats = if images.is_empty() {
+            None
+        } else {
+            let refs: Vec<&Tensor> = images.iter().map(|(t, _, _)| *t).collect();
+            Some(Tensor::cat(&refs, 0).map_err(|e| PipelineError::Model(ModelError::Forward(e.to_string())))?)
+        };
+        let eos = eos_set(cfg);
+        let mut sampler = TokenSampler::new(cfg, prompt_ids);
+        let t0 = Instant::now();
+        s.cache.truncate(reuse);
+        s.images.retain(|&(st, _, _)| st < reuse);
+        let chunk = prefill_chunk();
+        let mut hidden = None;
+        let mut at = reuse;
+        while at < prompt_ids.len() {
+            if sink.interrupted() {
+                s.cache.truncate(at);
+                return Err(PipelineError::Model(ModelError::Forward(INTERRUPTED.into())));
+            }
+            let end = (at + chunk).min(prompt_ids.len());
+            let inj: Vec<(usize, usize)> = inject.iter().filter(|&&(p, _)| p >= at && p < end).map(|&(p, f)| (p - at, f)).collect();
+            let mc = MediaChunk { rpos: &rpos[at..end], feats: feats.as_ref(), inject: &inj };
+            let h = no_grad(|| self.model.forward_media(&prompt_ids[at..end], &mut s.cache, Some(1), Some(&mc)))?;
+            if end == prompt_ids.len() {
+                hidden = Some(h);
+            }
+            at = end;
+        }
+        for &(st, l, i) in &runs {
+            if st >= reuse {
+                s.images.push((st, l, images[i].1));
+            }
+        }
+        let logits = no_grad(|| self.model.logits(hidden.as_ref().expect("последний чанк")))?;
+        let prefill_ms = t0.elapsed().as_millis();
+        let mut out = Vec::with_capacity(cfg.max_new_tokens);
+        if cfg.max_new_tokens == 0 {
+            return Ok((out, GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: 0, prefill_ms, decode_ms: 0 }, reuse));
+        }
+        self.size_zc_pool();
+        let t1 = Instant::now();
+        let mut tok = sampler.sample(&logits)?;
+        loop {
+            out.push(tok);
+            if !sink.on_token(tok) || eos.contains(&tok) || out.len() >= cfg.max_new_tokens || s.cache.seq_len() + 1 >= s.cache.max_seq {
+                break;
+            }
+            let h = no_grad(|| self.model.forward(&[tok], &mut s.cache, Some(1)))?;
+            let l = no_grad(|| self.model.logits(&h))?;
+            tok = sampler.sample(&l)?;
+        }
+        let st = GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: out.len(), prefill_ms, decode_ms: t1.elapsed().as_millis() };
+        Ok((out, st, reuse))
+    }
+
     pub fn eos_ids(&self) -> Vec<u32> {
         self.config.eos.clone()
     }
@@ -316,7 +459,7 @@ impl Hy4Pipeline {
     }
 
     pub fn new_session(&self, ctx: usize) -> Result<Hy4Session, PipelineError> {
-        Ok(Hy4Session { cache: self.model.make_cache(ctx.max(2))?, resume_at: None, parked: false, device: self.model.device })
+        Ok(Hy4Session { cache: self.model.make_cache(ctx.max(2))?, resume_at: None, parked: false, device: self.model.device, images: Vec::new() })
     }
 
     /// Дорастить сессию: кэш пересоздаётся, посчитанное пересчитается в следующем ходе.
@@ -415,4 +558,48 @@ impl Hy4Pipeline {
         let st = GenerationStats { prompt_tokens: prompt_ids.len(), new_tokens: out.len(), prefill_ms, decode_ms: t1.elapsed().as_millis() };
         Ok((out, st, reuse))
     }
+}
+
+/// RoPE-позиции M-RoPE промпта с картинками, подстановка признаков
+/// `(строка промпта, строка склеенных признаков)` и прогоны заполнителя
+/// `(начало, длина, номер картинки)`.
+#[allow(clippy::type_complexity)]
+pub fn media_positions(
+    ids: &[u32],
+    img_tok: u32,
+    images: &[(&Tensor, u64, (usize, usize))],
+) -> Result<(Vec<[f32; 3]>, Vec<(usize, usize)>, Vec<(usize, usize, usize)>), PipelineError> {
+    let mut rpos = Vec::with_capacity(ids.len());
+    let mut inject = Vec::new();
+    let mut runs = Vec::new();
+    let (mut p, mut i, mut img, mut feat0) = (0f32, 0usize, 0usize, 0usize);
+    while i < ids.len() {
+        if ids[i] != img_tok {
+            rpos.push([p; 3]);
+            p += 1.0;
+            i += 1;
+            continue;
+        }
+        let run = ids[i..].iter().take_while(|&&t| t == img_tok).count();
+        let Some(&(f, _, (rows, cols))) = images.get(img) else {
+            return Err(PipelineError::Tokenize(format!("заполнителей картинок в промпте больше, чем картинок ({})", images.len())));
+        };
+        if run != rows * cols || f.dims()[0] != run {
+            return Err(PipelineError::Tokenize(format!("картинка {img}: заполнителей {run}, признаков {}, сетка {rows}×{cols}", f.dims()[0])));
+        }
+        for k in 0..run {
+            let (r, c) = ((k / cols) as f32, (k % cols) as f32);
+            rpos.push([p, p + r, p + c]);
+            inject.push((i + k, feat0 + k));
+        }
+        runs.push((i, run, img));
+        p += rows.max(cols) as f32;
+        feat0 += run;
+        img += 1;
+        i += run;
+    }
+    if img != images.len() {
+        return Err(PipelineError::Tokenize(format!("картинок {}, а заполнителей в промпте — на {img}", images.len())));
+    }
+    Ok((rpos, inject, runs))
 }

@@ -141,10 +141,23 @@ pub fn rms_cols(x: &Tensor, h: usize, w: Option<&Tensor>, eps: f32, out_dt: DTyp
 /// хвост от `off` шириной `width`.
 #[allow(clippy::too_many_arguments)]
 pub fn rope(x: &Tensor, pos: &Tensor, row: usize, heads: usize, head_stride: usize, off: usize, width: usize, theta: f64) -> R<()> {
+    rope_m(x, pos, None, row, heads, head_stride, off, width, theta)
+}
+
+/// Граница секций h/w M-RoPE Hy4 в парах (`mrope_section [12, 10, 10]` → 3·10).
+pub const MROPE_SPLIT: usize = 30;
+
+/// RoPE с позициями M-RoPE: `pos3` — `[T, 3]` F32 (t, h, w) или `None` (1D по `pos`).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_m(x: &Tensor, pos: &Tensor, pos3: Option<&Tensor>, row: usize, heads: usize, head_stride: usize, off: usize, width: usize, theta: f64) -> R<()> {
     let t = x.numel() / row;
     let mut a = Ink2Launch::default();
     a.a[0] = addr(x)?;
     a.a[1] = addr(pos)?;
+    if let Some(p3) = pos3 {
+        a.a[2] = addr(p3)?;
+        a.u[6] = MROPE_SPLIT as u32;
+    }
     a.u[0] = t as u32;
     a.u[1] = row as u32;
     a.u[2] = head_stride as u32;
@@ -225,7 +238,8 @@ pub fn mla_attn(qa: &Tensor, cache: &Tensor, sinks: &Tensor, pos: &Tensor, laten
 
 /// Пулинг групп `g0..g1` индексатора в кэш ключей групп.
 #[allow(clippy::too_many_arguments)]
-pub fn idx_pool(tok: &Tensor, wv: &Tensor, wg: &Tensor, ape: &Tensor, norm: &Tensor, out: &Tensor, g0: usize, g1: usize, group: usize, rope_w: usize, eps: f32, theta: f64) -> R<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn idx_pool(tok: &Tensor, wv: &Tensor, wg: &Tensor, ape: &Tensor, norm: &Tensor, out: &Tensor, g0: usize, g1: usize, group: usize, rope_w: usize, eps: f32, theta: f64, rpos: Option<&Tensor>) -> R<()> {
     if g1 <= g0 {
         return Ok(());
     }
@@ -245,6 +259,12 @@ pub fn idx_pool(tok: &Tensor, wv: &Tensor, wg: &Tensor, ape: &Tensor, norm: &Ten
     a.u[5] = rope_w as u32;
     a.f[0] = eps;
     a.f[1] = theta.log2() as f32;
+    // RoPE-позиции по слотам `[CAP, 3]` F32 (с картинками в кэше).
+    if let Some(t) = rpos {
+        a.a[6] = addr(t)?;
+        a.u[7] = t.dims()[0] as u32;
+        a.u[8] = MROPE_SPLIT as u32;
+    }
     launch(tok.device(), "hy4_idx_pool", &a, ((g1 - g0) as u32, 1, 1), 128)
 }
 

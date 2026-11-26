@@ -16,7 +16,7 @@ fn main() {
     let path = &args[1];
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let gen: usize = opt("--gen").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let p = Hy4Pipeline::load(path, Device::Cuda(0), Some(8192)).expect("загрузка");
+    let mut p = Hy4Pipeline::load(path, Device::Cuda(0), Some(8192)).expect("загрузка");
     // `--wait-mirror`: замер в установившемся режиме — дождаться, пока зеркало
     // экспертов в RAM заполнится (иначе промахи делят диск с копировщиками).
     if args.iter().any(|a| a == "--wait-mirror") {
@@ -27,6 +27,32 @@ fn main() {
         if let Some((r, t)) = p.mirror_progress() {
             eprintln!("зеркало заполнено за {:.0} с: {:.1} из {:.1} ГБ", t0.elapsed().as_secs_f64(), r as f64 / 1e9, t as f64 / 1e9);
         }
+    }
+    // `--image файл --chat "…"`: ход с картинкой (башня зрения, M-RoPE).
+    if let Some(img) = opt("--image") {
+        assert!(p.load_vision().expect("башня"), "в бандле нет башни зрения");
+        let t0 = Instant::now();
+        let (f, grid) = p.encode_image(std::path::Path::new(&img), None).expect("картинка");
+        eprintln!("картинка: {} токенов, сетка {grid:?}, {:.2} с", f.dims()[0], t0.elapsed().as_secs_f64());
+        let msg = opt("--chat").unwrap_or_else(|| "Что на картинке?".into());
+        let s = format!(
+            "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜>\
+             <｜hy_start:opensource｜>user<｜hy_middle:opensource｜>{}{msg}<｜hy_end:opensource｜>\
+             <｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>",
+            p.image_block(f.dims()[0])
+        );
+        let ids = p.encode(&s).unwrap();
+        let mut sess = p.new_session(ids.len() + gen + 8).unwrap();
+        let cfg = synaptix_llm_common::generate::GenerationConfig { max_new_tokens: gen.max(1), temperature: 0.0, eos_token_ids: p.eos_ids(), ..Default::default() };
+        let mut toks = Vec::new();
+        let mut sink = |t: u32| {
+            toks.push(t);
+            true
+        };
+        let (_, st, _) = p.generate_cached_media_streaming(&mut sess, &ids, &[(&f, 1, grid)], &cfg, &mut sink).expect("ход");
+        eprintln!("промпт {} токенов, префилл {} мс, {} токенов за {} мс", st.prompt_tokens, st.prefill_ms, st.new_tokens, st.decode_ms);
+        println!("{}", p.decode(&toks).unwrap());
+        return;
     }
     let ids: Vec<u32> = if let Some(f) = opt("--ids") {
         std::fs::read_to_string(f).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect()

@@ -119,6 +119,24 @@ impl Hc {
     }
 }
 
+/// RoPE прохода: `pos3` — позиции (t, h, w) строк `[T, 3]` F32 (M-RoPE, есть
+/// картинки в кэше), `table` — позиции всех слотов `[max_seq, 3]` для ключей
+/// групп индексатора. Без картинок оба `None`: позиция RoPE = слот.
+#[derive(Default)]
+pub(crate) struct RopeCtx {
+    pub pos3: Option<Tensor>,
+    pub table: Option<Tensor>,
+}
+
+/// Картинки в чанке префилла: RoPE-позиции всех строк чанка и подстановка
+/// признаков `(строка чанка, строка feats)`.
+pub struct MediaChunk<'a> {
+    pub rpos: &'a [[f32; 3]],
+    /// Признаки `[F, H]` (BF16/F32) — строки на места заполнителей.
+    pub feats: Option<&'a Tensor>,
+    pub inject: &'a [(usize, usize)],
+}
+
 /// Ключи внимания, заданные снаружи (блок драфтера DFly по кэшу целевого слоя).
 pub(crate) enum ExtKeys {
     /// Цель считала слой плотно: все позиции до запроса.
@@ -210,6 +228,11 @@ pub struct ModelCache {
     /// Токены, уже прошедшие через модель (история для engram).
     pub ids: Vec<u32>,
     pub max_seq: usize,
+    /// M-RoPE (картинки в кэше): RoPE-позиции (t, h, w) каждого слота; пусто —
+    /// позиция RoPE совпадает со слотом.
+    pub rpos_host: Vec<[f32; 3]>,
+    /// Те же позиции на карте `[max_seq, 3]` F32 — для ключей групп индексатора.
+    pub rpos: Option<Tensor>,
 }
 
 impl ModelCache {
@@ -219,6 +242,7 @@ impl ModelCache {
 
     /// Откатить к первым `n` токенам (KV дальше просто перепишется).
     pub fn truncate(&mut self, n: usize) {
+        self.rpos_host.truncate(n);
         if n < self.ids.len() {
             self.ids.truncate(n);
             for l in &mut self.layers {
@@ -239,6 +263,9 @@ impl ModelCache {
                 l.grp = Some(t.to_device(dev).map_err(fe)?);
             }
             l.snap = None;
+        }
+        if let Some(t) = &self.rpos {
+            self.rpos = Some(t.to_device(dev).map_err(fe)?);
         }
         Ok(prev)
     }
@@ -342,7 +369,7 @@ impl Hy4Model {
                 Some((e, i)) => {
                     let g = format!("{p}.engram_layer");
                     let mc = cfg.hc_mult;
-                    let hash = EngramHash::new(e, i, token_map.clone(), w.engram_multipliers[i]);
+                    let hash = EngramHash::new(e, i, token_map.clone(), w.engram_multipliers[i]).with_skip(cfg.image_token_id.into_iter().chain(cfg.video_token_id).collect());
                     let table = table_rows(&w.raw, &format!("{g}.multi_head_embedding.embedding.weight"), e.head_dim)?;
                     let mut head_norm = Vec::with_capacity(e.width());
                     for h in 0..e.heads() {
@@ -463,7 +490,7 @@ impl Hy4Model {
             };
             layers.push(LayerCache { lat, tok, grp, pooled: 0, snap: None });
         }
-        Ok(ModelCache { layers, ids: Vec::new(), max_seq })
+        Ok(ModelCache { layers, ids: Vec::new(), max_seq, rpos_host: Vec::new(), rpos: None })
     }
 
     /// Байт KV на токен (индексированные слои растут с длиной, SWA — кольцо).
@@ -471,6 +498,45 @@ impl Hy4Model {
         let c = &self.config;
         let n = c.attn.iter().filter(|a| **a == AttnKind::Indexed).count();
         n * ((c.kv_lora_rank + c.indexed.qk_rope) * self.kv_dtype.bytes_for_numel(1) + c.index_head_dim * 4 + c.index_head_dim)
+    }
+
+    /// RoPE-позиции прохода. Картинки в чанке (`media`) или уже в кэше
+    /// включают M-RoPE: позиции всех слотов ведутся на хосте и на карте
+    /// (прежние слоты — тождественные), текст после картинки идёт с позиции
+    /// «максимум последнего токена + 1».
+    fn rope_ctx(&self, cache: &mut ModelCache, p0: usize, t: usize, pos: &Tensor, media: Option<&MediaChunk>) -> R<RopeCtx> {
+        let rows: Vec<[f32; 3]> = match media {
+            Some(m) => m.rpos.to_vec(),
+            None if !cache.rpos_host.is_empty() => {
+                let next = cache.rpos_host.last().map_or(p0 as f32, |r| r[0].max(r[1]).max(r[2]) + 1.0);
+                (0..t).map(|i| [next + i as f32; 3]).collect()
+            }
+            None => return Ok(RopeCtx::default()),
+        };
+        if rows.len() != t {
+            return Err(ModelError::Forward(format!("hy4: позиций M-RoPE {} на {t} строк", rows.len())));
+        }
+        let dev = self.device;
+        if cache.rpos.is_none() {
+            cache.rpos = Some(kern::zeros(vec![cache.max_seq.max(1), 3], DType::F32, dev)?);
+        }
+        let table = cache.rpos.clone().expect("таблица");
+        if cache.rpos_host.len() < p0 {
+            // Включение посреди сессии: прежние слоты — тождественные позиции.
+            let from = cache.rpos_host.len();
+            let fill: Vec<[f32; 3]> = (from..p0).map(|i| [i as f32; 3]).collect();
+            let flat: Vec<f32> = fill.iter().flatten().copied().collect();
+            let slots: Vec<i32> = (from..p0).map(|i| i as i32).collect();
+            let n = fill.len();
+            kern::cache_put(&Tensor::from_vec(flat, vec![n, 3], dev).map_err(fe)?, &table, &Tensor::from_vec(slots, vec![n], dev).map_err(fe)?)?;
+            cache.rpos_host.extend(fill);
+        }
+        cache.rpos_host.truncate(p0);
+        cache.rpos_host.extend_from_slice(&rows);
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let pos3 = Tensor::from_vec(flat, vec![t, 3], dev).map_err(fe)?;
+        kern::cache_put(&pos3, &table, pos)?;
+        Ok(RopeCtx { pos3: Some(pos3), table: Some(table) })
     }
 
     pub(crate) fn embed_rows(&self, ids: &[u32]) -> R<Tensor> {
@@ -489,6 +555,11 @@ impl Hy4Model {
     /// скрытое после финальной нормы `[T, H]` (BF16) — для `rows` последних
     /// строк (`None` — все).
     pub fn forward(&self, ids: &[u32], cache: &mut ModelCache, rows: Option<usize>) -> R<Tensor> {
+        self.forward_media(ids, cache, rows, None)
+    }
+
+    /// [`Self::forward`] с картинками в чанке (RoPE-позиции и подстановка признаков).
+    pub fn forward_media(&self, ids: &[u32], cache: &mut ModelCache, rows: Option<usize>, media: Option<&MediaChunk>) -> R<Tensor> {
         let c = &self.config;
         let (t, h, m) = (ids.len(), c.hidden_size, c.hc_mult);
         let p0 = cache.ids.len();
@@ -496,7 +567,7 @@ impl Hy4Model {
             return Err(ModelError::Forward(format!("hy4: контекст {} > ёмкости {}", p0 + t, cache.max_seq)));
         }
         cache.ids.extend_from_slice(ids);
-        let res = self.forward_inner(ids, p0, cache, rows);
+        let res = self.forward_inner(ids, p0, cache, rows, media);
         if res.is_err() {
             cache.truncate(p0);
         }
@@ -504,13 +575,28 @@ impl Hy4Model {
         res
     }
 
-    fn forward_inner(&self, ids: &[u32], p0: usize, cache: &mut ModelCache, rows: Option<usize>) -> R<Tensor> {
+    fn forward_inner(&self, ids: &[u32], p0: usize, cache: &mut ModelCache, rows: Option<usize>, media: Option<&MediaChunk>) -> R<Tensor> {
         let c = &self.config;
         let (t, h, m) = (ids.len(), c.hidden_size, c.hc_mult);
         let dev = self.device;
         let pos: Vec<i32> = (p0..p0 + t).map(|p| p as i32).collect();
         let pos = Tensor::from_vec(pos, vec![t], dev).map_err(fe)?;
-        let emb = self.embed_rows(ids)?;
+        let rc = self.rope_ctx(cache, p0, t, &pos, media)?;
+        let mut emb = self.embed_rows(ids)?;
+        if let Some(m) = media.filter(|m| !m.inject.is_empty()) {
+            // Признаки картинки — на места заполнителей: строки feats после
+            // строк чанка, выборка по индексам.
+            let feats = m.feats.ok_or_else(|| ModelError::Forward("hy4: подстановка без признаков".into()))?;
+            let fr: Vec<u32> = m.inject.iter().map(|&(_, f)| f as u32).collect();
+            let fr = Tensor::from_vec(fr, vec![m.inject.len()], dev).map_err(fe)?;
+            let sel = f32c(&feats.index_select(0, &fr).map_err(fe)?)?;
+            let mut map: Vec<u32> = (0..t as u32).collect();
+            for (j, &(r, _)) in m.inject.iter().enumerate() {
+                map[r] = (t + j) as u32;
+            }
+            let map = Tensor::from_vec(map, vec![t], dev).map_err(fe)?;
+            emb = kern::contig(&Tensor::cat(&[&emb, &sel], 0).and_then(|e| e.index_select(0, &map)).map_err(fe)?)?;
+        }
         let x = kern::contig(&emb.unsqueeze(1).and_then(|e| e.expand(vec![t, m, h])).map_err(fe)?)?;
         let all_ids = cache.ids.clone();
         // Профиль `SYN_MOE_PROFILE`: стадия ждёт карту, иначе время уходит в следующую.
@@ -532,7 +618,7 @@ impl Hy4Model {
             let hn = kern::rms(&hin, Some(&layer.in_norm), c.rms_norm_eps, ACT)?;
             stage(l, "x", &x);
             stage(l, "attn_hn", &hn);
-            let y = hy4_stage(prof, dev, "hy4:attn", || self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l], None))?;
+            let y = hy4_stage(prof, dev, "hy4:attn", || self.attention(l, &layer.attn, &hn, &pos, p0, &mut cache.layers[l], None, &rc))?;
             let y = kern::rms(&y, Some(&layer.attn.post_norm), c.rms_norm_eps, DType::F32)?;
             stage(l, "attn_y", &y);
             kern::hc_post(&x, post.as_ref().expect("post"), &y)?;
@@ -601,7 +687,8 @@ impl Hy4Model {
         }
     }
 
-    pub(crate) fn attention(&self, _l: usize, a: &Attn, hn: &Tensor, pos: &Tensor, p0: usize, lc: &mut LayerCache, ext: Option<&ExtKeys>) -> R<Tensor> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention(&self, _l: usize, a: &Attn, hn: &Tensor, pos: &Tensor, p0: usize, lc: &mut LayerCache, ext: Option<&ExtKeys>, rc: &RopeCtx) -> R<Tensor> {
         let c = &self.config;
         let d = &a.dims;
         let (t, nh, lat) = (hn.dims()[0], d.heads, c.kv_lora_rank);
@@ -614,11 +701,11 @@ impl Hy4Model {
             let q = f32c(&fwd(&a.q_b, &qr)?)?;
             Ok((gate, qr, q))
         })?;
-        kern::rope(&q, pos, nh * d.qk(), nh, d.qk(), d.qk_nope, d.qk_rope, d.rope_theta)?;
+        kern::rope_m(&q, pos, rc.pos3.as_ref(), nh * d.qk(), nh, d.qk(), d.qk_nope, d.qk_rope, d.rope_theta)?;
         let ckv = hy4_stage(prof, dev, "a:kv", || f32c(&fwd(&a.kv_a, hn)?))?;
         let latent = kern::rms_cols(&ckv, lat, Some(&a.kv_a_norm), eps, DType::F32)?;
         let krot = kern::contig(&ckv.narrow(1, lat, d.qk_rope).map_err(fe)?)?;
-        kern::rope(&krot, pos, d.qk_rope, 1, d.qk_rope, 0, d.qk_rope, d.rope_theta)?;
+        kern::rope_m(&krot, pos, rc.pos3.as_ref(), d.qk_rope, 1, d.qk_rope, 0, d.qk_rope, d.rope_theta)?;
         let row = kern::contig(&Tensor::cat(&[&latent, &krot], 1).map_err(fe)?)?;
         kern::cache_put(&row, &lc.lat, pos)?;
         // Поглощённый запрос: q_lat = q_nope · W_uk по головам.
@@ -648,7 +735,7 @@ impl Hy4Model {
             },
             AttnKind::Indexed => {
                 let idx = a.indexer.as_ref().expect("индексатор");
-                let groups = self.indexer(_l, idx, hn, &qr, pos, p0, t, lc)?;
+                let groups = self.indexer(_l, idx, hn, &qr, pos, p0, t, lc, rc)?;
                 match &groups {
                     Some(g) => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Groups(g, c.index_kpool), scale)?,
                     None => kern::mla_attn(&qa, &lc.lat, &a.sinks, pos, lat, Keys::Window(usize::MAX), scale)?,
@@ -672,7 +759,7 @@ impl Hy4Model {
     /// Ключи индексатора в кэш, свёртка закрытых групп и, если хоть одному
     /// запросу мало плотного окна, выбор групп `[T, k]`.
     #[allow(clippy::too_many_arguments)]
-    fn indexer(&self, l: usize, idx: &Indexer, hn: &Tensor, qr: &Tensor, pos: &Tensor, p0: usize, t: usize, lc: &mut LayerCache) -> R<Option<Tensor>> {
+    fn indexer(&self, l: usize, idx: &Indexer, hn: &Tensor, qr: &Tensor, pos: &Tensor, p0: usize, t: usize, lc: &mut LayerCache, rc: &RopeCtx) -> R<Option<Tensor>> {
         let c = &self.config;
         let (g, ch) = (c.index_kpool, c.index_head_dim);
         let rope_w = c.indexed.qk_rope;
@@ -682,7 +769,7 @@ impl Hy4Model {
         let grp_cache = lc.grp.as_ref().expect("ключи групп");
         kern::cache_put(&tok, tok_cache, pos)?;
         let complete = (p0 + t) / g;
-        kern::idx_pool(tok_cache, &idx.wv, &idx.wg, &idx.ape, &idx.key_norm, grp_cache, lc.pooled, complete, g, rope_w, c.rms_norm_eps, theta)?;
+        kern::idx_pool(tok_cache, &idx.wv, &idx.wg, &idx.ape, &idx.key_norm, grp_cache, lc.pooled, complete, g, rope_w, c.rms_norm_eps, theta, rc.table.as_ref())?;
         lc.pooled = complete;
         let last_own = (p0 + t - 1) / g;
         if last_own <= c.index_groups() {
@@ -692,7 +779,7 @@ impl Hy4Model {
             return Ok(None);
         }
         let q = f32c(&fwd(&idx.q_proj, qr)?)?;
-        kern::rope(&q, pos, c.index_heads * ch, c.index_heads, ch, ch - rope_w, rope_w, theta)?;
+        kern::rope_m(&q, pos, rc.pos3.as_ref(), c.index_heads * ch, c.index_heads, ch, ch - rope_w, rope_w, theta)?;
         let q = q.reshape(vec![t, c.index_heads, ch]).map_err(fe)?;
         let wscale = 1.0 / ((c.index_heads as f32).sqrt() * (ch as f32).sqrt());
         let w = f32c(&fwd(&idx.w_proj, hn)?)?.mul_scalar(wscale).map_err(fe)?;
