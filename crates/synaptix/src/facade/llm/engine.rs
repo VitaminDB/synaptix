@@ -751,6 +751,18 @@ impl LlmPipeline {
                     .map(|_| ())
                     .map_err(|e| LlmError(e.to_string()))
             }
+            // Hy4: разовая сессия, картинки с сетками (позиции M-RoPE).
+            LlmPipeline::Hy4(p) => {
+                if media.iter().any(|m| m.kind != MediaKind::Image) {
+                    return Err(LlmError("Hy4-flash принимает только картинки".into()));
+                }
+                let images: Vec<(&Tensor, u64, (usize, usize))> = media.iter().enumerate().map(|(i, m)| (&m.embeds, i as u64, m.grid_hw)).collect();
+                let ctx = cfg.max_seq.unwrap_or(prompt_ids.len() + cfg.max_new_tokens + 1).min(prompt_ids.len() + cfg.max_new_tokens + 1);
+                let mut s = p.new_session(ctx).map_err(|e| LlmError(e.to_string()))?;
+                p.generate_cached_media_streaming(&mut s, prompt_ids, &images, &cfg, sink)
+                    .map(|_| ())
+                    .map_err(|e| LlmError(e.to_string()))
+            }
             _ => Err(LlmError("архитектура не принимает медиа-вход".into())),
         }
     }
@@ -772,6 +784,7 @@ impl LlmPipeline {
             // Inkling-2: один плейсхолдер на картинку; пайплайн сам выносит его
             // в часть `<|content_image|>` и разворачивает в `tokens` строк.
             LlmPipeline::Inkling2(_) => synaptix_llm_inkling2::vision::IMAGE_TOKEN.to_string(),
+            LlmPipeline::Hy4(p) => p.image_block(tokens),
             _ => format!(
                 "{IMAGE_START_TOKEN}{}{IMAGE_END_TOKEN}",
                 IMAGE_PAD_TOKEN.repeat(tokens)
@@ -2027,6 +2040,7 @@ impl Llm {
                     g.config.image_token_id.is_some() && g.has_vision_config()
                 }
                 LlmPipeline::Inkling2(p) => p.config.vision.is_some(),
+                LlmPipeline::Hy4(p) => p.has_vision_weights(),
                 _ => false,
             },
             Err(_) => false,
@@ -2042,6 +2056,7 @@ impl Llm {
                 LlmPipeline::Qwen4Exp(q) => q.has_vision(),
                 LlmPipeline::Gemma4(g) => g.has_vision(),
                 LlmPipeline::Inkling2(p) => p.has_vision(),
+                LlmPipeline::Hy4(p) => p.has_vision(),
                 _ => false,
             },
             Err(_) => false,
@@ -2084,6 +2099,7 @@ impl Llm {
                 .ensure_vision(self.compute_dtype)
                 .map_err(|e| LlmError(format!("vision load: {e}"))),
             LlmPipeline::Inkling2(p) => p.load_vision().map_err(|e| LlmError(format!("vision load: {e}"))),
+            LlmPipeline::Hy4(p) => p.load_vision().map_err(|e| LlmError(format!("vision load: {e}"))),
             _ => Ok(false),
         }
     }
@@ -2110,6 +2126,7 @@ impl Llm {
                 LlmPipeline::Qwen4Exp(q) => q.release_vision(),
                 LlmPipeline::Gemma4(g) => g.release_vision(),
                 LlmPipeline::Inkling2(p) => p.release_vision(),
+                LlmPipeline::Hy4(p) => p.release_vision(),
                 _ => {}
             }
         }
@@ -2199,6 +2216,10 @@ impl Llm {
                     .map_err(|e| LlmError(format!("image encode: {e}")))?,
                 (0, 0),
             ),
+            // Hy4: сетка (строк, столбцов с newline) — для позиций M-RoPE.
+            LlmPipeline::Hy4(p) => p
+                .encode_image(path, max_tokens)
+                .map_err(|e| LlmError(format!("image encode: {e}")))?,
             _ => return Err(LlmError("архитектура не принимает картинки".into())),
         };
         let tokens = embeds.dims()[0];
@@ -3441,6 +3462,24 @@ impl<'a> LlmGeneration<'a> {
                     .generate_cached_media_streaming(s, prompt_ids, &images, &cfg, &mut sink)
                     .map_err(|e| LlmError(e.to_string()))?;
                 Ok(prompt_ids.len().saturating_sub(st.prompt_tokens - reuse))
+            }
+            // Hy4: картинки со своими сетками (позиции M-RoPE), отпечатки — для
+            // переиспользования префикса.
+            LlmPipeline::Hy4(p) => {
+                let SessionKind::Hy4(s) = &mut session.kind else {
+                    return Err(LlmError("префикс-KV: сессия от другой модели".into()));
+                };
+                if media.iter().any(|m| m.kind != MediaKind::Image) {
+                    return Err(LlmError("Hy4-flash принимает только картинки".into()));
+                }
+                let images = media
+                    .iter()
+                    .map(|m| Ok((&m.embeds, embeds_hash(&m.embeds, m.embeds.dims()[0])?, m.grid_hw)))
+                    .collect::<Result<Vec<_>, LlmError>>()?;
+                let (_, _, reuse) = p
+                    .generate_cached_media_streaming(s, prompt_ids, &images, &cfg, &mut sink)
+                    .map_err(|e| LlmError(e.to_string()))?;
+                Ok(reuse)
             }
             _ => Err(LlmError("префикс-KV с медиа: архитектура не поддержана".into())),
         }
