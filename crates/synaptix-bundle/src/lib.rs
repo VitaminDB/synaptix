@@ -14,9 +14,12 @@ pub mod cdir;
 pub mod chunk;
 pub mod error;
 pub mod header;
+#[cfg(feature = "quant")]
 pub mod inspect;
+#[cfg(feature = "quant")]
 pub mod pack_plan;
 pub mod path;
+#[cfg(feature = "quant")]
 pub mod quant_layout;
 pub mod quantized;
 pub mod stream;
@@ -28,6 +31,7 @@ mod resolver;
 
 
 pub use bundle::{Bundle, DirEntry};
+#[cfg(feature = "quant")]
 pub use pack_plan::{scan_collection, scan_source, FoundItem, PackPlan, SourceCandidate};
 pub use builder::{
     resolve_safetensors_in_dir, BundleBuilder, ProgressCallback, ProgressEvent,
@@ -39,6 +43,7 @@ pub fn available_space(path: impl AsRef<std::path::Path>) -> Result<u64> {
 pub use cdir::{BundleMeta, CdirFormat, ChunkEntry, ChunkStatus, ChunkType, FileTag, LoraOverlay, RefSpec};
 pub use editor::{compact, BundleEditor};
 pub use error::{Error, Result};
+#[cfg(feature = "quant")]
 pub use quant_layout::{QuantEntry, QuantManifest};
 pub use quantized::{QuantizedChunkHeader, QUANT_FORMAT_FP8E4M3, QUANTIZED_CHUNK_NAME};
 pub use stream::{safetensors_header, StDtype, StreamTensor, TensorStream};

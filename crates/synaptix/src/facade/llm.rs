@@ -299,6 +299,33 @@ pub(crate) fn load_template_source(model: &Path) -> Option<String> {
     v.get("chat_template").and_then(|t| t.as_str()).map(str::to_string)
 }
 
+/// Байтовые границы токенов текста по `tokenizer.json` модели — любой, у
+/// которой он есть (языковая, эмбеддер, реранкер). Нужны клиентам службы,
+/// чтобы резать текст на куски по токенам (база знаний), не держа у себя
+/// токенизатор. Токенизатор модели кэшируется: `tokenizer.json` BGE-M3 —
+/// десятки мегабайт, разбирать его на каждый документ дорого.
+pub fn token_spans(model: &Path, text: &str) -> Result<Vec<(usize, usize)>, LlmError> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<HfTokenizer>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).get(model).cloned();
+    let tok = match cached {
+        Some(t) => t,
+        None => {
+            let t = Arc::new(build_tokenizer(model)?);
+            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if c.len() >= 8 {
+                c.clear();
+            }
+            c.insert(model.to_path_buf(), t.clone());
+            t
+        }
+    };
+    let enc = tok.inner().encode(text, false).map_err(|e| LlmError(format!("токенизатор: {e}")))?;
+    Ok(enc.get_offsets().to_vec())
+}
+
 pub(crate) fn build_tokenizer(model: &Path) -> Result<HfTokenizer, LlmError> {
     let bytes = read_model_file(model, "tokenizer.json")
         .ok_or_else(|| LlmError(format!("tokenizer.json не найден в {}", model.display())))?;
