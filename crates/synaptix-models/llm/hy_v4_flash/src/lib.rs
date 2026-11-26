@@ -7,6 +7,7 @@ pub mod kern;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod vision;
 
 pub use config::{AttnKind, Hy4Config};
 pub use loader::{Hy4Weights, LoadError};

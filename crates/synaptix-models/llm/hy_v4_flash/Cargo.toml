@@ -10,7 +10,8 @@ description = "Hy4-flash (tencent, hy_v4_flash): MLA с гейтом и синк
 synaptix-core       = { workspace = true }
 synaptix-ops        = { workspace = true }
 synaptix-nn         = { workspace = true }
-synaptix-io         = { workspace = true }
+synaptix-io         = { workspace = true, features = ["image"] }
+synaptix-vlm-minicpm = { workspace = true }
 synaptix-bundle     = { workspace = true }
 synaptix-llm-common = { workspace = true }
 synaptix-tokenizer  = { workspace = true }
