@@ -79,6 +79,9 @@ pub struct Gemma4Config {
     pub eos_token_ids: Vec<u32>,
     /// `image_token_id` — по нему в промпт вклеиваются мягкие токены картинки.
     pub image_token_id: Option<u32>,
+    /// `text_config.pad_token_id` — им HF заменяет заполнители медиа при
+    /// выборке PLE (эмбеддингов на слой у E2B/E4B).
+    pub pad_token_id: u32,
     /// Есть ли в конфиге башня зрения.
     pub has_vision: bool,
 }
@@ -192,6 +195,7 @@ impl Gemma4Config {
             bos_token_id: usize_at(&text, "bos_token_id").map(|x| x as u32),
             eos_token_ids,
             image_token_id: usize_at(&root, "image_token_id").map(|x| x as u32),
+            pad_token_id: usize_at(&text, "pad_token_id").map_or(0, |x| x as u32),
             has_vision: root.get("vision_config").is_some_and(|v| !v.is_null()),
         };
         cfg.validate()?;

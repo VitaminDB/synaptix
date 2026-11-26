@@ -2687,6 +2687,16 @@ impl DecoderModel {
         Ok(hidden)
     }
 
+    /// PLE на ближайший проход по готовым эмбеддингам (медиа уже подставлены),
+    /// как в HF Gemma4: доля «по токену» — по `ids` (на местах медиа там
+    /// pad-id), проекция — по `emb` после подстановки. Без PLE — ничего.
+    pub fn set_ple_inputs(&self, ids: &Tensor, emb: &Tensor) -> Result<(), ModelError> {
+        let Some(p) = &self.ple else { return Ok(()) };
+        let pli = self.ple_inputs(p, ids, emb)?;
+        *self.ple_cur.lock().unwrap_or_else(|e| e.into_inner()) = Some(pli);
+        Ok(())
+    }
+
     fn ple_inputs(&self, p: &ModelPle, ids: &Tensor, emb: &Tensor) -> Result<Tensor, ModelError> {
         let dims = ids.dims().to_vec();
         let host: Vec<u32> = ids

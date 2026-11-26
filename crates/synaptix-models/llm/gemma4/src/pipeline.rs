@@ -424,6 +424,17 @@ impl Gemma4Pipeline {
                 .narrow(1, off - prefix, step)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| PipelineError::Model(e.to_string()))?;
+            // PLE (E2B/E4B) — по чанку: заполнители медиа → pad-id, проекция по
+            // эмбеддингам после подстановки (иначе модель «не видит» картинку).
+            let ple_ids: Vec<u32> = prompt_ids[off..off + step]
+                .iter()
+                .map(|&t| if media.iter().any(|m| m.pad == t) { self.config.pad_token_id } else { t })
+                .collect();
+            let ple_ids = Tensor::from_vec(ple_ids, vec![1usize, step], device)
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
+            self.model
+                .set_ple_inputs(&ple_ids, &part)
+                .map_err(|e| PipelineError::Model(e.to_string()))?;
             let h = no_grad(|| {
                 self.model.forward_from_hidden_spans(
                     &part,
