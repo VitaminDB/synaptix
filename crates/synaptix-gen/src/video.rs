@@ -62,6 +62,18 @@ pub struct VideoRequest {
     pub tail_out: Option<PathBuf>,
     /// Идентификатор модели в службе (пишется в метаданные хвоста и сверяется при продолжении).
     pub model_id: Option<String>,
+    /// H3: LoRA поверх DiT (Turbo и др.) и её сила (по умолчанию 1).
+    /// У Turbo без явных steps/guidance — шаги по имени файла («8step», «4step»), CFG 1.
+    pub lora: Option<PathBuf>,
+    pub lora_strength: Option<f32>,
+}
+
+/// Число шагов дистиллированной LoRA по имени файла (`…_8step_…` → 8).
+pub fn lora_steps(p: &Path) -> Option<usize> {
+    let n = p.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let i = n.find("step")?;
+    let digits: String = n[..i].chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    digits.parse().ok().filter(|&s: &usize| s > 0 && s <= 64)
 }
 
 /// Формат весов, которым квантован бандл (`quant_manifest.json`): у
@@ -110,7 +122,16 @@ pub struct VideoOutput {
 pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoRequest, out: &Path, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> R<VideoOutput> {
     use crate::h3_stages as st;
     use crate::tail::TailLatent;
-    let m = st::open(model, encoder, device, req.quant.as_deref())?;
+    let mut m = st::open(model, encoder, device, req.quant.as_deref())?;
+    let lora = req.lora.as_ref().filter(|_| req.lora_strength.unwrap_or(1.0) > 0.0);
+    if let Some(p) = lora {
+        if !p.exists() {
+            return Err(format!("LoRA нет: {}", p.display()));
+        }
+        m = m.with_lora(p.clone(), req.lora_strength.unwrap_or(1.0));
+    }
+    // дистиллированная LoRA (Turbo): свои шаги и без CFG
+    let distilled = lora.and_then(|p| lora_steps(p));
     let context = match &req.context {
         Some(p) => Some(TailLatent::load(p)?),
         None => None,
@@ -118,8 +139,8 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let continued = context.is_some();
     let ctx_lat_frames = context.as_ref().map(|c| c.meta.context_frames).unwrap_or(0);
     let size = st::Size { width: req.width.unwrap_or(0), height: req.height.unwrap_or(0), seconds: req.seconds.unwrap_or(0.0) };
-    let steps = req.steps.filter(|&s| s > 0).unwrap_or(20);
-    let cfg_scale = req.guidance.unwrap_or(5.0);
+    let steps = req.steps.filter(|&s| s > 0).or(distilled).unwrap_or(20);
+    let cfg_scale = req.guidance.unwrap_or(if distilled.is_some() { 1.0 } else { 5.0 });
     // Негатив — только при CFG > 1 (без CFG его не кодировать).
     let negative = req.negative.as_deref().filter(|_| cfg_scale > 1.0);
     let first = if continued { None } else { req.first_frame.as_deref() };
@@ -146,6 +167,9 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let (width, height) = (lat.width, lat.height);
     let n_frames = frames.len();
     let mut label = format!("MiniMax-H3 {width}×{height}, {:.1} с, {steps} шагов", n_frames as f64 / st::FPS);
+    if let Some(p) = lora {
+        label += &format!(", LoRA {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    }
     if continued {
         label += &format!(", с хвоста ({ctx_lat_frames} лат.)");
     } else if keyframes > 0 {
@@ -830,4 +854,15 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     }
     let label = format!("LTX-2.3 {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / fps, if two_stage { ", две стадии" } else { "" });
     Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label, tail: tail_path, continued_from_latent: continued })
+}
+
+#[cfg(test)]
+mod lora_tests {
+    #[test]
+    fn lora_steps_from_name() {
+        use std::path::Path;
+        assert_eq!(super::lora_steps(Path::new("minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors")), Some(8));
+        assert_eq!(super::lora_steps(Path::new("minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors")), Some(4));
+        assert_eq!(super::lora_steps(Path::new("style.safetensors")), None);
+    }
 }
