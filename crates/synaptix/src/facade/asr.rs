@@ -7,7 +7,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 #[cfg(feature = "engine")]
-use synaptix_asr_gigaam::GigaAm;
+use synaptix_asr_gigaam::{GigaAm, GigaAm4};
 #[cfg(feature = "engine")]
 use synaptix_asr_whisper::{Task, WhisperPipeline, WordOptions};
 #[cfg(feature = "engine")]
@@ -106,6 +106,8 @@ impl Default for AsrWordsOptions {
 enum Engine {
     Whisper(WhisperPipeline),
     GigaAm(GigaAm),
+    /// GigaAM-v4 (Zapformer, две CTC-головы): русский и английский.
+    GigaAm4(Box<GigaAm4>),
 }
 
 #[cfg(feature = "engine")]
@@ -135,6 +137,11 @@ impl Transcriber {
                     engine: Engine::Whisper(whisper),
                     language: cfg.language,
                 })
+            }
+            // GigaAM-v4 — другая архитектура; счёт F32, как эталон.
+            AsrModelKind::GigaAm if GigaAm4::is_v4(&cfg.model_path) => {
+                let m = GigaAm4::load(&cfg.model_path, &cfg.device).map_err(|e| e.to_string())?;
+                Ok(Self { kind: cfg.kind, engine: Engine::GigaAm4(Box::new(m)), language: cfg.language })
             }
             AsrModelKind::GigaAm => {
                 // Каталог = распакованный HF-снапшот; файл = .syn-бандл.
@@ -185,6 +192,8 @@ impl Transcriber {
             Engine::GigaAm(gigaam) => {
                 gigaam.transcribe_pcm(pcm, sample_rate).map_err(|e| e.to_string())
             }
+            // GigaAM-v4: текст с регистром и пунктуацией (голова e2e).
+            Engine::GigaAm4(m) => m.transcribe(pcm, sample_rate).map(|t| t.e2e).map_err(|e| e.to_string()),
         }
     }
 
@@ -232,6 +241,20 @@ impl Transcriber {
                         .into_iter()
                         .map(|w| AsrWord { text: w.text, start: w.start, end: w.end, prob: w.prob })
                         .collect(),
+                })
+            }
+            Engine::GigaAm4(m) => {
+                let t = m.transcribe(pcm, sample_rate).map_err(|e| e.to_string())?;
+                // Язык — по письму распознанного текста (модель знает русский и английский).
+                let (cyr, lat) = t.raw.chars().fold((0usize, 0usize), |(c, l), ch| match ch {
+                    'а'..='я' | 'ё' => (c + 1, l),
+                    'a'..='z' => (c, l + 1),
+                    _ => (c, l),
+                });
+                Ok(AsrResult {
+                    text: t.e2e,
+                    language: if lat > cyr { "en" } else { "ru" }.to_string(),
+                    words: t.words.into_iter().map(|w| AsrWord { text: w.text, start: w.start, end: w.end, prob: w.prob }).collect(),
                 })
             }
         }

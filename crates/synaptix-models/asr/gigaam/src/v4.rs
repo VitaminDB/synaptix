@@ -475,6 +475,17 @@ impl GigaAm4 {
         serde_json::from_slice::<serde_json::Value>(bytes).ok().is_some_and(|v| v["cfg"]["encoder"]["_target_"].as_str().is_some_and(|t| t.contains("Zapformer")))
     }
 
+    /// Модель по пути (бандл или каталог HF) — GigaAM-v4?
+    pub fn is_v4(path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        let cfg = if path.is_dir() {
+            std::fs::read(path.join("config.json")).ok()
+        } else {
+            SynBundleLoader::open(path).ok().and_then(|l| l.read_file("config.json"))
+        };
+        cfg.is_some_and(|c| Self::is_v4_config(&c))
+    }
+
     /// `.syn`-бандл или каталог HF (`model.safetensors` + `config.json`).
     pub fn load(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let path = path.as_ref();
