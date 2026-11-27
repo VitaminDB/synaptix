@@ -21,12 +21,32 @@ use synaptix_ops::norm::rms_norm::rms_norm;
 use synaptix_ops::pos::rope::{apply_rope_with_cossin, RopeLayout};
 
 use crate::dualar::rope_tables;
-use crate::loader::Checkpoint;
+
+/// Источник весов кодека (компонент `codec` бандла): свой у Audio8 и у моделей
+/// с тем же кодеком (Fish Drama 3).
+pub trait CodecSource {
+    /// Вес в счётном типе кодека.
+    fn codec(&self, name: &str) -> Result<Tensor>;
+    /// Вес в F32 (кодбуки, alpha, g/v weight-norm).
+    fn codec_f32(&self, name: &str) -> Result<Tensor>;
+    fn codec_has(&self, name: &str) -> bool;
+    fn codec_dtype(&self) -> DType;
+    fn device(&self) -> Device;
+}
+
+/// Размеры кодека, не выводимые из весов.
+#[derive(Debug, Clone, Copy)]
+pub struct CodecShape {
+    pub num_codebooks: usize,
+    pub post_layers: usize,
+    pub post_heads: usize,
+    pub post_local_heads: usize,
+}
 use crate::{Audio8Error, Result, FRAME_SAMPLES};
 
 /// weight-norm: w = g · v / ‖v‖ (норма по всем осям, кроме 0). Имена — новые
 /// параметризации (`parametrizations.weight.original0/1`) или старые (`weight_g/v`).
-fn wn_weight(ck: &Checkpoint, prefix: &str) -> Result<Tensor> {
+fn wn_weight(ck: &dyn CodecSource, prefix: &str) -> Result<Tensor> {
     let (g, v) = if ck.codec_has(&format!("{prefix}.parametrizations.weight.original0")) {
         (
             ck.codec_f32(&format!("{prefix}.parametrizations.weight.original0"))?,
@@ -41,7 +61,7 @@ fn wn_weight(ck: &Checkpoint, prefix: &str) -> Result<Tensor> {
     let mut shape = vec![d[0]];
     shape.extend(std::iter::repeat_n(1usize, d.len() - 1));
     let w = v.broadcast_mul(&g.reshape(shape.clone())?.div(&norm.reshape(shape)?)?)?;
-    Ok(w.to_dtype(ck.codec_dtype)?)
+    Ok(w.to_dtype(ck.codec_dtype())?)
 }
 
 fn pad_time(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
@@ -72,11 +92,11 @@ struct CConv {
 }
 
 impl CConv {
-    fn load(ck: &Checkpoint, prefix: &str, wn: bool, stride: usize, dilation: usize) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, prefix: &str, wn: bool, stride: usize, dilation: usize) -> Result<Self> {
         Self::load_g(ck, prefix, wn, stride, dilation, false)
     }
 
-    fn load_g(ck: &Checkpoint, prefix: &str, wn: bool, stride: usize, dilation: usize, groups_depthwise: bool) -> Result<Self> {
+    fn load_g(ck: &dyn CodecSource, prefix: &str, wn: bool, stride: usize, dilation: usize, groups_depthwise: bool) -> Result<Self> {
         let w = if wn { wn_weight(ck, prefix)? } else { ck.codec(&format!("{prefix}.weight"))? };
         let b = Some(ck.codec(&format!("{prefix}.bias"))?);
         let k = w.dims()[2];
@@ -112,7 +132,7 @@ struct CConvT {
 }
 
 impl CConvT {
-    fn load(ck: &Checkpoint, prefix: &str, wn: bool, stride: usize) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, prefix: &str, wn: bool, stride: usize) -> Result<Self> {
         let w = if wn { wn_weight(ck, prefix)? } else { ck.codec(&format!("{prefix}.weight"))? };
         let b = Some(ck.codec(&format!("{prefix}.bias"))?);
         let k = w.dims()[2];
@@ -137,12 +157,12 @@ struct Snake {
 }
 
 impl Snake {
-    fn load(ck: &Checkpoint, name: &str) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, name: &str) -> Result<Self> {
         let a = ck.codec_f32(name)?;
         let host = a.flatten_all()?.to_vec1::<f32>()?;
         let positive = host.iter().all(|&v| v > 0.0) && std::env::var("SYN_AUDIO8_SNAKE").as_deref() != Ok("plain");
         let ln_alpha = if positive { Some(a.flatten_all()?.log()?) } else { None };
-        Ok(Self { alpha: a.to_dtype(ck.codec_dtype)?, ln_alpha })
+        Ok(Self { alpha: a.to_dtype(ck.codec_dtype())?, ln_alpha })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -168,7 +188,7 @@ struct ResUnit {
 }
 
 impl ResUnit {
-    fn load(ck: &Checkpoint, p: &str, dilation: usize) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, p: &str, dilation: usize) -> Result<Self> {
         Ok(Self {
             s1: Snake::load(ck, &format!("{p}.block.0.alpha"))?,
             c1: CConv::load(ck, &format!("{p}.block.1.conv"), true, 1, dilation)?,
@@ -185,7 +205,7 @@ impl ResUnit {
     }
 }
 
-fn lin(ck: &Checkpoint, p: &str, bias: bool) -> Result<QuantLinear> {
+fn lin(ck: &dyn CodecSource, p: &str, bias: bool) -> Result<QuantLinear> {
     let w = ck.codec(&format!("{p}.weight"))?;
     let b = if bias { Some(ck.codec(&format!("{p}.bias"))?) } else { None };
     Ok(QuantLinear::dense(w, b)?)
@@ -216,7 +236,7 @@ struct WindowTransformer {
 }
 
 impl WindowTransformer {
-    fn load(ck: &Checkpoint, p: &str, n_layer: usize, n_head: usize, n_kv: usize, window: usize) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, p: &str, n_layer: usize, n_head: usize, n_kv: usize, window: usize) -> Result<Self> {
         let hd = 64usize;
         let mut perm = Vec::with_capacity((n_head + 2 * n_kv) * hd);
         for h in 0..n_head + n_kv {
@@ -245,7 +265,7 @@ impl WindowTransformer {
         }
         let norm = ck.codec(&format!("{p}.norm.weight"))?;
         let dim = norm.dims()[0];
-        Ok(Self { blocks, norm, n_head, n_kv, hd, window, dim, device: ck.device })
+        Ok(Self { blocks, norm, n_head, n_kv, hd, window, dim, device: ck.device() })
     }
 
     fn heads(&self, t: &Tensor, off: usize, n: usize, s: usize) -> Result<Tensor> {
@@ -319,7 +339,7 @@ struct ConvNeXt {
 }
 
 impl ConvNeXt {
-    fn load(ck: &Checkpoint, p: &str) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, p: &str) -> Result<Self> {
         Ok(Self {
             dw: CConv::load_g(ck, &format!("{p}.dwconv.conv"), false, 1, 1, true)?,
             norm_w: ck.codec(&format!("{p}.norm.weight"))?,
@@ -352,7 +372,7 @@ struct Vq {
 }
 
 impl Vq {
-    fn load(ck: &Checkpoint, p: &str, with_in: bool) -> Result<Self> {
+    fn load(ck: &dyn CodecSource, p: &str, with_in: bool) -> Result<Self> {
         let codebook = ck.codec_f32(&format!("{p}.codebook.weight"))?;
         let size = codebook.dims()[0];
         let flat = |w: Tensor| -> Result<Tensor> {
@@ -438,7 +458,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    fn load(ck: &Checkpoint) -> Result<Self> {
+    fn load(ck: &dyn CodecSource) -> Result<Self> {
         let first = CConv::load(ck, "encoder.block.0.conv", true, 1, 1)?;
         let mut blocks = Vec::new();
         for (i, (&stride, &tl)) in [2usize, 4, 8, 8].iter().zip([0usize, 0, 0, 4].iter()).enumerate() {
@@ -474,13 +494,12 @@ impl Encoder {
 }
 
 impl Codec {
-    pub fn load(ck: &Checkpoint, with_encoder: bool) -> Result<Self> {
-        let c = &ck.config;
+    pub fn load(ck: &dyn CodecSource, c: CodecShape, with_encoder: bool) -> Result<Self> {
         let sem_vq = Vq::load(ck, "quantizer.semantic_quantizer.quantizers.0", true)?;
         let res_vq = (0..c.num_codebooks - 1)
             .map(|i| Vq::load(ck, &format!("quantizer.quantizer.quantizers.{i}"), true))
             .collect::<Result<Vec<_>>>()?;
-        let post = WindowTransformer::load(ck, "quantizer.post_module", c.codec_post_n_layer, c.codec_post_n_head, c.codec_post_n_local_heads, 128)?;
+        let post = WindowTransformer::load(ck, "quantizer.post_module", c.post_layers, c.post_heads, c.post_local_heads, 128)?;
         let up = (0..2)
             .map(|i| {
                 Ok((
@@ -508,7 +527,7 @@ impl Codec {
         if with_encoder {
             let _ = enc.set(Encoder::load(ck)?);
         }
-        Ok(Self { sem_vq, res_vq, post, up, dec_in, dec_blocks, dec_snake, dec_out, enc, enc_lock: Default::default(), dtype: ck.codec_dtype, device: ck.device })
+        Ok(Self { sem_vq, res_vq, post, up, dec_in, dec_blocks, dec_snake, dec_out, enc, enc_lock: Default::default(), dtype: ck.codec_dtype(), device: ck.device() })
     }
 
     pub fn has_encoder(&self) -> bool {
@@ -516,7 +535,7 @@ impl Codec {
     }
 
     /// Загрузить энкодер, если ещё не загружен.
-    pub fn ensure_encoder(&self, ck: &Checkpoint) -> Result<()> {
+    pub fn ensure_encoder(&self, ck: &dyn CodecSource) -> Result<()> {
         if self.enc.get().is_some() {
             return Ok(());
         }

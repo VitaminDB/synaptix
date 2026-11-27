@@ -2811,6 +2811,12 @@ impl DecoderModel {
         self.lm_head_forward(&normed)
     }
 
+    /// Финальная норма всех позиций `hidden [B, S, H]` (вход головы; у
+    /// Drama 3 — ещё и вход башни кодбуков).
+    pub fn normed_all(&self, hidden: &Tensor) -> Result<Tensor, ModelError> {
+        rms_norm(hidden, &self.final_norm, self.config.rms_norm_eps).coerr()
+    }
+
     pub fn normed_at(&self, hidden: &Tensor, idx: usize) -> Result<Tensor, ModelError> {
         let dev = self.device;
         let normed = prof(dev, "norm", || {

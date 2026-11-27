@@ -1,0 +1,23 @@
+[package]
+name = "synaptix-tts-drama3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fish Audio Drama 3 — речь по тексту с клонированием голоса: основа Qwen3.5-MoE покадрово даёт семантический токен, башня кодбуков (13 слоёв) — девять акустических, кодек 44,1 кГц."
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+hound = { workspace = true }
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-audio     = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-llm-qwen3-next-hybrid = { workspace = true }
+synaptix-tts-audio8 = { workspace = true }
+thiserror          = { workspace = true }

@@ -83,20 +83,6 @@ impl Checkpoint {
         self.main.names().iter().any(|n| *n == name)
     }
 
-    /// Вес кодека (в типе кодека).
-    pub fn codec(&self, name: &str) -> Result<Tensor> {
-        self.codec.load_to(name, self.device, self.codec_dtype).map_err(|e| Audio8Error::Load(format!("codec {name}: {e}")))
-    }
-
-    /// Вес кодека в F32 (мелкие таблицы: кодбуки, alpha, g/v weight-norm).
-    pub fn codec_f32(&self, name: &str) -> Result<Tensor> {
-        self.codec.load_to(name, self.device, DType::F32).map_err(|e| Audio8Error::Load(format!("codec {name}: {e}")))
-    }
-
-    pub fn codec_has(&self, name: &str) -> bool {
-        self.codec.names().iter().any(|n| *n == name)
-    }
-
     /// Линейный слой LM: квант из бандла как есть, иначе плотный вес
     /// (`prep` — правка плотного веса и смещения до кванта, например перестановка
     /// строк q/k под split-RoPE) и квант на лету по `self.quant`.
@@ -127,6 +113,31 @@ impl Checkpoint {
             None => QuantLinear::dense(w, b)?,
         };
         Ok(Lin(l))
+    }
+}
+
+impl crate::codec::CodecSource for Checkpoint {
+    fn codec(&self, name: &str) -> Result<Tensor> {
+        self.codec.load_to(name, self.device, self.codec_dtype).map_err(|e| Audio8Error::Load(format!("codec {name}: {e}")))
+    }
+    fn codec_f32(&self, name: &str) -> Result<Tensor> {
+        self.codec.load_to(name, self.device, DType::F32).map_err(|e| Audio8Error::Load(format!("codec {name}: {e}")))
+    }
+    fn codec_has(&self, name: &str) -> bool {
+        self.codec.names().iter().any(|n| *n == name)
+    }
+    fn codec_dtype(&self) -> DType {
+        self.codec_dtype
+    }
+    fn device(&self) -> Device {
+        self.device
+    }
+}
+
+impl Checkpoint {
+    pub fn codec_shape(&self) -> crate::codec::CodecShape {
+        let c = &self.config;
+        crate::codec::CodecShape { num_codebooks: c.num_codebooks, post_layers: c.codec_post_n_layer, post_heads: c.codec_post_n_head, post_local_heads: c.codec_post_n_local_heads }
     }
 }
 

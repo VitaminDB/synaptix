@@ -79,7 +79,7 @@ impl Audio8Pipeline {
         let tok = TextTokenizer::from_bytes(&ck.read_file("tokenizer.json")?)?;
         let model = DualAr::load(&ck)?;
         let eager = std::env::var("SYN_AUDIO8_ENCODER").as_deref() == Ok("eager");
-        let codec = Codec::load(&ck, eager)?;
+        let codec = Codec::load(&ck, ck.codec_shape(), eager)?;
         let g = &ck.gen;
         let defaults = GenerateOptions { temperature: g.temperature, top_p: g.top_p, top_k: g.top_k, ..GenerateOptions::default() };
         Ok(Self { model, codec, tok, config: ck.config.clone(), defaults, device, last: Default::default(), ck })
