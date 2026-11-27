@@ -195,6 +195,8 @@ pub struct ZcLayer {
     n_slots: usize,
     /// Частоты выбора на префилле — затравка следующей сборки.
     seed: Vec<f32>,
+    /// Адреса блобов всех экспертов в закреплённой RAM (для асинхронной DMA-подкачки на префилле).
+    host_blobs: Vec<ExpertBlobs>,
     ord: usize,
     /// Скретч упреждающей подкачки (живёт со слоем: его читают ядра второго стрима).
     pf: Mutex<Option<PfScratch>>,
@@ -349,6 +351,7 @@ impl ZcLayer {
             experts,
             n_slots,
             seed,
+            host_blobs: blobs.to_vec(),
             ord,
             pf: Mutex::new(None),
             pending: Mutex::new(None),
@@ -427,15 +430,18 @@ impl ZcLayer {
         let pairs = idx.numel();
         let dev = pool.device;
         let split = self.split_scales();
-        let eff_gu = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
-        let eff_dn = Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?;
+        let eff_gu = Tensor::empty_uninit(vec![pairs], DType::I64, dev).map_err(zerr)?;
+        let eff_dn = Tensor::empty_uninit(vec![pairs], DType::I64, dev).map_err(zerr)?;
         // Масштабы — отдельными тензорами: таблица GEMV берёт хранилище целиком.
         let eff_s = if split {
-            Some((Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?, Tensor::zeros(vec![pairs], DType::I64, dev).map_err(zerr)?))
+            Some((
+                Tensor::empty_uninit(vec![pairs], DType::I64, dev).map_err(zerr)?,
+                Tensor::empty_uninit(vec![pairs], DType::I64, dev).map_err(zerr)?,
+            ))
         } else {
             None
         };
-        let cp = Tensor::zeros(vec![if split { 5 } else { 3 }, pairs], DType::I64, dev).map_err(zerr)?;
+        let cp = Tensor::empty_uninit(vec![if split { 5 } else { 3 }, pairs], DType::I64, dev).map_err(zerr)?;
         let cpa = addr(&cp)?;
         let row = 8 * pairs as u64;
         let mut a = self.launch_base()?;
@@ -569,6 +575,42 @@ impl ZcLayer {
 
     pub fn slots(&self) -> usize {
         self.n_slots
+    }
+
+    pub fn host_blobs(&self) -> &[ExpertBlobs] {
+        &self.host_blobs
+    }
+
+    pub fn slot_base(&self) -> u64 {
+        self.slot_base
+    }
+
+    pub fn gu_bytes(&self) -> usize {
+        self.gu_bytes
+    }
+
+    pub fn gu_s_bytes(&self) -> usize {
+        self.gu_s_bytes
+    }
+
+    pub fn dn_bytes(&self) -> usize {
+        self.dn_bytes
+    }
+
+    pub fn dn_s_bytes(&self) -> usize {
+        self.dn_s_bytes
+    }
+
+    pub fn gu_shape(&self) -> (usize, usize) {
+        self.gu_shape
+    }
+
+    pub fn dn_shape(&self) -> (usize, usize) {
+        self.dn_shape
+    }
+
+    pub fn ord(&self) -> usize {
+        self.ord
     }
 
     /// Какие эксперты сейчас в слотах (синхронное чтение `owner`, −1 — слот

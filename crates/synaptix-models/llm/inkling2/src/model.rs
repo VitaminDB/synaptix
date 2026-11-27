@@ -522,6 +522,9 @@ pub struct Inkling2Model {
     layers: Vec<Layer>,
     /// Веса экспертов и пул zero-copy (режим меняется на ходу).
     pub(crate) xrt: SharedExperts,
+    /// Общий ping-pong буфер DMA для подкачки промахов на префилле zero-copy
+    /// (`2 × 8` слотов, выделяется лениво только при ZC-префилле).
+    prefill_staging: std::sync::Mutex<Option<Tensor>>,
     /// Формат KV слотов полного внимания у новых кэшей ([`Self::make_cache`]).
     kv_fmt: KvFormat,
 }
@@ -533,6 +536,12 @@ fn lerr(e: impl std::fmt::Display) -> LoadError {
 /// Тензор F32 на карте из host-вектора.
 fn dev_f32(v: Vec<f32>, shape: Vec<usize>, dev: Device) -> Result<Tensor, LoadError> {
     Tensor::from_vec(v, shape, dev).map_err(lerr)
+}
+
+/// Тензор BF16 на карте из host-вектора F32.
+fn dev_bf16(v: &[f32], shape: Vec<usize>, dev: Device) -> Result<Tensor, LoadError> {
+    let b: Vec<half::bf16> = v.iter().map(|&x| half::bf16::from_f32(x)).collect();
+    Tensor::from_vec(b, shape, dev).map_err(lerr)
 }
 
 /// Матрица `[r, c]` → транспонированная `[c, r]`.
@@ -645,9 +654,9 @@ impl Inkling2Model {
                 }
                 Some(LoopLayer {
                     msg_q: dev_f32(mq, vec![4, h], dev)?,
-                    down: dev_f32(down, vec![4, rank, 2 * h], dev)?,
-                    gain: dev_f32(gain, vec![4, rank, h], dev)?,
-                    forget: dev_f32(forget, vec![4, rank, h], dev)?,
+                    down: dev_bf16(&down, vec![4, rank, 2 * h], dev)?,
+                    gain: dev_bf16(&gain, vec![4, rank, h], dev)?,
+                    forget: dev_bf16(&forget, vec![4, rank, h], dev)?,
                     rank,
                 })
             } else {
@@ -682,7 +691,7 @@ impl Inkling2Model {
         }
         let stores = (0..layers.len()).map(|_| ExpertStore::Pending).collect();
         let xrt = std::sync::Arc::new(std::sync::RwLock::new(ExpertRt { stores, pool: None }));
-        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, xrt, kv_fmt: KvFormat::Bf16 })
+        Ok(Self { cfg, device: dev, embed, embed_norm, unembed, norm, output_q, layers, xrt, prefill_staging: std::sync::Mutex::new(None), kv_fmt: KvFormat::Bf16 })
     }
 
     /// Модель целиком, эксперты резидентны на карте.
@@ -1138,11 +1147,15 @@ impl Inkling2Model {
         }
         let mut states: Vec<&Tensor> = blocks.iter().collect();
         states.push(&cur);
-        let out = kern::pick(&kern::mix(&states, &self.output_q)?, 0)?;
-        let out = f32c(&out)?;
-        let out = if all_logits { out } else { f32c(&out.narrow(0, n - 1, 1).map_err(fe)?)? };
-        let rows = out.dims()[0];
-        let xn = kern::rms(&out, Some(&self.norm), t.rms_norm_eps, true)?;
+        let xn = if n == 1 && !all_logits && t.hidden_size % 4 == 0 && t.hidden_size <= 4096 {
+            kern::mix_rms_dec(&states, &self.output_q, &self.norm, t.rms_norm_eps)?
+        } else {
+            let out = kern::pick(&kern::mix(&states, &self.output_q)?, 0)?;
+            let out = f32c(&out)?;
+            let out = if all_logits { out } else { f32c(&out.narrow(0, n - 1, 1).map_err(fe)?)? };
+            kern::rms(&out, Some(&self.norm), t.rms_norm_eps, true)?
+        };
+        let rows = xn.dims()[0];
         let logits = bf16c(&self.unembed.raw(&xn)?)?;
         let vu = t.unpadded_vocab_size;
         let res = empty(vec![rows, vu], DType::F32, dev)?;
@@ -1166,11 +1179,13 @@ impl Inkling2Model {
         let dev = self.device;
         let th = n * h;
         let r = lp.rank;
+        let w_bf16 = (lp.down.dtype() == DType::BF16) as u32;
+        let w_elem = if w_bf16 != 0 { 2usize } else { 4usize };
         let d = empty(vec![nz, n, r], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(x)?;
         a.a[1] = addr(msg)? + (first * th * 4) as u64;
-        a.a[2] = addr(&lp.down)? + (first * r * 2 * h * 4) as u64;
+        a.a[2] = addr(&lp.down)? + (first * r * 2 * h * w_elem) as u64;
         a.a[3] = addr(&d)?;
         a.u[0] = n as u32;
         a.u[1] = h as u32;
@@ -1179,14 +1194,19 @@ impl Inkling2Model {
         a.u[4] = th as u32;
         a.u[5] = (r * 2 * h) as u32;
         a.u[6] = (n * r) as u32;
-        launch(dev, "ink2_ctrl_down", &a, (n as u32, r as u32, nz as u32), 256)?;
+        a.u[7] = w_bf16;
+        if n == 1 {
+            launch(dev, "ink2_ctrl_down_dec", &a, (1, r as u32, nz as u32), 256)?;
+        } else {
+            launch(dev, "ink2_ctrl_down", &a, (n as u32, (r as u32).div_ceil(8), nz as u32), 256)?;
+        }
         let out = empty(vec![nz, n, h], DType::F32, dev)?;
         let mut a = Ink2Launch::default();
         a.a[0] = addr(x)?;
         a.a[1] = addr(msg)? + (first * th * 4) as u64;
         a.a[2] = addr(&d)?;
-        a.a[3] = addr(&lp.gain)? + (first * r * h * 4) as u64;
-        a.a[4] = addr(&lp.forget)? + (first * r * h * 4) as u64;
+        a.a[3] = addr(&lp.gain)? + (first * r * h * w_elem) as u64;
+        a.a[4] = addr(&lp.forget)? + (first * r * h * w_elem) as u64;
         a.a[5] = addr(&out)?;
         a.u[0] = n as u32;
         a.u[1] = h as u32;
@@ -1195,6 +1215,7 @@ impl Inkling2Model {
         a.u[4] = th as u32;
         a.u[5] = (r * h) as u32;
         a.u[6] = (n * r) as u32;
+        a.u[7] = w_bf16;
         launch(dev, "ink2_ctrl_out", &a, ((h as u32).div_ceil(256), n as u32, nz as u32), 256)?;
         Ok(out)
     }
@@ -1211,17 +1232,24 @@ impl Inkling2Model {
 
         // Входы q/k/v: строки смеси блоков (у SWA — одна на всех), затем контроллеры (проход > 0)
         // и RMS-нормы — по одному запуску на этап для всех трёх входов (`blockIdx.z`).
-        let mixed = match &l.attn_res_q {
-            Some(q) => {
-                let mut states: Vec<&Tensor> = blocks.iter().collect();
-                states.push(&cur);
-                Some(kern::stage("mix", dev, || kern::mix(&states, q))?)
-            }
-            None => None,
-        };
-        let src = mixed.as_ref().unwrap_or(&cur);
-        let src_z = if mixed.is_some() && !l.swa { 1 } else { 0 };
-        let normed: [Tensor; 3] = {
+        let normed: [Tensor; 3] = if n == 1 && messages.is_none() && l.swa && l.attn_res_q.is_some() && t.hidden_size % 4 == 0 && t.hidden_size <= 4096 {
+            let q = l.attn_res_q.as_ref().expect("attn_res_q");
+            let w = l.attn_norm.as_ref().expect("attn_norm");
+            let mut states: Vec<&Tensor> = blocks.iter().collect();
+            states.push(&cur);
+            let y = kern::stage("mix", dev, || kern::mix_rms_dec(&states, q, w, eps))?;
+            [y.clone(), y.clone(), y]
+        } else {
+            let mixed = match &l.attn_res_q {
+                Some(q) => {
+                    let mut states: Vec<&Tensor> = blocks.iter().collect();
+                    states.push(&cur);
+                    Some(kern::stage("mix", dev, || kern::mix(&states, q))?)
+                }
+                None => None,
+            };
+            let src = mixed.as_ref().unwrap_or(&cur);
+            let src_z = if mixed.is_some() && !l.swa { 1 } else { 0 };
             let (x, x_z, nz) = match messages {
                 Some(m) => {
                     let lp = l.lp.as_ref().expect("контроллеры есть, раз есть сообщения");
@@ -1326,9 +1354,12 @@ impl Inkling2Model {
         // части по ключам — от длины контекста, сборка — ink2_attn_merge.
         // Декод (T = 1): прежнее ink2_attn, число частей фиксировано от ёмкости (CUDA-граф).
         let fa = n > 1 && d == 128 && dr == 16;
+        let gqa_dec = n == 1 && !l.swa && span >= 32768 && nh % nkv == 0 && nh / nkv <= 3;
         let splits = if fa {
             let keys = if l.swa { (t.sliding_window_size + 64).min(past + n) } else { past + n };
             kern::attn_fa_splits(n, nh, keys)
+        } else if gqa_dec {
+            span.div_ceil(1024).clamp(16, 64)
         } else if n == 1 {
             span.div_ceil(64).clamp(1, 32)
         } else {
@@ -1342,6 +1373,8 @@ impl Inkling2Model {
         kern::stage("k_attn", dev, || -> R<()> {
             if fa {
                 launch(dev, "ink2_attn_fa", &a, ((n as u32).div_ceil(64), nh as u32, splits as u32), 128)?;
+            } else if gqa_dec {
+                launch(dev, "ink2_attn_gqa", &a, (1, nkv as u32, splits as u32), 128)?;
             } else {
                 launch(dev, "ink2_attn", &a, (n as u32, nh as u32, splits as u32), 128)?;
             }
@@ -1361,17 +1394,90 @@ impl Inkling2Model {
         let ffn_inp = cur.clone();
         let mut states: Vec<&Tensor> = blocks.iter().collect();
         states.push(&cur);
-        let mut m = kern::mix(&states, &l.ffn_res_q)?;
-        if let Some(msg) = messages {
-            let lp = l.lp.as_ref().expect("контроллеры");
-            m = self.control(&m, 0, msg, lp, 3, 1)?;
-        }
-        let m = kern::pick(&m, 0)?;
-        let xn = kern::rms(&m, Some(&l.ffn_norm), eps, true)?;
-        let y = kern::stage("moe", dev, || self.moe(ip, l, &xn))?;
+        let xn = if n == 1 && messages.is_none() && t.hidden_size % 4 == 0 && t.hidden_size <= 4096 {
+            kern::mix_rms_dec(&states, &l.ffn_res_q, &l.ffn_norm, eps)?
+        } else {
+            let mut m = kern::mix(&states, &l.ffn_res_q)?;
+            if let Some(msg) = messages {
+                let lp = l.lp.as_ref().expect("контроллеры");
+                m = self.control(&m, 0, msg, lp, 3, 1)?;
+            }
+            let m = kern::pick(&m, 0)?;
+            kern::rms(&m, Some(&l.ffn_norm), eps, true)?
+        };
         let sc = &mut cache.slots[slot];
+        if n == 1 {
+            // Декод: сборка MoE + ffn_post_conv + остаток в одном ядре (минус 48 запусков).
+            return kern::stage("moe", dev, || {
+                self.moe_decode_conv(ip, l, &xn, &sc.ffn_state, &ffn_inp, k_scale)
+            });
+        }
+        let y = kern::stage("moe", dev, || self.moe(ip, l, &xn))?;
         let job = kern::ConvJob { x: kern::cols(&y, 0)?, w: &l.ffn_post_conv, state: &sc.ffn_state, dynamic: None };
         Ok(kern::conv(&[job], n, t.hidden_size, Some(&ffn_inp), k_scale, dev)?.pop().expect("свёртка"))
+    }
+
+    /// Декод MoE (`T = 1`) + слитая `ffn_post_conv` + остаток `ffn_inp`.
+    fn moe_decode_conv(&self, ip: usize, l: &Layer, xn: &Tensor, ffn_state: &Tensor, ffn_inp: &Tensor, k_scale: f32) -> R<Tensor> {
+        let t = &self.cfg.text;
+        let (e, k, hdim, inter) = (t.n_routed_experts, t.num_experts_per_tok, t.hidden_size, t.intermediate_size);
+        let dev = self.device;
+        let ex = &l.experts;
+        let rt = self.xrt.read().unwrap_or_else(|e| e.into_inner());
+        let store = &rt.stores[ip];
+        let xin = kern::cols(xn, 0)?;
+        let logits = empty(vec![1, e], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = xin.addr;
+        a.a[1] = addr(&l.router)?;
+        a.a[2] = addr(&logits)?;
+        a.u[0] = 1;
+        a.u[1] = hdim as u32;
+        a.u[2] = e as u32;
+        a.u[3] = xin.bf16;
+        launch(dev, "ink2_router", &a, (1, (e as u32).div_ceil(8), 1), 256)?;
+        let idx = empty(vec![k], DType::U32, dev)?;
+        let wts = empty(vec![k], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = addr(&logits)?;
+        a.a[1] = addr(&l.router_bias)?;
+        a.a[2] = addr(&idx)?;
+        a.a[3] = addr(&wts)?;
+        a.a[4] = addr(&ex.alpha_down_dev)?;
+        a.u[0] = 1;
+        a.u[1] = e as u32;
+        a.u[2] = k as u32;
+        a.f[0] = t.route_scale;
+        launch(dev, "ink2_route", &a, (1, 1, 1), 32)?;
+        let y = match store {
+            ExpertStore::Resident { gate_up, down, .. } => {
+                let gu = gate_up.gemv_indexed_dense(&idx, xn, false).map_err(fe)?;
+                let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
+                down.gemv_indexed_dense(&idx, &h, true).map_err(fe)?
+            }
+            ExpertStore::Zc(z) => {
+                let pool = rt.pool.as_ref().expect("пул zero-copy");
+                let (gu_t, dn_t, iota) = z.stage(pool, &idx)?;
+                let gu = gu_t.gemv_indexed_dense(&iota, xn, false).map_err(fe)?;
+                let h = self.act(&gu, &ex.alpha_gate_up_dev, Some(&idx), inter)?;
+                dn_t.gemv_indexed_dense(&iota, &h, true).map_err(fe)?
+            }
+            ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
+        };
+        let out = empty(vec![1, hdim], DType::F32, dev)?;
+        let mut a = Ink2Launch::default();
+        a.a[0] = addr(&y)?;
+        a.a[1] = addr(&wts)?;
+        a.a[2] = addr(ffn_state)?;
+        a.a[3] = addr(&l.ffn_post_conv)?;
+        a.a[4] = addr(ffn_inp)?;
+        a.a[5] = addr(&out)?;
+        a.u[0] = hdim as u32;
+        a.u[1] = k as u32;
+        a.u[2] = t.sconv_kernel_size as u32;
+        a.f[0] = k_scale;
+        launch(dev, "ink2_combine_conv", &a, ((hdim as u32).div_ceil(256), 1, 1), 256)?;
+        Ok(out)
     }
 
     /// MoE: `xn [T, H]` BF16 → `[T, H]` F32. Декод (T = 1) — целиком на карте,
@@ -1432,20 +1538,21 @@ impl Inkling2Model {
             return self.combine(&y, &wts, None, n, hdim, k);
         }
         let idx_h: Vec<u32> = idx.to_device(Device::Cpu).map_err(fe)?.to_vec1::<u32>().map_err(fe)?;
-        // Zero-copy: эксперты, уже лежащие в слотах, считаются первыми — подкачка
-        // промахов вытесняет только тех, чей GEMM уже поставлен в поток.
-        let resident: Option<Vec<bool>> = match store {
-            ExpertStore::Zc(z) => {
-                let mut r = vec![false; e];
-                for o in z.slot_owners()? {
-                    if o >= 0 && (o as usize) < e {
-                        r[o as usize] = true;
-                    }
-                }
-                Some(r)
-            }
+        // Zero-copy: эксперты, уже лежащие в слотах, считаются первыми; промахи
+        // стримятся через ping-pong DMA буфер параллельно с вычислением попаданий.
+        let slot_owners: Option<Vec<i32>> = match store {
+            ExpertStore::Zc(z) => Some(z.slot_owners()?),
             _ => None,
         };
+        let resident: Option<Vec<bool>> = slot_owners.as_ref().map(|owners| {
+            let mut r = vec![false; e];
+            for &o in owners {
+                if o >= 0 && (o as usize) < e {
+                    r[o as usize] = true;
+                }
+            }
+            r
+        });
         let pairs = n * k;
         let mut order: Vec<usize> = (0..pairs).collect();
         match &resident {
@@ -1475,9 +1582,10 @@ impl Inkling2Model {
                 bf16c(&down.gemm_grouped_dense_rows(&h, None, &segments, false).map_err(fe)?)?
             }
             ExpertStore::Zc(z) => {
+                let owners = slot_owners.as_deref().expect("владельцы слотов");
                 let r = resident.as_ref().expect("резиденты слоя");
                 let pool = rt.pool.as_ref().expect("пул zero-copy");
-                self.moe_zc_prefill(z, pool, xn, &rows, &alpha_rows, &segments, r, inter)?
+                self.moe_zc_prefill(z, pool, xn, &rows, &alpha_rows, &segments, r, owners, inter)?
             }
             ExpertStore::Pending => return Err(ModelError::Forward("inkling2: эксперты не подняты".into())),
         };
@@ -1501,36 +1609,252 @@ impl Inkling2Model {
         Ok(out)
     }
 
-    /// Префилл MoE по слотам zero-copy: сегменты (уже по порядку «резиденты, затем
-    /// промахи») группами не больше числа слотов — группа целиком помещается в
-    /// слоты, её промахи копируются в слоты прошлых групп (их GEMM в потоке
-    /// раньше). Групповой GEMM — тот же, что у резидентного пути, по таблице группы.
+    /// Префилл MoE по слотам zero-copy с асинхронной ping-pong DMA подкачкой:
+    /// - пока в `ZcLayer` есть пустые слоты (холодный старт), заполняем их самыми
+    ///   востребованными промахами через `z.stage()`;
+    /// - все попадания считаются напрямую из резидентных слотов VRAM без вызова `zc_lru`;
+    /// - промахи батчами по `B = 8` подкачиваются аппаратным DMA (`loader`-стрим) в
+    ///   двухбуферный staging параллельно с GEMM попаданий и предыдущего батча.
+    /// Резидентные слоты `ZcLayer` не вытесняются между 3 проходами цикла и чанками.
     #[allow(clippy::too_many_arguments)]
-    fn moe_zc_prefill(&self, z: &ZcLayer, pool: &ZcPool, xn: &Tensor, row_idx: &[u32], alpha_rows: &[f32], segments: &[(u32, u32, u32)], resident: &[bool], inter: usize) -> R<Tensor> {
+    fn moe_zc_prefill(
+        &self,
+        z: &ZcLayer,
+        pool: &ZcPool,
+        xn: &Tensor,
+        row_idx: &[u32],
+        alpha_rows: &[f32],
+        segments: &[(u32, u32, u32)],
+        resident: &[bool],
+        owners: &[i32],
+        inter: usize,
+    ) -> R<Tensor> {
         let dev = self.device;
-        let cap = z.slots().max(1);
-        // Группы: сначала все попадания одной группой (сколько бы их ни было — они
-        // уже в слотах), промахи — по `cap`.
-        let hits = segments.iter().take_while(|s| resident[s.0 as usize]).count();
-        let mut groups: Vec<&[(u32, u32, u32)]> = Vec::new();
-        if hits > 0 {
-            groups.push(&segments[..hits]);
-        }
-        groups.extend(segments[hits..].chunks(cap));
         let xn = bf16c(xn)?;
-        let mut parts: Vec<Tensor> = Vec::with_capacity(groups.len());
-        for g in groups {
-            let ids: Vec<u32> = g.iter().map(|s| s.0).collect();
-            let idx_g = Tensor::from_vec(ids, vec![g.len()], dev).map_err(fe)?;
-            let (gu_t, dn_t, _) = z.stage(pool, &idx_g)?;
+        let hits = segments.iter().take_while(|s| resident[s.0 as usize]).count();
+        let misses = &segments[hits..];
+
+        // Холодный старт: если есть пустые слоты в кэше слоя, заполним их самыми
+        // частыми промахами этого чанка, чтобы прогреть кэш для следующих проходов и декода.
+        let empty_slots = owners.iter().filter(|&&o| o < 0).count();
+        if empty_slots > 0 && !misses.is_empty() {
+            let mut by_freq: Vec<(u32, u32)> = misses.iter().map(|s| (s.0, s.2 - s.1)).collect();
+            by_freq.sort_by(|a, b| b.1.cmp(&a.1));
+            let fill_ids: Vec<u32> = by_freq.into_iter().take(empty_slots).map(|(e, _)| e).collect();
+            let n_fill = fill_ids.len();
+            let idx_fill = Tensor::from_vec(fill_ids, vec![n_fill], dev).map_err(fe)?;
+            let _ = z.stage(pool, &idx_fill)?;
+            // Обновлённые владельцы слотов: теперь эти эксперты резидентны.
+            let new_owners = z.slot_owners()?;
+            return self.moe_zc_prefill_pipelined(z, &xn, row_idx, alpha_rows, segments, &new_owners, inter);
+        }
+        self.moe_zc_prefill_pipelined(z, &xn, row_idx, alpha_rows, segments, owners, inter)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_zc_prefill_pipelined(
+        &self,
+        z: &ZcLayer,
+        xn: &Tensor,
+        row_idx: &[u32],
+        alpha_rows: &[f32],
+        segments: &[(u32, u32, u32)],
+        owners: &[i32],
+        inter: usize,
+    ) -> R<Tensor> {
+        use synaptix_core::device::cuda::{loader_copy_from_pinned, loader_wait_default, LoaderDone};
+        const BATCH: usize = 8;
+
+        let dev = self.device;
+        let ord = z.ord();
+        let slot_bytes = z.slot_bytes();
+        let gu_bytes = z.gu_bytes();
+        let gu_s_bytes = z.gu_s_bytes();
+        let dn_bytes = z.dn_bytes();
+        let dn_s_bytes = z.dn_s_bytes();
+        let dn_off = gu_bytes + gu_s_bytes;
+        let split = z.split_scales();
+        let dt = z.dtype();
+        let gu_shape = z.gu_shape();
+        let dn_shape = z.dn_shape();
+        let slot_base = z.slot_base();
+        let blobs = z.host_blobs();
+
+        // Карта эксперт → слот VRAM (если резидент).
+        let mut slot_of = vec![-1i32; z.experts()];
+        for (s, &o) in owners.iter().enumerate() {
+            if o >= 0 && (o as usize) < slot_of.len() {
+                slot_of[o as usize] = s as i32;
+            }
+        }
+
+        // Разделяем сегменты на попадания (в слотах) и промахи (в RAM), сохраняя исходный порядок строк!
+        // Примечание: в cold-start ветке часть бывших промахов могла стать попаданиями — строим
+        // таблицу попаданий/промахов по актуальному `slot_of` (промахи батчами по BATCH).
+        let mut hit_segs: Vec<&(u32, u32, u32)> = Vec::new();
+        let mut miss_segs: Vec<&(u32, u32, u32)> = Vec::new();
+        for s in segments {
+            if slot_of[s.0 as usize] >= 0 {
+                hit_segs.push(s);
+            } else {
+                miss_segs.push(s);
+            }
+        }
+        // Если порядок сегментов не чисто [hits..., misses...] (только в cold-start чанке 0),
+        // проще прогнать единый список групп в исходном порядке `segments` (без перестановки `parts`).
+        let ordered_split = {
+            let mut seen_miss = false;
+            let mut ok = true;
+            for s in segments {
+                let is_hit = slot_of[s.0 as usize] >= 0;
+                if !is_hit {
+                    seen_miss = true;
+                } else if seen_miss {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+
+        let make_table = |addrs: &[(u64, u64, u64, u64)]| -> R<(ExpertTable, ExpertTable)> {
+            let gu_v: Vec<i64> = addrs.iter().map(|a| a.0 as i64).collect();
+            let dn_v: Vec<i64> = addrs.iter().map(|a| a.2 as i64).collect();
+            let n = addrs.len();
+            let t_gu = Tensor::from_vec(gu_v, vec![n], dev).map_err(fe)?;
+            let t_dn = Tensor::from_vec(dn_v, vec![n], dev).map_err(fe)?;
+            if split {
+                let gs_v: Vec<i64> = addrs.iter().map(|a| a.1 as i64).collect();
+                let ds_v: Vec<i64> = addrs.iter().map(|a| a.3 as i64).collect();
+                let t_gs = Tensor::from_vec(gs_v, vec![n], dev).map_err(fe)?;
+                let t_ds = Tensor::from_vec(ds_v, vec![n], dev).map_err(fe)?;
+                let gu = ExpertTable::from_tensors_dense(gu_shape.0, gu_shape.1, dt, t_gu, t_gs)
+                    .ok_or_else(|| ModelError::Forward("zc prefill: таблица gate_up".into()))?;
+                let dn = ExpertTable::from_tensors_dense(dn_shape.0, dn_shape.1, dt, t_dn, t_ds)
+                    .ok_or_else(|| ModelError::Forward("zc prefill: таблица down".into()))?;
+                Ok((gu, dn))
+            } else {
+                let gu = ExpertTable::from_tensor_dense(gu_shape.0, gu_shape.1, dt, t_gu)
+                    .ok_or_else(|| ModelError::Forward("zc prefill: таблица gate_up".into()))?;
+                let dn = ExpertTable::from_tensor_dense(dn_shape.0, dn_shape.1, dt, t_dn)
+                    .ok_or_else(|| ModelError::Forward("zc prefill: таблица down".into()))?;
+                Ok((gu, dn))
+            }
+        };
+
+        let run_group = |gu_t: &ExpertTable, dn_t: &ExpertTable, g: &[(u32, u32, u32)]| -> R<Tensor> {
             let (r0, r1) = (g[0].1, g[g.len() - 1].2);
             let segs: Vec<(u32, u32, u32)> = g.iter().enumerate().map(|(u, s)| (u as u32, s.1 - r0, s.2 - r0)).collect();
             let (r0u, r1u) = (r0 as usize, r1 as usize);
             let rows = Tensor::from_vec(row_idx[r0u..r1u].to_vec(), vec![r1u - r0u], dev).map_err(fe)?;
-            let gu = gu_t.gemm_grouped_dense_rows(&xn, Some(&rows), &segs, false).map_err(fe)?;
+            let gu = gu_t.gemm_grouped_dense_rows(xn, Some(&rows), &segs, false).map_err(fe)?;
             let at = Tensor::from_vec(alpha_rows[r0u..r1u].to_vec(), vec![r1u - r0u], dev).map_err(fe)?;
             let h = self.act(&gu, &at, None, inter)?;
-            parts.push(bf16c(&dn_t.gemm_grouped_dense_rows(&h, None, &segs, false).map_err(fe)?)?);
+            bf16c(&dn_t.gemm_grouped_dense_rows(&h, None, &segs, false).map_err(fe)?)
+        };
+
+        let slot_addr = |s: usize| -> (u64, u64, u64, u64) {
+            let base = slot_base + (s * slot_bytes) as u64;
+            (base, base + gu_bytes as u64, base + dn_off as u64, base + (dn_off + dn_bytes) as u64)
+        };
+
+        // Если все сегменты — попадания, считаем одним групповым GEMM без DMA и без zc_lru!
+        if miss_segs.is_empty() {
+            let addrs: Vec<_> = segments.iter().map(|s| slot_addr(slot_of[s.0 as usize] as usize)).collect();
+            let (gu_t, dn_t) = make_table(&addrs)?;
+            return run_group(&gu_t, &dn_t, segments);
+        }
+
+        // Выделяем/проверяем общий ping-pong буфер `2 × BATCH` слотов.
+        let need_bytes = 2 * BATCH * slot_bytes;
+        let stg_base = {
+            let mut g = self.prefill_staging.lock().unwrap_or_else(|e| e.into_inner());
+            if g.as_ref().is_none_or(|t| t.numel() < need_bytes) {
+                *g = Some(Tensor::empty_uninit(vec![need_bytes], DType::U8, dev).map_err(fe)?);
+            }
+            addr(g.as_ref().expect("staging"))?
+        };
+
+        let copy_batch = |half: usize, batch: &[(u32, u32, u32)]| -> R<(LoaderDone, Vec<(u64, u64, u64, u64)>)> {
+            let half_base = stg_base + (half * BATCH * slot_bytes) as u64;
+            let mut addrs = Vec::with_capacity(batch.len());
+            for (u, seg) in batch.iter().enumerate() {
+                let dst = half_base + (u * slot_bytes) as u64;
+                let b = &blobs[seg.0 as usize];
+                loader_copy_from_pinned(ord, dst, b.gu, gu_bytes).map_err(fe)?;
+                loader_copy_from_pinned(ord, dst + dn_off as u64, b.dn, dn_bytes).map_err(fe)?;
+                if split {
+                    loader_copy_from_pinned(ord, dst + gu_bytes as u64, b.gu_s, gu_s_bytes).map_err(fe)?;
+                    loader_copy_from_pinned(ord, dst + (dn_off + dn_bytes) as u64, b.dn_s, dn_s_bytes).map_err(fe)?;
+                }
+                addrs.push((dst, dst + gu_bytes as u64, dst + dn_off as u64, dst + (dn_off + dn_bytes) as u64));
+            }
+            let done = LoaderDone::record(ord).map_err(fe)?;
+            Ok((done, addrs))
+        };
+
+        if !ordered_split {
+            // Редкий случай холодного старта чанка 0: считаем отрезками подряд,
+            // попадания из слотов, промахи через staging (half 0).
+            let mut parts = Vec::new();
+            let mut i = 0;
+            while i < segments.len() {
+                if slot_of[segments[i].0 as usize] >= 0 {
+                    let j = segments[i..].iter().take_while(|s| slot_of[s.0 as usize] >= 0).count();
+                    let g = &segments[i..i + j];
+                    let addrs: Vec<_> = g.iter().map(|s| slot_addr(slot_of[s.0 as usize] as usize)).collect();
+                    let (gu_t, dn_t) = make_table(&addrs)?;
+                    parts.push(run_group(&gu_t, &dn_t, g)?);
+                    i += j;
+                } else {
+                    let j = segments[i..].iter().take_while(|s| slot_of[s.0 as usize] < 0).count().min(BATCH);
+                    let g = &segments[i..i + j];
+                    loader_wait_default(ord).map_err(fe)?;
+                    let (done, addrs) = copy_batch(0, g)?;
+                    done.wait_default().map_err(fe)?;
+                    let (gu_t, dn_t) = make_table(&addrs)?;
+                    parts.push(run_group(&gu_t, &dn_t, g)?);
+                    i += j;
+                }
+            }
+            if parts.len() == 1 {
+                return Ok(parts.pop().expect("одна часть"));
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            return Tensor::cat(&refs, 0).map_err(fe);
+        }
+
+        // Основной путь: `segments = [hits..., misses...]`.
+        let n_hits = hit_segs.len();
+        let miss_slice = &segments[n_hits..];
+        let miss_batches: Vec<&[(u32, u32, u32)]> = miss_slice.chunks(BATCH).collect();
+
+        // Ждём завершения предыдущего слоя на staging, сразу запускаем DMA первых двух батчей промахов
+        // параллельно с GEMM попаданий!
+        loader_wait_default(ord).map_err(fe)?;
+        let mut inflight: Vec<Option<(LoaderDone, Vec<(u64, u64, u64, u64)>)>> = (0..miss_batches.len()).map(|_| None).collect();
+        inflight[0] = Some(copy_batch(0, miss_batches[0])?);
+        if miss_batches.len() > 1 {
+            inflight[1] = Some(copy_batch(1, miss_batches[1])?);
+        }
+
+        let mut parts: Vec<Tensor> = Vec::with_capacity(1 + miss_batches.len());
+        if n_hits > 0 {
+            let g = &segments[..n_hits];
+            let addrs: Vec<_> = g.iter().map(|s| slot_addr(slot_of[s.0 as usize] as usize)).collect();
+            let (gu_t, dn_t) = make_table(&addrs)?;
+            parts.push(run_group(&gu_t, &dn_t, g)?);
+        }
+
+        for bi in 0..miss_batches.len() {
+            let (done, addrs) = inflight[bi].take().expect("dma inflight");
+            done.wait_default().map_err(fe)?;
+            let (gu_t, dn_t) = make_table(&addrs)?;
+            parts.push(run_group(&gu_t, &dn_t, miss_batches[bi])?);
+            if bi + 2 < miss_batches.len() {
+                loader_wait_default(ord).map_err(fe)?;
+                inflight[bi + 2] = Some(copy_batch(bi % 2, miss_batches[bi + 2])?);
+            }
         }
         if parts.len() == 1 {
             return Ok(parts.pop().expect("одна группа"));

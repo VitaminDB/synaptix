@@ -83,14 +83,16 @@ pub fn rms_z(x: &Tensor, x_z: usize, t: usize, ws: &[&Tensor], eps: f32) -> R<Ve
 }
 
 /// Внимание по глубине: состояния (`[T, H]` F32), запросы `[nq, H]` → `[nq, T, H]`.
-/// Два прохода по кускам H: частичные суммы (`ink2_mix_part`), softmax и выход (`ink2_mix_out`).
+/// На декоде (`T = 1`, `H` кратен 4) — одним запуском `ink2_mix_dec` (без второго чтения
+/// состояний); на префилле — два прохода `ink2_mix_part` + `ink2_mix_out`.
 pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     if states.is_empty() || states.len() > 8 {
         return Err(ModelError::Forward(format!("inkling2 mix: {} состояний", states.len())));
     }
     let (t, h) = (states[0].dims()[0], states[0].dims()[1]);
     let nq = queries.dims()[0];
-    let out = empty(vec![nq, t, h], DType::F32, states[0].device())?;
+    let dev = states[0].device();
+    let out = empty(vec![nq, t, h], DType::F32, dev)?;
     let mut a = Ink2Launch::default();
     for (i, s) in states.iter().enumerate() {
         a.a[i] = addr(s)?;
@@ -101,13 +103,40 @@ pub fn mix(states: &[&Tensor], queries: &Tensor) -> R<Tensor> {
     a.u[1] = t as u32;
     a.u[2] = h as u32;
     a.u[3] = nq as u32;
-    let dev = states[0].device();
+    if t == 1 && h % 4 == 0 && h <= 4096 {
+        let block = ((h / 4) as u32).div_ceil(32) * 32;
+        launch(dev, "ink2_mix_dec", &a, (1, 1, 1), block)?;
+        return Ok(out);
+    }
     let b = (h as u32).div_ceil(256);
     let part = empty(vec![t * b as usize * 40], DType::F32, dev)?;
     a.a[10] = addr(&part)?;
     a.u[4] = b;
     launch(dev, "ink2_mix_part", &a, (t as u32, b, 1), 256)?;
     launch(dev, "ink2_mix_out", &a, (t as u32, b, 1), 256)?;
+    Ok(out)
+}
+
+/// Слитое `mix` (nq = 1) + `rms` → `[1, H]` BF16 на декоде (`T = 1`, один запуск вместо трёх).
+pub fn mix_rms_dec(states: &[&Tensor], query: &Tensor, rms_w: &Tensor, eps: f32) -> R<Tensor> {
+    let h = states[0].dims()[1];
+    let dev = states[0].device();
+    let out = empty(vec![1, h], DType::BF16, dev)?;
+    let mut a = Ink2Launch::default();
+    for (i, s) in states.iter().enumerate() {
+        a.a[i] = addr(s)?;
+    }
+    a.a[8] = addr(query)?;
+    a.a[9] = addr(&out)?;
+    a.a[10] = addr(rms_w)?;
+    a.u[0] = states.len() as u32;
+    a.u[1] = 1;
+    a.u[2] = h as u32;
+    a.u[3] = 1;
+    a.u[4] = 1;
+    a.f[0] = eps;
+    let block = ((h / 4) as u32).div_ceil(32) * 32;
+    launch(dev, "ink2_mix_dec", &a, (1, 1, 1), block)?;
     Ok(out)
 }
 
