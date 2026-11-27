@@ -160,7 +160,7 @@ impl FlowTransformer {
     }
 
     /// Таблицы частичного RoPE для `s` позиций: `(cos, sin)` `[1, 1, s, 16]`.
-    fn rope(&self, s: usize) -> R<(Tensor, Tensor)> {
+    pub fn rope(&self, s: usize) -> R<(Tensor, Tensor)> {
         let half = ROTARY / 2;
         let (mut cs, mut sn) = (vec![0f32; s * half], vec![0f32; s * half]);
         for p in 0..s {

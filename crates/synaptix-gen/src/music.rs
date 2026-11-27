@@ -112,6 +112,47 @@ pub fn yue2(model: &Path, vae: &Path, device: Device, req: &MusicRequest, cancel
 }
 
 /// WAV 16 бит из перемежённых отсчётов.
+/// MiniMax Music 3: песня по описанию (`prompt`) и тексту (`lyrics`), 44,1 кГц
+/// стерео. `seconds` — верхняя граница (0 — минута; модель может закончить
+/// раньше), предел — 6 минут. `progress(шаг, всего)` — по кадрам сочинения и
+/// шагам звука одной шкалой.
+pub fn minimax3(model: &Path, device: Device, req: &MusicRequest, cancel: Arc<AtomicBool>, progress: &mut dyn FnMut(usize, usize)) -> R<MusicOutput> {
+    use synaptix_music_minimax3::{Music3, Music3Request};
+    synaptix_kernels_cpu::ensure_registered();
+    synaptix_kernels_cuda::ensure_registered();
+    if req.lyrics.trim().is_empty() {
+        return Err("MiniMax Music 3: нужен текст песни (инструментал без текста модель не делает)".into());
+    }
+    let mut m = Music3::open(model, device).map_err(|e| e.to_string())?;
+    m.quant = match req.quant.as_deref() {
+        Some("mxfp8") => Some(DType::MXFP8),
+        Some("nvfp4") => Some(DType::NVFP4),
+        _ => None,
+    };
+    let seconds = if req.seconds == 0 { 60.0 } else { (req.seconds as f64).min(360.0) };
+    let steps = req.steps.filter(|&s| s > 0).unwrap_or(30);
+    let r = Music3Request { description: req.prompt.clone(), lyrics: req.lyrics.clone(), seconds, seed: req.seed, steps };
+    // Шкала: кадры сочинения (25 в секунду) + шаги звука, приведённые к кадрам.
+    let frames = (seconds * 25.0) as usize;
+    let out = m
+        .generate(&r, &mut |stage, i, n| {
+            match stage {
+                "сочинение" => progress(i, frames * 2),
+                "звук" => progress(frames + frames * i / n.max(1), frames * 2),
+                _ => {}
+            }
+            !cancel.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .map_err(|e| e.to_string())?;
+    let secs = out.pcm.len() as f64 / 2.0 / out.sample_rate as f64;
+    Ok(MusicOutput {
+        label: format!("MiniMax Music 3, {secs:.0} с, {steps} шагов (сочинение {:.0} с, звук {:.0} с)", out.ar_seconds, out.flow_seconds),
+        samples: out.pcm,
+        sample_rate: out.sample_rate,
+        channels: out.channels,
+    })
+}
+
 pub fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;
     let mut w = Vec::with_capacity(44 + samples.len() * 2);

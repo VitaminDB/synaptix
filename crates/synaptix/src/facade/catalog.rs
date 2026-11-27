@@ -251,6 +251,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                 p.components.extend(h3_encoder.iter().map(|x| ("encoder".to_string(), x.clone())));
                 Some(p)
             }
+            "minimax_music3" => Some(single(f, Task::Music, "minimax_music3", "Песни по тексту и описанию, до 6 минут (MiniMax Music 3)")),
             "acestep" => {
                 let mut p = single(f, Task::Music, "acestep", "Музыка и песни по описанию и тексту");
                 p.components.extend(ace_lm_big.iter().map(|x| ("lm".to_string(), x.clone())));

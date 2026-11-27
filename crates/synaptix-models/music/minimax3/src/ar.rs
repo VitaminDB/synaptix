@@ -104,7 +104,7 @@ impl DepthDecoder {
     }
 
     /// `seq` `[B, S, H]` (уже через `projection`) → нормированные состояния `[B, S, H]`.
-    fn forward(&self, seq: &Tensor) -> R<Tensor> {
+    pub fn forward(&self, seq: &Tensor) -> R<Tensor> {
         let (b, s, h) = (seq.dims()[0], seq.dims()[1], seq.dims()[2]);
         let (nh, hd) = (16usize, h / 16);
         let mut x = seq.broadcast_add(&self.pos.narrow(0, 0, s)?.contiguous()?.reshape(vec![1, s, h])?)?;
