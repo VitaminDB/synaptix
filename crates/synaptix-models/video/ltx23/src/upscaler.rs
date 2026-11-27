@@ -62,8 +62,11 @@ pub struct Upsampler {
     initial_conv: Conv3,
     initial_norm: Norm,
     res_blocks: Vec<ResBlock>,
-    up_w: Tensor, // Conv2d [4096,1024,3,3]
+    /// Пространственный: Conv2d `[4·mid, mid, 3,3]` + PixelShuffle2 покадрово.
+    /// Временной (LTX-2.5): Conv3d `[2·mid, mid, 3,3,3]` + shuffle по времени.
+    up_w: Tensor,
     up_b: Tensor,
+    temporal: bool,
     post_blocks: Vec<ResBlock>,
     final_conv: Conv3,
     // VAE per-channel statistics (для un/normalize латента)
@@ -110,6 +113,7 @@ impl Upsampler {
             initial_conv: conv3("initial_conv")?,
             initial_norm: norm("initial_norm")?,
             res_blocks,
+            temporal: ld.raw_bytes("upsampler.0.weight").is_some_and(|(_, _, sh)| sh.len() == 5),
             up_w: g("upsampler.0.weight")?,
             up_b: g("upsampler.0.bias")?,
             post_blocks,
@@ -131,8 +135,18 @@ impl Upsampler {
         for blk in &self.res_blocks {
             x = blk.forward(&x)?;
         }
-        // per-frame upsampler: [B,C,F,H,W] -> [B*F,C,H,W] -> conv2d -> pixelshuffle2 -> back
         let (c, h, w) = (x.dims()[1], x.dims()[3], x.dims()[4]);
+        if self.temporal {
+            // Conv3d → `b (c p) f h w → b c (f·p) h w`, p = 2 → без первого кадра: F → 2F−1.
+            let y = conv3d_p1(&x, &self.up_w, &self.up_b)?;
+            let y = y.reshape(vec![b, c, 2, f, h, w])?.permute(vec![0, 1, 3, 2, 4, 5])?.contiguous()?.reshape(vec![b, c, f * 2, h, w])?;
+            x = y.narrow(2, 1, f * 2 - 1)?.contiguous()?;
+            for blk in &self.post_blocks {
+                x = blk.forward(&x)?;
+            }
+            return conv3d_p1(&x, &self.final_conv.w, &self.final_conv.b);
+        }
+        // per-frame upsampler: [B,C,F,H,W] -> [B*F,C,H,W] -> conv2d -> pixelshuffle2 -> back
         let x2 = x.permute(vec![0, 2, 1, 3, 4])?.contiguous()?.reshape(vec![b * f, c, h, w])?;
         let x2 = conv2d(&x2, &self.up_w, Some(&self.up_b), (1, 1), (1, 1), (1, 1))?;
         let x2 = pixel_shuffle2(&x2)?; // [B*F, 1024, H*2, W*2]
@@ -142,6 +156,11 @@ impl Upsampler {
             x = blk.forward(&x)?;
         }
         conv3d_p1(&x, &self.final_conv.w, &self.final_conv.b)
+    }
+
+    /// Временной апскейлер (удваивает кадры: F → 2F−1).
+    pub fn is_temporal(&self) -> bool {
+        self.temporal
     }
 
     /// `upsample_video`: un_normalize (VAE stats) → сеть → normalize. Латент

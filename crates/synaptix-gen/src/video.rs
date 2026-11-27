@@ -52,6 +52,8 @@ pub struct VideoRequest {
     pub control: Option<String>,
     /// LTX: две стадии (половинное разрешение → апскейлер ×2 → доводка).
     pub two_stage: bool,
+    /// LTX-2.5: удвоить частоту кадров временным апскейлером латента (24 → 48 кадр/с).
+    pub fps_x2: bool,
     /// H3 restyle: сила перерисовки `source_video` (0..1; по умолчанию 0.6).
     pub strength: Option<f32>,
     /// Латент хвоста предыдущего ролика (`.safetensors`): продолжить с хвоста без PNG.
@@ -273,6 +275,41 @@ pub struct LtxPaths {
     pub ic_union: Option<PathBuf>,
     pub ic_motion: Option<PathBuf>,
     pub ic_lipdub: Option<PathBuf>,
+    /// LTX-2.5: голова длительности (длина ролика по описанию, когда она не задана).
+    pub duration_head: Option<PathBuf>,
+    /// LTX-2.5: временной апскейлер ×2 (удвоение частоты кадров).
+    pub temporal_upscaler: Option<PathBuf>,
+    /// LTX-2.5: IC-LoRA детализации ×2 (этап 2 DFR).
+    pub detail_lora: Option<PathBuf>,
+}
+
+/// LTX-2.5: длина ролика в секундах по описанию — текстовый кодер, коннекторы
+/// и голова длительности (эталон `duration_predictor.py`; пределы 1…20 с,
+/// сетка 8k+1 кадров при 24 кадр/с).
+pub fn ltx_auto_seconds(paths: &LtxPaths, device: Device, prompt: &str, quant: Option<&str>) -> R<f64> {
+    use synaptix_core::precision::PrecisionConfig;
+    use synaptix_video_ltx23::loader::LtxCheckpoint;
+    use synaptix_video_ltx23::text_encoder::{AudioTextConditioner, VideoTextConditioner};
+    let head_path = paths.duration_head.as_ref().ok_or("у модели нет головы длительности")?;
+    let compute = DType::BF16;
+    let quant_dit = quant_setting(quant).or_else(|| stored_format(&paths.model)).unwrap_or(compute);
+    let quant_enc = if quant_dit == DType::NVFP4 { DType::NVFP4 } else { DType::MXFP8 };
+    let ord = if let Device::Cuda(o) = device { o } else { 0 };
+    let (states, mask) = {
+        let prec = PrecisionConfig { compute, attn_w: quant_enc, mlp_w: quant_enc, lm_head: DType::BF16, embed: DType::BF16, kv: DType::BF16 };
+        let enc = crate::ltx_text::LtxTextEncoder::load(&paths.gemma, device, prec, Some(1024))?;
+        enc.encode_for_ltx(prompt, 1024, device)?
+    };
+    let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
+    let ckpt = LtxCheckpoint::open(&paths.model, Device::Cpu, DType::BF16).map_err(|e| format!("LTX: {e}"))?;
+    let view = ckpt.view_on(device);
+    let v = VideoTextConditioner::load(&view, device, compute).map_err(err)?.forward(&states, &mask).map_err(err)?;
+    let a = AudioTextConditioner::load(&view, device, compute).map_err(err)?.forward(&states, &mask).map_err(err)?;
+    let head = synaptix_video_ltx23::duration::DurationHead::load(head_path, device).map_err(err)?;
+    let secs = head.seconds(&v, &a).map_err(err)?;
+    let frames = synaptix_video_ltx23::duration::frames_for(secs, 24.0, 1.0, 20.0);
+    let _ = synaptix_core::memory::cuda_pool::hard_trim_cuda_mempool_device(ord);
+    Ok(frames as f64 / 24.0)
 }
 
 enum LtxMode {
@@ -451,10 +488,19 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::Retake { video, .. } | LtxMode::Ic { video, .. } => media_seconds(video),
         _ => None,
     };
+    // LTX-2.5: длина не задана — по описанию (голова длительности).
+    let auto_secs = match &mode {
+        LtxMode::Text | LtxMode::Frames { .. } if req.seconds.is_none_or(|s| s <= 0.0) && paths.duration_head.is_some() => {
+            let s = ltx_auto_seconds(paths, device, &req.prompt, req.quant.as_deref())?;
+            eprintln!("[ltx] длительность по описанию: {s:.2} с");
+            Some(s)
+        }
+        _ => None,
+    };
     // От звука (липсинк, LipDub) длина ролика — по звуку; иначе — запрошенная.
     let secs = match &mode {
         LtxMode::A2v { .. } | LtxMode::Lipdub { .. } => src_secs.or(req.seconds),
-        _ => req.seconds.filter(|s| *s > 0.0).or(src_secs),
+        _ => req.seconds.filter(|s| *s > 0.0).or(auto_secs).or(src_secs),
     }
     .unwrap_or(5.0)
     .clamp(1.0, 20.0);
@@ -794,6 +840,27 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     };
     release();
     synaptix_core::gen_status::phase("декодер VAE: видео");
+    // LTX-2.5: временной апскейлер латента ×2 (F → 2F−1 латентных кадров, вдвое чаще кадры).
+    let mut fps_mul = 1.0;
+    let latent = match (&paths.temporal_upscaler, &mode) {
+        (Some(tp), LtxMode::Text | LtxMode::Frames { .. }) if req.fps_x2 => {
+            synaptix_core::gen_status::phase("временной апскейлер ×2");
+            let view = ckpt.view_on(device);
+            let mean = view.get_raw("vae.per_channel_statistics.mean-of-means").map_err(err)?;
+            let std = view.get_raw("vae.per_channel_statistics.std-of-means").map_err(err)?;
+            let up = Upsampler::load(tp, &mean, &std, device).map_err(|e| format!("временной апскейлер: {e}"))?;
+            if !up.is_temporal() {
+                return Err("файл временного апскейлера — пространственный".into());
+            }
+            let l = synaptix_core::grad::no_grad(|| up.upsample(&latent)).map_err(err)?.to_dtype(compute).map_err(err)?;
+            drop(up);
+            synaptix_core::tensor::ops::conv_filter_cache_clear();
+            release();
+            fps_mul = 2.0;
+            l
+        }
+        _ => latent,
+    };
     let rgb = synaptix_core::grad::no_grad(|| -> R<Tensor> {
         let vae = VaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
         vae.decode(&latent).map_err(|e| format!("VAE: {e}"))
@@ -876,10 +943,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
-        _ => write_mp4(&frames, Some((&pcm, 48_000, 2)), fps, out)?,
+        _ => write_mp4(&frames, Some((&pcm, 48_000, 2)), fps * fps_mul, out)?,
     }
     let name = if ltx_version_at_least(&ckpt.config.model_version, 2, 5) { "LTX-2.5" } else { "LTX-2.3" };
-    let label = format!("{name} {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / fps, if two_stage { ", две стадии" } else { "" });
+    let label = format!("{name} {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / (fps * fps_mul), if two_stage { ", две стадии" } else { "" });
     Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label, tail: tail_path, continued_from_latent: continued })
 }
 

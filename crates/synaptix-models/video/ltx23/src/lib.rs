@@ -13,6 +13,7 @@
 pub mod audio_vae;
 pub mod config;
 pub mod dit;
+pub mod duration;
 pub mod guider;
 pub mod loader;
 pub mod vae;

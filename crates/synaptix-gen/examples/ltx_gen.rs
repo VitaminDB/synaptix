@@ -12,14 +12,19 @@ fn main() {
         model: PathBuf::from(&a[0]),
         gemma: PathBuf::from(&a[1]),
         upscaler: (a[2] != "-").then(|| PathBuf::from(&a[2])),
+        duration_head: std::env::var("LTX_DURATION_HEAD").ok().map(PathBuf::from),
+        temporal_upscaler: std::env::var("LTX_TEMPORAL_UPSCALER").ok().map(PathBuf::from),
+        detail_lora: std::env::var("LTX_DETAIL_LORA").ok().map(PathBuf::from),
         ..Default::default()
     };
     let req = synaptix_gen::video::VideoRequest {
         prompt: a[8].clone(),
-        seconds: Some(a[4].parse().unwrap()),
+        seconds: Some(a[4].parse::<f64>().unwrap()).filter(|s| *s > 0.0),
         width: Some(a[5].parse().unwrap()),
         height: Some(a[6].parse().unwrap()),
         seed: a[7].parse().unwrap(),
+        fps_x2: std::env::var("LTX_FPS_X2").is_ok(),
+        two_stage: std::env::var("LTX_TWO_STAGE").is_ok(),
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
