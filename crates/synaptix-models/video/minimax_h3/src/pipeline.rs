@@ -550,7 +550,10 @@ fn sparse_cfg_for_step(
         return None;
     }
     Some(synaptix_core::precision::AttentionSparseConfig {
-        protected_prefix: prep.video_seg.0,
+        // Text + Cond + Ref* + Audio и кадры латентного хвоста (они в начале
+        // видео): без них новые кадры теряют внимание к хвосту — продолжение
+        // рвётся (новый план, сдвиг цвета на стыке).
+        protected_prefix: (prep.video_seg.0 + prep.layout.prefix_video_t * prep.layout.frame_rows).min(prep.video_seg.1),
         q_offset: 0,
         keep_ratio,
         frame_tokens: prep.layout.frame_rows,
