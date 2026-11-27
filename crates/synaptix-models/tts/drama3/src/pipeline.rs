@@ -89,6 +89,7 @@ pub struct Drama3 {
     pub tower: Tower,
     codec: Codec,
     codec_src: CodecW,
+    _zc: Option<std::sync::Arc<synaptix_llm_common::moe_zc::ZcPool>>,
     /// Кандидаты головного токена: eos и полоса семантики.
     head_ids: Vec<u32>,
     device: Device,
@@ -98,7 +99,12 @@ impl Drama3 {
     pub fn load(bundle: &Path, device: Device) -> R<Self> {
         let compute = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         let cap = MAX_PROMPT_ROWS + MAX_FRAMES + 16;
-        let lm = HybridPipeline::load_with_experts_in_ram(bundle, device, PrecisionConfig::dense(compute), Some(cap)).map_err(|e| Drama3Error::Load(format!("основа: {e}")))?;
+        // Основа считает в BF16, как оригинал. F16 (`D3_LM_F16=1`, под него написан
+        // быстрый device-шаг гибрида) портит речь: состояния префилла расходятся
+        // с BF16 (cos 0,997, отдельные строки 0,94), речь обрывается через
+        // несколько кадров — замер 27.11.2026.
+        let lm_dtype = if device.is_cuda() && std::env::var_os("D3_LM_F16").is_some() { DType::F16 } else { compute };
+        let mut lm = HybridPipeline::load_with_experts_in_ram(bundle, device, PrecisionConfig::dense(lm_dtype), Some(cap)).map_err(|e| Drama3Error::Load(format!("основа: {e}")))?;
         if lm.config.hidden_size != DIM {
             return Err(Drama3Error::Load(format!("hidden_size основы {} ≠ {DIM}", lm.config.hidden_size)));
         }
@@ -111,9 +117,32 @@ impl Drama3 {
         };
         let shape = CodecShape { num_codebooks: CODEBOOKS, post_layers: 8, post_heads: 16, post_local_heads: 16 };
         let codec = Codec::load(&codec_src, shape, false).map_err(|e| Drama3Error::Load(format!("кодек: {e}")))?;
+        // Эксперты основы — в RAM; кэш экспертов на карте по умолчанию мал,
+        // и каждый шаг тянул бы их по шине. Башня и кодек уже загружены —
+        // остаток видеопамяти (минус запас под активации префилла) отдаём кэшу.
+        // Декод MoE без синхронизации с хостом (zero-copy): выбор экспертов и
+        // счёт — на карте, эксперт читается из слота VRAM или прямо из
+        // закреплённой RAM. Результат побайтно тот же, шаг основы 41,6 → 18,8 мс
+        // (96 слотов). Слотов на слой — по свободной видеопамяти (башня и кодек
+        // уже загружены): 16…96, запас 3 ГБ под префилл, KV и кодек;
+        // `D3_ZC=N` — задать, `D3_ZC=0` — выключить.
+        let zc_slots = std::env::var("D3_ZC").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
+            let free = match device {
+                Device::Cuda(ord) => synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f as usize).unwrap_or(0),
+                _ => 0,
+            };
+            let c = &lm.config;
+            // gate_up [2I, H] + down [H, I] в MXFP8: байт на вес + масштабы блоков по 32.
+            let per_expert = 3 * c.hidden_size * 512 * 33 / 32;
+            (free.saturating_sub(3usize << 30) / c.num_hidden_layers.max(1) / per_expert.max(1)).clamp(16, 96)
+        });
+        let zc = if zc_slots > 0 { lm.model.attach_zc(zc_slots) } else { None };
+        if std::env::var_os("D3_PROF").is_some() {
+            eprintln!("[d3] zero-copy MoE: {}", if zc.is_some() { format!("{zc_slots} слотов на слой") } else { "нет".into() });
+        }
         let mut head_ids = vec![EOS];
         head_ids.extend(SEMANTIC_BEGIN..=SEMANTIC_END);
-        Ok(Self { lm, tower, codec, codec_src, head_ids, device })
+        Ok(Self { lm, tower, codec, codec_src, _zc: zc, head_ids, device })
     }
 
     /// Образец голоса (моно, 44,1 кГц) → коды `[10][T]`.
@@ -144,7 +173,7 @@ impl Drama3 {
     pub fn embed(&self, rows: &[Row]) -> R<Tensor> {
         let ids = Tensor::from_vec(rows.iter().map(|r| r[0]).collect::<Vec<u32>>(), vec![rows.len()], self.device)?;
         let text = self.lm.model.embed_rows(&ids).map_err(me)?;
-        Ok(self.tower.backbone_input(rows, &text)?.reshape(vec![1, rows.len(), DIM])?.contiguous()?)
+        Ok(self.tower.backbone_input(rows, &text)?.to_dtype(self.lm.model.dtype)?.reshape(vec![1, rows.len(), DIM])?.contiguous()?)
     }
 
     /// Логиты кандидатов головного токена по состоянию после нормы `[1, H]`.
@@ -178,21 +207,55 @@ impl Drama3 {
             return Err(Drama3Error::Input(format!("промпт {} строк — больше предела {MAX_PROMPT_ROWS}", rows.len())));
         }
         let max_frames = req.max_frames.clamp(1, MAX_FRAMES);
+        let prof = std::env::var_os("D3_PROF").is_some();
+        let tp = std::time::Instant::now();
+        // Префилл всегда идёт прежним путём MoE: со собранными слотами zero-copy
+        // он пошёл бы через их групповой GEMM, а это другой счёт (второй кусок
+        // реплики переставал совпадать с прогоном без zero-copy). Слоты
+        // собираются заново на первом шаге декода.
+        if self._zc.is_some() {
+            self.lm.model.zc_release();
+        }
         let (mut last, mut kv, mut tc) = self.prefill(&rows, max_frames)?;
+        let (mut t_head, mut t_tower, mut t_lm) = (0f64, 0f64, 0f64);
+        if prof {
+            let _ = host(&last)?;
+            eprintln!("[d3] префилл {} строк: {:.2} с", rows.len(), tp.elapsed().as_secs_f64());
+        }
         let mut window: Vec<u32> = rows.iter().map(|r| r[0]).collect();
         let mut input = *rows.last().expect("промпт не пуст");
         let mut frames: Vec<Row> = Vec::new();
         let top_k_cb = if req.top_k == 0 { CODEBOOK_TOP_K } else { req.top_k.min(CODEBOOK_TOP_K) };
         let mut finished = false;
+        // Быстрый device-шаг основы (слитые ядра декода); `D3_EAGER=1` — прежний
+        // общий проход (для сравнения).
+        let fast = self.lm.model.dtype == DType::F16 && self.lm.model.device_step_ready_hidden() && std::env::var_os("D3_EAGER").is_none();
+        let mut state = if fast {
+            self.lm.model.sync_decode_dev_state(&mut kv).map_err(me)?;
+            Some(self.lm.model.make_decode_state().map_err(me)?)
+        } else {
+            None
+        };
+        if prof {
+            eprintln!("[d3] шаг основы: {}", if fast { "device (слитые ядра)" } else { "общий проход" });
+        }
+        if std::env::var_os("D3_PROF_OPS").is_some() {
+            synaptix_llm_common::model::set_decode_prof(true);
+            let _ = synaptix_llm_common::profile::report();
+        }
         for step in 0..max_frames {
             let pos = rows.len() - 1 + step;
+            let t = std::time::Instant::now();
             let logits = self.head_logits(&last)?;
+            t_head += t.elapsed().as_secs_f64();
             let main = sample_main(&logits, &self.head_ids, &window, req.temperature, req.top_k, req.top_p, rng);
             if main == EOS {
                 finished = true;
                 break;
             }
+            let t = std::time::Instant::now();
             let codes = self.tower.step(&last, &input, main, pos, &mut tc, &mut |_, lg| sample(lg, req.temperature, top_k_cb, req.top_p, false, rng) as u32)?;
+            t_tower += t.elapsed().as_secs_f64();
             let mut frame = [0u32; CODEBOOKS + 1];
             frame[0] = main;
             frame[1..].copy_from_slice(&codes);
@@ -201,9 +264,39 @@ impl Drama3 {
             if !progress(frames.len(), max_frames) {
                 return Err(Drama3Error::Cancelled);
             }
-            let hid = self.lm.model.forward_from_hidden(&self.embed(std::slice::from_ref(&frame))?, &mut kv).map_err(me)?;
-            last = self.lm.model.normed_at(&hid, 0).map_err(me)?.contiguous()?;
+            let t = std::time::Instant::now();
+            let emb = self.embed(std::slice::from_ref(&frame))?;
+            last = match state.as_mut() {
+                Some(st) => {
+                    st.update(frame[0], (rows.len() + step) as u32).map_err(me)?;
+                    self.lm.model.forward_decode_dev_hidden(st, &mut kv, &emb.reshape(vec![1, DIM])?).map_err(me)?.reshape(vec![1, DIM])?.contiguous()?
+                }
+                None => {
+                    let hid = self.lm.model.forward_from_hidden(&emb, &mut kv).map_err(me)?;
+                    self.lm.model.normed_at(&hid, 0).map_err(me)?.contiguous()?
+                }
+            };
+            if prof {
+                let _ = host(&last)?;
+            }
+            t_lm += t.elapsed().as_secs_f64();
             input = frame;
+        }
+        if prof {
+            let (zh, zp, zs) = self.lm.model.zc_stats();
+            eprintln!("[d3] zero-copy: в слотах {zh}, из RAM {zp}, слотов всего {zs}");
+            if let Some(st) = self.lm.model.expert_cache_stats() {
+                eprintln!("[d3] кэш экспертов: попаданий {}, промахов {}, на карте {} ({} МБ), батчем {} / поэкспертно {}", st.hits, st.misses, st.resident, st.bytes >> 20, st.batched, st.unbatched);
+            }
+        }
+        if std::env::var_os("D3_PROF_OPS").is_some() {
+            eprintln!("{}", synaptix_llm_common::model::decode_prof_report_and_clear());
+            eprintln!("MoE:\n{}", synaptix_llm_common::profile::report());
+            synaptix_llm_common::model::set_decode_prof(false);
+        }
+        if prof && !frames.is_empty() {
+            let n = frames.len() as f64;
+            eprintln!("[d3] на кадр: основа {:.1} мс, голова {:.1} мс, башня {:.1} мс ({} кадров)", t_lm / n * 1e3, t_head / n * 1e3, t_tower / n * 1e3, frames.len());
         }
         // Хвостовой `<|semantic:0|>` перед концом речи даёт щелчок — отбрасывается
         // (как удержание кадра в MLX-эталоне).
@@ -236,15 +329,26 @@ impl Drama3 {
                 done.push((chunk.clone(), frames));
             }
         }
-        let frames: Vec<Row> = done.into_iter().flat_map(|(_, f)| f).collect();
-        if frames.is_empty() {
+        let total: usize = done.iter().map(|(_, f)| f.len()).sum();
+        if total == 0 {
             return Err(Drama3Error::Input("модель не выдала ни одного кадра речи".into()));
         }
         let ar_seconds = t0.elapsed().as_secs_f64();
         let t1 = std::time::Instant::now();
-        let codes: Vec<Vec<u32>> = (0..CODEBOOKS).map(|k| frames.iter().map(|f| f[1 + k]).collect()).collect();
-        let pcm = self.decode_codes(&codes)?;
-        debug_assert_eq!(pcm.len(), frames.len() * FRAME_SAMPLES);
+        // Слоты zero-copy держат до ~12 ГБ VRAM, а кодеку на длинную реплику
+        // нужны гигабайты активаций — слоты отпускаются (соберутся на следующем
+        // декоде). Кодек — по кускам текста, как в эталоне: память не растёт
+        // с длиной текста.
+        if self._zc.is_some() {
+            self.lm.model.zc_release();
+        }
+        let mut pcm: Vec<f32> = Vec::with_capacity(total * FRAME_SAMPLES);
+        for (_, frames) in &done {
+            let codes: Vec<Vec<u32>> = (0..CODEBOOKS).map(|k| frames.iter().map(|f| f[1 + k]).collect()).collect();
+            pcm.extend(self.decode_codes(&codes)?);
+        }
+        debug_assert_eq!(pcm.len(), total * FRAME_SAMPLES);
+        let frames = vec![(); total];
         Ok(Drama3Output { pcm, frames: frames.len(), chunks: chunks.len(), finished, ar_seconds, codec_seconds: t1.elapsed().as_secs_f64() })
     }
 }

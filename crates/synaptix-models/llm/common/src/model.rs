@@ -2111,6 +2111,60 @@ impl DecoderModel {
     ///
     /// Возвращает, сколько блоков в итоге резидентно: если перевозка упёрлась
     /// в память, останавливаемся на достигнутом, а не роняем загрузку.
+    /// Включить у MoE-слоёв с экспертами в RAM декод без синхронизации с хостом
+    /// (zero-copy, см. `moe_zc`): выбор экспертов и счёт — на карте, промахи
+    /// слотов читаются ядром прямо из закреплённого зеркала. `slots` — слотов
+    /// VRAM на слой. Возвращает пул (его держит вызывающий) или `None`, если
+    /// экспертов в RAM нет или зеркала нет. Точность счёта не меняется.
+    pub fn attach_zc(&mut self, slots: usize) -> Option<std::sync::Arc<crate::moe_zc::ZcPool>> {
+        if self.expert_cache.is_none() || self.host_mirror.is_none() {
+            return None;
+        }
+        let pool = crate::moe_zc::ZcPool::new(self.device);
+        pool.set_min_slots(slots.clamp(1, 16));
+        let mut n = 0usize;
+        for b in self.blocks.iter_mut() {
+            if let Ffn::Moe(m) = &mut b.mlp {
+                if m.offloaded() {
+                    m.attach_zc(pool.clone());
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        pool.set_slots_per_layer(slots);
+        self.weights_gen = self.weights_gen.wrapping_add(1);
+        Some(pool)
+    }
+
+    /// Отпустить слоты zero-copy (их VRAM нужна другому этапу — длинному
+    /// префиллу, кодеку); на следующем декоде слои соберутся заново.
+    pub fn zc_release(&self) {
+        for b in &self.blocks {
+            if let Ffn::Moe(m) = &b.mlp {
+                m.zc_release();
+            }
+        }
+        if let Device::Cuda(ord) = self.device {
+            let _ = synaptix_core::device::cuda::synchronize_all(ord);
+        }
+    }
+
+    /// Статистика zero-copy по слоям: (попаданий в слоты, чтений из RAM, слотов).
+    pub fn zc_stats(&self) -> (u64, u64, usize) {
+        let mut acc = (0u64, 0u64, 0usize);
+        for b in &self.blocks {
+            if let Ffn::Moe(m) = &b.mlp {
+                if let Some((h, p, s)) = m.zc_stats() {
+                    acc = (acc.0 + h, acc.1 + p, acc.2 + s);
+                }
+            }
+        }
+        acc
+    }
+
     /// Ключ годности захваченного графа: тот же экземпляр модели и те же
     /// адреса весов.
     pub fn graph_weights_key(&self) -> (u64, u64) {
@@ -3380,17 +3434,23 @@ impl DecoderModel {
     /// Годен ли device-шаг декода ([`Self::forward_decode_dev`]) для захвата
     /// в CUDA-граф: [`Self::device_step_ready`] и ни одной выгрузки на хост.
     pub fn graph_decode_ready(&self) -> bool {
-        self.device_step_ready_inner(true)
+        self.device_step_ready_inner(true, false)
     }
 
     /// Годен ли device-шаг декода вообще: как [`Self::graph_decode_ready`],
     /// но MoE с экспертами в RAM допускается слитым путём (top-k читает
     /// хост — шаг без захвата графа).
     pub fn device_step_ready(&self) -> bool {
-        self.device_step_ready_inner(false)
+        self.device_step_ready_inner(false, false)
     }
 
-    fn device_step_ready_inner(&self, capture: bool) -> bool {
+    /// Как [`Self::device_step_ready`], но для шага по готовому эмбеддингу
+    /// ([`Self::forward_decode_dev_hidden`]): таблица эмбеддингов в RAM не мешает.
+    pub fn device_step_ready_hidden(&self) -> bool {
+        self.device_step_ready_inner(false, true)
+    }
+
+    fn device_step_ready_inner(&self, capture: bool, external_embed: bool) -> bool {
         let trace = trace_graph();
         let no = |why: &str| {
             if trace {
@@ -3413,7 +3473,7 @@ impl DecoderModel {
         if !self.blocks_all_resident() {
             return no("блоки не резидентны");
         }
-        if self.embed_on_host() {
+        if self.embed_on_host() && !external_embed {
             return no("эмбеддинги в RAM");
         }
         for (i, b) in self.blocks.iter().enumerate() {
@@ -3442,8 +3502,21 @@ impl DecoderModel {
     }
 
     pub fn forward_decode_dev(&self, state: &mut DecodeState, kv: &mut KvCache) -> Result<(), ModelError> {
+        self.forward_decode_dev_inner(state, kv, None).map(|_| ())
+    }
+
+    /// Device-шаг декода по ГОТОВОМУ эмбеддингу входа `emb` `[1, H]` (вместо
+    /// строки таблицы по `state.input`) — для моделей, у которых вход шага
+    /// собирается снаружи (Drama 3: токен кадра + код кодбука). Возвращает
+    /// состояние после финальной нормы `[1, H]`; голова не считается и
+    /// `state.logits` не трогается. Позицию задаёт `state.update(_, pos)`.
+    pub fn forward_decode_dev_hidden(&self, state: &mut DecodeState, kv: &mut KvCache, emb: &Tensor) -> Result<Tensor, ModelError> {
+        self.forward_decode_dev_inner(state, kv, Some(emb))?.ok_or_else(|| ModelError::Forward("forward_decode_dev_hidden: нет состояния".into()))
+    }
+
+    fn forward_decode_dev_inner(&self, state: &mut DecodeState, kv: &mut KvCache, emb_in: Option<&Tensor>) -> Result<Option<Tensor>, ModelError> {
         let npu = self.npu_decode_ready();
-        if !npu && !self.device_step_ready() {
+        if !npu && !self.device_step_ready_inner(false, emb_in.is_some()) {
             return Err(ModelError::Forward(
                 "forward_decode_dev: профиль не поддержан (MoE без device-пути, оффлоад блоков или sliding без ring-KV)".into(),
             ));
@@ -3454,7 +3527,10 @@ impl DecoderModel {
         let dev = self.device;
         let b = state.input.dims()[0];
         let ids_flat = state.input.reshape(vec![b]).coerr()?;
-        let emb = prof(dev, "embed_gather", || self.embed_rows(&ids_flat))?;
+        let emb = match emb_in {
+            Some(e) => e.clone(),
+            None => prof(dev, "embed_gather", || self.embed_rows(&ids_flat))?,
+        };
         let mut hidden = emb.reshape(vec![b, 1, self.config.hidden_size]).coerr()?;
         if let Some(scale) = self.embed_scale {
             hidden = hidden.mul_scalar(scale).coerr()?;
@@ -3571,6 +3647,9 @@ impl DecoderModel {
         }
 
         let last_in = hidden.reshape(vec![b, self.config.hidden_size]).coerr()?;
+        if emb_in.is_some() {
+            return Ok(Some(rms_norm(&last_in, &self.final_norm, self.config.rms_norm_eps).coerr()?));
+        }
         let logits = if b == 1 {
             let (normed, pq) =
                 rms_norm_quant(&last_in, &self.final_norm, self.config.rms_norm_eps, self.lm_head.quant_dtype())?;
@@ -3587,7 +3666,7 @@ impl DecoderModel {
             self.lm_head_forward(&last)?
         };
         prof(dev, "logits_copy", || state.logits.copy_from(&logits)).coerr()?;
-        Ok(())
+        Ok(None)
     }
 
     /// Масштаб и softcap логитов (то, что `lm_head_forward` делает после
