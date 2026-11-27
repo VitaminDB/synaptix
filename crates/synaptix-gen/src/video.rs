@@ -54,6 +54,8 @@ pub struct VideoRequest {
     pub two_stage: bool,
     /// LTX-2.5: удвоить частоту кадров временным апскейлером латента (24 → 48 кадр/с).
     pub fps_x2: bool,
+    /// LTX-2.5: декодировать диффузионным видеодекодером (резче лица, текстуры, текст; дольше).
+    pub diff_decoder: bool,
     /// LTX-2.5: Diffusion Fidelity Rendering — половинное разрешение со слотами
     /// ключевых кадров, затем полное с IC-LoRA детализации.
     pub dfr: bool,
@@ -284,6 +286,8 @@ pub struct LtxPaths {
     pub temporal_upscaler: Option<PathBuf>,
     /// LTX-2.5: IC-LoRA детализации ×2 (этап 2 DFR).
     pub detail_lora: Option<PathBuf>,
+    /// LTX-2.5: диффузионный видеодекодер (вместо свёрточного VAE).
+    pub diff_vae: Option<PathBuf>,
 }
 
 /// LTX-2.5: длина ролика в секундах по описанию — текстовый кодер, коннекторы
@@ -918,6 +922,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         _ => latent,
     };
     let rgb = synaptix_core::grad::no_grad(|| -> R<Tensor> {
+        if let (true, Some(dp)) = (req.diff_decoder, &paths.diff_vae) {
+            let dec = synaptix_video_ltx23::diff_vae::DiffVaeDecoder::load(dp, device).map_err(|e| format!("диффузионный декодер: {e}"))?;
+            return dec.decode(&latent, req.seed.wrapping_add(30_000)).map_err(|e| format!("диффузионный декодер: {e}"));
+        }
         let vae = VaeDecoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
         vae.decode(&latent).map_err(|e| format!("VAE: {e}"))
     })?;

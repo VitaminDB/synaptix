@@ -446,3 +446,107 @@ extern "C" __global__ void hy4_head_gemv(Hy4Args args) {
         out[(size_t)t * args.u[6] + (size_t)h * args.u[7] + col] = s;
     }
 }
+
+// ── LTX-2.5: диффузионный видеодекодер (NADiffusionDecoder) ─────────────────
+// Внимание по трёхмерной окрестности (семантика NATTEN): у токена (t,h,w) окно
+// K = kt·kh·kw ключей, по каждой оси start = clamp(i − k/2, 0, L − k) — у края
+// окно сдвигается внутрь, без масок и дополнения. Раскладка channels-last,
+// токен = (t·H + h)·W + w; голова — 64 канала.
+
+__device__ __forceinline__ float bf(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+
+// Подготовка q и k: RMS-норма по 64 каналам головы с весом, у q — множитель
+// f[1] (0.125), затем RoPE по осям (t,h,w) = (16,24,24) каналов, пары —
+// соседние каналы, угол = позиция / 10000^(2j/d).
+//   a0 qkv [N, 3C] bf16 (q | k | v), a1 q_norm [64] f32, a2 k_norm [64] f32,
+//   a3 q' [N, NH, 64] bf16, a4 k' [N, NH, 64] bf16
+//   u0..2 T,H,W; u3 NH; f0 eps; f1 масштаб q.
+extern "C" __global__ void ltx_na_prep(Hy4Args args) {
+    const unsigned T = args.u[0], H = args.u[1], W = args.u[2], NH = args.u[3];
+    const unsigned long long n = (unsigned long long)T * H * W;
+    const unsigned long long id = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n * NH * 2ull) return;
+    const unsigned which = (unsigned)(id & 1ull);            // 0 — q, 1 — k
+    const unsigned long long th = id >> 1;
+    const unsigned head = (unsigned)(th % NH);
+    const unsigned long long tok = th / NH;
+    const unsigned w = (unsigned)(tok % W), h = (unsigned)((tok / W) % H), t = (unsigned)(tok / ((unsigned long long)W * H));
+    const unsigned C = NH * 64u;
+    const __nv_bfloat16* src = (const __nv_bfloat16*)args.a[0] + tok * 3ull * C + (unsigned long long)which * C + head * 64u;
+    const float* nw = which ? CPF(2) : CPF(1);
+    __nv_bfloat16* dst = (__nv_bfloat16*)args.a[which ? 4 : 3] + (tok * NH + head) * 64ull;
+    float x[64];
+    float ss = 0.f;
+    for (int c = 0; c < 64; ++c) { x[c] = bf(src + c); ss += x[c] * x[c]; }
+    const float r = rsqrtf(ss / 64.f + args.f[0]) * (which ? 1.f : args.f[1]);
+    for (int c = 0; c < 64; ++c) x[c] *= r * nw[c];
+    for (int p = 0; p < 32; ++p) {
+        const int c = 2 * p;
+        float pos, d; int j;
+        if (c < 16) { pos = (float)t; d = 16.f; j = p; }
+        else if (c < 40) { pos = (float)h; d = 24.f; j = p - 8; }
+        else { pos = (float)w; d = 24.f; j = p - 20; }
+        const float ang = pos * powf(10000.f, -2.f * (float)j / d);
+        const float cs = cosf(ang), sn = sinf(ang);
+        const float e = x[c], o = x[c + 1];
+        dst[c] = __float2bfloat16(e * cs - o * sn);
+        dst[c + 1] = __float2bfloat16(e * sn + o * cs);
+    }
+}
+
+// Внимание по окрестности: варп на пару (токен, голова), дорожка — два канала.
+// softmax(q·k) по окну с онлайн-нормировкой (масштаб 1), выход — взвешенное v.
+// Буферы q', k', qkv — срез по времени: локальный кадр 0 = глобальный u9, всего
+// кадров в ролике u10 (окно по времени зажимается по ролику, а не по срезу);
+// запросы — локальные кадры [u11, u11 + u12), выход — только для них.
+//   a0 q' [N,NH,64], a1 k' [N,NH,64], a2 qkv [N,3C] (v — третья треть),
+//   a3 out [u12·H·W, C] bf16; u0..2 T(среза),H,W; u3 NH; u4..6 kt,kh,kw;
+//   u7/u8 — сдвиг первой пары (запуск кусками, младшие/старшие 32 бита).
+extern "C" __global__ void ltx_na3d(Hy4Args args) {
+    const unsigned H = args.u[1], W = args.u[2], NH = args.u[3];
+    const int kt = (int)args.u[4], kh = (int)args.u[5], kw = (int)args.u[6];
+    const int t_off = (int)args.u[9], Tg = (int)args.u[10], qa = (int)args.u[11];
+    const unsigned long long base = ((unsigned long long)args.u[8] << 32) | args.u[7];
+    const unsigned long long hw = (unsigned long long)H * W;
+    const unsigned long long nq = (unsigned long long)args.u[12] * hw;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned long long pair = base + (unsigned long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (pair >= nq * NH) return;
+    const unsigned head = (unsigned)(pair % NH);
+    const unsigned long long qtok = pair / NH;
+    const int w = (int)(qtok % W), h = (int)((qtok / W) % H), t = qa + (int)(qtok / hw);
+    const unsigned long long tok = (unsigned long long)t * hw + (unsigned long long)h * W + (unsigned)w;
+    const unsigned C = NH * 64u;
+    const __nv_bfloat16* Q = (const __nv_bfloat16*)args.a[0];
+    const __nv_bfloat16* K = (const __nv_bfloat16*)args.a[1];
+    const __nv_bfloat16* V = (const __nv_bfloat16*)args.a[2];
+    const __nv_bfloat162 qv = *(const __nv_bfloat162*)(Q + (tok * NH + head) * 64ull + lane * 2u);
+    const float q0 = __bfloat162float(qv.x), q1 = __bfloat162float(qv.y);
+    int tg = t + t_off - kt / 2; tg = tg < 0 ? 0 : (tg > Tg - kt ? Tg - kt : tg);
+    const int t0 = tg - t_off;
+    int h0 = h - kh / 2; h0 = h0 < 0 ? 0 : (h0 > (int)H - kh ? (int)H - kh : h0);
+    int w0 = w - kw / 2; w0 = w0 < 0 ? 0 : (w0 > (int)W - kw ? (int)W - kw : w0);
+    float m = -INFINITY, den = 0.f, a0 = 0.f, a1 = 0.f;
+    for (int it = 0; it < kt; ++it) {
+        for (int ih = 0; ih < kh; ++ih) {
+            const unsigned long long row = ((unsigned long long)(t0 + it) * H + (unsigned)(h0 + ih)) * W + (unsigned)w0;
+            for (int iw = 0; iw < kw; ++iw) {
+                const unsigned long long kt_ = row + (unsigned)iw;
+                const __nv_bfloat162 kv = *(const __nv_bfloat162*)(K + (kt_ * NH + head) * 64ull + lane * 2u);
+                const float s = warp_sum(q0 * __bfloat162float(kv.x) + q1 * __bfloat162float(kv.y));
+                const __nv_bfloat162 vv = *(const __nv_bfloat162*)(V + kt_ * 3ull * C + 2ull * C + head * 64u + lane * 2u);
+                if (s > m) {
+                    const float sc = expf(m - s);
+                    den = den * sc + 1.f; a0 = a0 * sc + __bfloat162float(vv.x); a1 = a1 * sc + __bfloat162float(vv.y);
+                    m = s;
+                } else {
+                    const float e = expf(s - m);
+                    den += e; a0 += e * __bfloat162float(vv.x); a1 += e * __bfloat162float(vv.y);
+                }
+            }
+        }
+    }
+    __nv_bfloat16* out = (__nv_bfloat16*)args.a[3] + qtok * (unsigned long long)C + head * 64u + lane * 2u;
+    out[0] = __float2bfloat16(a0 / den);
+    out[1] = __float2bfloat16(a1 / den);
+}

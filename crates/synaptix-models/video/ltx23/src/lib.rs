@@ -12,6 +12,7 @@
 
 pub mod audio_vae;
 pub mod config;
+pub mod diff_vae;
 pub mod dit;
 pub mod duration;
 pub mod guider;

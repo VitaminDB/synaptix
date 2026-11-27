@@ -152,6 +152,8 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                 "temporal_upscaler"
             } else if n.contains("ic-lora-pixel-spatial-upscaler") {
                 "detail_lora"
+            } else if n.contains("video-vae-diffusion") {
+                "diff_vae"
             } else {
                 return None;
             };
@@ -323,6 +325,7 @@ mod tests {
             f("ltx-2.5-22b-distilled", "ltx-2.5"),
             f("ltx-gemma-4-12b-2.5", "gemma4_unified_text"),
             f("ltx-2.5-prompt-enhancer", "gemma4"),
+            f("ltx-2.5-video-vae-diffusion", "ltx-2.5"),
             f("ltx-2.5-duration-head", "ltx-2.5"),
             f("ltx-2.5-temporal-upscaler-x2-1.0", "ltx-2.5"),
             f("ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0", "ltx-2.5"),
@@ -332,7 +335,7 @@ mod tests {
         let enc = m.components.iter().find(|(r, _)| r == "text_encoder").map(|(_, p)| p.clone());
         assert_eq!(enc, Some(PathBuf::from("/m/ltx-gemma-4-12b-2.5.syn")));
         assert!(m.components.iter().any(|(r, _)| r == "upscaler"));
-        for role in ["duration_head", "temporal_upscaler", "detail_lora"] {
+        for role in ["duration_head", "temporal_upscaler", "detail_lora", "diff_vae"] {
             assert!(m.components.iter().any(|(r, _)| r == role), "{role}");
         }
         assert_eq!(p.models.iter().filter(|m| m.id.starts_with("ltx-2-5")).count(), 2);

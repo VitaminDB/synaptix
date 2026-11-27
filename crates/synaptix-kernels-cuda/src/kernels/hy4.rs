@@ -11,7 +11,7 @@ use synaptix_core::error::{Result, SynaptixError};
 use crate::kernels::compile::{compile_module, load_fn};
 
 const NAMES: &[&str] = &[
-    "hy4_hc_pre", "hy4_hc_post", "hy4_rms", "hy4_rope", "hy4_mla_attn", "hy4_cache_put", "hy4_idx_pool", "hy4_idx_score", "hy4_engram_gate", "hy4_gate_mul", "hy4_head_gemv",
+    "hy4_hc_pre", "hy4_hc_post", "hy4_rms", "hy4_rope", "hy4_mla_attn", "hy4_cache_put", "hy4_idx_pool", "hy4_idx_score", "hy4_engram_gate", "hy4_gate_mul", "hy4_head_gemv", "ltx_na_prep", "ltx_na3d",
 ];
 
 pub struct Hy4Kernels {
