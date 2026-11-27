@@ -260,7 +260,8 @@ impl H3Model {
         let variant = if ref_sources.is_empty() { h3::config::H3Variant::Fl2va } else { h3::config::H3Variant::Ref2va };
         let source = h3::H3Source::open(&self.model, variant).map_err(err)?;
         let audio_secs = refs.iter().filter(|p| is_audio(p)).filter_map(|p| media_seconds(p)).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
-        let want_secs = audio_secs.or((size.seconds > 0.0).then_some(size.seconds)).unwrap_or(5.0).clamp(1.0, 15.0);
+        // предел ролика — 18 с при любом разрешении (решение пользователя: длиннее — дольше, но работает)
+        let want_secs = audio_secs.or((size.seconds > 0.0).then_some(size.seconds)).unwrap_or(5.0).clamp(1.0, 18.0);
         let frame_count = if overlap_frames > 0 {
             let want_new = (want_secs * FPS).round() as usize;
             h3::config::snap_frame_count(overlap_frames + want_new)
