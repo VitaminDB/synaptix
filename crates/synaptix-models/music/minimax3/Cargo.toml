@@ -1,0 +1,23 @@
+[package]
+name = "synaptix-music-minimax3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MiniMax Music 3 — песни по тексту и описанию: глобальная LM (Qwen3 8B) + локальная (RVQ depth) → flow-matching → DAC-декодер, 44,1 кГц стерео."
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-llm-common = { workspace = true }
+synaptix-llm-qwen3 = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-tokenizer = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+fancy-regex        = { workspace = true }
