@@ -126,6 +126,36 @@ pub fn run(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Error>> {
         dur_s
     );
     let (text, segments, language) = match engine {
+        // GigaAM-v4 (Zapformer): русский и английский, текст с пунктуацией.
+        Engine::GigaAm if synaptix_asr_gigaam::GigaAm4::is_v4(&args.model) => {
+            if matches!(task, Task::Translate) {
+                return Err("GigaAM — только транскрибация (--task transcribe)".into());
+            }
+            let pipe = synaptix_asr_gigaam::GigaAm4::load(&args.model, &dev)?;
+            eprintln!("synaptix transcribe: model loaded in {:.2}s", t0.elapsed().as_secs_f32());
+            let t1 = std::time::Instant::now();
+            let r = pipe.transcribe(&audio, 16_000)?;
+            let infer = t1.elapsed().as_secs_f32();
+            eprintln!("synaptix transcribe: done in {:.2}s (RTF={:.3})", infer, infer / dur_s.max(1e-6));
+            // Сегменты для --timestamps / srt / vtt — по предложениям (слово с концом фразы закрывает сегмент).
+            let mut segments: Vec<Segment> = Vec::new();
+            if need_segments {
+                let mut cur: Option<Segment> = None;
+                for w in &r.words {
+                    let seg = cur.get_or_insert_with(|| Segment { start: w.start, end: w.end, text: String::new() });
+                    if !seg.text.is_empty() {
+                        seg.text.push(' ');
+                    }
+                    seg.text.push_str(&w.text);
+                    seg.end = w.end;
+                    if w.text.ends_with(['.', '!', '?']) {
+                        segments.extend(cur.take());
+                    }
+                }
+                segments.extend(cur.take());
+            }
+            (r.e2e, segments, None)
+        }
         Engine::GigaAm => {
             if args.language.as_deref().is_some_and(|l| l != "ru") || matches!(task, Task::Translate) {
                 return Err("GigaAM — только русская транскрибация (--language ru, --task transcribe)".into());
