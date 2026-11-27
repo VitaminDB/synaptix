@@ -665,6 +665,13 @@ impl Block {
 }
 
 pub struct DecoderModel {
+    /// Закреплённое зеркало стопок экспертов в RAM (оффлоад из бандла):
+    /// живёт, пока жива модель ([`crate::expert_mirror::host_mirror`]).
+    /// ПЕРВОЕ поле: поля роняются по порядку, и копировщики зеркала должны
+    /// встать раньше, чем блоки отпустят mmap бандла, из которого они читают
+    /// (иначе выгрузка модели при недокопированном зеркале — SIGSEGV: служба
+    /// падала на Drama 3, 27.11.2026).
+    host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     pub config: DecoderConfig,
     pub device: Device,
     pub dtype: DType,
@@ -711,9 +718,6 @@ pub struct DecoderModel {
     /// MLP, роутеры) при этом резидентны. Ёмкость подгоняется под фазу
     /// ([`Self::fit_expert_cache`]).
     expert_cache: Option<std::sync::Arc<crate::moe::ExpertCache>>,
-    /// Закреплённое зеркало стопок экспертов в RAM (оффлоад из бандла):
-    /// живёт, пока жива модель ([`crate::expert_mirror::host_mirror`]).
-    host_mirror: Option<synaptix_core::device::cuda::OffloadPinCacheGuard>,
     /// Раскладка экспертов для виджетов службы (`None` — модель без стопок
     /// экспертов в бандле).
     placement: Option<crate::placement::PlacementProbe>,

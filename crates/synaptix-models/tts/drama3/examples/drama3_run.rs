@@ -54,6 +54,15 @@ fn main() {
     let t0 = Instant::now();
     let m = Drama3::load(std::path::Path::new(&a[0]), Device::Cuda(0)).expect("бандл");
     eprintln!("загрузка {:.1} с", t0.elapsed().as_secs_f64());
+    // `D3_DROP_AFTER_LOAD=1` — выгрузить сразу после загрузки, пока зеркало
+    // экспертов ещё копируется (проверка порядка освобождения).
+    if env("D3_DROP_AFTER_LOAD").is_some() {
+        drop(m);
+        eprintln!("модель выгружена сразу после загрузки");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        println!("после выгрузки жив");
+        return;
+    }
     let mut refs = Vec::new();
     for p in a[4..].chunks(2) {
         let pcm = read_wav(&p[0]);
@@ -120,4 +129,56 @@ fn main() {
         "кадров {} ({secs:.1} с звука), кусков {}, конец речи: {}: речь {:.1} с ({:.1} кадр/с, нужно 21,5), кодек {:.2} с → {}",
         out.frames, out.chunks, if out.finished { "да" } else { "нет (предел кадров)" }, out.ar_seconds, out.frames as f64 / out.ar_seconds, out.codec_seconds, a[1]
     );
+    // `D3_DROP_EARLY=1` — выгрузить модель сразу после реплики (служба так делает,
+    // когда соседней модели не хватает видеопамяти) и подождать: проверка, что
+    // выгрузка при недокопированном зеркале экспертов не роняет процесс.
+    if env("D3_DROP_EARLY").is_some() {
+        drop(m);
+        eprintln!("модель выгружена");
+        // Как служба: ужать память и загрузить модель в том же процессе заново.
+        let _ = synaptix_kernels_cuda::release_device_caches();
+        let _ = synaptix_core::memory::expert_arena::release_empty(0);
+        let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(0);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if let Ok((free, total)) = synaptix_core::device::cuda::mem_info(0) {
+            println!("после выгрузки и ужатия: свободно {} из {} МБ видеопамяти", free >> 20, total >> 20);
+        }
+        if env("D3_NO_RELOAD").is_some() {
+            return;
+        }
+        let m2 = Drama3::load(std::path::Path::new(&a[0]), Device::Cuda(0)).expect("вторая загрузка");
+        eprintln!("вторая загрузка готова");
+        let mut r = req.clone();
+        r.seed += 1;
+        match m2.generate(&r, &mut |_, _, _, _| true) {
+            Ok(o) => println!("вторая загрузка: кадров {} ({:.1} кадр/с)", o.frames, o.frames as f64 / o.ar_seconds),
+            Err(e) => println!("вторая загрузка: ОШИБКА {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        println!("после второй загрузки жив");
+        return;
+    }
+    // `D3_AGAIN="текст|текст…"` — ещё реплики той же моделью и с теми же образцами
+    // (как подряд идущие вызовы службы); `D3_TRIM=1` — между репликами ужать пулы
+    // видеопамяти, как делает служба при загрузке соседней модели.
+    if let Some(more) = env("D3_AGAIN") {
+        for (i, text) in more.split('|').enumerate() {
+            if env("D3_TRIM").is_some() {
+                let _ = synaptix_core::device::cuda::synchronize_all(0);
+                // Как `release_vram` службы: кэши ядер (дескрипторы, скретчи), пустые
+                // slab'ы арены экспертов, пулы.
+                let (descs, scratch) = synaptix_kernels_cuda::release_device_caches();
+                let arena = synaptix_core::memory::expert_arena::release_empty(0) >> 20;
+                let _ = synaptix_core::memory::cuda_pool::hard_trim_all_pools_device(0);
+                eprintln!("пулы ужаты: дескрипторов {descs}, скретчей {} МБ, арена {arena} МБ", scratch >> 20);
+            }
+            let mut r = req.clone();
+            r.text = text.to_string();
+            r.seed = req.seed + 1 + i as u64;
+            match m.generate(&r, &mut |_, _, _, _| true) {
+                Ok(o) => println!("повтор {}: кадров {} ({:.1} кадр/с), конец речи: {}", i + 1, o.frames, o.frames as f64 / o.ar_seconds, o.finished),
+                Err(e) => println!("повтор {}: ОШИБКА {e}", i + 1),
+            }
+        }
+    }
 }
