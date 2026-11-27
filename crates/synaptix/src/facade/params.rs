@@ -174,6 +174,23 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
                 spec("top_k", "Top-k", "Сколько лучших токенов рассматривать (50)", int(1, 4096, 1), i(50)),
                 seed(),
             ],
+            "seedvc" | "seedvc_v1" => {
+                let mut v = vec![
+                    spec("source_audio", "Исходная речь", "Запись, которую нужно переозвучить другим голосом (любой длины)", ParamKind::File { patterns: vec!["audio/*".into(), "*.wav".into(), "*.mp3".into(), "*.flac".into()] }, None),
+                    spec("ref_audio", "Образец голоса", "Запись целевого голоса на 3–25 секунд (текст образца не нужен)", ParamKind::File { patterns: vec!["audio/*".into(), "*.wav".into(), "*.mp3".into(), "*.flac".into()] }, None),
+                    steps(Some(30), "Шаги flow matching (30 — качество, 10 — втрое быстрее)"),
+                    spec("speed", "Скорость речи", "1 — как в источнике", float(0.5, 2.0, 0.05, 2), f(1.0)),
+                ];
+                if arch == "seedvc" {
+                    v.push(spec("convert_style", "Переносить манеру", "Кроме тембра — акцент, интонация и эмоция образца (длительность реплики может измениться)", ParamKind::Bool, Some(ParamValue::Bool(false))));
+                    v.push(spec("similarity", "Похожесть на образец", "CFG по голосу (0.7)", float(0.0, 1.0, 0.05, 2), f(0.7)));
+                    v.push(spec("intelligibility", "Разборчивость", "CFG по содержанию (0.7)", float(0.0, 1.0, 0.05, 2), f(0.7)));
+                } else {
+                    v.push(spec("guidance", "CFG", "Сила следования образцу (0.7)", float(0.0, 1.0, 0.05, 2), f(0.7)));
+                }
+                v.push(seed());
+                v
+            }
             "drama3" => vec![
                 ref_audio(),
                 spec("ref_text", "Текст образца", "Что сказано в записи, слово в слово (без него клон заметно хуже). Несколько образцов — по строке на образец, в порядке говорящих <|speaker:0|>, <|speaker:1|>, …", ParamKind::Text { multiline: true }, None),
