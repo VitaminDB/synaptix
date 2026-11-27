@@ -819,6 +819,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         Ok((l, Some(a), wave, stage1_saved))
     })?;
     let (latent, a_tok, input_wave, stage1_saved) = (latent.0, latent.1, latent.2, latent.3);
+    let mut pending_tail: Option<crate::tail::TailLatent> = None;
     let tail_path = if let Some(tp) = &req.tail_out {
         let ltx_lat = crate::ltx_stages::LtxLatent {
             video: latent.clone(),
@@ -832,8 +833,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             label: String::new(),
         };
         let model_name = req.model_id.as_deref().unwrap_or("ltx-2-3");
-        let tail = ltx_lat.tail(req.context_frames.unwrap_or(0), model_name)?;
-        tail.save(tp)?;
+        // Сохраняется после декода: видео-латент хвоста перекодируется из кадров (см. ниже).
+        pending_tail = Some(ltx_lat.tail(req.context_frames.unwrap_or(0), model_name)?);
         Some(tp.clone())
     } else {
         None
@@ -883,6 +884,41 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
     };
     let mut frames = lp::rgb_to_frames(&rgb).map_err(err)?;
+    drop(rgb);
+    // Хвост для продолжения — из готовых кадров, а не срезом латента: у
+    // причинного VAE первый латентный кадр кодирует один кадр, остальные — по
+    // восемь; срез середины ролика на местах 0…t давал мягкие первые кадры
+    // продолжения и скачок резкости через ~16 кадров («переход» на стыке).
+    // Эталон LTX-2 (chunks) так же переносит 8k+1 пиксельных кадров.
+    if let (Some(mut tail), Some(tp)) = (pending_tail.take(), &req.tail_out) {
+        if fps_mul == 1.0 && frames.len() >= tail.meta.overlap_frames {
+            synaptix_core::gen_status::phase("хвост для продолжения");
+            let last = &frames[frames.len() - tail.meta.overlap_frames..];
+            let venc = VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?;
+            let encode = |gh: usize, gw: usize| -> R<Tensor> {
+                let (ph, pw) = (gh * 32, gw * 32);
+                let mut fr = Vec::with_capacity(last.len());
+                for f in last {
+                    fr.push(synaptix_io::image::fit_image(f, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?);
+                }
+                let refs: Vec<&Tensor> = fr.iter().collect();
+                let x = Tensor::cat(&refs, 2).map_err(err)?.contiguous().map_err(err)?;
+                let l = synaptix_core::grad::no_grad(|| venc.encode(&x)).map_err(|e| format!("VAE: {e}"))?;
+                l.to_device(Device::Cpu).map_err(err)?.to_dtype(DType::F32).map_err(err)
+            };
+            let v = encode(hp, wp)?;
+            if v.dims()[2] == tail.meta.context_frames {
+                tail.video = v;
+                if tail.video_stage1.is_some() {
+                    let (h1, w1) = lp::stage1_grid(hp, wp);
+                    tail.video_stage1 = Some(encode(h1, w1)?);
+                }
+            }
+            drop(venc);
+            release();
+        }
+        tail.save(tp)?;
+    }
     let mut pcm = pcm;
     if overlap_frames > 0 && frames.len() > overlap_frames {
         frames.drain(0..overlap_frames);

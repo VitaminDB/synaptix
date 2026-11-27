@@ -24,6 +24,11 @@ fn main() {
         height: Some(a[6].parse().unwrap()),
         seed: a[7].parse().unwrap(),
         fps_x2: std::env::var("LTX_FPS_X2").is_ok(),
+        source_video: std::env::var("LTX_SOURCE").ok().map(PathBuf::from),
+        extend: std::env::var("LTX_EXTEND").is_ok(),
+        tail_out: std::env::var("LTX_TAIL_OUT").ok().map(PathBuf::from),
+        context: std::env::var("LTX_CONTEXT").ok().map(PathBuf::from),
+        context_frames: std::env::var("LTX_CONTEXT_FRAMES").ok().and_then(|v| v.parse().ok()),
         two_stage: std::env::var("LTX_TWO_STAGE").is_ok(),
         ..Default::default()
     };
