@@ -36,7 +36,6 @@ Qwen3.8-27B, Qwen4Exp, Inkling-2 — подробные таблицы в их �
 | 2026-11-26 | MiniMax-H3 fl2va, Turbo 8 шагов | story-video, 1 сцена 5 с | журнал | ~186 с на H3 целиком |
 | 2026-11-26 | MiniMax-H3 (правки cc4a4a6) | 1344×768, 5,17 с, шаг DiT | по коммиту | 22,55 → 12,9 с/шаг |
 | 2026-11-26 | MiniMax-H3 (правки cc4a4a6) | Video VAE | по коммиту | 23,5 → 15,9 с |
-| 2026-11-27 | MiniMax-H3 Ref2VA + DFR-нет, diff-нет | 540p, сцены story-video | — | нет замера |
 | 2026-11-26 | LTX-2.3 distilled (MXFP8) | 768×448, 4 с, одна стадия | CLI `ltx_gen` | 39–44 с |
 | 2026-11-26 | LTX-2.5 distilled (MXFP8) | 768×448, 4 с, одна стадия | CLI `ltx_gen` | 30–36 с |
 | 2026-11-27 | LTX-2.5 | 768×448, 8 с, три плана | CLI | 52 с |
@@ -60,6 +59,8 @@ Qwen3.8-27B, Qwen4Exp, Inkling-2 — подробные таблицы в их �
 | 2026-11-27 | Qwen-Image 2.1 (BF16) | 1344×768, 20 шагов | CLI `synaptix imagine` | 7,8 с денойз; 12,7 с всего |
 
 FLUX.1 / FLUX.2 / SDXL / Qwen-Image Edit — нет замера.
+
+MiniMax-H3 Ref2VA 540p (сцены story-video) — нет замера.
 
 ## Музыка и речь
 
