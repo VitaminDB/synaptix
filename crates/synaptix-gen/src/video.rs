@@ -900,6 +900,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         Ok((l, Some(a), wave, stage1_saved))
     })?;
     let (latent, a_tok, input_wave, stage1_saved) = (latent.0, latent.1, latent.2, latent.3);
+    // Отладка: итоговый латент сырым f32 `[128, F, H, W]` (подбор коэффициентов превью).
+    if let Some(p) = std::env::var_os("LTX_DUMP_LATENT") {
+        let d = latent.dims().to_vec();
+        let v = latent.to_dtype(DType::F32).map_err(err)?.to_device(Device::Cpu).map_err(err)?.flatten_all().map_err(err)?.to_vec1::<f32>().map_err(err)?;
+        let path = PathBuf::from(p).with_extension(format!("{}x{}x{}.f32", d[2], d[3], d[4]));
+        std::fs::write(&path, v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(err)?;
+    }
     let mut pending_tail: Option<crate::tail::TailLatent> = None;
     let tail_path = if let Some(tp) = &req.tail_out {
         let ltx_lat = crate::ltx_stages::LtxLatent {

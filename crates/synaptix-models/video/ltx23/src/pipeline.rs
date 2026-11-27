@@ -1217,6 +1217,7 @@ pub fn denoise_av_cond(
             &a_tok, &a_ts, sigma as f32, &a_pos, &a_ctx,
             v_nag,
         )?;
+        crate::preview::emit(&v_tok, &v_vel, sigma, fp, hp, wp, i, max_steps);
         let dt = (sigma_next - sigma) as f32;
         if let Some(base) = anc {
             // LTX-2.5: Euler-ancestral (eta = 1) по x0 = x − σ·v, затем
@@ -1575,6 +1576,7 @@ pub fn denoise_dfr(
             let v_ts: Vec<f32> = mask.iter().map(|&m| m * sigma as f32).collect();
             let a_ts: Vec<f32> = a_mask.iter().map(|&m| m * sigma as f32).collect();
             let (v_vel, a_vel) = dit.forward(&v_tok, &v_ts, sigma as f32, &pos, &v_ctx, &a_tok, &a_ts, sigma as f32, &a_pos, &a_ctx, None)?;
+            crate::preview::emit(&v_tok, &v_vel, sigma, fp, hp, wp, i, sigmas.len() - 1);
             let dt = (sigma_next - sigma) as f32;
             if let Some(base) = crate::runtime::ancestral() {
                 let s = i as u64 * 2;

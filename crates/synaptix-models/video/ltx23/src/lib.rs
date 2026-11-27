@@ -21,6 +21,7 @@ pub mod vae;
 pub mod vocoder;
 pub mod model;
 pub mod pipeline;
+pub mod preview;
 pub mod runtime;
 pub mod spec;
 pub mod text_encoder;

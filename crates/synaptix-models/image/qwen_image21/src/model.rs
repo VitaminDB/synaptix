@@ -514,10 +514,23 @@ impl QwenImage21Model {
                 None => v,
             };
             drop(input);
+            preview(&latents, &v, sigmas[i], w, h, i, n);
             latents = sched.step(&v, i, &latents)?;
             if !progress(i + 1, n) && i + 1 < n {
                 return Err(QwenImage21Error::Cancelled);
             }
+        }
+        // Отладка: упакованный латент сырым f32 `[64, 1, h, w]` (подбор коэффициентов превью).
+        if let Some(p) = std::env::var_os("QWEN_DUMP_LATENT") {
+            let t = latents.to_dtype(DType::F32)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0f32; t.len()];
+            for i in 0..h * w {
+                for c in 0..64 {
+                    out[c * h * w + i] = t[i * 64 + c];
+                }
+            }
+            let path = std::path::PathBuf::from(p).with_extension(format!("1x{h}x{w}.f32"));
+            let _ = std::fs::write(path, out.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
         }
         eprintln!(
             "[qwen-image-2.1] денойз {n} шагов {width}×{height}{}{}{} за {:.1} с",
@@ -592,4 +605,25 @@ mod tests {
         assert_eq!(snap_side(1030), 1024);
         assert_eq!(QwenImage21Model::tokens_for(1024, 1024, 4096, 100), 100 + 4096 + 4096);
     }
+}
+
+/// Превью по ходу денойза: `x0 = x − σ·v` по упакованным токенам `[1, h·w, 64]`
+/// (1/16 кадра) линейной проекцией в RGB; коэффициенты подобраны примером
+/// `latent_rgb_fit` (`SYN_QWEN21_RGB_FACTORS` — свой файл).
+fn preview(x: &Tensor, v: &Tensor, sigma: f32, w: usize, h: usize, step: usize, total: usize) {
+    use synaptix_core::gen_status;
+    static F: std::sync::OnceLock<Option<Vec<f32>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| match std::env::var_os("SYN_QWEN21_RGB_FACTORS") {
+        Some(p) => gen_status::parse_factors(&std::fs::read(p).ok()?, 64),
+        None => gen_status::parse_factors(include_bytes!("../assets/latent_rgb.f32"), 64),
+    });
+    let (Some(f), n) = (f.as_ref(), gen_status::preview_every(4)) else { return };
+    if n == 0 || step % n != 0 {
+        return;
+    }
+    let _ = (|| -> synaptix_core::error::Result<()> {
+        let x0 = x.to_dtype(DType::F32)?.sub(&v.to_dtype(DType::F32)?.mul_scalar(sigma)?)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        gen_status::linear_preview(&x0, 64, w, h, f, step, total);
+        Ok(())
+    })();
 }
