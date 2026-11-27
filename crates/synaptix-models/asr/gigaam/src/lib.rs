@@ -11,12 +11,14 @@ pub mod mel;
 pub mod model;
 pub mod pipeline;
 pub mod spm;
+pub mod v4;
 
 pub use config::GigaAmConfig;
 pub use loader::GigaAmWeights;
 pub use model::GigaAmModel;
 pub use pipeline::{CtcWord, GigaAm};
 pub use spm::SpmDecoder;
+pub use v4::{GigaAm4, Transcript};
 
 pub type Result<T> = std::result::Result<T, GigaAmError>;
 
