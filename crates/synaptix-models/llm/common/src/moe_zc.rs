@@ -458,6 +458,9 @@ impl ZcLayer {
             a.rows = rows as u32;
             a.k = (pairs / rows.max(1)) as u32;
             a.h = h as u32;
+            if x.dtype() == DType::BF16 {
+                a._pad |= 2;
+            }
             _logits = Some(lg);
         }
         synaptix_core::tensor::ops::moe_zc_lru(dev, &a).map_err(zerr)?;
@@ -524,7 +527,7 @@ impl ZcLayer {
         a.cp_src_dn = cpa + 8 * cap;
         a.cp_dst = cpa + 16 * cap;
         a.pairs = pairs as u32;
-        a._pad = 1;
+        a._pad = 1 | if x.dtype() == DType::BF16 { 2 } else { 0 };
         a.router_w = addr(router)?;
         a.x = addr(x)?;
         a.logits = addr(&sc.logits)?;

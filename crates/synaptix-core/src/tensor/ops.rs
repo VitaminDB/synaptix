@@ -3799,8 +3799,9 @@ impl Tensor {
         let cs_layout = conv_state.layout.clone();
         let ss_layout = ssm_state.layout.clone();
 
-        let out_layout = Layout::contiguous(Shape::new(vec![1, value_dim]), DType::F16);
-        let out_bytes = DType::F16.bytes_for_numel(out_layout.numel());
+        let out_dt = self.dtype();
+        let out_layout = Layout::contiguous(Shape::new(vec![1, value_dim]), out_dt);
+        let out_bytes = out_dt.bytes_for_numel(out_layout.numel());
         let backend = registry::backend_for(dev)?;
         let stream = Stream::default_for(dev)?;
         let mut out_storage = backend.alloc_zeros(out_bytes, dev)?;

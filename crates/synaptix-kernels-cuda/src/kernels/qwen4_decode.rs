@@ -22,6 +22,7 @@ pub struct Qwen4DecodeKernels {
     hc_inject: CudaFunction,
     scale_act: CudaFunction,
     weighted_rows_sum: CudaFunction,
+    weighted_rows_sum_bf16: CudaFunction,
     hc_down: CudaFunction,
     hc_up: CudaFunction,
     se_up: CudaFunction,
@@ -51,6 +52,7 @@ impl Qwen4DecodeKernels {
             hc_inject: load_fn(&module, "hc_inject_f16")?,
             scale_act: load_fn(&module, "scale_act_f16")?,
             weighted_rows_sum: load_fn(&module, "weighted_rows_sum_f16")?,
+            weighted_rows_sum_bf16: load_fn(&module, "weighted_rows_sum_bf16")?,
             hc_down: load_fn(&module, "hc_down_f16")?,
             hc_up: load_fn(&module, "hc_up_f16")?,
             se_up: load_fn(&module, "se_up_f16")?,
@@ -186,14 +188,16 @@ pub fn weighted_rows_sum_f16(
     t: u32,
     kk: u32,
     h: u32,
+    is_bf16: bool,
 ) -> Result<()> {
     let pv = parts.0.slice(parts.1..parts.1 + t as usize * kk as usize * h as usize * 2);
     let wv = w.0.slice(w.1..w.1 + t as usize * kk as usize * 4);
     let mut ov = out.0.slice_mut(out.1..out.1 + t as usize * h as usize * 2);
-    let mut bld = stream.launch_builder(&k.weighted_rows_sum);
+    let f = if is_bf16 { &k.weighted_rows_sum_bf16 } else { &k.weighted_rows_sum };
+    let mut bld = stream.launch_builder(f);
     bld.arg(&pv).arg(&wv).arg(&mut ov).arg(&t).arg(&kk).arg(&h);
     unsafe {
-        bld.launch(grid1(t as u64 * h as u64)).map_err(|e| launch_err("weighted_rows_sum_f16", e))?
+        bld.launch(grid1(t as u64 * h as u64)).map_err(|e| launch_err("weighted_rows_sum", e))?
     };
     Ok(())
 }

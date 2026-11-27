@@ -3,6 +3,7 @@
 // пути. Счёт в F32, вход/выход F16. Все ядра построчные — годятся и на
 // префилле (T строк), и на декоде (T = 1).
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
@@ -131,6 +132,26 @@ extern "C" __global__ void weighted_rows_sum_f16(
         acc += w[p] * __half2float(parts[(unsigned long long)p * H + i]);
     }
     out[idx] = __float2half(acc);
+}
+
+extern "C" __global__ void weighted_rows_sum_bf16(
+    const __nv_bfloat16* __restrict__ parts,
+    const float* __restrict__ w,
+    __nv_bfloat16* __restrict__ out,
+    unsigned int t,
+    unsigned int k,
+    unsigned int H
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long total = (unsigned long long)t * H;
+    if (idx >= total) return;
+    unsigned int row = (unsigned int)(idx / H), i = (unsigned int)(idx % H);
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < k; ++j) {
+        unsigned int p = row * k + j;
+        acc += w[p] * __bfloat162float(parts[(unsigned long long)p * H + i]);
+    }
+    out[idx] = __float2bfloat16(acc);
 }
 
 // ───────────── слитый gated-residual (hyper-connection) на декоде ─────────────

@@ -61,6 +61,7 @@ __device__ __forceinline__ void zc_cp_s(const ZcArgs& a, unsigned int p, unsigne
 }
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // Строка роутера на варп; порядок fmaf — как у mma_gemv_f32 (вектор из 4 на
 // лейн, шаг 32 вектора): выбор экспертов совпадает с прежним путём.
@@ -78,6 +79,28 @@ extern "C" __global__ void zc_router(ZcArgs a) {
         const float4 wv = w4[i];
         const float2 xa = __half22float2(x2[2 * i]);
         const float2 xb = __half22float2(x2[2 * i + 1]);
+        acc = fmaf(wv.x, xa.x, acc);
+        acc = fmaf(wv.y, xa.y, acc);
+        acc = fmaf(wv.z, xb.x, acc);
+        acc = fmaf(wv.w, xb.y, acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) ((float*)a.logits)[(size_t)t * a.experts + e] = acc;
+}
+
+extern "C" __global__ void zc_router_bf16(ZcArgs a) {
+    const unsigned e = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const unsigned t = blockIdx.y;
+    if (e >= a.experts) return;
+    const unsigned lane = threadIdx.x & 31u;
+    const float4* w4 = reinterpret_cast<const float4*>((const float*)a.router_w + (size_t)e * a.H);
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>((const __nv_bfloat16*)a.x + (size_t)t * a.H);
+    float acc = 0.f;
+    const unsigned k4 = a.H >> 2;
+    for (unsigned i = lane; i < k4; i += 32u) {
+        const float4 wv = w4[i];
+        const float2 xa = __bfloat1622float2(x2[2 * i]);
+        const float2 xb = __bfloat1622float2(x2[2 * i + 1]);
         acc = fmaf(wv.x, xa.x, acc);
         acc = fmaf(wv.y, xa.y, acc);
         acc = fmaf(wv.z, xb.x, acc);
@@ -155,7 +178,7 @@ extern "C" __global__ void zc_lru(ZcArgs a) {
     unsigned long long* csg = (unsigned long long*)a.cp_src_gu;
     unsigned long long* csd = (unsigned long long*)a.cp_src_dn;
     unsigned long long* cdst = (unsigned long long*)a.cp_dst;
-    if (a._pad == 1u) {
+    if ((a._pad & 1u) != 0u) {
         // Упреждающая подкачка (второй стрим, до шага слоя): предсказанные
         // эксперты — резидентам бит обращения, не более `_pad2` промахов
         // поднимаются в слоты по часам. Таблицы eff и статистика не нужны.

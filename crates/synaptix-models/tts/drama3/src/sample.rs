@@ -31,12 +31,27 @@ impl Rng {
 /// Индекс выбранного логита. `top_k = 0` — без ограничения.
 pub fn sample(logits: &[f32], temperature: f32, top_k: usize, top_p: f32, keep_crossing: bool, rng: &mut Rng) -> usize {
     let t = temperature.max(1e-5);
-    let mut order: Vec<usize> = (0..logits.len()).collect();
-    order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
-    let max = logits[order[0]] / t;
-    let p: Vec<f64> = order.iter().map(|&i| ((logits[i] / t - max) as f64).exp()).collect();
-    let z: f64 = p.iter().sum();
-    let k = if top_k == 0 { order.len() } else { top_k.min(order.len()) };
+    let n = logits.len();
+    let k = if top_k == 0 { n } else { top_k.min(n) };
+    let mut order: Vec<usize> = (0..n).collect();
+    let cmp = |&a: &usize, &b: &usize| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal);
+    let (max, z) = if k < n {
+        // Нужны только k старших и полная сумма exp: O(N + k log k) вместо O(N log N).
+        order.select_nth_unstable_by(k - 1, cmp);
+        order[..k].sort_by(cmp);
+        let max = logits[order[0]] / t;
+        let z: f64 = logits.iter().map(|&v| ((v / t - max) as f64).exp()).sum();
+        (max, z)
+    } else {
+        order.sort_by(cmp);
+        let max = logits[order[0]] / t;
+        let z: f64 = order.iter().map(|&i| ((logits[i] / t - max) as f64).exp()).sum();
+        (max, z)
+    };
+    let mut p = Vec::with_capacity(k);
+    for &i in &order[..k] {
+        p.push(((logits[i] / t - max) as f64).exp());
+    }
     let mut keep = 1usize;
     let mut cum = p[0] / z;
     let mut prev_dropped = cum > top_p as f64;

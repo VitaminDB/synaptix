@@ -17,6 +17,7 @@ synaptix-ops       = { workspace = true }
 synaptix-nn        = { workspace = true }
 synaptix-io        = { workspace = true }
 synaptix-audio     = { workspace = true }
+synaptix-infer     = { workspace = true }
 synaptix-llm-common = { workspace = true }
 synaptix-llm-qwen3-next-hybrid = { workspace = true }
 synaptix-tts-audio8 = { workspace = true }

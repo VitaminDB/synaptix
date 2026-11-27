@@ -137,7 +137,33 @@ impl GatedDeltaNetState {
     /// Сеет/пересеивает device-зеркала из host-векторов. Первый вызов аллоцирует
     /// dev-тензоры; последующие копируют host→существующий буфер **in-place**
     /// (стабильный указатель — обязателен для graph-replay, который захватил адрес
-    /// при capture). `conv_state` → F16, `ssm_state` → F32.
+    /// при capture). `conv_state` → `conv_dtype` (F16 или BF16), `ssm_state` → F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_to_device_dtype(
+        &mut self,
+        device: Device,
+        conv_dim: usize,
+        conv_k: usize,
+        num_v_heads: usize,
+        dk: usize,
+        dv: usize,
+        conv_dtype: DType,
+    ) -> Result<()> {
+        let rows = conv_k.saturating_sub(1);
+        let cs_src = Tensor::from_vec(self.conv_state.clone(), vec![rows, conv_dim], device)?
+            .to_dtype(conv_dtype)?;
+        match self.conv_state_dev.as_mut() {
+            Some(d) if d.dtype() == conv_dtype => d.copy_from(&cs_src)?,
+            _ => self.conv_state_dev = Some(cs_src),
+        }
+        let ss_src = Tensor::from_vec(self.ssm_state.clone(), vec![num_v_heads, dk, dv], device)?;
+        match self.ssm_state_dev.as_mut() {
+            Some(d) => d.copy_from(&ss_src)?,
+            None => self.ssm_state_dev = Some(ss_src),
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn sync_to_device(
         &mut self,
@@ -148,19 +174,7 @@ impl GatedDeltaNetState {
         dk: usize,
         dv: usize,
     ) -> Result<()> {
-        let rows = conv_k.saturating_sub(1);
-        let cs_src = Tensor::from_vec(self.conv_state.clone(), vec![rows, conv_dim], device)?
-            .to_dtype(DType::F16)?;
-        match self.conv_state_dev.as_mut() {
-            Some(d) => d.copy_from(&cs_src)?,
-            None => self.conv_state_dev = Some(cs_src),
-        }
-        let ss_src = Tensor::from_vec(self.ssm_state.clone(), vec![num_v_heads, dk, dv], device)?;
-        match self.ssm_state_dev.as_mut() {
-            Some(d) => d.copy_from(&ss_src)?,
-            None => self.ssm_state_dev = Some(ss_src),
-        }
-        Ok(())
+        self.sync_to_device_dtype(device, conv_dim, conv_k, num_v_heads, dk, dv, DType::F16)
     }
 
     /// Обратный синк device→host: считывает device-зеркала обратно в host-векторы.

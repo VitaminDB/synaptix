@@ -16,6 +16,10 @@ use crate::tensor::shape::Shape;
 use crate::tensor::storage::Storage;
 use crate::tensor::Tensor;
 
+/// Флаг бита `rotary_dim` для [`Tensor::dec_attn_prep`]: интерливный RoPE
+/// (пары `(2i, 2i+1)`, таблицы `cos`/`sin` вида `[c0, c0, c1, c1, …]`).
+pub const DEC_ROPE_INTERLEAVED: usize = 1 << 30;
+
 /// В каком виде нужна норма от `hidden`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecOutFmt {

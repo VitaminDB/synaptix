@@ -74,6 +74,13 @@ pub fn build_rows(text: &str, refs: &[RefCodes], encode: &dyn Fn(&str) -> R<Vec<
 /// `[токен, c0..c9]`) — ходы user/assistant перед целевым текстом, чтобы
 /// длинная реплика звучала одним голосом и интонацией (как в MLX-эталоне).
 pub fn build_rows_with_history(text: &str, refs: &[RefCodes], history: &[(&str, &[Row])], encode: &dyn Fn(&str) -> R<Vec<u32>>) -> R<Vec<Row>> {
+    build_rows_split(text, refs, history, encode).map(|(rows, _)| rows)
+}
+
+/// Как [`build_rows_with_history`], но также возвращает длину системного префикса
+/// с образцами (`<|im_start|>system\n…<|im_end|>\n`), неизменного между кусками
+/// и повторными фразами с тем же голосом — для кэширования KV префикса.
+pub fn build_rows_split(text: &str, refs: &[RefCodes], history: &[(&str, &[Row])], encode: &dyn Fn(&str) -> R<Vec<u32>>) -> R<(Vec<Row>, usize)> {
     let mut rows: Vec<Row> = Vec::new();
     let push_text = |rows: &mut Vec<Row>, s: &str| -> R<()> {
         for id in encode(s)? {
@@ -109,6 +116,7 @@ pub fn build_rows_with_history(text: &str, refs: &[RefCodes], history: &[(&str, 
     }
     validate(text, "текст")?;
     push_text(&mut rows, MESSAGE_END)?;
+    let prefix_len = rows.len();
     for (t, frames) in history {
         push_text(&mut rows, "<|im_start|>user\n")?;
         push_text(&mut rows, &with_speaker_tag(t))?;
@@ -121,7 +129,7 @@ pub fn build_rows_with_history(text: &str, refs: &[RefCodes], history: &[(&str, 
     push_text(&mut rows, &with_speaker_tag(text))?;
     push_text(&mut rows, MESSAGE_END)?;
     push_text(&mut rows, GENERATION_START)?;
-    Ok(rows)
+    Ok((rows, prefix_len))
 }
 
 #[cfg(test)]

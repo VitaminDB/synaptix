@@ -391,28 +391,41 @@ fn cat_cuda(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
                 let (p, _g) = src_buf.slice().device_ptr(&stream);
                 p
             };
-            let copy = sys::CUDA_MEMCPY2D_st {
-                srcXInBytes: 0,
-                srcY: 0,
-                srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                srcHost: std::ptr::null(),
-                srcDevice: src_base + t.layout().byte_offset() as sys::CUdeviceptr,
-                srcArray: std::ptr::null_mut(),
-                srcPitch: chunk,
-                dstXInBytes: 0,
-                dstY: 0,
-                dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                dstHost: std::ptr::null_mut(),
-                dstDevice: dst_base + written as sys::CUdeviceptr,
-                dstArray: std::ptr::null_mut(),
-                dstPitch: out_slice_per_outer,
-                WidthInBytes: chunk,
-                Height: outer,
-            };
-            unsafe {
-                sys::cuMemcpy2DAsync_v2(&copy, cu_stream)
+            if outer == 1 {
+                unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(
+                        dst_base + written as sys::CUdeviceptr,
+                        src_base + t.layout().byte_offset() as sys::CUdeviceptr,
+                        chunk,
+                        cu_stream,
+                    )
                     .result()
-                    .map_err(|e| SynaptixError::Cuda(format!("cat cuMemcpy2D: {e:?}")))?;
+                    .map_err(|e| SynaptixError::Cuda(format!("cat cuMemcpyDtoD: {e:?}")))?;
+                }
+            } else {
+                let copy = sys::CUDA_MEMCPY2D_st {
+                    srcXInBytes: 0,
+                    srcY: 0,
+                    srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                    srcHost: std::ptr::null(),
+                    srcDevice: src_base + t.layout().byte_offset() as sys::CUdeviceptr,
+                    srcArray: std::ptr::null_mut(),
+                    srcPitch: chunk,
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                    dstHost: std::ptr::null_mut(),
+                    dstDevice: dst_base + written as sys::CUdeviceptr,
+                    dstArray: std::ptr::null_mut(),
+                    dstPitch: out_slice_per_outer,
+                    WidthInBytes: chunk,
+                    Height: outer,
+                };
+                unsafe {
+                    sys::cuMemcpy2DAsync_v2(&copy, cu_stream)
+                        .result()
+                        .map_err(|e| SynaptixError::Cuda(format!("cat cuMemcpy2D: {e:?}")))?;
+                }
             }
             written += chunk;
         }

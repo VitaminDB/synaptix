@@ -506,6 +506,7 @@ impl LinearAttn {
     /// стриминговом блоке. На CPU зеркала = None.
     fn to_device(&self, dev: Device) -> Result<Self, ModelError> {
         let norm_weight = self.norm_weight.to_device(dev).map_err(|e| ModelError::Load(e.to_string()))?;
+        let dev_dt = if self.norm_weight.dtype() == DType::BF16 { DType::BF16 } else { DType::F16 };
         let (conv_w_dev, a_log_dev, dt_bias_dev, norm_w_f16) = if dev.is_cpu() {
             (None, None, None, None)
         } else {
@@ -515,14 +516,14 @@ impl LinearAttn {
             (
                 Some(
                     mk(&self.conv_w, vec![self.conv_dim, self.conv_k])?
-                        .to_dtype(DType::F16)
+                        .to_dtype(dev_dt)
                         .map_err(|e| ModelError::Load(e.to_string()))?,
                 ),
                 Some(mk(&self.a_log, vec![self.num_v_heads])?),
                 Some(mk(&self.dt_bias, vec![self.num_v_heads])?),
                 Some(
                     norm_weight
-                        .to_dtype(DType::F16)
+                        .to_dtype(dev_dt)
                         .map_err(|e| ModelError::Load(e.to_string()))?,
                 ),
             )
@@ -1726,16 +1727,17 @@ impl DecoderModel {
                     let dt_bias = host_f32(&key("linear_attn.dt_bias"))?;
                     let norm_weight = weights.tensor(&key("linear_attn.norm.weight"), device, compute)?;
                     let (conv_dim, ck, nv) = (lc.conv_dim(), lc.conv_kernel, lc.num_value_heads);
-                    // Device-зеркала весов для CUDA-graph decode (F16/F32). На CPU не нужны.
+                    // Device-зеркала весов для CUDA-graph decode (F16/BF16 и F32). На CPU не нужны.
+                    let dev_dt = if compute == DType::BF16 { DType::BF16 } else { DType::F16 };
                     let (conv_w_dev, a_log_dev, dt_bias_dev, norm_w_f16) = if device.is_cpu() {
                         (None, None, None, None)
                     } else {
                         (
                             Some(Tensor::from_vec(conv_w.clone(), vec![conv_dim, ck], device).coerr()?
-                                .to_dtype(DType::F16).coerr()?),
+                                .to_dtype(dev_dt).coerr()?),
                             Some(Tensor::from_vec(a_log.clone(), vec![nv], device).coerr()?),
                             Some(Tensor::from_vec(dt_bias.clone(), vec![nv], device).coerr()?),
-                            Some(norm_weight.to_dtype(DType::F16).coerr()?),
+                            Some(norm_weight.to_dtype(dev_dt).coerr()?),
                         )
                     };
                     Mixer::Linear(LinearAttn {
@@ -2163,6 +2165,40 @@ impl DecoderModel {
             }
         }
         acc
+    }
+
+    /// Урезать плотную `lm_head` до указанных диапазонов строк `(начало, длина)`:
+    /// освобождает неиспользуемую часть словаря в VRAM и ускоряет голову
+    /// (у Drama 3 нужны только 4097 строк из 252 288). `false` — голова квантована.
+    pub fn slice_lm_head(&mut self, ranges: &[(usize, usize)]) -> Result<bool, ModelError> {
+        let QLinear::Dense(lin) = &self.lm_head else { return Ok(false) };
+        let w = lin.weight();
+        let mut parts = Vec::with_capacity(ranges.len());
+        for &(start, len) in ranges {
+            parts.push(w.narrow(0, start, len).coerr()?.contiguous().coerr()?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        let sliced = Tensor::cat(&refs, 0).coerr()?.contiguous().coerr()?;
+        self.lm_head = QLinear::Dense(
+            synaptix_nn::linear::Linear::new(sliced, None)
+                .map_err(|e| ModelError::Build(e.to_string()))?,
+        );
+        self.weights_gen = self.weights_gen.wrapping_add(1);
+        if let Device::Cuda(ord) = self.device {
+            let _ = synaptix_core::device::cuda::trim_weights_pool(ord);
+            let _ = synaptix_core::device::cuda::trim_activations_pool(ord);
+        }
+        Ok(true)
+    }
+
+    /// Очистить кэш экспертов (при переходе на zero-copy освобождает VRAM).
+    pub fn clear_expert_cache(&self) {
+        if let Some(cache) = &self.expert_cache {
+            cache.clear();
+            if let Device::Cuda(ord) = self.device {
+                let _ = synaptix_core::device::cuda::trim_experts_pool(ord);
+            }
+        }
     }
 
     /// Ключ годности захваченного графа: тот же экземпляр модели и те же
@@ -3310,15 +3346,17 @@ impl DecoderModel {
             Some(l) => l,
             None => return Ok(()),
         };
+        let dev_dt = if self.dtype == DType::BF16 { DType::BF16 } else { DType::F16 };
         for lc in kv.layers.iter_mut() {
             if let LayerCache::Linear(s) = lc {
-                s.sync_to_device(
+                s.sync_to_device_dtype(
                     self.device,
                     lin.conv_dim(),
                     lin.conv_kernel,
                     lin.num_value_heads,
                     lin.key_head_dim,
                     lin.value_head_dim,
+                    dev_dt,
                 )
                 .coerr()?;
             }
@@ -3592,6 +3630,18 @@ impl DecoderModel {
             h_pair = None;
             let cache_idx = self.config.kv_source(idx).unwrap_or(idx);
             let mixed = match &blk.mixer {
+                Mixer::Full(fa) if b == 1 && matches!(self.dtype, DType::BF16 | DType::F16) && fa.fused_hybrid_ready(dev, self.block_kv_mxfp8(fa)) => {
+                    let fmt = fa.hybrid_fused_fmt().ok_or_else(|| missing("hybrid_fused_fmt"))?;
+                    let h_row = h.reshape(vec![1usize, self.config.hidden_size]).coerr()?;
+                    let pair = prof(dev, "attn_quant", || match fmt {
+                        DType::MXFP8 => h_row.mxfp8_quantize_act(),
+                        _ => h_row.nvfp4_quantize_act(),
+                    })
+                    .coerr()?;
+                    fa.forward_decode_fused(FusedIn::Pair(&pair), &mut kv.layers[cache_idx], state, self.dtype)?
+                        .reshape(vec![1usize, 1, self.config.hidden_size])
+                        .coerr()?
+                }
                 Mixer::Full(fa) => fa.forward_decode_dev(&h, &mut kv.layers[cache_idx], state)?,
                 Mixer::Linear(la) => la.forward_decode_dev(&h, &mut kv.layers[idx])?,
                 Mixer::Conv(sc) => sc.forward(&h, &mut kv.layers[idx])?,
@@ -5322,22 +5372,40 @@ impl LinearAttn {
         // Свежий KV (короткий s<=SMALL_CHUNK_DEV префилл идёт этим же путём) —
         // зеркала ещё не созданы: засеять из host-векторов (нулевое состояние).
         // Существующие зеркала не трогаем: во время decode host отстаёт от dev.
+        let dt = h.dtype();
         if state.conv_state_dev.is_none() || state.ssm_state_dev.is_none() {
             state
-                .sync_to_device(h.device(), self.conv_dim, self.conv_k, self.num_v_heads, self.dk, self.dv)
+                .sync_to_device_dtype(h.device(), self.conv_dim, self.conv_k, self.num_v_heads, self.dk, self.dv, dt)
                 .coerr()?;
         }
         let cs = state.conv_state_dev.as_mut().ok_or_else(|| missing("conv_state_dev (sync_to_device?)"))?;
         let ss = state.ssm_state_dev.as_mut().ok_or_else(|| missing("ssm_state_dev (sync_to_device?)"))?;
 
         let dev = h.device();
-        // in_qkv/a/b/z берут один `h` → квантуем 1×; qkv/z через prequant (NVFP4),
-        // a/b — Dense [N=48] (forward сам, prequant их не касается).
-        let act = quant_act_shared(h, self.in_proj_qkv.quant_dtype());
-        let qkv = proj_shared(&self.in_proj_qkv, h, &act, dev, "lin_in_qkv")?;
-        let a = prof(dev, "lin_in_a", || self.in_proj_a.forward(h))?;
-        let b = prof(dev, "lin_in_b", || self.in_proj_b.forward(h))?;
-        let z = proj_shared(&self.in_proj_z, h, &act, dev, "lin_in_z")?;
+        let (qkv, a, b, z) = if self.fused_fmt() == Some(DType::MXFP8) && matches!(dt, DType::F16 | DType::BF16) {
+            let hsz = h.dims()[h.rank() - 1];
+            let h_row = h.reshape(vec![1usize, hsz]).coerr()?;
+            let (xp, xs) = prof(dev, "lin_in_quant", || h_row.mxfp8_quantize_act()).coerr()?;
+            let w_qkv = self.in_proj_qkv.quant_weight().ok_or_else(|| missing("in_proj_qkv"))?;
+            let w_z = self.in_proj_z.quant_weight().ok_or_else(|| missing("in_proj_z"))?;
+            let w_a = self.in_proj_a.quant_weight().ok_or_else(|| missing("in_proj_a"))?;
+            let w_b = self.in_proj_b.quant_weight().ok_or_else(|| missing("in_proj_b"))?;
+            let (p1, _) = prof(dev, "lin_in_qkv", || Tensor::dec_gemv_grouped(&[w_qkv, w_z, w_a], &xp, &xs, dt, None)).coerr()?;
+            let (p2, _) = prof(dev, "lin_in_b", || Tensor::dec_gemv_grouped(&[w_b], &xp, &xs, dt, None)).coerr()?;
+            let qkv = p1.narrow(1, 0, self.conv_dim).coerr()?;
+            let z = p1.narrow(1, self.conv_dim, self.value_dim).coerr()?;
+            let a = p1.narrow(1, self.conv_dim + self.value_dim, self.num_v_heads).coerr()?;
+            (qkv, a, p2, z)
+        } else {
+            // in_qkv/a/b/z берут один `h` → квантуем 1×; qkv/z через prequant (NVFP4),
+            // a/b — Dense [N=48] (forward сам, prequant их не касается).
+            let act = quant_act_shared(h, self.in_proj_qkv.quant_dtype());
+            let qkv = proj_shared(&self.in_proj_qkv, h, &act, dev, "lin_in_qkv")?;
+            let a = prof(dev, "lin_in_a", || self.in_proj_a.forward(h))?;
+            let b = prof(dev, "lin_in_b", || self.in_proj_b.forward(h))?;
+            let z = proj_shared(&self.in_proj_z, h, &act, dev, "lin_in_z")?;
+            (qkv, a, b, z)
+        };
         let out = prof(dev, "lin_gdr_step", || qkv
             .linear_attn_decode_step(
                 conv_w, &a, &b, dt_bias, a_log, &z, norm_w, cs, ss,

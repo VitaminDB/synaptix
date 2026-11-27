@@ -342,8 +342,14 @@ pub fn attn_prep(
         return Err(SynaptixError::Cuda(format!("attn_prep: hd={hd} (кратно 32, ≤1024)")));
     }
     let vn: i32 = i32::from(v_norm);
-    let (rd, ms, nhi, nkvi, hdi, qsi) =
-        (rotary_dim as i32, max_seq as i32, nh as i32, nkv as i32, hd as i32, q_stride as i32);
+    const INTERLEAVED_BIT: u32 = 1 << 30;
+    let rd = if (rotary_dim & INTERLEAVED_BIT) != 0 {
+        -((rotary_dim & !INTERLEAVED_BIT) as i32)
+    } else {
+        rotary_dim as i32
+    };
+    let (ms, nhi, nkvi, hdi, qsi) =
+        (max_seq as i32, nh as i32, nkv as i32, hd as i32, q_stride as i32);
     let cfg = LaunchConfig {
         grid_dim: (nh + 2 * nkv, 1, 1),
         block_dim: (hd, 1, 1),

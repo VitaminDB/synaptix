@@ -1871,7 +1871,7 @@ impl MoeFfn {
             return Ok(());
         }
         let Some(pool) = &self.zc_pool else { return Ok(()) };
-        if x.rank() != 2 || x.dims()[0] > 4 || x.dtype() != DType::F16 || !x.is_contiguous() || self.router.dtype() != DType::F32 {
+        if x.rank() != 2 || x.dims()[0] > 4 || !matches!(x.dtype(), DType::F16 | DType::BF16) || !x.is_contiguous() || self.router.dtype() != DType::F32 {
             return Ok(());
         }
         let guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
@@ -2031,9 +2031,9 @@ impl MoeFfn {
         let h = self.cfg.hidden_size;
         let xa = if matches!(x.dtype(), DType::F16 | DType::BF16) { x.clone() } else { to_f16(x)? };
         let xa = if xa.is_contiguous() { xa } else { xa.contiguous().map_err(ferr)? };
-        // Роутер, top-k, softmax и кэш экспертов — одной пачкой ядер (F16-вход);
+        // Роутер, top-k, softmax и кэш экспертов — одной пачкой ядер (F16/BF16-вход);
         // иначе выбор считается тензорными операциями.
-        let routed_on_dev = !sigmoid && router_in.is_none() && xa.dtype() == DType::F16 && self.router.dtype() == DType::F32 && self.router.is_contiguous() && self.cfg.num_experts <= 1024 && k <= 64 && h % 4 == 0;
+        let routed_on_dev = !sigmoid && router_in.is_none() && matches!(xa.dtype(), DType::F16 | DType::BF16) && self.router.dtype() == DType::F32 && self.router.is_contiguous() && self.cfg.num_experts <= 1024 && k <= 64 && h % 4 == 0;
         let (idx, w, gu_t, dn_t, iota) = if routed_on_dev {
             let idx = Tensor::empty_uninit(vec![t * k], DType::U32, self.device).map_err(ferr)?;
             let w = Tensor::empty_uninit(vec![t * k], DType::F32, self.device).map_err(ferr)?;
@@ -3298,8 +3298,30 @@ impl MoeFfn {
         if let Some(y) = self.shared_forward_fused(shared, x)? {
             return Ok(y);
         }
-        let gate = shared.gate.forward(x)?;
-        let up = shared.up.forward(x)?;
+        let (gate, up) = if x.rank() == 2
+            && x.dims()[0] == 1
+            && matches!(x.dtype(), DType::F16 | DType::BF16)
+            && shared.gate.quant_dtype() == Some(DType::MXFP8)
+            && shared.up.quant_dtype() == Some(DType::MXFP8)
+        {
+            let g_w = shared.gate.quant_weight().unwrap();
+            let u_w = shared.up.quant_weight().unwrap();
+            let inter = g_w.n();
+            if let Ok((px, sx)) = x.mxfp8_quantize_act() {
+                if let Ok((gu, _)) = Tensor::dec_gemv_grouped(&[g_w, u_w], &px, &sx, x.dtype(), None) {
+                    (
+                        gu.narrow(1, 0, inter).map_err(|e| ModelError::Forward(format!("MoE shared gate: {e}")))?,
+                        gu.narrow(1, inter, u_w.n()).map_err(|e| ModelError::Forward(format!("MoE shared up: {e}")))?,
+                    )
+                } else {
+                    (shared.gate.forward(x)?, shared.up.forward(x)?)
+                }
+            } else {
+                (shared.gate.forward(x)?, shared.up.forward(x)?)
+            }
+        } else {
+            (shared.gate.forward(x)?, shared.up.forward(x)?)
+        };
         let h = self.act_mul(&gate, &up)?;
         let y = self.to_compute(shared.down.forward(&h)?)?;
         if self.cfg.ext.shared_ungated {

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use half::f16;
+use half::{bf16, f16};
 use synaptix_core::error::{Result, SynaptixError};
 
 use crate::attention::linear_attn_raw::LinearAttnRawKernels;
@@ -64,6 +64,7 @@ pub fn linear_attn_decode_step_u8_dev(
     q_scale: f32,
     eps: f32,
     gate_sigmoid: bool,
+    is_bf16: bool,
 ) -> Result<()> {
     if num_k == 0 || num_v % num_k != 0 {
         return Err(SynaptixError::Cuda(format!(
@@ -99,30 +100,6 @@ pub fn linear_attn_decode_step_u8_dev(
         k
     };
     if fused_ok && hk == hv && hk.is_power_of_two() && (n_rep as usize) * hk * ks_n <= 1024 {
-        let x_v = unsafe {
-            qkv.0
-                .slice(qkv.1..qkv.1 + conv_dim * tm::<f16>())
-                .transmute::<f16>(conv_dim)
-                .ok_or_else(|| cerr("qkv"))?
-        };
-        let w_v = unsafe {
-            conv_w
-                .0
-                .slice(conv_w.1..conv_w.1 + conv_w_len * tm::<f16>())
-                .transmute::<f16>(conv_w_len)
-                .ok_or_else(|| cerr("conv_w"))?
-        };
-        let a_v = unsafe {
-            a.0.slice(a.1..a.1 + nv * tm::<f16>())
-                .transmute::<f16>(nv)
-                .ok_or_else(|| cerr("a"))?
-        };
-        let b_v = unsafe {
-            b_in.0
-                .slice(b_in.1..b_in.1 + nv * tm::<f16>())
-                .transmute::<f16>(nv)
-                .ok_or_else(|| cerr("b"))?
-        };
         let dt_v = unsafe {
             dt_bias
                 .0
@@ -137,39 +114,21 @@ pub fn linear_attn_decode_step_u8_dev(
                 .transmute::<f32>(nv)
                 .ok_or_else(|| cerr("a_log"))?
         };
-        let gate_v = unsafe {
-            z.0.slice(z.1..z.1 + value_dim * tm::<f16>())
-                .transmute::<f16>(value_dim)
-                .ok_or_else(|| cerr("z"))?
-        };
-        let nw_v = unsafe {
-            norm_w
-                .0
-                .slice(norm_w.1..norm_w.1 + hv * tm::<f16>())
-                .transmute::<f16>(hv)
-                .ok_or_else(|| cerr("norm_w"))?
-        };
-        let mut cs_s = conv_state
-            .slice_mut(conv_state_off..conv_state_off + state_rows * conv_dim * tm::<f16>());
-        let mut cs_v = unsafe {
-            cs_s.transmute_mut::<f16>(state_rows * conv_dim)
-                .ok_or_else(|| cerr("conv_state"))?
-        };
         let mut ss_s =
             ssm_state.slice_mut(ssm_state_off..ssm_state_off + nv * hk * hv * tm::<f32>());
         let mut ss_v = unsafe {
             ss_s.transmute_mut::<f32>(nv * hk * hv)
                 .ok_or_else(|| cerr("ssm_state"))?
         };
-        let mut out_s = out.slice_mut(out_off..out_off + value_dim * tm::<f16>());
-        let mut out_v = unsafe {
-            out_s
-                .transmute_mut::<f16>(value_dim)
-                .ok_or_else(|| cerr("out"))?
-        };
-        // Блок на v-голову (grid = num_v): втрое больше SM читают состояние.
-        // Состояние свёртки читается из копии — q/k-каналы нужны соседним
-        // блокам. `SYN_GDN_VHEAD=0` — прежний блок на k-голову.
+        // Элементы F16 и BF16 оба 2-байтовые; ядра различаются функцией (`*_f16` / `*_bf16`).
+        let x_v = qkv.0.slice(qkv.1..qkv.1 + conv_dim * 2);
+        let w_v = conv_w.0.slice(conv_w.1..conv_w.1 + conv_w_len * 2);
+        let a_v = a.0.slice(a.1..a.1 + nv * 2);
+        let b_v = b_in.0.slice(b_in.1..b_in.1 + nv * 2);
+        let gate_v = z.0.slice(z.1..z.1 + value_dim * 2);
+        let nw_v = norm_w.0.slice(norm_w.1..norm_w.1 + hv * 2);
+        let mut cs_v = conv_state.slice_mut(conv_state_off..conv_state_off + state_rows * conv_dim * 2);
+        let mut out_v = out.slice_mut(out_off..out_off + value_dim * 2);
         if n_rep > 1 && std::env::var("SYN_GDN_VHEAD").map(|v| v != "0").unwrap_or(true) {
             let ks_v = {
                 let want = std::env::var("SYN_GDN_VHEAD_KS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
@@ -179,16 +138,17 @@ pub fn linear_attn_decode_step_u8_dev(
                 }
                 k
             };
-            let cs_len = state_rows * conv_dim;
-            let mut cs_in = unsafe { stream.ws_alloc::<f16>(cs_len.max(1)) }.map_err(|e| aerr("conv_in", e))?;
+            let cs_bytes = state_rows * conv_dim * 2;
+            let mut cs_in = unsafe { stream.ws_alloc::<u8>(cs_bytes.max(2)) }.map_err(|e| aerr("conv_in", e))?;
             stream
-                .memcpy_dtod(&cs_v.slice(0..cs_len), &mut cs_in.slice_mut(0..cs_len))
+                .memcpy_dtod(&cs_v.slice(0..cs_bytes), &mut cs_in.slice_mut(0..cs_bytes))
                 .map_err(|e| SynaptixError::Cuda(format!("linear_decode: копия conv_state: {e:?}")))?;
             let shared = ((2 * hk + (3 + ks_v) * hv + 2) * tm::<f32>()) as u32;
             let cfg = LaunchConfig { grid_dim: (num_v, 1, 1), block_dim: ((hv * ks_v) as u32, 1, 1), shared_mem_bytes: shared };
             let ks_u = ks_v as u32;
             let gate_mode: u32 = gate_sigmoid as u32;
-            let mut bld = stream.launch_builder(gdr_kernels.decode_step_v_fn());
+            let func = if is_bf16 { gdr_kernels.decode_step_v_bf16_fn() } else { gdr_kernels.decode_step_v_fn() };
+            let mut bld = stream.launch_builder(func);
             bld.arg(&x_v)
                 .arg(&cs_in)
                 .arg(&mut cs_v)
@@ -223,7 +183,8 @@ pub fn linear_attn_decode_step_u8_dev(
         };
         let ks_u = ks_n as u32;
         let gate_mode: u32 = gate_sigmoid as u32;
-        let mut bld = stream.launch_builder(gdr_kernels.decode_step_fn());
+        let func = if is_bf16 { gdr_kernels.decode_step_bf16_fn() } else { gdr_kernels.decode_step_fn() };
+        let mut bld = stream.launch_builder(func);
         bld.arg(&x_v)
             .arg(&mut cs_v)
             .arg(&w_v)
@@ -248,6 +209,10 @@ pub fn linear_attn_decode_step_u8_dev(
             bld.launch(cfg).map_err(|e| lerr("gdn_decode_step", e))?;
         }
         return Ok(());
+    }
+    if is_bf16 {
+        let _ = bf16::ZERO;
+        return Err(SynaptixError::Unsupported("linear_attn_decode_step: BF16 поддержан только слитым ядром"));
     }
 
     let mut post_conv = stream

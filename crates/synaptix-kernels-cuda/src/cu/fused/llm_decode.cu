@@ -862,15 +862,25 @@ __device__ __forceinline__ void attn_prep_impl(
     s_y[d] = y;
     __syncthreads();
     float out = y;
-    if (d < rotary_dim) {
+    bool interleaved = rotary_dim < 0;
+    int rd = interleaved ? -rotary_dim : rotary_dim;
+    if (d < rd) {
         unsigned int pos = pos_ptr[0];
-        int half = rotary_dim >> 1;
-        bool low = d < half;
-        int partner = low ? d + half : d - half;
-        float c = ldf(cos_t + (size_t)pos * rotary_dim + d);
-        float s = ldf(sin_t + (size_t)pos * rotary_dim + d);
+        int partner;
+        bool neg;
+        if (interleaved) {
+            partner = d ^ 1;
+            neg = (d & 1) == 0;
+        } else {
+            int half = rd >> 1;
+            bool low = d < half;
+            partner = low ? d + half : d - half;
+            neg = low;
+        }
+        float c = ldf(cos_t + (size_t)pos * rd + d);
+        float s = ldf(sin_t + (size_t)pos * rd + d);
         float xp = s_y[partner];
-        float rot = low ? -xp : xp;
+        float rot = neg ? -xp : xp;
         out = y * c + rot * s;
     }
     if (kind == 0) {

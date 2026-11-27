@@ -14,6 +14,7 @@
 //!
 //! Нормы — RMS с весом `1 + w`; RoPE интерливный на первых 64 каналах головы.
 
+use synaptix_core::tensor::decode_fused::{DecOut, DecOutFmt, DEC_ROPE_INTERLEAVED};
 use synaptix_core::{device::Device, dtype::DType, tensor::Tensor};
 use synaptix_llm_common::WeightSource;
 use synaptix_nn::quant_linear::QuantLinear;
@@ -64,6 +65,12 @@ impl Src<'_> {
     }
 }
 
+enum FfnUp {
+    /// Плотные `w1` и `w3` склеены по строкам в `[2·inter, H]` — один GEMV вместо двух.
+    Merged { w13: QuantLinear, inter: usize },
+    Split { w1: QuantLinear, w3: QuantLinear },
+}
+
 struct Layer {
     emb: Tensor,
     enorm: Tensor,
@@ -75,8 +82,7 @@ struct Layer {
     k_norm: Tensor,
     wo: QuantLinear,
     ffn_norm: Tensor,
-    w1: QuantLinear,
-    w3: QuantLinear,
+    ffn_up: FfnUp,
     w2: QuantLinear,
     final_norm: Tensor,
 }
@@ -84,6 +90,16 @@ struct Layer {
 impl Layer {
     fn load(s: &Src, p: &str, emb: &str) -> R<Self> {
         let t = format!("{p}.transformer_layer");
+        let w1 = s.lin(&format!("{t}.feed_forward.w1"))?;
+        let w3 = s.lin(&format!("{t}.feed_forward.w3"))?;
+        let ffn_up = match (&w1, &w3) {
+            (QuantLinear::Dense(l1), QuantLinear::Dense(l3)) if l1.out_features() == l3.out_features() => {
+                let inter = l1.out_features();
+                let cat = Tensor::cat(&[&l1.weight(), &l3.weight()], 0)?.contiguous()?;
+                FfnUp::Merged { w13: QuantLinear::dense(cat, None)?, inter }
+            }
+            _ => FfnUp::Split { w1, w3 },
+        };
         Ok(Self {
             emb: s.get(&format!("{p}.{emb}.weight"))?,
             enorm: s.norm(&format!("{p}.enorm.weight"))?,
@@ -95,20 +111,57 @@ impl Layer {
             k_norm: s.norm(&format!("{t}.attention.k_norm.weight"))?,
             wo: s.lin(&format!("{t}.attention.wo"))?,
             ffn_norm: s.norm(&format!("{t}.ffn_norm.weight"))?,
-            w1: s.lin(&format!("{t}.feed_forward.w1"))?,
-            w3: s.lin(&format!("{t}.feed_forward.w3"))?,
+            ffn_up,
             w2: s.lin(&format!("{t}.feed_forward.w2"))?,
             final_norm: s.norm(&format!("{p}.final_layernorm.weight"))?,
         })
     }
 }
 
-/// KV-кэш башни: на слой и kv-голову — `[1, cap, 256]`.
+/// KV-кэш башни: на слой — `[1, KV_HEADS, cap, 256]` (раскладка как у `KvCacheLayer`,
+/// чтобы на декоде работали `dec_attn_prep` и `dec_flash_gqa` без копирования кэша).
 pub struct TowerCache {
-    k: Vec<Vec<Tensor>>,
-    v: Vec<Vec<Tensor>>,
+    k: Vec<Tensor>,
+    v: Vec<Tensor>,
+    pos_dev: Option<Tensor>,
+    tlen_dev: Option<Tensor>,
     pub len: usize,
     cap: usize,
+}
+
+/// Снимок префикса KV-кэша башни (для кэширования образцов голоса).
+pub struct TowerPrefixSnapshot {
+    pub k: Vec<Tensor>,
+    pub v: Vec<Tensor>,
+    pub len: usize,
+}
+
+impl TowerCache {
+    /// Снять копию первых `len` позиций кэша на хосте (малый объём ~8 МБ на 300 строк).
+    pub fn snapshot(&self, len: usize) -> R<TowerPrefixSnapshot> {
+        let mut k = Vec::with_capacity(self.k.len());
+        let mut v = Vec::with_capacity(self.v.len());
+        for li in 0..self.k.len() {
+            k.push(self.k[li].narrow(2, 0, len)?.contiguous()?.to_device(Device::Cpu)?);
+            v.push(self.v[li].narrow(2, 0, len)?.contiguous()?.to_device(Device::Cpu)?);
+        }
+        Ok(TowerPrefixSnapshot { k, v, len })
+    }
+
+    /// Восстановить префикс из снимка в пустой кэш.
+    pub fn restore(&mut self, snap: &TowerPrefixSnapshot, dev: Device) -> R<()> {
+        if snap.len > self.cap {
+            return Err(Drama3Error::Other(format!("снимок башни {} > cap {}", snap.len, self.cap)));
+        }
+        for li in 0..self.k.len() {
+            let ks = snap.k[li].to_device(dev)?;
+            let vs = snap.v[li].to_device(dev)?;
+            self.k[li].kv_append_inplace(&ks, 0)?;
+            self.v[li].kv_append_inplace(&vs, 0)?;
+        }
+        self.len = snap.len;
+        Ok(())
+    }
 }
 
 pub struct Tower {
@@ -116,11 +169,18 @@ pub struct Tower {
     heads: Vec<QuantLinear>,
     /// `audio_decoder.codebook_embeddings` `[10·4096, H]`, строка `k·4096 + c_k`.
     pub cb_emb: Tensor,
+    /// F32 `[cap, ROTARY/2]` — для префилла (`apply_rope_with_cossin`).
     cos: Tensor,
     sin: Tensor,
+    /// `dtype` `[cap, ROTARY]` вида `[c0, c0, c1, c1, …]` — для `dec_attn_prep` с интерливным RoPE.
+    cos_inter: Tensor,
+    sin_inter: Tensor,
+    /// Нулевая строка `[1, DIM]` в `dtype` (несемантические кадры без аллокации).
+    zero_row: Tensor,
     cap: usize,
     device: Device,
     dtype: DType,
+    fast_decode: bool,
 }
 
 fn host(t: &Tensor) -> R<Vec<f32>> {
@@ -139,24 +199,37 @@ impl Tower {
         let heads = (0..RESIDUAL).map(|i| s.lin(&format!("audio_decoder_mtp.heads.{i}"))).collect::<R<Vec<_>>>()?;
         let half = ROTARY / 2;
         let (mut cos, mut sin) = (vec![0f32; max_pos * half], vec![0f32; max_pos * half]);
+        let (mut cos_i, mut sin_i) = (vec![0f32; max_pos * ROTARY], vec![0f32; max_pos * ROTARY]);
         for p in 0..max_pos {
             for i in 0..half {
                 // Как в эталоне: частоты и углы в f32.
                 let f = (1.0 / ROPE_BASE.powf((2 * i) as f64 / ROTARY as f64)) as f32;
                 let a = p as f32 * f;
-                cos[p * half + i] = a.cos();
-                sin[p * half + i] = a.sin();
+                let (c, sn) = (a.cos(), a.sin());
+                cos[p * half + i] = c;
+                sin[p * half + i] = sn;
+                cos_i[p * ROTARY + 2 * i] = c;
+                cos_i[p * ROTARY + 2 * i + 1] = c;
+                sin_i[p * ROTARY + 2 * i] = sn;
+                sin_i[p * ROTARY + 2 * i + 1] = sn;
             }
         }
+        let fast_decode = s.device.is_cuda()
+            && matches!(s.dtype, DType::BF16 | DType::F16)
+            && Tensor::dec_flash_gqa_supported(s.device, HEAD_DIM, HEADS / KV_HEADS, false);
         Ok(Self {
             layers,
             heads,
             cb_emb: s.get("audio_decoder.codebook_embeddings.weight")?,
             cos: Tensor::from_vec(cos, vec![max_pos, half], s.device)?,
             sin: Tensor::from_vec(sin, vec![max_pos, half], s.device)?,
+            cos_inter: Tensor::from_vec(cos_i, vec![max_pos, ROTARY], s.device)?.to_dtype(s.dtype)?,
+            sin_inter: Tensor::from_vec(sin_i, vec![max_pos, ROTARY], s.device)?.to_dtype(s.dtype)?,
+            zero_row: Tensor::zeros(vec![1, DIM], s.dtype, s.device)?,
             cap: max_pos,
             device: s.device,
             dtype: s.dtype,
+            fast_decode,
         })
     }
 
@@ -164,12 +237,20 @@ impl Tower {
         if cap > self.cap {
             return Err(Drama3Error::Input(format!("контекст {cap} больше предела башни {}", self.cap)));
         }
-        let mk = || -> R<Vec<Vec<Tensor>>> {
+        let mk = || -> R<Vec<Tensor>> {
             (0..LAYERS)
-                .map(|_| (0..KV_HEADS).map(|_| Ok(Tensor::zeros(vec![1, cap, HEAD_DIM], self.dtype, self.device)?)).collect::<R<Vec<_>>>())
+                .map(|_| Ok(Tensor::zeros(vec![1, KV_HEADS, cap, HEAD_DIM], self.dtype, self.device)?))
                 .collect()
         };
-        Ok(TowerCache { k: mk()?, v: mk()?, len: 0, cap })
+        let (pos_dev, tlen_dev) = if self.fast_decode {
+            (
+                Some(Tensor::from_vec(vec![0u32], vec![1], self.device)?),
+                Some(Tensor::from_vec(vec![0u32], vec![1], self.device)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(TowerCache { k: mk()?, v: mk()?, pos_dev, tlen_dev, len: 0, cap })
     }
 
     /// Строки таблицы по индексам → `[n, H]`.
@@ -186,7 +267,9 @@ impl Tower {
     /// Доп. вход общего слоя 0: сумма эмбеддингов кодов 2…9 входных кадров
     /// (у несемантических — ноль). `frames[i]` — `[токен, c0..c9]`.
     pub fn shared_input(&self, frames: &[crate::Row]) -> R<Tensor> {
-        let n = frames.len();
+        if frames.len() == 1 {
+            return self.shared_input_one(&frames[0]);
+        }
         let mut acc: Option<Tensor> = None;
         for k in 2..CODEBOOKS {
             let idx: Vec<usize> = frames.iter().map(|f| k * CODEBOOK_SIZE + (f[1 + k] as usize).min(CODEBOOK_SIZE - 1)).collect();
@@ -197,13 +280,32 @@ impl Tower {
             });
         }
         let m = self.column(frames.iter().map(|f| if crate::is_semantic(f[0]) { 1.0 } else { 0.0 }).collect())?;
-        let _ = n;
         Ok(acc.expect("кодбуков больше двух").broadcast_mul(&m)?)
+    }
+
+    /// Быстрый `shared_input` для одного кадра декода: 1 `index_select` + `sum` вместо 25 операций.
+    fn shared_input_one(&self, f: &crate::Row) -> R<Tensor> {
+        if !crate::is_semantic(f[0]) {
+            return Ok(self.zero_row.clone());
+        }
+        let idx: Vec<i64> = (2..CODEBOOKS).map(|k| (k * CODEBOOK_SIZE + (f[1 + k] as usize).min(CODEBOOK_SIZE - 1)) as i64).collect();
+        let i = Tensor::from_vec(idx, vec![CODEBOOKS - 2], self.device)?;
+        Ok(self.cb_emb.index_select(0, &i)?.sum([0usize])?.reshape(vec![1, DIM])?)
     }
 
     /// Вход основы для кадров: текстовый эмбеддинг, у семантических —
     /// `(emb + E_cb[4096 + c1]) / √2`. `text` — `[n, H]`.
     pub fn backbone_input(&self, frames: &[crate::Row], text: &Tensor) -> R<Tensor> {
+        if frames.len() == 1 {
+            let f = &frames[0];
+            let t = if text.dtype() == self.dtype { text.clone() } else { text.to_dtype(self.dtype)? };
+            if !crate::is_semantic(f[0]) {
+                return Ok(t);
+            }
+            let row = CODEBOOK_SIZE + (f[2] as usize).min(CODEBOOK_SIZE - 1);
+            let add = self.cb_emb.narrow(0, row, 1)?.contiguous()?;
+            return Ok(t.add(&add)?.mul_scalar(std::f32::consts::FRAC_1_SQRT_2)?);
+        }
         let idx: Vec<usize> = frames.iter().map(|f| CODEBOOK_SIZE + (f[2] as usize).min(CODEBOOK_SIZE - 1)).collect();
         let sem: Vec<bool> = frames.iter().map(|f| crate::is_semantic(f[0])).collect();
         let add = self.rows(&self.cb_emb, &idx)?.broadcast_mul(&self.column(sem.iter().map(|&s| if s { 1.0 } else { 0.0 }).collect())?)?;
@@ -223,14 +325,83 @@ impl Tower {
         Ok(Tensor::cat(&[&rot, &rest], 3)?.contiguous()?)
     }
 
+    /// Слитый шаг декода (n = 1) одного слоя башни на CUDA: `dec_attn_prep`
+    /// (нормы голов + интерливный RoPE + запись KV) + `dec_flash_gqa` (GQA +
+    /// sigmoid-гейт) + `dec_attn_tail` + склеенный `w13` + `dec_geglu`.
+    fn layer_decode_fast(&self, li: usize, h: &Tensor, e: &Tensor, cache: &mut TowerCache) -> R<Tensor> {
+        let l = &self.layers[li];
+        let qw = HEADS * HEAD_DIM;
+        let kw = KV_HEADS * HEAD_DIM;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let eh_in = Tensor::cat(&[&rms_norm(e, &l.enorm, EPS)?, &rms_norm(h, &l.hnorm, EPS)?], 1)?;
+        let mixed = l.eh.forward(&eh_in)?;
+        let qkv = l.wqkv.forward(&rms_norm(&mixed, &l.attn_norm, EPS)?)?;
+        let pos_dev = cache.pos_dev.as_ref().expect("pos_dev");
+        let tlen_dev = cache.tlen_dev.as_ref().expect("tlen_dev");
+        let q = Tensor::dec_attn_prep(
+            (&qkv, 0),
+            (&qkv, 2 * qw),
+            Some((&qkv, 2 * qw + kw)),
+            Some(&l.q_norm),
+            Some(&l.k_norm),
+            false,
+            &self.cos_inter,
+            &self.sin_inter,
+            pos_dev,
+            ROTARY | DEC_ROPE_INTERLEAVED,
+            pos_dev,
+            &mut cache.k[li],
+            &mut cache.v[li],
+            None,
+            HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            HEAD_DIM,
+            EPS,
+        )?;
+        let (attn, _) = q.dec_flash_gqa(
+            &cache.k[li],
+            &cache.v[li],
+            None,
+            tlen_dev,
+            scale,
+            None,
+            8,
+            Some((&qkv, qw, HEAD_DIM)),
+            true,
+            false,
+        )?;
+        let a = l.wo.forward(&attn.expect("attn").reshape(vec![1, qw])?)?;
+        let (r1, mut t1) = a.dec_attn_tail(None, &mixed, &[(&l.ffn_norm, DecOutFmt::Bf16)], EPS, EPS)?;
+        let DecOut::Bf16(f) = t1.pop().expect("f") else { unreachable!() };
+        let act = match &l.ffn_up {
+            FfnUp::Merged { w13, inter } => {
+                let gu = w13.forward(&f)?;
+                Tensor::dec_geglu((&gu, 0), (&gu, *inter), 2 * inter, 1, *inter, true, None)?.0
+            }
+            FfnUp::Split { w1, w3 } => {
+                let gate = w1.forward(&f)?;
+                let up = w3.forward(&f)?;
+                gate.silu_and_mul(&up).or_else(|_| gate.silu().and_then(|x| x.mul(&up)))?
+            }
+        };
+        let w2_out = l.w2.forward(&act)?;
+        let (_, mut t2) = w2_out.dec_attn_tail(None, &r1, &[(&l.final_norm, DecOutFmt::Bf16)], EPS, EPS)?;
+        let DecOut::Bf16(out) = t2.pop().expect("out") else { unreachable!() };
+        Ok(out)
+    }
+
     /// Слой `li` на строках позиций `pos0 .. pos0 + n`: `h`, `e` — `[n, H]`.
     fn layer(&self, li: usize, h: &Tensor, e: &Tensor, pos0: usize, cache: &mut TowerCache) -> R<Tensor> {
-        let l = &self.layers[li];
         let n = h.dims()[0];
         let t = pos0 + n;
         if t > cache.cap {
             return Err(Drama3Error::Other(format!("кэш башни переполнен: {t} > {}", cache.cap)));
         }
+        if n == 1 && self.fast_decode && cache.pos_dev.is_some() {
+            return self.layer_decode_fast(li, h, e, cache);
+        }
+        let l = &self.layers[li];
         let mixed = l.eh.forward(&Tensor::cat(&[&rms_norm(e, &l.enorm, EPS)?, &rms_norm(h, &l.hnorm, EPS)?], 1)?.contiguous()?)?;
         let qkv = l.wqkv.forward(&rms_norm(&mixed, &l.attn_norm, EPS)?)?;
         let qw = HEADS * HEAD_DIM;
@@ -241,7 +412,9 @@ impl Tower {
         let v = qkv.narrow(1, 2 * qw + kw, kw)?.contiguous()?.reshape(vec![n, KV_HEADS, HEAD_DIM])?;
         let q = self.rope(&q, pos0)?; // [1, 16, n, 256]
         let k = self.rope(&k, pos0)?; // [1, 2, n, 256]
-        let v = v.permute(vec![1, 0, 2])?.contiguous()?; // [2, n, 256]
+        let v = v.permute(vec![1, 0, 2])?.contiguous()?.reshape(vec![1, KV_HEADS, n, HEAD_DIM])?;
+        cache.k[li].kv_append_inplace(&k, pos0)?;
+        cache.v[li].kv_append_inplace(&v, pos0)?;
         let per = HEADS / KV_HEADS;
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         let mask = if n > 1 {
@@ -257,13 +430,10 @@ impl Tower {
         };
         let mut outs: Vec<Tensor> = Vec::with_capacity(KV_HEADS);
         for kh in 0..KV_HEADS {
-            cache.k[li][kh].copy_rows_from(pos0, &k.narrow(1, kh, 1)?.contiguous()?.reshape(vec![1, n, HEAD_DIM])?)?;
-            cache.v[li][kh].copy_rows_from(pos0, &v.narrow(0, kh, 1)?.contiguous()?.reshape(vec![1, n, HEAD_DIM])?)?;
-            let kk = cache.k[li][kh].narrow(1, 0, t)?.contiguous()?.reshape(vec![1, 1, t, HEAD_DIM])?;
-            let vv = cache.v[li][kh].narrow(1, 0, t)?.contiguous()?.reshape(vec![1, 1, t, HEAD_DIM])?;
+            let kk = cache.k[li].narrow(1, kh, 1)?.narrow(2, 0, t)?.contiguous()?; // [1, 1, t, 256]
+            let vv = cache.v[li].narrow(1, kh, 1)?.narrow(2, 0, t)?.contiguous()?;
             let qh = q.narrow(1, kh * per, per)?.contiguous()?; // [1, per, n, 256]
             let o = if n == 1 {
-                // Один запрос: головы группы — «позиции запроса» против T ключей.
                 let qh = qh.reshape(vec![1, 1, per, HEAD_DIM])?;
                 scaled_dot_attention(&qh, &kk, &vv, scale, None)?.reshape(vec![1, per * HEAD_DIM])?
             } else {
@@ -278,9 +448,19 @@ impl Tower {
         let a = l.wo.forward(&a.mul(&g.sigmoid()?)?)?;
         let r1 = mixed.add(&a)?;
         let f = rms_norm(&r1, &l.ffn_norm, EPS)?;
-        let gate = l.w1.forward(&f)?;
-        let up = l.w3.forward(&f)?;
-        let act = gate.silu_and_mul(&up).or_else(|_| gate.silu().and_then(|x| x.mul(&up)))?;
+        let act = match &l.ffn_up {
+            FfnUp::Merged { w13, inter } => {
+                let gu = w13.forward(&f)?;
+                let gate = gu.narrow(1, 0, *inter)?.contiguous()?;
+                let up = gu.narrow(1, *inter, *inter)?.contiguous()?;
+                gate.silu_and_mul(&up).or_else(|_| gate.silu().and_then(|x| x.mul(&up)))?
+            }
+            FfnUp::Split { w1, w3 } => {
+                let gate = w1.forward(&f)?;
+                let up = w3.forward(&f)?;
+                gate.silu_and_mul(&up).or_else(|_| gate.silu().and_then(|x| x.mul(&up)))?
+            }
+        };
         let r2 = r1.add(&l.w2.forward(&act)?)?;
         Ok(rms_norm(&r2, &l.final_norm, EPS)?)
     }
@@ -290,6 +470,15 @@ impl Tower {
         let idx: Vec<usize> = codes.iter().map(|&c| (c as usize).min(CODEBOOK_SIZE - 1)).collect();
         let m = self.column(sem.iter().map(|&s| if s { 1.0 } else { 0.0 }).collect())?;
         Ok(self.rows(&self.layers[li].emb, &idx)?.broadcast_mul(&m)?)
+    }
+
+    /// Быстрый `label` для одного кадра декода: срез строки таблицы без H2D и `index_select`.
+    fn label_one(&self, li: usize, code: u32, sem: bool) -> R<Tensor> {
+        if !sem {
+            return Ok(self.zero_row.clone());
+        }
+        let row = (code as usize).min(CODEBOOK_SIZE - 1);
+        Ok(self.layers[li].emb.narrow(0, row, 1)?.contiguous()?)
     }
 
     /// Префилл: строки промпта `input[i]` (позиции `pos0 + i`) с метками из
@@ -323,21 +512,25 @@ impl Tower {
     /// кадру и уже выбранному головному токену — коды 1…9. `pick(r, логиты)` —
     /// выбор кода головы `r`.
     pub fn step(&self, h: &Tensor, input: &crate::Row, main: u32, pos: usize, cache: &mut TowerCache, pick: &mut dyn FnMut(usize, &[f32]) -> u32) -> R<[u32; CODEBOOKS]> {
-        let sem = [crate::is_semantic(main)];
+        if let (Some(p), Some(tl)) = (cache.pos_dev.as_mut(), cache.tlen_dev.as_mut()) {
+            p.write_host_u32(&[pos as u32])?;
+            tl.write_host_u32(&[(pos + 1) as u32])?;
+        }
+        let sem = crate::is_semantic(main);
         let c0 = main.saturating_sub(crate::SEMANTIC_BEGIN).min(CODEBOOK_SIZE as u32 - 1);
         let mut codes = [0u32; CODEBOOKS];
         codes[0] = c0;
-        let mut x = h.to_dtype(self.dtype)?.contiguous()?;
-        let extra = self.shared_input(std::slice::from_ref(input))?;
+        let mut x = if h.dtype() == self.dtype && h.is_contiguous() { h.clone() } else { h.to_dtype(self.dtype)?.contiguous()? };
+        let extra = self.shared_input_one(input)?;
         for li in 0..SHARED {
-            let mut e = self.label(li, &[c0], &sem)?;
+            let mut e = self.label_one(li, c0, sem)?;
             if li == 0 {
                 e = e.add(&extra)?;
             }
             x = self.layer(li, &x, &e, pos, cache)?;
         }
         for r in 0..RESIDUAL {
-            let e = self.label(SHARED + r, &[codes[r]], &sem)?;
+            let e = self.label_one(SHARED + r, codes[r], sem)?;
             x = self.layer(SHARED + r, &x, &e, pos, cache)?;
             codes[r + 1] = pick(r, &host(&self.heads[r].forward(&x)?)?);
         }

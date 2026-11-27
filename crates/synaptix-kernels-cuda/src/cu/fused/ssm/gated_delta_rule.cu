@@ -17,6 +17,14 @@
 // Семантически: S_t = g_t·S_{t-1} + β_t·k_t·(v_t − (g_t·S_{t-1})ᵀk_t)ᵀ;  o_t = S_tᵀ·q_t.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+__device__ __forceinline__ float gdn_ld(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ float gdn_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ __half gdn_st(const __half*, float v) { return __float2half(v); }
+__device__ __forceinline__ __nv_bfloat16 gdn_st(const __nv_bfloat16*, float v) { return __float2bfloat16(v); }
+__device__ __forceinline__ float gdn_rnd(const __half*, float v) { return __half2float(__float2half(v)); }
+__device__ __forceinline__ float gdn_rnd(const __nv_bfloat16*, float v) { return __bfloat162float(__float2bfloat16(v)); }
 
 extern "C" __global__ void gated_delta_rule_step_f32(
     const float* __restrict__ q,        // (B, H, HK)
@@ -277,18 +285,19 @@ extern "C" __global__ void gated_delta_rule_step_fused_rms_norm_f32_to_f16(
 // Требования: hk == hv (степень двойки), KS | hk, n_rep·hv·KS ≤ 1024.
 // Shared: (2·hk + (3 + KS)·n_rep·hv + 2·n_rep) F32.
 
-extern "C" __global__ void gdn_decode_step_f16(
-    const __half* __restrict__ x,            // [conv_dim] = Q | K | V (выход in_proj)
-    __half*       __restrict__ conv_state,   // [K-1, conv_dim] in/out
-    const __half* __restrict__ conv_w,       // [conv_dim, K]
-    const __half* __restrict__ a_f16,        // [num_v]
-    const __half* __restrict__ b_f16,        // [num_v]
+template <typename T>
+__device__ __forceinline__ void gdn_decode_step_impl(
+    const T*      __restrict__ x,            // [conv_dim] = Q | K | V (выход in_proj)
+    T*            __restrict__ conv_state,   // [K-1, conv_dim] in/out
+    const T*      __restrict__ conv_w,       // [conv_dim, K]
+    const T*      __restrict__ a_in,         // [num_v]
+    const T*      __restrict__ b_in,         // [num_v]
     const float*  __restrict__ dt_bias,      // [num_v]
     const float*  __restrict__ a_log,        // [num_v]
     float*        __restrict__ state,        // [num_v, hk, hv] in/out
-    const __half* __restrict__ gate_f16,     // [num_v·hv] (z)
-    const __half* __restrict__ weight_f16,   // [hv]
-    __half*       __restrict__ out_f16,      // [num_v·hv]
+    const T*      __restrict__ gate_in,      // [num_v·hv] (z)
+    const T*      __restrict__ weight_in,    // [hv]
+    T*            __restrict__ out_buf,      // [num_v·hv]
     float q_scale,
     float eps,
     unsigned int num_k,
@@ -324,17 +333,17 @@ extern "C" __global__ void gdn_decode_step_f16(
 
     // ── свёртка одного канала: окно [state[0..K-2, c], x[c]], сдвиг состояния ──
     auto conv_ch = [&](unsigned int c) -> float {
-        const __half* wc = conv_w + (size_t)c * conv_k;
-        float xc = __half2float(x[c]);
+        const T* wc = conv_w + (size_t)c * conv_k;
+        float xc = gdn_ld(x + c);
         float acc = 0.0f;
         for (unsigned int j = 0u; j < km1; ++j)
-            acc += __half2float(conv_state[(size_t)j * conv_dim + c]) * __half2float(wc[j]);
-        acc += xc * __half2float(wc[km1]);
+            acc += gdn_ld(conv_state + (size_t)j * conv_dim + c) * gdn_ld(wc + j);
+        acc += xc * gdn_ld(wc + km1);
         acc = acc / (1.0f + expf(-acc));
         for (unsigned int j = 0u; j + 1u < km1; ++j)
             conv_state[(size_t)j * conv_dim + c] = conv_state[(size_t)(j + 1u) * conv_dim + c];
-        if (km1 > 0u) conv_state[(size_t)(km1 - 1u) * conv_dim + c] = __float2half(xc);
-        return __half2float(__float2half(acc));
+        if (km1 > 0u) conv_state[(size_t)(km1 - 1u) * conv_dim + c] = gdn_st(x, xc);
+        return gdn_rnd(x, acc);
     };
 
     if (ks == 0u) {
@@ -342,9 +351,9 @@ extern "C" __global__ void gdn_decode_step_f16(
         if (sub == (n_rep > 1u ? 1u : 0u)) k_sm[d] = conv_ch(key_dim + kh * hk + d);
         v_sm[sub * hv + d] = conv_ch(2u * key_dim + vh * hv + d);
         if (d == 0u) {
-            float bv = __half2float(b_f16[vh]);
+            float bv = gdn_ld(b_in + vh);
             scal_sm[sub * 2u + 1u] = 1.0f / (1.0f + __expf(-bv));
-            float av = __half2float(a_f16[vh]);
+            float av = gdn_ld(a_in + vh);
             float dt = av + dt_bias[vh];
             float softplus_dt = __logf(1.0f + __expf(dt));
             float g = softplus_dt * (-__expf(a_log[vh]));
@@ -419,8 +428,6 @@ extern "C" __global__ void gdn_decode_step_f16(
     }
 
     // ── RmsNormGated своей v-головы (нити ks = 0: hv на v-голову) ──
-    // Барьеры ниже — только для нитей ks = 0; вышедшие нити в них не участвуют
-    // (named barrier на hv·n_rep нитей).
     float* red = reduce_sm + sub * hv;
     float xv = core_sm[sub * hv + d];
     red[d] = xv * xv;
@@ -431,40 +438,53 @@ extern "C" __global__ void gdn_decode_step_f16(
     }
     float total = red[0];
     float inv = rsqrtf(total / (float)hv + eps);
-    float w = __half2float(weight_f16[d]);
-    float gz = __half2float(gate_f16[(size_t)vh * hv + d]);
+    float w = gdn_ld(weight_in + d);
+    float gz = gdn_ld(gate_in + (size_t)vh * hv + d);
     float sig = 1.0f / (1.0f + __expf(-gz));
     float act = gate_mode ? sig : gz * sig;
-    out_f16[(size_t)vh * hv + d] = __float2half(w * xv * inv * act);
+    out_buf[(size_t)vh * hv + d] = gdn_st(x, w * xv * inv * act);
+}
+
+extern "C" __global__ void gdn_decode_step_f16(
+    const __half* __restrict__ x, __half* __restrict__ conv_state, const __half* __restrict__ conv_w,
+    const __half* __restrict__ a_f16, const __half* __restrict__ b_f16, const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log, float* __restrict__ state, const __half* __restrict__ gate_f16,
+    const __half* __restrict__ weight_f16, __half* __restrict__ out_f16,
+    float q_scale, float eps, unsigned int num_k, unsigned int n_rep,
+    unsigned int hk, unsigned int hv, unsigned int conv_k, unsigned int ks_n, unsigned int gate_mode
+) {
+    gdn_decode_step_impl<__half>(x, conv_state, conv_w, a_f16, b_f16, dt_bias, a_log, state,
+        gate_f16, weight_f16, out_f16, q_scale, eps, num_k, n_rep, hk, hv, conv_k, ks_n, gate_mode);
+}
+
+extern "C" __global__ void gdn_decode_step_bf16(
+    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ conv_w,
+    const __nv_bfloat16* __restrict__ a_in, const __nv_bfloat16* __restrict__ b_in, const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log, float* __restrict__ state, const __nv_bfloat16* __restrict__ gate_in,
+    const __nv_bfloat16* __restrict__ weight_in, __nv_bfloat16* __restrict__ out_buf,
+    float q_scale, float eps, unsigned int num_k, unsigned int n_rep,
+    unsigned int hk, unsigned int hv, unsigned int conv_k, unsigned int ks_n, unsigned int gate_mode
+) {
+    gdn_decode_step_impl<__nv_bfloat16>(x, conv_state, conv_w, a_in, b_in, dt_bias, a_log, state,
+        gate_in, weight_in, out_buf, q_scale, eps, num_k, n_rep, hk, hv, conv_k, ks_n, gate_mode);
 }
 
 // ───────────── decode-шаг GDN: блок на v-голову ─────────────────────────────
-//
-// То же, что gdn_decode_step_f16, но блок — одна v-голова (grid = num_v):
-// прежний блок k-головы занимал 16 SM из ~80, и чтение состояния (64 КБ на
-// голову, 6 МБ на слой) упиралось в число запросов в полёте. q/k-каналы
-// свёртки нужны всем v-головам k-головы, поэтому состояние свёртки читается
-// из `conv_in` (копия до шага), а пишется в `conv_out`: q/k-каналы сдвигает
-// блок sub = 0, свой v-канал — каждый блок. Арифметика и порядок редукций —
-// как у gdn_decode_step_f16 (бит в бит).
-//
-// Нить (ks, d): канал d, группа ks из KS по строкам kk состояния.
-// Требования: hk == hv (степень двойки), KS | hk, hv·KS ≤ 1024.
-// Shared: (2·hk + (3 + KS)·hv + 2) F32.
 
-extern "C" __global__ void gdn_decode_step_v_f16(
-    const __half* __restrict__ x,
-    const __half* __restrict__ conv_in,     // [K-1, conv_dim]
-    __half*       __restrict__ conv_out,    // [K-1, conv_dim]
-    const __half* __restrict__ conv_w,
-    const __half* __restrict__ a_f16,
-    const __half* __restrict__ b_f16,
+template <typename T>
+__device__ __forceinline__ void gdn_decode_step_v_impl(
+    const T*      __restrict__ x,
+    const T*      __restrict__ conv_in,     // [K-1, conv_dim]
+    T*            __restrict__ conv_out,    // [K-1, conv_dim]
+    const T*      __restrict__ conv_w,
+    const T*      __restrict__ a_in,
+    const T*      __restrict__ b_in,
     const float*  __restrict__ dt_bias,
     const float*  __restrict__ a_log,
     float*        __restrict__ state,
-    const __half* __restrict__ gate_f16,
-    const __half* __restrict__ weight_f16,
-    __half*       __restrict__ out_f16,
+    const T*      __restrict__ gate_in,
+    const T*      __restrict__ weight_in,
+    T*            __restrict__ out_buf,
     float q_scale,
     float eps,
     unsigned int num_k,
@@ -498,19 +518,19 @@ extern "C" __global__ void gdn_decode_step_v_f16(
     float* scal_sm   = part + ks_n * hv;        // [2]
 
     auto conv_ch = [&](unsigned int c, bool write) -> float {
-        const __half* wc = conv_w + (size_t)c * conv_k;
-        float xc = __half2float(x[c]);
+        const T* wc = conv_w + (size_t)c * conv_k;
+        float xc = gdn_ld(x + c);
         float acc = 0.0f;
         for (unsigned int j = 0u; j < km1; ++j)
-            acc += __half2float(conv_in[(size_t)j * conv_dim + c]) * __half2float(wc[j]);
-        acc += xc * __half2float(wc[km1]);
+            acc += gdn_ld(conv_in + (size_t)j * conv_dim + c) * gdn_ld(wc + j);
+        acc += xc * gdn_ld(wc + km1);
         acc = acc / (1.0f + expf(-acc));
         if (write) {
             for (unsigned int j = 0u; j + 1u < km1; ++j)
                 conv_out[(size_t)j * conv_dim + c] = conv_in[(size_t)(j + 1u) * conv_dim + c];
-            if (km1 > 0u) conv_out[(size_t)(km1 - 1u) * conv_dim + c] = __float2half(xc);
+            if (km1 > 0u) conv_out[(size_t)(km1 - 1u) * conv_dim + c] = gdn_st(x, xc);
         }
-        return __half2float(__float2half(acc));
+        return gdn_rnd(x, acc);
     };
 
     if (ks == 0u) {
@@ -518,9 +538,9 @@ extern "C" __global__ void gdn_decode_step_v_f16(
         k_sm[d] = conv_ch(key_dim + kh * hk + d, sub == 0u);
         v_sm[d] = conv_ch(2u * key_dim + vh * hv + d, true);
         if (d == 0u) {
-            float bv = __half2float(b_f16[vh]);
+            float bv = gdn_ld(b_in + vh);
             scal_sm[1] = 1.0f / (1.0f + __expf(-bv));
-            float av = __half2float(a_f16[vh]);
+            float av = gdn_ld(a_in + vh);
             float dt = av + dt_bias[vh];
             float softplus_dt = __logf(1.0f + __expf(dt));
             float g = softplus_dt * (-__expf(a_log[vh]));
@@ -599,9 +619,33 @@ extern "C" __global__ void gdn_decode_step_v_f16(
     }
     float total = reduce_sm[0];
     float inv = rsqrtf(total / (float)hv + eps);
-    float w = __half2float(weight_f16[d]);
-    float gz = __half2float(gate_f16[(size_t)vh * hv + d]);
+    float w = gdn_ld(weight_in + d);
+    float gz = gdn_ld(gate_in + (size_t)vh * hv + d);
     float sig = 1.0f / (1.0f + __expf(-gz));
     float act = gate_mode ? sig : gz * sig;
-    out_f16[(size_t)vh * hv + d] = __float2half(w * xv * inv * act);
+    out_buf[(size_t)vh * hv + d] = gdn_st(x, w * xv * inv * act);
+}
+
+extern "C" __global__ void gdn_decode_step_v_f16(
+    const __half* __restrict__ x, const __half* __restrict__ conv_in, __half* __restrict__ conv_out,
+    const __half* __restrict__ conv_w, const __half* __restrict__ a_f16, const __half* __restrict__ b_f16,
+    const float* __restrict__ dt_bias, const float* __restrict__ a_log, float* __restrict__ state,
+    const __half* __restrict__ gate_f16, const __half* __restrict__ weight_f16, __half* __restrict__ out_f16,
+    float q_scale, float eps, unsigned int num_k, unsigned int n_rep,
+    unsigned int hk, unsigned int hv, unsigned int conv_k, unsigned int ks_n, unsigned int gate_mode
+) {
+    gdn_decode_step_v_impl<__half>(x, conv_in, conv_out, conv_w, a_f16, b_f16, dt_bias, a_log, state,
+        gate_f16, weight_f16, out_f16, q_scale, eps, num_k, n_rep, hk, hv, conv_k, ks_n, gate_mode);
+}
+
+extern "C" __global__ void gdn_decode_step_v_bf16(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ conv_in, __nv_bfloat16* __restrict__ conv_out,
+    const __nv_bfloat16* __restrict__ conv_w, const __nv_bfloat16* __restrict__ a_in, const __nv_bfloat16* __restrict__ b_in,
+    const float* __restrict__ dt_bias, const float* __restrict__ a_log, float* __restrict__ state,
+    const __nv_bfloat16* __restrict__ gate_in, const __nv_bfloat16* __restrict__ weight_in, __nv_bfloat16* __restrict__ out_buf,
+    float q_scale, float eps, unsigned int num_k, unsigned int n_rep,
+    unsigned int hk, unsigned int hv, unsigned int conv_k, unsigned int ks_n, unsigned int gate_mode
+) {
+    gdn_decode_step_v_impl<__nv_bfloat16>(x, conv_in, conv_out, conv_w, a_in, b_in, dt_bias, a_log, state,
+        gate_in, weight_in, out_buf, q_scale, eps, num_k, n_rep, hk, hv, conv_k, ks_n, gate_mode);
 }

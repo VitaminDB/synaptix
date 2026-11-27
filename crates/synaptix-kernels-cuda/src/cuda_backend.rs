@@ -987,33 +987,37 @@ impl Backend for CudaBackend {
         #[repr(transparent)]
         struct Arg(synaptix_core::backend::ZcLaunch);
         unsafe impl cudarc::driver::DeviceRepr for Arg {}
-        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
+        type Fns = (usize, Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction);
         static CACHE: std::sync::OnceLock<parking_lot::Mutex<Vec<Fns>>> = std::sync::OnceLock::new();
         let synaptix_core::device::Device::Cuda(ord) = device else {
             return Err(SynaptixError::Unsupported("moe_zc_lru: не CUDA"));
         };
         let ctx = synaptix_core::device::cuda::get(ord)?;
-        // `_pad == 1` — упреждающая подкачка: вся пачка идёт loader-стримом,
+        // `_pad & 1 != 0` — упреждающая подкачка: вся пачка идёт loader-стримом,
         // параллельно счёту в default (порядок — события у вызывающего).
-        let stream = if a._pad == 1 {
+        // `_pad & 2 != 0` — вход роутера BF16 (иначе F16).
+        let prefetch = (a._pad & 1) != 0;
+        let bf16 = (a._pad & 2) != 0;
+        let stream = if prefetch {
             synaptix_core::device::cuda::loader_stream(ord)?
         } else {
             synaptix_core::device::cuda::default_stream(ord)?
         };
         let key = Arc::as_ptr(&ctx) as usize;
-        let (lru, copy, router, topk, lru_w) = {
+        let (lru, copy, router, router_bf16, topk, lru_w) = {
             let mut g = CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new())).lock();
             match g.iter().find(|f| f.0 == key) {
-                Some(f) => (f.2.clone(), f.3.clone(), f.4.clone(), f.5.clone(), f.6.clone()),
+                Some(f) => (f.2.clone(), f.3.clone(), f.4.clone(), f.5.clone(), f.6.clone(), f.7.clone()),
                 None => {
                     let m = crate::kernels::compile::compile_module(&ctx, include_str!("cu/fused/moe_zc_stage.cu"), "moe_zc_stage.cu")?;
                     let l = crate::kernels::compile::load_fn(&m, "zc_lru")?;
                     let c = crate::kernels::compile::load_fn(&m, "zc_copy")?;
                     let r = crate::kernels::compile::load_fn(&m, "zc_router")?;
+                    let rb = crate::kernels::compile::load_fn(&m, "zc_router_bf16")?;
                     let t = crate::kernels::compile::load_fn(&m, "zc_topk")?;
                     let lw = crate::kernels::compile::load_fn(&m, "zc_lru_w")?;
-                    g.push((key, m, l.clone(), c.clone(), r.clone(), t.clone(), lw.clone()));
-                    (l, c, r, t, lw)
+                    g.push((key, m, l.clone(), c.clone(), r.clone(), rb.clone(), t.clone(), lw.clone()));
+                    (l, c, r, rb, t, lw)
                 }
             }
         };
@@ -1028,7 +1032,7 @@ impl Backend for CudaBackend {
             if a.experts > 1024 || a.k == 0 || a.k > 64 || a.h % 4 != 0 || a.rows * a.k != a.pairs {
                 return Err(SynaptixError::Unsupported("moe_zc_lru: форма роутера"));
             }
-            let mut b = stream.launch_builder(&router);
+            let mut b = stream.launch_builder(if bf16 { &router_bf16 } else { &router });
             b.arg(&arg);
             unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (a.experts.div_ceil(8), a.rows, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
                 .map_err(|e| SynaptixError::Cuda(format!("launch zc_router: {e:?}")))?;
@@ -1039,7 +1043,7 @@ impl Backend for CudaBackend {
         }
         // Шаг декода (до 32 пар) — варп-версия; `SYN_ZC_LRU_SERIAL=1` — прежняя.
         static FORCE_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let serial = a._pad != 0 || a.pairs > 32 || *FORCE_SERIAL.get_or_init(|| std::env::var("SYN_ZC_LRU_SERIAL").is_ok());
+        let serial = prefetch || a.pairs > 32 || *FORCE_SERIAL.get_or_init(|| std::env::var("SYN_ZC_LRU_SERIAL").is_ok());
         let mut b = stream.launch_builder(if serial { &lru } else { &lru_w });
         b.arg(&arg);
         unsafe { b.launch(cudarc::driver::LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }
@@ -2892,9 +2896,13 @@ impl Backend for CudaBackend {
         h: usize,
         _stream: &Stream,
     ) -> Result<()> {
+        let dt = parts.1.dtype();
+        if !matches!(dt, DType::F16 | DType::BF16) || out.1.dtype() != dt {
+            return Err(SynaptixError::Unsupported("weighted_rows_sum: только contiguous F16/BF16"));
+        }
         for lo in [parts.1, out.1] {
-            if lo.dtype() != DType::F16 || !lo.strides().is_contiguous(lo.shape()) {
-                return Err(SynaptixError::Unsupported("weighted_rows_sum: только contiguous F16"));
+            if !lo.strides().is_contiguous(lo.shape()) {
+                return Err(SynaptixError::Unsupported("weighted_rows_sum: только contiguous F16/BF16"));
             }
         }
         if w.1.dtype() != DType::F32 || !w.1.strides().is_contiguous(w.1.shape()) {
@@ -2919,6 +2927,7 @@ impl Backend for CudaBackend {
             t as u32,
             kk as u32,
             h as u32,
+            dt == DType::BF16,
         )
     }
 
@@ -6241,18 +6250,24 @@ impl Backend for CudaBackend {
         gate_sigmoid: bool,
         _stream: &Stream,
     ) -> Result<()> {
+        let act_dt = qkv.1.dtype();
+        if !matches!(act_dt, DType::F16 | DType::BF16) {
+            return Err(SynaptixError::Cuda(format!(
+                "linear_attn_decode_step: qkv must be F16 or BF16, got {act_dt:?}"
+            )));
+        }
         for (st, name, want) in [
-            (qkv.1, "qkv", DType::F16),
-            (conv_w.1, "conv_w", DType::F16),
-            (a.1, "a", DType::F16),
-            (b.1, "b", DType::F16),
+            (qkv.1, "qkv", act_dt),
+            (conv_w.1, "conv_w", act_dt),
+            (a.1, "a", act_dt),
+            (b.1, "b", act_dt),
             (dt_bias.1, "dt_bias", DType::F32),
             (a_log.1, "a_log", DType::F32),
-            (z.1, "z", DType::F16),
-            (norm_w.1, "norm_w", DType::F16),
-            (conv_state.1, "conv_state", DType::F16),
+            (z.1, "z", act_dt),
+            (norm_w.1, "norm_w", act_dt),
+            (conv_state.1, "conv_state", act_dt),
             (ssm_state.1, "ssm_state", DType::F32),
-            (out.1, "out", DType::F16),
+            (out.1, "out", act_dt),
         ] {
             if st.dtype() != want {
                 return Err(SynaptixError::Cuda(format!(
@@ -6351,6 +6366,7 @@ impl Backend for CudaBackend {
             q_scale,
             eps,
             gate_sigmoid,
+            act_dt == DType::BF16,
         )
     }
 
