@@ -144,6 +144,9 @@ impl ZcPool {
         if let Some(t) = g.get(&key) {
             return Ok(t.clone());
         }
+        if synaptix_core::device::cuda::graph_capturing() {
+            return Err(zerr("аллокация индексов iota_range под захватом CUDA-графа запрещена"));
+        }
         let t = Tensor::from_vec::<_, u32>((start as u32..(start + len) as u32).collect(), vec![len], self.device).map_err(zerr)?;
         g.insert(key, t.clone());
         Ok(t)
@@ -156,6 +159,9 @@ impl ZcPool {
         }
         if let Some(t) = &g[pairs] {
             return Ok(t.clone());
+        }
+        if synaptix_core::device::cuda::graph_capturing() {
+            return Err(zerr("аллокация индексов iota под захватом CUDA-графа запрещена"));
         }
         let t = Tensor::from_vec::<_, u32>((0..pairs as u32).collect(), vec![pairs], self.device).map_err(zerr)?;
         g[pairs] = Some(t.clone());

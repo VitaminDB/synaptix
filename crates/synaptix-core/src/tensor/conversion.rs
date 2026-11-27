@@ -43,6 +43,9 @@ impl Tensor {
             }
             (Storage::Cuda(b), Device::Cpu) => {
                 {
+                    if crate::device::cuda::graph_capturing() {
+                        return Err(SynaptixError::Cuda("D2H (to_device Cpu) под захватом CUDA-графа запрещён".into()));
+                    }
                     let stream = b.stream().clone();
                     // offload-выгрузка → pinned-конвейер (pageable dtoh 3-6GB/s
                     // жёг 5-8s на 24GB квант-блоков LTX host-stream).
@@ -115,6 +118,9 @@ pub(crate) fn storage_to_device(s: &Storage, device: Device) -> Result<Storage> 
         }
         (Storage::Cuda(b), Device::Cpu) => {
             {
+                if crate::device::cuda::graph_capturing() {
+                    return Err(SynaptixError::Cuda("D2H (storage_to_device Cpu) под захватом CUDA-графа запрещён".into()));
+                }
                 let bytes: Vec<u8> = if let Some(h) =
                     crate::memory::host_mapped::host_bytes(b.device_address(), b.slice().len())
                 {
@@ -228,6 +234,9 @@ impl Tensor {
             }
             Storage::Cuda(b) => {
                 {
+                    if crate::device::cuda::graph_capturing() {
+                        return Err(SynaptixError::Cuda("D2H (to_host_typed) под захватом CUDA-графа запрещён".into()));
+                    }
                     let stream = b.stream.clone();
                     let bytes: Vec<u8> = stream
                         .clone_dtoh(&b.buf)

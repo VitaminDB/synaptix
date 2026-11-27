@@ -385,6 +385,8 @@ impl Drama3 {
         };
         let want_graph = fast
             && matches!(self.device, Device::Cuda(_))
+            && (self._zc.is_some() || self.lm.model.zc_all_built())
+            && !synaptix_llm_common::moe::MoeFfn::zc_host_flags()
             && std::env::var_os("D3_NOGRAPH").is_none()
             && std::env::var_os("D3_PROF_OPS").is_none();
         let mut emb_buf = if want_graph { Some(Tensor::zeros(vec![1, DIM], self.lm.model.dtype, self.device)?) } else { None };
@@ -424,10 +426,12 @@ impl Drama3 {
             last = match state.as_mut() {
                 Some(st) => {
                     st.update(frame[0], (rows.len() + step) as u32).map_err(me)?;
-                    // Шаг 0 идёт обычным device-путём: собирает все 40 слоёв zero-copy и
-                    // прогревает CUDA-модули. Шаг 1 захватывается в CUDA-граф без
-                    // исполнения ядер, после чего запускается один раз.
-                    if want_graph && step == 1 && !graph_tried {
+                    // Шаг 0 идёт обычным device-путём: собирает слои zero-copy и
+                    // прогревает CUDA-модули. Граф захватываем только когда ВСЕ слои
+                    // zero-copy реально собраны (пока зеркало экспертов копируется,
+                    // шаги идут eager и подхватывают граф сразу после сборки
+                    // последнего слоя — иначе хостовый роутинг MoE попадёт в захват).
+                    if want_graph && step >= 1 && !graph_tried && self.lm.model.zc_all_built() {
                         graph_tried = true;
                         if let (Device::Cuda(ord), Some(eb), Some(ob)) = (self.device, emb_buf.as_mut(), out_buf.as_mut()) {
                             let stream = synaptix_core::device::cuda::default_stream(ord)?;

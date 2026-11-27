@@ -546,18 +546,20 @@ mod inner {
         }
     }
 
-    static GRAPH_CAPTURING: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    thread_local! {
+        static GRAPH_CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
-    /// Взводится на время `cuStreamBeginCapture`/`EndCapture`: аллокации под
-    /// capture становятся узлами графа, и пул для них выбирает драйвер —
-    /// свой пул тут не навязываем.
+    /// Взводится на время `cuStreamBeginCapture`/`EndCapture` на текущем потоке:
+    /// аллокации под capture становятся узлами графа, и пул для них выбирает
+    /// драйвер — свой пул тут не навязываем. Thread-local, чтобы захват графа
+    /// на одном потоке не мешал параллельным операциям других потоков.
     pub fn set_graph_capturing(on: bool) {
-        GRAPH_CAPTURING.store(on, std::sync::atomic::Ordering::Relaxed);
+        GRAPH_CAPTURING.with(|c| c.set(on));
     }
 
     pub fn graph_capturing() -> bool {
-        GRAPH_CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
+        GRAPH_CAPTURING.with(|c| c.get())
     }
 
     /// Аварийный выключатель разделения пулов: `SYN_ACT_POOL=0` возвращает

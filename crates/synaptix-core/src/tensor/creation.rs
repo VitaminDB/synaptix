@@ -534,6 +534,9 @@ pub(crate) fn cuda_alloc_from_bytes(device: Device, bytes: &[u8]) -> Result<Stor
         // простаивающие модели), затем ещё раз — как у аллокатора активаций.
         let mut dst = match unsafe { crate::device::cuda::alloc_bytes_uninit(&stream, bytes.len()) } {
             Ok(d) => d,
+            Err(first) if crate::device::cuda::graph_capturing() => {
+                return Err(SynaptixError::Cuda(format!("alloc H2D({} bytes) под graph capture: {first:?}", bytes.len())));
+            }
             Err(first) => {
                 let mut got = Err(first);
                 for attempt in 1..=3usize {

@@ -156,3 +156,53 @@ fn graph_is_reusable_many_times() {
     stream.synchronize().expect("sync after 100 replays");
     assert_eq!(COUNTER_C.load(Ordering::SeqCst), 100);
 }
+
+/// D2H (`to_device(Cpu)` / `to_vec1`) внутри graph capture должен отклоняться с
+/// ошибкой, корректно закрывать capture на стриме и не оставлять стрим/контекст
+/// в битом состоянии для последующих H2D, D2H и повторного захвата графа.
+#[test]
+fn dtoh_inside_capture_fails_cleanly_and_leaves_stream_usable() {
+    use synaptix_core::{device::Device, tensor::Tensor};
+
+    let (_ctx, stream) = match setup() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[4], Device::Cuda(0))
+        .expect("initial H2D");
+
+    let mut capturer = GraphCapturer::new(0);
+    let res = capturer.capture_with(&stream, |s| {
+        // Имитация временной графовой аллокации до ошибки.
+        let _tmp = unsafe { s.alloc::<u8>(64) }
+            .map_err(|e| synaptix_infer::error::InferError::Other(format!("alloc: {e}")))?;
+        let _ = src
+            .to_device(Device::Cpu)
+            .map_err(|e| synaptix_infer::error::InferError::Other(e.to_string()))?;
+        Ok(())
+    });
+    assert!(res.is_err(), "D2H под graph capture должен возвращать ошибку");
+    assert!(!capturer.is_captured());
+    assert!(!synaptix_core::device::cuda::graph_capturing());
+
+    // После неудавшегося захвата стрим и контекст полностью рабочие:
+    // синхронизация, чтение на хост, 4-байтовый H2D и новый захват графа проходят.
+    stream.synchronize().expect("sync after failed capture");
+    let host = src.to_vec1::<f32>().expect("D2H after failed capture");
+    assert_eq!(host, vec![1.0, 2.0, 3.0, 4.0]);
+
+    let scalar = Tensor::from_vec(vec![42u32], &[1], Device::Cuda(0))
+        .expect("4-byte H2D after failed capture");
+    assert_eq!(scalar.to_vec1::<u32>().expect("readback"), vec![42u32]);
+
+    // Повторный захват на том же стриме подтверждает, что стрим вышел из capture.
+    static COUNTER_D: AtomicU64 = AtomicU64::new(0);
+    let mut capturer2 = GraphCapturer::new(0);
+    capturer2
+        .capture_with(&stream, |s| {
+            enqueue_host_inc(s, &COUNTER_D)
+                .map_err(synaptix_infer::error::InferError::Other)
+        })
+        .expect("subsequent capture on same stream must succeed");
+}

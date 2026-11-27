@@ -92,6 +92,11 @@ impl GraphCapturer {
         // Если step упал — всё равно нужно завершить capture, иначе stream останется
         // в CAPTURING-состоянии и любой следующий launch вернёт CUDA_ERROR.
         let step_res = step(stream);
+        // Дроп временных буферов внутри `step` мог записать отложенную ошибку в
+        // `ctx.error_state`; `stream.end_capture()` зовёт `bind_to_thread()` →
+        // `check_err()` и вышел бы раньше `cuStreamEndCapture`, оставив стрим в
+        // состоянии захвата. Забираем отложенную ошибку до `end_capture`.
+        let drop_err = ctx.check_err();
         let end_res = stream
             .end_capture(CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
 
@@ -100,8 +105,20 @@ impl GraphCapturer {
             unsafe { ctx.enable_event_tracking() };
         }
 
-        step_res?;
-        let graph_opt = end_res.map_err(|e| InferError::Other(format!("cuStreamEndCapture: {e}")))?;
+        if let Err(e) = step_res {
+            drop(end_res);
+            let _ = ctx.check_err();
+            return Err(e);
+        }
+        if let Err(e) = drop_err {
+            drop(end_res);
+            let _ = ctx.check_err();
+            return Err(InferError::Other(format!("CUDA error during capture: {e}")));
+        }
+        let graph_opt = end_res.map_err(|e| {
+            let _ = ctx.check_err();
+            InferError::Other(format!("cuStreamEndCapture: {e}"))
+        })?;
         // cudarc `end_capture` отдаёт `None` если stream не был в captured-state
         // (т.е. capture был "проглочен" внешним sync). В норме это не случается, потому что
         // begin_capture отработал. Если случилось — это инвариант-нарушение.

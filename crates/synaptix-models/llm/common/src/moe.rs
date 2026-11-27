@@ -1991,6 +1991,9 @@ impl MoeFfn {
         }
         let mut guard = self.zc.lock().map_err(|_| ModelError::Forward("zero-copy: состояние отравлено".into()))?;
         if guard.is_none() {
+            if synaptix_core::device::cuda::graph_capturing() {
+                return Err(ModelError::Forward("MoE zero-copy: сборка слоя под захватом CUDA-графа запрещена".into()));
+            }
             // Повторная попытка не на каждом вызове: пока зеркало заполняется,
             // сборка таблицы стоила бы 512 поисков на слой.
             let tries = self.zc_retry.fetch_add(1, Ordering::Relaxed);
@@ -2051,6 +2054,9 @@ impl MoeFfn {
                     let bias = match self.zc_select_bias.get() {
                         Some(t) => t.clone(),
                         None => {
+                            if synaptix_core::device::cuda::graph_capturing() {
+                                return Err(ModelError::Forward("MoE zero-copy: кэш select_bias под захватом CUDA-графа запрещён".into()));
+                            }
                             let t = Tensor::from_vec(b.clone(), vec![b.len()], self.device).map_err(ferr)?;
                             let _ = self.zc_select_bias.set(t.clone());
                             t
@@ -2104,6 +2110,9 @@ impl MoeFfn {
                 match g.get(&(self.device, t, k)) {
                     Some(r) => r.clone(),
                     None => {
+                        if synaptix_core::device::cuda::graph_capturing() {
+                            return Err(ModelError::Forward("MoE zero-copy: кэш строк пар под захватом CUDA-графа запрещён".into()));
+                        }
                         let rows: Vec<u32> = (0..t * k).map(|p| (p / k) as u32).collect();
                         let r = Tensor::from_vec::<_, u32>(rows, vec![t * k], self.device).map_err(ferr)?;
                         g.insert((self.device, t, k), r.clone());
@@ -2344,6 +2353,9 @@ impl MoeFfn {
                 }
                 return Ok(out);
             }
+        }
+        if synaptix_core::device::cuda::graph_capturing() {
+            return Err(ModelError::Forward("MoE: хостовый роутинг под захватом CUDA-графа запрещён".into()));
         }
         let (experts, weights) = stage("moe:route", || self.route(routed))?;
         if self.zc_pool.is_some() && t > zc_rows {

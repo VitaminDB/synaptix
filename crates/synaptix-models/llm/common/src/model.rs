@@ -2171,6 +2171,26 @@ impl DecoderModel {
         acc
     }
 
+    /// Все ли MoE-слои без резидентного device-пути собрали таблицы zero-copy
+    /// (и не включены хостовые флаги отладки): шаг декода целиком на карте и
+    /// годится для захвата CUDA-графом.
+    pub fn zc_all_built(&self) -> bool {
+        if crate::moe::MoeFfn::zc_host_flags() {
+            return false;
+        }
+        self.blocks.iter().all(|b| {
+            let mlp_ok = match &b.mlp {
+                Ffn::Moe(m) if !m.dev_path_ready() => m.zc_built(),
+                _ => true,
+            };
+            let side_ok = match &b.moe {
+                Some(s) if !s.ffn.dev_path_ready() => s.ffn.zc_built(),
+                _ => true,
+            };
+            mlp_ok && side_ok
+        })
+    }
+
     /// Урезать плотную `lm_head` до указанных диапазонов строк `(начало, длина)`:
     /// освобождает неиспользуемую часть словаря в VRAM и ускоряет голову
     /// (у Drama 3 нужны только 4097 строк из 252 288). `false` — голова квантована.
