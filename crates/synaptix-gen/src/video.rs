@@ -486,7 +486,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         && !matches!(mode, LtxMode::Retake { .. })
         && !matches!(&mode, LtxMode::Continue { tail } if tail.video_stage1.is_none()))
         || matches!(mode, LtxMode::Lipdub { .. });
-    let dfr = req.dfr && matches!(mode, LtxMode::Text);
+    let dfr = req.dfr && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. } | LtxMode::Continue { .. });
     if dfr && paths.detail_lora.is_none() {
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
@@ -597,6 +597,17 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         synaptix_core::gen_status::phase(if offload { "денойз (DiT стримится с хоста)" } else { "денойз" });
         let (hp1, wp1) = if two_stage { lp::stage1_grid(hp, wp) } else { (hp, wp) };
         let (hp2, wp2) = (hp1 * 2, wp1 * 2);
+        let venc = if matches!(mode, LtxMode::Text | LtxMode::Continue { .. } | LtxMode::A2v { image: None, .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
+        let image_tokens = |img: &Tensor, g: (usize, usize)| -> R<Tensor> {
+            let (ph, pw) = (g.0 * 32, g.1 * 32);
+            let x = synaptix_io::image::fit_image(img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
+            let lat = venc.as_ref().unwrap().encode(&x).map_err(|e| format!("VAE: {e}"))?;
+            lp::frame_latent_to_tokens(&lat).map_err(err)
+        };
+        let latent_tokens = |lat: &Tensor| -> R<(Tensor, usize, usize, usize)> {
+            let (f, h, w) = (lat.dims()[2], lat.dims()[3], lat.dims()[4]);
+            Ok((lat.reshape(vec![1, 128, f * h * w]).map_err(err)?.transpose(1, 2).map_err(err)?.contiguous().map_err(err)?, f, h, w))
+        };
         if dfr {
             // DFR (эталон LTX-2 `dfr_pipeline.py`, этапы 1–2 без временных раундов и эпилога).
             if !ltx_version_at_least(&ckpt.config.model_version, 2, 5) {
@@ -614,7 +625,28 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let fp_c = lp::fp_for_frames(n_canvas);
             eprintln!("[ltx] DFR: холст {n_canvas} кадров, слоты ключевых кадров {slots:?}, этап 1 {}×{}", wp1 * 32, hp1 * 32);
             synaptix_video_ltx23::runtime::set_ancestral(Some(base.wrapping_add(10_000)));
-            let (l1, a1, s1) = lp::denoise_dfr(&dit, &v_enc, &a_enc, fp_c, hp1, wp1, &lp::DISTILLED_SIGMAS, None, None, &slots, None, None, fps, device, seed, &hooks).map_err(err)?;
+            // Условия: первый кадр или хвост прошлой сцены — чистые токены в начале.
+            let conds_for = |g: (usize, usize), second: bool| -> R<(Vec<(usize, Tensor, f32)>, Vec<(usize, Tensor, f32)>)> {
+                Ok(match &mode {
+                    LtxMode::Frames { first: Some(p), .. } => {
+                        let img = synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
+                        (vec![(0usize, image_tokens(&img, g)?, 1.0f32)], Vec::new())
+                    }
+                    LtxMode::Continue { tail } => {
+                        let v = if second { Some(&tail.video) } else { tail.video_stage1.as_ref() }
+                            .filter(|t| t.dims()[3] == g.0 && t.dims()[4] == g.1)
+                            .ok_or("DFR: у хвоста прошлой сцены нет латента нужного разрешения (нужен хвост от ролика с двумя стадиями или DFR того же размера)")?;
+                        let ac = match &tail.audio {
+                            Some(a) => vec![(0usize, a.clone(), 1.0f32)],
+                            None => Vec::new(),
+                        };
+                        (vec![(0usize, latent_tokens(v)?.0, 1.0f32)], ac)
+                    }
+                    _ => (Vec::new(), Vec::new()),
+                })
+            };
+            let (vc1, ac1) = conds_for((hp1, wp1), false)?;
+            let (l1, a1, s1) = lp::denoise_dfr(&dit, &v_enc, &a_enc, fp_c, hp1, wp1, &lp::DISTILLED_SIGMAS, None, None, &slots, None, None, &vc1, &ac1, fps, device, seed, &hooks).map_err(err)?;
             drop(dit);
             release();
             let (l2, s2) = {
@@ -635,7 +667,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let dit2 = AvDit::load_with(&dckpt, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
             synaptix_core::gen_status::phase("DFR: детализация");
             synaptix_video_ltx23::runtime::set_ancestral(Some(base.wrapping_add(20_000)));
-            let (l3, _, _) = lp::denoise_dfr(&dit2, &v_enc, &a_enc, fp_c, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), &slots, Some(&s2), Some((&l1, 2)), fps, device, seed, &hooks).map_err(err)?;
+            let (vc2, ac2) = conds_for((hp2, wp2), true)?;
+            let (l3, _, _) = lp::denoise_dfr(&dit2, &v_enc, &a_enc, fp_c, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), &slots, Some(&s2), Some((&l1, 2)), &vc2, &ac2, fps, device, seed, &hooks).map_err(err)?;
             drop(dit2);
             // Обрезка холста до запрошенной длины (видео и звук этапа 1).
             let l = l3.narrow(2, 0, fp.min(fp_c)).map_err(err)?.contiguous().map_err(err)?;
@@ -644,17 +677,6 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_core::tensor::ops::conv_filter_cache_gc();
             return Ok((l, Some(a), None, Some(l1.narrow(2, 0, fp.min(fp_c)).map_err(err)?.contiguous().map_err(err)?)));
         }
-        let venc = if matches!(mode, LtxMode::Text | LtxMode::Continue { .. } | LtxMode::A2v { image: None, .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
-        let image_tokens = |img: &Tensor, g: (usize, usize)| -> R<Tensor> {
-            let (ph, pw) = (g.0 * 32, g.1 * 32);
-            let x = synaptix_io::image::fit_image(img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
-            let lat = venc.as_ref().unwrap().encode(&x).map_err(|e| format!("VAE: {e}"))?;
-            lp::frame_latent_to_tokens(&lat).map_err(err)
-        };
-        let latent_tokens = |lat: &Tensor| -> R<(Tensor, usize, usize, usize)> {
-            let (f, h, w) = (lat.dims()[2], lat.dims()[3], lat.dims()[4]);
-            Ok((lat.reshape(vec![1, 128, f * h * w]).map_err(err)?.transpose(1, 2).map_err(err)?.contiguous().map_err(err)?, f, h, w))
-        };
         // Этап денойза на сетке g (stage1: с NAG, без init; stage2: init — апскейл).
         let stage = |g: (usize, usize), sigmas: &[f64], init: Option<(&Tensor, &Tensor)>| -> R<(Tensor, Tensor, Option<Vec<f32>>)> {
             let (vi, ai) = match init {

@@ -1474,6 +1474,8 @@ pub fn denoise_dfr(
     slot_frames: &[usize],
     slot_init: Option<&Tensor>,
     reference: Option<(&Tensor, usize)>,
+    v_conds: &[(usize, Tensor, f32)],
+    a_conds: &[(usize, Tensor, f32)],
     fps: f64,
     device: Device,
     seed: Option<u64>,
@@ -1495,13 +1497,42 @@ pub fn denoise_dfr(
             None => Ok(noise),
         }
     };
-    let v_main = renoise(tokens(&noise_tensor(vec![1usize, 128, fp, hp, wp], seed)?)?, v_init)?;
+    // Замена токенов `[start, start+n)` чистыми (первый кадр, хвост прошлой сцены).
+    let put = |x: Tensor, conds: &[(usize, Tensor, f32)]| -> Result<Tensor, LtxError> {
+        let mut x = x;
+        for (start, c, _) in conds {
+            let (t, n) = (x.dims()[1], c.dims()[1]);
+            let c = c.to_device(device)?.to_dtype(DType::BF16)?;
+            let mut parts: Vec<Tensor> = Vec::new();
+            if *start > 0 {
+                parts.push(x.narrow(1, 0, *start)?.contiguous()?);
+            }
+            parts.push(c);
+            if start + n < t {
+                parts.push(x.narrow(1, start + n, t - start - n)?.contiguous()?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            x = Tensor::cat(&refs, 1)?.contiguous()?;
+        }
+        Ok(x)
+    };
+    let v_main = put(renoise(tokens(&noise_tensor(vec![1usize, 128, fp, hp, wp], seed)?)?, v_init)?, v_conds)?;
     let slots = renoise(tokens(&noise_tensor(vec![1usize, 128, k.max(1), hp, wp], seed.map(|s| s.wrapping_add(777)))?)?, slot_init)?;
     let a_noise = noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(DType::BF16)?;
     let mut a_tok = a_noise.transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?;
     if let Some(init) = a_init {
         a_tok = a_tok.mul_scalar(s0)?.add(&init.to_device(device)?.to_dtype(DType::BF16)?.mul_scalar(1.0 - s0)?)?;
     }
+    a_tok = put(a_tok, a_conds)?;
+    let mut a_mask = vec![1f32; fa];
+    for (start, c, strength) in a_conds {
+        for m in a_mask.iter_mut().skip(*start).take(c.dims()[1]) {
+            *m = 1.0 - *strength;
+        }
+    }
+    let am = Tensor::from_vec(a_mask.clone(), vec![1, fa, 1], device)?.to_dtype(DType::BF16)?;
+    let am_inv = am.affine(-1.0, 1.0)?;
+    let a_clean = a_tok.clone();
     // Позиции: цель, слоты (один кадр каждый), референс.
     let mut pos = pixel_coords(fp, hp, wp, fps);
     let mut t_all = tv;
@@ -1514,6 +1545,11 @@ pub fn denoise_dfr(
         parts.push(slots);
     }
     let mut mask = vec![1f32; t_all];
+    for (start, c, strength) in v_conds {
+        for m in mask.iter_mut().skip(*start).take(c.dims()[1]) {
+            *m = 1.0 - *strength;
+        }
+    }
     if let Some((r, ds)) = reference {
         let d = r.dims().to_vec();
         let tr = d[2] * d[3] * d[4];
@@ -1537,7 +1573,7 @@ pub fn denoise_dfr(
             }
             let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
             let v_ts: Vec<f32> = mask.iter().map(|&m| m * sigma as f32).collect();
-            let a_ts = vec![sigma as f32; fa];
+            let a_ts: Vec<f32> = a_mask.iter().map(|&m| m * sigma as f32).collect();
             let (v_vel, a_vel) = dit.forward(&v_tok, &v_ts, sigma as f32, &pos, &v_ctx, &a_tok, &a_ts, sigma as f32, &a_pos, &a_ctx, None)?;
             let dt = (sigma_next - sigma) as f32;
             if let Some(base) = crate::runtime::ancestral() {
@@ -1546,9 +1582,10 @@ pub fn denoise_dfr(
                 a_tok = ancestral_step(&a_tok, &a_vel, sigma, sigma_next, base.wrapping_add(s + 1))?;
             } else {
                 v_tok = v_tok.add(&v_vel.broadcast_mul(&vm.mul_scalar(dt)?)?)?;
-                a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+                a_tok = a_tok.add(&a_vel.broadcast_mul(&am.mul_scalar(dt)?)?)?;
             }
             v_tok = v_tok.broadcast_mul(&vm)?.add(&v_clean.broadcast_mul(&vm_inv)?)?;
+            a_tok = a_tok.broadcast_mul(&am)?.add(&a_clean.broadcast_mul(&am_inv)?)?;
             hooks.emit(i + 1, sigmas.len() - 1, sigma_next);
         }
         Ok(())

@@ -26,6 +26,7 @@ fn main() {
         seed: a[7].parse().unwrap(),
         fps_x2: std::env::var("LTX_FPS_X2").is_ok(),
         dfr: std::env::var("LTX_DFR").is_ok(),
+        first_frame: std::env::var("LTX_FIRST").ok().map(PathBuf::from),
         diff_decoder: std::env::var("LTX_DIFF_VAE").is_ok(),
         source_video: std::env::var("LTX_SOURCE").ok().map(PathBuf::from),
         extend: std::env::var("LTX_EXTEND").is_ok(),
