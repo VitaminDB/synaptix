@@ -700,6 +700,7 @@ impl LtxModel {
 
     /// Retake: перегенерировать отрезок `start..end` (с) исходного ролика.
     pub fn retake(&self, cond: &LtxCond, video: &Path, shape: Shape, start: f64, end: f64, seed: u64, h: &Hooks) -> R<LtxLatent> {
+        let _anc = Ancestral::on(self.ltx25, seed.wrapping_add(10_000));
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
         let dev = self.device;
         let fps = shape.fps;
@@ -722,6 +723,7 @@ impl LtxModel {
     /// управляющий сигнал `control`). Адаптер — LoRA модели.
     #[allow(clippy::too_many_arguments)]
     pub fn ic_lora(&self, cond: &LtxCond, video: &Path, shape: Shape, downscale: usize, strength: f32, control: Control, seed: u64, h: &Hooks) -> R<LtxLatent> {
+        let _anc = Ancestral::on(self.ltx25, seed.wrapping_add(10_000));
         let _fp8 = synaptix_core::precision::AttentionFp8Guard::new(self.quant_dit.is_quantized());
         let dev = self.device;
         let fps = shape.fps;

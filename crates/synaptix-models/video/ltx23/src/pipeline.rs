@@ -815,9 +815,15 @@ pub fn denoise_av_retake(
             None,
         )?;
         let dt = (sigma_next - sigma) as f32;
-        v_tok = v_tok.add(&v_vel.broadcast_mul(&v_mask.mul_scalar(dt)?)?)?;
+        if let Some(base) = crate::runtime::ancestral() {
+            let s = i as u64 * 2;
+            v_tok = ancestral_step(&v_tok, &v_vel, sigma, sigma_next, base.wrapping_add(s))?;
+            a_tok = ancestral_step(&a_tok, &a_vel, sigma, sigma_next, base.wrapping_add(s + 1))?;
+        } else {
+            v_tok = v_tok.add(&v_vel.broadcast_mul(&v_mask.mul_scalar(dt)?)?)?;
+            a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        }
         v_tok = v_tok.broadcast_mul(&v_mask)?.add(&v_clean.broadcast_mul(&v_inv)?)?;
-        a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
         hooks.emit(i + 1, sigmas.len() - 1, sigma_next);
     }
     let v_latent = v_tok.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, fp, hp, wp])?.to_dtype(DType::F32)?;
@@ -1417,9 +1423,15 @@ pub fn denoise_av_append(
             None,
         )?;
         let dt = (sigma_next - sigma) as f32;
-        v_tok = v_tok.add(&v_vel.broadcast_mul(&vm.mul_scalar(dt)?)?)?;
+        if let Some(base) = crate::runtime::ancestral() {
+            let s = i as u64 * 2;
+            v_tok = ancestral_step(&v_tok, &v_vel, sigma, sigma_next, base.wrapping_add(s))?;
+            a_tok = ancestral_step(&a_tok, &a_vel, sigma, sigma_next, base.wrapping_add(s + 1))?;
+        } else {
+            v_tok = v_tok.add(&v_vel.broadcast_mul(&vm.mul_scalar(dt)?)?)?;
+            a_tok = a_tok.add(&a_vel.broadcast_mul(&am.mul_scalar(dt)?)?)?;
+        }
         v_tok = v_tok.broadcast_mul(&vm)?.add(&v_clean.broadcast_mul(&vm_inv)?)?;
-        a_tok = a_tok.add(&a_vel.broadcast_mul(&am.mul_scalar(dt)?)?)?;
         a_tok = a_tok.broadcast_mul(&am)?.add(&a_clean.broadcast_mul(&am_inv)?)?;
         hooks.emit(i + 1, sigmas.len() - 1, sigma_next);
     }
