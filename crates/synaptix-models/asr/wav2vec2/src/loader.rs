@@ -21,6 +21,8 @@ use crate::Wav2Vec2Error;
 enum Source {
     Safetensors(SafetensorsLoader),
     Bundle(Box<Bundle>),
+    /// Компонент составного `.syn`-бандла (энкодер внутри чужой модели).
+    Component(synaptix_io::weights::syn_bundle::SynBundleLoader),
 }
 
 pub struct Wav2Vec2Weights {
@@ -95,6 +97,42 @@ impl Wav2Vec2Weights {
             names.extend(q.tensors.keys().cloned());
         }
         Ok(Self { source: Source::Bundle(Box::new(bundle)), names, quant, config, config_json, vocab, quant_dtype: None, device, dtype })
+    }
+
+    /// Энкодер как компонент составного бандла (например, HuBERT в бандле
+    /// преобразования голоса): веса — из компонента `component`, конфиг —
+    /// файл `config_file` бандла (HF `config.json` модели). Словаря CTC нет.
+    pub fn from_syn_component(
+        path: impl AsRef<Path>,
+        component: &str,
+        config_file: &str,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, Wav2Vec2Error> {
+        let path = path.as_ref();
+        let bundle = Bundle::open(path).map_err(|e| Wav2Vec2Error::Bundle(e.to_string()))?;
+        let config_bytes = bundle
+            .read_file(config_file)
+            .map(|c| c.into_owned())
+            .map_err(|e| Wav2Vec2Error::Bundle(format!("{config_file}: {e}")))?;
+        let config = Wav2Vec2Config::from_json_bytes(&config_bytes)?;
+        let config_json = serde_json::from_slice(&config_bytes).unwrap_or_default();
+        let loader = synaptix_io::weights::syn_bundle::SynBundleLoader::open(path)
+            .map_err(|e| Wav2Vec2Error::Bundle(format!("{}: {e}", path.display())))?
+            .with_device(device)
+            .with_component(component);
+        let names = loader.names().into_iter().map(|s| s.to_string()).collect();
+        Ok(Self {
+            source: Source::Component(loader),
+            names,
+            quant: None,
+            config,
+            config_json,
+            vocab: CtcVocab::from_json_bytes(b"{}")?,
+            quant_dtype: None,
+            device,
+            dtype,
+        })
     }
 
     /// Полное имя тензора: как есть, либо с префиксом энкодера
@@ -185,6 +223,9 @@ impl Wav2Vec2Weights {
         }
         synaptix_core::backend::with_param_upload(|| match &self.source {
             Source::Safetensors(loader) => loader
+                .load(&full)
+                .map_err(|e| Wav2Vec2Error::Load(format!("'{full}': {e}"))),
+            Source::Component(loader) => loader
                 .load(&full)
                 .map_err(|e| Wav2Vec2Error::Load(format!("'{full}': {e}"))),
             Source::Bundle(bundle) => {

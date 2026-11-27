@@ -1,3 +1,4 @@
+pub mod bigvgan;
 pub mod conformer_enc;
 pub mod dac;
 pub mod silero_vad;

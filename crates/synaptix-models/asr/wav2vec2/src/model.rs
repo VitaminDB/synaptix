@@ -406,6 +406,27 @@ impl Wav2Vec2Model {
         Ok((pos, h))
     }
 
+    /// Скрытое состояние после первых `n_layers` слоёв **без** финальной
+    /// нормы энкодера — как HF-модель с `encoder.layers[:n]` и
+    /// `encoder.layer_norm = Identity` (признаки среднего слоя HuBERT/XLS-R
+    /// для токенизаторов речи). Только pre-LN (`do_stable_layer_norm`):
+    /// у post-LN финальной нормы нет, а входная обязательна.
+    pub fn encode_partial(&self, proj: &Tensor, n_layers: usize) -> Result<Tensor> {
+        if !self.config.do_stable_layer_norm {
+            return Err(Wav2Vec2Error::Config("encode_partial: нужен do_stable_layer_norm".into()));
+        }
+        if n_layers > self.layers.len() {
+            return Err(Wav2Vec2Error::Config(format!("encode_partial: слоёв {}, запрошено {n_layers}", self.layers.len())));
+        }
+        let pos = self.pos_conv.forward(proj)?;
+        let mut h = proj.add(&pos)?;
+        let bias = self.relative_bias(h.dims()[1])?;
+        for l in &self.layers[..n_layers] {
+            h = l.forward_stable(&h, bias.as_ref())?;
+        }
+        Ok(h)
+    }
+
     /// WavLM: относительный позиционный bias `[1, H, T, T]` (F32) по
     /// логарифмическим корзинам расстояния `key − query`.
     fn relative_bias(&self, t: usize) -> Result<Option<Tensor>> {

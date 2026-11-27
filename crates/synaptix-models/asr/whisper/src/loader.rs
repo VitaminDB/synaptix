@@ -93,6 +93,30 @@ impl WhisperWeights {
         })
     }
 
+    /// Энкодер Whisper как компонент составного бандла (признаки содержания
+    /// для преобразования голоса): тензоры `model.encoder.*` — из компонента
+    /// `component`, конфиг — файл `config_file` бандла (HF `config.json`).
+    pub fn open_component(
+        path: impl AsRef<Path>,
+        component: &str,
+        config_file: &str,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self, WhisperError> {
+        use synaptix_io::weights::WeightLoader as _;
+        let path = path.as_ref();
+        let bundle = Bundle::open(path).map_err(|e| WhisperError::Bundle(e.to_string()))?;
+        let config = WhisperConfig::from_json_bytes(
+            &bundle.read_file(config_file).map_err(|e| WhisperError::Bundle(format!("{config_file}: {e}")))?,
+        )?;
+        let loader = SynBundleLoader::open(path)
+            .map_err(|e| WhisperError::Load(e.to_string()))?
+            .with_device(device)
+            .with_component(component);
+        let names: HashSet<String> = loader.names().into_iter().map(|s| s.to_string()).collect();
+        Ok(Self { bundle, loader, names, config, gen_config: GenerationConfig::default(), device, dtype, quant: None, encoder_prefix: None })
+    }
+
     /// Имя тензора в бандле с учётом `encoder_prefix`.
     fn resolve<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
         match (&self.encoder_prefix, name.strip_prefix("model.encoder.")) {

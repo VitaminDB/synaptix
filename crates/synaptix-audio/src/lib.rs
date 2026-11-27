@@ -1,6 +1,7 @@
 pub mod diarization_utils;
 pub mod error;
 pub mod io;
+pub mod kaldi;
 pub mod mel;
 pub mod mfcc;
 pub mod resample;

@@ -1,0 +1,22 @@
+[package]
+name = "synaptix-vc-seed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Seed-VC v2 — преобразование голоса по образцу (тембр и манера): HuBERT + ASTRAL (BSQ) → AR (манера) → flow-matching DiT → BigVGAN, 22,05 кГц моно."
+
+[dev-dependencies]
+synaptix-kernels-cpu = { workspace = true }
+synaptix-kernels-cuda = { workspace = true }
+
+[dependencies]
+synaptix-core      = { workspace = true }
+synaptix-ops       = { workspace = true }
+synaptix-nn        = { workspace = true }
+synaptix-io        = { workspace = true }
+synaptix-audio     = { workspace = true }
+synaptix-bundle    = { workspace = true }
+synaptix-asr-wav2vec2 = { workspace = true }
+synaptix-asr-whisper = { workspace = true }
+thiserror          = { workspace = true }
