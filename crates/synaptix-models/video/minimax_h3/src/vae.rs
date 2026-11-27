@@ -1183,6 +1183,7 @@ impl VaeDecoder {
             .broadcast_add(&m)?
             .to_dtype(self.dtype)?;
         crate::pipeline::dump_tensor("final_latent", latent);
+        crate::preview::dump_if_requested(latent);
         if crate::runtime::h3_vae_prof() {
             eprintln!(
                 "[h3-vae] {} · {}",

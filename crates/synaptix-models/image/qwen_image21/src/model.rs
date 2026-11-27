@@ -605,17 +605,32 @@ mod tests {
         assert_eq!(snap_side(1030), 1024);
         assert_eq!(QwenImage21Model::tokens_for(1024, 1024, 4096, 100), 100 + 4096 + 4096);
     }
+
+    #[test]
+    fn embedded_preview_factors_and_emit() {
+        synaptix_kernels_cpu::ensure_registered();
+        let f = synaptix_core::gen_status::parse_block_factors(include_bytes!("../assets/latent_rgb.f32"), 64)
+            .expect("valid Qwen21 factors");
+        assert_eq!((f.kernel, f.scale), (3, 4));
+        let x = Tensor::from_vec(vec![0.0f32; 4 * 6 * 64], (1, 24, 64), Device::Cpu).unwrap();
+        let v = Tensor::from_vec(vec![0.0f32; 4 * 6 * 64], (1, 24, 64), Device::Cpu).unwrap();
+        let _ = synaptix_core::gen_status::take_preview();
+        preview(&x, &v, 0.5, 6, 4, 0, 20);
+        let p = synaptix_core::gen_status::take_preview().expect("preview emitted");
+        assert_eq!((p.width, p.height, p.step, p.total), (24, 16, 0, 20));
+        assert_eq!(p.rgb.len(), 24 * 16 * 3);
+    }
 }
 
 /// Превью по ходу денойза: `x0 = x − σ·v` по упакованным токенам `[1, h·w, 64]`
-/// (1/16 кадра) линейной проекцией в RGB; коэффициенты подобраны примером
-/// `latent_rgb_fit` (`SYN_QWEN21_RGB_FACTORS` — свой файл).
+/// блочной линейной проекцией в RGB (окно 1×1 или 3×3 токенов → блок S×S пикселей);
+/// коэффициенты подобраны примером `latent_rgb_fit` (`SYN_QWEN21_RGB_FACTORS` — свой файл).
 fn preview(x: &Tensor, v: &Tensor, sigma: f32, w: usize, h: usize, step: usize, total: usize) {
     use synaptix_core::gen_status;
-    static F: std::sync::OnceLock<Option<Vec<f32>>> = std::sync::OnceLock::new();
+    static F: std::sync::OnceLock<Option<gen_status::PreviewFactors>> = std::sync::OnceLock::new();
     let f = F.get_or_init(|| match std::env::var_os("SYN_QWEN21_RGB_FACTORS") {
-        Some(p) => gen_status::parse_factors(&std::fs::read(p).ok()?, 64),
-        None => gen_status::parse_factors(include_bytes!("../assets/latent_rgb.f32"), 64),
+        Some(p) => gen_status::parse_block_factors(&std::fs::read(p).ok()?, 64),
+        None => gen_status::parse_block_factors(include_bytes!("../assets/latent_rgb.f32"), 64),
     });
     let (Some(f), n) = (f.as_ref(), gen_status::preview_every(4)) else { return };
     if n == 0 || step % n != 0 {
@@ -623,7 +638,7 @@ fn preview(x: &Tensor, v: &Tensor, sigma: f32, w: usize, h: usize, step: usize, 
     }
     let _ = (|| -> synaptix_core::error::Result<()> {
         let x0 = x.to_dtype(DType::F32)?.sub(&v.to_dtype(DType::F32)?.mul_scalar(sigma)?)?.to_device(Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        gen_status::linear_preview(&x0, 64, w, h, f, step, total);
+        gen_status::linear_preview_blocks(&x0, 64, w, h, f, step, total);
         Ok(())
     })();
 }

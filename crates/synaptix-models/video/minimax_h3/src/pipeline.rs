@@ -1305,6 +1305,7 @@ fn run_denoise_range(
             Some((exact, _, pt)) => splice_v(&denoised_v, exact, *pt)?,
             None => denoised_v,
         };
+        crate::preview::emit(&denoised_v, step, total_steps);
         let denoised_a = match a_prefix {
             Some((exact, _, pt)) => splice_a(&denoised_a, exact, *pt)?,
             None => denoised_a,
