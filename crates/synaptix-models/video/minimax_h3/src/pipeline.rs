@@ -1083,7 +1083,10 @@ pub fn denoise_av(
         let mut old_denoised_v: Option<Tensor> = None;
         let mut old_denoised_a: Option<Tensor> = old_ca;
 
-        // Замер пика VRAM начинаем заново уже на полном разрешении.
+        // Освобождаем кэшированные буферы от активаций Stage 1 (960×544) до
+        // замера пика на полном разрешении — иначе FreeWatch недосчитывается ~1 ГБ
+        // и поднимает на 2–3 блока меньше.
+        crate::memory::trim_pool(device);
         dit.set_adapt_resident(true);
         dit.reset_free_watch();
         run_denoise_range(

@@ -1190,8 +1190,9 @@ impl H3Dit {
         // Место, которое должно остаться после резидентных блоков: два
         // стримящихся блока (текущий + префетч), сырой вес под квантование
         // и запас на хвост модели.
-        // LoRA при счёте: её веса A/B (~1.3 ГБ на все 50 блоков у Turbo).
-        let lora = if ckpt.has_lora() { 1400usize << 20 } else { 0 };
+        // LoRA резидентных блоков уже вычтена из free_vram по ходу загрузки, а
+        // хостовые уедут на хост; в запасе нужны только 2 стримящихся блока LoRA (~60 МБ).
+        let lora = if ckpt.has_lora() { 64usize << 20 } else { 0 };
         let reserve = 2 * blk_q + blk_dense / 2 + (1usize << 30) + runtime::load_reserve_bytes() + lora;
         let mut host_from = match mode {
             crate::memory::H3MemoryMode::BlockOffload if cuda => 0,

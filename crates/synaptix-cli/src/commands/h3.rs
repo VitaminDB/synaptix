@@ -388,16 +388,6 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         req.init_audio = Some(a0);
     }
 
-    h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(
-        &geometry,
-        &ckpt.config,
-        compute,
-        !keyframe_paths.is_empty() || !ref_sources.is_empty(),
-        args.lora.is_some(),
-    ));
-    let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit)?;
-    let prep = h3::pipeline::prepare(&dit, &req, &sched)?;
-
     if !keyframe_rgb.is_empty() {
         eprintln!("[h3 {}] кодирование ключевых кадров через VAE", ts());
         let vae_cfg = ckpt.vae_config()?;
@@ -417,11 +407,21 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
         h3::memory::trim_pool(device);
         req.cond_rows.video = h3::pipeline::cond_rows_from_keyframe_latents(
             &latents,
-            dit.cfg.patch_size,
+            ckpt.config.patch_size,
             None,
             seed,
         )?;
     }
+
+    h3::runtime::set_load_reserve_bytes(h3::memory::load_reserve_for(
+        &geometry,
+        &ckpt.config,
+        compute,
+        !keyframe_paths.is_empty() || !ref_sources.is_empty(),
+        args.lora.is_some(),
+    ));
+    let dit = h3::dit::H3Dit::load(&ckpt, device, compute, quant_dit)?;
+    let prep = h3::pipeline::prepare(&dit, &req, &sched)?;
 
     let plan = h3::memory::plan(
         &ckpt,
