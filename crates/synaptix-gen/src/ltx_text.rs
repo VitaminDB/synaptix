@@ -43,3 +43,50 @@ impl LtxTextEncoder {
         }
     }
 }
+
+// ── Улучшитель промпта LTX-2.5 ────────────────────────────────────────────
+
+/// Системные промпты улучшителя (Gemma 4 E2B) — дословно из эталона LTX-2.
+pub const ENHANCER_T2V_SYSTEM: &str = include_str!("../assets/gemma4_t2v_system_prompt.txt");
+pub const ENHANCER_I2V_SYSTEM: &str = include_str!("../assets/gemma4_i2v_system_prompt.txt");
+/// Предел ответа улучшителя (эталон: жадно, 600 токенов).
+pub const ENHANCER_MAX_TOKENS: usize = 600;
+
+/// Сообщение пользователя улучшителю: текст→видео или картинка→видео.
+pub fn enhancer_user_message(prompt: &str, with_image: bool) -> String {
+    if with_image {
+        format!("User Raw Input Prompt: {prompt}.")
+    } else {
+        format!("user prompt: {prompt}")
+    }
+}
+
+/// Чистка ответа улучшителя (эталон `clean_response`): типографские кавычки,
+/// тире и неразрывный пробел — в ASCII; всё до первой буквы срезается.
+pub fn enhancer_clean(text: &str) -> String {
+    let t: String = text
+        .chars()
+        .map(|c| match c {
+            '‘' | '’' | '′' => '\'',
+            '“' | '”' => '"',
+            '—' | '–' | '−' => '-',
+            '\u{a0}' => ' ',
+            c => c,
+        })
+        .collect();
+    let start = t.find(|c: char| c.is_alphabetic()).unwrap_or(0);
+    t[start..].trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhancer_cleaning() {
+        assert_eq!(enhancer_clean("** “A fox” — walks…\u{a0}now"), "A fox\" - walks… now");
+        assert!(ENHANCER_T2V_SYSTEM.starts_with("You are given a user's short text-to-video request"));
+        assert!(ENHANCER_I2V_SYSTEM.contains("REFERENCE IMAGE"));
+        assert_eq!(enhancer_user_message("кот", false), "user prompt: кот");
+    }
+}

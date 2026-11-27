@@ -140,7 +140,7 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
 
     let ltx_encoder = find(&|f| f.arch == "gemma3" && name(f).contains("ltx"));
     // LTX-2.5: Gemma 4 12B unified (свой кодер); апскейлер ×2 побайтно как у 2.3.
-    let ltx25_encoder = find(&|f| f.arch.starts_with("gemma4") && name(f).contains("ltx"));
+    let ltx25_encoder = find(&|f| f.arch.starts_with("gemma4") && name(f).contains("ltx") && !name(f).contains("enhancer"));
     let ltx25_parts: Vec<(String, PathBuf)> = files
         .iter()
         .filter(|f| f.arch == "ltx-2.5")
@@ -322,6 +322,7 @@ mod tests {
             f("ltx-2.3-22b-distilled-1.1", "ltx-2.3"),
             f("ltx-2.5-22b-distilled", "ltx-2.5"),
             f("ltx-gemma-4-12b-2.5", "gemma4_unified_text"),
+            f("ltx-2.5-prompt-enhancer", "gemma4"),
             f("ltx-2.5-duration-head", "ltx-2.5"),
             f("ltx-2.5-temporal-upscaler-x2-1.0", "ltx-2.5"),
             f("ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0", "ltx-2.5"),
@@ -334,7 +335,8 @@ mod tests {
         for role in ["duration_head", "temporal_upscaler", "detail_lora"] {
             assert!(m.components.iter().any(|(r, _)| r == role), "{role}");
         }
-        assert_eq!(p.models.iter().filter(|m| m.id.starts_with("ltx-2-5")).count(), 1);
+        assert_eq!(p.models.iter().filter(|m| m.id.starts_with("ltx-2-5")).count(), 2);
+        assert!(p.models.iter().any(|m| m.id == "ltx-2-5-prompt-enhancer"));
         let m23 = p.models.iter().find(|m| m.id == "ltx-2-3-22b-distilled-1-1").unwrap();
         assert!(m23.components.iter().any(|(_, p)| p.ends_with("ltx-gemma-3-12b-qat.syn")));
         assert!(p.skipped.is_empty(), "{:?}", p.skipped);
