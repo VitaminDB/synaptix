@@ -54,6 +54,9 @@ pub struct VideoRequest {
     pub two_stage: bool,
     /// LTX-2.5: удвоить частоту кадров временным апскейлером латента (24 → 48 кадр/с).
     pub fps_x2: bool,
+    /// LTX-2.5: Diffusion Fidelity Rendering — половинное разрешение со слотами
+    /// ключевых кадров, затем полное с IC-LoRA детализации.
+    pub dfr: bool,
     /// H3 restyle: сила перерисовки `source_video` (0..1; по умолчанию 0.6).
     pub strength: Option<f32>,
     /// Латент хвоста предыдущего ролика (`.safetensors`): продолжить с хвоста без PNG.
@@ -479,6 +482,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         && !matches!(mode, LtxMode::Retake { .. })
         && !matches!(&mode, LtxMode::Continue { tail } if tail.video_stage1.is_none()))
         || matches!(mode, LtxMode::Lipdub { .. });
+    let dfr = req.dfr && matches!(mode, LtxMode::Text);
+    if dfr && paths.detail_lora.is_none() {
+        return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
+    }
+    let two_stage = two_stage || dfr;
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
     }
@@ -585,6 +593,53 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         synaptix_core::gen_status::phase(if offload { "денойз (DiT стримится с хоста)" } else { "денойз" });
         let (hp1, wp1) = if two_stage { lp::stage1_grid(hp, wp) } else { (hp, wp) };
         let (hp2, wp2) = (hp1 * 2, wp1 * 2);
+        if dfr {
+            // DFR (эталон LTX-2 `dfr_pipeline.py`, этапы 1–2 без временных раундов и эпилога).
+            if !ltx_version_at_least(&ckpt.config.model_version, 2, 5) {
+                return Err("DFR есть только у LTX-2.5".into());
+            }
+            struct Anc;
+            impl Drop for Anc {
+                fn drop(&mut self) {
+                    synaptix_video_ltx23::runtime::set_ancestral(None);
+                }
+            }
+            let _anc = Anc;
+            let base = seed.unwrap_or(1);
+            let (n_canvas, slots) = lp::dfr_canvas(out_frames);
+            let fp_c = lp::fp_for_frames(n_canvas);
+            eprintln!("[ltx] DFR: холст {n_canvas} кадров, слоты ключевых кадров {slots:?}, этап 1 {}×{}", wp1 * 32, hp1 * 32);
+            synaptix_video_ltx23::runtime::set_ancestral(Some(base.wrapping_add(10_000)));
+            let (l1, a1, s1) = lp::denoise_dfr(&dit, &v_enc, &a_enc, fp_c, hp1, wp1, &lp::DISTILLED_SIGMAS, None, None, &slots, None, None, fps, device, seed, &hooks).map_err(err)?;
+            drop(dit);
+            release();
+            let (l2, s2) = {
+                let view = ckpt.view_on(device);
+                let mean = view.get_raw("vae.per_channel_statistics.mean-of-means").map_err(err)?;
+                let std = view.get_raw("vae.per_channel_statistics.std-of-means").map_err(err)?;
+                let up = Upsampler::load(paths.upscaler.as_ref().unwrap(), &mean, &std, device).map_err(|e| format!("апскейлер: {e}"))?;
+                let l2 = up.upsample(&l1).map_err(err)?.to_dtype(compute).map_err(err)?;
+                let s2 = up.upsample(&s1).map_err(err)?.to_dtype(compute).map_err(err)?;
+                (l2, s2)
+            };
+            synaptix_core::tensor::ops::conv_filter_cache_clear();
+            release();
+            // Этап 2: DiT с IC-LoRA детализации (сила 0.5), референс — латент этапа 1.
+            synaptix_core::gen_status::phase("DFR: загрузка DiT с LoRA детализации");
+            let dl = LoraWeights::open(paths.detail_lora.as_ref().unwrap(), device, 0.5).map_err(|e| format!("LoRA детализации: {e}"))?;
+            let dckpt = ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(dl));
+            let dit2 = AvDit::load_with(&dckpt, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
+            synaptix_core::gen_status::phase("DFR: детализация");
+            synaptix_video_ltx23::runtime::set_ancestral(Some(base.wrapping_add(20_000)));
+            let (l3, _, _) = lp::denoise_dfr(&dit2, &v_enc, &a_enc, fp_c, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), &slots, Some(&s2), Some((&l1, 2)), fps, device, seed, &hooks).map_err(err)?;
+            drop(dit2);
+            // Обрезка холста до запрошенной длины (видео и звук этапа 1).
+            let l = l3.narrow(2, 0, fp.min(fp_c)).map_err(err)?.contiguous().map_err(err)?;
+            let fa = lp::audio_token_count(fp, fps).min(a1.dims()[1]);
+            let a = a1.narrow(1, 0, fa).map_err(err)?.contiguous().map_err(err)?;
+            synaptix_core::tensor::ops::conv_filter_cache_gc();
+            return Ok((l, Some(a), None, Some(l1.narrow(2, 0, fp.min(fp_c)).map_err(err)?.contiguous().map_err(err)?)));
+        }
         let venc = if matches!(mode, LtxMode::Text | LtxMode::Continue { .. } | LtxMode::A2v { image: None, .. }) { None } else { Some(VaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE: {e}"))?) };
         let image_tokens = |img: &Tensor, g: (usize, usize)| -> R<Tensor> {
             let (ph, pw) = (g.0 * 32, g.1 * 32);
@@ -982,7 +1037,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         _ => write_mp4(&frames, Some((&pcm, 48_000, 2)), fps * fps_mul, out)?,
     }
     let name = if ltx_version_at_least(&ckpt.config.model_version, 2, 5) { "LTX-2.5" } else { "LTX-2.3" };
-    let label = format!("{name} {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / (fps * fps_mul), if two_stage { ", две стадии" } else { "" });
+    let label = format!("{name} {}×{}, {:.1} с, {label_mode}{}", wp * 32, hp * 32, n as f64 / (fps * fps_mul), if dfr { ", DFR" } else if two_stage { ", две стадии" } else { "" });
     Ok(VideoOutput { width: wp * 32, height: hp * 32, frames: n, fps, label, tail: tail_path, continued_from_latent: continued })
 }
 

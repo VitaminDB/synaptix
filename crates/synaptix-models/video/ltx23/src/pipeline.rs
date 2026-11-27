@@ -1441,6 +1441,139 @@ pub fn denoise_av_append(
     Ok((v_latent, a_out))
 }
 
+/// Холст DFR (эталон `dfr_helpers/layout.py`): содержимое `n − 1` кадров
+/// дополняется до кратного сегменту `S ∈ {24, 32}` (меньшее дополнение; при
+/// равенстве — 32). Возвращает (кадров холста `N′`, позиции слотов ключевых
+/// кадров `[S, 2S, …, N′−1]` в пиксельных кадрах).
+pub fn dfr_canvas(n_frames: usize) -> (usize, Vec<usize>) {
+    let content = n_frames.saturating_sub(1).max(1);
+    let pad = |s: usize| (s - content % s) % s;
+    let seg = if pad(24) < pad(32) { 24 } else { 32 };
+    let padded = content + pad(seg);
+    (padded + 1, (1..=padded / seg).map(|k| k * seg).collect())
+}
+
+/// Денойз DFR: видео = `[цель | слоты ключевых кадров | референс]`, звук —
+/// как обычно. Слоты (`slot_frames` — пиксельные кадры) шумятся и
+/// денойзятся вместе с целью (маска 1, эмбеддинг ключевого кадра), на этапе 2
+/// стартуют от `slot_init` `[1,128,K,hp,wp]` (σ₀·шум + (1−σ₀)·init). Референс
+/// (`[1,128,fr,hr,wr]`, IC-LoRA детализации, `downscale` — во сколько раз он
+/// мельче цели) — чистый, маска 0. Возвращает (видео-латент, звук-токены,
+/// слоты `[1,128,K,hp,wp]`).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_dfr(
+    dit: &AvDit,
+    video_encoding: &Tensor,
+    audio_encoding: &Tensor,
+    fp: usize,
+    hp: usize,
+    wp: usize,
+    sigmas: &[f64],
+    v_init: Option<&Tensor>,
+    a_init: Option<&Tensor>,
+    slot_frames: &[usize],
+    slot_init: Option<&Tensor>,
+    reference: Option<(&Tensor, usize)>,
+    fps: f64,
+    device: Device,
+    seed: Option<u64>,
+    hooks: &DenoiseHooks,
+) -> Result<(Tensor, Tensor, Tensor), LtxError> {
+    let (tv, hw, k) = (fp * hp * wp, hp * wp, slot_frames.len());
+    let ddt = dit.compute_dtype();
+    let v_ctx = video_encoding.to_device(device)?.to_dtype(ddt)?;
+    let a_ctx = audio_encoding.to_device(device)?.to_dtype(ddt)?;
+    let fa = audio_token_count(fp, fps);
+    let s0 = sigmas[0] as f32;
+    let tokens = |lat: &Tensor| -> Result<Tensor, LtxError> {
+        let d = lat.dims().to_vec();
+        Ok(lat.to_device(device)?.to_dtype(DType::BF16)?.reshape(vec![1, 128, d[2] * d[3] * d[4]])?.transpose(1, 2)?.contiguous()?)
+    };
+    let renoise = |noise: Tensor, init: Option<&Tensor>| -> Result<Tensor, LtxError> {
+        match init {
+            Some(i) => Ok(noise.mul_scalar(s0)?.add(&tokens(i)?.mul_scalar(1.0 - s0)?)?),
+            None => Ok(noise),
+        }
+    };
+    let v_main = renoise(tokens(&noise_tensor(vec![1usize, 128, fp, hp, wp], seed)?)?, v_init)?;
+    let slots = renoise(tokens(&noise_tensor(vec![1usize, 128, k.max(1), hp, wp], seed.map(|s| s.wrapping_add(777)))?)?, slot_init)?;
+    let a_noise = noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(DType::BF16)?;
+    let mut a_tok = a_noise.transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?;
+    if let Some(init) = a_init {
+        a_tok = a_tok.mul_scalar(s0)?.add(&init.to_device(device)?.to_dtype(DType::BF16)?.mul_scalar(1.0 - s0)?)?;
+    }
+    // Позиции: цель, слоты (один кадр каждый), референс.
+    let mut pos = pixel_coords(fp, hp, wp, fps);
+    let mut t_all = tv;
+    let mut parts: Vec<Tensor> = vec![v_main];
+    if k > 0 {
+        for &f in slot_frames {
+            pos = cat_positions(&pos, t_all, &keyframe_positions(hp, wp, f, fps), hw);
+            t_all += hw;
+        }
+        parts.push(slots);
+    }
+    let mut mask = vec![1f32; t_all];
+    if let Some((r, ds)) = reference {
+        let d = r.dims().to_vec();
+        let tr = d[2] * d[3] * d[4];
+        pos = cat_positions(&pos, t_all, &ref_video_positions(d[2], d[3], d[4], fps, ds), tr);
+        parts.push(tokens(r)?);
+        mask.extend(std::iter::repeat_n(0f32, tr));
+        t_all += tr;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    let mut v_tok = Tensor::cat(&refs, 1)?.contiguous()?;
+    drop(parts);
+    let vm = Tensor::from_vec(mask.clone(), vec![1, t_all, 1], device)?.to_dtype(DType::BF16)?;
+    let vm_inv = vm.affine(-1.0, 1.0)?;
+    let v_clean = v_tok.clone();
+    let a_pos = audio_coords(fa);
+    dit.set_keyframe_ranges(if k > 0 { vec![(tv, tv + k * hw)] } else { Vec::new() });
+    let result = (|| -> Result<(), LtxError> {
+        for i in 0..sigmas.len() - 1 {
+            if hooks.cancelled() {
+                return Err(LtxError::Cancelled);
+            }
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+            let v_ts: Vec<f32> = mask.iter().map(|&m| m * sigma as f32).collect();
+            let a_ts = vec![sigma as f32; fa];
+            let (v_vel, a_vel) = dit.forward(&v_tok, &v_ts, sigma as f32, &pos, &v_ctx, &a_tok, &a_ts, sigma as f32, &a_pos, &a_ctx, None)?;
+            let dt = (sigma_next - sigma) as f32;
+            if let Some(base) = crate::runtime::ancestral() {
+                let s = i as u64 * 2;
+                v_tok = ancestral_step(&v_tok, &v_vel, sigma, sigma_next, base.wrapping_add(s))?;
+                a_tok = ancestral_step(&a_tok, &a_vel, sigma, sigma_next, base.wrapping_add(s + 1))?;
+            } else {
+                v_tok = v_tok.add(&v_vel.broadcast_mul(&vm.mul_scalar(dt)?)?)?;
+                a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+            }
+            v_tok = v_tok.broadcast_mul(&vm)?.add(&v_clean.broadcast_mul(&vm_inv)?)?;
+            hooks.emit(i + 1, sigmas.len() - 1, sigma_next);
+        }
+        Ok(())
+    })();
+    dit.set_keyframe_ranges(Vec::new());
+    result?;
+    let grid = |t: Tensor, f: usize| -> Result<Tensor, LtxError> { Ok(t.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, f, hp, wp])?.to_dtype(DType::F32)?) };
+    let v_latent = grid(v_tok.narrow(1, 0, tv)?.contiguous()?, fp)?;
+    let slot_lat = if k > 0 { grid(v_tok.narrow(1, tv, k * hw)?.contiguous()?, k)? } else { Tensor::zeros(vec![1, 128, 0, hp, wp], DType::F32, device)? };
+    Ok((v_latent, a_tok, slot_lat))
+}
+
+#[cfg(test)]
+mod dfr_tests {
+    use super::dfr_canvas;
+
+    #[test]
+    fn canvas_and_slots() {
+        assert_eq!(dfr_canvas(121), (121, vec![24, 48, 72, 96, 120]));
+        assert_eq!(dfr_canvas(97), (97, vec![32, 64, 96]));
+        // 113 кадров: до 24 — дополнение 8, до 32 — 16 → S = 24, холст 121.
+        assert_eq!(dfr_canvas(113).0, 121);
+    }
+}
+
 /// LipDub (официальный поток): stage1 joint A/V denoise с ref-видео (append,
 /// маска 0) + ref-аудио (append, отриц. позиции) → upscale видео ×2 → stage2
 /// refine видео (ref-видео на полном разрешении; аудио ЗАМОРОЖЕНО = результат

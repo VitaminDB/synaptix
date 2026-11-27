@@ -1610,6 +1610,26 @@ fn add_first_frame_emb(vx: &Tensor, e: &Tensor, positions: &[f64]) -> R<Tensor> 
     Tensor::cat(&[&head, &vx.narrow(1, n, t - n)?.contiguous()?], 1)
 }
 
+/// Эмбеддинг `e [1,dim]` к токенам `[a, b)` (слоты ключевых кадров DFR).
+fn add_range_emb(vx: &Tensor, e: &Tensor, a: usize, b: usize) -> R<Tensor> {
+    let t = vx.dims()[1];
+    let (a, b) = (a.min(t), b.min(t));
+    if a >= b {
+        return Ok(vx.clone());
+    }
+    let e = e.reshape(vec![1, 1, e.dims().iter().product::<usize>()])?.to_dtype(vx.dtype())?;
+    let mut parts: Vec<Tensor> = Vec::new();
+    if a > 0 {
+        parts.push(vx.narrow(1, 0, a)?.contiguous()?);
+    }
+    parts.push(vx.narrow(1, a, b - a)?.contiguous()?.broadcast_add(&e)?);
+    if b < t {
+        parts.push(vx.narrow(1, b, t - b)?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 1)
+}
+
 /// Есть ли у блоков смещение тензора `suffix` (LTX-2.5: видео-FFN без смещения).
 fn block_has(ckpt: &LtxCheckpoint, suffix: &str) -> bool {
     ckpt.contains(&format!("{}.{suffix}", block_prefix(0)))
@@ -2105,6 +2125,9 @@ pub struct AvDit {
     /// LTX-2.5 (`use_keyframes_abs_pos_embedding`): `[1,4096]`, прибавляется
     /// к токенам первого латентного кадра сразу после patchify.
     v_kf_emb: Option<Tensor>,
+    /// Диапазоны токенов `[начало, конец)` со слотами сгенерированных ключевых
+    /// кадров (DFR): им тот же эмбеддинг, что первому кадру.
+    kf_ranges: std::sync::Mutex<Vec<(usize, usize)>>,
     v_ada: AdaLN,
     v_pada: AdaLN,
     v_sst_out: Tensor,
@@ -2243,6 +2266,7 @@ impl AvDit {
         Ok(Self {
             v_patchify: g("patchify_proj")?,
             v_kf_emb,
+            kf_ranges: std::sync::Mutex::new(Vec::new()),
             v_ada: ga("adaln_single")?,
             v_pada: ga("prompt_adaln_single")?,
             v_sst_out: raw("scale_shift_table")?,
@@ -2343,6 +2367,13 @@ impl AvDit {
     }
 
     /// Forward → (velocity_video `[1,Tv,128]`, velocity_audio `[1,Ta,128]`).
+    /// Слоты ключевых кадров (DFR) на ближайшие проходы; пустой список — снять.
+    pub fn set_keyframe_ranges(&self, ranges: Vec<(usize, usize)>) {
+        if let Ok(mut r) = self.kf_ranges.lock() {
+            *r = ranges;
+        }
+    }
+
     /// `positions_*` — host f64: video `[3*Tv*2]`, audio `[1*Ta*2]`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
@@ -2366,6 +2397,10 @@ impl AvDit {
         let mut vx = self.v_patchify.fwd(v_latent)?; // [1,Tv,4096]
         if let Some(e) = &self.v_kf_emb {
             vx = add_first_frame_emb(&vx, e, v_positions)?;
+            let ranges = self.kf_ranges.lock().map(|r| r.clone()).unwrap_or_default();
+            for (a, b) in ranges {
+                vx = add_range_emb(&vx, e, a, b)?;
+            }
         }
         let mut ax = self.a_patchify.fwd(a_latent)?; // [1,Ta,2048]
 

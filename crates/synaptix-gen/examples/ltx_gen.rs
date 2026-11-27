@@ -24,6 +24,7 @@ fn main() {
         height: Some(a[6].parse().unwrap()),
         seed: a[7].parse().unwrap(),
         fps_x2: std::env::var("LTX_FPS_X2").is_ok(),
+        dfr: std::env::var("LTX_DFR").is_ok(),
         source_video: std::env::var("LTX_SOURCE").ok().map(PathBuf::from),
         extend: std::env::var("LTX_EXTEND").is_ok(),
         tail_out: std::env::var("LTX_TAIL_OUT").ok().map(PathBuf::from),
