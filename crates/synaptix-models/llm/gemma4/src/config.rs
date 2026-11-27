@@ -158,7 +158,11 @@ impl Gemma4Config {
                 .ok_or_else(|| ConfigError::Invalid("нет num_attention_heads".into()))?,
             num_key_value_heads: usize_at(&text, "num_key_value_heads").unwrap_or(1),
             head_dim,
-            global_head_dim: usize_at(&text, "global_head_dim").unwrap_or(head_dim),
+            // Новая форма конфига (улучшитель промпта LTX-2.5): размер головы
+            // full-слоёв — в `per_layer_config` (`{"04": {"head_dim": 512}, …}`).
+            global_head_dim: usize_at(&text, "global_head_dim")
+                .or_else(|| text.get("per_layer_config")?.as_object()?.values().find_map(|v| v.get("head_dim")?.as_u64()).map(|v| v as usize))
+                .unwrap_or(head_dim),
             num_global_key_value_heads: usize_at(&text, "num_global_key_value_heads")
                 .unwrap_or_else(|| usize_at(&text, "num_key_value_heads").unwrap_or(1)),
             attention_k_eq_v: text

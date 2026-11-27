@@ -1655,20 +1655,30 @@ impl DecoderModel {
                         }
                         weights.tensor(&k, b_dev, compute).map(Some)
                     };
+                    // Слой с общим KV берёт ключи и значения у слоя-источника: в
+                    // части чекпойнтов (улучшитель промпта LTX-2.5, Gemma 4 E2B)
+                    // его собственных k/v-проекций и k_norm нет вовсе — на их
+                    // место встают веса источника (в счёте не участвуют).
+                    let kv_key = |s: &str| -> String {
+                        match cfg.kv_source(l) {
+                            Some(src) if !weights.contains(&key(s)) => format!("model.layers.{src}.{s}"),
+                            _ => key(s),
+                        }
+                    };
                     Mixer::Full(FullAttn {
                         q_proj: qlin(&key("self_attn.q_proj.weight"), attn_w)?,
-                        k_proj: qlin(&key("self_attn.k_proj.weight"), attn_w)?,
+                        k_proj: qlin(&kv_key("self_attn.k_proj.weight"), attn_w)?,
                         v_proj: if cfg.k_eq_v_at(l) {
                             None
                         } else {
-                            Some(qlin(&key("self_attn.v_proj.weight"), attn_w)?)
+                            Some(qlin(&kv_key("self_attn.v_proj.weight"), attn_w)?)
                         },
                         o_proj: qlin(&key("self_attn.o_proj.weight"), attn_w)?,
                         q_bias: bias("self_attn.q_proj.bias")?,
                         k_bias: bias("self_attn.k_proj.bias")?,
                         v_bias: bias("self_attn.v_proj.bias")?,
                         q_norm: if cfg.qk_norm { Some(norm(&key("self_attn.q_norm.weight"))?) } else { None },
-                        k_norm: if cfg.qk_norm { Some(norm(&key("self_attn.k_norm.weight"))?) } else { None },
+                        k_norm: if cfg.qk_norm { Some(norm(&kv_key("self_attn.k_norm.weight"))?) } else { None },
                         v_norm: if cfg.ext.as_ref().is_some_and(|e| e.v_rms_norm) { Some(ones(hd)?) } else { None },
                         num_heads: cfg.num_attention_heads,
                         num_kv_heads: cfg.kv_heads_at(l),
