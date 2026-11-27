@@ -41,6 +41,7 @@ const MAX_SMEM: u32 = 99 * 1024;
 impl Gpu {
     pub fn new(ordinal: usize) -> Result<Arc<Self>> {
         let ctx = CudaContext::new(ordinal).map_err(cuda("CudaContext"))?;
+        let _ = ctx.set_blocking_synchronize();
         let stream = ctx.new_stream().map_err(cuda("new_stream"))?;
         let module = synaptix_kernels_cuda::kernels::compile::compile_module_with_opts(&ctx, include_str!("vfx.cu"), "synaptix-vfx/vfx.cu", &[], None)
             .map_err(|e| Error::Cuda(e.to_string()))?;

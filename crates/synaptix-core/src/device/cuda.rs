@@ -55,6 +55,9 @@ mod inner {
         if let Err(e) = ctx.bind_to_thread() {
             return Err(SynaptixError::Cuda(format!("bind_to_thread({ordinal}): {e:?}")));
         }
+        // Сон потока вместо busy-wait (CU_CTX_SCHED_AUTO → SPIN) в synchronize/event:
+        // на ноутбуке 100% одного ядра греет CPU и отбирает Dynamic Boost у GPU.
+        let _ = ctx.set_blocking_synchronize();
         if let Ok(pool) =
             unsafe { cudarc::driver::result::device::get_default_mem_pool(ctx.cu_device()) }
         {
