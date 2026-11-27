@@ -35,6 +35,9 @@ pub struct TailMeta {
     pub overlap_frames: usize,
     /// Число аудио-латентных кадров в хвосте (0 — без аудио).
     pub audio_frames: usize,
+    /// Цвет последних `overlap_frames` кадров ролика после декодирования:
+    /// средние R, G, B и их разброс — по нему следующий ролик подгоняет стык.
+    pub color: Option<[f32; 6]>,
 }
 
 impl TailMeta {
@@ -113,6 +116,9 @@ impl TailMeta {
         m.insert("context_frames".into(), self.context_frames.to_string());
         m.insert("overlap_frames".into(), self.overlap_frames.to_string());
         m.insert("audio_frames".into(), self.audio_frames.to_string());
+        if let Some(c) = self.color {
+            m.insert("color".into(), c.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","));
+        }
         m
     }
 
@@ -128,6 +134,10 @@ impl TailMeta {
             context_frames: num("context_frames")?,
             overlap_frames: num("overlap_frames")?,
             audio_frames: m.get("audio_frames").and_then(|v| v.parse().ok()).unwrap_or(0),
+            color: m.get("color").and_then(|v| {
+                let x: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                <[f32; 6]>::try_from(x).ok()
+            }),
         })
     }
 }
@@ -274,6 +284,7 @@ mod tests {
                 context_frames: 2,
                 overlap_frames: 5,
                 audio_frames: 1,
+                color: Some([0.1, 0.2, 0.3, 0.01, 0.02, 0.03]),
             },
             video: v.clone(),
             audio: Some(a.clone()),

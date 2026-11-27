@@ -159,6 +159,8 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
         None => None,
     };
     let continued = context.is_some();
+    // цвет конца предыдущего ролика — для подгонки стыка
+    let prev_color = context.as_ref().and_then(|c| c.meta.color);
     let ctx_lat_frames = context.as_ref().map(|c| c.meta.context_frames).unwrap_or(0);
     let size = st::Size { width: req.width.unwrap_or(0), height: req.height.unwrap_or(0), seconds: req.seconds.unwrap_or(0.0) };
     let steps = req.steps.filter(|&s| s > 0).or(distilled).unwrap_or(20);
@@ -172,16 +174,26 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     synaptix_core::gen_status::phase("загрузка DiT");
     let lat = m.sample(&cond, steps, cfg_scale, req.seed, req.source_video.as_deref(), req.strength, cancel, progress)?;
     drop(cond);
-    let tail_path = if let Some(tp) = &req.tail_out {
-        let model_name = req.model_id.as_deref().unwrap_or("minimax-h3");
-        let tail = lat.tail(req.context_frames.unwrap_or(0), model_name)?;
-        tail.save(tp)?;
-        Some(tp.clone())
-    } else {
-        None
+    let tail = match &req.tail_out {
+        Some(_) => Some(lat.tail(req.context_frames.unwrap_or(0), req.model_id.as_deref().unwrap_or("minimax-h3"))?),
+        None => None,
     };
     synaptix_core::gen_status::phase("декодер VAE: видео");
-    let frames = m.decode_video(&lat)?;
+    let (mut frames, overlap) = m.decode_video_overlap(&lat)?;
+    // стык с предыдущим роликом: кадры перекрытия — тот же латент, что его конец;
+    // подгоняем цвет начала к концу предыдущего и отпускаем за 2 с
+    if let (Some(dst), Some(src)) = (prev_color, crate::color_match::stats(&overlap)?) {
+        crate::color_match::match_start(&mut frames, &src, &dst, (2.0 * st::FPS) as usize)?;
+    }
+    let tail_path = match (tail, &req.tail_out) {
+        (Some(mut t), Some(tp)) => {
+            let k = t.meta.overlap_frames.min(frames.len());
+            t.meta.color = crate::color_match::stats(&frames[frames.len() - k..])?;
+            t.save(tp)?;
+            Some(tp.clone())
+        }
+        _ => None,
+    };
     synaptix_core::gen_status::phase("декодер VAE: звук");
     let (pcm, sample_rate, channels) = m.decode_audio(&lat)?;
     synaptix_core::gen_status::phase("запись mp4");
