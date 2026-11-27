@@ -163,7 +163,6 @@ impl H3Latent {
                 context_frames: t_ctx,
                 overlap_frames,
                 audio_frames: a_ctx,
-                color: None,
             },
             video: v_tail,
             audio: Some(a_tail),
@@ -446,11 +445,6 @@ impl H3Model {
     /// Латент видео → кадры `[3,H,W]` 0..1 (24 к/с). При продолжении с хвоста
     /// декодируется полный латент (для прогрева ViT VAE), затем перекрытие отрезается.
     pub fn decode_video(&self, lat: &H3Latent) -> R<Vec<Tensor>> {
-        Ok(self.decode_video_overlap(lat)?.0)
-    }
-
-    /// То же, но отрезанные кадры перекрытия тоже возвращаются (для подгонки цвета стыка).
-    pub fn decode_video_overlap(&self, lat: &H3Latent) -> R<(Vec<Tensor>, Vec<Tensor>)> {
         setup()?;
         let device = self.device;
         let ckpt = h3::H3Checkpoint::open_source(lat.source.clone(), device, COMPUTE).map_err(err)?;
@@ -461,11 +455,10 @@ impl H3Model {
         drop(vw);
         h3::memory::trim_pool(device);
         let mut frames = h3::vae::rgb_to_frames(&rgb).map_err(err)?;
-        let mut overlap = Vec::new();
         if lat.overlap_frames > 0 && frames.len() > lat.overlap_frames {
-            overlap = frames.drain(0..lat.overlap_frames).collect();
+            frames.drain(0..lat.overlap_frames);
         }
-        Ok((frames, overlap))
+        Ok(frames)
     }
 
     /// Латент звука → перемежённые отсчёты, частота, каналы (с обрезкой перекрытия хвоста).

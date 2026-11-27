@@ -184,7 +184,6 @@ impl LtxLatent {
                 context_frames: t_ctx,
                 overlap_frames,
                 audio_frames: fa_ctx,
-                color: None,
             },
             video: v_tail,
             audio: Some(a_tail),
