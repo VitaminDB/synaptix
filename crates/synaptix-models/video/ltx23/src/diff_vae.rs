@@ -30,6 +30,9 @@ const UP: [(usize, usize, usize); 4] = [(1, 2, 2), (2, 1, 1), (2, 2, 2), (2, 2, 
 const ROW_BUDGET: usize = 192 << 20;
 /// Бюджет токенов среза внимания (q', k', qkv среза).
 const SLAB_TOKENS: usize = 1 << 19;
+/// Бюджет токенов объёма стадии 5 на срез по времени и перекрытие срезов, кадров.
+const TILE_TOKENS: usize = 8 << 20;
+const TILE_OVERLAP: usize = 40;
 
 fn addr(t: &Tensor) -> R<u64> {
     if !t.is_contiguous() {
@@ -233,6 +236,12 @@ impl Block {
 /// индекс канала `((c·pt + it)·ph + ih)·pw + iw`. При шаге по времени 2
 /// первый кадр выхода отбрасывается (причинность).
 fn shuffle(x: &Tensor, t: usize, h: usize, w: usize, p: (usize, usize, usize)) -> R<Vol> {
+    shuffle_opt(x, t, h, w, p, true)
+}
+
+/// То же; `drop_first` — отбрасывать ли первый кадр при шаге по времени 2
+/// (у среза не с начала ролика — нет).
+fn shuffle_opt(x: &Tensor, t: usize, h: usize, w: usize, p: (usize, usize, usize), drop_first: bool) -> R<Vol> {
     let c = x.dims()[2] / (p.0 * p.1 * p.2);
     let y = x
         .reshape(vec![t, h, w, c, p.0, p.1, p.2])?
@@ -240,7 +249,7 @@ fn shuffle(x: &Tensor, t: usize, h: usize, w: usize, p: (usize, usize, usize)) -
         .contiguous()?
         .reshape(vec![1, t * p.0 * h * p.1 * w * p.2, c])?;
     let (mut t2, h2, w2) = (t * p.0, h * p.1, w * p.2);
-    let x = if p.0 == 2 {
+    let x = if p.0 == 2 && drop_first {
         t2 -= 1;
         y.narrow(1, h2 * w2, t2 * h2 * w2)?.contiguous()?
     } else {
@@ -344,47 +353,98 @@ impl DiffVaeDecoder {
             for blk in &self.stages[s] {
                 blk.forward(&mut v, KERNEL[s], None)?;
             }
-            let (uw, ub) = &self.ups[s];
-            let up_c = uw.dims()[0];
-            let y = rows(&v.x, up_c, up_c, |r| linear(r, uw, Some(ub)))?;
-            v = shuffle(&y, v.t, v.h, v.w, UP[s])?;
+            if s < 3 {
+                let (uw, ub) = &self.ups[s];
+                let up_c = uw.dims()[0];
+                let y = rows(&v.x, up_c, up_c, |r| linear(r, uw, Some(ub)))?;
+                v = shuffle(&y, v.t, v.h, v.w, UP[s])?;
+            }
         }
-        // Срез «призрачного» хвоста: 8F + 9 → 8F − 7 кадров.
+        // Выход стадии 4 до апсемпла: кадр j контекста стадии 5 — кадр j+1
+        // апсемпла (первый отброшен), то есть половина кадра (j+1)/2 стадии 4.
+        // «Призрачный» хвост срезается: 8F + 9 → 8F − 7 кадров.
         let t5 = 8 * f - 7;
-        let hw = v.h * v.w;
-        let context = v.x.narrow(1, 0, t5 * hw)?.contiguous()?;
-        let (gh, gw) = (v.h, v.w);
-        drop(v);
+        let (h4, w4, hw4) = (v.h, v.w, v.h * v.w);
+        let (gh, gw) = (h4 * 2, w4 * 2);
+        let hw = gh * gw;
+        let v4 = v.x;
         if t5 < KERNEL[4].0 {
             return Err(LtxError::Load(format!("диффузионный декодер: {t5} кадров меньше окна 11")));
         }
-        synaptix_core::gen_status::phase("диффузионный декодер: стадия 5 из 5");
-        // Шум сразу в пространстве патчей 4×4 (48 каналов) → 256.
-        let n = t5 * hw;
-        let mut x5 = Tensor::empty_uninit(vec![1, n, 256], DT, dev)?;
-        let step = (ROW_BUDGET / 256).max(1024);
-        let mut off = 0;
-        let mut k = 0u64;
-        while off < n {
-            let m = step.min(n - off);
-            // `LTX_DIFFVAE_ZERO_NOISE=1` — нулевой шум (сверка с эталоном без общего генератора).
-            let noise = if std::env::var_os("LTX_DIFFVAE_ZERO_NOISE").is_some() {
-                Tensor::zeros(vec![1usize, m, 48], DT, dev)?
-            } else {
-                Tensor::randn_seeded(vec![1usize, m, 48], seed.wrapping_add(k), Device::Cpu)?.to_device(dev)?.to_dtype(DT)?
-            };
-            x5.copy_rows_from(off, &linear(&noise, &self.conv_in_x.0, Some(&self.conv_in_x.1))?.contiguous()?)?;
-            off += m;
-            k += 1;
+        let (uw, ub) = &self.ups[3];
+        let context_for = |p: usize, q: usize| -> R<Tensor> {
+            let (a, b) = ((p + 1) / 2, q / 2);
+            let part = v4.narrow(1, a * hw4, (b - a + 1) * hw4)?.contiguous()?;
+            let up_c = uw.dims()[0];
+            let y = rows(&part, up_c, up_c, |r| linear(r, uw, Some(ub)))?;
+            let vol = shuffle_opt(&y, b - a + 1, h4, w4, UP[3], false)?;
+            vol.x.narrow(1, (p + 1 - 2 * a) * hw, (q - p) * hw)?.contiguous()
+        };
+        // Стадия 5 — срезами по времени (объём растёт с длиной ролика):
+        // перекрытие 40 кадров, линейное смешивание (эталон `diffusion_tiling`).
+        let budget_frames = (TILE_TOKENS / hw).max(KERNEL[4].0 + 2 * TILE_OVERLAP);
+        let tiles: Vec<(usize, usize)> = if t5 <= budget_frames {
+            vec![(0, t5)]
+        } else {
+            let stride = budget_frames - TILE_OVERLAP;
+            let mut v = Vec::new();
+            let mut p = 0;
+            loop {
+                let q = (p + budget_frames).min(t5);
+                v.push((q.saturating_sub(budget_frames).min(p), q));
+                if q == t5 {
+                    break;
+                }
+                p += stride;
+            }
+            v
+        };
+        let mut y = Tensor::empty_uninit(vec![1, t5 * hw, 48], DT, dev)?;
+        let mut done = 0usize;
+        for (ti, &(p, q)) in tiles.iter().enumerate() {
+            synaptix_core::gen_status::phase(format!("диффузионный декодер: стадия 5 из 5, срез {} из {}", ti + 1, tiles.len()));
+            let context = context_for(p, q)?;
+            // Шум сразу в пространстве патчей 4×4 (48 каналов) → 256.
+            let n = (q - p) * hw;
+            let mut x5 = Tensor::empty_uninit(vec![1, n, 256], DT, dev)?;
+            let step = (ROW_BUDGET / 256).max(1024);
+            let (mut off, mut k) = (0usize, 0u64);
+            while off < n {
+                let m = step.min(n - off);
+                // `LTX_DIFFVAE_ZERO_NOISE=1` — нулевой шум (сверка с эталоном без общего генератора).
+                let noise = if std::env::var_os("LTX_DIFFVAE_ZERO_NOISE").is_some() {
+                    Tensor::zeros(vec![1usize, m, 48], DT, dev)?
+                } else {
+                    Tensor::randn_seeded(vec![1usize, m, 48], seed.wrapping_add(k + ((ti as u64) << 20)), Device::Cpu)?.to_device(dev)?.to_dtype(DT)?
+                };
+                x5.copy_rows_from(off, &linear(&noise, &self.conv_in_x.0, Some(&self.conv_in_x.1))?.contiguous()?)?;
+                off += m;
+                k += 1;
+            }
+            let mut vol = Vol { x: x5, t: q - p, h: gh, w: gw };
+            for blk in &self.stages[4] {
+                blk.forward(&mut vol, KERNEL[4], Some(&context))?;
+            }
+            drop(context);
+            // norm_out → conv_out (48 = 3·4·4).
+            let yt = rows(&vol.x, 48, 256 * 2, |r| linear(&rms(r, &self.norm_out)?, &self.conv_out.0, Some(&self.conv_out.1)))?;
+            drop(vol);
+            // Перекрытие с уже записанным — покадровое линейное смешивание.
+            let ov = done.saturating_sub(p);
+            for j in 0..ov {
+                let a = (j + 1) as f32 / (ov + 1) as f32;
+                let old = y.narrow(1, (p + j) * hw, hw)?.contiguous()?;
+                let new = yt.narrow(1, j * hw, hw)?.contiguous()?;
+                let mix = old.mul_scalar(1.0 - a)?.add(&new.mul_scalar(a)?)?;
+                y.copy_rows_from((p + j) * hw, &mix.contiguous()?)?;
+            }
+            if q - p > ov {
+                y.copy_rows_from((p + ov) * hw, &yt.narrow(1, ov * hw, (q - p - ov) * hw)?.contiguous()?)?;
+            }
+            done = q;
         }
-        let mut v = Vol { x: x5, t: t5, h: gh, w: gw };
-        for blk in &self.stages[4] {
-            blk.forward(&mut v, KERNEL[4], Some(&context))?;
-        }
-        drop(context);
-        // norm_out → conv_out (48 = 3·4·4) → unpatchify: канал (c·4 + dw)·4 + dh.
-        let y = rows(&v.x, 48, 256 * 2, |r| linear(&rms(r, &self.norm_out)?, &self.conv_out.0, Some(&self.conv_out.1)))?;
-        drop(v);
+        drop(v4);
+        // unpatchify: канал (c·4 + dw)·4 + dh.
         let rgb = y
             .reshape(vec![t5, gh, gw, 3, 4, 4])?
             .permute(vec![3, 0, 1, 5, 2, 4])?
