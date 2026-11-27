@@ -151,12 +151,8 @@ impl Drama3 {
         // остаток видеопамяти (минус запас под активации префилла) отдаём кэшу.
         // Декод MoE без синхронизации с хостом (zero-copy): выбор экспертов и
         // счёт — на карте, эксперт читается из слота VRAM или прямо из
-        // закреплённой RAM. Слотов на слой — по свободной видеопамяти: 16…64
-        // (потолок `D3_ZC_MAX`), запас под префилл, KV и кодек; `D3_ZC=N` — задать,
-        // `D3_ZC=0` — выключить. Потолок 64 (≈8 ГБ), а не «всё свободное»: иначе
-        // соседней модели службы (LLM агента, распознавание) не хватает карты,
-        // служба выгружает Drama 3 после каждой реплики, и следующая реплика
-        // заново читает с диска 31 ГБ зеркала экспертов.
+        // закреплённой RAM. Слотов на слой — по свободной видеопамяти: 16…160,
+        // запас 3 ГБ под префилл, KV и кодек; `D3_ZC=N` — задать, `D3_ZC=0` — выключить.
         let zc_slots = std::env::var("D3_ZC").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
             let free = match device {
                 Device::Cuda(ord) => synaptix_core::device::cuda::mem_info(ord).map(|(f, _)| f as usize).unwrap_or(0),
@@ -167,8 +163,7 @@ impl Drama3 {
             // Оставляем запас 4,5 ГБ под KV/SSM, префилл, кодек и арену (перелив VRAM
             // в системную память через драйвер замедляет декод почти вдвое).
             let per_expert = 3 * c.hidden_size * 512 * 33 / 32;
-            let cap = std::env::var("D3_ZC_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64).max(16);
-            (free.saturating_sub(4608usize << 20) / c.num_hidden_layers.max(1) / per_expert.max(1)).clamp(16, cap)
+            (free.saturating_sub(4608usize << 20) / c.num_hidden_layers.max(1) / per_expert.max(1)).clamp(16, 160)
         });
         let zc = if zc_slots > 0 { lm.model.attach_zc(zc_slots) } else { None };
         if std::env::var_os("D3_PROF").is_some() {
