@@ -11,7 +11,7 @@ default = []
 audio = ["dep:hound", "dep:symphonia", "dep:rubato"]
 image = ["dep:image"]
 video = ["dep:ffmpeg-next"]
-documents = ["dep:pulldown-cmark", "dep:htmd", "dep:pdf-extract", "dep:ignore"]
+documents = ["dep:pulldown-cmark", "dep:htmd", "dep:pdf-extract", "dep:lopdf", "dep:png", "dep:encoding_rs", "dep:ignore"]
 
 [dependencies]
 synaptix-core   = { workspace = true }
@@ -33,6 +33,9 @@ image           = { workspace = true, optional = true }
 pulldown-cmark  = { workspace = true, optional = true }
 htmd            = { workspace = true, optional = true }
 pdf-extract     = { workspace = true, optional = true }
+lopdf           = { version = "0.34", optional = true }
+png             = { version = "0.17", optional = true }
+encoding_rs     = { version = "0.8", optional = true }
 ignore          = { workspace = true, optional = true }
 ffmpeg-next     = { workspace = true, optional = true }
 
