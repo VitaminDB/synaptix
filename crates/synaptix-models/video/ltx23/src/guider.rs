@@ -112,6 +112,47 @@ pub fn calculate(
     Ok(pred)
 }
 
+/// Как [`calculate`], но rescale считается только по токенам с `active[k]`
+/// (замороженные условием токены не искажают его) — `calculate(..., denoise_mask)`
+/// оригинала. Тензоры `[1, T, C]`; меньше двух активных токенов — без rescale.
+pub fn calculate_masked(
+    p: &GuiderParams,
+    cond: &Tensor,
+    uncond_text: Option<&Tensor>,
+    uncond_perturbed: Option<&Tensor>,
+    uncond_modality: Option<&Tensor>,
+    active: Option<&[bool]>,
+) -> R<Tensor> {
+    let Some(active) = active.filter(|a| a.iter().any(|x| !*x)) else {
+        return calculate(p, cond, uncond_text, uncond_perturbed, uncond_modality);
+    };
+    let plain = GuiderParams { rescale_scale: 0.0, ..p.clone() };
+    let pred = calculate(&plain, cond, uncond_text, uncond_perturbed, uncond_modality)?;
+    if approx_eq(p.rescale_scale, 0.0) {
+        return Ok(pred);
+    }
+    let c = cond.dims()[cond.rank() - 1];
+    let pick = |t: &Tensor| -> R<Vec<f32>> {
+        let v: Vec<f32> = t.to_dtype(synaptix_core::dtype::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(v.chunks(c).zip(active).filter(|(_, a)| **a).flat_map(|(r, _)| r.iter().copied()).collect())
+    };
+    let (cs, ps) = (std_vec(&pick(cond)?), std_vec(&pick(&pred)?));
+    if cs.is_none() || ps.is_none() {
+        return Ok(pred);
+    }
+    let factor = p.rescale_scale * (cs.unwrap() / ps.unwrap()) + (1.0 - p.rescale_scale);
+    Ok(pred.mul_scalar(factor)?)
+}
+
+fn std_vec(v: &[f32]) -> Option<f32> {
+    let n = v.len() as f32;
+    if n < 2.0 {
+        return None;
+    }
+    let mean = v.iter().sum::<f32>() / n;
+    Some((v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (n - 1.0)).sqrt())
+}
+
 /// Стандартное отклонение по всем элементам (population std, как `torch.std()` с
 /// `unbiased=False`? — torch.std() по умолчанию unbiased=True; LTX использует
 /// `tensor.std()` → unbiased=True, делитель N-1).

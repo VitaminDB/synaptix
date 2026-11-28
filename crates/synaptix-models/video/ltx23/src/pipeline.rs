@@ -1269,6 +1269,149 @@ pub fn denoise_av_cond(
     Ok((v_latent, a_tok))
 }
 
+/// Управляемый денойз видео со звуком — стадия 1 официального `ti2vid_two_stages`
+/// для полного (не distilled) чекпойнта: на шаге проходы cond, отрицательный
+/// промпт (CFG), STG (пропуск self-attn видео/звука в `stg_blocks`) и изоляция
+/// модальностей (без перекрёстного внимания A↔V) — только нужные гайдерам;
+/// сведение — в пространстве x0 своим гайдером видео и звука (rescale — по
+/// свободным токенам), шаг Euler. `v_conds` — замена кадров (первый кадр и т. п.),
+/// как в [`denoise_av_cond`]. → (латент видео `[1,128,F',H',W']`, токены звука).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_guided(
+    dit: &AvDit,
+    video_encoding: &Tensor,
+    audio_encoding: &Tensor,
+    v_neg: &Tensor,
+    a_neg: &Tensor,
+    vg: &GuiderParams,
+    ag: &GuiderParams,
+    fp: usize,
+    hp: usize,
+    wp: usize,
+    sigmas: &[f64],
+    fps: f64,
+    device: Device,
+    v_conds: &[(usize, Tensor, f32)],
+    seed: Option<u64>,
+    hooks: &DenoiseHooks,
+) -> Result<(Tensor, Tensor), LtxError> {
+    use crate::dit::AvPerturb;
+    let tv = fp * hp * wp;
+    let v_pos = pixel_coords(fp, hp, wp, fps);
+    let ddt = dit.compute_dtype();
+    let v_ctx = video_encoding.to_device(device)?.to_dtype(ddt)?;
+    let a_ctx = audio_encoding.to_device(device)?.to_dtype(ddt)?;
+    let v_nctx = v_neg.to_device(device)?.to_dtype(ddt)?;
+    let a_nctx = a_neg.to_device(device)?.to_dtype(ddt)?;
+    let fa = audio_token_count(fp, fps);
+    let a_pos = audio_coords(fa);
+    let v_noise = noise_tensor(vec![1usize, 128, fp, hp, wp], seed)?.to_device(device)?.to_dtype(ddt)?;
+    let a_noise = noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(ddt)?;
+    let mut v_tok = v_noise.reshape(vec![1, 128, tv])?.transpose(1, 2)?.contiguous()?;
+    let mut a_tok = a_noise.transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?;
+    // Замена кадров условием (как denoise_av_cond).
+    let mut v_mask_v = vec![1f32; tv];
+    for (start, toks, strength) in v_conds {
+        let n = toks.dims()[1];
+        for k in *start..(*start + n).min(tv) {
+            v_mask_v[k] = 1.0 - *strength;
+        }
+        let toks = toks.to_device(device)?.to_dtype(ddt)?;
+        let mut parts: Vec<Tensor> = Vec::new();
+        if *start > 0 {
+            parts.push(v_tok.narrow(1, 0, *start)?.contiguous()?);
+        }
+        parts.push(toks);
+        if start + n < tv {
+            parts.push(v_tok.narrow(1, start + n, tv - start - n)?.contiguous()?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        v_tok = Tensor::cat(&refs, 1)?.contiguous()?;
+    }
+    let cond = !v_conds.is_empty();
+    let v_clean = v_tok.clone();
+    let v_m = Tensor::from_vec(v_mask_v.clone(), vec![1, tv, 1], device)?.to_dtype(ddt)?;
+    let v_inv = v_m.affine(-1.0, 1.0)?;
+    let active: Vec<bool> = v_mask_v.iter().map(|m| *m != 0.0).collect();
+
+    // Проходы: (контекст видео, контекст звука, возмущение).
+    let need_u = vg.do_uncond() || ag.do_uncond();
+    let ptb_stg = AvPerturb {
+        skip_video_self: if vg.do_perturbed() { vg.stg_blocks.clone() } else { Vec::new() },
+        skip_audio_self: if ag.do_perturbed() { ag.stg_blocks.clone() } else { Vec::new() },
+        skip_cross: false,
+    };
+    let need_p = !ptb_stg.skip_video_self.is_empty() || !ptb_stg.skip_audio_self.is_empty();
+    let need_m = vg.do_isolated_modality() || ag.do_isolated_modality();
+    let ptb_mod = AvPerturb { skip_cross: true, ..AvPerturb::default() };
+
+    let total = sigmas.len() - 1;
+    for i in 0..total {
+        if hooks.cancelled() {
+            return Err(LtxError::Cancelled);
+        }
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        let v_ts: Vec<f32> = v_mask_v.iter().map(|&m| m * sigma as f32).collect();
+        let a_ts = vec![sigma as f32; fa];
+        let run = |vc: &Tensor, ac: &Tensor, p: Option<&AvPerturb>| {
+            dit.forward_ptb(&v_tok, &v_ts, sigma as f32, &v_pos, vc, &a_tok, &a_ts, sigma as f32, &a_pos, ac, None, p)
+        };
+        let (cv, ca) = run(&v_ctx, &a_ctx, None)?;
+        let skip_guidance = vg.should_skip_step(i) && ag.should_skip_step(i);
+        let (u, p, m) = if skip_guidance {
+            (None, None, None)
+        } else {
+            (
+                if need_u { Some(run(&v_nctx, &a_nctx, None)?) } else { None },
+                if need_p { Some(run(&v_ctx, &a_ctx, Some(&ptb_stg))?) } else { None },
+                if need_m { Some(run(&v_ctx, &a_ctx, Some(&ptb_mod))?) } else { None },
+            )
+        };
+        // Сведение в x0: x0 = x − t·v (t по токену), гайдер, обратно в скорость.
+        let v_t = v_m.mul_scalar(sigma as f32)?;
+        let v_x0 = |vel: &Tensor| -> Result<Tensor, LtxError> { Ok(v_tok.sub(&vel.broadcast_mul(&v_t)?)?) };
+        let a_x0 = |vel: &Tensor| -> Result<Tensor, LtxError> { Ok(a_tok.sub(&vel.mul_scalar(sigma as f32)?)?) };
+        let (v_vel, a_vel) = if skip_guidance {
+            (cv, ca)
+        } else {
+            let opt_v = |x: &Option<(Tensor, Tensor)>| x.as_ref().map(|t| v_x0(&t.0)).transpose();
+            let opt_a = |x: &Option<(Tensor, Tensor)>| x.as_ref().map(|t| a_x0(&t.1)).transpose();
+            let (uv, pv, mv) = (opt_v(&u)?, opt_v(&p)?, opt_v(&m)?);
+            let (ua, pa, ma) = (opt_a(&u)?, opt_a(&p)?, opt_a(&m)?);
+            let gate = |on: bool, t: &Option<Tensor>| if on { t.clone() } else { None };
+            let x0v = guider::calculate_masked(
+                vg,
+                &v_x0(&cv)?,
+                gate(vg.do_uncond(), &uv).as_ref(),
+                gate(vg.do_perturbed(), &pv).as_ref(),
+                gate(vg.do_isolated_modality(), &mv).as_ref(),
+                cond.then_some(&active[..]),
+            )?;
+            let x0a = guider::calculate(
+                ag,
+                &a_x0(&ca)?,
+                gate(ag.do_uncond(), &ua).as_ref(),
+                gate(ag.do_perturbed(), &pa).as_ref(),
+                gate(ag.do_isolated_modality(), &ma).as_ref(),
+            )?;
+            let v_tc = v_t.clamp(1e-6, f32::MAX)?;
+            (v_tok.sub(&x0v)?.broadcast_div(&v_tc)?, a_tok.sub(&x0a)?.mul_scalar(1.0 / sigma as f32)?)
+        };
+        crate::preview::emit(&v_tok, &v_vel, sigma, fp, hp, wp, i, total);
+        let dt = (sigma_next - sigma) as f32;
+        if cond {
+            v_tok = v_tok.add(&v_vel.broadcast_mul(&v_m.mul_scalar(dt)?)?)?;
+            v_tok = v_tok.broadcast_mul(&v_m)?.add(&v_clean.broadcast_mul(&v_inv)?)?;
+        } else {
+            v_tok = v_tok.add(&v_vel.mul_scalar(dt)?)?;
+        }
+        a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        hooks.emit(i + 1, total, sigma_next);
+    }
+    let v_latent = v_tok.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, fp, hp, wp])?.to_dtype(DType::F32)?;
+    Ok((v_latent, a_tok))
+}
+
 /// RGB `[1,3,F,H,W]` (≈[−1,1]) → кадры `[3,H,W]` в [0,1] для записи видео.
 pub fn rgb_to_frames(rgb: &Tensor) -> Result<Vec<Tensor>, LtxError> {
     let (f, h, w) = (rgb.dims()[2], rgb.dims()[3], rgb.dims()[4]);

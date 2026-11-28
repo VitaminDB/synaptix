@@ -73,6 +73,36 @@ pub struct VideoRequest {
     /// У Turbo без явных steps/guidance — шаги по имени файла («8step», «4step»), CFG 1.
     pub lora: Option<PathBuf>,
     pub lora_strength: Option<f32>,
+    /// LTX, полный (не distilled) чекпойнт: управляемая генерация как у Lightricks
+    /// (`ti2vid_two_stages`: стадия 1 в половинном разрешении — полные шаги с
+    /// CFG/STG/модальностями и отрицательным промптом, апскейл ×2, стадия 2 —
+    /// дистилл-LoRA). `None` — включено для текста и первого кадра; `Some(false)` —
+    /// прежний быстрый путь (дистилл-LoRA на обеих стадиях).
+    pub guided: Option<bool>,
+}
+
+/// Отрицательный промпт Lightricks по умолчанию (`DEFAULT_NEGATIVE_PROMPT` ltx-pipelines).
+pub const LTX_NEGATIVE_PROMPT: &str = "has_subtitles, has_blurbox, transition from black, transition to black, speech_ending_short, \
+blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, \
+grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, \
+deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, \
+wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of \
+field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent \
+lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny \
+valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, \
+mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, \
+off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward \
+pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, \
+inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
+
+/// Гайдеры видео и звука по умолчанию Lightricks для полного чекпойнта (2.3+:
+/// STG на блоке 28; 2.0 — 29); `cfg` — своя сила CFG видео.
+fn guided_params(version: &str, cfg: Option<f32>) -> (synaptix_video_ltx23::guider::GuiderParams, synaptix_video_ltx23::guider::GuiderParams) {
+    use synaptix_video_ltx23::guider::GuiderParams;
+    let block = if ltx_version_at_least(version, 2, 3) { 28 } else { 29 };
+    let v = GuiderParams { cfg_scale: cfg.filter(|c| *c > 0.0).unwrap_or(3.0), stg_scale: 1.0, rescale_scale: 0.7, modality_scale: 3.0, skip_step: 0, stg_blocks: vec![block] };
+    let a = GuiderParams { cfg_scale: 7.0, stg_scale: 1.0, rescale_scale: 0.7, modality_scale: 3.0, skip_step: 0, stg_blocks: vec![block] };
+    (v, a)
 }
 
 /// Число шагов дистиллированной LoRA по имени файла (`…_8step_…` → 8).
@@ -490,7 +520,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     if dfr && paths.detail_lora.is_none() {
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
-    let two_stage = two_stage || dfr;
+    // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
+    let guided = !distilled_ckpt
+        && adapter.is_none()
+        && !dfr
+        && req.guided.unwrap_or(true)
+        && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. });
+    let two_stage = two_stage || dfr || (guided && paths.upscaler.is_some());
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
     }
@@ -549,7 +585,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         synaptix_core::device::cuda::mem_info(ord).map(|(free, _)| need > free).unwrap_or(true)
     };
     let pin = (offload && quant_dit == compute).then(|| synaptix_core::device::cuda::OffloadPinCacheGuard::new_paused(&ckpt.shard_bytes()));
-    let lora_path = adapter.clone().or_else(|| if distilled_ckpt { None } else { paths.distilled_lora.clone() });
+    // Управляемый путь: стадия 1 — чистый полный DiT, дистилл-LoRA — только на стадии 2.
+    let lora_path = adapter.clone().or_else(|| if distilled_ckpt || guided { None } else { paths.distilled_lora.clone() });
 
     // Текст: Gemma (выгружается) → коннекторы.
     let _status = synaptix_core::gen_status::Scope::new("кодирование текста (Gemma)");
@@ -562,8 +599,16 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
         let (s, m) = gemma.encode_for_ltx(&req.prompt, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
         let nag = gemma.encode_for_ltx(lp::DEFAULT_NAG_PROMPT, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
-        (s, m, nag)
+        // Управляемый путь: отрицательный промпт (свой или Lightricks) для CFG.
+        let neg = if guided {
+            let text = req.negative.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(LTX_NEGATIVE_PROMPT);
+            Some(gemma.encode_for_ltx(text, 1024, device).map_err(|e| format!("Gemma: {e}"))?)
+        } else {
+            None
+        };
+        (s, m, (nag, neg))
     };
+    let (nag_states, neg_states) = nag_states;
     release();
     let (v_enc, a_enc, nag_enc) = {
         let ckpt_gpu = ckpt.view_on(device);
@@ -571,14 +616,22 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let v = vtc.forward(&states, &mask).map_err(err)?;
         let a = AudioTextConditioner::load(&ckpt_gpu, device, compute).map_err(err)?.forward(&states, &mask).map_err(err)?;
         let n = vtc.forward(&nag_states.0, &nag_states.1).map_err(err)?;
-        (v, a, n)
+        let neg_enc = match &neg_states {
+            Some((s, m)) => Some((vtc.forward(s, m).map_err(err)?, AudioTextConditioner::load(&ckpt_gpu, device, compute).map_err(err)?.forward(s, m).map_err(err)?)),
+            None => None,
+        };
+        (v, a, (n, neg_enc))
     };
+    let (nag_enc, neg_enc) = nag_enc;
     drop(states);
     drop(nag_states);
+    drop(neg_states);
     synaptix_core::device::cuda::set_offload_pinned(false);
     let v_nag = Some((&nag_enc, lp::NAG_DEFAULT_SCALE, lp::NAG_DEFAULT_ALPHA, lp::NAG_DEFAULT_TAU));
 
-    let total_steps = (lp::DISTILLED_SIGMAS.len() - 1) + if two_stage { lp::STAGE2_SIGMAS.len() - 1 } else { 0 };
+    let guided_steps = req.steps.filter(|s| *s > 0).unwrap_or(30);
+    let stage1_steps = if guided { guided_steps } else { lp::DISTILLED_SIGMAS.len() - 1 };
+    let total_steps = stage1_steps + if two_stage { lp::STAGE2_SIGMAS.len() - 1 } else { 0 };
     let done = std::sync::atomic::AtomicUsize::new(0);
     let on_step = |_: lp::DenoiseProgress| {
         let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -608,6 +661,60 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let (f, h, w) = (lat.dims()[2], lat.dims()[3], lat.dims()[4]);
             Ok((lat.reshape(vec![1, 128, f * h * w]).map_err(err)?.transpose(1, 2).map_err(err)?.contiguous().map_err(err)?, f, h, w))
         };
+        if guided {
+            // Lightricks `ti2vid_two_stages` для полного чекпойнта: стадия 1 в
+            // половинном разрешении — `guided_steps` шагов LTX2Scheduler с CFG,
+            // STG и изоляцией модальностей (Euler), апскейл ×2, стадия 2 — тот же
+            // DiT с дистилл-LoRA, STAGE2_SIGMAS, звук стадии 1 сохраняется.
+            synaptix_video_ltx23::runtime::set_ancestral(None);
+            let first = match &mode {
+                LtxMode::Frames { first: Some(p), .. } => Some(synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?),
+                _ => None,
+            };
+            let conds = |g: (usize, usize)| -> R<Vec<(usize, Tensor, f32)>> {
+                Ok(match &first {
+                    Some(img) => vec![(0usize, image_tokens(img, g)?, 1.0f32)],
+                    None => Vec::new(),
+                })
+            };
+            let (vg, ag) = guided_params(&ckpt.config.model_version, req.guidance);
+            let (vn, an) = neg_enc.as_ref().ok_or("LTX: нет отрицательного промпта")?;
+            let sig = lp::ltx2_sigmas(guided_steps, fp * hp1 * wp1);
+            eprintln!("[ltx] полный чекпойнт: стадия 1 {}×{}, {guided_steps} шагов, CFG видео {} / звук {}, STG {:?}", wp1 * 32, hp1 * 32, vg.cfg_scale, ag.cfg_scale, vg.stg_blocks);
+            synaptix_core::gen_status::phase("стадия 1: полный DiT, CFG/STG");
+            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1))?, seed, &hooks).map_err(err)?;
+            drop(dit);
+            release();
+            if !two_stage {
+                return Ok((l1, Some(a1), None, None));
+            }
+            let l2 = {
+                let view = ckpt.view_on(device);
+                let mean = view.get_raw("vae.per_channel_statistics.mean-of-means").map_err(err)?;
+                let std = view.get_raw("vae.per_channel_statistics.std-of-means").map_err(err)?;
+                let up = Upsampler::load(paths.upscaler.as_ref().unwrap(), &mean, &std, device).map_err(|e| format!("апскейлер: {e}"))?;
+                up.upsample(&l1).map_err(err)?.to_dtype(compute).map_err(err)?
+            };
+            synaptix_core::tensor::ops::conv_filter_cache_clear();
+            release();
+            synaptix_core::gen_status::phase("стадия 2: загрузка DiT с дистилл-LoRA");
+            let dit2 = match &paths.distilled_lora {
+                Some(p) => {
+                    let l = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
+                    AvDit::load_with(&ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)), device, compute, quant_dit, offload)
+                }
+                None => {
+                    eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
+                    AvDit::load_with(&ckpt, device, compute, quant_dit, offload)
+                }
+            }
+            .map_err(|e| format!("DiT: {e}"))?;
+            synaptix_core::gen_status::phase("стадия 2: доводка ×2");
+            let (l3, _) = lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &conds((hp2, wp2))?, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?;
+            drop(dit2);
+            synaptix_core::tensor::ops::conv_filter_cache_gc();
+            return Ok((l3, Some(a1), None, Some(l1)));
+        }
         if dfr {
             // DFR (эталон LTX-2 `dfr_pipeline.py`, этапы 1–2 без временных раундов и эпилога).
             if !ltx_version_at_least(&ckpt.config.model_version, 2, 5) {

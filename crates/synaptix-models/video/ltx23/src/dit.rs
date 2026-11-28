@@ -1275,6 +1275,18 @@ struct AvCtx<'a> {
     /// (neg-контекст [1,Ttv,4096], scale, alpha, tau). Только stage1 —
     /// distilled stage2-refine NAG не требует (рецепт убирания субтитров).
     v_nag: Option<(&'a Tensor, f32, f32, f32)>,
+    /// Возмущение прохода мультимодального гайдинга (STG, изоляция модальностей).
+    ptb: Option<&'a AvPerturb>,
+}
+
+/// Возмущение прохода мультимодального гайдинга — как `PerturbationConfig`
+/// оригинала: STG пропускает вклад self-attn видео/звука в своих блоках,
+/// изоляция модальностей — вклад перекрёстного внимания A↔V во всех блоках.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AvPerturb {
+    pub skip_video_self: Vec<usize>,
+    pub skip_audio_self: Vec<usize>,
+    pub skip_cross: bool,
 }
 
 impl AvBlock {
@@ -1344,7 +1356,10 @@ impl AvBlock {
 
     /// `tm`: PROF-аккумулятор фаз `[v_attn1, v_attn2, audio, av_ca, ff]` (sync на
     /// границах фаз; только под runtime::set_ltx_prof — см. AvDit::forward).
-    fn forward(&self, vx: &Tensor, ax: &Tensor, c: &AvCtx, mut tm: Option<&mut [f32; 5]>) -> R<(Tensor, Tensor)> {
+    fn forward(&self, vx: &Tensor, ax: &Tensor, c: &AvCtx, idx: usize, mut tm: Option<&mut [f32; 5]>) -> R<(Tensor, Tensor)> {
+        let skip_v_self = c.ptb.is_some_and(|p| p.skip_video_self.contains(&idx));
+        let skip_a_self = c.ptb.is_some_and(|p| p.skip_audio_self.contains(&idx));
+        let skip_cross = c.ptb.is_some_and(|p| p.skip_cross);
         let ord = if let Device::Cuda(o) = vx.device() { o } else { 0 };
         let mut tphase = std::time::Instant::now();
         let mut lap = |slot: usize, tm: &mut Option<&mut [f32; 5]>| {
@@ -1384,10 +1399,12 @@ impl AvBlock {
         // attention держим только gate (20s-refine VRAM впритык).
         let m2 = m.pop().ok_or(SynaptixError::Unsupported("ada m2"))?;
         m.clear();
-        let attn1_out = self
-            .v_attn1
-            .forward_pq(&norm, None, Some(c.v_rope.0), Some(c.v_rope.1), pq.as_ref().map(|(p, s)| (p, s)))?;
-        vx = gate_residual(&vx, &attn1_out, &m2)?;
+        if !skip_v_self {
+            let attn1_out = self
+                .v_attn1
+                .forward_pq(&norm, None, Some(c.v_rope.0), Some(c.v_rope.1), pq.as_ref().map(|(p, s)| (p, s)))?;
+            vx = gate_residual(&vx, &attn1_out, &m2)?;
+        }
         drop(m2);
         bmark("attn1", &mut bt, &mut bm);
         if bprof && !bm.is_empty() {
@@ -1444,8 +1461,10 @@ impl AvBlock {
         let (anorm, _) = mod_norm_quant(&ax, &am[1], &am[0], None)?;
         let am2 = am.pop().ok_or(SynaptixError::Unsupported("ada am2"))?;
         am.clear();
-        let a_attn1_out = self.a_attn1.forward(&anorm, None, Some(c.a_rope.0), Some(c.a_rope.1))?;
-        ax = gate_residual(&ax, &a_attn1_out, &am2)?;
+        if !skip_a_self {
+            let a_attn1_out = self.a_attn1.forward(&anorm, None, Some(c.a_rope.0), Some(c.a_rope.1))?;
+            ax = gate_residual(&ax, &a_attn1_out, &am2)?;
+        }
         drop(am2);
         let mut amc = match &self.sst_dt {
             Some(d) => ada_rows(&d.a_rows, c.a_mods, 6, 9)?,
@@ -1478,8 +1497,10 @@ impl AvBlock {
         };
         let vx_s = mod_row(&vx_norm3, &sc_v, &sh_v)?;
         let ax_s = mod_row(&ax_norm3, &sc_a, &sh_a)?;
-        let a2v = self.a2v_attn.forward2(&vx_s, Some(&ax_s), Some(c.v_cross_pe), Some(c.a_cross_pe), None)?;
-        vx = gate_residual(&vx, &a2v, &gate_a2v)?;
+        if !skip_cross {
+            let a2v = self.a2v_attn.forward2(&vx_s, Some(&ax_s), Some(c.v_cross_pe), Some(c.a_cross_pe), None)?;
+            vx = gate_residual(&vx, &a2v, &gate_a2v)?;
+        }
         // V2A (Q=audio, KV=video): модифицирует ax (использует vx_norm3/ax_norm3 «до A2V»)
         let (sc_a2, sh_a2, gate_v2a) = match &self.sst_dt {
             Some(d) => av_ca_ada_rows(&d.ca_a_rows, c.a_cross_ss, c.a_cross_gate, 2)?,
@@ -1491,8 +1512,10 @@ impl AvBlock {
         };
         let ax_s2 = mod_row(&ax_norm3, &sc_a2, &sh_a2)?;
         let vx_s2 = mod_row(&vx_norm3, &sc_v2, &sh_v2)?;
-        let v2a = self.v2a_attn.forward2(&ax_s2, Some(&vx_s2), Some(c.a_cross_pe), Some(c.v_cross_pe), None)?;
-        ax = gate_residual(&ax, &v2a, &gate_v2a)?;
+        if !skip_cross {
+            let v2a = self.v2a_attn.forward2(&ax_s2, Some(&vx_s2), Some(c.a_cross_pe), Some(c.v_cross_pe), None)?;
+            ax = gate_residual(&ax, &v2a, &gate_v2a)?;
+        }
         lap(3, &mut tm);
 
         // ── FF (video, audio) ──
@@ -2105,12 +2128,13 @@ impl GraphCtx {
             a_cross_pe: (&self.a_cpe.0, &self.a_cpe.1),
             dtype,
             v_nag: None,
+            ptb: None,
         }
     }
 
     /// Один блок-шаг на фикс-буферах: forward + copy-back vx/ax (тело графа).
     fn block_step(&self, blk: &AvBlock, ctx: &AvCtx) -> R<()> {
-        let (nvx, nax) = blk.forward(&self.vxb, &self.axb, ctx, None)?;
+        let (nvx, nax) = blk.forward(&self.vxb, &self.axb, ctx, 0, None)?;
         copy_into_fixed(&self.vxb, &nvx)?;
         copy_into_fixed(&self.axb, &nax)?;
         Ok(())
@@ -2382,6 +2406,20 @@ impl AvDit {
         a_latent: &Tensor, a_timesteps: &[f32], a_sigma: f32, a_positions: &[f64], a_context: &Tensor,
         v_nag: Option<(&Tensor, f32, f32, f32)>,
     ) -> Result<(Tensor, Tensor), LtxError> {
+        self.forward_ptb(v_latent, v_timesteps, v_sigma, v_positions, v_context, a_latent, a_timesteps, a_sigma, a_positions, a_context, v_nag, None)
+    }
+
+    /// Как [`Self::forward`], с возмущением прохода мультимодального гайдинга
+    /// ([`AvPerturb`]; `None` — обычный проход). Возмущённый проход идёт без
+    /// CUDA-графов блока.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ptb(
+        &self,
+        v_latent: &Tensor, v_timesteps: &[f32], v_sigma: f32, v_positions: &[f64], v_context: &Tensor,
+        a_latent: &Tensor, a_timesteps: &[f32], a_sigma: f32, a_positions: &[f64], a_context: &Tensor,
+        v_nag: Option<(&Tensor, f32, f32, f32)>,
+        ptb: Option<&AvPerturb>,
+    ) -> Result<(Tensor, Tensor), LtxError> {
         let (dev, dt) = (self.device, self.dtype);
         let tv = v_latent.dims()[1];
         let ta = a_latent.dims()[1];
@@ -2444,6 +2482,7 @@ impl AvDit {
         let use_graph = slot_st.is_some()
             && crate::runtime::ltx_block_mode() >= 2
             && v_nag.is_none()
+            && ptb.is_none()
             && matches!(self.device, Device::Cuda(_));
         let fp = rope_fingerprint(v_positions, a_positions);
         let gc_ready: Option<Arc<GraphCtx>> = if use_graph {
@@ -2578,6 +2617,7 @@ impl AvDit {
             v_cross_pe: (vcc, vcs), a_cross_pe: (ac, as_),
             dtype: dt,
             v_nag: v_nag.map(|(t, s, a, tau)| (t, s, a, tau)),
+            ptb,
         };
         if let Some(st) = slot_st {
             let sc = self.stream.as_deref().expect("slot path: stream ckpt");
@@ -2598,7 +2638,7 @@ impl AvDit {
                     } else {
                         None
                     };
-                    let (nvx, nax) = stc.slots[i % 2].block.forward(&vx, &ax, &ctx, prof.then_some(&mut tm))?;
+                    let (nvx, nax) = stc.slots[i % 2].block.forward(&vx, &ax, &ctx, i, prof.then_some(&mut tm))?;
                     vx = nvx;
                     ax = nax;
                     stc.slots[i % 2].ev_done.record_default(ord).map_err(LtxError::from)?;
@@ -2653,7 +2693,7 @@ impl AvDit {
                     } else {
                         None
                     };
-                    let (nvx, nax) = cur.forward(&vx, &ax, &ctx, prof.then_some(&mut tm))?;
+                    let (nvx, nax) = cur.forward(&vx, &ax, &ctx, i, prof.then_some(&mut tm))?;
                     vx = nvx;
                     ax = nax;
                     let tj = std::time::Instant::now();
@@ -2670,7 +2710,7 @@ impl AvDit {
             }
         } else {
             for i in 0..self.nblocks {
-                let (nvx, nax) = self.blocks[i].forward(&vx, &ax, &ctx, prof.then_some(&mut tm))?;
+                let (nvx, nax) = self.blocks[i].forward(&vx, &ax, &ctx, i, prof.then_some(&mut tm))?;
                 vx = nvx;
                 ax = nax;
             }

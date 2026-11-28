@@ -158,6 +158,12 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                 "detail_lora"
             } else if n.contains("video-vae-diffusion") {
                 "diff_vae"
+            } else if n.contains("distilled-lora") {
+                // дистилл-LoRA стадии 2 полного (dev) чекпойнта
+                "distilled_lora"
+            } else if n.contains("ic-lora-ingredients") {
+                // IC-LoRA Ingredients: лист-референс героев, предметов, места
+                "ic_lora_ingredients"
             } else {
                 return None;
             };
@@ -250,7 +256,8 @@ fn plan_parsed(files: &[File]) -> CatalogPlan {
                 let mut p = single(f, Task::Video, "ltx23", "Видео со звуком по тексту и картинке (LTX-2.5)");
                 p.components.extend(ltx25_encoder.iter().map(|x| ("text_encoder".to_string(), x.clone())));
                 p.components.extend(ltx_upscaler.iter().map(|x| ("upscaler".to_string(), x.clone())));
-                p.components.extend(ltx25_parts.iter().cloned());
+                // Дистилл-LoRA — только полному (dev) чекпойнту.
+                p.components.extend(ltx25_parts.iter().filter(|(r, _)| r != "distilled_lora" || !n.contains("distilled")).cloned());
                 Some(p)
             }
             // `syn-pack` по каталогу Diffusers пишет имя класса из `model_index.json`.
@@ -338,6 +345,9 @@ mod tests {
             f("ltx-2.5-duration-head", "ltx-2.5"),
             f("ltx-2.5-temporal-upscaler-x2-1.0", "ltx-2.5"),
             f("ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0", "ltx-2.5"),
+            f("ltx-2.5-22b-dev", "ltx-2.5"),
+            f("ltx-2.5-22b-distilled-lora-450", "ltx-2.5"),
+            f("ltx-2.5-22b-ic-lora-ingredients-0.9", "ltx-2.5"),
         ];
         let p = plan_parsed(&files);
         let m = p.models.iter().find(|m| m.id == "ltx-2-5-22b-distilled").expect("ltx-2.5");
@@ -347,7 +357,13 @@ mod tests {
         for role in ["duration_head", "temporal_upscaler", "detail_lora", "diff_vae"] {
             assert!(m.components.iter().any(|(r, _)| r == role), "{role}");
         }
-        assert_eq!(p.models.iter().filter(|m| m.id.starts_with("ltx-2-5")).count(), 2);
+        assert_eq!(p.models.iter().filter(|m| m.id.starts_with("ltx-2-5")).count(), 3);
+        let dev = p.models.iter().find(|m| m.id == "ltx-2-5-22b-dev").expect("ltx-2.5 dev");
+        assert!(dev.components.iter().any(|(r, _)| r == "distilled_lora"));
+        assert!(!m.components.iter().any(|(r, _)| r == "distilled_lora"), "distilled не берёт дистилл-LoRA");
+        for x in [m, dev] {
+            assert!(x.components.iter().any(|(r, _)| r == "ic_lora_ingredients"));
+        }
         assert!(p.models.iter().any(|m| m.id == "ltx-2-5-prompt-enhancer"));
         let m23 = p.models.iter().find(|m| m.id == "ltx-2-3-22b-distilled-1-1").unwrap();
         assert!(m23.components.iter().any(|(_, p)| p.ends_with("ltx-gemma-3-12b-qat.syn")));
