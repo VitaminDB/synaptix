@@ -526,10 +526,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     // прочие IC-LoRA и LipDub — как у Lightricks, только на distilled.
     let sheet_on_full = !distilled_ckpt && matches!(mode, LtxMode::Sheet { .. });
     // Лист на полном чекпойнте — по карточке IC-LoRA Ingredients (валидация
-    // Lightricks): dev без дистилл-LoRA, ОДНА стадия в полном разрешении
-    // (обучено на 768×448×121), 30 шагов, CFG 4, STG 1.0 на блоке 29 (видео),
-    // отрицательный промпт карточки. Одна стадия distilled копирует лист, две
-    // стадии дают мозаику (так и у сторонних замеров).
+    // Lightricks): стадия 1 — dev + IC-LoRA (сила 1.4, иначе копирует лист),
+    // 30 шагов, CFG 4, STG 1.0 на блоке 29 (видео), отрицательный промпт
+    // карточки; стадия 2 (при наличии апскейлера ×2) — только дистилл-LoRA,
+    // БЕЗ листа и БЕЗ IC-LoRA (как DEFAULT_IC_LORA_STAGES Lightricks:
+    // apply_ic_lora=false на стадии 2).
     let sheet_dev = sheet_on_full;
     if adapter.is_some() && !distilled_ckpt && !sheet_on_full {
         return Err("IC-LoRA и LipDub идут на distilled-чекпойнте (ltx-2-3-22b-distilled, ltx-2-5-22b-distilled)".into());
@@ -550,13 +551,20 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    let guided = sheet_dev
+    // Для листа `guided == Some(false)` включает быстрый двухстадийный режим
+    // (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
+    let sheet_distill_k: f32 = std::env::var("LTX_DISTILL_STRENGTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if sheet_dev && req.guided == Some(false) { 1.0 } else { 0.0 });
+    let sheet_unguided = sheet_dev && (req.guided == Some(false) || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
+    let guided = (sheet_dev && !sheet_unguided)
         || (!distilled_ckpt
             && adapter.is_none()
             && !dfr
             && req.guided.unwrap_or(true)
             && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. }));
-    let two_stage = !sheet_dev && (two_stage || dfr || (guided && paths.upscaler.is_some()));
+    let two_stage = two_stage || dfr || ((guided || sheet_unguided) && paths.upscaler.is_some());
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
     }
@@ -661,7 +669,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let v_nag = Some((&nag_enc, lp::NAG_DEFAULT_SCALE, lp::NAG_DEFAULT_ALPHA, lp::NAG_DEFAULT_TAU));
 
     let guided_steps = req.steps.filter(|s| *s > 0).unwrap_or(30);
-    let stage1_steps = if guided { guided_steps } else { lp::DISTILLED_SIGMAS.len() - 1 };
+    let stage1_steps = if guided {
+        guided_steps
+    } else if sheet_dev && req.steps.is_some_and(|s| s > 8) {
+        req.steps.unwrap()
+    } else {
+        lp::DISTILLED_SIGMAS.len() - 1
+    };
     let total_steps = stage1_steps + if two_stage { lp::STAGE2_SIGMAS.len() - 1 } else { 0 };
     let done = std::sync::atomic::AtomicUsize::new(0);
     let on_step = |_: lp::DenoiseProgress| {
@@ -671,13 +685,22 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let hooks = lp::DenoiseHooks { progress: Some(&on_step), cancel: Some(cancel) };
 
     let latent = synaptix_core::grad::no_grad(|| -> R<(Tensor, Option<Tensor>, Option<Vec<f32>>, Option<Tensor>)> {
-        // Сила IC-LoRA: 1.0 (карточка 2.5; у 2.3 — 1.4), `SYN_LTX_IC_STRENGTH` — подбор.
-        let ic_k = std::env::var("SYN_LTX_IC_STRENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32);
+        // Сила IC-LoRA: для Ingredients 1.4 (валидация Lightricks; при 1.0 модель
+        // копирует сетку листа), для прочих IC-LoRA 1.0; `SYN_LTX_IC_STRENGTH` — подбор.
+        let ic_default = if matches!(mode, LtxMode::Sheet { .. }) { 1.4f32 } else { 1.0f32 };
+        let ic_k = std::env::var("SYN_LTX_IC_STRENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(ic_default);
         let lora = match &lora_path {
             Some(p) => Some(LoraWeights::open(p, device, if adapter.is_some() { ic_k } else { 1.0 }).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
             None => None,
         };
-        let lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
+        let mut lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
+        if sheet_dev && sheet_distill_k > 0.0 {
+            if let Some(dp) = &paths.distilled_lora {
+                eprintln!("[ltx] лист dev: подмешиваем дистилл-LoRA (сила {sheet_distill_k}) + IC-LoRA (сила {ic_k})");
+                let dl = LoraWeights::open(dp, device, sheet_distill_k).map_err(|e| format!("LoRA {}: {e}", dp.display()))?;
+                lora_ckpt = Some(lora_ckpt.unwrap_or_else(|| ckpt.view_on(Device::Cpu)).with_lora(std::sync::Arc::new(dl)));
+            }
+        }
         synaptix_core::gen_status::phase("загрузка DiT");
         let dit = AvDit::load_with(lora_ckpt.as_ref().unwrap_or(&ckpt), device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
         synaptix_core::gen_status::phase(if offload { "денойз (DiT стримится с хоста)" } else { "денойз" });
@@ -751,21 +774,30 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_core::tensor::ops::conv_filter_cache_clear();
             release();
             synaptix_core::gen_status::phase("стадия 2: загрузка DiT с дистилл-LoRA");
-            // Стадия 2: дистилл-LoRA (+ IC-LoRA листа, ΔW складываются).
+            // Стадия 2: только дистилл-LoRA (без листа и IC-LoRA, как
+            // DEFAULT_IC_LORA_STAGES Lightricks: apply_ic_lora=false на стадии 2).
             let mut view2 = ckpt.view_on(Device::Cpu);
-            for p in paths.distilled_lora.iter().chain(adapter.iter()) {
+            if let Some(p) = &paths.distilled_lora {
                 let l = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
                 view2 = view2.with_lora(std::sync::Arc::new(l));
-            }
-            if paths.distilled_lora.is_none() {
+            } else {
                 eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
             }
             let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
             synaptix_core::gen_status::phase("стадия 2: доводка ×2");
-            let l3 = match sheet_ref((hp2, wp2))? {
-                Some((tok2, pos2)) => lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, Some((&tok2, &pos2, 1.0)), None, fps, device, seed, &hooks).map_err(err)?.0,
-                None => lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &conds((hp2, wp2))?, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?.0,
+            // LTX-2.5: стадия 2 с дистилл-LoRA идёт на Euler-ancestral (как в DFR/distilled);
+            // звук стадии 1 заморожен (`a_frozen = true` → a_sigma = 0).
+            let ltx25_s2 = ltx_version_at_least(&ckpt.config.model_version, 2, 5)
+                && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler");
+            let base = seed.unwrap_or(1);
+            synaptix_video_ltx23::runtime::set_ancestral(ltx25_s2.then(|| base.wrapping_add(20_000)));
+            let c2 = conds((hp2, wp2))?;
+            let l3 = if c2.is_empty() {
+                lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, None, None, fps, device, seed, &hooks).map_err(err)?.0
+            } else {
+                lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &c2, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?.0
             };
+            synaptix_video_ltx23::runtime::set_ancestral(None);
             drop(dit2);
             synaptix_core::tensor::ops::conv_filter_cache_gc();
             return Ok((l3, Some(a1), None, Some(l1)));
@@ -1044,7 +1076,9 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             })
         };
         // LTX-2.5: Euler-ancestral на обоих этапах, шум — seed+10000 / seed+20000.
-        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5) && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler") && !sheet_dev;
+        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5)
+            && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler")
+            && (!sheet_dev || sheet_distill_k > 0.0);
         let base = seed.unwrap_or(1);
         struct AncReset;
         impl Drop for AncReset {
@@ -1055,7 +1089,17 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let _anc = AncReset;
         synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(10_000)));
         // Лист на полном чекпойнте: `steps` > 8 — расписание LTX2Scheduler на столько шагов.
-        let (mut l, mut a, mut wave) = stage((hp1, wp1), &lp::DISTILLED_SIGMAS, None)?;
+        let s1_custom: Vec<f64> = if sheet_dev && req.steps.is_some_and(|s| s > 8) {
+            let st = req.steps.unwrap();
+            eprintln!("[ltx] лист dev (CFG 1): {st} шагов LTX2Scheduler, IC-LoRA {ic_k}, дистилл-LoRA {sheet_distill_k}");
+            lp::ltx2_sigmas(st, fp * hp1 * wp1)
+        } else {
+            if sheet_dev {
+                eprintln!("[ltx] лист dev (CFG 1): 8 шагов DISTILLED_SIGMAS, IC-LoRA {ic_k}, дистилл-LoRA {sheet_distill_k}");
+            }
+            lp::DISTILLED_SIGMAS.to_vec()
+        };
+        let (mut l, mut a, mut wave) = stage((hp1, wp1), &s1_custom, None)?;
         let stage1_saved = if two_stage { Some(l.clone()) } else { None };
         if two_stage {
             let view = ckpt.view_on(device);
@@ -1066,6 +1110,22 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             drop(up);
             synaptix_core::tensor::ops::conv_filter_cache_clear();
             synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(20_000)));
+            if sheet_dev {
+                // Стадия 2 листа: без листа и без IC-LoRA (только дистилл-LoRA, звук заморожен).
+                drop(dit);
+                release();
+                let mut view2 = ckpt.view_on(Device::Cpu);
+                if let Some(p) = &paths.distilled_lora {
+                    let dl = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
+                    view2 = view2.with_lora(std::sync::Arc::new(dl));
+                }
+                let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
+                l = lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a), true, None, None, fps, device, seed, &hooks).map_err(err)?.0;
+                drop(dit2);
+                drop(venc);
+                synaptix_core::tensor::ops::conv_filter_cache_gc();
+                return Ok((l, Some(a), wave, stage1_saved));
+            }
             let (l3, a3, w3) = stage((hp2, wp2), &lp::STAGE2_SIGMAS, Some((&l2, &a)))?;
             l = l3;
             a = a3;
