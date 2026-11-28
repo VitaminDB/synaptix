@@ -92,7 +92,9 @@ pub struct LtxCheckpoint {
     /// сырыми через [`LtxCheckpoint::get_raw`].
     dtype: DType,
     /// LoRA для мерджа в веса DiT при загрузке (distilled-LoRA на refine-стадии).
-    lora: Option<std::sync::Arc<LoraWeights>>,
+    /// LoRA для мерджа в веса DiT при загрузке: дистилл-LoRA стадии доводки,
+    /// IC-LoRA — или несколько сразу (их ΔW складываются).
+    lora: Vec<std::sync::Arc<LoraWeights>>,
 }
 
 impl LtxCheckpoint {
@@ -109,22 +111,30 @@ impl LtxCheckpoint {
         }
         let loader = open_weights(path)?.with_device(device);
         let config = Ltx23Config::from_metadata(loader.metadata())?;
-        Ok(Self { loader, config, device, dtype, lora: None })
+        Ok(Self { loader, config, device, dtype, lora: Vec::new() })
     }
 
     /// Прикрепить LoRA для мерджа в веса DiT при загрузке (переживает [`view_on`]).
+    /// Добавить LoRA (повторный вызов — ещё одна, ΔW складываются).
     pub fn with_lora(mut self, lora: std::sync::Arc<LoraWeights>) -> Self {
-        self.lora = Some(lora);
+        self.lora.push(lora);
         self
     }
 
     /// ΔW LoRA для линейки `key` (или `None`). Мерджится в [`get_raw`]-вес при сборке.
     pub fn lora_delta(&self, key: &str, dtype: DType) -> Result<Option<Tensor>, LtxError> {
-        match &self.lora {
-            Some(l) => l.delta(key, dtype),
-            None => Ok(None),
+        let mut sum: Option<Tensor> = None;
+        for l in &self.lora {
+            if let Some(d) = l.delta(key, dtype)? {
+                sum = Some(match sum {
+                    Some(s) => s.add(&d).map_err(LtxError::from)?,
+                    None => d,
+                });
+            }
         }
+        Ok(sum)
     }
+
 
     /// Тензор по полному имени, приведённый к compute-dtype на целевом устройстве.
     pub fn get(&self, name: &str) -> Result<Tensor, SynaptixError> {
@@ -202,7 +212,7 @@ impl LtxCheckpoint {
     /// LoRA прикреплена (слот-стриминг несовместим: веса слота — сырые байты
     /// файла, без мерджа ΔW).
     pub fn has_lora(&self) -> bool {
-        self.lora.is_some()
+        !self.lora.is_empty()
     }
 }
 

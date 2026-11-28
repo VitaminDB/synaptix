@@ -1292,12 +1292,13 @@ pub fn denoise_av_guided(
     fps: f64,
     device: Device,
     v_conds: &[(usize, Tensor, f32)],
+    v_ref: Option<(&Tensor, &[f64])>,
     seed: Option<u64>,
     hooks: &DenoiseHooks,
 ) -> Result<(Tensor, Tensor), LtxError> {
     use crate::dit::AvPerturb;
     let tv = fp * hp * wp;
-    let v_pos = pixel_coords(fp, hp, wp, fps);
+    let mut v_pos = pixel_coords(fp, hp, wp, fps);
     let ddt = dit.compute_dtype();
     let v_ctx = video_encoding.to_device(device)?.to_dtype(ddt)?;
     let a_ctx = audio_encoding.to_device(device)?.to_dtype(ddt)?;
@@ -1328,9 +1329,20 @@ pub fn denoise_av_guided(
         let refs: Vec<&Tensor> = parts.iter().collect();
         v_tok = Tensor::cat(&refs, 1)?.contiguous()?;
     }
-    let cond = !v_conds.is_empty();
+    // IC-LoRA-референс (лист Ingredients и т. п.): чистые токены после видео
+    // со своими позициями, во всех проходах гайдинга (и в отрицательном),
+    // как LTXAddVideoICLoRAGuide; на выходе отрезаются.
+    if let Some((rt, rpos)) = v_ref {
+        let ta = rt.dims()[1];
+        let rt = rt.to_device(device)?.to_dtype(ddt)?;
+        v_tok = Tensor::cat(&[&v_tok, &rt], 1)?.contiguous()?;
+        v_pos = cat_positions(&v_pos, tv, rpos, ta);
+        v_mask_v.extend(std::iter::repeat_n(0.0f32, ta));
+    }
+    let tv_all = v_mask_v.len();
+    let cond = !v_conds.is_empty() || v_ref.is_some();
     let v_clean = v_tok.clone();
-    let v_m = Tensor::from_vec(v_mask_v.clone(), vec![1, tv, 1], device)?.to_dtype(ddt)?;
+    let v_m = Tensor::from_vec(v_mask_v.clone(), vec![1, tv_all, 1], device)?.to_dtype(ddt)?;
     let v_inv = v_m.affine(-1.0, 1.0)?;
     let active: Vec<bool> = v_mask_v.iter().map(|m| *m != 0.0).collect();
 
@@ -1397,7 +1409,11 @@ pub fn denoise_av_guided(
             let v_tc = v_t.clamp(1e-6, f32::MAX)?;
             (v_tok.sub(&x0v)?.broadcast_div(&v_tc)?, a_tok.sub(&x0a)?.mul_scalar(1.0 / sigma as f32)?)
         };
-        crate::preview::emit(&v_tok, &v_vel, sigma, fp, hp, wp, i, total);
+        if tv_all == tv {
+            crate::preview::emit(&v_tok, &v_vel, sigma, fp, hp, wp, i, total);
+        } else {
+            crate::preview::emit(&v_tok.narrow(1, 0, tv)?.contiguous()?, &v_vel.narrow(1, 0, tv)?.contiguous()?, sigma, fp, hp, wp, i, total);
+        }
         let dt = (sigma_next - sigma) as f32;
         if cond {
             v_tok = v_tok.add(&v_vel.broadcast_mul(&v_m.mul_scalar(dt)?)?)?;
@@ -1408,7 +1424,7 @@ pub fn denoise_av_guided(
         a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
         hooks.emit(i + 1, total, sigma_next);
     }
-    let v_latent = v_tok.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, fp, hp, wp])?.to_dtype(DType::F32)?;
+    let v_latent = v_tok.narrow(1, 0, tv)?.contiguous()?.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, fp, hp, wp])?.to_dtype(DType::F32)?;
     Ok((v_latent, a_tok))
 }
 

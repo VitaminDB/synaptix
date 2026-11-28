@@ -16,6 +16,8 @@ fn main() {
         temporal_upscaler: std::env::var("LTX_TEMPORAL_UPSCALER").ok().map(PathBuf::from),
         detail_lora: std::env::var("LTX_DETAIL_LORA").ok().map(PathBuf::from),
         diff_vae: std::env::var("LTX_DIFF_VAE").ok().map(PathBuf::from),
+        ic_ingredients: std::env::var("LTX_INGREDIENTS").ok().map(PathBuf::from),
+        distilled_lora: std::env::var("LTX_DISTILLED_LORA").ok().map(PathBuf::from),
         ..Default::default()
     };
     let req = synaptix_gen::video::VideoRequest {
@@ -34,6 +36,7 @@ fn main() {
         context: std::env::var("LTX_CONTEXT").ok().map(PathBuf::from),
         context_frames: std::env::var("LTX_CONTEXT_FRAMES").ok().and_then(|v| v.parse().ok()),
         two_stage: std::env::var("LTX_TWO_STAGE").is_ok(),
+        ref_sheet: std::env::var("LTX_SHEET").ok().map(PathBuf::from),
         ..Default::default()
     };
     let t0 = std::time::Instant::now();

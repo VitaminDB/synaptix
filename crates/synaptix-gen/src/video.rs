@@ -519,7 +519,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         _ => None,
     };
     let distilled_ckpt = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
-    if adapter.is_some() && !distilled_ckpt {
+    // Лист Ingredients на полном чекпойнте — управляемым путём (dev + IC-LoRA);
+    // прочие IC-LoRA и LipDub — как у Lightricks, только на distilled.
+    let sheet_on_full = !distilled_ckpt && matches!(mode, LtxMode::Sheet { .. }) && req.guided != Some(false);
+    if adapter.is_some() && !distilled_ckpt && !sheet_on_full {
         return Err("IC-LoRA и LipDub идут на distilled-чекпойнте (ltx-2-3-22b-distilled, ltx-2-5-22b-distilled)".into());
     }
     // Retake — одной стадией на целевом разрешении; LipDub — всегда две;
@@ -538,11 +541,12 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    let guided = !distilled_ckpt
-        && adapter.is_none()
-        && !dfr
-        && req.guided.unwrap_or(true)
-        && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. });
+    let guided = sheet_on_full
+        || (!distilled_ckpt
+            && adapter.is_none()
+            && !dfr
+            && req.guided.unwrap_or(true)
+            && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. }));
     let two_stage = two_stage || dfr || (guided && paths.upscaler.is_some());
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
@@ -694,12 +698,27 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     None => Vec::new(),
                 })
             };
+            // Лист Ingredients: статичное видео в разрешении стадии (масштаб 1), ≥121 кадра.
+            let sheet_ref = |g: (usize, usize)| -> R<Option<(Tensor, Vec<f64>)>> {
+                let LtxMode::Sheet { image } = &mode else { return Ok(None) };
+                let img = synaptix_io::image::load_image(image, Device::Cpu).map_err(|e| format!("{}: {e}", image.display()))?;
+                let (ph, pw) = (g.0 * 32, g.1 * 32);
+                let one = synaptix_io::image::fit_image(&img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
+                let n = lp::out_frame_count(lp::fp_for_frames(out_frames.max(121)));
+                let copies: Vec<&Tensor> = std::iter::repeat_n(&one, n).collect();
+                let frames = Tensor::cat(&copies, 2).map_err(err)?.contiguous().map_err(err)?;
+                let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
+                let (tok, f_, h_, w_) = latent_tokens(&lat)?;
+                Ok(Some((tok, lp::ref_video_positions(f_, h_, w_, fps, 1))))
+            };
             let (vg, ag) = guided_params(&ckpt.config.model_version, req.guidance);
             let (vn, an) = neg_enc.as_ref().ok_or("LTX: нет отрицательного промпта")?;
             let sig = lp::ltx2_sigmas(guided_steps, fp * hp1 * wp1);
             eprintln!("[ltx] полный чекпойнт: стадия 1 {}×{}, {guided_steps} шагов, CFG видео {} / звук {}, STG {:?}", wp1 * 32, hp1 * 32, vg.cfg_scale, ag.cfg_scale, vg.stg_blocks);
             synaptix_core::gen_status::phase("стадия 1: полный DiT, CFG/STG");
-            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1))?, seed, &hooks).map_err(err)?;
+            let ref1 = sheet_ref((hp1, wp1))?;
+            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1))?, ref1.as_ref().map(|(t, p)| (t, p.as_slice())), seed, &hooks).map_err(err)?;
+            drop(ref1);
             drop(dit);
             release();
             if !two_stage {
@@ -715,19 +734,21 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_core::tensor::ops::conv_filter_cache_clear();
             release();
             synaptix_core::gen_status::phase("стадия 2: загрузка DiT с дистилл-LoRA");
-            let dit2 = match &paths.distilled_lora {
-                Some(p) => {
-                    let l = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
-                    AvDit::load_with(&ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)), device, compute, quant_dit, offload)
-                }
-                None => {
-                    eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
-                    AvDit::load_with(&ckpt, device, compute, quant_dit, offload)
-                }
+            // Стадия 2: дистилл-LoRA (+ IC-LoRA листа, ΔW складываются).
+            let mut view2 = ckpt.view_on(Device::Cpu);
+            for p in paths.distilled_lora.iter().chain(adapter.iter()) {
+                let l = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
+                view2 = view2.with_lora(std::sync::Arc::new(l));
             }
-            .map_err(|e| format!("DiT: {e}"))?;
+            if paths.distilled_lora.is_none() {
+                eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
+            }
+            let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
             synaptix_core::gen_status::phase("стадия 2: доводка ×2");
-            let (l3, _) = lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &conds((hp2, wp2))?, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?;
+            let l3 = match sheet_ref((hp2, wp2))? {
+                Some((tok2, pos2)) => lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, Some((&tok2, &pos2, 1.0)), None, fps, device, seed, &hooks).map_err(err)?.0,
+                None => lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &conds((hp2, wp2))?, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?.0,
+            };
             drop(dit2);
             synaptix_core::tensor::ops::conv_filter_cache_gc();
             return Ok((l3, Some(a1), None, Some(l1)));
