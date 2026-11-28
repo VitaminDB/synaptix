@@ -2466,11 +2466,12 @@ impl AvDit {
         // av_ca cross-timesteps: scale_shift на (cross_sigma·ts_mult), gate на
         // (cross_sigma·ts_mult·avca_factor), avca_factor = avca_mult/ts_mult.
         let factor = self.avca_mult / self.ts_mult;
-        // video args: cross_modality = audio → conditioned on a_sigma
-        let v_css = self.avca_v_ss.modulate(&[a_sigma * self.ts_mult as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 4, 4096])?;
+        // video args: scale_shift по своей модальности (v_sigma), gate по кросс-модальности (a_sigma)
+        // (эталон transformer_args.py::_prepare_cross_attention_timestep).
+        let v_css = self.avca_v_ss.modulate(&[v_sigma * self.ts_mult as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 4, 4096])?;
         let v_cg = self.avca_a2v_gate.modulate(&[a_sigma * self.ts_mult as f32 * factor as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 1, 4096])?;
-        // audio args: cross_modality = video → conditioned on v_sigma
-        let a_css = self.avca_a_ss.modulate(&[v_sigma * self.ts_mult as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 4, 2048])?;
+        // audio args: scale_shift по своей модальности (a_sigma), gate по кросс-модальности (v_sigma)
+        let a_css = self.avca_a_ss.modulate(&[a_sigma * self.ts_mult as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 4, 2048])?;
         let a_cg = self.avca_v2a_gate.modulate(&[v_sigma * self.ts_mult as f32 * factor as f32], 1, dev, dt)?.0.reshape(vec![1, 1, 1, 2048])?;
 
         // Решение по graph-кэшу ДО RoPE: при готовом GraphCtx той же формы и
