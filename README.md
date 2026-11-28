@@ -71,6 +71,8 @@ Native ports, each validated against its upstream reference:
 | **Music** | YuE2 (song from style and lyrics through an editable ABC score; covers of a recording), SheetSage2 (recording → lead sheet in ABC: melody, chords, beats, key, sections), ACE-Step (generate, cover, edit, extend, extract, repaint) |
 | **Embeddings / rerank** | BGE-M3, BGE-reranker-v2-m3 |
 
+**Base vs. distilled.** Final renders use the full (base / dev) checkpoints: LTX dev runs the reference guided two-stage path (half-resolution stage with CFG, STG and modality guidance, ×2 latent upscale, distilled-LoRA refine), ACE-Step uses `xl-base`. Turbo and distilled checkpoints are for drafts only. Exception: LTX IC-LoRAs (reference sheet, union/motion control, LipDub) are trained for the distilled checkpoint and run only there.
+
 ## Quantization and memory
 
 - **NVFP4 (4-bit) and MXFP8 (8-bit)** with block scaling, through `mma.sync` tensor-core
