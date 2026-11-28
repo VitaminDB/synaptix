@@ -37,6 +37,7 @@ fn main() {
         context_frames: std::env::var("LTX_CONTEXT_FRAMES").ok().and_then(|v| v.parse().ok()),
         two_stage: std::env::var("LTX_TWO_STAGE").is_ok(),
         ref_sheet: std::env::var("LTX_SHEET").ok().map(PathBuf::from),
+        steps: std::env::var("LTX_STEPS").ok().and_then(|v| v.parse().ok()),
         ..Default::default()
     };
     let t0 = std::time::Instant::now();

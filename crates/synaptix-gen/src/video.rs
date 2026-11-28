@@ -100,6 +100,9 @@ off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery m
 pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, \
 inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
 
+/// Отрицательный промпт из карточки IC-LoRA Ingredients.
+pub const INGREDIENTS_NEGATIVE_PROMPT: &str = "worst quality, inconsistent motion, blurry, jittery, distorted";
+
 /// Гайдеры видео и звука по умолчанию Lightricks для полного чекпойнта (2.3+:
 /// STG на блоке 28; 2.0 — 29); `cfg` — своя сила CFG видео.
 fn guided_params(version: &str, cfg: Option<f32>) -> (synaptix_video_ltx23::guider::GuiderParams, synaptix_video_ltx23::guider::GuiderParams) {
@@ -521,7 +524,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let distilled_ckpt = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
     // Лист Ingredients на полном чекпойнте — управляемым путём (dev + IC-LoRA);
     // прочие IC-LoRA и LipDub — как у Lightricks, только на distilled.
-    let sheet_on_full = !distilled_ckpt && matches!(mode, LtxMode::Sheet { .. }) && req.guided != Some(false);
+    let sheet_on_full = !distilled_ckpt && matches!(mode, LtxMode::Sheet { .. });
+    // Лист на полном чекпойнте — по карточке IC-LoRA Ingredients (валидация
+    // Lightricks): dev без дистилл-LoRA, ОДНА стадия в полном разрешении
+    // (обучено на 768×448×121), 30 шагов, CFG 4, STG 1.0 на блоке 29 (видео),
+    // отрицательный промпт карточки. Одна стадия distilled копирует лист, две
+    // стадии дают мозаику (так и у сторонних замеров).
+    let sheet_dev = sheet_on_full;
     if adapter.is_some() && !distilled_ckpt && !sheet_on_full {
         return Err("IC-LoRA и LipDub идут на distilled-чекпойнте (ltx-2-3-22b-distilled, ltx-2-5-22b-distilled)".into());
     }
@@ -541,13 +550,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    let guided = sheet_on_full
+    let guided = sheet_dev
         || (!distilled_ckpt
             && adapter.is_none()
             && !dfr
             && req.guided.unwrap_or(true)
             && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. }));
-    let two_stage = two_stage || dfr || (guided && paths.upscaler.is_some());
+    let two_stage = !sheet_dev && (two_stage || dfr || (guided && paths.upscaler.is_some()));
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
     }
@@ -622,7 +631,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let nag = gemma.encode_for_ltx(lp::DEFAULT_NAG_PROMPT, 1024, device).map_err(|e| format!("Gemma: {e}"))?;
         // Управляемый путь: отрицательный промпт (свой или Lightricks) для CFG.
         let neg = if guided {
-            let text = req.negative.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(LTX_NEGATIVE_PROMPT);
+            let default = if matches!(mode, LtxMode::Sheet { .. }) { INGREDIENTS_NEGATIVE_PROMPT } else { LTX_NEGATIVE_PROMPT };
+            let text = req.negative.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(default);
             Some(gemma.encode_for_ltx(text, 1024, device).map_err(|e| format!("Gemma: {e}"))?)
         } else {
             None
@@ -661,8 +671,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let hooks = lp::DenoiseHooks { progress: Some(&on_step), cancel: Some(cancel) };
 
     let latent = synaptix_core::grad::no_grad(|| -> R<(Tensor, Option<Tensor>, Option<Vec<f32>>, Option<Tensor>)> {
+        // Сила IC-LoRA: 1.0 (карточка 2.5; у 2.3 — 1.4), `SYN_LTX_IC_STRENGTH` — подбор.
+        let ic_k = std::env::var("SYN_LTX_IC_STRENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32);
         let lora = match &lora_path {
-            Some(p) => Some(LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
+            Some(p) => Some(LoraWeights::open(p, device, if adapter.is_some() { ic_k } else { 1.0 }).map_err(|e| format!("LoRA {}: {e}", p.display()))?),
             None => None,
         };
         let lora_ckpt = lora.map(|l| ckpt.view_on(Device::Cpu).with_lora(std::sync::Arc::new(l)));
@@ -711,7 +723,12 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                 let (tok, f_, h_, w_) = latent_tokens(&lat)?;
                 Ok(Some((tok, lp::ref_video_positions(f_, h_, w_, fps, 1))))
             };
-            let (vg, ag) = guided_params(&ckpt.config.model_version, req.guidance);
+            let (mut vg, ag) = guided_params(&ckpt.config.model_version, req.guidance);
+            if sheet_dev {
+                // Валидация Ingredients: CFG 4, STG 1.0 на блоке 29 (видео).
+                vg.cfg_scale = req.guidance.filter(|c| *c > 0.0).unwrap_or(4.0);
+                vg.stg_blocks = vec![29];
+            }
             let (vn, an) = neg_enc.as_ref().ok_or("LTX: нет отрицательного промпта")?;
             let sig = lp::ltx2_sigmas(guided_steps, fp * hp1 * wp1);
             eprintln!("[ltx] полный чекпойнт: стадия 1 {}×{}, {guided_steps} шагов, CFG видео {} / звук {}, STG {:?}", wp1 * 32, hp1 * 32, vg.cfg_scale, ag.cfg_scale, vg.stg_blocks);
@@ -1027,7 +1044,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             })
         };
         // LTX-2.5: Euler-ancestral на обоих этапах, шум — seed+10000 / seed+20000.
-        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5) && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler");
+        let ltx25 = ltx_version_at_least(&ckpt.config.model_version, 2, 5) && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler") && !sheet_dev;
         let base = seed.unwrap_or(1);
         struct AncReset;
         impl Drop for AncReset {
@@ -1037,6 +1054,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
         let _anc = AncReset;
         synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(10_000)));
+        // Лист на полном чекпойнте: `steps` > 8 — расписание LTX2Scheduler на столько шагов.
         let (mut l, mut a, mut wave) = stage((hp1, wp1), &lp::DISTILLED_SIGMAS, None)?;
         let stage1_saved = if two_stage { Some(l.clone()) } else { None };
         if two_stage {
