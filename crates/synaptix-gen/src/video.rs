@@ -368,8 +368,8 @@ enum LtxMode {
     A2v { audio: PathBuf, image: Option<PathBuf> },
     Ic { video: PathBuf, canny: bool },
     Lipdub { video: PathBuf, audio: PathBuf },
-    /// Лист-референс IC-LoRA Ingredients.
-    Sheet { image: PathBuf },
+    /// Лист-референс IC-LoRA Ingredients (опционально: продолжение с хвоста `tail` и/или озвучка `audio`).
+    Sheet { image: PathBuf, tail: Option<crate::tail::TailLatent>, audio: Option<PathBuf> },
 }
 
 fn scratch(tag: &str) -> R<PathBuf> {
@@ -487,12 +487,20 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     let seed = Some(req.seed.max(1));
 
     // Режим и источник длительности/размера.
-    let mode = if let Some(ctx_path) = &req.context {
+    let mode = if let Some(sheet) = &req.ref_sheet {
+        let tail = match &req.context {
+            Some(ctx_path) => {
+                let t = crate::tail::TailLatent::load(ctx_path)?;
+                t.meta.check_compat("ltx", req.model_id.as_deref(), req.width, req.height, None)?;
+                Some(t)
+            }
+            None => None,
+        };
+        LtxMode::Sheet { image: sheet.clone(), tail, audio: req.audio.clone() }
+    } else if let Some(ctx_path) = &req.context {
         let tail = crate::tail::TailLatent::load(ctx_path)?;
         tail.meta.check_compat("ltx", req.model_id.as_deref(), req.width, req.height, None)?;
         LtxMode::Continue { tail }
-    } else if let Some(sheet) = &req.ref_sheet {
-        LtxMode::Sheet { image: sheet.clone() }
     } else {
         match (&req.control_video, &req.audio, &req.source_video) {
             (Some(v), Some(a), _) => LtxMode::Lipdub { video: v.clone(), audio: a.clone() },
@@ -511,7 +519,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
     };
     let fps = match &mode {
-        LtxMode::Continue { tail } => tail.meta.fps,
+        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.fps,
         _ => fps,
     };
     let adapter = match &mode {
@@ -551,26 +559,28 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    // Для листа `guided == Some(false)` включает быстрый двухстадийный режим
-    // (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
+    // Для листа `guided == Some(false)` или подача внешней озвучки (`audio`) включает
+    // быстрый двухстадийный режим (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
+    let sheet_has_audio = matches!(mode, LtxMode::Sheet { audio: Some(_), .. });
     let sheet_distill_k: f32 = std::env::var("LTX_DISTILL_STRENGTH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if sheet_dev && req.guided == Some(false) { 1.0 } else { 0.0 });
-    let sheet_unguided = sheet_dev && (req.guided == Some(false) || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
+        .unwrap_or(if sheet_dev && (req.guided == Some(false) || sheet_has_audio) { 1.0 } else { 0.0 });
+    let sheet_unguided = sheet_dev && (req.guided == Some(false) || sheet_has_audio || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
     let guided = (sheet_dev && !sheet_unguided)
         || (!distilled_ckpt
             && adapter.is_none()
             && !dfr
             && req.guided.unwrap_or(true)
             && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. }));
-    let two_stage = two_stage || dfr || ((guided || sheet_unguided) && paths.upscaler.is_some());
+    let sheet_no_s1_tail = matches!(&mode, LtxMode::Sheet { tail: Some(tail), .. } if tail.video_stage1.is_none());
+    let two_stage = !sheet_no_s1_tail && (two_stage || dfr || ((guided || sheet_unguided) && paths.upscaler.is_some()));
     if two_stage && paths.upscaler.is_none() {
         return Err("для двух стадий нужен апскейлер LTX-2.3 ×2".into());
     }
     // Длительность: у звука, retake и образцов — по исходнику.
     let src_secs = match &mode {
-        LtxMode::A2v { audio, .. } | LtxMode::Lipdub { audio, .. } => media_seconds(audio),
+        LtxMode::A2v { audio, .. } | LtxMode::Lipdub { audio, .. } | LtxMode::Sheet { audio: Some(audio), .. } => media_seconds(audio),
         LtxMode::Retake { video, .. } | LtxMode::Ic { video, .. } => media_seconds(video),
         _ => None,
     };
@@ -583,24 +593,24 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
         _ => None,
     };
-    // От звука (липсинк, LipDub) длина ролика — по звуку; иначе — запрошенная.
+    // От звука (липсинк, LipDub, озвучка листа) длина ролика — по звуку; иначе — запрошенная.
     let secs = match &mode {
-        LtxMode::A2v { .. } | LtxMode::Lipdub { .. } => src_secs.or(req.seconds),
+        LtxMode::A2v { .. } | LtxMode::Lipdub { .. } | LtxMode::Sheet { audio: Some(_), .. } => src_secs.or(req.seconds),
         _ => req.seconds.filter(|s| *s > 0.0).or(auto_secs).or(src_secs),
     }
     .unwrap_or(5.0)
     .clamp(1.0, 20.0);
     let width = match &mode {
-        LtxMode::Continue { tail } => tail.meta.width,
+        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.width,
         _ => req.width.filter(|&v| v > 0).unwrap_or(960),
     };
     let height = match &mode {
-        LtxMode::Continue { tail } => tail.meta.height,
+        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.height,
         _ => req.height.filter(|&v| v > 0).unwrap_or(544),
     };
     let (hp, wp) = lp::latent_grid(width, height);
     let (fp, overlap_frames) = match &mode {
-        LtxMode::Continue { tail } => {
+        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => {
             let fp_new = ((secs * fps) / 8.0).round().max(1.0) as usize;
             (tail.meta.context_frames + fp_new, tail.meta.overlap_frames)
         }
@@ -727,15 +737,26 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                 LtxMode::Frames { first: Some(p), .. } => Some(synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?),
                 _ => None,
             };
-            let conds = |g: (usize, usize)| -> R<Vec<(usize, Tensor, f32)>> {
-                Ok(match &first {
-                    Some(img) => vec![(0usize, image_tokens(img, g)?, 1.0f32)],
-                    None => Vec::new(),
-                })
+            let conds = |g: (usize, usize), second: bool| -> R<Vec<(usize, Tensor, f32)>> {
+                if let Some(img) = &first {
+                    return Ok(vec![(0usize, image_tokens(img, g)?, 1.0f32)]);
+                }
+                if let LtxMode::Sheet { tail: Some(tail), .. } = &mode {
+                    let v_pref = if !second {
+                        tail.video_stage1
+                            .as_ref()
+                            .filter(|s1| s1.dims()[3] == g.0 && s1.dims()[4] == g.1)
+                            .unwrap_or(&tail.video)
+                    } else {
+                        &tail.video
+                    };
+                    return Ok(vec![(0usize, latent_tokens(v_pref)?.0, 1.0f32)]);
+                }
+                Ok(Vec::new())
             };
             // Лист Ingredients: статичное видео в разрешении стадии (масштаб 1), ≥121 кадра.
             let sheet_ref = |g: (usize, usize)| -> R<Option<(Tensor, Vec<f64>)>> {
-                let LtxMode::Sheet { image } = &mode else { return Ok(None) };
+                let LtxMode::Sheet { image, .. } = &mode else { return Ok(None) };
                 let img = synaptix_io::image::load_image(image, Device::Cpu).map_err(|e| format!("{}: {e}", image.display()))?;
                 let (ph, pw) = (g.0 * 32, g.1 * 32);
                 let one = synaptix_io::image::fit_image(&img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
@@ -757,7 +778,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             eprintln!("[ltx] полный чекпойнт: стадия 1 {}×{}, {guided_steps} шагов, CFG видео {} / звук {}, STG {:?}", wp1 * 32, hp1 * 32, vg.cfg_scale, ag.cfg_scale, vg.stg_blocks);
             synaptix_core::gen_status::phase("стадия 1: полный DiT, CFG/STG");
             let ref1 = sheet_ref((hp1, wp1))?;
-            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1))?, ref1.as_ref().map(|(t, p)| (t, p.as_slice())), seed, &hooks).map_err(err)?;
+            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1), false)?, ref1.as_ref().map(|(t, p)| (t, p.as_slice())), seed, &hooks).map_err(err)?;
             drop(ref1);
             drop(dit);
             release();
@@ -786,8 +807,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             } else {
                 eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
             }
-            let c2 = conds((hp2, wp2))?;
-            let ref_s1 = if sheet_dev && c2.is_empty() {
+            let c2 = conds((hp2, wp2), true)?;
+            let ref_s1 = if sheet_dev {
                 if let Some(dp) = &paths.detail_lora {
                     eprintln!("[ltx] стадия 2: IC-LoRA детализации ×2 (сила 0.5) с привязкой к латенту стадии 1");
                     let dtl = LoraWeights::open(dp, device, 0.5).map_err(|e| format!("LoRA детализации: {e}"))?;
@@ -809,8 +830,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             let base = seed.unwrap_or(1);
             synaptix_video_ltx23::runtime::set_ancestral(ltx25_s2.then(|| base.wrapping_add(20_000)));
             let v_app = ref_s1.as_ref().map(|(t, p)| (t, p.as_slice(), 1.0f32));
-            let l3 = if c2.is_empty() {
-                lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, v_app, None, fps, device, seed, &hooks).map_err(err)?.0
+            let l3 = if c2.is_empty() || sheet_dev {
+                lp::denoise_av_append_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, &c2, &[], v_app, None, fps, device, seed, &hooks).map_err(err)?.0
             } else {
                 lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &c2, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?.0
             };
@@ -1046,7 +1067,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
                     (l, a, None)
                 }
-                LtxMode::Sheet { image } => {
+                LtxMode::Sheet { image, tail, audio } => {
                     // Лист — статичное видео в выходном разрешении (масштаб референса 1),
                     // не короче ролика и не меньше 121 кадра (корзина обучения).
                     let img = synaptix_io::image::load_image(image, Device::Cpu).map_err(|e| format!("{}: {e}", image.display()))?;
@@ -1059,8 +1080,40 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     drop(frames);
                     let (tok, f_, h_, w_) = latent_tokens(&lat)?;
                     let pos = lp::ref_video_positions(f_, h_, w_, fps, 1);
-                    let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
-                    (l, a, None)
+                    // Сшивка с хвостом предыдущего ролика (при наличии `tail`): замораживаем
+                    // начало видео (и звука, если не задана отдельная озвучка `audio`).
+                    let v_conds: Vec<(usize, Tensor, f32)> = match tail {
+                        Some(t) => {
+                            let v_pref = if init.is_none() {
+                                t.video_stage1
+                                    .as_ref()
+                                    .filter(|s1| s1.dims()[3] == g.0 && s1.dims()[4] == g.1)
+                                    .unwrap_or(&t.video)
+                            } else {
+                                &t.video
+                            };
+                            vec![(0, latent_tokens(v_pref)?.0, 1.0)]
+                        }
+                        None => Vec::new(),
+                    };
+                    if let Some(a_path) = audio {
+                        // Дубляж / озвучка под готовую аудиодорожку: кодируем звук и замораживаем.
+                        let fa = lp::audio_token_count(fp, fps);
+                        let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                        let mel = ltx_log_mel(&[ffmpeg_f32(a_path, 16000, 1)?], device).map_err(err)?;
+                        let enc = aenc.encode(&mel).map_err(err)?;
+                        drop(aenc);
+                        let audio_lat = fit_audio_tokens(enc, fa)?;
+                        let (l, _) = lp::denoise_av_append_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, &v_conds, &[], Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                        (l, audio_lat, Some(ffmpeg_f32(a_path, 48000, 2)?))
+                    } else {
+                        let a_conds: Vec<(usize, Tensor, f32)> = match tail.as_ref().and_then(|t| t.audio.as_ref()) {
+                            Some(a) => vec![(0, a.clone(), 1.0)],
+                            None => Vec::new(),
+                        };
+                        let (l, a) = lp::denoise_av_append_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, &v_conds, &a_conds, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                        (l, a, None)
+                    }
                 }
                 LtxMode::Lipdub { video, audio } => {
                     let frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
@@ -1150,7 +1203,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                 };
                 let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
                 let v_app = ref_s1.as_ref().map(|(t, p)| (t, p.as_slice(), 1.0f32));
-                l = lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a), true, v_app, None, fps, device, seed, &hooks).map_err(err)?.0;
+                let v_conds2: Vec<(usize, Tensor, f32)> = match &mode {
+                    LtxMode::Sheet { tail: Some(t), .. } => vec![(0, latent_tokens(&t.video)?.0, 1.0)],
+                    _ => Vec::new(),
+                };
+                l = lp::denoise_av_append_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a), true, &v_conds2, &[], v_app, None, fps, device, seed, &hooks).map_err(err)?.0;
                 drop(dit2);
                 drop(venc);
                 synaptix_core::tensor::ops::conv_filter_cache_gc();
@@ -1290,7 +1347,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
     }
     let n = frames.len();
-    let continued = matches!(mode, LtxMode::Continue { .. });
+    let continued = matches!(mode, LtxMode::Continue { .. } | LtxMode::Sheet { tail: Some(_), .. });
     let label_mode = match &mode {
         LtxMode::Text => "по описанию".to_string(),
         LtxMode::Frames { first: Some(_), last: Some(_) } => "между первым и последним кадром".to_string(),
@@ -1303,7 +1360,16 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::A2v { .. } => "по звуку (липсинк)".to_string(),
         LtxMode::Ic { canny: true, .. } => "по контурам образца (IC-LoRA)".to_string(),
         LtxMode::Ic { .. } => "по движению образца (IC-LoRA)".to_string(),
-        LtxMode::Sheet { .. } => "по листу-референсу (IC-LoRA Ingredients)".to_string(),
+        LtxMode::Sheet { tail, audio, .. } => {
+            let mut s = "по листу-референсу (IC-LoRA Ingredients)".to_string();
+            if let Some(t) = tail {
+                s += &format!(", с хвоста ({} лат.)", t.meta.context_frames);
+            }
+            if audio.is_some() {
+                s += ", с озвучкой";
+            }
+            s
+        }
         LtxMode::Lipdub { .. } => "LipDub".to_string(),
     };
     match &mode {

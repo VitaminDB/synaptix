@@ -1507,6 +1507,37 @@ pub fn denoise_av_append(
     seed: Option<u64>,
     hooks: &DenoiseHooks,
 ) -> Result<(Tensor, Tensor), LtxError> {
+    denoise_av_append_cond(
+        dit, video_encoding, audio_encoding, fp, hp, wp, sigmas,
+        v_init, a_init, a_frozen, &[], &[], v_app, a_app, fps, device, seed, hooks,
+    )
+}
+
+/// Как [`denoise_av_append`], но также принимает replace-conditioning
+/// (`v_conds`, `a_conds`: `(start_token, tokens, strength)`) — например,
+/// сшивка с замороженным хвостом предыдущего ролика (`Continue`) вместе с
+/// листом-референсом (`v_app`) или привязкой к латенту стадии 1 (`detail_lora`).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_append_cond(
+    dit: &AvDit,
+    video_encoding: &Tensor,
+    audio_encoding: &Tensor,
+    fp: usize,
+    hp: usize,
+    wp: usize,
+    sigmas: &[f64],
+    v_init: Option<&Tensor>,
+    a_init: Option<&Tensor>,
+    a_frozen: bool,
+    v_conds: &[(usize, Tensor, f32)],
+    a_conds: &[(usize, Tensor, f32)],
+    v_app: Option<(&Tensor, &[f64], f32)>,
+    a_app: Option<(&Tensor, &[f64])>,
+    fps: f64,
+    device: Device,
+    seed: Option<u64>,
+    hooks: &DenoiseHooks,
+) -> Result<(Tensor, Tensor), LtxError> {
     let tv = fp * hp * wp;
     let ddt = dit.compute_dtype();
     let v_ctx = video_encoding.to_device(device)?.to_dtype(ddt)?;
@@ -1522,6 +1553,28 @@ pub fn denoise_av_append(
             .reshape(vec![1, 128, tv])?.transpose(1, 2)?.contiguous()?;
         v_main = v_main.mul_scalar(s0 as f32)?.add(&clean.mul_scalar((1.0 - s0) as f32)?)?;
     }
+    let mut v_main_mask = vec![1f32; tv];
+    for (start, toks, strength) in v_conds {
+        let n = toks.dims()[1].min(tv.saturating_sub(*start));
+        if n == 0 {
+            continue;
+        }
+        for k in *start..(*start + n) {
+            v_main_mask[k] = 1.0 - *strength;
+        }
+        let toks = toks.narrow(1, 0, n)?.contiguous()?.to_device(device)?.to_dtype(DType::BF16)?;
+        let mut parts: Vec<Tensor> = Vec::new();
+        if *start > 0 {
+            parts.push(v_main.narrow(1, 0, *start)?.contiguous()?);
+        }
+        parts.push(toks);
+        if start + n < tv {
+            parts.push(v_main.narrow(1, start + n, tv - start - n)?.contiguous()?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        v_main = Tensor::cat(&refs, 1)?.contiguous()?;
+    }
+
     let a_noise = noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(DType::BF16)?;
     let mut a_main = a_noise.transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?;
     if let Some(init) = a_init {
@@ -1532,6 +1585,30 @@ pub fn denoise_av_append(
             a_main.mul_scalar(s0 as f32)?.add(&clean.mul_scalar((1.0 - s0) as f32)?)?
         };
     }
+    let a_main_val = if a_frozen { 0f32 } else { 1f32 };
+    let mut a_main_mask = vec![a_main_val; fa];
+    if !a_frozen {
+        for (start, toks, strength) in a_conds {
+            let n = toks.dims()[1].min(fa.saturating_sub(*start));
+            if n == 0 {
+                continue;
+            }
+            for k in *start..(*start + n) {
+                a_main_mask[k] = 1.0 - *strength;
+            }
+            let toks = toks.narrow(1, 0, n)?.contiguous()?.to_device(device)?.to_dtype(DType::BF16)?;
+            let mut parts: Vec<Tensor> = Vec::new();
+            if *start > 0 {
+                parts.push(a_main.narrow(1, 0, *start)?.contiguous()?);
+            }
+            parts.push(toks);
+            if start + n < fa {
+                parts.push(a_main.narrow(1, start + n, fa - start - n)?.contiguous()?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            a_main = Tensor::cat(&refs, 1)?.contiguous()?;
+        }
+    }
 
     // сборка последовательностей: main ++ append (append fixed, mask 0)
     let (mut v_tok, v_pos, tv_all, v_mask) = match &v_app {
@@ -1539,24 +1616,23 @@ pub fn denoise_av_append(
             let app = app.to_device(device)?.to_dtype(DType::BF16)?;
             let ta = app.dims()[1];
             let pos = cat_positions(&pixel_coords(fp, hp, wp, fps), tv, app_pos, ta);
-            let mut m = vec![1f32; tv];
+            let mut m = v_main_mask;
             m.extend(std::iter::repeat(1.0 - *strength).take(ta));
             (Tensor::cat(&[&v_main, &app], 1)?.contiguous()?, pos, tv + ta, m)
         }
-        None => (v_main, pixel_coords(fp, hp, wp, fps), tv, vec![1f32; tv]),
+        None => (v_main, pixel_coords(fp, hp, wp, fps), tv, v_main_mask),
     };
-    let a_main_mask = if a_frozen { 0f32 } else { 1f32 };
     let (mut a_tok, a_pos, fa_all, a_mask) = match &a_app {
         Some((app, app_pos)) => {
             let app = app.to_device(device)?.to_dtype(DType::BF16)?;
             let ta = app.dims()[1];
             let mut pos = audio_coords(fa);
             pos.extend_from_slice(app_pos);
-            let mut m = vec![a_main_mask; fa];
+            let mut m = a_main_mask;
             m.extend(std::iter::repeat(0f32).take(ta));
             (Tensor::cat(&[&a_main, &app], 1)?.contiguous()?, pos, fa + ta, m)
         }
-        None => (a_main, audio_coords(fa), fa, vec![a_main_mask; fa]),
+        None => (a_main, audio_coords(fa), fa, a_main_mask),
     };
     let vm = Tensor::from_vec(v_mask.clone(), vec![1, tv_all, 1], device)?.to_dtype(DType::BF16)?;
     let vm_inv = vm.affine(-1.0, 1.0)?;

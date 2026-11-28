@@ -31,6 +31,7 @@ fn main() {
         first_frame: std::env::var("LTX_FIRST").ok().map(PathBuf::from),
         diff_decoder: std::env::var("LTX_DIFF_VAE").is_ok(),
         source_video: std::env::var("LTX_SOURCE").ok().map(PathBuf::from),
+        audio: std::env::var("LTX_AUDIO").ok().map(PathBuf::from),
         extend: std::env::var("LTX_EXTEND").is_ok(),
         tail_out: std::env::var("LTX_TAIL_OUT").ok().map(PathBuf::from),
         context: std::env::var("LTX_CONTEXT").ok().map(PathBuf::from),
