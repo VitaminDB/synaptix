@@ -286,12 +286,22 @@ pub fn write_mp4(frames: &[Tensor], audio: Option<(&[f32], u32, u16)>, fps: f64,
         }
         let wav = dir.join("audio.wav");
         if let Some((pcm, sr, ch)) = audio {
-            std::fs::write(&wav, crate::music::wav_bytes(pcm, sr, ch)).map_err(err)?;
+            // Подгоняем длину аудио точно под видео (дополняем тишиной или обрезаем),
+            // чтобы ffmpeg не откусывал последние 1–2 кадра видео через `-shortest`
+            // (при сшивке по хвосту потеря этих кадров даёт видимый скачок на стыке).
+            let target_samples = ((frames.len() as f64 / fps) * sr as f64).round() as usize * ch as usize;
+            let mut aligned = Vec::with_capacity(target_samples);
+            let copy_len = pcm.len().min(target_samples);
+            aligned.extend_from_slice(&pcm[..copy_len]);
+            if aligned.len() < target_samples {
+                aligned.resize(target_samples, 0.0);
+            }
+            std::fs::write(&wav, crate::music::wav_bytes(&aligned, sr, ch)).map_err(err)?;
         }
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y"]).arg("-framerate").arg(format!("{fps}")).arg("-i").arg(dir.join("f%05d.ppm"));
         if audio.is_some() {
-            cmd.arg("-i").arg(&wav).args(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+            cmd.arg("-i").arg(&wav).args(["-c:a", "aac", "-b:a", "192k"]);
         }
         let status = cmd.args(["-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]).arg(out).status().map_err(|e| format!("ffmpeg: {e}"))?;
         if !status.success() {
