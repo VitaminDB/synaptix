@@ -559,14 +559,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    // Для листа `guided == Some(false)` или подача внешней озвучки (`audio`) включает
-    // быстрый двухстадийный режим (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
-    let sheet_has_audio = matches!(mode, LtxMode::Sheet { audio: Some(_), .. });
+    // Для листа `guided == Some(false)` включает быстрый двухстадийный режим
+    // (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
     let sheet_distill_k: f32 = std::env::var("LTX_DISTILL_STRENGTH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if sheet_dev && (req.guided == Some(false) || sheet_has_audio) { 1.0 } else { 0.0 });
-    let sheet_unguided = sheet_dev && (req.guided == Some(false) || sheet_has_audio || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
+        .unwrap_or(if sheet_dev && req.guided == Some(false) { 1.0 } else { 0.0 });
+    let sheet_unguided = sheet_dev && (req.guided == Some(false) || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
     let guided = (sheet_dev && !sheet_unguided)
         || (!distilled_ckpt
             && adapter.is_none()
@@ -586,7 +585,9 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     };
     // LTX-2.5: длина не задана — по описанию (голова длительности).
     let auto_secs = match &mode {
-        LtxMode::Text | LtxMode::Frames { .. } if req.seconds.is_none_or(|s| s <= 0.0) && paths.duration_head.is_some() => {
+        LtxMode::Text | LtxMode::Frames { .. } | LtxMode::Sheet { audio: None, .. }
+            if req.seconds.is_none_or(|s| s <= 0.0) && paths.duration_head.is_some() =>
+        {
             let s = ltx_auto_seconds(paths, device, &req.prompt, req.quant.as_deref())?;
             eprintln!("[ltx] длительность по описанию: {s:.2} с");
             Some(s)
@@ -778,12 +779,23 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             eprintln!("[ltx] полный чекпойнт: стадия 1 {}×{}, {guided_steps} шагов, CFG видео {} / звук {}, STG {:?}", wp1 * 32, hp1 * 32, vg.cfg_scale, ag.cfg_scale, vg.stg_blocks);
             synaptix_core::gen_status::phase("стадия 1: полный DiT, CFG/STG");
             let ref1 = sheet_ref((hp1, wp1))?;
-            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1), false)?, ref1.as_ref().map(|(t, p)| (t, p.as_slice())), seed, &hooks).map_err(err)?;
+            let (a_frz, input_wave) = match &mode {
+                LtxMode::Sheet { audio: Some(a_path), .. } => {
+                    let fa = lp::audio_token_count(fp, fps);
+                    let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                    let mel = ltx_log_mel(&[ffmpeg_f32(a_path, 16000, 1)?], device).map_err(err)?;
+                    let enc = aenc.encode(&mel).map_err(err)?;
+                    drop(aenc);
+                    (Some(fit_audio_tokens(enc, fa)?), Some(ffmpeg_f32(a_path, 48000, 2)?))
+                }
+                _ => (None, None),
+            };
+            let (l1, a1) = lp::denoise_av_guided(&dit, &v_enc, &a_enc, vn, an, &vg, &ag, fp, hp1, wp1, &sig, fps, device, &conds((hp1, wp1), false)?, ref1.as_ref().map(|(t, p)| (t, p.as_slice())), a_frz.as_ref(), seed, &hooks).map_err(err)?;
             drop(ref1);
             drop(dit);
             release();
             if !two_stage {
-                return Ok((l1, Some(a1), None, None));
+                return Ok((l1, Some(a1), input_wave, None));
             }
             let l2 = {
                 let view = ckpt.view_on(device);
@@ -838,7 +850,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_video_ltx23::runtime::set_ancestral(None);
             drop(dit2);
             synaptix_core::tensor::ops::conv_filter_cache_gc();
-            return Ok((l3, Some(a1), None, Some(l1)));
+            return Ok((l3, Some(a1), input_wave, Some(l1)));
         }
         if dfr {
             // DFR (эталон LTX-2 `dfr_pipeline.py`, этапы 1–2 без временных раундов и эпилога).

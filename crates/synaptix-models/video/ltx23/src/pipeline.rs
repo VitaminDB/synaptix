@@ -1293,6 +1293,7 @@ pub fn denoise_av_guided(
     device: Device,
     v_conds: &[(usize, Tensor, f32)],
     v_ref: Option<(&Tensor, &[f64])>,
+    a_frozen: Option<&Tensor>,
     seed: Option<u64>,
     hooks: &DenoiseHooks,
 ) -> Result<(Tensor, Tensor), LtxError> {
@@ -1307,9 +1308,12 @@ pub fn denoise_av_guided(
     let fa = audio_token_count(fp, fps);
     let a_pos = audio_coords(fa);
     let v_noise = noise_tensor(vec![1usize, 128, fp, hp, wp], seed)?.to_device(device)?.to_dtype(ddt)?;
-    let a_noise = noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(ddt)?;
     let mut v_tok = v_noise.reshape(vec![1, 128, tv])?.transpose(1, 2)?.contiguous()?;
-    let mut a_tok = a_noise.transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?;
+    let mut a_tok = match a_frozen {
+        Some(af) => af.to_device(device)?.to_dtype(ddt)?,
+        None => noise_tensor(vec![1usize, 8, fa, 16], seed)?.to_device(device)?.to_dtype(ddt)?
+            .transpose(1, 2)?.contiguous()?.reshape(vec![1, fa, 128])?,
+    };
     // Замена кадров условием (как denoise_av_cond).
     let mut v_mask_v = vec![1f32; tv];
     for (start, toks, strength) in v_conds {
@@ -1347,14 +1351,15 @@ pub fn denoise_av_guided(
     let active: Vec<bool> = v_mask_v.iter().map(|m| *m != 0.0).collect();
 
     // Проходы: (контекст видео, контекст звука, возмущение).
-    let need_u = vg.do_uncond() || ag.do_uncond();
+    let a_frz = a_frozen.is_some();
+    let need_u = vg.do_uncond() || (!a_frz && ag.do_uncond());
     let ptb_stg = AvPerturb {
         skip_video_self: if vg.do_perturbed() { vg.stg_blocks.clone() } else { Vec::new() },
-        skip_audio_self: if ag.do_perturbed() { ag.stg_blocks.clone() } else { Vec::new() },
+        skip_audio_self: if !a_frz && ag.do_perturbed() { ag.stg_blocks.clone() } else { Vec::new() },
         skip_cross: false,
     };
     let need_p = !ptb_stg.skip_video_self.is_empty() || !ptb_stg.skip_audio_self.is_empty();
-    let need_m = vg.do_isolated_modality() || ag.do_isolated_modality();
+    let need_m = vg.do_isolated_modality() || (!a_frz && ag.do_isolated_modality());
     let ptb_mod = AvPerturb { skip_cross: true, ..AvPerturb::default() };
 
     let total = sigmas.len() - 1;
@@ -1364,9 +1369,10 @@ pub fn denoise_av_guided(
         }
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         let v_ts: Vec<f32> = v_mask_v.iter().map(|&m| m * sigma as f32).collect();
-        let a_ts = vec![sigma as f32; fa];
+        let a_sigma = if a_frz { 0.0f32 } else { sigma as f32 };
+        let a_ts = vec![a_sigma; fa];
         let run = |vc: &Tensor, ac: &Tensor, p: Option<&AvPerturb>| {
-            dit.forward_ptb(&v_tok, &v_ts, sigma as f32, &v_pos, vc, &a_tok, &a_ts, sigma as f32, &a_pos, ac, None, p)
+            dit.forward_ptb(&v_tok, &v_ts, sigma as f32, &v_pos, vc, &a_tok, &a_ts, a_sigma, &a_pos, ac, None, p)
         };
         let (cv, ca) = run(&v_ctx, &a_ctx, None)?;
         let skip_guidance = vg.should_skip_step(i) && ag.should_skip_step(i);
@@ -1421,7 +1427,9 @@ pub fn denoise_av_guided(
         } else {
             v_tok = v_tok.add(&v_vel.mul_scalar(dt)?)?;
         }
-        a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        if !a_frz {
+            a_tok = a_tok.add(&a_vel.mul_scalar(dt)?)?;
+        }
         hooks.emit(i + 1, total, sigma_next);
     }
     let v_latent = v_tok.narrow(1, 0, tv)?.contiguous()?.transpose(1, 2)?.contiguous()?.reshape(vec![1, 128, fp, hp, wp])?.to_dtype(DType::F32)?;
