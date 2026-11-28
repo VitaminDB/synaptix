@@ -2924,7 +2924,11 @@ impl<'a> LlmGeneration<'a> {
                             Ok(())
                         }),
                     );
-                    if let Some(sn) = new_snap {
+                    // Граница — ровно на взятой из кэша точке (голова роли
+                    // или чата, посчитан только хвост): точка остаётся там,
+                    // иначе следующий ход с той же головой и другим хвостом
+                    // ушёл бы в полный префилл.
+                    if let Some(sn) = new_snap.filter(|_| !(reuse > 0 && resume_at == Some(reuse))) {
                         *snap = Some(sn);
                         *sess_ids = ids[..new_len].to_vec();
                     }
@@ -2989,7 +2993,8 @@ impl<'a> LlmGeneration<'a> {
                 // остаётся в силе: она по-прежнему префикс этого промпта. Это
                 // верно и при ошибке генерации — хвост за точкой всё равно
                 // перезапишется следующим ходом.
-                if let Some(sn) = new_snap {
+                // Граница на взятой из кэша точке — точка остаётся (см. выше).
+                if let Some(sn) = new_snap.filter(|_| !(reuse > 0 && resume_at == Some(reuse))) {
                     *snap = Some(sn);
                     *mtp_len = new_mtp_len;
                     *sess_ids = ids[..new_len].to_vec();

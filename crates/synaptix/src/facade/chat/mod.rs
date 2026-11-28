@@ -194,6 +194,48 @@ pub fn history_tokens(
     (tail_ids.len() < ids.len() && ids.ends_with(&tail_ids)).then(|| ids.len() - tail_ids.len())
 }
 
+/// Сколько токенов промпта `ids` занимает голова — первые `k` сообщений
+/// `messages` (системная подсказка роли, выжимка проекта и т. п.) вместе с
+/// заголовком следующего сообщения, если он у всех ходов одинаков. `prompt` —
+/// тот же промпт текстом (с `add_generation_prompt` и [`prompt_for_model`]).
+///
+/// Граница для парковки KV головы: ходы с той же головой и разным хвостом
+/// делят её токены, и [`crate::facade::llm::LlmKvSession::set_resume_at`] на
+/// неё даёт следующему такому ходу считать только хвост. Шаблон Qwen не
+/// рендерит чат без сообщения пользователя («No user query found»), поэтому
+/// голова, если не рендерится отдельно, дополняется сообщением-заглушкой, и
+/// граница — общий префикс этого рендера с настоящим промптом, откатанный
+/// к концу строки (там токенизация не склеивает соседей). `None` — общего
+/// префикса нет или он не лёг на токены.
+pub fn head_tokens(
+    tokenizer: &LlmTokenizer,
+    messages: &[crate::facade::llm::Message],
+    k: usize,
+    enable_thinking: bool,
+    effort: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    prompt: &str,
+    ids: &[u32],
+) -> Option<usize> {
+    if k == 0 || k >= messages.len() {
+        return None;
+    }
+    // Шаблон рендерит голову сам по себе (Gemma, Inkling) — её конец и есть граница.
+    if let Some(h) = history_tokens(tokenizer, &messages[..k], enable_thinking, effort, tools, prompt, ids) {
+        return Some(h);
+    }
+    let mut probe: Vec<crate::facade::llm::Message> = messages[..k].to_vec();
+    probe.push(crate::facade::llm::Message::user("\u{2063}".to_string()));
+    let other = tokenizer.apply_chat_template_reasoning(&probe, true, enable_thinking, effort, tools).ok()?;
+    let other = prompt_for_model(tokenizer, enable_thinking, other);
+    let common = prompt.char_indices().zip(other.chars()).take_while(|((_, a), b)| a == b).last().map(|((i, c), _)| i + c.len_utf8())?;
+    // Голова не длиннее того, что рендерят сами `k` сообщений плюс заголовок
+    // следующего: откат к последнему переводу строки внутри общего префикса.
+    let cut = prompt[..common].rfind('\n').map(|i| i + 1)?;
+    let head_ids = tokenizer.encode(&prompt[..cut]).ok()?;
+    (!head_ids.is_empty() && head_ids.len() < ids.len() && ids.starts_with(&head_ids)).then_some(head_ids.len())
+}
+
 fn gemma4_restore_empty_thinking(prompt: &str) -> String {
     const CLOSE: &str = "<tool_response|>";
     const EMPTY_THOUGHT: &str = "<|channel>thought\n<channel|>";

@@ -933,10 +933,17 @@ impl Qwen4ExpPipeline {
             .map(|s| s.reusable_media_mode(prompt_ids, inputs))
             .unwrap_or((0, false));
         // Граница точки возврата внутри хвоста, который предстоит посчитать.
-        let split = session
-            .as_deref_mut()
-            .and_then(|s| s.resume_at.take())
-            .filter(|&at| at > reuse && at < prompt_ids.len());
+        let resume = session.as_deref_mut().and_then(|s| s.resume_at.take());
+        let split = resume.filter(|&at| at > reuse && at < prompt_ids.len());
+        // Граница, на которой точка уже стоит (голова роли или чата взята из
+        // кэша, считается только хвост), оставляет её как есть: иначе снимок
+        // уехал бы на конец этого промпта, и следующий ход с той же головой,
+        // но другим хвостом ушёл бы в полный префилл.
+        let keep = split.is_none()
+            && resume.is_some_and(|at| {
+                at <= reuse
+                    && session.as_deref().is_some_and(|s| s.snap.is_some() && s.ids.len() == at && prompt_ids.get(..at) == Some(&s.ids[..]))
+            });
         // Флаг снимаем заранее: дальше `session` занята заимствованием кэша.
         let want_session = session.is_some();
         let mut owned_cache;
@@ -1025,7 +1032,7 @@ impl Qwen4ExpPipeline {
                 self.prefill_span(prompt_ids, media, cache, reuse..prompt_ids.len(), by_layers, &mut chunk, &cfg, prefill_pos, sink, rest)?
             }
         };
-        if want_session && boundary.is_none() {
+        if want_session && boundary.is_none() && !keep {
             boundary = Some(cache.snapshot().map_err(PipelineError::from)?);
         }
         let prefill_ms = prefill_start.elapsed().as_millis();
@@ -1174,7 +1181,13 @@ impl Qwen4ExpPipeline {
         // дописать в кэш свои токены; сравнение префикса на следующем ходу
         // идёт по `ids`, откат — по снимку.
         let absorbed = cache.seq_len.saturating_sub(prompt_ids.len()).min(out.len());
-        if let (Some(s), Some(snap)) = (session, boundary) {
+        if let (Some(s), true) = (session.as_deref_mut(), keep) {
+            // Точка возврата прежняя (`ids`, `snap`, `media`) — продолжение
+            // с живого кэша знает весь этот ход.
+            s.full_ids.clear();
+            s.full_ids.extend_from_slice(prompt_ids);
+            s.full_ids.extend_from_slice(&out[..absorbed]);
+        } else if let (Some(s), Some(snap)) = (session, boundary) {
             let kept = &prompt_ids[..split.unwrap_or(prompt_ids.len())];
             s.ids = kept.to_vec();
             s.full_ids.clear();
