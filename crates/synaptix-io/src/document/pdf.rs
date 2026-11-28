@@ -257,6 +257,10 @@ pub fn layout(bytes: &[u8], pages: Option<RangeInclusive<u32>>, dir: Option<&Pat
 
 fn layout_inner(bytes: &[u8], range: Option<RangeInclusive<u32>>, dir: Option<&Path>) -> Result<Vec<Part>> {
     let mut doc = Document::load_mem(bytes).map_err(|e| IoError::Document(format!("PDF не разобран: {e}")))?;
+    // защищённый без пароля (только от правки/печати) — расшифровать пустым
+    if doc.is_encrypted() {
+        doc.decrypt("").map_err(|e| IoError::Document(format!("PDF защищён паролем: {e}")))?;
+    }
     let pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().filter(|(n, _)| range.as_ref().is_none_or(|r| r.contains(n))).collect();
     // 1. картинки каждой страницы с местом; их вызовы — из потоков
     let mut images: BTreeMap<u32, Vec<Placed>> = BTreeMap::new();
@@ -599,3 +603,28 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod real {
+    /// `SYN_PDF=файл.pdf cargo test -p synaptix-io --features documents real_pdf -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_pdf() {
+        let p = std::path::PathBuf::from(std::env::var("SYN_PDF").unwrap());
+        let bytes = std::fs::read(&p).unwrap();
+        let direct = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes));
+        match direct {
+            Ok(Ok(v)) => println!("pdf_extract напрямую: страниц {}, знаков {}", v.len(), v.iter().map(|s| s.len()).sum::<usize>()),
+            Ok(Err(e)) => println!("pdf_extract напрямую: ошибка {e}"),
+            Err(_) => println!("pdf_extract напрямую: паника"),
+        }
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let mut col = super::Collector::default();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pdf_extract::output_doc_page(&doc, &mut col, 2)));
+        println!("output_doc_page(2): {:?}", r.as_ref().map(|x| x.as_ref().map(|_| ()).map_err(|e| e.to_string())).map_err(|_| "паника"));
+        col.flush();
+        println!("собрано: {:?}", col.pages.iter().map(|(k, v)| (*k, v.len(), v.first().map(|l| (l.top, l.x, l.size, l.text.chars().take(40).collect::<String>())))).collect::<Vec<_>>());
+        let parts = super::layout(&bytes, Some(1..=3), None).unwrap();
+        println!("{parts:?}");
+    }
+}
