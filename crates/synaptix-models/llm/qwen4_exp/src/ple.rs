@@ -83,6 +83,30 @@ impl PleState {
         bytes
     }
 
+    /// Контекст n-грамм и свёртка на хосте — для выгрузки головы сессии.
+    pub fn host_parts(&self) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+        let conv = match &self.conv_dev {
+            Some(t) => coerr(t.to_dtype(DType::F32).and_then(|x| x.to_device(Device::Cpu)).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>()))?,
+            None => self.conv.clone(),
+        };
+        Ok((self.tokens.clone(), conv))
+    }
+
+    /// Состояние той же формы, что `self`, из хостовых частей (загрузка
+    /// головы сессии). Размеры обязаны совпасть — иначе голова от другой модели.
+    pub fn with_parts(&self, tokens: Vec<u32>, conv: Vec<f32>) -> Result<Self, ModelError> {
+        if tokens.len() != self.tokens.len() || conv.len() != self.conv_len {
+            return Err(ModelError::Forward(format!(
+                "голова сессии: PLE {}+{} вместо {}+{}",
+                tokens.len(),
+                conv.len(),
+                self.tokens.len(),
+                self.conv_len
+            )));
+        }
+        Ok(Self { tokens, conv, conv_dev: None, eos: self.eos, conv_len: self.conv_len })
+    }
+
     pub fn device_bytes(&self) -> usize {
         self.conv_dev
             .as_ref()

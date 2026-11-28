@@ -128,6 +128,81 @@ impl ModelCache {
         Ok(())
     }
 
+    /// Голова сессии на хосте по её снимку `snap` (см. [`HeadState`]): KV и
+    /// блоки индексатора ниже точки возврата кэш хранит нетронутыми — ходы
+    /// после неё пишут только дальше.
+    pub fn export_head(&self, snap: &CacheSnapshot) -> Result<HeadState, ModelError> {
+        let tails = snap.qsa_tails.as_ref().ok_or_else(|| ModelError::Forward("голова сессии: снимок без хвостов индексатора".into()))?;
+        let (mut linear, mut tails) = (snap.linear.iter(), tails.iter());
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            layers.push(match l {
+                LayerState::Linear(_) => {
+                    let g = linear.next().ok_or_else(|| ModelError::Forward("голова сессии: снимок короче кэша".into()))?;
+                    let (conv, ssm) = g.host_vecs()?;
+                    LayerHead::Linear { conv, ssm }
+                }
+                LayerState::Qsa(b) => {
+                    let tail = tails.next().ok_or_else(|| ModelError::Forward("голова сессии: снимок короче кэша".into()))?.clone();
+                    let kvl = &b.0;
+                    let mut kv = vec![Rows::take(&kvl.k, snap.seq_len)?, Rows::take(&kvl.v, snap.seq_len)?];
+                    for t in [kvl.k_scale.as_ref(), kvl.v_scale.as_ref()].into_iter().flatten() {
+                        kv.push(Rows::take(t, snap.seq_len)?);
+                    }
+                    let keys = Rows::take(b.1.block_keys(), tail.mark().0)?;
+                    LayerHead::Qsa { kv, keys, tail }
+                }
+            });
+        }
+        let ple = snap.ple.iter().map(|p| p.host_parts()).collect::<Result<_, _>>()?;
+        Ok(HeadState { seq_len: snap.seq_len, layers, ple })
+    }
+
+    /// Положить голову в этот (пустой) кэш: строки KV и блоков индексатора —
+    /// сразу, остальное — снимком, который применит `restore` хода. Ошибка —
+    /// голова от другой модели или настроек (формы, тип KV) либо длиннее кэша.
+    pub fn import_head(&mut self, head: &HeadState) -> Result<CacheSnapshot, ModelError> {
+        if head.seq_len >= self.max_seq || head.layers.len() != self.layers.len() || head.ple.len() != self.ple.len() {
+            return Err(ModelError::Forward(format!(
+                "голова сессии: {} токенов, {} слоёв не ложатся в кэш на {} позиций, {} слоёв",
+                head.seq_len,
+                head.layers.len(),
+                self.max_seq,
+                self.layers.len()
+            )));
+        }
+        self.seg.clear();
+        let (mut linear, mut qsa, mut tails) = (Vec::new(), Vec::new(), Vec::new());
+        for (l, h) in self.layers.iter_mut().zip(&head.layers) {
+            match (l, h) {
+                (LayerState::Linear(s), LayerHead::Linear { conv, ssm }) => {
+                    if conv.len() != s.conv_state.len() || ssm.len() != s.ssm_state.len() {
+                        return Err(ModelError::Forward("голова сессии: размер состояния линейного слоя".into()));
+                    }
+                    linear.push(GdnSnap::from_host(conv.clone(), ssm.clone()));
+                }
+                (LayerState::Qsa(b), LayerHead::Qsa { kv, keys, tail }) => {
+                    let (kvl, idx) = b.as_mut();
+                    if kv.len() != 2 + usize::from(kvl.k_scale.is_some()) + usize::from(kvl.v_scale.is_some()) {
+                        return Err(ModelError::Forward("голова сессии: другой формат KV".into()));
+                    }
+                    let mut it = kv.iter();
+                    it.next().expect("k").put(&mut kvl.k)?;
+                    it.next().expect("v").put(&mut kvl.v)?;
+                    for t in [kvl.k_scale.as_mut(), kvl.v_scale.as_mut()].into_iter().flatten() {
+                        it.next().expect("масштаб").put(t)?;
+                    }
+                    keys.put(idx.block_keys_mut())?;
+                    qsa.push(tail.mark());
+                    tails.push(tail.clone());
+                }
+                _ => return Err(ModelError::Forward("голова сессии: другой порядок слоёв".into())),
+            }
+        }
+        let ple = self.ple.iter().zip(&head.ple).map(|(p, (t, c))| p.with_parts(t.clone(), c.clone())).collect::<Result<_, _>>()?;
+        Ok(CacheSnapshot { seq_len: head.seq_len, linear, qsa, qsa_tails: Some(tails), ple })
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         for l in self.layers.iter_mut() {
@@ -249,6 +324,236 @@ fn dev_bytes(t: Option<&Tensor>) -> usize {
 /// индексатора достаточно усечь по позиции, а рекуррентное состояние линейного
 /// внимания, свёртка PLE и его история токенов копируются: спекулятивный шаг
 /// впитывает драфт, и при отказе всё это надо вернуть.
+/// Голова сессии на хосте: состояние кэша на точке возврата — строки KV и
+/// ключи блоков индексатора до неё, рекуррентное состояние, хвосты
+/// индексатора, PLE. Не привязана к устройству и ёмкости кэша: её можно
+/// положить на диск и поднять в новую сессию (парковка контекста ролей,
+/// общая голова проекта для разных ролей).
+#[derive(Clone)]
+pub struct HeadState {
+    seq_len: usize,
+    layers: Vec<LayerHead>,
+    ple: Vec<(Vec<u32>, Vec<f32>)>,
+}
+
+#[derive(Clone)]
+enum LayerHead {
+    Linear { conv: Vec<f32>, ssm: Vec<f32> },
+    /// `kv` — k, v и (у KV в fp8) их масштабы; `keys` — собранные блоки индексатора.
+    Qsa { kv: Vec<Rows>, keys: Rows, tail: IndexerTail },
+}
+
+/// Первые `rows` строк по оси 2 тензора `[1, heads, ёмкость, …]`: по `heads`
+/// отрезков подряд, `row_bytes` на строку.
+#[derive(Clone)]
+struct Rows {
+    dtype: DType,
+    heads: usize,
+    rows: usize,
+    row_bytes: usize,
+    bytes: Vec<u8>,
+}
+
+impl Rows {
+    fn take(t: &Tensor, rows: usize) -> Result<Self, ModelError> {
+        let d = t.dims().to_vec();
+        if d.len() != 4 || d[0] != 1 || rows > d[2] {
+            return Err(ModelError::Forward(format!("голова сессии: форма {d:?}, строк {rows}")));
+        }
+        let (heads, cap) = (d[1], d[2]);
+        let row_bytes = t.dtype().bytes_for_numel(d[3]);
+        let host = coerr(t.to_device(Device::Cpu).and_then(|x| x.contiguous()).and_then(|x| x.to_bytes()))?;
+        let mut bytes = Vec::with_capacity(heads * rows * row_bytes);
+        for h in 0..heads {
+            let at = h * cap * row_bytes;
+            bytes.extend_from_slice(&host[at..at + rows * row_bytes]);
+        }
+        Ok(Self { dtype: t.dtype(), heads, rows, row_bytes, bytes })
+    }
+
+    /// Записать строки в `t` той же формы (кроме ёмкости): тензор заменяется
+    /// новым на том же устройстве, строки за головой — нули.
+    fn put(&self, t: &mut Tensor) -> Result<(), ModelError> {
+        let d = t.dims().to_vec();
+        if t.dtype() != self.dtype || d[1] != self.heads || t.dtype().bytes_for_numel(d[3]) != self.row_bytes || self.rows > d[2] {
+            return Err(ModelError::Forward(format!(
+                "голова сессии: строки {:?}×{}×{} не ложатся в {:?} {:?}",
+                self.dtype, self.heads, self.rows, t.dtype(), d
+            )));
+        }
+        let cap = d[2];
+        let mut host = vec![0u8; self.heads * cap * self.row_bytes];
+        let n = self.rows * self.row_bytes;
+        for h in 0..self.heads {
+            host[h * cap * self.row_bytes..][..n].copy_from_slice(&self.bytes[h * n..][..n]);
+        }
+        *t = coerr(Tensor::from_raw_bytes(host, d, self.dtype, t.device()))?;
+        Ok(())
+    }
+}
+
+impl HeadState {
+    /// Токенов в голове.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Сколько байт держит голова.
+    pub fn bytes(&self) -> usize {
+        let rows = |r: &Rows| r.bytes.len();
+        self.layers
+            .iter()
+            .map(|l| match l {
+                LayerHead::Linear { conv, ssm } => 4 * (conv.len() + ssm.len()),
+                LayerHead::Qsa { kv, keys, tail } => kv.iter().map(rows).sum::<usize>() + rows(keys) + 4 * tail.parts().2.len(),
+            })
+            .sum::<usize>()
+            + self.ple.iter().map(|(t, c)| 4 * (t.len() + c.len())).sum::<usize>()
+    }
+
+    /// Двоичная запись (для диска): свой формат, версия в заголовке.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::with_capacity(self.bytes() + 4096));
+        w.0.extend_from_slice(HEAD_MAGIC);
+        w.u64(self.seq_len as u64);
+        w.u64(self.layers.len() as u64);
+        for l in &self.layers {
+            match l {
+                LayerHead::Linear { conv, ssm } => {
+                    w.u64(0);
+                    w.f32s(conv);
+                    w.f32s(ssm);
+                }
+                LayerHead::Qsa { kv, keys, tail } => {
+                    w.u64(1);
+                    w.u64(kv.len() as u64);
+                    for r in kv.iter().chain(std::iter::once(keys)) {
+                        w.rows(r);
+                    }
+                    let (blocks, rows, data) = tail.parts();
+                    w.u64(blocks as u64);
+                    w.u64(rows as u64);
+                    w.f32s(data);
+                }
+            }
+        }
+        w.u64(self.ple.len() as u64);
+        for (t, c) in &self.ple {
+            w.u64(t.len() as u64);
+            for x in t {
+                w.0.extend_from_slice(&x.to_le_bytes());
+            }
+            w.f32s(c);
+        }
+        w.0
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, ModelError> {
+        let bad = |what: &str| ModelError::Forward(format!("голова сессии: {what}"));
+        let mut r = Reader { b, at: 0 };
+        if r.take(HEAD_MAGIC.len()).ok_or_else(|| bad("пусто"))? != HEAD_MAGIC {
+            return Err(bad("не тот формат или версия"));
+        }
+        let seq_len = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+        let n = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+        let mut layers = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let l = match r.u64().ok_or_else(|| bad("обрыв"))? {
+                0 => LayerHead::Linear { conv: r.f32s().ok_or_else(|| bad("обрыв"))?, ssm: r.f32s().ok_or_else(|| bad("обрыв"))? },
+                1 => {
+                    let k = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+                    let mut kv = Vec::with_capacity(k.min(8));
+                    for _ in 0..k {
+                        kv.push(r.rows().ok_or_else(|| bad("обрыв"))?);
+                    }
+                    let keys = r.rows().ok_or_else(|| bad("обрыв"))?;
+                    let blocks = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+                    let rows = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+                    let data = r.f32s().ok_or_else(|| bad("обрыв"))?;
+                    LayerHead::Qsa { kv, keys, tail: IndexerTail::from_parts(blocks, rows, data) }
+                }
+                _ => return Err(bad("вид слоя")),
+            };
+            layers.push(l);
+        }
+        let np = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+        let mut ple = Vec::with_capacity(np.min(1024));
+        for _ in 0..np {
+            let nt = r.u64().ok_or_else(|| bad("обрыв"))? as usize;
+            let raw = r.take(nt.checked_mul(4).ok_or_else(|| bad("размер"))?).ok_or_else(|| bad("обрыв"))?;
+            let t = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            ple.push((t, r.f32s().ok_or_else(|| bad("обрыв"))?));
+        }
+        if r.at != b.len() {
+            return Err(bad("лишние байты"));
+        }
+        Ok(Self { seq_len, layers, ple })
+    }
+}
+
+const HEAD_MAGIC: &[u8] = b"SYNQ4HEAD1";
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn f32s(&mut self, v: &[f32]) {
+        self.u64(v.len() as u64);
+        for x in v {
+            self.0.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    fn rows(&mut self, r: &Rows) {
+        self.u64(dtype_code(r.dtype));
+        self.u64(r.heads as u64);
+        self.u64(r.rows as u64);
+        self.u64(r.row_bytes as u64);
+        self.u64(r.bytes.len() as u64);
+        self.0.extend_from_slice(&r.bytes);
+    }
+}
+
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.at..self.at.checked_add(n)?)?;
+        self.at += n;
+        Some(s)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn f32s(&mut self) -> Option<Vec<f32>> {
+        let n = self.u64()? as usize;
+        Some(self.take(n.checked_mul(4)?)?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+    fn rows(&mut self) -> Option<Rows> {
+        let dtype = dtype_of(self.u64()?)?;
+        let (heads, rows, row_bytes, n) = (self.u64()? as usize, self.u64()? as usize, self.u64()? as usize, self.u64()? as usize);
+        if heads.checked_mul(rows)?.checked_mul(row_bytes)? != n {
+            return None;
+        }
+        Some(Rows { dtype, heads, rows, row_bytes, bytes: self.take(n)?.to_vec() })
+    }
+}
+
+/// Коды типов KV и ключей в записи головы (только те, что бывают в кэше).
+const HEAD_DTYPES: [DType; 5] = [DType::F32, DType::BF16, DType::F16, DType::MXFP8, DType::U8];
+
+fn dtype_code(d: DType) -> u64 {
+    HEAD_DTYPES.iter().position(|x| *x == d).map(|i| i as u64).unwrap_or(u64::MAX)
+}
+
+fn dtype_of(c: u64) -> Option<DType> {
+    HEAD_DTYPES.get(c as usize).copied()
+}
+
 pub struct CacheSnapshot {
     seq_len: usize,
     linear: Vec<GdnSnap>,

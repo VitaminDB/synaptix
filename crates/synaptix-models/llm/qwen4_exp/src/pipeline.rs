@@ -19,7 +19,7 @@ use synaptix_tokenizer::tokenizer::Tokenizer;
 use crate::config::Qwen4ExpConfig;
 use crate::loader::Qwen4ExpWeights;
 use synaptix_llm_common::expert_mirror as em;
-use crate::model::{CacheSnapshot, ModelCache, Qwen4ExpModel};
+use crate::model::{CacheSnapshot, HeadState, ModelCache, Qwen4ExpModel};
 use crate::mtp::{present as mtp_present, MtpCache, MtpHead};
 
 /// Чанк префилла. Чем он крупнее, тем меньше проходов по всей стопке
@@ -281,6 +281,17 @@ impl Qwen4ExpSession {
     pub fn device_bytes(&self) -> usize {
         self.cache.device_bytes()
             + self.snap.as_ref().map(|s| s.device_bytes()).unwrap_or(0)
+    }
+
+    /// Голова сессии на хосте — токены точки возврата и состояние на ней
+    /// (см. [`HeadState`]): для парковки на диск и для общей головы разных
+    /// ролей. `None` — точки возврата нет или в ней медиа (их строки
+    /// голова не несёт).
+    pub fn export_head(&self) -> Result<Option<(Vec<u32>, HeadState)>, PipelineError> {
+        let Some(snap) = self.snap.as_ref().filter(|_| self.media.is_empty() && !self.ids.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some((self.ids.clone(), self.cache.export_head(snap)?)))
     }
 }
 
@@ -825,6 +836,21 @@ impl Qwen4ExpPipeline {
             media: Vec::new(),
             resume_at: None,
         })
+    }
+
+    /// Сессия на `ctx_tokens` токенов, чья точка возврата — голова `head`
+    /// с токенами `ids` (см. [`Qwen4ExpSession::export_head`]): ход с этой
+    /// головой посчитает только свой хвост. Ошибка — голова от другой модели
+    /// или настроек KV.
+    pub fn import_head(&self, ids: &[u32], head: &HeadState, ctx_tokens: usize) -> Result<Qwen4ExpSession, PipelineError> {
+        if ids.len() != head.seq_len() {
+            return Err(PipelineError::Model(format!("голова сессии: {} токенов при состоянии на {}", ids.len(), head.seq_len())));
+        }
+        let mut s = self.new_session(ctx_tokens.max(head.seq_len() + 1))?;
+        let snap = s.cache.import_head(head)?;
+        s.ids = ids.to_vec();
+        s.snap = Some(snap);
+        Ok(s)
     }
 
     /// Расширить кэш сессии до `ctx_tokens` (не выше окна модели), сохранив

@@ -98,3 +98,48 @@ fn full_prefill_on_used_session_matches_fresh() {
     assert_eq!(r, 0);
     assert_eq!(out, ref_b, "полный префилл по использованной сессии разошёлся со свежей");
 }
+
+/// Голова, выгруженная на хост и записанная байтами (как на диск), поднимается
+/// в новую сессию другой ёмкости: ход с ней считает только хвост и отвечает
+/// как без кэша. Одна голова проекта — основа сессий разных ролей: роль
+/// дописывает свою часть и ставит точку на её конце.
+#[test]
+fn head_export_import_roundtrip() {
+    use synaptix_llm_qwen4_exp::HeadState;
+    synaptix_kernels_cpu::ensure_registered();
+    let Some(dir) = ref_dir() else {
+        eprintln!("SYN_QWEN4EXP_REF не задан — пропуск");
+        return;
+    };
+    let p = Qwen4ExpPipeline::load(&dir, Device::Cpu, DType::F32).expect("модель");
+    let project = tokens(21, 45);
+    let role_a = [project.as_slice(), &tokens(22, 20)].concat();
+    let role_b = [project.as_slice(), &tokens(23, 17)].concat();
+    let with = |head: &[u32], tail: u32| [head, &tokens(tail, 11)].concat();
+
+    // Голова проекта посчитана один раз и выгружена.
+    let mut s = p.new_session(256).expect("сессия");
+    s.set_resume_at(Some(project.len()));
+    p.generate_cached_streaming(&mut s, &with(&role_a, 30), cfg(), &mut |_: u32| true).expect("ход");
+    let (ids, head) = s.export_head().expect("выгрузка").expect("голова есть");
+    assert_eq!(ids, project);
+    assert!(head.bytes() > 0);
+    let disk = head.to_bytes();
+    let head = HeadState::from_bytes(&disk).expect("чтение");
+    assert_eq!(head.to_bytes(), disk, "запись не обратима");
+
+    // Каждая роль — своя сессия от головы проекта (ёмкость другая — 192).
+    for (role, tails) in [(&role_a, [31u32, 32]), (&role_b, [33, 34])] {
+        let mut r = p.import_head(&ids, &head, 192).expect("загрузка");
+        for (i, t) in tails.into_iter().enumerate() {
+            let prompt = with(role, t);
+            r.set_resume_at(Some(role.len()));
+            let (out, _, reuse) = p.generate_cached_streaming(&mut r, &prompt, cfg(), &mut |_: u32| true).expect("ход");
+            assert_eq!(out, plain(&p, &prompt), "ответ роли с головы проекта разошёлся с ходом без кэша");
+            // Первый ход роли берёт голову проекта, следующие — голову роли.
+            assert_eq!(reuse, if i == 0 { project.len() } else { role.len() });
+        }
+    }
+    // Битая запись не принимается.
+    assert!(HeadState::from_bytes(&disk[..disk.len() - 3]).is_err());
+}

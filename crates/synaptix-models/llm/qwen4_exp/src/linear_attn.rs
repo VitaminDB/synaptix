@@ -100,6 +100,24 @@ impl GdnSnap {
     pub fn device_bytes(&self) -> usize {
         dev_bytes(self.conv_dev.as_ref()) + dev_bytes(self.ssm_dev.as_ref())
     }
+
+    /// Состояние снимка на хосте (свёртка, рекуррентная матрица) — для
+    /// выгрузки головы сессии; истина с карты, если она там.
+    pub fn host_vecs(&self) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        let get = |t: &Option<Tensor>, v: &Vec<f32>| -> Result<Vec<f32>, ModelError> {
+            match t {
+                Some(t) => coerr(t.to_dtype(DType::F32).and_then(|x| x.to_device(Device::Cpu)).and_then(|x| x.flatten_all()).and_then(|x| x.to_vec1::<f32>())),
+                None => Ok(v.clone()),
+            }
+        };
+        Ok((get(&self.conv_dev, &self.conv_host)?, get(&self.ssm_dev, &self.ssm_host)?))
+    }
+
+    /// Снимок из хостовых векторов (загрузка головы сессии): `restore`
+    /// положит их в состояние слоя, зеркала на карте пересеются сами.
+    pub fn from_host(conv: Vec<f32>, ssm: Vec<f32>) -> Self {
+        Self { conv_dev: None, ssm_dev: None, conv_host: conv, ssm_host: ssm }
+    }
 }
 
 fn dev_bytes(t: Option<&Tensor>) -> usize {

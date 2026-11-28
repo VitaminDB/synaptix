@@ -89,6 +89,22 @@ pub struct IndexerTail {
     data: Vec<f32>,
 }
 
+impl IndexerTail {
+    /// Счётчики (`blocks`, `rows`) — метка того же состояния.
+    pub fn mark(&self) -> (usize, usize) {
+        (self.blocks, self.rows)
+    }
+
+    /// Плоские данные для записи на диск: счётчики и ключи хвоста.
+    pub fn parts(&self) -> (usize, usize, &[f32]) {
+        (self.blocks, self.rows, &self.data)
+    }
+
+    pub fn from_parts(blocks: usize, rows: usize, data: Vec<f32>) -> Self {
+        Self { blocks, rows, data }
+    }
+}
+
 pub struct IndexerCache {
     /// Ключи, не набравшие полный блок. Живут на карте: раньше они уезжали
     /// на хост целиком, сворачивались там циклом и возвращались обратно.
@@ -127,6 +143,16 @@ impl IndexerCache {
 
     pub fn blocks(&self) -> usize {
         self.blocks
+    }
+
+    /// Буфер собранных блоков `[1, 1, ёмкость, d]` — для выгрузки и загрузки
+    /// головы сессии (`ModelCache::export_head`).
+    pub fn block_keys(&self) -> &Tensor {
+        &self.block_keys
+    }
+
+    pub fn block_keys_mut(&mut self) -> &mut Tensor {
+        &mut self.block_keys
     }
 
     /// Метка состояния: сколько блоков собрано и сколько сырых ключей ждёт

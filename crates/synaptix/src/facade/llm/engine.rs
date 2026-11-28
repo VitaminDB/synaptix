@@ -938,6 +938,64 @@ pub struct LlmKvSession {
     lora_gen: u64,
 }
 
+/// Голова сессии префикс-KV на хосте: токены точки возврата и состояние
+/// кэша на ней, без привязки к устройству и ёмкости. Её можно записать на
+/// диск ([`Self::to_bytes`]) и поднять в новую сессию ([`Llm::import_kv_head`]):
+/// так служба держит головы ролей дольше, чем позволяет RAM, и даёт разным
+/// ролям одну общую голову проекта. Пока умеет Qwen4Exp (Qwen3.8-Flash-Next).
+#[derive(Clone)]
+pub struct KvHead {
+    ids: Vec<u32>,
+    lora_gen: u64,
+    state: KvHeadState,
+}
+
+#[derive(Clone)]
+enum KvHeadState {
+    Qwen4Exp(synaptix_llm_qwen4_exp::HeadState),
+}
+
+impl KvHead {
+    /// Токены головы.
+    pub fn tokens(&self) -> &[u32] {
+        &self.ids
+    }
+
+    /// Сколько байт держит голова в RAM (и примерно на диске).
+    pub fn bytes(&self) -> usize {
+        4 * self.ids.len()
+            + match &self.state {
+                KvHeadState::Qwen4Exp(h) => h.bytes(),
+            }
+    }
+
+    /// Запись для диска. Отпечаток модели и настроек — забота вызывающего
+    /// (каталог по модели): голова чужой модели при загрузке отвергается
+    /// по формам, но одинаковые формы у разных весов не отличить.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let KvHeadState::Qwen4Exp(h) = &self.state;
+        let body = h.to_bytes();
+        let mut out = Vec::with_capacity(body.len() + 4 * self.ids.len() + 32);
+        out.extend_from_slice(b"SYNKVH1q4");
+        out.extend_from_slice(&(self.ids.len() as u64).to_le_bytes());
+        for t in &self.ids {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&body);
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, LlmError> {
+        let bad = || LlmError("голова сессии: не тот формат".into());
+        let rest = b.strip_prefix(b"SYNKVH1q4".as_slice()).ok_or_else(bad)?;
+        let n = u64::from_le_bytes(rest.get(..8).ok_or_else(bad)?.try_into().map_err(|_| bad())?) as usize;
+        let ids_end = 8usize.checked_add(n.checked_mul(4).ok_or_else(bad)?).ok_or_else(bad)?;
+        let ids = rest.get(8..ids_end).ok_or_else(bad)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let state = synaptix_llm_qwen4_exp::HeadState::from_bytes(&rest[ids_end..]).map_err(|e| LlmError(e.to_string()))?;
+        Ok(Self { ids, lora_gen: 0, state: KvHeadState::Qwen4Exp(state) })
+    }
+}
+
 /// Отпечаток строк медиа-эмбеддингов, попавших в кэшированный префикс.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MediaSig {
@@ -1256,6 +1314,18 @@ impl LlmKvSession {
         Ok(moved)
     }
 
+    /// Голова сессии на хосте (см. [`KvHead`]): состояние на точке возврата.
+    /// `None` — архитектура этого не умеет, точки нет или в ней медиа.
+    pub fn export_head(&self) -> Result<Option<KvHead>, LlmError> {
+        match &self.kind {
+            SessionKind::Qwen4Exp(s) => Ok(s
+                .export_head()
+                .map_err(|e| LlmError(e.to_string()))?
+                .map(|(ids, h)| KvHead { ids, lora_gen: self.lora_gen, state: KvHeadState::Qwen4Exp(h) })),
+            _ => Ok(None),
+        }
+    }
+
     /// Кэш сейчас в host-RAM.
     pub fn is_parked(&self) -> bool {
         match &self.kind {
@@ -1531,6 +1601,33 @@ impl Llm {
     /// сессию держат все: гибрид Qwen3.6/3.8 и MiniCPM-V 4.7 (с MTP-головой и
     /// без), Muse-Glimmer (включая DFlash-декод), Gemma-4, Qwen4Exp, плотный
     /// Qwen3, Llama, Gemma-3.
+    /// Сессия на `ctx_tokens` токенов с точкой возврата на голове `head`
+    /// (см. [`LlmKvSession::export_head`]): ход, продолжающий голову, посчитает
+    /// только свой хвост. `None` — модель другой архитектуры. Ошибка — голова
+    /// не ложится (другая модель или формат KV): вызывающему — полный префилл.
+    pub fn import_kv_head(&self, head: &KvHead, ctx_tokens: usize) -> Result<Option<LlmKvSession>, LlmError> {
+        let _runtime = self.runtime_scope();
+        let ctx = ctx_tokens.max(head.ids.len() + 2);
+        self.fit_vram(self.kv_session_bytes(ctx), 0);
+        let pipeline = self.pipeline.lock().map_err(|_| LlmError("pipeline mutex poisoned".into()))?;
+        match (&*pipeline, &head.state) {
+            (LlmPipeline::Qwen4Exp(p), KvHeadState::Qwen4Exp(h)) => {
+                let session = p.import_head(&head.ids, h, ctx).map_err(|e| LlmError(e.to_string()))?;
+                Ok(Some(LlmKvSession {
+                    kv: LlmKvCache { layers: Vec::new(), seq_len: 0, max_seq: ctx, decode_graph: Default::default() },
+                    ids: Vec::new(),
+                    ctx_tokens: ctx,
+                    kind: SessionKind::Qwen4Exp(Box::new(session)),
+                    media: Vec::new(),
+                    resume_at: None,
+                    lora_gen: head.lora_gen,
+                }))
+            }
+            #[allow(unreachable_patterns)]
+            _ => Ok(None),
+        }
+    }
+
     pub fn new_kv_session(
         &self,
         ctx_tokens: usize,

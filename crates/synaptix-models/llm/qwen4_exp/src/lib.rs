@@ -15,5 +15,5 @@ pub mod seg_graph;
 
 pub use config::{IndexerConfig, LayerType, PleConfig, Qwen4ExpConfig};
 pub use loader::{LoadError, Qwen4ExpWeights};
-pub use model::{ModelCache, Qwen4ExpModel};
+pub use model::{HeadState, ModelCache, Qwen4ExpModel};
 pub use pipeline::{PipelineError, Qwen4ExpPipeline};
