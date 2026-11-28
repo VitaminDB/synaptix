@@ -200,7 +200,7 @@ pub fn h3(model: &Path, encoder: Option<&Path>, device: Device, req: &VideoReque
     let ctx_lat_frames = context.as_ref().map(|c| c.meta.context_frames).unwrap_or(0);
     let size = st::Size { width: req.width.unwrap_or(0), height: req.height.unwrap_or(0), seconds: req.seconds.unwrap_or(0.0) };
     let steps = req.steps.filter(|&s| s > 0).or(distilled).unwrap_or(20);
-    let cfg_scale = req.guidance.unwrap_or(if distilled.is_some() { 1.0 } else { 5.0 });
+    let cfg_scale = req.guidance.unwrap_or(1.0);
     // Негатив — только при CFG > 1 (без CFG его не кодировать).
     let negative = req.negative.as_deref().filter(|_| cfg_scale > 1.0);
     let first = if continued { None } else { req.first_frame.as_deref() };

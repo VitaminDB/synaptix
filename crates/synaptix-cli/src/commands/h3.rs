@@ -190,7 +190,7 @@ pub fn run(args: H3Args) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_scale = if args.cfg_scale > 0.0 {
         args.cfg_scale
     } else {
-        spec.as_ref().map(|s| s.default_cfg).unwrap_or(5.0)
+        spec.as_ref().map(|s| s.default_cfg).unwrap_or(1.0)
     };
 
     let frame_count = args
