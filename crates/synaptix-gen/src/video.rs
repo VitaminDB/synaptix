@@ -372,7 +372,7 @@ pub fn ltx_auto_seconds(paths: &LtxPaths, device: Device, prompt: &str, quant: O
 enum LtxMode {
     Text,
     Frames { first: Option<PathBuf>, last: Option<PathBuf> },
-    Continue { tail: crate::tail::TailLatent },
+    Continue { tail: crate::tail::TailLatent, audio: Option<PathBuf> },
     Retake { video: PathBuf, start: f64, end: f64 },
     Extend { video: PathBuf, tail_frames: usize },
     A2v { audio: PathBuf, image: Option<PathBuf> },
@@ -510,7 +510,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     } else if let Some(ctx_path) = &req.context {
         let tail = crate::tail::TailLatent::load(ctx_path)?;
         tail.meta.check_compat("ltx", req.model_id.as_deref(), req.width, req.height, None)?;
-        LtxMode::Continue { tail }
+        LtxMode::Continue { tail, audio: req.audio.clone() }
     } else {
         match (&req.control_video, &req.audio, &req.source_video) {
             (Some(v), Some(a), _) => LtxMode::Lipdub { video: v.clone(), audio: a.clone() },
@@ -529,7 +529,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
     };
     let fps = match &mode {
-        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.fps,
+        LtxMode::Continue { tail, .. } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.fps,
         _ => fps,
     };
     let adapter = match &mode {
@@ -557,7 +557,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     // Continue с хвостом без stage1_video — одной стадией на точном разрешении хвоста.
     let two_stage = (req.two_stage
         && !matches!(mode, LtxMode::Retake { .. })
-        && !matches!(&mode, LtxMode::Continue { tail } if tail.video_stage1.is_none()))
+        && !matches!(&mode, LtxMode::Continue { tail, .. } if tail.video_stage1.is_none()))
         || matches!(mode, LtxMode::Lipdub { .. });
     let dfr = req.dfr && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. } | LtxMode::Continue { .. });
     if dfr && !distilled_ckpt {
@@ -592,7 +592,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     }
     // Длительность: у звука, retake и образцов — по исходнику.
     let src_secs = match &mode {
-        LtxMode::A2v { audio, .. } | LtxMode::Lipdub { audio, .. } | LtxMode::Sheet { audio: Some(audio), .. } => media_seconds(audio),
+        LtxMode::A2v { audio, .. }
+        | LtxMode::Lipdub { audio, .. }
+        | LtxMode::Sheet { audio: Some(audio), .. }
+        | LtxMode::Continue { audio: Some(audio), .. } => media_seconds(audio),
         LtxMode::Retake { video, .. } | LtxMode::Ic { video, .. } => media_seconds(video),
         _ => None,
     };
@@ -600,7 +603,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
     // Для листа-референса передаём в голову только часть «Generated video:»,
     // чтобы описание панелей листа не раздувало оценку длительности сцены.
     let auto_secs = match &mode {
-        LtxMode::Text | LtxMode::Frames { .. } | LtxMode::Sheet { audio: None, .. }
+        LtxMode::Text | LtxMode::Frames { .. } | LtxMode::Sheet { audio: None, .. } | LtxMode::Continue { audio: None, .. }
             if req.seconds.is_none_or(|s| s <= 0.0) && paths.duration_head.is_some() =>
         {
             let dur_prompt = if matches!(mode, LtxMode::Sheet { .. }) {
@@ -618,24 +621,24 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         }
         _ => None,
     };
-    // От звука (липсинк, LipDub, озвучка листа) длина ролика — по звуку; иначе — запрошенная.
+    // От звука (липсинк, LipDub, озвучка листа/продолжения) длина ролика — по звуку; иначе — запрошенная.
     let secs = match &mode {
-        LtxMode::A2v { .. } | LtxMode::Lipdub { .. } | LtxMode::Sheet { audio: Some(_), .. } => src_secs.or(req.seconds),
+        LtxMode::A2v { .. } | LtxMode::Lipdub { .. } | LtxMode::Sheet { audio: Some(_), .. } | LtxMode::Continue { audio: Some(_), .. } => src_secs.or(req.seconds),
         _ => req.seconds.filter(|s| *s > 0.0).or(auto_secs).or(src_secs),
     }
     .unwrap_or(5.0)
     .clamp(1.0, 20.0);
     let width = match &mode {
-        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.width,
+        LtxMode::Continue { tail, .. } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.width,
         _ => req.width.filter(|&v| v > 0).unwrap_or(960),
     };
     let height = match &mode {
-        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.height,
+        LtxMode::Continue { tail, .. } | LtxMode::Sheet { tail: Some(tail), .. } => tail.meta.height,
         _ => req.height.filter(|&v| v > 0).unwrap_or(544),
     };
     let (hp, wp) = lp::latent_grid(width, height);
     let (fp, overlap_frames) = match &mode {
-        LtxMode::Continue { tail } | LtxMode::Sheet { tail: Some(tail), .. } => {
+        LtxMode::Continue { tail, .. } | LtxMode::Sheet { tail: Some(tail), .. } => {
             let fp_new = ((secs * fps) / 8.0).round().max(1.0) as usize;
             (tail.meta.context_frames + fp_new, tail.meta.overlap_frames)
         }
@@ -900,7 +903,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                         let img = synaptix_io::image::load_image(p, Device::Cpu).map_err(|e| format!("{}: {e}", p.display()))?;
                         (vec![(0usize, image_tokens(&img, g)?, 1.0f32)], Vec::new())
                     }
-                    LtxMode::Continue { tail } => {
+                    LtxMode::Continue { tail, .. } => {
                         let v = if second { Some(&tail.video) } else { tail.video_stage1.as_ref() }
                             .filter(|t| t.dims()[3] == g.0 && t.dims()[4] == g.1)
                             .ok_or("DFR: у хвоста прошлой сцены нет латента нужного разрешения (нужен хвост от ролика с двумя стадиями или DFR того же размера)")?;
@@ -957,7 +960,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let (l, a) = lp::denoise_av(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, fps, device, nag, &[], seed, &hooks).map_err(err)?;
                     (l, a, None)
                 }
-                LtxMode::Continue { tail } => {
+                LtxMode::Continue { tail, audio } => {
                     let v_pref = if init.is_none() {
                         tail.video_stage1
                             .as_ref()
@@ -967,12 +970,49 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                         &tail.video
                     };
                     let (v_tok, _, _, _) = latent_tokens(v_pref)?;
-                    let a_conds: Vec<(usize, Tensor, f32)> = match &tail.audio {
-                        Some(a) => vec![(0, a.clone(), 1.0)],
-                        None => Vec::new(),
-                    };
-                    let (l, a) = lp::denoise_av_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, fps, device, nag, &[(0, v_tok, 1.0)], &a_conds, seed, &hooks).map_err(err)?;
-                    (l, a, None)
+                    if let Some(a_path) = audio {
+                        // Продолжение с готовой дорожкой: в начало подклеиваем хвост звука
+                        // (перекрытие `overlap_frames`), а сам `.wav` идёт следом и заморожен
+                        // (`a_frozen = true`, `a_sigma = 0`), чтобы губы совпадали, а после
+                        // обрезки перекрытия осталась 100% исходная дорожка с нулевого сэмпла.
+                        let fa = lp::audio_token_count(fp, fps);
+                        let audio_lat = match ai {
+                            Some(a) => a.clone(),
+                            None => {
+                                let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
+                                let mut mono = ffmpeg_f32(a_path, 16000, 1)?;
+                                let enc = if let Some(ta) = &tail.audio {
+                                    let enc_new = aenc.encode(&ltx_log_mel(&[mono], device).map_err(err)?).map_err(err)?;
+                                    let ta_dev = ta.to_device(device).map_err(err)?.to_dtype(enc_new.dtype()).map_err(err)?;
+                                    Tensor::cat(&[&ta_dev, &enc_new], 1).map_err(err)?.contiguous().map_err(err)?
+                                } else {
+                                    let pad = ((overlap_frames as f64 / fps) * 16000.0).round() as usize;
+                                    let mut full = vec![0.0f32; pad];
+                                    full.append(&mut mono);
+                                    aenc.encode(&ltx_log_mel(&[full], device).map_err(err)?).map_err(err)?
+                                };
+                                drop(aenc);
+                                fit_audio_tokens(enc, fa)?
+                            }
+                        };
+                        let (l, _) = lp::denoise_av_append_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, &[(0, v_tok, 1.0)], &[], None, None, fps, device, seed, &hooks).map_err(err)?;
+                        let wave = if init.is_none() {
+                            let pad = ((overlap_frames as f64 / fps) * 48000.0).round() as usize * 2;
+                            let mut w = vec![0.0f32; pad];
+                            w.extend(ffmpeg_f32(a_path, 48000, 2)?);
+                            Some(w)
+                        } else {
+                            None
+                        };
+                        (l, audio_lat, wave)
+                    } else {
+                        let a_conds: Vec<(usize, Tensor, f32)> = match &tail.audio {
+                            Some(a) => vec![(0, a.clone(), 1.0)],
+                            None => Vec::new(),
+                        };
+                        let (l, a) = lp::denoise_av_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, fps, device, nag, &[(0, v_tok, 1.0)], &a_conds, seed, &hooks).map_err(err)?;
+                        (l, a, None)
+                    }
                 }
                 LtxMode::Extend { video, tail_frames } => {
                     // Кодируем хвост исходного ролика (последние tail_frames кадров + звук) в латент
@@ -1134,14 +1174,30 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     };
                     if let Some(a_path) = audio {
                         // Дубляж / озвучка под готовую аудиодорожку: кодируем звук и замораживаем.
+                        // При продолжении с хвоста (`overlap_frames > 0`) подклеиваем хвост звука в начало.
                         let fa = lp::audio_token_count(fp, fps);
                         let aenc = AudioVaeEncoder::load(&ckpt, device).map_err(|e| format!("VAE звука: {e}"))?;
-                        let mel = ltx_log_mel(&[ffmpeg_f32(a_path, 16000, 1)?], device).map_err(err)?;
-                        let enc = aenc.encode(&mel).map_err(err)?;
+                        let mut mono = ffmpeg_f32(a_path, 16000, 1)?;
+                        let enc = if let Some(ta) = tail.as_ref().and_then(|t| t.audio.as_ref()) {
+                            let enc_new = aenc.encode(&ltx_log_mel(&[mono], device).map_err(err)?).map_err(err)?;
+                            let ta_dev = ta.to_device(device).map_err(err)?.to_dtype(enc_new.dtype()).map_err(err)?;
+                            Tensor::cat(&[&ta_dev, &enc_new], 1).map_err(err)?.contiguous().map_err(err)?
+                        } else {
+                            let pad = ((overlap_frames as f64 / fps) * 16000.0).round() as usize;
+                            if pad > 0 {
+                                let mut full = vec![0.0f32; pad];
+                                full.append(&mut mono);
+                                mono = full;
+                            }
+                            aenc.encode(&ltx_log_mel(&[mono], device).map_err(err)?).map_err(err)?
+                        };
                         drop(aenc);
                         let audio_lat = fit_audio_tokens(enc, fa)?;
                         let (l, _) = lp::denoise_av_append_cond(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, Some(&audio_lat), true, &v_conds, &[], Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
-                        (l, audio_lat, Some(ffmpeg_f32(a_path, 48000, 2)?))
+                        let pad = ((overlap_frames as f64 / fps) * 48000.0).round() as usize * 2;
+                        let mut w = vec![0.0f32; pad];
+                        w.extend(ffmpeg_f32(a_path, 48000, 2)?);
+                        (l, audio_lat, Some(w))
                     } else {
                         let a_conds: Vec<(usize, Tensor, f32)> = match tail.as_ref().and_then(|t| t.audio.as_ref()) {
                             Some(a) => vec![(0, a.clone(), 1.0)],
@@ -1389,7 +1445,13 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::Frames { first: Some(_), last: Some(_) } => "между первым и последним кадром".to_string(),
         LtxMode::Frames { last: Some(_), .. } => "к последнему кадру".to_string(),
         LtxMode::Frames { .. } => "с первого кадра".to_string(),
-        LtxMode::Continue { tail } => format!("с хвоста ({} лат.)", tail.meta.context_frames),
+        LtxMode::Continue { tail, audio } => {
+            let mut s = format!("с хвоста ({} лат.)", tail.meta.context_frames);
+            if audio.is_some() {
+                s += ", с озвучкой";
+            }
+            s
+        }
         LtxMode::Retake { .. } => "retake отрезка".to_string(),
         LtxMode::Extend { .. } => "продление по латенту".to_string(),
         LtxMode::A2v { image: Some(_), .. } => "по звуку с первого кадра (липсинк)".to_string(),
