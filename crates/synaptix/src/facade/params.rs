@@ -113,6 +113,48 @@ pub fn silero_speakers(path: &Path) -> Vec<String> {
     v["packages"][0]["speakers"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
+/// Все родные настройки YuE2 (`YuE2Pipeline`, `yue2 generate`,
+/// `yue2_generation_config.json`, навык инструментала) — имена как в оригинале.
+fn yue2_params() -> Vec<ParamSpec> {
+    let choice = |o: &[&str]| ParamKind::Choice { options: o.iter().map(|s| s.to_string()).collect() };
+    let text = |v: &str| Some(ParamValue::Text(v.into()));
+    vec![
+        spec("lyrics", "Текст песни", "Слова с метками разделов [Verse], [Chorus]… Пусто или только метки — инструментал", ParamKind::Text { multiline: true }, None),
+        spec(
+            "vocals",
+            "Вокал",
+            "auto — по тексту (нет слов — без вокала); on — песня; off — инструментал родным путём YuE2: модель пишет партитуру, мелодия голоса переносится на инструмент, стиль с запретом голоса. Отдельной кнопки вокала в оригинале нет — это его официальный процесс",
+            choice(&["auto", "on", "off"]),
+            text("auto"),
+        ),
+        spec("cot", "Партитура (CoT)", "full — мелодия и аккорды (умолчание); melody — только мелодия (для каверов); off — без партитуры", choice(&["full", "melody", "off"]), text("full")),
+        spec("abc", "Своя партитура (ABC)", "Родная ABC YuE2: голоса Vocal и Ins, аккорды в Vocal (режим full). Вместо сочинённой моделью", ParamKind::Text { multiline: true }, None),
+        spec("midi", "Мелодия из MIDI", "Мелодическая дорожка переводится в родную партитуру (сетка 1/32, верхний голос; размер, темп, тональность — из файла). В оригинале MIDI нет — это мост", ParamKind::File { patterns: vec!["audio/midi".into(), "*.mid".into(), "*.midi".into()] }, None),
+        spec("midi_track", "Дорожка MIDI", "Номер дорожки с 0; −1 — дорожка с наибольшим числом нот", int(-1, 255, 1), i(-1)),
+        spec("cover_audio", "Кавер: запись", "Песня-образец: SheetSage2 снимает с неё партитуру, YuE2 поёт её в новом стиле (нужен и текст)", ParamKind::File { patterns: vec!["audio/*".into()] }, None),
+        spec("cover_harmony", "Кавер с аккордами", "Сохранить гармонию оригинала (full); иначе только мелодия (melody, рекомендуется)", ParamKind::Bool, Some(ParamValue::Bool(false))),
+        duration(180.0, 360.0),
+        spec("min_duration", "Не короче, с", "Нижняя граница длины (min_tokens музыки, 25 токенов = 1 с)", float(0.0, 360.0, 1.0, 0), f(8.0)),
+        spec("cfg_scale", "Guidance (CFG)", "Сила следования стилю и тексту; 0 — умолчание режима (1.0, у off — 1.01); попробуйте 1.2", float(0.0, 20.0, 0.05, 2), f(0.0)),
+        steps(Some(32), "Шаги ODE (midpoint) акустики"),
+        spec("context", "Окно модели", "Токенов на акустический чанк; меньше — меньше памяти, но больше швов", int(4096, 24576, 1024), i(24576)),
+        spec("abc_temperature", "Партитура: температура", "Сэмплинг партитуры", float(0.0, 5.0, 0.05, 2), f(0.7)),
+        spec("abc_top_p", "Партитура: top-p", "", float(0.01, 1.0, 0.01, 2), f(0.9)),
+        spec("abc_top_k", "Партитура: top-k", "", int(1, 1000, 1), i(30)),
+        spec("abc_repetition_penalty", "Партитура: штраф повторов", "", float(0.5, 2.0, 0.005, 3), f(1.005)),
+        spec("abc_penalty_window", "Партитура: окно штрафа", "Последних токенов", int(1, 100, 1), i(100)),
+        spec("abc_min_tokens", "Партитура: не короче", "Токенов", int(0, 4096, 1), i(32)),
+        spec("abc_max_tokens", "Партитура: не длиннее", "Токенов", int(1, 8192, 1), i(4096)),
+        spec("semantic_temperature", "Музыка: температура", "Сэмплинг семантических токенов", float(0.0, 5.0, 0.05, 2), f(1.0)),
+        spec("semantic_top_p", "Музыка: top-p", "", float(0.01, 1.0, 0.01, 2), f(0.95)),
+        spec("semantic_top_k", "Музыка: top-k", "", int(1, 1000, 1), i(100)),
+        spec("semantic_repetition_penalty", "Музыка: штраф повторов", "", float(0.5, 3.0, 0.05, 2), f(1.2)),
+        spec("semantic_penalty_window", "Музыка: окно штрафа", "Последних токенов", int(1, 100, 1), i(50)),
+        spec("plan_only", "Только партитура", "Вернуть партитуру без звука — для правки и повторного рендера с abc", ParamKind::Bool, Some(ParamValue::Bool(false))),
+        seed(),
+    ]
+}
+
 pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Vec<ParamSpec> {
     let arch = arch.to_ascii_lowercase();
     let id = id.to_ascii_lowercase();
@@ -262,7 +304,7 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             }
         },
         Task::Music => match arch.as_str() {
-            "yue2" => vec![spec("lyrics", "Текст песни", "Куплеты и припевы", ParamKind::Text { multiline: true }, None), duration(180.0, 300.0), seed()],
+            "yue2" => yue2_params(),
             _ => {
                 let (st, cfg) = if id.contains("turbo") {
                     (8, 1.0)

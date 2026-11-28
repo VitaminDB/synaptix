@@ -460,37 +460,43 @@ impl YueModel {
 
     /// Запись → партитура ABC (SheetSage2 из того же бандла).
     pub fn transcribe(&self, audio: &Path, mode: &str, voices: &str, cancel: &dyn Fn() -> bool, progress: &dyn Fn(f32)) -> R<String> {
-        use synaptix_music_sheetsage2::pipeline::{prepare_audio, Progress};
-        use synaptix_music_sheetsage2::{SheetSage2, TranscribeOptions, VoiceSelect};
-        kernels();
-        if !synaptix_music_sheetsage2::loader::bundle_has_sheetsage2(&self.model) {
-            return Err(format!("в {} нет транскриптора SheetSage2", self.model.display()));
-        }
-        let sheet = SheetSage2::open(&self.model, self.device, DType::BF16).map_err(|e| e.to_string())?;
-        let ch = channels(audio, 48_000, 2)?;
-        let samples = prepare_audio(&ch, 48_000, sheet.sample_rate()).map_err(|e| e.to_string())?;
-        let options = TranscribeOptions {
-            melody_only: mode != "full",
-            voices: match voices {
-                "vocal" => VoiceSelect::Vocal,
-                "ins" => VoiceSelect::Instrumental,
-                _ => VoiceSelect::Both,
-            },
-            ..Default::default()
-        };
-        let seconds = samples.len() as f64 / sheet.sample_rate() as f64;
-        let window = sheet.config.input_audio_length.min(seconds).max(1.0);
-        let mut on_progress = |p: Progress| match p {
-            Progress::Encoding { window: w, windows } => progress((w - 1) as f32 / windows as f32),
-            Progress::Decoding { window: w, windows, tokens } => {
-                let part = (tokens as f64 / (12.0 * window)).min(0.95) as f32;
-                progress(((w - 1) as f32 + part) / windows as f32)
-            }
-            Progress::Notation => progress(0.99),
-        };
-        let r = sheet.transcribe(&samples, &options, &mut on_progress, cancel).map_err(|e| e.to_string())?;
-        r.abc.ok_or_else(|| format!("партитура не получилась: {}", r.abc_error.unwrap_or_default()))
+        sheetsage_abc(&self.model, self.device, audio, mode, voices, cancel, progress)
     }
+}
+
+/// Партитура записи в родной ABC YuE2 (SheetSage2 из бандла YuE2): `mode` —
+/// `melody` (без аккордов) или `full`; `voices` — `both`, `vocal`, `ins`.
+pub fn sheetsage_abc(model: &Path, device: Device, audio: &Path, mode: &str, voices: &str, cancel: &dyn Fn() -> bool, progress: &dyn Fn(f32)) -> R<String> {
+    use synaptix_music_sheetsage2::pipeline::{prepare_audio, Progress};
+    use synaptix_music_sheetsage2::{SheetSage2, TranscribeOptions, VoiceSelect};
+    kernels();
+    if !synaptix_music_sheetsage2::loader::bundle_has_sheetsage2(&model) {
+        return Err(format!("в {} нет транскриптора SheetSage2", model.display()));
+    }
+    let sheet = SheetSage2::open(&model, device, DType::BF16).map_err(|e| e.to_string())?;
+    let ch = channels(audio, 48_000, 2)?;
+    let samples = prepare_audio(&ch, 48_000, sheet.sample_rate()).map_err(|e| e.to_string())?;
+    let options = TranscribeOptions {
+        melody_only: mode != "full",
+        voices: match voices {
+            "vocal" => VoiceSelect::Vocal,
+            "ins" => VoiceSelect::Instrumental,
+            _ => VoiceSelect::Both,
+        },
+        ..Default::default()
+    };
+    let seconds = samples.len() as f64 / sheet.sample_rate() as f64;
+    let window = sheet.config.input_audio_length.min(seconds).max(1.0);
+    let mut on_progress = |p: Progress| match p {
+        Progress::Encoding { window: w, windows } => progress((w - 1) as f32 / windows as f32),
+        Progress::Decoding { window: w, windows, tokens } => {
+            let part = (tokens as f64 / (12.0 * window)).min(0.95) as f32;
+            progress(((w - 1) as f32 + part) / windows as f32)
+        }
+        Progress::Notation => progress(0.99),
+    };
+    let r = sheet.transcribe(&samples, &options, &mut on_progress, cancel).map_err(|e| e.to_string())?;
+    r.abc.ok_or_else(|| format!("партитура не получилась: {}", r.abc_error.unwrap_or_default()))
 }
 
 /// Латенты синтеза (`[кадры, 64]` или `[1, 64, кадры]`) → `[1, 64, кадры]` на хосте.
