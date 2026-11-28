@@ -174,7 +174,7 @@ impl Qwen4ExpConfig {
                 .iter()
                 .map(|x| match x.as_str().unwrap_or("") {
                     "linear_attention" => Ok(LayerType::Linear),
-                    "full_attention" | "qwen_sparse_attention" => Ok(LayerType::Qsa),
+                    "full_attention" | "qwen_sparse_attention" | "indexed_attention" => Ok(LayerType::Qsa),
                     other => Err(ConfigError(format!("неизвестный layer_type: {other}"))),
                 })
                 .collect::<Result<Vec<_>, _>>()?,

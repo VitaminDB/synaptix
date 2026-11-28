@@ -14,6 +14,10 @@ pub struct PleState {
     /// Состояние свёртки на карте (`[state_len, width]` в `compute`): убирает
     /// H2D-загрузку и синхронную D2H-выгрузку на каждом шаге декода и префилла.
     pub conv_dev: Option<Tensor>,
+    /// Чем заполнен контекст n-грамм до первого токена — к этому `reset`.
+    eos: u32,
+    /// Размер свёртки на хосте (`conv` бывает пуст, пока истина на карте).
+    conv_len: usize,
 }
 
 impl PleState {
@@ -22,6 +26,8 @@ impl PleState {
             tokens: vec![eos; context_len],
             conv: vec![0.0; state_len * width],
             conv_dev: None,
+            eos,
+            conv_len: state_len * width,
         }
     }
 
@@ -39,7 +45,7 @@ impl PleState {
             None => None,
         };
         let conv = if conv_dev.is_some() { Vec::new() } else { self.conv.clone() };
-        Ok(Self { tokens: self.tokens.clone(), conv, conv_dev })
+        Ok(Self { tokens: self.tokens.clone(), conv, conv_dev, eos: self.eos, conv_len: self.conv_len })
     }
 
     pub fn restore_from(&mut self, snap: &Self) -> Result<(), ModelError> {
@@ -84,8 +90,13 @@ impl PleState {
             .unwrap_or(0)
     }
 
+    /// Состояние до первого токена. Контекст n-грамм — тоже: иначе полный
+    /// префилл по старой сессии видел последние токены прошлого хода перед
+    /// своим первым (ответ расходился со свежей сессией).
     pub fn reset(&mut self) {
-        self.conv.fill(0.0);
+        self.tokens.fill(self.eos);
+        self.conv.clear();
+        self.conv.resize(self.conv_len, 0.0);
         self.conv_dev = None;
     }
 }
