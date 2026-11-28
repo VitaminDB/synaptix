@@ -20,6 +20,8 @@ pub mod loader;
 pub mod nar;
 pub mod pipeline;
 pub mod protocol;
+pub mod score;
+pub mod midi;
 pub mod tokenizer;
 pub mod vae;
 
