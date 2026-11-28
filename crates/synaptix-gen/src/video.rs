@@ -529,6 +529,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         && !matches!(&mode, LtxMode::Continue { tail } if tail.video_stage1.is_none()))
         || matches!(mode, LtxMode::Lipdub { .. });
     let dfr = req.dfr && matches!(mode, LtxMode::Text | LtxMode::Frames { last: None, .. } | LtxMode::Continue { .. });
+    if dfr && !distilled_ckpt {
+        // Как DFRPipeline Lightricks: дистиллированное расписание на distilled-чекпойнте;
+        // на полном стадия 2 шла бы без дистилл-LoRA с дистилл-сигмами.
+        return Err("DFR идёт на distilled-чекпойнте (ltx-2-5-22b-distilled); у полного — управляемый путь (guided)".into());
+    }
     if dfr && paths.detail_lora.is_none() {
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
