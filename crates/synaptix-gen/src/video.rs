@@ -559,13 +559,16 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         return Err("DFR: у модели нет IC-LoRA детализации (ltx-2.5-…-ic-lora-pixel-spatial-upscaler)".into());
     }
     // Полный чекпойнт: управляемый путь Lightricks (текст, первый кадр).
-    // Для листа `guided == Some(false)` включает быстрый двухстадийный режим
-    // (дистилл-LoRA 1.0 + IC-LoRA 1.4, 8+3 шага, Euler-ancestral).
+    // Для листа по умолчанию (при наличии дистилл-LoRA и если явно не запрошен
+    // `guided == Some(true)`) идёт быстрый двухстадийный путь (дистилл-LoRA 1.0 +
+    // IC-LoRA 1.4, 8+3 шага Euler-ancestral + detail_lora на стадии 2): в 4×
+    // быстрее и заметно чище/естественнее, чем 30 шагов CFG 4.
+    let sheet_fast_default = sheet_dev && paths.distilled_lora.is_some() && req.guided != Some(true);
     let sheet_distill_k: f32 = std::env::var("LTX_DISTILL_STRENGTH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if sheet_dev && req.guided == Some(false) { 1.0 } else { 0.0 });
-    let sheet_unguided = sheet_dev && (req.guided == Some(false) || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
+        .unwrap_or(if sheet_fast_default { 1.0 } else { 0.0 });
+    let sheet_unguided = sheet_dev && (sheet_fast_default || req.guided == Some(false) || req.guidance == Some(1.0) || sheet_distill_k > 0.0);
     let guided = (sheet_dev && !sheet_unguided)
         || (!distilled_ckpt
             && adapter.is_none()
