@@ -104,9 +104,14 @@ pub struct Qwen4ExpPipeline {
 /// откатываются по позиции.
 pub struct Qwen4ExpSession {
     cache: ModelCache,
-    /// Токены промпта, на конце которого стоит точка возврата.
+    /// Токены промпта, на конце которого стоит точка возврата (`snap`).
     ids: Vec<u32>,
-    /// Состояние в этой точке. `None` — сессия пустая.
+    /// Все токены, фактически впитанные `cache` после декода (`prompt + out[..absorbed]`).
+    /// Если следующий промпт сохраняет реплику ассистента без перерисовки,
+    /// кэш продолжается напрямую с этой точки — без отката и без повторного
+    /// префилла ответа.
+    full_ids: Vec<u32>,
+    /// Состояние в точке `ids`. `None` — сессия пустая.
     snap: Option<CacheSnapshot>,
     /// Медиа, вошедшие в кэшированный префикс. Токены заполнителей у двух
     /// разных картинок одинаковы, так что промпт с той же разметкой, но
@@ -157,11 +162,20 @@ fn media_sigs(inputs: &[MediaInput], ids: &[u32]) -> Result<Vec<MediaSig>, Pipel
 }
 
 impl Qwen4ExpSession {
-    /// Сколько токенов нового промпта уже посчитано. Ноль — префикс не
-    /// совпал (сжали историю, поправили сообщение, сменили системный
-    /// prompt): частичное совпадение бесполезно, GDN-состояние на середину
-    /// не откатить.
-    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+    /// Можно ли продолжить прямо с живого `cache` после прошлого декода (без
+    /// отката на `snap`), переиспользовав и ответ ассистента.
+    fn reusable_live(&self, prompt_ids: &[u32]) -> usize {
+        let n = self.full_ids.len();
+        if n == 0 || n != self.cache.seq_len || prompt_ids.len() <= n {
+            return 0;
+        }
+        if prompt_ids[..n] != self.full_ids[..] {
+            return 0;
+        }
+        n
+    }
+
+    fn reusable_snap(&self, prompt_ids: &[u32]) -> usize {
         let n = self.ids.len();
         if n == 0 || self.snap.is_none() || prompt_ids.len() <= n {
             return 0;
@@ -172,17 +186,43 @@ impl Qwen4ExpSession {
         n
     }
 
+    /// Сколько токенов нового промпта уже посчитано. Ноль — префикс не
+    /// совпал (сжали историю, поправили сообщение, сменили системный
+    /// prompt): частичное совпадение бесполезно, GDN-состояние на середину
+    /// не откатить.
+    pub fn reusable(&self, prompt_ids: &[u32]) -> usize {
+        let live = self.reusable_live(prompt_ids);
+        if live > 0 {
+            return live;
+        }
+        self.reusable_snap(prompt_ids)
+    }
+
+    /// То же для промпта с медиа: помимо токенов должны совпасть и строки
+    /// вложений, вошедшие в кэшированный префикс. Возвращает `(токенов, живой_кэш)`.
+    fn reusable_media_mode(&self, prompt_ids: &[u32], inputs: &[MediaInput]) -> (usize, bool) {
+        let live = self.reusable_live(prompt_ids);
+        if live > 0 {
+            if let Ok(sigs) = media_sigs(inputs, &self.ids) {
+                if sigs == self.media {
+                    return (live, true);
+                }
+            }
+        }
+        let n = self.reusable_snap(prompt_ids);
+        if n == 0 {
+            return (0, false);
+        }
+        match media_sigs(inputs, &self.ids) {
+            Ok(sigs) if sigs == self.media => (n, false),
+            _ => (0, false),
+        }
+    }
+
     /// То же для промпта с медиа: помимо токенов должны совпасть и строки
     /// вложений, вошедшие в кэшированный префикс.
     pub fn reusable_media(&self, prompt_ids: &[u32], inputs: &[MediaInput]) -> usize {
-        let n = self.reusable(prompt_ids);
-        if n == 0 {
-            return 0;
-        }
-        match media_sigs(inputs, &self.ids) {
-            Ok(sigs) if sigs == self.media => n,
-            _ => 0,
-        }
+        self.reusable_media_mode(prompt_ids, inputs).0
     }
 
     pub fn ctx_tokens(&self) -> usize {
@@ -211,6 +251,7 @@ impl Qwen4ExpSession {
     /// Забыть префикс (смена чата/модели, сжатие истории).
     pub fn invalidate(&mut self) {
         self.ids.clear();
+        self.full_ids.clear();
         self.snap = None;
         self.media.clear();
         self.cache.reset();
@@ -332,10 +373,12 @@ impl Qwen4ExpPipeline {
             fit_cache_to_vram(cache, &config, device, kv_reserve);
         }
         let chat_template = weights.chat_template.clone();
-        // Спекуляция MTP по умолчанию — там, где она окупается: с zero-copy
-        // декодом (промахи экспертов не стоят синхронизаций).
+        // Спекуляция MTP по умолчанию — там, где эксперты в RAM или на карте:
+        // на NVFP4 с зеркалом в RAM приёмка 80–91 % (~1.88 ток/прогон) даёт
+        // +16–20 % к скорости декода.
         let zc_eligible = zc_on() && lazy && host_mirror.is_some() && one_blob;
-        let mtp = if speculation_on(zc_eligible) && mtp_present(&*weights) {
+        let spec_default = zc_eligible || (lazy && host_mirror.is_some()) || model.expert_cache().is_none();
+        let mtp = if speculation_on(spec_default) && mtp_present(&*weights) {
             let cache = model.expert_cache().cloned();
             let source: Option<Arc<dyn ExpertSource>> = (cache.is_some()
                 && stacks.as_deref().is_some_and(|s| em::has_lazy_stacks(s, config.num_hidden_layers)))
@@ -777,6 +820,7 @@ impl Qwen4ExpPipeline {
         Ok(Qwen4ExpSession {
             cache: self.make_cache(ctx_tokens)?,
             ids: Vec::new(),
+            full_ids: Vec::new(),
             snap: None,
             media: Vec::new(),
             resume_at: None,
@@ -879,14 +923,15 @@ impl Qwen4ExpPipeline {
             if budget > s.cache.max_seq && self.grow_session(s, budget).is_err() {
                 s.cache = self.make_cache(budget)?;
                 s.ids.clear();
+                s.full_ids.clear();
                 s.snap = None;
                 s.media.clear();
             }
         }
-        let reuse = session
+        let (reuse, live_reuse) = session
             .as_deref()
-            .map(|s| s.reusable_media(prompt_ids, inputs))
-            .unwrap_or(0);
+            .map(|s| s.reusable_media_mode(prompt_ids, inputs))
+            .unwrap_or((0, false));
         // Граница точки возврата внутри хвоста, который предстоит посчитать.
         let split = session
             .as_deref_mut()
@@ -897,9 +942,13 @@ impl Qwen4ExpPipeline {
         let mut owned_cache;
         let cache: &mut ModelCache = match session.as_deref_mut() {
             Some(s) => {
-                match (reuse > 0).then(|| s.snap.as_ref()).flatten() {
-                    Some(snap) => s.cache.restore(snap).map_err(PipelineError::from)?,
-                    None => s.cache.reset(),
+                if live_reuse {
+                    // Кэш уже стоит точно на конце `full_ids` — откат не нужен.
+                } else {
+                    match (reuse > 0).then(|| s.snap.as_ref()).flatten() {
+                        Some(snap) => s.cache.restore(snap).map_err(PipelineError::from)?,
+                        None => s.cache.reset(),
+                    }
                 }
                 &mut s.cache
             }
@@ -999,11 +1048,20 @@ impl Qwen4ExpPipeline {
 
         let decode_start = Instant::now();
         let mut out = Vec::with_capacity(cfg.max_new_tokens);
+        // Голова MTP начинает со своей позиции 0 и впитывает только
+        // сгенерированные токены (`<= max_new_tokens`), а не весь промпт.
+        let mtp_cap = (cfg.max_new_tokens + 16).min(self.max_seq);
         let mut spec = match (self.mtp.as_ref().filter(|_| cfg.constraint.is_none()), tail_stream) {
             (Some(head), Some(stream)) => Some(Speculation {
                 head,
                 cache: head
-                    .make_cache(&self.config, budget + 8, self.model.device, self.model.compute)
+                    .make_cache(
+                        &self.config,
+                        mtp_cap,
+                        self.model.device,
+                        self.model.compute,
+                        self.model.kv_quantized(),
+                    )
                     .map_err(PipelineError::from)?,
                 stream,
                 tokens: Vec::new(),
@@ -1115,9 +1173,14 @@ impl Qwen4ExpPipeline {
         // в сессию. Порядок важен: `boundary` снят до декода, а декод успел
         // дописать в кэш свои токены; сравнение префикса на следующем ходу
         // идёт по `ids`, откат — по снимку.
+        let absorbed = cache.seq_len.saturating_sub(prompt_ids.len()).min(out.len());
         if let (Some(s), Some(snap)) = (session, boundary) {
             let kept = &prompt_ids[..split.unwrap_or(prompt_ids.len())];
             s.ids = kept.to_vec();
+            s.full_ids.clear();
+            s.full_ids.reserve(prompt_ids.len() + absorbed);
+            s.full_ids.extend_from_slice(prompt_ids);
+            s.full_ids.extend_from_slice(&out[..absorbed]);
             s.snap = Some(snap);
             s.media = media_sigs(inputs, kept)?;
         }
@@ -1560,10 +1623,11 @@ impl Qwen4ExpPipeline {
         let headroom = std::env::var("SYN_QWEN4EXP_ZC_HEADROOM_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20;
         let reserve = decode_reserve(&self.config) + (768usize << 20) + headroom;
         let layers = self.config.num_hidden_layers + self.mtp.is_some() as usize;
-        // Байт на слот: gate_up + down одного эксперта IQ3_S-128 (точно — в слое;
-        // здесь по формам и 3,5 бит на вес).
+        // Байт на слот: gate_up + down одного эксперта (9/16 для NVFP4 с
+        // раздельными масштабами, 7/16 для одноблобного IQ3_S-128).
         let m = &self.config.moe;
-        let per_expert = (2 * m.moe_intermediate_size * m.hidden_size + m.hidden_size * m.moe_intermediate_size) * 7 / 16;
+        let num = if zc_split_on() { 9 } else { 7 };
+        let per_expert = (2 * m.moe_intermediate_size * m.hidden_size + m.hidden_size * m.moe_intermediate_size) * num / 16;
         let slots = free.saturating_sub(reserve) / layers.max(1) / per_expert.max(1);
         let slots = slots.min(m.num_experts);
         pool.set_slots_per_layer(slots);

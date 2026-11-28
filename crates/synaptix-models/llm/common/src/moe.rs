@@ -2380,16 +2380,21 @@ impl MoeFfn {
 
         // Промахи поднимаются одной параллельной пачкой до счёта: батчевый
         // путь берёт экспертов из кэша по одному, и очередь в один поток к
-        // страницам бандла стоит дороже самого умножения.
+        // страницам бандла стоит дороже самого умножения. Для сегментного
+        // группового GEMM (префилл NVFP4) пропускаем общий prefetch на все 512
+        // экспертов: группы по `SYN_MOE_GROUP` подкачиваются конвейером в фоне
+        // параллельно с вычислением текущей группы на GPU.
         let batchable = t <= batch_tokens();
-        stage("moe:prefetch", || self.prefetch(&experts, &weights, batchable));
         if batchable {
+            stage("moe:prefetch", || self.prefetch(&experts, &weights, true));
             if let Some(out) = self.forward_pairs_batched(x, &experts, &weights)? {
                 return Ok(out);
             }
-        }
-        if let Some(out) = self.forward_chunk_segmented(x, &experts, &weights)? {
-            return Ok(out);
+        } else {
+            if let Some(out) = self.forward_chunk_segmented(x, &experts, &weights)? {
+                return Ok(out);
+            }
+            stage("moe:prefetch", || self.prefetch(&experts, &weights, false));
         }
         if let Some(out) = self.forward_chunk_grouped_dense(x, &experts, &weights)? {
             return Ok(out);
@@ -2721,81 +2726,109 @@ impl MoeFfn {
         };
         let stacked = stage("moe:expert", || -> Result<Tensor, ModelError> {
             let mut parts: Vec<Tensor> = Vec::new();
-            let mut g0 = 0usize;
-            while g0 < segs.len() {
-                let g1 = (g0 + group_n).min(segs.len());
-                let row0 = segs[g0].1;
-                let row1 = segs[g1 - 1].1 + segs[g1 - 1].2;
-                let g_rows = row1 - row0;
-                let mut held: Vec<Arc<Expert>> = Vec::new();
-                let mut refs: Vec<&Expert> = Vec::with_capacity(g1 - g0);
-                match (resident_all, &self.cache) {
-                    (Some(all), _) => {
-                        for (e, _, _) in &segs[g0..g1] {
-                            refs.push(&all[*e]);
-                        }
+            std::thread::scope(|scope| -> Result<(), ModelError> {
+                let mut g0 = 0usize;
+                let mut bg_fetch: Option<std::thread::ScopedJoinHandle<'_, ()>> = None;
+                // Запускаем подкачку первой группы, если эксперты в оффлоаде.
+                if resident_all.is_none() && self.cache.is_some() && !segs.is_empty() {
+                    let g1 = group_n.min(segs.len());
+                    let ids: Vec<u32> = segs[0..g1].iter().map(|(e, _, _)| *e as u32).collect();
+                    if let Some(job) = self.fetch_job(&ids, &vec![1.0; ids.len()], false) {
+                        stage("moe:prefetch", || job.run());
                     }
-                    (None, Some(cache)) => {
-                        // Промахи группы — одной параллельной пачкой: кэш мог
-                        // ужаться и растерять поднятое `prefetch`'ем, а брать
-                        // их по одному значит подкачивать последовательно.
-                        let ids: Vec<u32> = segs[g0..g1].iter().map(|(e, _, _)| *e as u32).collect();
-                        if let Some(job) = self.fetch_job(&ids, &vec![1.0; ids.len()], false) {
-                            job.run();
-                        }
-                        for (e, _, _) in &segs[g0..g1] {
-                            held.push(self.resident_expert(*e, cache)?);
-                        }
-                        for e in &held {
-                            if !nvfp4_pair(e) {
-                                return Err(ModelError::Forward(NOT_NVFP4_EXPERT.into()));
+                }
+                while g0 < segs.len() {
+                    let g1 = (g0 + group_n).min(segs.len());
+                    if let Some(h) = bg_fetch.take() {
+                        let _ = h.join();
+                    }
+                    let row0 = segs[g0].1;
+                    let row1 = segs[g1 - 1].1 + segs[g1 - 1].2;
+                    let g_rows = row1 - row0;
+                    let mut held: Vec<Arc<Expert>> = Vec::new();
+                    let mut refs: Vec<&Expert> = Vec::with_capacity(g1 - g0);
+                    match (resident_all, &self.cache) {
+                        (Some(all), _) => {
+                            for (e, _, _) in &segs[g0..g1] {
+                                refs.push(&all[*e]);
                             }
-                            refs.push(e.as_ref());
                         }
+                        (None, Some(cache)) => {
+                            // Если кэш ужался во время фоновой подкачки — добираем недостающее.
+                            let ids: Vec<u32> = segs[g0..g1].iter().map(|(e, _, _)| *e as u32).collect();
+                            if let Some(job) = self.fetch_job(&ids, &vec![1.0; ids.len()], false) {
+                                stage("moe:prefetch", || job.run());
+                            }
+                            for (e, _, _) in &segs[g0..g1] {
+                                held.push(self.resident_expert(*e, cache)?);
+                            }
+                            for e in &held {
+                                if !nvfp4_pair(e) {
+                                    return Err(ModelError::Forward(NOT_NVFP4_EXPERT.into()));
+                                }
+                                refs.push(e.as_ref());
+                            }
+                            // Конвейер: пока GPU считает GEMM текущей группы,
+                            // фоновый поток подкачивает следующую группу экспертов.
+                            if g1 < segs.len() {
+                                let next_g1 = (g1 + group_n).min(segs.len());
+                                let next_ids: Vec<u32> =
+                                    segs[g1..next_g1].iter().map(|(e, _, _)| *e as u32).collect();
+                                if let Some(job) =
+                                    self.fetch_job(&next_ids, &vec![1.0; next_ids.len()], false)
+                                {
+                                    bg_fetch = Some(scope.spawn(move || job.run()));
+                                }
+                            }
+                        }
+                        (None, None) => unreachable!("проверено выше"),
                     }
-                    (None, None) => unreachable!("проверено выше"),
+                    let mut gate_up: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
+                    let mut down: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
+                    for e in &refs {
+                        let (gu, dn) = (
+                            e.gate_up.quant_weight().expect("проверено выше"),
+                            e.down.quant_weight().expect("проверено выше"),
+                        );
+                        // Групповому GEMM нужна перемешанная копия; из зеркала
+                        // эксперт приходит уже перемешанным, иначе строим один раз.
+                        gu.ensure_shuffled()
+                            .and_then(|_| dn.ensure_shuffled())
+                            .map_err(|e| ModelError::Forward(format!("MoE: перепаковка: {e}")))?;
+                        gate_up.push(gu);
+                        down.push(dn);
+                    }
+                    let row_off: Vec<u32> = segs[g0..g1].iter().map(|(_, s, _)| (*s - row0) as u32).collect();
+                    let seg_rows: Vec<u32> = segs[g0..g1].iter().map(|(_, _, m)| *m as u32).collect();
+                    let xin = if g0 == 0 && g1 == segs.len() {
+                        gathered.clone()
+                    } else {
+                        gathered
+                            .narrow(0, row0, g_rows)
+                            .and_then(|t| t.contiguous())
+                            .map_err(|e| ModelError::Forward(format!("MoE: срез группы: {e}")))?
+                    };
+                    let (px, sx) = xin
+                        .nvfp4_quantize_act()
+                        .map_err(|e| ModelError::Forward(format!("MoE: квант входа: {e}")))?;
+                    let gu = QuantWeight::gemm_grouped(&gate_up, &px, &sx, &row_off, &seg_rows, g_rows, self.compute)
+                        .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM gate_up: {e}")))?;
+                    let (ph, sh) = match self.cfg.activation {
+                        Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
+                        Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
+                        Activation::SwigluOai | Activation::SiluClamp(_) => self.swiglu(&gu).and_then(|h| if h.dtype() == DType::F16 { Ok(h) } else { to_f16(&h) })?.nvfp4_quantize_act(),
+                    }
+                    .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
+                    let part = QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, g_rows, self.compute)
+                        .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM down: {e}")))?;
+                    parts.push(part);
+                    g0 = g1;
                 }
-                let mut gate_up: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
-                let mut down: Vec<&QuantWeight> = Vec::with_capacity(refs.len());
-                for e in &refs {
-                    let (gu, dn) = (
-                        e.gate_up.quant_weight().expect("проверено выше"),
-                        e.down.quant_weight().expect("проверено выше"),
-                    );
-                    // Групповому GEMM нужна перемешанная копия; из зеркала
-                    // эксперт приходит уже перемешанным, иначе строим один раз.
-                    gu.ensure_shuffled()
-                        .and_then(|_| dn.ensure_shuffled())
-                        .map_err(|e| ModelError::Forward(format!("MoE: перепаковка: {e}")))?;
-                    gate_up.push(gu);
-                    down.push(dn);
+                if let Some(h) = bg_fetch.take() {
+                    let _ = h.join();
                 }
-                let row_off: Vec<u32> = segs[g0..g1].iter().map(|(_, s, _)| (*s - row0) as u32).collect();
-                let seg_rows: Vec<u32> = segs[g0..g1].iter().map(|(_, _, m)| *m as u32).collect();
-                let xin = if g0 == 0 && g1 == segs.len() {
-                    gathered.clone()
-                } else {
-                    gathered
-                        .narrow(0, row0, g_rows)
-                        .and_then(|t| t.contiguous())
-                        .map_err(|e| ModelError::Forward(format!("MoE: срез группы: {e}")))?
-                };
-                let (px, sx) = xin
-                    .nvfp4_quantize_act()
-                    .map_err(|e| ModelError::Forward(format!("MoE: квант входа: {e}")))?;
-                let gu = QuantWeight::gemm_grouped(&gate_up, &px, &sx, &row_off, &seg_rows, g_rows, self.compute)
-                    .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM gate_up: {e}")))?;
-                let (ph, sh) = match self.cfg.activation {
-                    Activation::GeluTanh => gu.gelu_tanh_mul_quant_nvfp4(1.0),
-                    Activation::Silu => gu.silu_mul_quant_nvfp4(1.0),
-                    Activation::SwigluOai | Activation::SiluClamp(_) => self.swiglu(&gu).and_then(|h| if h.dtype() == DType::F16 { Ok(h) } else { to_f16(&h) })?.nvfp4_quantize_act(),
-                }
-                .map_err(|e| ModelError::Forward(format!("MoE: активация+квант: {e}")))?;
-                let part = QuantWeight::gemm_grouped(&down, &ph, &sh, &row_off, &seg_rows, g_rows, self.compute)
-                    .map_err(|e| ModelError::Forward(format!("MoE: групповой GEMM down: {e}")))?;
-                parts.push(part);
-                g0 = g1;
-            }
+                Ok(())
+            })?;
             if parts.len() == 1 {
                 Ok(parts.pop().expect("одна часть"))
             } else {

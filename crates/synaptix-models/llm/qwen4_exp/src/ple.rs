@@ -11,6 +11,9 @@ use crate::norm::{coerr, group_rms, load_one_plus};
 pub struct PleState {
     pub tokens: Vec<u32>,
     pub conv: Vec<f32>,
+    /// Состояние свёртки на карте (`[state_len, width]` в `compute`): убирает
+    /// H2D-загрузку и синхронную D2H-выгрузку на каждом шаге декода и префилла.
+    pub conv_dev: Option<Tensor>,
 }
 
 impl PleState {
@@ -18,7 +21,72 @@ impl PleState {
         Self {
             tokens: vec![eos; context_len],
             conv: vec![0.0; state_len * width],
+            conv_dev: None,
         }
+    }
+
+    pub fn snapshot(&self) -> Result<Self, ModelError> {
+        let conv_dev = match &self.conv_dev {
+            Some(src) => {
+                let mut dst = coerr(Tensor::empty_uninit(
+                    src.dims().to_vec(),
+                    src.dtype(),
+                    src.device(),
+                ))?;
+                coerr(dst.copy_from(src))?;
+                Some(dst)
+            }
+            None => None,
+        };
+        let conv = if conv_dev.is_some() { Vec::new() } else { self.conv.clone() };
+        Ok(Self { tokens: self.tokens.clone(), conv, conv_dev })
+    }
+
+    pub fn restore_from(&mut self, snap: &Self) -> Result<(), ModelError> {
+        self.tokens.clone_from(&snap.tokens);
+        match (&mut self.conv_dev, &snap.conv_dev) {
+            (Some(dst), Some(src)) => coerr(dst.copy_from(src))?,
+            (None, Some(src)) => {
+                let mut dst = coerr(Tensor::empty_uninit(
+                    src.dims().to_vec(),
+                    src.dtype(),
+                    src.device(),
+                ))?;
+                coerr(dst.copy_from(src))?;
+                self.conv_dev = Some(dst);
+            }
+            (_, None) => {
+                self.conv.clone_from(&snap.conv);
+                self.conv_dev = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn park_to_host(&mut self) -> usize {
+        let Some(t) = self.conv_dev.take() else { return 0 };
+        let bytes = t.dtype().bytes_for_numel(t.numel());
+        if let Ok(v) = t
+            .to_device(Device::Cpu)
+            .and_then(|x| x.to_dtype(DType::F32))
+            .and_then(|x| x.flatten_all())
+            .and_then(|x| x.to_vec1::<f32>())
+        {
+            self.conv = v;
+        }
+        bytes
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.conv_dev
+            .as_ref()
+            .map(|t| t.dtype().bytes_for_numel(t.numel()))
+            .unwrap_or(0)
+    }
+
+    pub fn reset(&mut self) {
+        self.conv.fill(0.0);
+        self.conv_dev = None;
     }
 }
 
@@ -29,7 +97,7 @@ pub struct PleLayer {
     norm_key: Tensor,
     norm_query: Tensor,
     norm_conv: Tensor,
-    conv_w: Tensor,
+    conv_taps: Vec<Tensor>,
     hidden: usize,
     hc_count: usize,
     conv_kernel: usize,
@@ -68,6 +136,15 @@ impl PleLayer {
             .tensor(&format!("{prefix}.conv1d.weight"), device, compute)?
             .reshape(vec![hc_hidden, ple.conv_kernel_size])
             .map_err(|e| ModelError::Load(e.to_string()))?;
+        let mut conv_taps = Vec::with_capacity(ple.conv_kernel_size);
+        for j in 0..ple.conv_kernel_size {
+            let tap = conv_w
+                .narrow(1, j, 1)
+                .and_then(|t| t.contiguous())
+                .and_then(|t| t.reshape(vec![1, hc_hidden]))
+                .map_err(|e| ModelError::Load(e.to_string()))?;
+            conv_taps.push(tap);
+        }
 
         Ok(Self {
             embedding,
@@ -76,7 +153,7 @@ impl PleLayer {
             norm_key: load_one_plus(weights, &format!("{prefix}.norm_key.weight"), device, compute)?,
             norm_query: load_one_plus(weights, &format!("{prefix}.norm_query.weight"), device, compute)?,
             norm_conv: load_one_plus(weights, &format!("{prefix}.norm_conv.weight"), device, compute)?,
-            conv_w,
+            conv_taps,
             hidden: cfg.hidden_size,
             hc_count: cfg.hc_count,
             conv_kernel: ple.conv_kernel_size,
@@ -145,17 +222,26 @@ impl PleLayer {
     fn short_conv(&self, x: &Tensor, state: &mut PleState) -> Result<Tensor, ModelError> {
         let t = x.dims()[0];
         let width = self.conv_width();
-        let state_t = Tensor::from_vec(state.conv.clone(), vec![self.state_len, width], self.device)
-            .and_then(|s| s.to_dtype(self.compute))
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        let state_t = if self.device != Device::Cpu {
+            if state.conv_dev.is_none() {
+                let s = Tensor::from_vec(state.conv.clone(), vec![self.state_len, width], self.device)
+                    .and_then(|s| s.to_dtype(self.compute))
+                    .map_err(|e| ModelError::Forward(e.to_string()))?;
+                state.conv_dev = Some(s);
+            }
+            state.conv_dev.as_ref().expect("инициализирован выше").clone()
+        } else {
+            Tensor::from_vec(state.conv.clone(), vec![self.state_len, width], self.device)
+                .and_then(|s| s.to_dtype(self.compute))
+                .map_err(|e| ModelError::Forward(e.to_string()))?
+        };
         let padded = coerr(Tensor::cat(&[&state_t, x], 0))?;
 
         let mut acc: Option<Tensor> = None;
         for j in 0..self.conv_kernel {
             let offset = j * self.dilation;
             let slice = coerr(coerr(padded.narrow(0, offset, t))?.contiguous())?;
-            let w = coerr(coerr(coerr(self.conv_w.narrow(1, j, 1))?.contiguous())?.reshape(vec![1, width]))?;
-            let term = coerr(slice.broadcast_mul(&w))?;
+            let term = coerr(slice.broadcast_mul(&self.conv_taps[j]))?;
             acc = Some(match acc {
                 Some(a) => coerr(a.add(&term))?,
                 None => term,
@@ -165,12 +251,16 @@ impl PleLayer {
 
         let tail_start = padded.dims()[0].saturating_sub(self.state_len);
         let tail = coerr(coerr(padded.narrow(0, tail_start, self.state_len))?.contiguous())?;
-        state.conv = tail
-            .to_device(Device::Cpu)
-            .and_then(|x| x.to_dtype(DType::F32))
-            .and_then(|x| x.flatten_all())
-            .and_then(|x| x.to_vec1::<f32>())
-            .map_err(|e| ModelError::Forward(e.to_string()))?;
+        if self.device != Device::Cpu {
+            state.conv_dev = Some(tail);
+        } else {
+            state.conv = tail
+                .to_device(Device::Cpu)
+                .and_then(|x| x.to_dtype(DType::F32))
+                .and_then(|x| x.flatten_all())
+                .and_then(|x| x.to_vec1::<f32>())
+                .map_err(|e| ModelError::Forward(e.to_string()))?;
+        }
 
         coerr(out.silu())
     }

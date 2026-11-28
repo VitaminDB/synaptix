@@ -147,8 +147,8 @@ __device__ __forceinline__ void flash_blocks_impl(
 
   const unsigned int* row_table = table + (long)src_row * NB;
 
-  // Регистровое состояние варпа: q и аккумулятор распределены по лейнам,
-  // максимум и нормировка — общие на варп.
+  // Регистровое состояние варпа: q (уже умноженный на scale) и аккумулятор
+  // распределены по лейнам, максимум и нормировка — общие на варп.
   float q_reg[FB_MAX_REP][FB_MAX_VEC];
   float acc[FB_MAX_REP][FB_MAX_VEC];
   float run_m[FB_MAX_REP], run_l[FB_MAX_REP];
@@ -158,17 +158,26 @@ __device__ __forceinline__ void flash_blocks_impl(
     const T* q_row = q + ((long)bi * NH + h) * D;
     #pragma unroll
     for (int i = 0; i < vec; i++) {
-      q_reg[r][i] = fb_ld(q_row + lane * vec + i);
+      q_reg[r][i] = fb_ld(q_row + lane * vec + i) * scale;
       acc[r][i] = 0.0f;
     }
     run_m[r] = FB_NEG_INF;
     run_l[r] = 0.0f;
   }
 
+  int in_blocks = NB * ratio;
+  bool r8 = (ratio == 8);
   for (int t = warp; t < total; t += FB_WARPS) {
-    int pos = fb_pos(row_table, NB, ratio, from, t);
-    bool live = pos >= 0;
-    if (!live) pos = 0;
+    int pos;
+    if (t < in_blocks) {
+      int blk = r8 ? (t >> 3) : (t / ratio);
+      unsigned int b = row_table[blk];
+      if (b == 0xFFFFFFFFu) continue;
+      int rem = r8 ? (t & 7) : (t % ratio);
+      pos = (int)b * ratio + rem;
+    } else {
+      pos = from + (t - in_blocks);
+    }
     const T* k_row = k + ((long)h_kv * CAP + pos) * D;
     float kv_reg[FB_MAX_VEC];
     fb_load_vec(kv_reg, k_row + lane * vec, vec);
@@ -182,16 +191,23 @@ __device__ __forceinline__ void flash_blocks_impl(
       float part = 0.0f;
       #pragma unroll
       for (int i = 0; i < vec; i++) part += q_reg[r][i] * kv_reg[i];
-      float s = fb_warp_sum(part) * scale;
-      if (!live) s = FB_NEG_INF;
+      float s = fb_warp_sum(part);
 
-      float m_new = fmaxf(run_m[r], s);
-      float alpha = fb_is_finite(run_m[r]) ? __expf(run_m[r] - m_new) : 0.0f;
-      float p = fb_is_finite(m_new) ? __expf(s - m_new) : 0.0f;
-      run_m[r] = m_new;
-      run_l[r] = run_l[r] * alpha + p;
-      #pragma unroll
-      for (int i = 0; i < vec; i++) acc[r][i] = acc[r][i] * alpha + p * vv_reg[i];
+      if (s > run_m[r]) {
+        float alpha = fb_is_finite(run_m[r]) ? __expf(run_m[r] - s) : 0.0f;
+        run_m[r] = s;
+        run_l[r] = run_l[r] * alpha + 1.0f;
+        #pragma unroll
+        for (int i = 0; i < vec; i++) acc[r][i] = acc[r][i] * alpha + vv_reg[i];
+      } else {
+        float diff = s - run_m[r];
+        if (diff > -20.0f) {
+          float p = __expf(diff);
+          run_l[r] += p;
+          #pragma unroll
+          for (int i = 0; i < vec; i++) acc[r][i] += p * vv_reg[i];
+        }
+      }
     }
   }
 
@@ -334,7 +350,7 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
     const T* q_row = q + ((long)bi * NH + h) * D;
     #pragma unroll
     for (int i = 0; i < vec; i++) {
-      q_reg[r][i] = fb_ld(q_row + lane * vec + i);
+      q_reg[r][i] = fb_ld(q_row + lane * vec + i) * scale;
       acc[r][i] = 0.0f;
     }
     run_m[r] = FB_NEG_INF;
@@ -349,10 +365,19 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
     t_begin = blockIdx.z * per;
     t_end = min(total, t_begin + per);
   }
+  int in_blocks = NB * ratio;
+  bool r8 = (ratio == 8);
   for (int t = t_begin + warp; t < t_end; t += FB_WARPS) {
-    int pos = fb_pos(row_table, NB, ratio, from, t);
-    bool live = pos >= 0;
-    if (!live) pos = 0;
+    int pos;
+    if (t < in_blocks) {
+      int blk = r8 ? (t >> 3) : (t / ratio);
+      unsigned int b = row_table[blk];
+      if (b == 0xFFFFFFFFu) continue;
+      int rem = r8 ? (t & 7) : (t % ratio);
+      pos = (int)b * ratio + rem;
+    } else {
+      pos = from + (t - in_blocks);
+    }
     long slot = (long)h_kv * CAP + pos;
 
     float kv_reg[FB_MAX_VEC];
@@ -368,17 +393,24 @@ __device__ __forceinline__ void flash_blocks_mxfp8_impl(
       float part = 0.0f;
       #pragma unroll
       for (int i = 0; i < vec; i++) part += q_reg[r][i] * kv_reg[i];
-      float s = fb_warp_sum(part * ksc) * scale;
-      if (!live) s = FB_NEG_INF;
+      float s = fb_warp_sum(part * ksc);
 
-      float m_new = fmaxf(run_m[r], s);
-      float alpha = fb_is_finite(run_m[r]) ? __expf(run_m[r] - m_new) : 0.0f;
-      float p = fb_is_finite(m_new) ? __expf(s - m_new) : 0.0f;
-      run_m[r] = m_new;
-      run_l[r] = run_l[r] * alpha + p;
-      float pv = p * vsc;
-      #pragma unroll
-      for (int i = 0; i < vec; i++) acc[r][i] = acc[r][i] * alpha + pv * vv_reg[i];
+      if (s > run_m[r]) {
+        float alpha = fb_is_finite(run_m[r]) ? __expf(run_m[r] - s) : 0.0f;
+        run_m[r] = s;
+        run_l[r] = run_l[r] * alpha + 1.0f;
+        #pragma unroll
+        for (int i = 0; i < vec; i++) acc[r][i] = acc[r][i] * alpha + vsc * vv_reg[i];
+      } else {
+        float diff = s - run_m[r];
+        if (diff > -20.0f) {
+          float p = __expf(diff);
+          run_l[r] += p;
+          float pv = p * vsc;
+          #pragma unroll
+          for (int i = 0; i < vec; i++) acc[r][i] += pv * vv_reg[i];
+        }
+      }
     }
   }
 

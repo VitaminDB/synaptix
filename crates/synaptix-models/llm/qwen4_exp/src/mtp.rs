@@ -173,9 +173,15 @@ impl MtpHead {
         max_seq: usize,
         device: Device,
         compute: DType,
+        kv_quantized: bool,
     ) -> Result<MtpCache, ModelError> {
+        let kv = if kv_quantized {
+            KvLayer::new_mxfp8(cfg.num_key_value_heads, cfg.head_dim, max_seq, device)?
+        } else {
+            KvLayer::new(cfg.num_key_value_heads, cfg.head_dim, max_seq, device, compute)?
+        };
         Ok(MtpCache {
-            kv: KvLayer::new(cfg.num_key_value_heads, cfg.head_dim, max_seq, device, compute)?,
+            kv,
             indexer: self.attn.indexer.make_cache(max_seq)?,
             seq_len: 0,
         })

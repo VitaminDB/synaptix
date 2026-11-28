@@ -68,12 +68,13 @@ impl ModelCache {
                 }
             }
         }
+        let ple = self.ple.iter().map(|p| p.snapshot()).collect::<Result<Vec<_>, _>>()?;
         Ok(CacheSnapshot {
             seq_len: self.seq_len,
             linear,
             qsa,
             qsa_tails: Some(qsa_tails),
-            ple: self.ple.clone(),
+            ple,
         })
     }
 
@@ -102,7 +103,9 @@ impl ModelCache {
                 }
             }
         }
-        self.ple.clone_from(&snap.ple);
+        for (dst, src) in self.ple.iter_mut().zip(&snap.ple) {
+            dst.restore_from(src)?;
+        }
         self.seq_len = snap.seq_len;
         Ok(())
     }
@@ -138,9 +141,10 @@ impl ModelCache {
                 LayerState::Qsa(b) => b.1.reset(),
             }
         }
+        for p in self.ple.iter_mut() {
+            p.reset();
+        }
     }
-
-    /// Переселить содержимое кэша в host-RAM, освободив VRAM. Позиции
     /// (`seq_len`, метки индексатора) не трогаются — переезжают только
     /// данные, так что после [`Self::unpark_to`] ход продолжается с той же
     /// точки.
@@ -178,6 +182,9 @@ impl ModelCache {
                     moved += idx.park_to_host()?;
                 }
             }
+        }
+        for p in self.ple.iter_mut() {
+            moved += p.park_to_host();
         }
         Ok(moved)
     }
@@ -227,6 +234,9 @@ impl ModelCache {
                 }
             }
         }
+        for p in &self.ple {
+            total += p.device_bytes();
+        }
         total
     }
 }
@@ -260,11 +270,13 @@ impl CacheSnapshot {
     /// `GdnSnap` дублирует состояние в host-векторах, поэтому переезд для
     /// него — это просто освобождение зеркал.
     pub fn park_to_host(&mut self) -> usize {
-        self.linear.iter_mut().map(|s| s.park_to_host()).sum()
+        self.linear.iter_mut().map(|s| s.park_to_host()).sum::<usize>()
+            + self.ple.iter_mut().map(|p| p.park_to_host()).sum::<usize>()
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.linear.iter().map(|s| s.device_bytes()).sum()
+        self.linear.iter().map(|s| s.device_bytes()).sum::<usize>()
+            + self.ple.iter().map(|p| p.device_bytes()).sum::<usize>()
     }
 }
 
@@ -1193,7 +1205,7 @@ impl Qwen4ExpModel {
                             ple.forward(&head, &tokens[..k], state),
                             &format!("слой {l} ple"),
                         )?;
-                        snap_ple.push(state.clone());
+                        snap_ple.push(state.snapshot()?);
                         let tail = coerr(coerr(hidden.narrow(0, k, s - k))?.contiguous())?;
                         let second = ctx(
                             ple.forward(&tail, &tokens[k..], state),

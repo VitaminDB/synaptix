@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ids = pipeline.encode(&prompt)?;
     let mut cache = pipeline.make_cache(ids.len() + steps + 8)?;
-    let mut head_cache = head.make_cache(&cfg, ids.len() + steps + 8, device, precision.compute)?;
+    let mut head_cache = head.make_cache(&cfg, ids.len() + steps + 8, device, precision.compute, false)?;
     let rope = pipeline.model.rope();
 
     let (mut hidden, mut stream) = pipeline.model.forward_with_stream(&ids, &mut cache)?;
