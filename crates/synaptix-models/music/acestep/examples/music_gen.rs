@@ -34,7 +34,7 @@ fn main() {
         generate_music(&paths, &caption, "", dur, Device::Cuda(0), DType::F32, DType::F32, DType::F32, &opts, &copts, use_cot, &edit, &extras, None)
             .expect("generate_music");
     let out = "/tmp/acestep_out.wav";
-    synaptix_audio::write_wav_mono_f32(out, &samples, sr).expect("write wav");
+    synaptix_audio::io::write_wav_interleaved_f32(out, &samples, sr, 2).expect("write wav");
     eprintln!(
         "[music] wrote {} samples ({:.1}s) to {out} in {:.1}s",
         samples.len(),

@@ -158,7 +158,7 @@ impl Default for AceRequest {
 }
 
 pub struct AceOutput {
-    /// Моно 48 кГц.
+    /// Стерео 48 кГц, отсчёты чередуются L, R.
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub latent: AceLatent,
@@ -307,7 +307,7 @@ impl AceModel {
         })
         .map_err(|e| e.to_string())?;
         let latent = AceLatent::new(&latent)?;
-        let secs = samples.len() as f32 / sample_rate.max(1) as f32;
+        let secs = samples.len() as f32 / 2.0 / sample_rate.max(1) as f32;
         let label = format!("ACE-Step {}, {secs:.0} с, {steps} шагов, сид {}", ACE_MODES[mode], copts.seed);
         Ok(AceOutput { samples, sample_rate, latent, label })
     }

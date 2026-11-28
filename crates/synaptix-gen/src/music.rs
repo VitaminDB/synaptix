@@ -148,8 +148,8 @@ pub fn acestep(paths: &AcePaths, device: Device, req: &MusicRequest, cancel: Arc
         generate_music(&mp, &req.prompt, &req.lyrics, req.seconds, device, compute, quant, quant, &opts, &copts, true, &EditOptions::default(), &extras, None)
     })
     .map_err(|e| e.to_string())?;
-    let secs = samples.len() as f32 / sample_rate.max(1) as f32;
-    Ok(MusicOutput { samples, sample_rate, channels: 1, label: format!("ACE-Step {variant:?}, {secs:.0} с, {steps} шагов"), score: None, notes: Vec::new() })
+    let secs = samples.len() as f32 / 2.0 / sample_rate.max(1) as f32;
+    Ok(MusicOutput { samples, sample_rate, channels: 2, label: format!("ACE-Step {variant:?}, {secs:.0} с, {steps} шагов"), score: None, notes: Vec::new() })
 }
 
 /// YuE2: песня (стиль + текст). `model` и `vae` — бандлы.

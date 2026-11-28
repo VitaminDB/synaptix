@@ -6,7 +6,7 @@ use synaptix_core::tensor::Tensor;
 use synaptix_music_acestep::ar::CodesGenOptions;
 use synaptix_music_acestep::dcw::{DcwCorrector, DcwMode};
 use synaptix_music_acestep::pipeline::{
-    apply_norm, generate_music, EditMode, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions,
+    generate_music, EditMode, EditOptions, GenExtras, MusicPaths, NormMode, SamplerOptions,
 };
 use synaptix_music_acestep::DitVariant;
 use synaptix_music_acestep::text_encoder::TRACK_NAMES;
@@ -258,17 +258,12 @@ pub fn run(args: MusicArgs) -> Result<(), Box<dyn std::error::Error>> {
         crate::commands::song::save_latent(path, &latent)?;
         eprintln!("synaptix music: латент {:?} → {}", latent.dims(), path.display());
     }
+    // generate_music отдаёт стерео (L, R вперемешку): декодировать заново не нужно.
     if args.channels == 2 {
-        let audio = AceStepVae::open(&vae, dev)?.decode_tiled(&latent, 500, 32)?;
-        let channel = |c: usize| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-            Ok(audio.narrow(1, c, 1)?.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
-        };
-        let (left, right) = (channel(0)?, channel(1)?);
-        let mut stereo: Vec<f32> = left.iter().zip(&right).flat_map(|(l, r)| [*l, *r]).collect();
-        apply_norm(&mut stereo, norm_mode);
-        write_wav_interleaved_f32(&args.output, &stereo, sr, 2)?;
+        write_wav_interleaved_f32(&args.output, &samples, sr, 2)?;
     } else {
-        write_wav_mono_f32(&args.output, &samples, sr)?;
+        let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
+        write_wav_mono_f32(&args.output, &left, sr)?;
     }
     eprintln!("synaptix music: wrote {}", args.output.display());
     Ok(())

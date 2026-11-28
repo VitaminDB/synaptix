@@ -686,6 +686,8 @@ impl GenExtras {
     }
 }
 
+/// Музыка целиком: LM кодов → DiT → VAE. Возвращает **стерео** 48 кГц
+/// (отсчёты чередуются L, R), частоту и латент `[1, 64, T]`.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_music(
     paths: &MusicPaths,
@@ -1010,8 +1012,11 @@ pub fn generate_music(
     stage(MusicStage::Vae, paths.vae)?;
     let latent_ncl = latent.transpose(1, 2)?.contiguous()?;
     let audio = vae.decode_tiled(&latent_ncl, 500, 32)?;
-    let ch0 = audio.narrow(1, 0, 1)?.contiguous()?;
-    let mut samples: Vec<f32> = ch0.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    // Стерео, как у оригинала (VAE даёт два канала; раньше отдавался только
+    // левый — песни выходили моно). Отсчёты чередуются L, R; нормировка общая.
+    let channel = |c: usize| -> Result<Vec<f32>, AceError> { Ok(audio.narrow(1, c, 1)?.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?) };
+    let (left, right) = (channel(0)?, channel(audio.dims()[1].min(2) - 1)?);
+    let mut samples: Vec<f32> = left.iter().zip(&right).flat_map(|(l, r)| [*l, *r]).collect();
     apply_norm(&mut samples, extras.norm_mode);
     eprintln!("[t] VAE (load+tiled decode): {:.1}s", t6.elapsed().as_secs_f32());
     Ok((samples, 48000, latent_ncl))
