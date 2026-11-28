@@ -79,6 +79,11 @@ pub struct VideoRequest {
     /// дистилл-LoRA). `None` — включено для текста и первого кадра; `Some(false)` —
     /// прежний быстрый путь (дистилл-LoRA на обеих стадиях).
     pub guided: Option<bool>,
+    /// LTX-2.5 IC-LoRA Ingredients: лист-референс (одна картинка: каждый герой —
+    /// крупный план и развороты, предметы и место — своими панелями, чёрный фон,
+    /// без текста) — герои, предметы и место держатся по нему. Промпт:
+    /// «Reference sheet: <панели> / Generated video: <действие>».
+    pub ref_sheet: Option<PathBuf>,
 }
 
 /// Отрицательный промпт Lightricks по умолчанию (`DEFAULT_NEGATIVE_PROMPT` ltx-pipelines).
@@ -310,6 +315,8 @@ pub struct LtxPaths {
     pub ic_union: Option<PathBuf>,
     pub ic_motion: Option<PathBuf>,
     pub ic_lipdub: Option<PathBuf>,
+    /// LTX-2.5: IC-LoRA Ingredients (лист-референс героев, предметов, места).
+    pub ic_ingredients: Option<PathBuf>,
     /// LTX-2.5: голова длительности (длина ролика по описанию, когда она не задана).
     pub duration_head: Option<PathBuf>,
     /// LTX-2.5: временной апскейлер ×2 (удвоение частоты кадров).
@@ -358,6 +365,8 @@ enum LtxMode {
     A2v { audio: PathBuf, image: Option<PathBuf> },
     Ic { video: PathBuf, canny: bool },
     Lipdub { video: PathBuf, audio: PathBuf },
+    /// Лист-референс IC-LoRA Ingredients.
+    Sheet { image: PathBuf },
 }
 
 fn scratch(tag: &str) -> R<PathBuf> {
@@ -479,6 +488,8 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         let tail = crate::tail::TailLatent::load(ctx_path)?;
         tail.meta.check_compat("ltx", req.model_id.as_deref(), req.width, req.height, None)?;
         LtxMode::Continue { tail }
+    } else if let Some(sheet) = &req.ref_sheet {
+        LtxMode::Sheet { image: sheet.clone() }
     } else {
         match (&req.control_video, &req.audio, &req.source_video) {
             (Some(v), Some(a), _) => LtxMode::Lipdub { video: v.clone(), audio: a.clone() },
@@ -504,11 +515,12 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::Lipdub { .. } => Some(paths.ic_lipdub.clone().ok_or("нет IC-LoRA LipDub (ltx-2.3-…-ic-lora-lipdub)")?),
         LtxMode::Ic { canny: true, .. } => Some(paths.ic_union.clone().ok_or("нет IC-LoRA union-control")?),
         LtxMode::Ic { canny: false, .. } => Some(paths.ic_motion.clone().ok_or("нет IC-LoRA motion-track")?),
+        LtxMode::Sheet { .. } => Some(paths.ic_ingredients.clone().ok_or("нет IC-LoRA Ingredients (ltx-2.5-…-ic-lora-ingredients)")?),
         _ => None,
     };
     let distilled_ckpt = paths.model.file_name().map(|n| n.to_string_lossy().to_lowercase().contains("distilled")).unwrap_or(false);
     if adapter.is_some() && !distilled_ckpt {
-        return Err("IC-LoRA и LipDub идут на distilled-чекпойнте LTX-2.3 (ltx-2-3-22b-distilled)".into());
+        return Err("IC-LoRA и LipDub идут на distilled-чекпойнте (ltx-2-3-22b-distilled, ltx-2-5-22b-distilled)".into());
     }
     // Retake — одной стадией на целевом разрешении; LipDub — всегда две;
     // Continue с хвостом без stage1_video — одной стадией на точном разрешении хвоста.
@@ -942,6 +954,22 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
                     (l, a, None)
                 }
+                LtxMode::Sheet { image } => {
+                    // Лист — статичное видео в выходном разрешении (масштаб референса 1),
+                    // не короче ролика и не меньше 121 кадра (корзина обучения).
+                    let img = synaptix_io::image::load_image(image, Device::Cpu).map_err(|e| format!("{}: {e}", image.display()))?;
+                    let (ph, pw) = (g.0 * 32, g.1 * 32);
+                    let one = synaptix_io::image::fit_image(&img, pw, ph, true).map_err(err)?.to_device(device).map_err(err)?.affine(2.0, -1.0).map_err(err)?.contiguous().map_err(err)?.reshape(vec![1, 3, 1, ph, pw]).map_err(err)?;
+                    let n = lp::out_frame_count(lp::fp_for_frames(out_frames.max(121)));
+                    let copies: Vec<&Tensor> = std::iter::repeat_n(&one, n).collect();
+                    let frames = Tensor::cat(&copies, 2).map_err(err)?.contiguous().map_err(err)?;
+                    let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
+                    drop(frames);
+                    let (tok, f_, h_, w_) = latent_tokens(&lat)?;
+                    let pos = lp::ref_video_positions(f_, h_, w_, fps, 1);
+                    let (l, a) = lp::denoise_av_append(&dit, &v_enc, &a_enc, fp, g.0, g.1, sigmas, vi, ai, false, Some((&tok, &pos, 1.0)), None, fps, device, seed, &hooks).map_err(err)?;
+                    (l, a, None)
+                }
                 LtxMode::Lipdub { video, audio } => {
                     let frames = load_video_frames(video, g.0 * 32, g.1 * 32, out_frames, fps, device)?;
                     let lat = venc.as_ref().unwrap().encode(&frames).map_err(|e| format!("VAE: {e}"))?;
@@ -1141,6 +1169,7 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         LtxMode::A2v { .. } => "по звуку (липсинк)".to_string(),
         LtxMode::Ic { canny: true, .. } => "по контурам образца (IC-LoRA)".to_string(),
         LtxMode::Ic { .. } => "по движению образца (IC-LoRA)".to_string(),
+        LtxMode::Sheet { .. } => "по листу-референсу (IC-LoRA Ingredients)".to_string(),
         LtxMode::Lipdub { .. } => "LipDub".to_string(),
     };
     match &mode {

@@ -51,6 +51,7 @@ fn main() {
                 gemma: dir.join("ltx-gemma-3-12b-qat.syn"),
                 upscaler: Some(dir.join("ltx-2.3-spatial-upscaler-x2-1.1.syn")),
                 ic_lipdub: Some(dir.join("ltx-2.3-22b-ic-lora-lipdub-0.9.syn")),
+                ic_ingredients: None,
                 ic_union: Some(dir.join("ltx-2.3-22b-ic-lora-union-control-ref0.5.syn")),
                 ic_motion: Some(dir.join("ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.syn")),
                 ..Default::default()
