@@ -774,8 +774,11 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_core::tensor::ops::conv_filter_cache_clear();
             release();
             synaptix_core::gen_status::phase("стадия 2: загрузка DiT с дистилл-LoRA");
-            // Стадия 2: только дистилл-LoRA (без листа и IC-LoRA, как
+            // Стадия 2: дистилл-LoRA (без листа и без Ingredients, как
             // DEFAULT_IC_LORA_STAGES Lightricks: apply_ic_lora=false на стадии 2).
+            // При наличии `detail_lora` (IC-LoRA детализации ×2) подмешиваем его
+            // на силе 0.5 и подаём латент стадии 1 референсом (downscale=2), чтобы
+            // доводка не уводила кухню/детали от стадии 1 и сохраняла резкость.
             let mut view2 = ckpt.view_on(Device::Cpu);
             if let Some(p) = &paths.distilled_lora {
                 let l = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
@@ -783,6 +786,20 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             } else {
                 eprintln!("[ltx] нет дистилл-LoRA — стадия 2 полным DiT");
             }
+            let c2 = conds((hp2, wp2))?;
+            let ref_s1 = if sheet_dev && c2.is_empty() {
+                if let Some(dp) = &paths.detail_lora {
+                    eprintln!("[ltx] стадия 2: IC-LoRA детализации ×2 (сила 0.5) с привязкой к латенту стадии 1");
+                    let dtl = LoraWeights::open(dp, device, 0.5).map_err(|e| format!("LoRA детализации: {e}"))?;
+                    view2 = view2.with_lora(std::sync::Arc::new(dtl));
+                    let (tok, f_, h_, w_) = latent_tokens(&l1)?;
+                    Some((tok, lp::ref_video_positions(f_, h_, w_, fps, 2)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
             synaptix_core::gen_status::phase("стадия 2: доводка ×2");
             // LTX-2.5: стадия 2 с дистилл-LoRA идёт на Euler-ancestral (как в DFR/distilled);
@@ -791,9 +808,9 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                 && std::env::var("SYN_LTX_SAMPLER").as_deref() != Ok("euler");
             let base = seed.unwrap_or(1);
             synaptix_video_ltx23::runtime::set_ancestral(ltx25_s2.then(|| base.wrapping_add(20_000)));
-            let c2 = conds((hp2, wp2))?;
+            let v_app = ref_s1.as_ref().map(|(t, p)| (t, p.as_slice(), 1.0f32));
             let l3 = if c2.is_empty() {
-                lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, None, None, fps, device, seed, &hooks).map_err(err)?.0
+                lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a1), true, v_app, None, fps, device, seed, &hooks).map_err(err)?.0
             } else {
                 lp::denoise_av_cond(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), None, fps, device, None, &c2, &[(0usize, a1.clone(), 1.0f32)], seed, &hooks).map_err(err)?.0
             };
@@ -1111,7 +1128,10 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
             synaptix_core::tensor::ops::conv_filter_cache_clear();
             synaptix_video_ltx23::runtime::set_ancestral(ltx25.then(|| base.wrapping_add(20_000)));
             if sheet_dev {
-                // Стадия 2 листа: без листа и без IC-LoRA (только дистилл-LoRA, звук заморожен).
+                // Стадия 2 листа: без листа и без Ingredients (только дистилл-LoRA,
+                // звук заморожен). Если задан `detail_lora` (IC-LoRA детализации ×2,
+                // как в DFR) — подмешиваем его на силе 0.5 и подаём латент стадии 1
+                // референсом (downscale=2), чтобы стадия 2 не «перепридумывала» кухню.
                 drop(dit);
                 release();
                 let mut view2 = ckpt.view_on(Device::Cpu);
@@ -1119,8 +1139,18 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
                     let dl = LoraWeights::open(p, device, 1.0).map_err(|e| format!("LoRA {}: {e}", p.display()))?;
                     view2 = view2.with_lora(std::sync::Arc::new(dl));
                 }
+                let ref_s1 = if let Some(dp) = &paths.detail_lora {
+                    eprintln!("[ltx] стадия 2: IC-LoRA детализации ×2 (сила 0.5) с привязкой к латенту стадии 1");
+                    let dtl = LoraWeights::open(dp, device, 0.5).map_err(|e| format!("LoRA детализации: {e}"))?;
+                    view2 = view2.with_lora(std::sync::Arc::new(dtl));
+                    let (tok, f_, h_, w_) = latent_tokens(&l)?;
+                    Some((tok, lp::ref_video_positions(f_, h_, w_, fps, 2)))
+                } else {
+                    None
+                };
                 let dit2 = AvDit::load_with(&view2, device, compute, quant_dit, offload).map_err(|e| format!("DiT: {e}"))?;
-                l = lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a), true, None, None, fps, device, seed, &hooks).map_err(err)?.0;
+                let v_app = ref_s1.as_ref().map(|(t, p)| (t, p.as_slice(), 1.0f32));
+                l = lp::denoise_av_append(&dit2, &v_enc, &a_enc, fp, hp2, wp2, &lp::STAGE2_SIGMAS, Some(&l2), Some(&a), true, v_app, None, fps, device, seed, &hooks).map_err(err)?.0;
                 drop(dit2);
                 drop(venc);
                 synaptix_core::tensor::ops::conv_filter_cache_gc();
