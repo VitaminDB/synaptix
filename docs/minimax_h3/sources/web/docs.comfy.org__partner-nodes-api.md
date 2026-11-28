@@ -1,0 +1,288 @@
+# Source: https://docs.comfy.org/tutorials/partner-nodes/minimax/minimax-h3.md
+
+Fetched: 2026-11-28 (raw markdown)
+
+---
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.comfy.org/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# MiniMax H3 API Video Generation in ComfyUI
+
+> Use the MiniMax H3 API nodes in ComfyUI for text-to-video, first/last-frame, and reference-to-video cloud workflows with native stereo audio.
+
+[MiniMax H3](https://www.minimax.io/blog/minimax-h3) is MiniMax's general-purpose, omni-modal generation model, available in ComfyUI through the MiniMax H3 API nodes. The API workflows run generation on MiniMax's servers, so no model downloads or local GPU is required, and each second of generated video is billed to your Comfy API account.
+
+MiniMax H3 generates video with **native stereo audio**: voice, sound effects, and music are modeled together in a single forward pass instead of being layered on afterward. Output is up to 2K resolution at 5-15 seconds per clip.
+
+**MiniMax H3 Max** is a variant of MiniMax H3 post-trained by fal for high-speed generation, added to the same API nodes in ComfyUI 0.34.2. It generates faster than real time, accepts a prompt of up to 50,000 characters, and offers 480P and 768P resolutions with an optional two-stage graph built from nodes ComfyUI already supports: prompt enhancement through the MiniMax H3 Context IR node, then regeneration to 2K with the MiniMax H3 Regenerate to 2K node.
+
+**MiniMax H3 Max Turbo** is a faster, cheaper H3 Max option added to the Text to Video and First-Last-Frame nodes in ComfyUI 0.34.4. It renders at 480P or 768P and drops resolution ratio controls on the First-Last-Frame node, where the output ratio follows the input frames.
+
+> [!NOTE]
+>
+> These API workflows run on MiniMax's servers through your Comfy account. To run H3 locally on your own hardware for commercial work, you need a [MiniMax commercial license](https://comfy.org/minimax/license), available through Comfy, the only official reseller.
+
+## What MiniMax H3 is good at
+
+* **Native stereo audio**: Voice, sound effects, and music are modeled together with the video in a single forward pass instead of being layered on afterward
+* **High-resolution output**: Up to 2K resolution at 5-15 seconds per clip
+* **Text-to-video**: Generates videos, with audio, from text prompts
+* **First-last-frame video**: Generates the motion between a first frame and an optional last frame image
+* **Reference-conditioned generation**: Generates videos conditioned on up to 9 reference images, 3 reference videos, and 3 reference audio clips
+* **MiniMax H3 Max**: A faster variant with 480P/768P output, long prompts, and an optional 2K upscale stage. The Reference node accepts up to 12 reference files on H3 Max
+* **MiniMax H3 Max Turbo**: The fastest H3 Max option for the Text to Video and First-Last-Frame nodes, at roughly half the Max per-second rate
+
+## Example outputs
+
+Text-to-video generation from a single prompt, with native stereo audio:
+
+<video controls src="https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/output/api_minimax_h3_t2v.mp4" />
+
+First-last-frame generation, with the model creating the motion between two frames:
+
+<video controls src="https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/output/api_minimax_h3_flf2v.mp4" />
+
+> [!TIP]
+>
+> To use the Partner Nodes, you need to ensure that you are logged in properly and using a permitted network environment. Please refer to the [Partner Nodes Overview](https://docs.comfy.org/tutorials/partner-nodes/overview.md) section of the documentation to understand the specific requirements for using the Partner Nodes.
+
+> [!TIP]
+>
+> > [tab] Local users
+> >
+> > Make sure your ComfyUI is updated.
+> >
+> > * [Download ComfyUI](https://www.comfy.org/download)
+> > * [Update Guide](https://docs.comfy.org/installation/update_comfyui.md)
+> >
+> > Workflows in this guide can be found in the [Workflow Templates](https://docs.comfy.org/interface/features/template.md).
+> > If you can't find them in the template, your ComfyUI may be outdated.
+> >
+> > If nodes are missing when loading a workflow, possible reasons:
+> >
+> > 1. You are not using the latest ComfyUI version (Nightly version)
+> > 2. Some nodes failed to import at startup
+>
+> > [tab] Cloud users
+> >
+> > * [Cloud](https://cloud.comfy.org) will update after ComfyUI stable release.
+> >
+> > So, if you find any core node missing in this document, it might be because the new core nodes have not yet been released in the latest stable version. Please wait for the next stable release.
+
+## MiniMax H3 API workflows
+
+The template library ships with three API example workflows for the base H3 model, four for H3 Max, and two for H3 Max Turbo:
+
+* **Text to Video**: Generate videos from text prompts
+* **First-Last-Frame to Video**: Generate a video between a first and last frame image
+* **Reference to Video**: Generate videos conditioned on reference images, videos, and audio
+* **H3 Max T2V / I2V / FLF2V / R2V**: The same modes through the faster MiniMax H3 Max model, with optional prompt enhancement and 2K upscaling stages built into each workflow
+* **H3 Max Turbo T2V / I2V**: Text-to-video and first/last-frame video through the fastest MiniMax H3 Max Turbo model, with the same optional prompt enhancement and 2K upscaling stages
+
+### MiniMax H3 Max
+
+The four `api_minimax_h3_max_*` templates run on the MiniMax H3 Max model through the same API nodes: the Text to Video and First-Last-Frame nodes gained an H3 Max option in ComfyUI 0.34.2, and the Reference to Video node in 0.34.3. Update ComfyUI to at least 0.34.3 to run all of them.
+
+H3 Max generates faster than real time and bills at lower rates than the base model: 15.09 credits/sec at 480P and 24.14 credits/sec at 768P (see the [Minimax pricing table](https://docs.comfy.org/tutorials/partner-nodes/pricing.md)). Each Max template adds two optional stages behind a Switch node, both off by default:
+
+1. **Prompt enhance**: Rewrites the prompt with the MiniMax H3 Context IR node before generation. Turn on the `Prompt Enhance` boolean to enable it
+2. **Upscale to 2K**: Runs the MiniMax H3 Regenerate to 2K node on the first-pass video. Turn on the `Upscale to 2K` boolean to enable it
+
+Keep the following in mind when wiring a Max template:
+
+* **Generate at 768P if you plan to upscale**: The Regenerate to 2K node only accepts 768P source video
+* **Match durations across nodes**: Generation and prompt enhance must use the same duration, or the stages drift out of sync. The Regenerate to 2K node has no duration input; it re-renders the submitted 768P video at its original duration
+* **Duplicate extra inputs**: The three nodes do not share extra context automatically. If you add a reference video, audio, or another image, plug the same wires into both the Context IR and Regenerate nodes
+
+### MiniMax H3 Text to Video
+
+Generate videos from text prompts through the MiniMax H3 API, with native stereo audio.
+
+<video controls src="https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/output/api_minimax_h3_t2v.mp4" />
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_t2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_t2v.json)
+>
+> Download JSON or search "MiniMax H3 T2V" in Template Library
+
+#### Prompting tips
+
+1. **Prompt**: Describe the whole scene and the accompanying audio (dialogue, SFX, music) in one block
+2. **Duration**: The duration input supports 5-15 seconds; the workflow ships with a fast 5-second preview
+3. **Resolution and ratio**: The API renders at 2K; choose an aspect ratio preset such as `16:9`, `9:16`, or `1:1`
+4. **Watermark**: The AIGC watermark is off by default; enable it in the node's advanced settings if required
+
+#### Prompt writing guide
+
+MiniMax publishes an official [video prompt writing guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md) for the base generation modes: T2VA, I2VA, FL2VA, and L2VA. The guide explains how to structure a prompt into timed shots with camera movement and audio (dialogue, SFX, music), and includes examples for each mode.
+
+#### MiniMax H3 Max: Text to Video
+
+Generate videos from text prompts on the faster H3 Max model. The template renders at 768P by default, with optional prompt enhancement and 2K upscaling stages.
+
+![MiniMax H3 Max Text to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_t2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_t2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_t2v.json)
+>
+> Download JSON or search "MiniMax H3 Max: Text to Video" in Template Library
+
+#### MiniMax H3 Max Turbo: Text to Video
+
+Generate videos from text prompts on the fastest H3 Max Turbo model. The template renders at 768P and 1:1 by default, with the same optional prompt enhancement and 2K upscaling stages as the Max templates. Requires ComfyUI 0.34.4 or later.
+
+![MiniMax H3 Max Turbo Text to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_turbo_t2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_turbo_t2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_turbo_t2v.json)
+>
+> Download JSON or search "MiniMax H3 Turbo: Text to Video" in Template Library
+
+### MiniMax H3 First-Last-Frame to Video
+
+Generate a video between a first frame and an optional last frame image through the MiniMax H3 API. The aspect ratio of the output follows the input images.
+
+<video controls src="https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/output/api_minimax_h3_flf2v.mp4" />
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_flf2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_flf2v.json)
+>
+> Download JSON or search "MiniMax H3 FLF2V" in Template Library
+
+> [card] [First Frame: angel-warrior-demon-battle-start.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/angel-warrior-demon-battle-start.png)
+>
+> First frame for the workflow, or use your own image.
+
+> [card] [Last Frame: angel-warrior-demon-battle-end.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/angel-warrior-demon-battle-end.png)
+>
+> Last frame for the workflow, or use your own image.
+
+#### Prompting tips
+
+1. **Frames**: The `first_frame` input is required; `last_frame` is optional. The model generates the motion between them
+2. **Aspect ratio**: The output follows the input images, so keep both frames at the same aspect ratio
+3. **Image constraints**: Each frame's width and height must be between 256 and 5760 pixels, with an aspect ratio between 2:5 and 5:2
+4. **Prompt**: Describe the transition between the frames, and the audio (dialogue, SFX, music) you want
+
+#### Prompt writing guide
+
+MiniMax publishes an official [video prompt writing guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md) for the base generation modes: T2VA, I2VA, FL2VA, and L2VA. The guide explains how to structure a prompt into timed shots with camera movement and audio (dialogue, SFX, music), and includes examples for each mode.
+
+#### MiniMax H3 Max: Image to Video
+
+Animate a still image on the faster H3 Max model. The template feeds a first frame into the First-Last-Frame node (the last frame stays optional) and ships with optional prompt enhancement and 2K upscaling stages.
+
+![MiniMax H3 Max Image to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_i2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_i2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_i2v.json)
+>
+> Download JSON or search "MiniMax H3 Max: Image to Video" in Template Library
+
+> [card] [Input Image: sneaker\_black.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/sneaker_black.png)
+>
+> Input image for the workflow, or use your own.
+
+#### MiniMax H3 Max Turbo: Image to Video
+
+Animate a still image on the fastest H3 Max Turbo model. The template feeds a first frame into the First-Last-Frame node and ships with optional prompt enhancement and 2K upscaling stages. Requires ComfyUI 0.34.4 or later.
+
+![MiniMax H3 Max Turbo Image to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_turbo_i2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_turbo_i2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_turbo_i2v.json)
+>
+> Download JSON or search "MiniMax H3 Max Turbo: Image to Video" in Template Library
+
+### MiniMax H3 Reference to Video
+
+Generate videos conditioned on reference images, videos, and audio through the MiniMax H3 API.
+
+![MiniMax H3 Reference to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_r2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_r2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_r2v.json)
+>
+> Download JSON or search "MiniMax H3 R2V" in Template Library
+
+> [card] [Reference Image: 9panel\_storyboard\_golden\_hour\_clay\_court.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/9panel_storyboard_golden_hour_clay_court.png)
+>
+> Storyboard reference for the workflow, or use your own images.
+
+#### Prompting tips
+
+1. **Reference by tag**: Refer to each input by its order in the prompt, for example `Image 1`, `Video 1`, or `Audio 1`
+2. **Limits**: Up to 9 reference images, 3 reference videos, and 3 reference audio clips. Each video or audio clip must be 2-15 seconds; total reference video and audio is capped at 15 seconds each
+3. **Audio needs a visual anchor**: Reference audio cannot be used without at least one reference image or video
+4. **Video requirements**: Reference videos must be 23.976-60 FPS
+5. **Prompt**: Assign each reference a job (identity, style, motion, voice) and describe the target shot; explicit assignments tend to work much better
+
+#### Prompt writing guide
+
+MiniMax publishes an official [full-reference mode prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md) for reference-driven generation (R2V). The guide covers the rewrite output structure, including subject definitions, reference labels, and retention analysis, and how to assign each reference a role in the target shot.
+
+#### MiniMax H3 Max: First-Last-Frame to Video
+
+Generate a video between a first and last frame image on the faster H3 Max model, with optional prompt enhancement and 2K upscaling stages.
+
+![MiniMax H3 Max First-Last-Frame to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_flf2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_flf2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_flf2v.json)
+>
+> Download JSON or search "MiniMax H3 Max: FLF2V" in Template Library
+
+> [card] [First Frame: dream\_face\_first.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/dream_face_first.png)
+>
+> First frame for the workflow, or use your own image.
+
+> [card] [Last Frame: dream\_face\_last.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/dream_face_last.png)
+>
+> Last frame for the workflow, or use your own image.
+
+#### MiniMax H3 Max: Reference to Video
+
+Generate videos conditioned on reference media on the faster H3 Max model. The Reference node accepts up to 12 reference files in total on H3 Max, with a `reference_detail` option that trades reference image resolution for cost.
+
+![MiniMax H3 Max Reference to Video workflow preview](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/api_minimax_h3_max_r2v-1.webp)
+
+> [card] [Run on Comfy Cloud](https://cloud.comfy.org/?template=api_minimax_h3_max_r2v\&utm_source=docs\&utm_medium=referral\&utm_campaign=minimax-h3-api)
+>
+> Open in Comfy Cloud
+
+> [card] [Download Workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/api_minimax_h3_max_r2v.json)
+>
+> Download JSON or search "MiniMax H3 Max: Reference to Video" in Template Library
+
+> [card] [Reference Image: burdened\_warrior\_in\_dreamscape.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/burdened_warrior_in_dreamscape.png)
+>
+> Reference image for the workflow, or use your own images.
+
+
+This documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.

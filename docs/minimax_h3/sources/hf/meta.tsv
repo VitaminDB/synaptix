@@ -1,0 +1,669 @@
+Comfy-Org/MiniMax-H3	33871716	2896	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-11-15T09:54:16.000Z
+MiniMaxAI/MiniMax-H3	5974796	7448			2026-11-24T04:56:04.000Z
+Comfy-Org/MiniMax-H3-Image	5052954	808	["MiniMaxAI/MiniMax-H3-Image"]	comfyui	2026-11-23T10:46:27.000Z
+unsloth/MiniMax-H3-GGUF	3774406	460	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-16T12:52:16.000Z
+lightx2v/Minimax-h3-Turbo	1835232	1252	MiniMaxAI/MiniMax-H3	distillation,lora	2026-11-24T07:04:24.000Z
+DeepBeepMeep/MiniMax-H3	1786632	96		gguf	2026-11-22T01:12:54.000Z
+WarmBloodAban/Minimax-h3_Singularity	1125221	1028	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-10-23T15:20:56.000Z
+MiniMaxAI/MiniMax-H3-Image	1102421	2631	["MiniMaxAI/MiniMax-H3"]		2026-11-16T10:00:08.000Z
+Abiray/MiniMax-H3-Pruned-GGUF	936048	98	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T19:16:23.000Z
+Hearthscale/MiniMax-H3-Image-GGUF	840375	24	MiniMaxAI/MiniMax-H3-Image	gguf,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-10T22:14:50.000Z
+OliviaRossi/Minimax-h3_Singularity-x-10Eros-Max_PRISM	579945	434	["WarmBloodAban/Minimax-h3_Singularity","TenStrip/10Eros-Max"]		2026-11-03T20:00:23.000Z
+LBH-123-AI/Minimax_h3_latent_Upscaler	452149	524		comfyui	2026-11-10T13:16:50.000Z
+Winnougan/Cobijada_Minimax-H3_Hybrid_Pruned_ComfyUI	448349	133		comfyui,quantization	2026-09-23T13:20:21.000Z
+MATLOWAI/minimax-h3-fused-turbo-int8-convrot	422813	321	["xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI","diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3,base_model:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI,base_model:merge:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	2026-08-30T01:25:46.000Z
+realrebelai/MiniMax-H3_GGUFs	411597	250	Comfy-Org/MiniMax-H3	gguf,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-08T05:58:24.000Z
+leejet/MiniMax-H3-GGUF	341034	38	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-14T11:42:05.000Z
+Abiray/MiniMax-H3-Image-GGUF	338350	366	["MiniMaxAI/MiniMax-H3-Image"]	gguf,comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-11T14:28:22.000Z
+Alissonerdx/Minimax-H3-ComfyUI	329372	694	["MiniMaxAI/MiniMax-H3","MiniMaxAI/MiniMax-H3-Image"]	lora,comfyui	2026-11-16T13:36:36.000Z
+unsloth/MiniMax-H3-Image-GGUF	324826	63	["MiniMaxAI/MiniMax-H3-Image"]	gguf,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-19T06:40:25.000Z
+drbaph/MiniMax-H3-Turbo-Lora-ComfyUI	250564	551	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-09-19T05:11:01.000Z
+Pika-Labs/Pika-H3-Flex-Turbo-LoRA	223682	210	["Pika-Labs/Pika-H3-Flex","lightx2v/Minimax-h3-Turbo","MiniMaxAI/MiniMax-H3","WarmBloodAban/Minimax-h3_Singularity","Iwannapose/minimax_h3_pdmd_2nfe_comfyui"]	turbo,lora,comfyui,base_model:Iwannapose/minimax_h3_pdmd_2nfe_comfyui,base_model:adapter:Iwannapose/minimax_h3_pdmd_2nfe_comfyui	2026-10-30T11:48:46.000Z
+Abiray/MiniMax-H3-GGUF	206197	167	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-08T07:18:36.000Z
+larryvrh/MiniMax-H3-Turbo-Lora	195918	1289	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-08T20:07:30.000Z
+Merserk/MiniMax-H3-INT4-ConvRot	166669	54		comfyui	2026-08-03T20:56:34.000Z
+fal/MiniMax-H3-Realism-People-LoRA	143314	579	MiniMaxAI/MiniMax-H3	lora,template:diffusion-lora	2026-08-12T20:46:37.000Z
+akatz-ai/MiniMax-H3-Character-Swap-LoRA	129428	1021	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-17T23:41:56.000Z
+Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot	122734	277	MiniMaxAI/MiniMax-H3	quantized,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-15T12:44:09.000Z
+WAS/Minimax-h3_Singularity_v2_pruned	105818	38	["WarmBloodAban/Minimax-h3_Singularity","MiniMaxAI/MiniMax-H3"]	comfyui	2026-10-25T01:03:12.000Z
+Deno2026/MiniMax-H3-DenoMix	98993	45	["MiniMaxAI/MiniMax-H3","WarmBloodAban/Minimax-h3_Singularity"]	comfyui	2026-11-06T01:09:05.000Z
+webmp3/Sakura-MiniMax-H3-Uncensored-GGUF	95346	57	MiniMaxAI/MiniMax-H3	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-17T10:45:00.000Z
+Hearmeman/minimax-h3-loras	78677	157	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-11-24T06:09:43.000Z
+nif0/Qwen3-VL-32B-Instruct-MiniMax-H3-GGUF	76143	26	["unsloth/Qwen3-VL-32B-Instruct-GGUF"]	gguf,base_model:unsloth/Qwen3-VL-32B-Instruct-GGUF,base_model:quantized:unsloth/Qwen3-VL-32B-Instruct-GGUF	2026-08-08T21:48:19.000Z
+molbal/MiniMax-H3-GGUF	75253	73	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-12T20:47:00.000Z
+AtomicChat/MiniMax-H3-Image-GGUF	59617	5	MiniMaxAI/MiniMax-H3-Image	gguf,comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-11T13:59:42.000Z
+joeygambino/MiniMax-H3-encoder-GGUF	52129	15	["MiniMaxAI/MiniMax-H3"]	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T11:07:22.000Z
+akhaliq/minimax-h3-image-pdmd-2step	48132	72	MiniMaxAI/MiniMax-H3-Image	lora,distilled,comfyui	2026-11-11T00:53:30.000Z
+H3-Tiny/MiniMax-H3-Tiny-ComfyUI	47824	37	MiniMaxAI/MiniMax-H3	comfyui	2026-11-24T11:53:08.000Z
+alibaba-pai/MiniMax-H3-Acc-LoRAs	46784	280	["alibaba-pai/MiniMax-H3-Acc-LoRAs","MiniMaxAI/MiniMax-H3"]		2026-08-27T06:13:51.000Z
+AX1Y2JP/MiniMax-H3-W4A8-ConvRot	39322	36	["Comfy-Org/MiniMax-H3"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-10T21:22:50.000Z
+JOKER141/MiniMax-H3-Combat-Base-V2	39124	55	["Comfy-Org/MiniMax-H3"]	lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-25T16:48:06.000Z
+alibaba-pai/MiniMax-H3-Fun-Controlnet-Union	37480	211		controlnet	2026-09-22T10:13:54.000Z
+t8star/Minimax-H3-Image-Exp-Comfy	34314	15	["MiniMaxAI/MiniMax-H3-Image"]	comfyui,lora	2026-11-21T08:52:35.000Z
+rockerBOO/minimax-h3-nvfp4-convrot	34284	34	MiniMaxAI/MiniMax-H3	quantized,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-21T17:17:16.000Z
+OliviaRossi/Minimax-H3-Hybrid-DMAD-PDMD	32154	25	["Comfy-Org/MiniMax-H3","pdmd2026/pdmd_4NFE_lora","ZhengmingYu/DMAD"]	comfyui,quantized,distilled,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-04T08:24:26.000Z
+alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0	31655	89		controlnet,controlnet-union	2026-09-22T09:57:14.000Z
+Abiray/Minimax-h3-Singularity-V2-Pruned-GGUF	31130	14	WarmBloodAban/Minimax-h3_Singularity	gguf,comfyui,quantized,base_model:quantized:WarmBloodAban/Minimax-h3_Singularity	2026-10-22T06:01:36.000Z
+koongrizzly/MiniMax_H3_int4_W4A8_ConvRot_Pruned	29919	11		quantization	2026-11-21T21:02:10.000Z
+Veda-Sparse/Minimax-H3-R2VA-Veda-Preview	26984	57	["MiniMaxAI/MiniMax-H3","larryvrh/MiniMax-H3-Turbo-Lora"]		2026-10-08T10:18:08.000Z
+ChrisColeTech/minimax-h3-turbo-GGUF	25866	24	["MiniMaxAI/MiniMax-H3"]	gguf,quantized,distilled,turbo,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-15T15:35:47.000Z
+unsloth/MiniMax-H3-Image-FP8	24835	37	["MiniMaxAI/MiniMax-H3-Image"]	quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-19T06:41:00.000Z
+lightx2v/Minimax-H3-Turbo-Fusion	24351	116	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-11-24T11:10:21.000Z
+xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	24115	47	["diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3	2026-08-28T15:20:58.000Z
+pablodawson/MiniMax-H3-360-Orbit-LoRA	24050	622	MiniMaxAI/MiniMax-H3	lora	2026-09-27T04:06:23.000Z
+joeygambino/MiniMax-H3-x-Z-Image-native	22587	107	["MiniMaxAI/MiniMax-H3"]	comfyui,comfy-native,comfy-quant	2026-08-24T08:28:31.000Z
+taobao-content-ai/MiniMax-H3-PTD-RefAsymOPD-LoRAs	20969	30	["MiniMaxAI/MiniMax-H3"]	distillation,lora	2026-10-26T12:07:39.000Z
+joeygambino/MiniMax-H3-GGUF	20744	10	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-14T11:57:36.000Z
+Abiray/Minimax-h3-Singularity-V2-Pruned	20654	27	WarmBloodAban/Minimax-h3_Singularity	comfyui,quantized,base_model:quantized:WarmBloodAban/Minimax-h3_Singularity	2026-10-22T06:09:51.000Z
+BennyDaBall/MiniMax-H3-Image-ComfyUI-NVFP4	20219	10	["MiniMaxAI/MiniMax-H3-Image","Comfy-Org/MiniMax-H3-Image"]	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3-Image,base_model:quantized:Comfy-Org/MiniMax-H3-Image	2026-11-16T16:30:16.000Z
+releaseworthy/dasiwa-minimax-h3-turbo-int8	20102	0		comfyui,turbo	2026-11-12T19:11:53.000Z
+akatz-ai/MiniMax-H3-Image-Character-Swap-LoRA	18604	95	Comfy-Org/MiniMax-H3-Image	lora,comfyui,base_model:Comfy-Org/MiniMax-H3-Image,base_model:adapter:Comfy-Org/MiniMax-H3-Image	2026-11-20T10:47:18.000Z
+Jojocodex/minimax-h3-spatial-physics-lora	17927	143	Comfy-Org/MiniMax-H3	lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-19T21:42:56.000Z
+Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora	17894	93	MiniMaxAI/MiniMax-H3	lora	2026-10-05T16:02:35.000Z
+Jojocodex/minimax-h3-Camera-Motion-lora	17469	91	Comfy-Org/MiniMax-H3	lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-25T03:14:31.000Z
+LiconStudio/Minimax-H3-VBVR	16562	197	["MiniMaxAI/MiniMax-H3"]		2026-11-20T07:53:21.000Z
+aptech0081/MiniMax-H3-PDD-ComfyUI	16004	88	["alibaba-pai/MiniMax-H3-Acc-LoRAs","MiniMaxAI/MiniMax-H3"]	comfyui,distillation	2026-10-20T04:58:44.000Z
+hoidhxd/MiniMax-H3-x-Z-Image-hybrid	15172	27	["MiniMaxAI/MiniMax-H3"]		2026-08-24T17:14:31.000Z
+multimodalart/MiniMax-H3-Pruned	15128	5	MiniMaxAI/MiniMax-H3	lora	2026-08-15T17:40:26.000Z
+joeygambino/MiniMax-H3-comfy-native-fl2va	13865	2	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-15T19:32:13.000Z
+joeygambino/MiniMax-H3-curve-GGUF	11182	10	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-14T11:57:37.000Z
+lynaNSFW/minimaxH3_Collection	11123	12	pmczip/MiniMaxH3_LoRAs	lora,template:diffusion-lora,base_model:pmczip/MiniMaxH3_LoRAs,base_model:adapter:pmczip/MiniMaxH3_LoRAs	2026-11-09T10:39:11.000Z
+Cseti/MiniMax-H3_Ref2VA-LoRA-CrossView-Warp_v1	11003	103	["MiniMaxAI/MiniMax-H3"]	lora	2026-09-20T19:23:11.000Z
+vantagewithai/MiniMax-H3-comfyUI-GGUF	10701	29	MiniMaxAI/MiniMax-H3	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-26T12:40:29.000Z
+Mamad8/MiniMax-H3-Image-VAE	10679	100		comfyui	2026-08-08T21:54:39.000Z
+Wuli-art/MiniMax-H3-Turbo	10277	72	["MiniMaxAI/MiniMax-H3"]	turbo,comfyui	2026-11-11T09:08:47.000Z
+lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA	8509	14			2026-10-29T15:05:45.000Z
+Jackxuanxuan/minimax-h3-fused-turbo-int8-convrot	7968	2	["xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI","diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3,base_model:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI,base_model:merge:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	2026-09-08T06:50:14.000Z
+MarxistLeninist/MiniMax-H3-FL2VA-Pruned-IQ1-GGUF	7695	0	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-10T14:27:21.000Z
+coolthor/MiniMax-H3-pruned-NVFP4	7602	53	["MiniMaxAI/MiniMax-H3"]	quantized,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-14T04:29:10.000Z
+rzgar/minimax-h3_fl2v_8Step_motion_enhancer	6842	64	MiniMaxAI/MiniMax-H3	lora,template:diffusion-lora	2026-10-07T10:12:51.000Z
+pytraveler/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA-GGUF	6829	1	lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA	gguf,base_model:quantized:lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA	2026-11-12T12:55:24.000Z
+Wuli-art/Gemma4-for-MiniMax-H3-Prompt-Extend	6827	42	["google/gemma-4-12B-it"]		2026-11-18T08:02:24.000Z
+Rkss/Minimax_h3_fl2v_lightx2v_turbo_4to8step_768p_v4_step600_dareties_native	6549	2	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-09-16T20:40:19.000Z
+indhic-ai/Minimax-h3_Singularity_v2_pruned	6536	3	WarmBloodAban/Minimax-h3_Singularity	comfyui,base_model:quantized:WarmBloodAban/Minimax-h3_Singularity	2026-10-22T05:44:33.000Z
+SOLRICKS/MiniMax-H3-Upscaler	6419	8	MiniMaxAI/MiniMax-H3	comfyui,lora	2026-11-26T21:40:28.000Z
+Alissonerdx/TE-PK-Minimax-H3	6198	88		comfyui	2026-11-28T08:27:30.000Z
+MiniMaxAI/MiniMax-H3-Image-PE	6044	120	["Qwen/Qwen3.8-27B"]	base_model:quantized:Qwen/Qwen3.8-27B	2026-11-10T15:16:06.000Z
+hoidhxd/MiniMax-H3-Hybrid-b25-49-GGUF	6021	5	["smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models"]	gguf,comfyui,quantized,base_model:quantized:smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models	2026-08-13T13:19:47.000Z
+HAOOOOOOO51/Minimax_h3_fl2v_lightx2v_turbo_4to8step_v0.1-v1.0_768p_v4_step600_dareties_fro095_pruned	5924	1	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-08-30T15:14:30.000Z
+mradermacher/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-Ref2VA-heretic-GGUF	5850	2	funnygeeker/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-Ref2VA-heretic	gguf,base_model:quantized:funnygeeker/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-Ref2VA-heretic	2026-11-18T09:51:33.000Z
+molbal/MiniMax-H3-Turbo-GGUF	5733	3	MiniMaxAI/MiniMax-H3	gguf,comfyui,turbo,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-13T21:17:48.000Z
+MATLOWAI/MiniMax-H3-Motion-Adapter	5711	50	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-09-22T02:00:25.000Z
+MATLOWAI/minimax-h3-nvfp4	5689	4	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-24T00:58:32.000Z
+sandpies/Wuli-MiniMax-H3-Turbo-ComfyUI	5621	10	MiniMaxAI/MiniMax-H3	comfyui,lora,step-distillation,turbo	2026-10-15T20:02:42.000Z
+brurpo/MiniMax-H3-NVFP4-GGUF	5312	1	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-16T08:48:17.000Z
+Abiray/MiniMax-H3-Turbo-Lora-Pruned-ComfyUI	5249	54	MiniMaxAI/MiniMax-H3	comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-09T07:02:23.000Z
+joeygambino/MiniMax-H3-x-Z-Image-GGUF	5188	41	["MiniMaxAI/MiniMax-H3"]	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-24T08:33:06.000Z
+unsloth/MiniMax-H3	5125	26			2026-08-07T04:38:58.000Z
+JOKER141/MiniMaxH3-GunFu-Gunfight-LORA	5016	25	["MiniMaxAI/MiniMax-H3"]	lora	2026-10-25T16:48:49.000Z
+Raretutor/Qwen3-VL-32B-MiniMax-H3-GGUF	4641	2	Qwen/Qwen3-VL-32B-Instruct	gguf,quantized,base_model:quantized:Qwen/Qwen3-VL-32B-Instruct	2026-09-06T10:06:34.000Z
+pytraveler/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-FL2VA-GGUF	4453	5	lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-FL2VA	gguf,base_model:quantized:lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-FL2VA	2026-11-12T12:53:51.000Z
+MATLOWAI/MiniMax-H3-ORB360-CardSpin	4426	65	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-09-30T03:20:15.000Z
+udero/minimax-h3-turbo-gguf	4358	1	["unsloth/MiniMax-H3-GGUF"]	gguf,turbo,base_model:unsloth/MiniMax-H3-GGUF,base_model:quantized:unsloth/MiniMax-H3-GGUF	2026-11-08T01:40:21.000Z
+speedyrulz/minimax-h3-image-int8-w4a8-hybrid	4256	7	["MiniMaxAI/MiniMax-H3-Image"]	comfyui	2026-11-10T20:07:35.000Z
+lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-FL2VA	4234	6			2026-10-29T15:05:19.000Z
+Iwannapose/minimax_h3_pdmd_2nfe_comfyui	4214	20	MiniMaxAI/MiniMax-H3	distillation,lora,comfyui	2026-09-30T21:50:41.000Z
+PurpleBlazey/Minimax-H3-pruned-GGUF	4043	3	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3","unsloth/Qwen3-VL-32B-Instruct-GGUF"]	gguf,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-22T16:51:14.000Z
+ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit	4012	21	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T04:01:24.000Z
+Beidouqixing/minimax-h3-4step-lora-flashgen	3673	32	MiniMaxAI/MiniMax-H3	lora,distillation	2026-09-22T09:23:38.000Z
+rzgar/minimax_h3_fl2va_fp8_e4m3fn	3665	25	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T06:18:57.000Z
+woodfireind/MiniMax-H3-GGUF-MiniStack	3603	5	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T10:57:06.000Z
+PulpCut/MiniMax-H3-Ref2VA-Turbo-INT8-ConvRot	3587	13	MiniMaxAI/MiniMax-H3	turbo	2026-08-21T11:52:39.000Z
+InstantX/MiniMax-H3-Turbo-Lora-Diffusers	3365	13	MiniMaxAI/MiniMax-H3	lora	2026-08-06T09:16:21.000Z
+DarkRomeo88/MiniMax-H3-turbo-lora-comfyui	3295	11	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-08T09:06:56.000Z
+moe-kill/H3-Turbo-Neat	3101	32	MiniMaxAI/MiniMax-H3	lora	2026-10-24T16:39:12.000Z
+Jojocodex/minimax-h3-wushu-action-lora	3067	71	Comfy-Org/MiniMax-H3	lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-30T00:37:44.000Z
+PulpCut/MiniMax-H3-Turbo-INT8-ConvRot	3053	5	MiniMaxAI/MiniMax-H3	turbo	2026-08-21T11:52:42.000Z
+rzgar/minimax_h3_ref2va_fp8_e4m3fn	2958	5	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-08T05:13:53.000Z
+akatz-ai/MiniMax-H3-Person-Remover-LoRA	2916	101	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-17T23:41:46.000Z
+supermansundies/Minimax-H3-Image-Pose-Transfer-Lora	2784	89	Comfy-Org/MiniMax-H3-Image	lora,template:diffusion-lora,base_model:Comfy-Org/MiniMax-H3-Image,base_model:adapter:Comfy-Org/MiniMax-H3-Image	2026-11-25T06:39:24.000Z
+hoidhxd/MiniMax-H3-x-Z-Image-hybrid-GGUF	2700	5	["hoidhxd/MiniMax-H3-x-Z-Image-hybrid"]	gguf,base_model:quantized:hoidhxd/MiniMax-H3-x-Z-Image-hybrid	2026-08-24T17:41:31.000Z
+berryber09/10Eros-Max-h3-turbo-beta6-pruned-w4a8	2666	3	TenStrip/10Eros-Max	comfyui,quantized,turbo	2026-10-12T13:04:16.000Z
+H3-Tiny/MiniMax-H3-Tiny-17B-FewStep-Ref2VA-v0.1	2633	4	MiniMaxAI/MiniMax-H3		2026-11-22T12:37:00.000Z
+S3ckn11g0r/CROWN-MiniMax-H3-HyperPDMD-HD-3-4Step-LoRA	2609	10	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	lora,turbo,distillation,gguf,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-11-23T16:26:07.000Z
+berryber09/MiniMax-H3-ref2va-fl2va-hybrid-w4a8	2604	14	["MiniMaxAI/MiniMax-H3"]	comfyui,quantized	2026-10-10T18:39:21.000Z
+convertor/minimax-h3-gguf	2594	2	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-11T17:28:34.000Z
+FenomAI/minimax-h3-fused-turbo-int8-convrot	2542	3	["xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI","diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3,base_model:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI,base_model:merge:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	2026-10-07T20:14:00.000Z
+abakanai/Minimax_h3_hybrid	2497	9	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-09T06:16:22.000Z
+Iwannapose/minimax_h3_pdmd_4nfe_comfyui	2494	19	MiniMaxAI/MiniMax-H3	distillation,lora,comfyui	2026-09-30T19:45:44.000Z
+matlod/minimax-h3-turnaround	2487	45	MiniMaxAI/MiniMax-H3	lora	2026-08-08T03:15:04.000Z
+infosave/MiniMax-H3-Turbo-cmf	2476	12	["Comfy-Org/MiniMax-H3","larryvrh/MiniMax-H3-Turbo-Lora"]	quantized,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-11-12T16:47:18.000Z
+yichengup/minimax_h3-tyc-zs05-ltxqnorm-int8-convrot	2431	8	MiniMaxAI/MiniMax-H3	comfyui	2026-11-27T08:40:04.000Z
+rzgar/minimax-h3_ref2va_8Step_motion_enhancer	2419	15	MiniMaxAI/MiniMax-H3	lora,template:diffusion-lora	2026-09-12T03:21:08.000Z
+robertbschuette/MiniMax-H3-Turbo-Lora-ComfyUI	2378	1	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-20T09:04:17.000Z
+indhic-ai/MiniMax_H3-Prompt_Rewriter-8B-LORA-Merged-GGUF	2244	5	["Qwen/Qwen3-VL-8B-Instruct","lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B"]	gguf,lora-merge,base_model:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B,base_model:merge:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B	2026-08-19T16:51:39.000Z
+lovis93/studio-1939-old-animation-lora-minimax-h3	2228	89	MiniMaxAI/MiniMax-H3	lora	2026-08-25T14:40:49.000Z
+pytraveler/MiniMax-H3-Prompt-Rewriter-LoRA-GGUF	2181	26	lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA	gguf,lora,base_model:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA,base_model:adapter:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA	2026-08-18T20:47:58.000Z
+mradermacher/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-FL2VA-heretic-i1-GGUF	2180	3	LeViAtHaN2K/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-FL2VA-heretic	gguf,base_model:quantized:LeViAtHaN2K/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-FL2VA-heretic	2026-11-22T19:18:01.000Z
+drozbay/MiniMax-H3-FastH3-Preview-LoRA	2169	7	FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2	lora,distillation,comfyui	2026-08-23T20:02:01.000Z
+FenomAI/MiniMax-H3_GGUFs	2141	5	Comfy-Org/MiniMax-H3	gguf,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-03T17:23:02.000Z
+OpenVDN/vdn-minimax-h3	2124	364	MiniMaxAI/MiniMax-H3		2026-10-05T04:50:46.000Z
+vladmandic/MiniMax-H3-Turbo-LoRA	2031	7	["MiniMaxAI/MiniMax-H3"]	turbo,lora	2026-09-16T06:24:33.000Z
+H3-Tiny/MiniMax-H3-Tiny-17B-Pruned-FL2VA	2024	9	MiniMaxAI/MiniMax-H3		2026-11-22T12:36:58.000Z
+hjshus/MiniMax-H3	2017	0			2026-08-24T15:20:20.000Z
+Kokosowek/MiniMax-H3-Turbo-Lora-ComfyUI	1968	0	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-04T15:37:59.000Z
+ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit	1956	14	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T04:01:25.000Z
+QrusherZA/H3_Turbo_ComfyUI	1915	45	larryvrh/MiniMax-H3-Turbo-Lora	comfyui,lora,base_model:larryvrh/MiniMax-H3-Turbo-Lora,base_model:adapter:larryvrh/MiniMax-H3-Turbo-Lora	2026-11-17T10:45:41.000Z
+JNcharkey1/MiniMax-H3	1738	0			2026-08-15T06:25:05.000Z
+A1Azmi/MiniMax-H3	1708	0			2026-08-14T05:38:11.000Z
+pytraveler/MiniMax-H3-Prompt-Rewriter-LoRA-Omni-GGUF	1680	9	lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-Omni	gguf,lora,base_model:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-Omni,base_model:adapter:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-Omni	2026-08-26T17:20:38.000Z
+FrankensteinSim/MiniMax-H3	1671	0			2026-08-22T00:52:43.000Z
+Raretutor/MiniMax-H3-Dual-Turbo-Lora-ComfyUI	1634	9	["MiniMaxAI/MiniMax-H3","larryvrh/MiniMax-H3-Turbo-Lora","TaoLiveAIGC/TaoMate-H3","ZhengmingYu/DMAD"]	lora,turbo,comfyui	2026-11-22T08:11:04.000Z
+FenomAI/Minimax-H3-WAN2GP	1599	0		gguf	2026-08-05T14:41:41.000Z
+6block/MiniMax-H3-Qwen3-VL-NVFP4	1543	1	Comfy-Org/MiniMax-H3	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-21T02:47:50.000Z
+Zakyrie/minimax-h3-beauty-clarity-enhancer	1518	4	minimax/h3	lora	2026-11-05T15:40:21.000Z
+jinjiyoshi/MiniMax-H3	1501	0			2026-08-26T19:37:20.000Z
+vasilerosca891/MiniMax-H3	1463	0			2026-08-20T05:28:30.000Z
+misstoyou/MiniMax-H3	1406	0			2026-08-22T07:04:13.000Z
+taurusduan/Pika-H3-Flex-Turbo-LoRA	1338	0	["Pika-Labs/Pika-H3-Flex","lightx2v/Minimax-h3-Turbo","MiniMaxAI/MiniMax-H3","WarmBloodAban/Minimax-h3_Singularity","Iwannapose/minimax_h3_pdmd_2nfe_comfyui"]	turbo,lora,comfyui,base_model:Iwannapose/minimax_h3_pdmd_2nfe_comfyui,base_model:adapter:Iwannapose/minimax_h3_pdmd_2nfe_comfyui	2026-11-04T15:04:27.000Z
+Halpak/MiniMax-H3-Turbo-Lora-ComfyUI	1296	2	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-30T06:11:45.000Z
+on-nurida-mov/My-MiniMax-H3	1290	1	["MiniMaxAI/MiniMax-H3"]	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-15T17:44:36.000Z
+Royalrajat1230/MiniMax-H3	1290	0			2026-08-23T01:23:05.000Z
+Stim748/MiniMax-H3	1277	0			2026-08-14T13:11:03.000Z
+shablyx666/MiniMax-H3	1276	0			2026-08-23T08:13:40.000Z
+Wesley1234/minimax_h3_turbo_4step_10ErosMax_test4_pruned_curveproj1025_T8	1266	1	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-27T16:30:17.000Z
+Wvkmsv/MiniMax-H3	1250	0			2026-08-16T12:04:15.000Z
+kabachuha/ReDiverse-MiniMax-H3-Comfy	1231	15	["ReDiverse/ReDiverse-MiniMax-H3"]	comfyui	2026-11-19T09:55:19.000Z
+myhuggingbb/MiniMax-H3-GGUF	1217	0	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-10T12:07:31.000Z
+Exmanq/MiniMax-H3	1214	0			2026-08-25T10:26:06.000Z
+Lite01385/MiniMax-H3	1141	0			2026-08-14T16:03:21.000Z
+MHWJJ/MiniMax-H3	1137	0			2026-08-15T05:44:02.000Z
+pipenetwork/MiniMax-H3-MLX-8bit	1107	12	MiniMaxAI/MiniMax-H3		2026-08-10T17:55:24.000Z
+SexGod1979/PinkCherry-NSFW_MiniMax-H3	1093	587			2026-10-08T15:04:18.000Z
+pytraveler/MiniMax-H3-Prompt-Rewriter-LoRA-8B-GGUF	1036	3	lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B	gguf,lora,base_model:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B,base_model:adapter:lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B	2026-08-18T21:46:34.000Z
+ulifisherde/MiniMax-H3-Turbo-Lora-Pruned-Fixed	1033	0	MiniMaxAI/MiniMax-H3	turbo,lora,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-09-03T18:54:14.000Z
+CurioSeaLab/Minimax-h3-Turbo	1013	0	["MiniMaxAI/MiniMax-H3"]		2026-09-10T13:54:27.000Z
+tsolful/Minimax_H3_Image_INT6_INT4GPTQ	1007	4	["MiniMaxAI/MiniMax-H3-Image","Comfy-Org/MiniMax-H3-Image"]	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3-Image,base_model:quantized:Comfy-Org/MiniMax-H3-Image	2026-11-10T23:02:36.000Z
+infosave/MiniMax-H3-Tiny-FewStep-cmf	938	4	["H3-Tiny/MiniMax-H3-Tiny-ComfyUI"]	base_model:H3-Tiny/MiniMax-H3-Tiny-ComfyUI,base_model:quantized:H3-Tiny/MiniMax-H3-Tiny-ComfyUI	2026-11-23T10:40:16.000Z
+PulpCut/MiniMax-H3-INT8-ConvRot	919	1	MiniMaxAI/MiniMax-H3		2026-08-21T11:52:45.000Z
+dipjeb/MiniMax-H3-Turbo-LoRA-Pruned	899	2	larryvrh/MiniMax-H3-Turbo-Lora	lora,comfyui,base_model:larryvrh/MiniMax-H3-Turbo-Lora,base_model:adapter:larryvrh/MiniMax-H3-Turbo-Lora	2026-10-03T13:17:57.000Z
+pipenetwork/MiniMax-H3-MLX-bf16	886	12	MiniMaxAI/MiniMax-H3		2026-08-03T17:38:10.000Z
+electroglyph/10Eros_Max_h3_TURBO-hybrid_beta3-GGUF	879	0		gguf	2026-08-29T01:15:39.000Z
+cgc-0521/minimax-h3-fused-turbo-int8-convrot	854	2	["xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI","diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3,base_model:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI,base_model:merge:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	2026-09-18T10:20:51.000Z
+puterijessica/MiniMax-H3	847	0			2026-08-26T12:41:18.000Z
+KENIC-1/Comfy-Org-MiniMax-H3	828	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-06T05:04:19.000Z
+pipenetwork/MiniMax-H3-MLX-4bit	828	7	MiniMaxAI/MiniMax-H3		2026-08-10T17:59:38.000Z
+chfm/minimax-h3-fused-turbo-int8-convrot	788	2	["xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI","diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024","Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3,base_model:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI,base_model:merge:xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI	2026-09-08T08:04:07.000Z
+ausboss/MiniMax-H3-Image-Outpaint-LoRA	784	19	MiniMaxAI/MiniMax-H3-Image	lora,comfyui	2026-11-26T01:22:14.000Z
+burningfeet/MiniMax-H3	779	0			2026-08-13T12:25:41.000Z
+AcademiaSD/MiniMax-H3-NF4	778	3	MiniMaxAI/MiniMax-H3	lora-training,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-01T09:02:06.000Z
+ravibhai1212/MiniMax_H3_int4_W4A8_ConvRot_Pruned	754	1		quantization	2026-08-20T13:22:49.000Z
+OxBee/Pika-H3-Flex-Turbo-LoRA	752	0	["Pika-Labs/Pika-H3-Flex","lightx2v/Minimax-h3-Turbo","MiniMaxAI/MiniMax-H3","WarmBloodAban/Minimax-h3_Singularity","Iwannapose/minimax_h3_pdmd_2nfe_comfyui"]	turbo,lora,comfyui,base_model:Iwannapose/minimax_h3_pdmd_2nfe_comfyui,base_model:adapter:Iwannapose/minimax_h3_pdmd_2nfe_comfyui	2026-11-02T04:56:32.000Z
+chfm/MiniMax-H3_GGUFs	743	2	Comfy-Org/MiniMax-H3	gguf,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-24T02:46:16.000Z
+DARK-MING/MiniMax-H3-Turbo-Lora	716	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-18T18:09:19.000Z
+MarxistLeninist/MiniMax-H3-LowBit-GGUF	716	0	["MiniMaxAI/MiniMax-H3"]	gguf,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-10T20:27:56.000Z
+ModelsLab/MiniMax-H3-Turbo-RL	710	10	["MiniMaxAI/MiniMax-H3","larryvrh/MiniMax-H3-Turbo-Lora"]	lora	2026-11-23T12:53:46.000Z
+ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit	698	0	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-06T20:34:20.000Z
+Smite79/MiniMax-H3-Longvideos	693	141		comfyui,comfyui-nodes	2026-11-27T22:34:54.000Z
+Exmanq/MiniMax-H3-Turbo-Lora	670	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-25T10:26:08.000Z
+Aun1236/MiniMax-H3	655	0			2026-08-21T05:36:23.000Z
+fkyyy/MiniMax-H3-slim	639	0			2026-08-25T07:57:31.000Z
+robertbschuette/MiniMax-H3-Turbo-GGUF	623	0	MiniMaxAI/MiniMax-H3	gguf,comfyui,turbo,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-20T09:06:57.000Z
+sony3021919/MiniMax-H3-Turbo-Lora	609	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-11-18T13:58:00.000Z
+water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8	601	3	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-11T17:57:42.000Z
+ibyteohdear/MiniMax-H3-Pruned-DMD-FL2VA-Turbo-Fused	599	1	multimodalart/MiniMax-H3-Pruned		2026-11-28T02:41:08.000Z
+abhishekchohan/minimax-h3-int8	594	2	["MiniMaxAI/MiniMax-H3"]	quantization,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-09T09:00:57.000Z
+nobodyatalliguess/minimax-h3-loras	554	1		lora	2026-10-09T00:03:14.000Z
+vftfnn/Minimax-h3-Turbo-new	546	1		distillation,lora	2026-10-23T03:06:11.000Z
+LILUMY/MiniMax-H3	522	0			2026-08-18T13:00:54.000Z
+musafa901/MiniMax-H3_20260816	512	1			2026-08-16T07:23:11.000Z
+chfm/MiniMax-H3-Turbo-Lora	507	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-23T12:42:36.000Z
+akhaliq/MiniMax-H3-Image-Fun-Controlnet-Union-2.0	504	22	["MiniMaxAI/MiniMax-H3-Image","alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0"]	controlnet,controlnet-union,base_model:alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0,base_model:merge:alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0	2026-11-19T08:16:35.000Z
+akhaliq/MiniMax-H3-Image-Character-Swap	484	214	["MiniMaxAI/MiniMax-H3-Image","akatz-ai/MiniMax-H3-Character-Swap-LoRA"]	lora-merge,base_model:akatz-ai/MiniMax-H3-Character-Swap-LoRA,base_model:merge:akatz-ai/MiniMax-H3-Character-Swap-LoRA	2026-11-14T21:17:04.000Z
+ReDiverse/ReDiverse-MiniMax-H3	474	42	lightx2v/Minimax-h3-Turbo	lora,distillation,base_model:lightx2v/Minimax-h3-Turbo,base_model:adapter:lightx2v/Minimax-h3-Turbo	2026-11-19T16:57:16.000Z
+iamkaikai/MiniMax-H3-Single-Frame-VAE-500K	471	54	["MiniMaxAI/MiniMax-H3","Mamad8/MiniMax-H3-Image-VAE"]		2026-08-20T04:44:36.000Z
+abhishekchohan/minimax-h3-fp8	470	0	["MiniMaxAI/MiniMax-H3"]	quantization,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-09T09:24:37.000Z
+LeViAtHaN2K/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-Ref2VA-heretic	461	2	lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.8-27B-Ref2VA		2026-11-23T07:31:15.000Z
+helao123/Pika-H3-Flex-Turbo-LoRA	456	1	["Pika-Labs/Pika-H3-Flex","lightx2v/Minimax-h3-Turbo","MiniMaxAI/MiniMax-H3","WarmBloodAban/Minimax-h3_Singularity","Iwannapose/minimax_h3_pdmd_2nfe_comfyui"]	turbo,lora,comfyui,base_model:Iwannapose/minimax_h3_pdmd_2nfe_comfyui,base_model:adapter:Iwannapose/minimax_h3_pdmd_2nfe_comfyui	2026-11-02T08:34:37.000Z
+Derdisirtlan/MiniMax-H3-GGUF	455	0	MiniMaxAI/MiniMax-H3	gguf,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-14T07:46:57.000Z
+EllaPriest45/MinimaxH3_base	435	5		gguf	2026-11-13T00:21:08.000Z
+gabrielrocco/MiniMax-H3-Ref2VA-MLX-Serve-4bit	421	1	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-04T01:50:39.000Z
+musafa901/MiniMax-H3-Comfy_20260816	418	1	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-16T07:26:19.000Z
+lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B	408	51	Qwen/Qwen3-VL-8B-Instruct	lora	2026-08-18T12:17:20.000Z
+treydonovan/Minimax-h3-Turbo	407	1	["MiniMaxAI/MiniMax-H3"]		2026-08-31T04:34:39.000Z
+SexGod1979/AfterMidnight-MiniMax-H3-NSFW	402	230			2026-08-19T03:21:29.000Z
+Ar4ikov/MiniMax-H3-transformer-W4A16-RTN	382	2	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-03T13:43:36.000Z
+Gyvin/MiniMax-H3	353	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-23T06:22:10.000Z
+MATLOWAI/MiniMax-H3-Variable-Clock	340	2	MiniMaxAI/MiniMax-H3	lora	2026-11-26T03:11:08.000Z
+Nhat333765/Minimax-h3-Turbo	338	0		distillation,lora	2026-11-18T18:40:01.000Z
+antocorr/MiniMax-H3-FL2VA-MLX-Serve-2bit-text-encoder	328	4	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-07T11:01:02.000Z
+OzzyGT/MiniMax_H3_sdnq_4bit_pruned	328	3	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-30T01:39:15.000Z
+mimimi2811/MiniMax-H3-Turbo-Lora	324	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-20T13:02:23.000Z
+ostris/minimax_h3_ref2va_jacked_lora	321	12	MiniMaxAI/MiniMax-H3	lora	2026-08-21T13:35:10.000Z
+masafy/minimax-h3-masafy-lora	318	1	["Comfy-Org/MiniMax-H3","MiniMaxAI/MiniMax-H3"]	lora,character-lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-16T14:17:26.000Z
+EllipsesMark/Minimax-h3-Turbo	315	1	["MiniMaxAI/MiniMax-H3"]		2026-09-23T20:46:46.000Z
+musafa901/MiniMax-H3-Comfy_20260820	313	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-19T18:30:42.000Z
+Sawfwair/MiniMax-H3-FL2VA-MLX-4bit	313	3	MiniMaxAI/MiniMax-H3		2026-08-04T08:28:01.000Z
+TechnoBaptist/MiniMax-H3-x-Z-Image-native	309	1	["MiniMaxAI/MiniMax-H3"]	comfyui,comfy-native,comfy-quant	2026-08-24T10:57:57.000Z
+OxBee/MiniMax-H3-ORB360-CardSpin	307	2	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-11-02T04:53:48.000Z
+jialidddh/MiniMax-H3-People-Vehicle-Removal-LoRA	299	15	MiniMaxAI/MiniMax-H3	lora	2026-11-15T09:42:44.000Z
+kentskooking/MiniMax-H3-AnimateDiff-LoRAs	290	7	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-11-23T00:24:15.000Z
+Exmanq/Minimax-h3-Turbo	284	0	["MiniMaxAI/MiniMax-H3"]		2026-08-25T10:26:09.000Z
+shuijiaodawang/Minimax-h3-Turbo	284	1	["MiniMaxAI/MiniMax-H3"]		2026-10-07T10:08:33.000Z
+lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-Omni	273	59	Qwen/Qwen2.5-Omni-7B	lora	2026-08-26T07:51:50.000Z
+terryway246/MiniMax-H3	272	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-10T11:25:20.000Z
+joeygambino/MiniMax-H3-Multishot-Workflow	271	91		comfyui	2026-08-27T21:42:22.000Z
+Assfnjk/MiniMax-H3-Turbo-Lora	266	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-21T09:08:05.000Z
+Kokosowek/MiniMax-H3-Turbo-Lora	256	1	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-10-04T13:44:16.000Z
+comfy-playflock/MiniMax-H3	239	1	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-06T11:07:07.000Z
+pipenetwork/MiniMax-H3-MLX-6bit	236	2	MiniMaxAI/MiniMax-H3		2026-08-10T17:57:41.000Z
+kai2336/Minimax-h3-Turbo	227	0	["MiniMaxAI/MiniMax-H3"]		2026-08-19T06:12:12.000Z
+yuivs/Minimax-H3-nvfp4-INT4-INT8-Convrot	225	0	MiniMaxAI/MiniMax-H3	quantized,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-18T15:32:02.000Z
+Jianqiao1/MiniMax-H3-Image-Lossless-Pruned-ComfyUI	224	2	["MiniMaxAI/MiniMax-H3-Image"]	quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-25T18:40:02.000Z
+gabrielrocco/MiniMax-H3-Ref2VA-MLX-Serve-8bit	217	1	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-04T01:43:43.000Z
+mu1998/MiniMax-H3-Turbo-Lora	217	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-31T14:37:56.000Z
+wangpj/MiniMax-H3_dit_bf16	216	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-18T14:14:02.000Z
+Lei0513abc/MiniMax-H3	206	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-26T12:08:25.000Z
+lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA	198	200	Qwen/Qwen3.6-27B	lora	2026-10-16T06:45:17.000Z
+abenliao/minimax-h3-transformer-mxfp8	192	0		quantized	2026-08-07T21:10:30.000Z
+hik45258/minimax-h3-wushu-action-lora	189	1	Comfy-Org/MiniMax-H3	lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-11-18T02:57:14.000Z
+neonforestmist/Minimax_H3_Monet_Style_LoRA	186	1	MiniMaxAI/MiniMax-H3	lora,style-lora	2026-11-24T16:17:06.000Z
+abenliao/minimax-h3-ref2va-transformer-bf16	185	0			2026-08-09T09:46:43.000Z
+finbase0530/MiniMax-H3-FL2VA-MLX-Serve-8bit	183	0	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-06T11:46:41.000Z
+AIModelMaestro/MiniMax-H3-Image-NVFP4	179	1	["MiniMaxAI/MiniMax-H3-Image"]	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image	2026-11-18T15:38:52.000Z
+CalamitousFelicitousness/MiniMax-H3-SDNQ-cb4-hadamard-dynamic	160	0	MiniMaxAI/MiniMax-H3	quantization,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-09T08:47:38.000Z
+VoidEclipseAI/MiniMax-H3-ReFrame-VideoInpainting-LoRA	157	5	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-11-26T13:21:14.000Z
+sandeshrajx/MiniMax-H3-Prompt-Rewriter-LoRA-gguf	145	1	Qwen/Qwen3.6-27B	gguf,lora	2026-08-07T23:19:41.000Z
+qb1222090/MiniMax-H3	143	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-09T15:54:43.000Z
+diffusers-modular/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024	142	8	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	base_model:Comfy-Org/MiniMax-H3,base_model:merge:Comfy-Org/MiniMax-H3	2026-08-21T11:42:43.000Z
+gigafreeze/MiniMax-H3	142	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-08T06:03:41.000Z
+Sawfwair/MiniMax-H3-FL2VA-MLX-BF16	141	0	MiniMaxAI/MiniMax-H3		2026-08-29T14:37:44.000Z
+pipenetwork/MiniMax-H3-MLX-f32	135	0	MiniMaxAI/MiniMax-H3		2026-08-03T18:20:03.000Z
+r3lax/MiniMax-H3-Turbo-cmf	133	0	["Comfy-Org/MiniMax-H3","larryvrh/MiniMax-H3-Turbo-Lora"]	base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-31T23:47:23.000Z
+KENIC-1/Comfy-Org-MiniMax-H3-loras	132	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-16T15:14:22.000Z
+Sawfwair/MiniMax-H3-Ref2VA-MLX-8bit	131	0	["MiniMaxAI/MiniMax-H3"]		2026-08-10T19:57:09.000Z
+SOLRICKS/3D-Animation-Style-MiniMax-H3	127	58	MiniMaxAI/MiniMax-H3	lora	2026-11-26T21:39:36.000Z
+tsolful/Minimax_H3_W4A8	127	0	["MiniMaxAI/MiniMax-H3"]	comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-19T23:13:14.000Z
+OzzyGT/MiniMax_H3_sdnq_8bit_pruned	122	0	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-30T01:38:32.000Z
+wangpj/MiniMax-H3_fp8	121	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-17T15:35:28.000Z
+Sawfwair/MiniMax-H3-FL2VA-MLX-8bit	120	0	MiniMaxAI/MiniMax-H3		2026-08-29T14:37:47.000Z
+sunnyyy/MiniMax-H3	120	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-06T20:04:35.000Z
+kotoriri/MiniMax-H3	118	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-12T10:06:43.000Z
+abenliao/minimax-h3-ref2va-transformer-mxfp8	115	1			2026-08-09T09:44:27.000Z
+rockerBOO/minimax-h3-nvfp4-fp8	115	1	MiniMaxAI/MiniMax-H3	quantized,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-21T17:19:44.000Z
+prithivMLmods/MiniMax-H3-Image-PE-NVFP4-MTP-Repacked	112	2	["MiniMaxAI/MiniMax-H3-Image-PE"]	base_model:quantized:MiniMaxAI/MiniMax-H3-Image-PE	2026-11-11T00:37:58.000Z
+OzzyGT/MiniMax_H3_sdnq_dynamic_4bit	108	1			2026-08-30T01:39:31.000Z
+solphor/MiniMax-H3-Prompt-Rewriter-LoRA-Q8-GGUF	106	1	["lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA","Qwen/Qwen3.6-27B"]	gguf,lora	2026-08-10T15:42:17.000Z
+EllaPriest45/MinimaxH3_Checkpoints	100	5		gguf	2026-11-13T01:38:12.000Z
+Fanw/MiniMax-H3	98	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-13T09:05:18.000Z
+OzzyGT/MiniMax_H3_sdnq_dynamic_8bit	98	0			2026-08-30T01:39:46.000Z
+Exmanq/minimax-h3-aoti	95	0			2026-08-25T10:26:11.000Z
+rzgar/qwen3-vl-32b-minimax-h3-fp8-comfyui	91	7	["Qwen/Qwen3-VL-32B-Instruct"]	base_model:quantized:Qwen/Qwen3-VL-32B-Instruct	2026-08-11T03:53:41.000Z
+manateelazycat/Pika-H3-Flex-Turbo-Ref2VA-AIPod	80	1		pika-h3-flex-turbo-ref2va	2026-11-19T01:49:33.000Z
+tiny-random/minimax-h3	76	2	["MiniMaxAI/MiniMax-H3"]		2026-10-24T11:09:20.000Z
+sonnybox/MiniMax-H3_experimental	75	0	["MiniMaxAI/MiniMax-H3","lightx2v/Minimax-h3-Turbo"]	lora,comfyui	2026-08-25T08:29:51.000Z
+PedroMarinhoDev/MiniMax-H3-Experimental	73	4	["Comfy-Org/MiniMax-H3","TaoLiveAIGC/TaoMate-H3","Asirus/TaoMate_H3_3_Step_LoRA"]	comfyui,base_model:Asirus/TaoMate_H3_3_Step_LoRA,base_model:finetune:Asirus/TaoMate_H3_3_Step_LoRA	2026-10-28T10:37:46.000Z
+diffusers-internal-dev/tiny-minimax-h3-modular-pipe	70	0			2026-08-01T22:01:17.000Z
+multimodalart/minimax-h3-aoti	54	2			2026-08-16T00:40:57.000Z
+t8star/minimax_h3_ref2va_patchin_hf102	54	2	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-10T04:48:08.000Z
+SexGod1979/PinkFluffyBunny-MiniMax-H3	48	100			2026-08-17T20:23:29.000Z
+zzzDDs/MiniMax-H3_experimental	47	0	["MiniMaxAI/MiniMax-H3","lightx2v/Minimax-h3-Turbo"]	lora,comfyui	2026-08-26T02:04:30.000Z
+SimpleTuner/minimaxh3-suno-reggae-rank128	45	0	MiniMaxAI/MiniMax-H3	lora,template:sd-lora	2026-08-16T19:57:17.000Z
+AXERA-TECH/MiniMax-H3-Image-AX8860	44	1			2026-11-25T09:16:17.000Z
+TechnoBaptist/MiniMax-H3-Fun-Controlnet-Union	44	0		controlnet	2026-08-24T15:02:44.000Z
+Makdiz/minimax-h3-aoti	42	1			2026-11-23T16:32:37.000Z
+yujiepan/minimax-h3-tiny-random	39	1	["MiniMaxAI/MiniMax-H3"]		2026-10-24T11:25:27.000Z
+WaveCut/MiniMax-H3-OrbitQuant-W4A4	36	3	MiniMaxAI/MiniMax-H3	orbitquant,comfyui	2026-10-02T02:22:37.000Z
+Momoking/Minimax-h3-Turbo	35	1	["MiniMaxAI/MiniMax-H3"]		2026-08-08T18:35:55.000Z
+radarer168/MinimaxH3_base	33	0		gguf	2026-08-06T23:58:45.000Z
+LaDruid/MiniMax-H3-Multishot-Workflow	32	16		comfyui	2026-09-19T20:29:07.000Z
+strangevil/MiniMax-H3	24	0			2026-08-14T14:48:56.000Z
+MJlohfg/MiniMax-H3	22	0			2026-08-09T09:38:56.000Z
+pottokao/MiniMax-H3-FL2VA-turbo-4step-v1.2-768p-NVFP4-SVDQuant-vLLM-Omni	21	0		turbo,distilled,svdquant	2026-09-05T13:57:29.000Z
+Zain0611/MiniMax-H3	20	0			2026-08-11T04:59:25.000Z
+Athena1433/MiniMax-H3	17	0			2026-08-04T15:56:40.000Z
+gubernac/MiniMax-H3	17	0			2026-08-04T21:46:40.000Z
+Momoking/MiniMax-H3-Prompt-Rewriter-LoRA	17	0	Qwen/Qwen3.6-27B	lora	2026-08-08T18:36:09.000Z
+vs4vijay/MiniMax-H3	17	0			2026-08-12T20:19:27.000Z
+Terminus404/MiniMax-H3	16	0			2026-08-05T12:48:22.000Z
+QVQsdaa/MiniMax-H3	15	0			2026-08-09T19:56:42.000Z
+Drakonff1/MiniMax-H3-Turbo-Lora-ComfyUI	14	1	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-09-07T19:38:28.000Z
+kg1965/MiniMax-H3	14	0			2026-08-09T04:19:57.000Z
+nahxa/MiniMax-H3	14	0			2026-08-10T10:17:47.000Z
+radarer168/MinimaxH3_Checkpoints	14	0		gguf	2026-08-06T23:59:23.000Z
+Vayden/MiniMax-H3-MLX-q8-extended-paged	14	1	MiniMaxAI/MiniMax-H3	comfyui,quantized	2026-08-08T17:21:43.000Z
+hvcgvvgg7/MiniMax-H3	13	0			2026-08-08T16:39:42.000Z
+Inkdhostile/MiniMax-H3	13	1			2026-08-04T15:59:19.000Z
+DeepDive404-2/MiniMax-H3	12	0			2026-08-10T14:04:58.000Z
+erueye/PinkFluffyBunny-MiniMax-H3	12	1			2026-08-10T06:35:26.000Z
+ghjk654/PinkCherry_MiniMax-H3	12	0			2026-08-11T04:17:09.000Z
+kingsoul0018/MiniMax-H3	12	0			2026-08-07T02:32:46.000Z
+rayrickypp/MiniMax-H3	12	0			2026-08-05T19:06:48.000Z
+Xxjbn/MiniMax-H3	12	0			2026-08-07T05:25:44.000Z
+abenliao/minimax-h3-conditioner-fp8	11	0		quantized	2026-08-07T20:00:12.000Z
+abenliao/minimax-h3-conditioner-fp8-stock	11	0			2026-08-09T09:54:07.000Z
+ovedrive/MiniMax-H3-generator-bf16	11	0	MiniMaxAI/MiniMax-H3		2026-08-04T00:54:32.000Z
+Xdp99/MiniMax-H3	11	1			2026-08-09T19:54:34.000Z
+alituvalu/MiniMax-H3	10	0			2026-08-07T21:06:06.000Z
+AnnaRa/MiniMax-H3	10	0			2026-08-12T18:38:49.000Z
+Elitetotem/MiniMax-H3	10	0			2026-08-12T08:14:56.000Z
+johnsonhuggingapi/MiniMax-H3	10	0			2026-08-09T07:14:34.000Z
+paulcoronel/MiniMax-H3	10	0			2026-08-03T16:19:11.000Z
+qqceqqq/MiniMax-H3	10	0			2026-08-05T08:27:29.000Z
+Simplismart/MiniMax-H3	10	0			2026-08-03T06:11:23.000Z
+yemsrach3723/MiniMax-H3-new	10	0			2026-08-05T08:55:01.000Z
+anlessparky/MiniMax-H3	9	0			2026-08-10T16:15:53.000Z
+liskasYR/MiniMax-H3	9	0			2026-08-11T13:07:21.000Z
+noctuashap/MiniMax-H3-pruned-r16	9	1	MiniMaxAI/MiniMax-H3		2026-08-06T09:53:42.000Z
+Obong128/MiniMax-H3	9	0			2026-08-06T06:36:45.000Z
+ZIYOU99/MiniMax-H3	9	0			2026-08-08T02:21:13.000Z
+astonzhang/MiniMax-H3	8	0			2026-08-11T06:37:15.000Z
+chiharoong/MiniMax-H3	8	0			2026-08-08T00:23:10.000Z
+greenslime/MiniMax-H3	8	0			2026-08-03T23:35:26.000Z
+Jeet070/PinkCherry_MiniMax-H3	8	0			2026-08-19T07:51:27.000Z
+wo1808401/MiniMax-H3	8	0			2026-08-12T22:22:06.000Z
+Yi30/minimax_h3_mxfp8_packed_pretrained	8	0			2026-08-12T08:25:11.000Z
+damiang/minimax-h3-ref2va-runpod	7	0			2026-08-11T02:24:50.000Z
+laoK888/MiniMax-H3	7	0			2026-08-08T08:15:38.000Z
+marchkamal51/MiniMax-H3	7	0			2026-08-06T16:10:52.000Z
+romonlyme/PinkCherry_MiniMax-H3	7	0			2026-08-13T16:07:13.000Z
+Asirus/MiniMax-H3-Ref2VA-NEXORA	6	9	Comfy-Org/MiniMax-H3	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-21T18:02:39.000Z
+maplewoohoooyeah/MiniMax-H3	6	0			2026-08-06T10:12:56.000Z
+LinYunPRO/MiniMax-H3	4	0			2026-08-03T15:19:17.000Z
+thanyathon/MiniMax-H3	4	0			2026-08-03T10:37:09.000Z
+0v0o0w0/MinimaxH3_Actions	0	2			2026-08-21T15:44:29.000Z
+1dk123456/PinkCherry_MiniMax-H3	0	0			2026-08-08T15:16:12.000Z
+727dcdxd/minimax-h3	0	0			2026-08-03T08:39:30.000Z
+7FSxDjZMUR/gogo-meme-minimax-h3-comfy-bundle	0	2	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-05T13:28:12.000Z
+AbstractFramework/minimax-h3-4bit	0	1	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-23T18:18:09.000Z
+AbstractFramework/minimax-h3-8bit	0	3	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-11-23T18:18:05.000Z
+acckpoot/MiniMax-H3	0	1		comfyui	2026-08-04T09:05:32.000Z
+adehong/minimax-h3-ntt-lora	0	1			2026-08-25T08:04:49.000Z
+adilkoray/minimax-h3-runpod-cache-lite	0	0			2026-08-23T20:37:11.000Z
+AiNinja94/MiniMax-H3	0	85			2026-11-26T19:03:22.000Z
+Alberto454/MiniMax-H3-Turbo-Lora-ComfyUI	0	1	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-11T12:57:20.000Z
+Alex995647/loras-minimax-h3	0	28	MiniMaxAI/MiniMax-H3	lora	2026-11-05T07:17:45.000Z
+Alissonerdx/MiniMax-H3-Single-Frame-VAE-500K-Comfy	0	14			2026-08-20T14:51:35.000Z
+Alissonerdx/Qwen3.5-9B-Minimax-H3	0	32		comfyui,lora	2026-11-25T18:54:56.000Z
+Allen987/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4	0	1	ethanfel/Qwen3-VL-32B-Ultra-Heretic-MiniMax-H3-ComfyUI-INT8-ConvRot	comfyui,base_model:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot,base_model:quantized:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot	2026-09-07T13:10:01.000Z
+alpaguyavuz/minimax-h3-l40s	0	0			2026-08-05T20:33:12.000Z
+amirjan122222/MiniMax-H3-Turbo-Lora	0	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-07T22:04:38.000Z
+angelarose210/Block-split_turbo_LoRA_MiniMax_H3_hybrid_blocks_25-49_only	0	1	["MiniMaxAI/MiniMax-H3"]		2026-10-22T11:33:24.000Z
+anlessparky/minimax-h3-aoti	0	0			2026-08-10T04:26:05.000Z
+appautomaton/minimax-h3-base-8bit-mlx	0	4	MiniMaxAI/MiniMax-H3	quantized	2026-08-14T21:25:46.000Z
+aria220/MiniMax-H3-experimental	0	0			2026-08-08T12:13:40.000Z
+asadkhan89/Minimax-h3-Turbo-SLA	0	1	["MiniMaxAI/MiniMax-H3"]	lora,distillation	2026-09-07T17:49:37.000Z
+audenvenn/h3metal-z-image-turbo	0	0	Tongyi-MAI/Z-Image-Turbo	z-image-turbo,base_model:Tongyi-MAI/Z-Image-Turbo,base_model:quantized:Tongyi-MAI/Z-Image-Turbo	2026-11-13T06:32:48.000Z
+BennyDaBall/MiniMax-H3-Workflows	0	4		comfyui,turbo,lora	2026-11-23T18:43:49.000Z
+BobMcoy/Minimax-H3-Temporal-Latent-Upscaler	0	1			2026-11-24T09:54:29.000Z
+Bolt-367/minimax-h3-serverless	0	2			2026-11-20T12:08:43.000Z
+boricuapab/Minimax-h3_Singularity_ref2va_v2_pruned_w6a8	0	1			2026-11-23T06:03:59.000Z
+Buonomo/MiniMax-H3-Slim	0	0			2026-08-15T23:18:44.000Z
+cgg507/MiniMax-H3-FP8-TP4	0	1	MiniMaxAI/MiniMax-H3		2026-11-22T11:14:28.000Z
+chdp207/minimax_h3_ref2va_LightX2V4step_Mystic05_NDE05mlp_W4A8_EdgeFP8	0	2			2026-11-28T00:14:19.000Z
+chfm/redcraft-minimax-h3	0	1			2026-09-08T07:29:14.000Z
+cicalooo/Minimax-H3-INT8-converts	0	1	["MiniMaxAI/MiniMax-H3"]	comfyui,quantized	2026-08-06T14:30:08.000Z
+circlestone-labs/MiniMax-H3-Image-Undistill-Lora	0	5			2026-11-19T00:37:18.000Z
+cjab05/MiniMaxH3Lora	0	0			2026-11-02T05:08:52.000Z
+clayshoaf/minimax-h3-runpod	0	0			2026-08-22T19:49:05.000Z
+ComfyCloudModel/MinimaxH3-Loras	0	5			2026-09-17T06:48:40.000Z
+cusiman/MiniMax-H3	0	0		comfyui	2026-08-03T14:37:53.000Z
+Cybronya/minimax-h3-toolkit	0	1			2026-09-28T18:34:13.000Z
+dadix4e/minimax_h3_turbo_lora_rank256_needs_training	0	0		lora,turbo	2026-08-10T19:35:19.000Z
+dani444444el/MiniMax-H3-ComfyUI-Slim	0	0			2026-08-20T14:11:05.000Z
+darksidewalker/MiniMaxH3	0	19		comfyui,comfy-kitchen	2026-11-14T13:10:10.000Z
+DBPEnAhTR8r/PinkCherry_MiniMax-H3	0	0			2026-08-08T23:51:29.000Z
+dci05049/h3-minimax	0	0			2026-09-26T04:05:25.000Z
+deAPI-ai/minimax-h3-33b-int8	0	2			2026-09-08T13:39:05.000Z
+DearAzrael/PinkCherry_MiniMax-H3	0	0			2026-08-06T08:28:52.000Z
+demlog/minimax-h3-ref2va-worker	0	0			2026-08-05T19:19:21.000Z
+DIE2025/MiniMaxH3Loras	0	1			2026-08-11T09:26:35.000Z
+DiffSynth-Studio/MiniMax-H3-LoRA-LineartAnime	0	20			2026-08-14T09:54:05.000Z
+DiffSynth-Studio/MiniMax-H3-NF4	0	15			2026-08-14T08:08:23.000Z
+DiffSynth-Studio/MiniMax-H3-Text-Embeddings	0	7			2026-08-14T08:00:09.000Z
+diffusers-modular/minimax-h3-inpainting	0	19	MiniMaxAI/MiniMax-H3		2026-10-07T10:08:44.000Z
+dimitarx/MiniMax-H3-fp8	0	1	["MiniMaxAI/MiniMax-H3"]		2026-08-03T12:07:08.000Z
+disguisequence/ClipProj-MiniMax-H3	0	0	["Comfy-Org/MiniMax-H3","Qwen/Qwen3-VL-4B-Instruct"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-09T15:26:56.000Z
+disguisequence/MiniMax-H3-10Eros-Max-Quants	0	3	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-05T13:30:11.000Z
+disguisequence/PinkCherry_MiniMax-H3	0	1			2026-08-08T04:08:35.000Z
+djessica/minimax-h3-aoti	0	0			2026-08-08T03:32:53.000Z
+DmitryDB/MiniMax-H3-10Eros-Max-DT-sQKV	0	5	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-05T11:54:20.000Z
+DmitryDB/MiniMax-H3-10Eros-Max-Quants	0	27	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-05T11:53:23.000Z
+DmitryDB/MiniMax-H3-ComfyUI-Quants	0	39	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-05T20:45:37.000Z
+DmitryDB/MiniMax-H3-DynTime-sQKV	0	9	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-04T20:55:39.000Z
+dotexec/MiniMax-H3-T2V-NVFP4	0	17	Comfy-Org/MiniMax-H3	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3,base_model:quantized:Comfy-Org/MiniMax-H3	2026-08-03T20:18:26.000Z
+dreamkrate/Minimax-H3-Hybrid-BF16-Pruned	0	5	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-21T14:57:59.000Z
+drowzeys/keys-2k-MiniMax-H3-Parallel-Two-DGX-Sparks	0	2		comfyui	2026-08-13T22:33:38.000Z
+drowzeys/keys-heretic-MiniMax-H3-sol-engine-more-DGX-Spark-weights	0	0	["Comfy-Org/MiniMax-H3","ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-05T22:30:18.000Z
+dully3865/Minimax_H3_seamless_anime_VAE	0	3	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-31T03:15:00.000Z
+EllaPriest45/MinimaxH3_Actions	0	85			2026-11-27T22:38:13.000Z
+EllaPriest45/MinimaxH3_Characters	0	5			2026-10-30T16:47:05.000Z
+EllaPriest45/MinimaxH3_Styles	0	26			2026-11-07T20:59:00.000Z
+endman100/MiniMax-H3-FL2VA-FP8	0	1	MiniMaxAI/MiniMax-H3	comfyui	2026-08-03T12:13:10.000Z
+endman100/MiniMax-H3-Ref2VA-FP8	0	2	MiniMaxAI/MiniMax-H3	comfyui	2026-08-03T09:40:19.000Z
+ethanfel/MiniMax-H3-Pruned-Ref2VA-Delta-LoRAs-Experimental	0	16	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	comfyui,lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-11T19:31:00.000Z
+f5aiteam/Minimax-H3	0	0			2026-08-20T10:46:54.000Z
+feizhai123/MiniMax-H3-ModelOpt-Mixed9-Dynamic-FP8	0	0	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-10T08:59:01.000Z
+felipesztutman/MiniMax-H3-W4A4	0	1	MiniMaxAI/MiniMax-H3	quantization,svdquant	2026-10-10T00:16:01.000Z
+FenomAI/MiniMax-H3	0	5	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-03T15:39:10.000Z
+FX-FeiHou/MiniMax-H3-Remix	0	42	["MiniMax-H3"]	comfyui	2026-11-06T00:37:13.000Z
+GingerLabsPlatform/MiniMax-H3-D10000-T2V-Runtime	0	0			2026-08-23T04:43:56.000Z
+GingerLabsPlatform/MiniMax-H3-Voice-Preprocessor-Runtime	0	0			2026-08-22T17:27:53.000Z
+GJuarez67/MiniMax-H3-Fun-Controlnet-Union-Demo	0	0		controlnet	2026-08-24T17:46:41.000Z
+Gluttony10/MiniMax-H3-INT8-CONVROT	0	23	MiniMaxAI/MiniMax-H3	comfyui	2026-08-19T08:00:14.000Z
+greenslime/MiniMax-H3-Turbo-Lora-ComfyUI	0	0	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-06T14:46:54.000Z
+h35656566/MiniMax-H3	0	2		comfyui	2026-08-03T03:27:11.000Z
+hainan88/minimax-h3-demo	0	1			2026-08-20T03:32:17.000Z
+HardGravy2/Minimax_H3_FLF_HardGravy_6_Step_Turbo_Merge	0	14		comfyui	2026-09-08T22:01:02.000Z
+harsh171104/MiniMax-H3-FP8	0	0			2026-08-03T08:07:37.000Z
+hoidhxd/MiniMax-H3-x-Z-Image-bf16	0	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-24T17:27:26.000Z
+hollyw12xw3f/PinkCherry_MiniMax-H3	0	0			2026-08-08T13:52:10.000Z
+iamgroot1212/minimax-h3-loras	0	14			2026-11-24T19:43:39.000Z
+ibyteohdear/h3-turbo-diffusers	0	0			2026-11-26T08:24:23.000Z
+illusion-of-life/style-max-minimax-h3-fl2va	0	0			2026-08-14T08:45:25.000Z
+inflected111/MiniMax-H3-Turbo-Lora	0	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-08T02:53:00.000Z
+Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime	0	87	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-11T06:50:14.000Z
+Ivan12191812/MiniMax-H3	0	0			2026-08-12T04:40:11.000Z
+JahJedi/MiniMax-H3-Character-Sheet	0	39		comfyui	2026-08-11T00:16:39.000Z
+JahJedi/MiniMax-H3-QJ-Riverfield-Workflow	0	1			2026-08-07T01:30:17.000Z
+jasperz111/redcraft-minimax-h3	0	4			2026-08-17T14:33:16.000Z
+javawock7618/comfy-MiniMax-H3-workflows	0	178		comfyui,controlnet,controlnet-union,pika-h3-flex-turbo-lora,turbo-lora,quantization	2026-11-26T11:07:16.000Z
+jekverse/minimax-h3-aoti	0	0			2026-08-19T07:05:27.000Z
+joeranger789/MinimaXH3All	0	0			2026-08-17T03:05:12.000Z
+joeygambino/MiniMax-H3-HardMode-Workflow	0	5	MiniMaxAI/MiniMax-H3	comfyui	2026-08-07T20:14:03.000Z
+joeygambino/MiniMax-H3-ZSpatial-native	0	0			2026-08-24T08:27:59.000Z
+JOKER141/MiniMax-H3-General-Motion-Continuity-Repair	0	123	["MiniMaxAI/MiniMax-H3"]	lora	2026-10-25T16:47:17.000Z
+joyfox/MiniMax-H3-Turbo	0	68	["Comfy-Org/MiniMax-H3"]	comfyui,lora,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-12T05:49:10.000Z
+K3NK/MiniMax_H3	0	0			2026-08-18T08:58:13.000Z
+kaiw7/Kai-JAV-MiniMax-H3	0	0			2026-08-19T19:41:49.000Z
+Kerochake/MiniMax-H3-10Eros-Max-DT-sQKV	0	1	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-08-06T03:30:18.000Z
+khaduyen1993/minimax-h3	0	0			2026-08-07T23:18:28.000Z
+Kijai/MiniMax-H3_comfy	0	558			2026-11-21T11:58:34.000Z
+Kijai/MiniMax-H3-experimental	0	721			2026-11-24T07:43:09.000Z
+Kijai/MiniMax-H3-TAE	0	218			2026-11-15T12:08:14.000Z
+lasdkjf/MiniMax-H3-Turbo-Lora	0	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-11T05:59:23.000Z
+lessxc/PinkCherry_MiniMax-H3-backup	0	0			2026-08-08T05:46:28.000Z
+liewge/MinimaxH3-GGUF-Quant	0	0			2026-08-03T04:56:12.000Z
+lightx2v/Minimax-h3-Turbo-SLA	0	114	["MiniMaxAI/MiniMax-H3"]	lora,distillation	2026-10-16T06:09:54.000Z
+lihaoyun6/MiniMax-H3-Ref-Patch	0	9	["Comfy-Org/MiniMax-H3"]	base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-12T14:28:34.000Z
+lilcheaty/MiniMax-H3-NVFP4	0	165	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-05T08:26:50.000Z
+linjian257/qwen3vl_32b_minimax_h3_int8_convrot_uncensored-by-linjian257	0	64	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	comfyui,quantized,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-05T14:43:37.000Z
+LIQI5134/minimax-h3-t2v	0	0			2026-10-28T19:03:08.000Z
+liran12345/h3-turbo-diffusion	0	0	MiniMaxAI/MiniMax-H3	turbodiffusion	2026-11-03T09:48:05.000Z
+MachineDelusions/Minimax-H3-LoRas	0	1			2026-08-17T00:31:53.000Z
+malcolmrey/minimaxh3	0	69			2026-10-18T09:33:14.000Z
+Mamad8/MiniMaxH3_R2V-PDD-Turbo-LoRA-Mamad8	0	14			2026-08-07T02:18:24.000Z
+manateelazycat/Pika-H3-Flex-Turbo-LoRA-AIPod	0	2			2026-11-25T09:20:51.000Z
+MarxistLeninist/MiniMax-H3-IQ1_M-GGUF	0	0			2026-08-10T05:07:20.000Z
+mhnakif/minimax_h3	0	2			2026-11-13T05:45:15.000Z
+mid2/MiniMax-H3-mirrors	0	0			2026-08-05T09:52:10.000Z
+MidFR-CAI/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA_w4a8_convrot	0	5	lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA	quantized,comfyui,base_model:quantized:lightx2v/MiniMax-H3-Prompt-Rewriter-Qwen3.5-9B-Ref2VA	2026-11-12T17:01:39.000Z
+minguri98/minimaxh3	0	0			2026-11-22T19:11:26.000Z
+ModelsLab/MiniMax-H3-ref2va-NVFP4	0	7	MiniMaxAI/MiniMax-H3	comfyui,quantized	2026-08-04T03:53:53.000Z
+ModelsLab/MiniMax-H3-svdquant-int4_r32	0	1	MiniMaxAI/MiniMax-H3	svdquant,quantized	2026-08-19T11:42:17.000Z
+ModelsLab/MiniMax-H3-svdquant-nvfp4_r32	0	1	MiniMaxAI/MiniMax-H3	svdquant,quantized	2026-08-19T11:26:09.000Z
+Momoking/MiniMax-H3_comfy	0	0			2026-08-08T17:45:17.000Z
+Momoking/MiniMax-H3-experimental	0	0			2026-08-08T17:27:39.000Z
+Momoking/MiniMax-H3-TAE	0	0			2026-08-08T17:46:29.000Z
+Momoking/MiniMax-H3-Turbo-Lora-ComfyUI	0	6	Comfy-Org/MiniMax-H3	lora,comfyui,turbo,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-08T18:31:53.000Z
+Momoking/PinkCherry_MiniMax-H3	0	2			2026-08-08T16:54:24.000Z
+Momoking/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4	0	406	ethanfel/Qwen3-VL-32B-Ultra-Heretic-MiniMax-H3-ComfyUI-INT8-ConvRot	comfyui,base_model:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot,base_model:quantized:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot	2026-08-07T16:42:59.000Z
+mrdarkbr/minimax-h3-models-backup	0	0			2026-08-21T19:39:28.000Z
+MrMofer/MiniMax-H3-MLX-8bit	0	2	MiniMaxAI/MiniMax-H3		2026-08-20T03:26:04.000Z
+ms13d/Minimax-h3-Singularity-TURBO	0	3			2026-11-08T11:28:54.000Z
+mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA	0	94	["MiniMaxAI/MiniMax-H3"]	lora	2026-08-20T16:32:37.000Z
+naiwen888/MiniMax-H3-NVFP4	0	0	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-13T13:52:35.000Z
+nanguoyu/MiniMax-H3-minirun	0	0	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-09-12T06:50:18.000Z
+natalie5/MiniMax-H3-INT8-CONVROT	0	3			2026-08-03T05:03:32.000Z
+NaukNauk/minimax-h3-turbo-fl2va-merged	0	0	["MiniMaxAI/MiniMax-H3"]	lora	2026-08-18T15:43:29.000Z
+NaukNauk/minimax-h3-turbo-merged	0	0			2026-08-17T14:05:38.000Z
+NaukNauk/minimax-h3-turbo-ref2va-merged	0	0	["MiniMaxAI/MiniMax-H3","lightx2v/Minimax-h3-Turbo"]	lora	2026-09-04T19:22:17.000Z
+NazGulation/comfyui_model_minimaxH3	0	0			2026-10-03T14:18:51.000Z
+nDman/MiniMax-H3	0	1		comfyui	2026-08-03T12:25:55.000Z
+nemusugikenshin/MiniMax-H3Test	0	0			2026-09-07T15:26:03.000Z
+NeuralDreamer/h3ErosMax_beta5_turbo_lora	0	17			2026-09-14T08:39:13.000Z
+NicoLab28/ClipProj-MiniMax-H3	0	193	["Comfy-Org/MiniMax-H3","Qwen/Qwen3-VL-4B-Instruct"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-16T14:55:46.000Z
+nikdevs/minimax-h3-fl2va	0	0			2026-08-12T11:32:20.000Z
+nikdevs/minimax-h3-loras	0	6			2026-08-21T15:54:05.000Z
+nikdevs/minimax-h3-ref2va	0	0			2026-08-12T11:34:24.000Z
+nynxz/MiniMax-H3-Experiments	0	7	MiniMaxAI/MiniMax-H3	quantization,comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-15T06:41:59.000Z
+OliviaRossi/Minimax-H3-Sulphur3-10Erosmax-Merge	0	60	["MiniMaxAI/MiniMax-H3","SulphurAI/Sulphur-3","TenStrip/10Eros-Max"]	comfyui	2026-11-22T16:27:30.000Z
+OliviaRossi/Minimax-H3-Sulphur3-10Erosmax-SingularityV2-TriPrism	0	33	["MiniMaxAI/MiniMax-H3","SulphurAI/Sulphur-3","TenStrip/10Eros-Max","WarmBloodAban/Minimax-h3_Singularity"]	comfyui	2026-11-24T13:37:39.000Z
+OliviaRossi/Minimax-H3-Sulphur3-10Erosmax-SingularityV2-TriPrism-TurboFusion	0	138	["MiniMaxAI/MiniMax-H3","SulphurAI/Sulphur-3","TenStrip/10Eros-Max","WarmBloodAban/Minimax-h3_Singularity"]	comfyui	2026-11-25T17:00:04.000Z
+orangesouth/MinimaxH3CinematicRealism	0	15			2026-08-31T03:21:19.000Z
+OREDDoug18792/Minimax-H3-fl2va-ref2va-hybrid-models	0	2	["MiniMax-H3-fl2va","MiniMax-H3-ref2va"]		2026-08-19T15:37:45.000Z
+ostris/minimax_h3_training_adapter	0	34			2026-11-10T19:46:00.000Z
+OTMFLY/Qwen3-VL-32B-Ultra-Heretic-MiniMax-H3-ComfyUI-INT8-ConvRot	0	28	["llmfan46/Qwen3-VL-32B-Instruct-ultra-uncensored-heretic"]	comfyui,quantized	2026-08-04T04:02:02.000Z
+OxBee/MiniMax-H3-INT8-CONVROT	0	0			2026-08-03T04:00:27.000Z
+Plaguekind/Minimax-H3	0	98	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-08T14:23:03.000Z
+Playtime-AI/Minimax_H3-Jennifer_Connelly	0	14			2026-08-25T11:51:44.000Z
+Playtime-AI/Minimax_H3-Margot_Robbie	0	24			2026-08-26T13:20:18.000Z
+Playtime-AI/Minimax_H3-Mila_Kunis	0	9			2026-08-22T13:24:22.000Z
+Playtime-AI/Minimax_H3-Salma_Hayek	0	11			2026-08-24T21:08:31.000Z
+Playtime-AI/Minimax-H3_Showcase	0	7			2026-08-11T21:42:37.000Z
+Playtime-AI/Minimax_H3-Sydney_Sweeney	0	128			2026-08-24T19:18:00.000Z
+pocis/MiniMax-H3-Video-PixelHead	0	2	["Comfy-Org/MiniMax-H3"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-26T10:19:54.000Z
+pottokao/MiniMax-H3-FastH3-NVFP4-rotated	0	6	MiniMaxAI/MiniMax-H3	comfyui,quantization	2026-09-21T02:28:30.000Z
+pottokao/MiniMax-H3-FL2VA-turbo-4step-v1.2-768p-NVFP4-rotated-T1	0	1		comfyui,turbo,distilled	2026-09-21T02:28:35.000Z
+PRISSETIK/Minimax-H3-Sulphur3-Singularity13-Merge	0	3	["SulphurAI/Sulphur-3","WarmBloodAban/Minimax-h3_Singularity","Comfy-Org/MiniMax-H3"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-25T07:54:03.000Z
+QrusherZA/MiniMax-H3-Workflow	0	2			2026-08-13T07:29:17.000Z
+quifox/H3-Turbo-Runtime	0	1	["MiniMaxAI/MiniMax-H3","lightx2v/Minimax-h3-Turbo"]	comfyui,turbo	2026-11-22T14:50:51.000Z
+rAVEUK/MiniMax-H3-Turbo	0	0	["MiniMaxAI/MiniMax-H3"]	turbo,comfyui	2026-10-18T18:26:08.000Z
+Rb227715/PinkCherry_MiniMax-H3	0	0			2026-08-09T04:44:29.000Z
+rb93452/MiniMaxAI.MiniMax-H3-Turbo-Lora	0	0			2026-08-15T02:51:50.000Z
+rehan-fal/minimax-h3-360-equirect-lora	0	24	MiniMaxAI/MiniMax-H3	lora	2026-09-30T06:01:01.000Z
+reverentelusarca/minimax-h3-comfyui-workflows	0	4			2026-08-08T22:05:02.000Z
+Rudra-ai/MiniMax-H3	0	0		comfyui	2026-09-09T19:05:55.000Z
+Rudra-ai/MiniMax-H3-NF4	0	3	["MiniMaxAI/MiniMax-H3"]	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-06T07:18:22.000Z
+RuneXX/Minimax-H3-Workflows	0	36		comfy,comfyui	2026-08-28T08:09:35.000Z
+RunningHubAI/MiniMax-H3-INT8-CONVROT	0	3	MiniMaxAI/MiniMax-H3	comfyui	2026-08-21T10:09:07.000Z
+RunningHubAI/rh-10eros-max-h3-turbo-hybrid-beta3-int8-convrot-unet	0	0		comfyui	2026-09-29T03:28:03.000Z
+RunningHubAI/rh-10eros-max-h3-turbo-hybrid-beta4-int8-convrot-unet	0	0			2026-11-05T06:53:28.000Z
+RunningHubAI/rh-crown-hyperpdmd-hd-3-4-minimax-h3-turbo-lora	0	0			2026-11-27T09:42:00.000Z
+RunningHubAI/rh-crown-hyperpdmd-hd-3-4-step-all-in-one-turbo-de-quantization-minimax-h3-lora	0	0			2026-11-24T03:03:03.000Z
+RunningHubAI/rh-larryvrh-minimax-h3-turbo-lora-4ema-lora	0	0		comfyui,lora	2026-10-17T13:26:01.000Z
+RunningHubAI/rh-minimax-h3-4step-turbo-v4-pass1-lora	0	0			2026-11-07T10:34:09.000Z
+RunningHubAI/rh-minimax-h3-4step-turbo-v4-pass2-lora	0	0		comfyui,lora	2026-09-30T19:38:06.000Z
+RunningHubAI/rh-minimax-h3-dmd-8step-turbo.safetensors-lora	0	1			2026-11-27T19:41:09.000Z
+RunningHubAI/rh-minimax-h3-dmd-fl2va-8step-turbo-pruned.safetensors-lora	0	1		comfyui,lora	2026-09-24T13:38:02.000Z
+RunningHubAI/rh-minimax-h3-dmd-ref2va-8step-turbo-pruned.safetensors-lora	0	6		comfyui,lora	2026-09-28T13:15:02.000Z
+RunningHubAI/rh-minimax-h3-fl2va-bf16-turbo-multistep-fro099-r144-pruned.safetensors-lora	0	1		comfyui,lora	2026-09-29T09:08:01.000Z
+RunningHubAI/rh-minimax-h3-fl2v-lightx2v-turbo-4step-v0.1-comfy-resized-avg-rank-21-bf16.safetensors-lora	0	2		comfyui,lora	2026-09-21T02:30:05.000Z
+RunningHubAI/rh-minimax-h3-fl2v-lightx2v-turbo-4step-v0.1-comfy.safetensors-lora	0	0		comfyui,lora	2026-09-21T02:29:23.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v0.1-768p-sla-comfyui-bf16-lora	0	1		comfyui,lora	2026-10-08T03:07:04.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v0.1-768p-sla-comfyui-bf16.safetensors-lora	0	0		comfyui,lora	2026-09-21T02:29:56.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v0.1-alpha8-t8-10erosmax-test4-pruned-compat-v001-alpha-lora	0	0			2026-11-08T11:57:07.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v0.1-comfyui-alpha8-t8-convert-lora	0	0		comfyui,lora	2026-09-30T17:58:02.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v0.1-comfyui-t8-convert-lora	0	0		comfyui,lora	2026-09-24T13:47:01.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v1.0-768p-comfyui-bf16.safetensors-lora	0	0		comfyui,lora	2026-09-21T02:29:38.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v1.1-768p-comfyui-bf16.safetensors-lora	0	1		comfyui,lora	2026-09-21T02:29:51.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v1.2-768p-comfyui-bf16.safetensors-lora	0	1		comfyui,lora	2026-09-21T02:29:43.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v1.2-768p-comfyui-resized-avg-rank-64-bf16.safetensors-lora	0	0		comfyui,lora	2026-09-24T00:52:02.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-4step-v1.2-768p-lora	0	0		comfyui,lora	2026-11-05T15:14:01.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-8step-v1.0-10erosmax-beta1-pruned-compat-v001-t8-lora	0	0		comfyui,lora	2026-09-26T02:57:01.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-8step-v1.0-768p-comfyui-bf16.safetensors-lora	0	2		comfyui,lora	2026-09-21T02:29:28.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-8step-v1.0-768p-comfyui-resized-avg-rank-64-bf16.safetensors-lora	0	1		comfyui,lora	2026-10-02T14:49:03.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-8step-v1.0-768p-feihouremix-v0.6-compat-v001-t8-lora	0	0		comfyui,lora	2026-10-02T00:29:03.000Z
+RunningHubAI/rh-minimax-h3-fl2v-turbo-8step-v1.0-comfyui-bf16.safetensors-lora	0	1		comfyui,lora	2026-09-21T02:29:13.000Z
+RunningHubAI/rh-minimax-h3-fused-refdelta-r1024-turbo8-mystic07-int8-convrot-r-unet	0	2		comfyui	2026-11-05T12:58:11.000Z
+RunningHubAI/rh-minimax-h3-hybrid-fl2va-ref2va-b25-49-int8-r-unet	0	3		comfyui	2026-09-25T20:39:03.000Z
+RunningHubAI/rh-minimax-h3-imagelora-lora	0	1			2026-11-27T01:29:01.000Z
+RunningHubAI/rh-minimax-h3-lms-v1.0-r64-lora	0	4		comfyui,lora	2026-09-27T10:04:02.000Z
+RunningHubAI/rh-minimax-h3-ref2va-turbo-int8-convrot-unet	0	0		comfyui	2026-09-26T08:49:02.000Z
+RunningHubAI/rh-minimax-h3-ref2v-turbo-4step-v0.1-comfyui-bf16.safetensors-lora	0	5		comfyui,lora	2026-09-21T02:29:33.000Z
+RunningHubAI/rh-minimax-h3-ref2v-turbo-8step-v1.0-768p-comfyui-bf16-lora	0	0		comfyui,lora	2026-09-24T11:52:01.000Z
+RunningHubAI/rh-minimax-h3-ref2v-turbo-8step-v1.0-768p-comfyui-bf16.safetensors-lora	0	3		comfyui,lora	2026-09-21T02:28:45.000Z
+RunningHubAI/rh-minimax-h3-ref2v-turbo-8step-v1.0-768p-lora	0	0		comfyui,lora	2026-09-29T16:00:02.000Z
+RunningHubAI/rh-minimax-h3-remix-hsa-turbo-v0.8-int8-pruned-unet	0	0		comfyui	2026-10-26T01:01:03.000Z
+RunningHubAI/rh-minimax-h3-turbo-4-comfyui-t8-lora	0	0		comfyui,lora	2026-09-24T13:43:02.000Z
+RunningHubAI/rh-minimax-h3-turbo-4step-10erosmax-test4-pruned-curveproj1025-exp-v001-t8-lora	0	0		comfyui,lora	2026-09-25T05:49:05.000Z
+RunningHubAI/rh-minimax-h3-turbo-4step-ckpt500-comfyui-lora	0	0			2026-11-27T06:12:03.000Z
+RunningHubAI/rh-minimax-h3-turbo-4step-ckpt500-comfyui-t8-lora	0	0		comfyui,lora	2026-09-26T12:00:03.000Z
+RunningHubAI/rh-minimax-h3-turbo-4step-ckpt500-converted.safetensors-lora	0	0		comfyui,lora	2026-09-24T10:13:01.000Z
+RunningHubAI/rh-minimax-h3-turbo-4step-ckpt850-t8-comfyui-lora	0	0		comfyui,lora	2026-09-26T12:32:01.000Z
+RunningHubAI/rh-minimax-h3-turbo-4steps-lora	0	0		comfyui,lora	2026-10-15T06:42:05.000Z
+RunningHubAI/rh-minimax-h3-turboref2v-turbo-8step-v1.0-768p-lora	0	0		comfyui,lora	2026-10-03T15:42:02.000Z
+RunningHubAI/rh-minimax-h3-turbo-v4-step600-comfyui-t8-convert-lora	0	0		comfyui,lora	2026-09-25T19:47:06.000Z
+RunningHubAI/rh-minimax-h3-turbo-v4-step600-ema-comfyui-b-lora	0	0		comfyui,lora	2026-09-28T05:08:15.000Z
+RunningHubAI/rh-minimax-h3-turbo-v4-step600-ema-dasiwaref2vahybridv1-0-curveproj1025-compat-v001-lora	0	2		comfyui,lora	2026-09-25T15:40:03.000Z
+RunningHubAI/rh-minimax-h3-turbo-v4-step600-t8-10erosmax-test4-pruned-curveproj1025-exp-v001-lora	0	0			2026-11-09T10:14:06.000Z
+SabiQG/minimax-h3-fp8	0	1	MiniMaxAI/MiniMax-H3		2026-08-08T17:40:57.000Z
+saejon/MinimaxH3	0	4			2026-11-18T16:29:30.000Z
+saejon/minimaxh32	0	0			2026-08-25T11:18:55.000Z
+sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4	0	255	ethanfel/Qwen3-VL-32B-Ultra-Heretic-MiniMax-H3-ComfyUI-INT8-ConvRot	comfyui,base_model:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot,base_model:quantized:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot	2026-08-04T00:50:28.000Z
+sandaisnot/PinkCherry_MiniMax-H3	0	1			2026-08-08T04:41:42.000Z
+SanDiegoDude/H3-Turbo-6-Step-LoRA-Comfy	0	4	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-07T20:35:41.000Z
+SceneWorks/minimax-h3-image-pe	0	1	MiniMaxAI/MiniMax-H3-Image-PE	quantized,base_model:quantized:MiniMaxAI/MiniMax-H3-Image-PE	2026-11-19T02:58:59.000Z
+SceneWorks/minimax-h3-mlx	0	0			2026-08-14T23:43:47.000Z
+Scorpio1111/MiniMax-H3-Turbo-Lora	0	0			2026-09-07T10:59:42.000Z
+seahorse12/MiniMax-H3-Turbo-Lora	0	0	Comfy-Org/MiniMax-H3	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-12T15:40:31.000Z
+SearchingMan/MiniMax-H3-Text-Encoders	0	8		comfyui	2026-08-13T18:52:25.000Z
+Sentinel7/minimax-h3-image	0	37			2026-11-21T19:33:22.000Z
+silveroxides/MiniMax-H3_tests	0	129	["MiniMaxAI/MiniMax-H3"]	lora	2026-11-12T02:12:21.000Z
+Simplismart/Minimax-H3-FL2VA-Photon	0	0			2026-08-10T09:29:09.000Z
+Simplismart/Minimax-H3-FL2V-NVFP4	0	0			2026-08-09T21:20:36.000Z
+Simplismart/Minimax-H3-Ref2VA-Photon	0	0			2026-08-10T09:29:35.000Z
+slmonker/minimax-h3-fl2v-turbo-comfyui-fp8	0	0			2026-09-11T04:22:32.000Z
+smart-bobo/MiniMax-H3	0	9			2026-11-21T11:22:25.000Z
+smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models	0	428	["MiniMax-H3-fl2va","MiniMax-H3-ref2va"]		2026-08-16T22:53:44.000Z
+Smite79/MiniMax-H3-Tape-FX	0	5	["MiniMaxAI/MiniMax-H3"]		2026-08-23T23:25:49.000Z
+SpXMerlin1D/MiniMaxH3-CondBridge-Qwen3.5-4B	0	7	["MiniMaxAI/MiniMax-H3"]	interface-distillation,comfyui	2026-08-16T14:18:23.000Z
+sSANCHESs/PinkCherry_MiniMax-H3	0	0			2026-08-09T19:13:15.000Z
+ssjenforcer191/Homelander_Minimax_H3_experimental	0	1			2026-08-07T04:50:12.000Z
+starsfriday/MiniMax-H3-w4a8	0	8	["MiniMaxAI/MiniMax-H3"]	comfyui,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-06T07:35:14.000Z
+suryatmodulus/ClipProj-MiniMax-H3	0	1	["Comfy-Org/MiniMax-H3","Qwen/Qwen3-VL-4B-Instruct"]	comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-08-10T09:14:50.000Z
+suryatmodulus/MiniMax-H3-Turbo	0	0		comfyui,lora	2026-08-10T09:14:17.000Z
+T0ddy/frame-room-minimax-h3-singularity-pruned-turbo8-realism	0	0			2026-10-16T19:24:12.000Z
+t8star/minimax-h3-4step-turbo-loras-comfyui-exp	0	66			2026-08-09T07:20:42.000Z
+t8star/MiniMax-H3-Acc-8Step-comfy	0	5			2026-08-26T18:57:12.000Z
+t8star/MinimaxH3-Dasiwa-10eros-hybird-8steps-turbo	0	7			2026-09-04T08:08:54.000Z
+t8star/Minimax-H3-Dasiwa-V1-Hybird-4steps	0	10			2026-08-23T03:06:08.000Z
+t8star/minimax_h3_fl2v_turbo_4step_v0.1_comfyui_alpha8-T8-convert	0	10			2026-08-07T17:55:58.000Z
+t8star/minimax_h3_fl2v_turbo_8step_v1.0_768p_FeiHouRemix_v0.6_compat_v001_T8	0	2			2026-09-04T11:32:04.000Z
+t8star/minimax_h3_turbo_4step_10ErosMax_test4_pruned_curveproj1025_T8	0	18	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	lora,comfyui,base_model:Comfy-Org/MiniMax-H3,base_model:adapter:Comfy-Org/MiniMax-H3	2026-08-11T18:59:22.000Z
+t8star/minimax_h3_turbo_v4_step600_ema_DasiwaREF2VAHybridV1_0_curveproj1025_compat_v001	0	5			2026-09-04T09:58:23.000Z
+taxexempt/Custom-MiniMaX-H3-mixed-quants	0	4	["MiniMaxAI/MiniMax-H3"]		2026-09-14T19:22:46.000Z
+TechnoBaptist/MiniMax-H3	0	0			2026-08-03T03:57:23.000Z
+TenStrip/MinimaxH3-Turbo_Shenanigans	0	21			2026-09-07T21:12:55.000Z
+The-frizzy1/Minimax-h3-gguf-workflow	0	1			2026-08-08T13:17:49.000Z
+tomas-organization/minimax-h3-production-fp8	0	0			2026-08-26T22:23:34.000Z
+tsolful/Minimax_H3_INT4MixedConvRot	0	41	MiniMaxAI/MiniMax-H3	base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-04T14:04:54.000Z
+tsolful/minimaxh3_tests	0	4			2026-10-07T22:07:00.000Z
+tutututututu/Tutu-MiniMax-H3-AudioVideo-20to8-NFE-LoRA	0	19	MiniMaxAI/MiniMax-H3	lora,comfyui	2026-08-09T08:11:37.000Z
+uetuluk2/minimax-h3-mlx-rebuild	0	1	MiniMaxAI/MiniMax-H3		2026-08-10T06:14:25.000Z
+unsloth/MiniMax-H3-FP8	0	19	["MiniMaxAI/MiniMax-H3"]	quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-10-16T12:52:17.000Z
+UntMods/FaceSwap_MiniMaxH3_REF2VA	0	230			2026-09-20T09:57:50.000Z
+Vayden/MiniMax-H3-Video-VAE-MLX-Q8	0	4	MiniMaxAI/MiniMax-H3	comfyui,quantized	2026-08-08T17:21:44.000Z
+vonkaiser/MiniMax-H3-NVFP4	0	2	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-06T04:13:05.000Z
+vyrekai/minimax-h3-image-comfyui-workflows	0	128		comfyui	2026-11-15T03:07:21.000Z
+wangpj/MiniMax-H3-FL2VA	0	0			2026-08-12T15:41:57.000Z
+wangpj/MiniMax-H3-Ref2VA	0	0			2026-08-12T15:37:26.000Z
+WarmBloodAban/Minimax_h3_ref2va_XUELUO_int8_convrot	0	33			2026-08-16T23:36:30.000Z
+water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX	0	5	MiniMaxAI/MiniMax-H3	lora,turbo	2026-08-11T17:56:55.000Z
+Wesley1234/minimax-h3-4step-turbo-loras-comfyui-exp	0	0			2026-08-27T16:18:25.000Z
+Wesley1234/minimax_h3_fl2v_turbo_4step_v0.1_comfyui_alpha8-T8-convert	0	0			2026-08-27T16:20:21.000Z
+wiikoo/minimax-h3	0	0			2026-08-13T12:37:36.000Z
+Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI	0	42	TODO-add-base-model-repo-link	comfyui,quantization	2026-09-20T12:24:32.000Z
+witcherderivia/minimax-h3-image-restyle	0	30	["MiniMaxAI/MiniMax-H3","Comfy-Org/MiniMax-H3"]	base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-11T05:16:18.000Z
+xdkings/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4	0	0	ethanfel/Qwen3-VL-32B-Ultra-Heretic-MiniMax-H3-ComfyUI-INT8-ConvRot	comfyui,base_model:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot,base_model:quantized:ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot	2026-08-17T20:10:15.000Z
+xvmrjxc/MiniMax-H3-NVFP4	0	0	MiniMaxAI/MiniMax-H3	comfyui,quantized,base_model:quantized:MiniMaxAI/MiniMax-H3	2026-08-20T05:28:28.000Z
+yemsrach3723/MiniMax-H3	0	0	["MiniMaxAI/MiniMax-H3"]	comfyui	2026-08-05T08:53:50.000Z
+yeowon/MiniMax-H3-Rung-Omega	0	5	["Comfy-Org/MiniMax-H3"]	comfyui,quantization,base_model:Comfy-Org/MiniMax-H3,base_model:finetune:Comfy-Org/MiniMax-H3	2026-11-06T09:41:53.000Z
+yitongl/minimax-h3-deltaquant-nvfp4	0	0		deltaquant,quantization	2026-08-09T16:04:15.000Z
+yitongl/minimax-h3-deltaquant-x0-trajectory	0	0		deltaquant,quantization	2026-08-09T16:04:13.000Z
+yitongl/minimax-h3-nvfp4-lambda-modality	0	0		svdquant,quantization	2026-08-09T05:51:22.000Z
+yitongl/minimax-h3-nvfp4-lora-recovery	0	0		quantization,lora,post-training-quantization	2026-08-10T04:36:50.000Z
+YZisM3/MinimaxH3	0	0			2026-08-29T06:28:15.000Z
+zhenshipo/MiniMax-H3-int8-models	0	1			2026-08-12T06:54:03.000Z
+zuanfilm/H3_Minimax_res2s_rkmk2e_Workflow	0	0		comfyui	2026-08-15T18:01:11.000Z
+Zxsry/PinkCherry_MiniMax-H3	0	0			2026-08-09T09:34:23.000Z
