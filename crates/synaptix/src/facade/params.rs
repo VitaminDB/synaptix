@@ -293,11 +293,16 @@ pub fn param_schema(task: Task, arch: &str, id: &str, path: Option<&Path>) -> Ve
             }
             _ => {
                 let [w, h] = size(1024, 576);
+                let dur = if id.contains("2-5") || id.contains("2.5") {
+                    spec("duration", "Длительность, с", "Длина результата в секундах (0 — авто по описанию сцены)", float(0.0, 20.0, 0.5, 1), f(0.0))
+                } else {
+                    duration(10.0, 20.0)
+                };
                 vec![
                     negative(),
                     w,
                     h,
-                    duration(10.0, 20.0),
+                    dur,
                     spec("fps", "Кадров в секунду", "Частота кадров видео", ParamKind::Choice { options: vec!["24".into(), "25".into(), "48".into(), "50".into()] }, Some(ParamValue::Text("24".into()))),
                     seed(),
                 ]

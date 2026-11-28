@@ -587,11 +587,22 @@ pub fn ltx(paths: &LtxPaths, device: Device, req: &VideoRequest, out: &Path, can
         _ => None,
     };
     // LTX-2.5: длина не задана — по описанию (голова длительности).
+    // Для листа-референса передаём в голову только часть «Generated video:»,
+    // чтобы описание панелей листа не раздувало оценку длительности сцены.
     let auto_secs = match &mode {
         LtxMode::Text | LtxMode::Frames { .. } | LtxMode::Sheet { audio: None, .. }
             if req.seconds.is_none_or(|s| s <= 0.0) && paths.duration_head.is_some() =>
         {
-            let s = ltx_auto_seconds(paths, device, &req.prompt, req.quant.as_deref())?;
+            let dur_prompt = if matches!(mode, LtxMode::Sheet { .. }) {
+                req.prompt
+                    .find("Generated video:")
+                    .map(|i| req.prompt[i + "Generated video:".len()..].trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&req.prompt)
+            } else {
+                &req.prompt
+            };
+            let s = ltx_auto_seconds(paths, device, dur_prompt, req.quant.as_deref())?;
             eprintln!("[ltx] длительность по описанию: {s:.2} с");
             Some(s)
         }
